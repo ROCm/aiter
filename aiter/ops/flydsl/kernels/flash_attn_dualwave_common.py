@@ -982,6 +982,31 @@ class DualwaveFp8KernelContext:
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
 
+    def compute_active_guard(self):
+        """Predicate for whether this workgroup's Q block is in range.
+
+        The grid is sized ``ceil(max_seqlen_q / BLOCK_M)`` in y for every batch
+        entry, because one launch has to cover the longest sequence. Under
+        varlen that overshoots every shorter sequence, and those excess blocks
+        have ``q_start`` past the end of their own sequence -- left to run they
+        write into the next packed sequence's rows.
+
+        Mirrors ``DualwaveKernelContext.compute_active_guard`` on the bf16 side
+        (upstream ``flash_attn_utils.py:3503`` at v0.3.0), which the fp8 context
+        never had: it computes ``seqlen_q_v`` but used it only for
+        ``delta_i32``. Returns None when no guard is needed, matching bf16 so
+        the dense path emits exactly the same code as before.
+        """
+        traits = self.traits
+        if const_expr(traits.SPLITK):
+            return self.split_nonempty
+        if const_expr(traits.VARLEN):
+            return self.q_start < self.seqlen_q_v
+        return None
+
+    def init_active_guard(self):
+        self.active = self.compute_active_guard()
+
     def init_workspace_io(self):
         if const_expr(self.traits.SPLITK):
             self.ws_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(self.DebugCounts), fx.make_layout(1, 1))

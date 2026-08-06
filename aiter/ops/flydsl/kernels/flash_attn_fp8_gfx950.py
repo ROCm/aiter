@@ -71,13 +71,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
         raise RuntimeError(f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}")
     if dtype_str not in ("bf16", "f16", "fp8"):
         raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16/fp8 only, got dtype={dtype_str}")
-    # fp8 is dense-only for now: split-K and packed varlen are not implemented for
-    # fp8, so reject them at the builder boundary rather than building a path that
-    # would silently produce wrong results.
+    # fp8 split-K is still unimplemented -- it fails inside the partial-output
+    # store, not here -- so keep rejecting it at the boundary rather than
+    # building a path that would silently produce wrong results.
     if dtype_str == "fp8" and int(num_kv_splits) > 1:
         raise RuntimeError(f"fp8 flash_attn does not support split-K (num_kv_splits={num_kv_splits})")
-    if dtype_str == "fp8" and varlen:
-        raise RuntimeError("fp8 flash_attn does not support packed varlen (cu_seqlens)")
+    # fp8 varlen was rejected here too. It needed the active guard the fp8
+    # context was missing (see compute_active_guard in the common module) plus
+    # the BN128 pipeline held on independently of varlen; with both, it works.
+    #
+    # The shallow (bn128=False) fp8 path still does not build at all -- its PV
+    # dispatch expects an unpacked P pair that the body never produces -- so
+    # fp8 stays on BN128 whatever varlen says, rather than inheriting the
+    # upstream derivation that would turn it off here.
+    if dtype_str == "fp8":
+        if bn128 is False:
+            raise RuntimeError("fp8 flash_attn has no working non-BN128 path (bn128=False)")
+        bn128 = True
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -171,6 +181,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ctx.init_descale()
         ctx.init_tile_bounds()
         ctx.init_workspace_io()
+        # After init_tile_bounds: the split-K guard reads split_nonempty.
+        ctx.init_active_guard()
 
         q_loader = DualwaveFp8QLoader(ctx)
         gemm_helper = DualwaveFp8GemmHelper(ctx)
@@ -214,95 +226,112 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 m_tile = softmax_helper.floor_masked_max(m_tile)
             return m_tile
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
-        q_loader.stage_q_to_lds()
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-        rocdl.s_barrier()
+        def _main_body():
+            kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
+            q_loader.stage_q_to_lds()
+            rocdl.s_waitcnt(0)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
 
-        ctx.init_q_row()
-        q_row = ctx.q_row
+            ctx.init_q_row()
+            q_row = ctx.q_row
 
-        q_wide = gemm_helper.load_q_wide() if const_expr(traits.QREG) else None
+            q_wide = gemm_helper.load_q_wide() if const_expr(traits.QREG) else None
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-        rocdl.s_barrier()
-        rocdl.sched_barrier(0)
-
-        m_row = ctx.c_neg_inf
-        l_row = ctx.c_zero_f
-        v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
-
-        NPF_I = const_expr(fx.Index(NPF))
-
-        def _ring_wrap(x):
-            return (x >= NPF_I).select(x - NPF_I, x)
-
-        init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
-        loop_results = init_args
-        for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
-            m_row = loop_args[0]
-            l_row = loop_args[1]
-            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
-
-            a_buf = loop_args[2 + D_CHUNKS]
-            b_buf = _ring_wrap(a_buf + fx.Index(1))
-            nn_a_buf = _ring_wrap(a_buf + fx.Index(2))
-            f_a_buf = _ring_wrap(a_buf + fx.Index(4))
-            f_b_buf = _ring_wrap(a_buf + fx.Index(5))
-
-            v_k_a = kv_lds_to_regs.load_k(a_buf)
-            v_k_b = kv_lds_to_regs.load_k(b_buf)
-
-            v_s_a = gemm_helper.qk(v_k_a, q_wide)
-            v_s_a = _mask_sub(v_s_a, j)
-            v_s_b = gemm_helper.qk(v_k_b, q_wide)
-            v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
-            v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
-
-            v_v_a = kv_lds_to_regs.load_v(a_buf)
-
-            kv_gmem_to_lds.load_k((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_k((j + fx.Index(5)) * BN, f_b_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(5)) * BN, f_b_buf)
-
-            m_tile = _merge_tile_max(v_s_a, v_s_b)
-            v_o, m_new, l_row = softmax_helper.lazy_correct_o(v_o, m_row, l_row, m_tile)
-            v_o = softmax_helper.anchor_v_o(v_o)
-
-            v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
-            v_v_b = kv_lds_to_regs.load_v(b_buf)
-            v_o, l_row = _subtile_tail(v_s_b, v_v_b, v_o, l_row, m_new)
-            m_row = m_new
-
-            _sched_barrier_exp_pairs(traits, 8, 16, 11)
-            _sched_barrier_pairs(traits, 8, 25, 11)
+            kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
+            kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
+            kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
+            kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
+            kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
+            kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
+            kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
             rocdl.s_waitcnt(0)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-            loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
-        m_row = loop_results[0]
-        l_row = loop_results[1]
-        v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+            m_row = ctx.c_neg_inf
+            l_row = ctx.c_zero_f
+            v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
-        inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
-        inv_l = ArithValue(fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
-        if const_expr(traits.FP8_PV):
-            inv_l = ArithValue(inv_l) * ctx.vd_fp8
-        softmax_helper.scale_o(v_o, inv_l)
-        rocdl.s_barrier()
-        output_store.store_final_o(v_o, q_row)
+            NPF_I = const_expr(fx.Index(NPF))
+
+            def _ring_wrap(x):
+                return (x >= NPF_I).select(x - NPF_I, x)
+
+            init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
+            loop_results = init_args
+            for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
+                m_row = loop_args[0]
+                l_row = loop_args[1]
+                v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+
+                a_buf = loop_args[2 + D_CHUNKS]
+                b_buf = _ring_wrap(a_buf + fx.Index(1))
+                nn_a_buf = _ring_wrap(a_buf + fx.Index(2))
+                f_a_buf = _ring_wrap(a_buf + fx.Index(4))
+                f_b_buf = _ring_wrap(a_buf + fx.Index(5))
+
+                v_k_a = kv_lds_to_regs.load_k(a_buf)
+                v_k_b = kv_lds_to_regs.load_k(b_buf)
+
+                v_s_a = gemm_helper.qk(v_k_a, q_wide)
+                v_s_a = _mask_sub(v_s_a, j)
+                v_s_b = gemm_helper.qk(v_k_b, q_wide)
+                v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
+                v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
+
+                v_v_a = kv_lds_to_regs.load_v(a_buf)
+
+                kv_gmem_to_lds.load_k((j + fx.Index(4)) * BN, f_a_buf)
+                kv_gmem_to_lds.load_k((j + fx.Index(5)) * BN, f_b_buf)
+                kv_gmem_to_lds.load_v((j + fx.Index(4)) * BN, f_a_buf)
+                kv_gmem_to_lds.load_v((j + fx.Index(5)) * BN, f_b_buf)
+
+                m_tile = _merge_tile_max(v_s_a, v_s_b)
+                v_o, m_new, l_row = softmax_helper.lazy_correct_o(v_o, m_row, l_row, m_tile)
+                v_o = softmax_helper.anchor_v_o(v_o)
+
+                v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
+                v_v_b = kv_lds_to_regs.load_v(b_buf)
+                v_o, l_row = _subtile_tail(v_s_b, v_v_b, v_o, l_row, m_new)
+                m_row = m_new
+
+                _sched_barrier_exp_pairs(traits, 8, 16, 11)
+                _sched_barrier_pairs(traits, 8, 25, 11)
+                rocdl.s_waitcnt(0)
+                rocdl.sched_barrier(0)
+                rocdl.s_barrier()
+                rocdl.sched_barrier(0)
+
+                loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
+            m_row = loop_results[0]
+            l_row = loop_results[1]
+            v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+
+            inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+            inv_l = ArithValue(fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+            if const_expr(traits.FP8_PV):
+                inv_l = ArithValue(inv_l) * ctx.vd_fp8
+            softmax_helper.scale_o(v_o, inv_l)
+            rocdl.s_barrier()
+            output_store.store_final_o(v_o, q_row)
+
+        # Skip workgroups whose Q block lies past their own sequence. The grid
+        # is sized for the longest sequence, so under varlen the excess blocks
+        # of every shorter one would otherwise write into the next packed
+        # sequence's rows. `active` is None on the dense path, which keeps the
+        # emitted code identical to before. Mirrors the bf16 kernel.
+        if ctx.active is None:
+            _main_body()
+        else:
+
+            @flyc.jit
+            def _run_body_if_active():
+                if ctx.active:
+                    _main_body()
+
+            _run_body_if_active()
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
     # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
