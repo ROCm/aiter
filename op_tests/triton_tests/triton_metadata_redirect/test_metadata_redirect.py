@@ -1,14 +1,13 @@
 import os
-from pathlib import Path
-import torch
 import tempfile
+from pathlib import Path
 
 import pytest
-
+import torch
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
-from triton.tools.compile import compile_kernel, CompileArgs
+from triton.tools.compile import CompileArgs, compile_kernel
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (
@@ -5802,7 +5801,7 @@ def test_f32_kernel():
         )
 
         with AOTMetadataContext("empty_kernel", temp_dir):
-            triton_kernel0, output_files0 = compile_kernel(compile_args)
+            _triton_kernel0, _output_files0 = compile_kernel(compile_args)
 
 
 def test_jit():

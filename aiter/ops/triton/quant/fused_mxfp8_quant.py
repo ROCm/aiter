@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
-    _fused_rms_mxfp8_kernel,
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
+    _fused_rms_mxfp8_kernel,
 )
 
 __all__ = [
-    "fused_rms_mxfp8_quant",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
+    "fused_rms_mxfp8_quant",
 ]
 
 _QUANT_BLOCK_SIZE = 32
@@ -24,9 +23,9 @@ def fused_rms_mxfp8_quant(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    y: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    y: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMSNorm + MXFP8 (1x32 e8m0) quant in a single Triton launch.
 
@@ -82,11 +81,11 @@ def fused_dual_rmsnorm_mxfp8_quant(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps_q: float,
-    eps_k: Optional[float] = None,
-    yq: Optional[torch.Tensor] = None,
-    sq: Optional[torch.Tensor] = None,
-    yk: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    eps_k: float | None = None,
+    yq: torch.Tensor | None = None,
+    sq: torch.Tensor | None = None,
+    yk: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused dual RMSNorm in a single Triton launch.
 
     - Q side: RMSNorm(q, q_weight, eps_q) -> MXFP8 (FP8 e4m3fn + uint8 e8m0 1x32).
@@ -169,7 +168,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
 def fused_flatten_mxfp8_quant(
     x: torch.Tensor,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Flatten the last two dimensions of x and apply per-1x32 MXFP8 quant along
     the flattened axis (FP8 e4m3 values + uint8 e8m0 scales).

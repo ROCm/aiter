@@ -23,6 +23,9 @@ torch.set_default_device("cuda")
 
 F32_MIN_NORMAL = 2.0 ** (-126)
 
+# E8M0 stores a biased exponent, so the encoding of 2^0 is the bias itself.
+E8M0_ONE = 0x7F
+
 
 def _finalize_scale(scaled: torch.Tensor, zero_mask: torch.Tensor) -> torch.Tensor:
     """Common tail: pow2-quantize a fp32 tensor to E8M0-representable range."""
@@ -324,9 +327,17 @@ def test_gui_shuffle_scale_w2_k_pad(inter_tp, float_dtype):
     out_auto = shuffle_scale_a16w4(s2d, E, False)
     assert out_auto.shape == (E * hidden_tp, k_groups_padded)
 
+    # The k-groups added by padding describe weights that are not there, so
+    # their scale has to be neutral -- 2^0. In e8m0 that is the bias itself,
+    # 0x7F; zero would mean 2^-127. Pre-pad by hand with the neutral value and
+    # the result has to match what shuffle_scale pads internally.
     k_ = s2d.shape[1]
     k_padded = (k_ + 7) // 8 * 8
-    pre = torch.zeros(s2d.shape[0], k_padded, dtype=s2d.dtype, device=s2d.device)
+    pre = torch.empty(s2d.shape[0], k_padded, dtype=s2d.dtype, device=s2d.device)
+    if pre.element_size() == 1:
+        pre.view(torch.uint8).fill_(E8M0_ONE)
+    else:
+        pre.fill_(1)
     pre[:, :k_] = s2d
     out_explicit = shuffle_scale(
         pre, experts_cnt=E, is_guinterleave=True, gate_up=False
@@ -344,18 +355,18 @@ def test_edge_values(float_dtype, round_mode):
     name = _MODE_NAME[round_mode]
 
     inp_zero = torch.zeros(rows, cols, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_zero, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_zero, group_size=32, round_mode=round_mode)
     assert packed.view(torch.uint8).sum() == 0, f"zero input failed mode={name}"
 
     inp_large = torch.full((rows, cols), 1e4, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_large, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_large, group_size=32, round_mode=round_mode)
     assert packed.view(torch.uint8).max() > 0, f"large input failed mode={name}"
 
     inp_tiny = torch.full((rows, cols), 1e-10, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_tiny, group_size=32, round_mode=round_mode)
 
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=round_mode)
     py_packed, _ = ref_quant_mxfp4(inp_neg.cpu(), round_mode=round_mode, group_size=32)
     assert torch.equal(
         packed.view(torch.uint8).cpu(), py_packed
@@ -378,12 +389,14 @@ def test_invalid_round_mode():
     cmd = [
         sys.executable,
         "-c",
-        "import torch, aiter\n"
-        "from aiter.ops.quant import quant_mxfp4_hip\n"
-        "x = torch.randn(32, 64, dtype=torch.bfloat16, device='cuda')\n"
-        "quant_mxfp4_hip(x, group_size=32, round_mode=4)\n",
+        (
+            "import torch, aiter\n"
+            "from aiter.ops.quant import quant_mxfp4_hip\n"
+            "x = torch.randn(32, 64, dtype=torch.bfloat16, device='cuda')\n"
+            "quant_mxfp4_hip(x, group_size=32, round_mode=4)\n"
+        ),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if proc.returncode == 0:
         raise AssertionError(
             "round_mode=4 should have been rejected by AITER_CHECK; "
@@ -397,8 +410,8 @@ def test_invalid_round_mode():
 
 def test_default_round_mode_drift():
     """Verify Python MX_DEFAULT_ROUND_MODE matches C++ kDefaultMxScaleRoundMode."""
-    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt
     from aiter.jit.core import get_module
+    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt
 
     assert MX_DEFAULT_ROUND_MODE in (
         MxScaleRoundModeInt.RoundDown,
