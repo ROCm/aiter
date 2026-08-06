@@ -500,3 +500,70 @@ def test_invalid_args_rejected(logits_dtype, call_kwargs, exc):
             logits.stride(1),
             **call_kwargs,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Layout contract. Only logits carries its pitch into the kernel (as stride0);
+# indices, seqLens and workspace are addressed with a pitch the kernel assumes
+# -- row * k, element i, and linearly from the base pointer. Each case below is
+# a layout that satisfies the size checks and would then be mis-addressed, so
+# the assert on the older condition is part of the test: it pins that the size
+# check alone lets the layout through.
+# --------------------------------------------------------------------------- #
+def _layout_case(k, rows=2, L=4096):
+    logits = torch.randn((rows, L), device="cuda", dtype=torch.float32)
+    seq_lens = torch.full((rows,), L, device="cuda", dtype=torch.int32)
+    indices = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    return logits, seq_lens, indices
+
+
+def _launch(logits, seq_lens, indices, rows, k, workspace=None):
+    flydsl_top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k,
+        ordered=False,
+        workspace=workspace,
+    )
+
+
+def test_indices_wider_than_k_rejected():
+    """A contiguous (rows, k + pad) output has room for k and adjacent columns,
+    but its rows sit pad elements too far apart for the kernel's row * k."""
+    k, rows = 512, 2
+    logits, seq_lens, _ = _layout_case(k, rows)
+    indices = torch.empty((rows, k + 16), device="cuda", dtype=torch.int32)
+    assert indices.shape[1] >= k and indices.stride(1) == 1
+    with pytest.raises(ValueError, match="packed k apart"):
+        _launch(logits, seq_lens, indices, rows, k)
+
+
+def test_strided_seq_lens_rejected():
+    """seqLens[::2] reports the right numel(), but the kernel reads element i
+    and would pick up the interleaved neighbours instead."""
+    k, rows, L = 512, 2, 4096
+    logits, _, indices = _layout_case(k, rows, L)
+    backing = torch.tensor([L, 64] * rows, device="cuda", dtype=torch.int32)
+    seq_lens = backing[::2]
+    assert seq_lens.numel() == rows
+    with pytest.raises(ValueError, match="seqLens must be packed"):
+        _launch(logits, seq_lens, indices, rows, k)
+
+
+def test_strided_workspace_rejected():
+    """workspace[::2] holds enough slots, but zero_() follows the view while the
+    kernel addresses the region linearly, so the two cover different memory."""
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    k, rows, L = 512, 2, 4096
+    logits, seq_lens, indices = _layout_case(k, rows, L)
+    slots = flydsl_top_k_per_row_decode_workspace_size(rows, L)
+    ws = torch.zeros(2 * slots, device="cuda", dtype=torch.int32)[::2]
+    assert ws.numel() >= slots
+    with pytest.raises(ValueError, match="workspace must be packed"):
+        _launch(logits, seq_lens, indices, rows, k, workspace=ws)

@@ -463,8 +463,12 @@ def _validate_inputs(
         )
     if indices.shape[1] < k:
         raise ValueError(f"indices second dimension must be at least k={k}")
-    if indices.stride(1) != 1:
-        raise ValueError("indices must have contiguous per-row storage")
+    if indices.stride() != (k, 1):
+        raise ValueError(
+            "indices rows must be packed k apart: the kernel writes row r at "
+            f"element offset r * k, so stride() must be ({k}, 1), got "
+            f"{tuple(indices.stride())}"
+        )
     if stride1 != 1:
         raise NotImplementedError(
             f"FlyDSL decode TopK currently supports stride1 == 1 only, got {stride1}"
@@ -482,12 +486,25 @@ def _validate_inputs(
             f"{required_seq_rows} seqLens entries, got {seqLens.numel()}"
         )
 
+    if not seqLens.is_contiguous():
+        raise ValueError(
+            "seqLens must be packed: the kernel reads entry i at element offset "
+            f"i, so a strided view silently reads its neighbours; got "
+            f"stride={tuple(seqLens.stride())}"
+        )
+
     if workspace is not None:
         _check_cuda_tensor("workspace", workspace)
         if workspace.dtype is not torch.int32:
             raise TypeError(f"workspace must be torch.int32, got {workspace.dtype}")
         if workspace.device != logits.device:
             raise ValueError("workspace must be on the same device as logits")
+        if not workspace.is_contiguous():
+            raise ValueError(
+                "workspace must be packed: zero_() follows the tensor's view "
+                "while the kernel addresses it linearly from the base pointer, "
+                f"so the two disagree; got stride={tuple(workspace.stride())}"
+            )
 
 
 def flydsl_top_k_per_row_decode(
