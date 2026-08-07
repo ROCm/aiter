@@ -334,15 +334,30 @@ def _load_ref():
 # --------------------------------------------------------------------------- #
 # TFLOPS
 # --------------------------------------------------------------------------- #
-def calculate_tflops(N: int, H: int, T_flat: int, K: int, V: int, time_us: float) -> float:
+def calculate_tflops(
+    N: int, H: int, T_flat: int, K: int, V: int, time_us: float, BT: int = 64
+) -> float:
     """Total FLOPs for K5 = GEMM1 (w @ h^T) + GEMM2 (k^T @ v_new).
 
-    Both GEMMs cost 2·BT·K·V per chunk; summed over NT=T_flat/BT chunks:
-    total = 4·N·H·T_flat·K·V.
+    Both GEMMs cost 2·BT·K·V per chunk per head, so 4·BT·K·V for the pair.
+
+    ``T_flat`` is the TOTAL token count across all ``N`` sequences -- they are
+    packed into a single flat token axis by ``_make_inputs`` (every tensor is
+    ``[B=1, T_flat, ...]`` and ``cu_seqlens`` merely splits that axis).
+
+    Chunks are counted per sequence with ceil(), because the kernel pads each
+    sequence's final chunk out to BT and issues the full BT-wide MFMA work for
+    it. That matches what the hardware actually executes: this formula
+    reproduces SQ_INSTS_MFMA x 8192 exactly on the preset shapes.
     """
     if time_us <= 0:
         return float("nan")
-    return 4 * N * H * T_flat * K * V / (time_us * 1e-6) / 1e12
+    # Mirrors the cu_seqlens split in _make_inputs: N-1 sequences of T_flat//N,
+    # with the last absorbing the remainder.
+    per = T_flat // N
+    lens = [per] * (N - 1) + [T_flat - per * (N - 1)]
+    n_chunks = sum(-(-length // BT) for length in lens)
+    return 4 * H * n_chunks * BT * K * V / (time_us * 1e-6) / 1e12
 
 
 # --------------------------------------------------------------------------- #
@@ -460,7 +475,9 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
             try:
                 stats = _time_measure(closure, mode, cfg)
                 timing[mode] = stats
-                tflops_d[mode] = calculate_tflops(N, H, T_flat, K, V, stats.median_us)
+                tflops_d[mode] = calculate_tflops(
+                    N, H, T_flat, K, V, stats.median_us, BT
+                )
             except EmptyGraphCaptureError as e:
                 timing[mode] = f"GRAPH-FAIL: {e}"
                 tflops_d[mode] = None
