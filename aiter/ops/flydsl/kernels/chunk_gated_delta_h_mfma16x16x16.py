@@ -29,17 +29,13 @@ from flydsl.expr.typing import T
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 
-def _gtile(buf, elem_off, width):
-    """``width``-element tile of ``buf`` at ELEMENT offset ``elem_off``."""
-    return fx.make_view(
-        fx.add_offset(fx.get_iter(buf), elem_off), fx.make_layout(width, 1)
-    )
-
-
 def _gload(atom, buf, elem_off, width, numeric):
     """buffer_load ``width`` elements of ``buf`` at ELEMENT offset ``elem_off``."""
     frag = fx.make_rmem_tensor(width, numeric)
-    fx.copy(atom, _gtile(buf, elem_off, width), frag)
+    tile = fx.make_view(
+        fx.add_offset(fx.get_iter(buf), elem_off), fx.make_layout(width, 1)
+    )
+    fx.copy(atom, tile, frag)
     vec = fx.Vector(frag.load())
     return vec[0] if width == 1 else vec
 
@@ -48,7 +44,10 @@ def _gstore(atom, buf, elem_off, value, width, numeric):
     """buffer_store ``value`` into ``buf`` at ELEMENT offset ``elem_off``."""
     frag = fx.make_rmem_tensor(width, numeric)
     frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
-    fx.copy(atom, frag, _gtile(buf, elem_off, width))
+    tile = fx.make_view(
+        fx.add_offset(fx.get_iter(buf), elem_off), fx.make_layout(width, 1)
+    )
+    fx.copy(atom, frag, tile)
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -72,22 +71,6 @@ def _make_fast_exp(g_is_log2_scaled: bool):
     return lambda x: fx.Float32(rocdl.exp2(T.f32, (x * _LOG2E).ir_value()))
 
 
-def _f32x4_to_bf16x4_rne(vec_f32x4):
-    """Round-to-nearest-even f32x4 -> bf16x4. LLVM lowers this to the native
-    ``v_cvt_pk_bf16_f32`` on gfx950 and to a software RNE sequence (bias +
-    NaN->qNaN fix-up) on gfx942, both matching torch/HIP
-    ``__float2bfloat16_rn`` (verified bit-exact on gfx942)."""
-    return vec_f32x4.to(fx.BFloat16)
-
-
-def _f32x4_to_bf16x4_trunc(vec_f32x4):
-    """Truncating f32x4 -> bf16x4 (keep high 16 bits, no rounding bias). Bit-
-    identical to HIP ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``); arch-neutral.
-    """
-    hi = vec_f32x4.bitcast(fx.Uint32) >> fx.full(4, 16, fx.Uint32)
-    return hi.to(fx.Uint16).bitcast(fx.BFloat16)
-
-
 # Default fp32->bf16 output-conversion mode. When True, use bit-truncation to
 # match HIP's ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``) so flydsl-hip
 # outputs are bit-identical to the HIP/C++ K5 kernel. When False, use RNE
@@ -98,10 +81,23 @@ _BF16_CONVERT_TRUNC_DEFAULT = True
 
 
 def _make_bf16_converter(trunc: bool):
-    """Return the fp32x4 -> bf16x4 output converter for this compile:
-    bit-truncation to match HIP ``float_to_bf16`` (``trunc=True``, default), or
-    RNE (arch-optimal: native cvt on gfx950, software RNE on gfx942)."""
-    return _f32x4_to_bf16x4_trunc if trunc else _f32x4_to_bf16x4_rne
+    """Return the fp32x4 -> bf16x4 output converter for this compile.
+
+    ``trunc=True`` (the default) keeps the high 16 bits with no rounding bias,
+    which is bit-identical to HIP ``float_to_bf16``
+    (``bit_cast<u32>(x) >> 16``) and arch-neutral. ``trunc=False`` rounds to
+    nearest even instead: LLVM lowers it to the native ``v_cvt_pk_bf16_f32`` on
+    gfx950 and to a software RNE sequence (bias + NaN->qNaN fix-up) on gfx942,
+    both matching torch/HIP ``__float2bfloat16_rn`` (verified bit-exact on
+    gfx942).
+    """
+    if trunc:
+        return lambda v: (
+            (v.bitcast(fx.Uint32) >> fx.full(4, 16, fx.Uint32))
+            .to(fx.Uint16)
+            .bitcast(fx.BFloat16)
+        )
+    return lambda v: v.to(fx.BFloat16)
 
 
 # -- Compile the kernel ---------------------------------------------------
@@ -160,10 +156,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # carrying its element type and the kernel body turns it into a buffer
     # resource with a single ``make_buffer_tensor``. The shape/stride of that
     # memref is never read: every access is a hand-computed element offset off
-    # the base iterator (see ``_gtile``), because the varlen offsets are runtime
-    # scalars that no layout coordinate can express. Element types therefore
-    # come from the host tensors -- the placeholder tensors the host passes for
-    # unused slots must match the dtype the body assumes for that slot.
+    # the base iterator (see ``_gload`` / ``_gstore``), because the varlen
+    # offsets are runtime scalars that no layout coordinate can express. Element
+    # types therefore come from the host tensors -- the placeholder tensors the
+    # host passes for unused slots must match the dtype the body assumes for
+    # that slot.
 
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
     # fp32->bf16 output converter selected by the compile option (arch-aware).
