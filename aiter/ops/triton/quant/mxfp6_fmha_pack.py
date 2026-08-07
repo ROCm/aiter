@@ -37,14 +37,39 @@ except ImportError:  # numpy-only host packing still works without triton/torch
     _HAVE_TRITON = False
 
 
-_K_TILE_TOKENS = 128
-_K_PACKED_ROW_BYTES = 96
+FP6_K_TILE_TOKENS = 128
+FP6_K_PACKED_ROW_BYTES = 96
+FP6_K_BUFFER_SLACK_BYTES = 256
+FP6_K_SCALE_VALUES_PER_TOKEN = 4
+FP6_K_SCALE_BUFFER_SLACK_BYTES = 64
+
+_K_TILE_TOKENS = FP6_K_TILE_TOKENS
+_K_PACKED_ROW_BYTES = FP6_K_PACKED_ROW_BYTES
 _K_COMPACT_DATA_BYTES = _K_TILE_TOKENS * _K_PACKED_ROW_BYTES
 _K_RESERVED_BYTES = 4096
 _K_SCALE_TAIL_BYTES = 1024
 _K_SCALE_TAIL_OFFSET = _K_COMPACT_DATA_BYTES + _K_RESERVED_BYTES
-_K_TILE_BYTES = _K_SCALE_TAIL_OFFSET + _K_SCALE_TAIL_BYTES
+FP6_K_TILE_BYTES = _K_SCALE_TAIL_OFFSET + _K_SCALE_TAIL_BYTES
+_K_TILE_BYTES = FP6_K_TILE_BYTES
 _K_SEQ_STRIDE_BYTES = _K_TILE_BYTES // _K_TILE_TOKENS
+
+
+def fp6_k_raw_buffer_sizes(batch, sequence, heads, tile=FP6_K_TILE_TOKENS):
+    """Return contiguous data/scale buffer sizes for the gfx950 FP6 K ABI.
+
+    Each head stores one 17,408-byte record per 128-token tile. The data buffer's
+    256-byte tail covers the final shifted scale-tail read; the separate scale ABI
+    buffer retains four E8M0 bytes per token plus 64 bytes of view slack.
+    """
+    tiles = (sequence + tile - 1) // tile
+    data_size = (
+        batch * heads * tiles * FP6_K_TILE_BYTES + FP6_K_BUFFER_SLACK_BYTES
+    )
+    scale_size = (
+        batch * sequence * heads * FP6_K_SCALE_VALUES_PER_TOKEN
+        + FP6_K_SCALE_BUFFER_SLACK_BYTES
+    )
+    return data_size, scale_size
 
 
 # ---------------------------------------------------------------------------
@@ -956,7 +981,8 @@ def quantize_fp6_k_lds_order_direct_triton(
     nt = (sk + tile - 1) // tile
     k_hs = nt * _K_TILE_BYTES
     k_bs = h * k_hs
-    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k.device)
+    data_size, scale_size = fp6_k_raw_buffer_sizes(b, sk, h, tile)
+    buf = torch.empty(data_size, dtype=torch.uint8, device=k.device)
     scale = torch.empty((b, sk, h, 4), dtype=torch.uint8, device=k.device)
     cperm = _qk_field_perm_dev(k.device)
     scatter = _k_lds_scatter_index(k.device)
@@ -992,7 +1018,7 @@ def quantize_fp6_k_lds_order_direct_triton(
         (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
     )
     sflat = scale.reshape(-1)
-    sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=k.device)
+    sbuf = torch.empty(scale_size, dtype=torch.uint8, device=k.device)
     sbuf[: sflat.numel()] = sflat
     if return_raw:
         return buf, sbuf

@@ -10,22 +10,25 @@ from torch import Tensor
 
 from aiter import dtypes
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
-    _rot_k_only_kernel,
     sage_quant_v_amax_finalize_kernel,
     sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    fp6_k_raw_buffer_sizes,
     fp6_k_lds_order_views_from_raw,
-    quantize_fp6_k_lds_order_direct_triton,
+    reorder_fp6_k_lds_order_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-    create_hadamard_matrix,
+    fp4_v_raw_buffer_size,
     sage_quant_v_f4f4,
 )
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
+
+
+MHA_V4_LOG2E = 1.4426950408889634
 
 
 @compile_ops("module_fmha_v4_fwd")
@@ -421,44 +424,22 @@ def _quantize_mxfp6_k_raw(input: Tensor) -> tuple[Tensor, Tensor]:
         raise ValueError(
             "MXFP6 E2M3 K quantization requires contiguous hd128 BSHD input"
         )
-    rotation = create_hadamard_matrix(
-        head_dim, device=input.device, dtype=input.dtype
-    ) / (head_dim**0.5)
-    rotated = torch.empty_like(input)
-    query_tile = 256
-    num_blocks = triton.cdiv(sequence, query_tile)
-    _rot_k_only_kernel[(batch * heads, num_blocks, 1)](
-        input,
-        rotated,
-        rotation,
-        input.stride(0),
-        input.stride(2),
-        input.stride(1),
-        input.stride(3),
-        rotated.stride(0),
-        rotated.stride(2),
-        rotated.stride(1),
-        rotated.stride(3),
-        rotation.stride(0),
-        rotation.stride(1),
-        heads,
-        sequence,
-        head_dim,
-        BLOCK_M=query_tile,
-        BLOCK_D=head_dim,
+    packed = input.new_empty(
+        (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
-    centered = rotated - rotated.mean(dim=1, keepdim=True)
-    return quantize_fp6_k_lds_order_direct_triton(centered, tile=128, return_raw=True)
+    scale = input.new_empty(
+        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
+    )
+    rotate_activation_mxfp6_quant(packed, scale, input, 1.0)
+    return reorder_fp6_k_lds_order_triton(packed, scale, tile=128, return_raw=True)
 
 
 @_quantize_mxfp6_k_raw.register_fake
 def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    tiles = (sequence + 127) // 128
-    return input.new_empty(
-        (batch * heads * tiles * 17408 + 256,), dtype=torch.uint8
-    ), input.new_empty(
-        (batch * sequence * heads * (head_dim // 32) + 64,), dtype=torch.uint8
+    batch, sequence, heads, _ = input.shape
+    data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
+    return input.new_empty((data_size,), dtype=torch.uint8), input.new_empty(
+        (scale_size,), dtype=torch.uint8
     )
 
 
@@ -538,7 +519,9 @@ def _quantize_v_mxfp4_raw(input: Tensor) -> tuple[Tensor, Tensor]:
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("MXFP4 V quantization requires contiguous hd128 BSHD input")
     quantized, scale = sage_quant_v_f4f4(input, layout="bshd")
-    raw = torch.as_strided(quantized, (batch * sequence * heads * 64 + 64,), (1,))
+    raw = torch.as_strided(
+        quantized, (fp4_v_raw_buffer_size(batch, sequence, heads),), (1,)
+    )
     return raw, scale
 
 
@@ -546,7 +529,7 @@ def _quantize_v_mxfp4_raw(input: Tensor) -> tuple[Tensor, Tensor]:
 def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
-        (batch * sequence * heads * 64 + 64,), dtype=torch.uint8
+        (fp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     ), input.new_empty((batch, heads, head_dim), dtype=torch.float32)
 
 
@@ -717,7 +700,7 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = _quantize_mxfp4(q, softmax_scale * 1.4426950408889634)
+        q_quantized, q_descale = _quantize_mxfp4(q, softmax_scale * MHA_V4_LOG2E)
         k_quantized, k_descale = _quantize_mxfp4(k, 1.0)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = _quantize_v_fp8(v)
@@ -741,9 +724,7 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = _quantize_mxfp6_q(
-            q, softmax_scale * 1.4426950408889634
-        )
+        q_quantized, q_descale = _quantize_mxfp6_q(q, softmax_scale * MHA_V4_LOG2E)
         k_quantized, k_descale = _quantize_mxfp6_k_raw(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = _quantize_v_fp8(v)

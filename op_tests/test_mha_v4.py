@@ -11,6 +11,11 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_packed,
 )
+from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    fp4_v_padded_sequence,
+    fp4_v_raw_buffer_size,
+)
 
 
 def test_attention_format_ids_are_stable():
@@ -32,6 +37,17 @@ def test_attention_format_ids_are_stable():
     assert int(AttentionFormat.UINT8) == 11
     assert int(AttentionFormat.INT4) == 12
     assert int(AttentionFormat.UINT4) == 13
+
+
+def test_mha_v4_raw_buffer_sizes_are_stable():
+    assert fp6_k_raw_buffer_sizes(1, 128, 1) == (17408 + 256, 128 * 4 + 64)
+    assert fp6_k_raw_buffer_sizes(2, 129, 3) == (
+        2 * 3 * 2 * 17408 + 256,
+        2 * 129 * 3 * 4 + 64,
+    )
+    assert fp4_v_padded_sequence(128) == 128
+    assert fp4_v_padded_sequence(129) == 256
+    assert fp4_v_raw_buffer_size(2, 129, 3) == 2 * 256 * 3 * 64 + 64
 
 
 def test_mha_v4_rejects_unsupported_contracts():

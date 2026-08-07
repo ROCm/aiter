@@ -22,6 +22,7 @@ from aiter.ops.mha import (
 )
 from aiter.ops.mha_v4 import (
     AttentionFormat,
+    MHA_V4_LOG2E,
     mha_v4,
     mha_v4_packed,
     native_fp8_format,
@@ -31,7 +32,6 @@ from aiter.ops.mha_v4 import (
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
-    _rot_k_only_kernel,
     sage_quant_v_amax_finalize_kernel,
     sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
@@ -49,7 +49,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-    quantize_fp6_k_lds_order_direct_triton,
+    reorder_fp6_k_lds_order_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
@@ -131,36 +131,6 @@ def _production_quantize_v(value: torch.Tensor):
     return quantized, scale
 
 
-def _production_rotate_center_k(
-    key: torch.Tensor, rotation: torch.Tensor, block_m: int
-):
-    b, seq_len, heads, head_dim = key.shape
-    block_r = rotation.shape[-1]
-    rotated = torch.empty_like(key)
-    num_blocks = triton.cdiv(seq_len, block_m)
-    _rot_k_only_kernel[(b * heads, num_blocks, head_dim // block_r)](
-        key,
-        rotated,
-        rotation,
-        key.stride(0),
-        key.stride(2),
-        key.stride(1),
-        key.stride(3),
-        rotated.stride(0),
-        rotated.stride(2),
-        rotated.stride(1),
-        rotated.stride(3),
-        rotation.stride(0),
-        rotation.stride(1),
-        heads,
-        seq_len,
-        head_dim,
-        BLOCK_M=block_m,
-        BLOCK_D=block_r,
-    )
-    return rotated - rotated.mean(dim=1, keepdim=True)
-
-
 def _production_quantize_mxfp4_qk(query, key, softmax_scale):
     b, seq_len, heads, head_dim = query.shape
     q_fp4 = query.new_empty((b, seq_len, heads, head_dim // 2), dtype=torch.uint8)
@@ -172,7 +142,7 @@ def _production_quantize_mxfp4_qk(query, key, softmax_scale):
         (b, key.shape[1], key.shape[2], head_dim // 32), dtype=torch.uint8
     )
     rotate_activation_mxfp4_quant(
-        q_fp4, q_scale, query, softmax_scale * 1.4426950408889634
+        q_fp4, q_scale, query, softmax_scale * MHA_V4_LOG2E
     )
     rotate_activation_mxfp4_quant(k_fp4, k_scale, key, 1.0)
     return q_fp4, q_scale, k_fp4, k_scale
@@ -194,15 +164,23 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
-def _production_quantize_mxfp6(query, key, value, softmax_scale, rotation, block_m):
+def _production_quantize_mxfp6(query, key, value, softmax_scale):
     b, seq_len, heads, head_dim = query.shape
     q_fp6 = query.new_empty((b, seq_len, heads, head_dim // 32 * 24), dtype=torch.uint8)
     q_scale = query.new_empty((b, seq_len, heads, head_dim // 32), dtype=torch.uint8)
     rotate_activation_mxfp6_quant(
-        q_fp6, q_scale, query, softmax_scale * 1.4426950408889634
+        q_fp6, q_scale, query, softmax_scale * MHA_V4_LOG2E
     )
-    centered_k = _production_rotate_center_k(key, rotation, block_m)
-    k_fp6, k_scale = quantize_fp6_k_lds_order_direct_triton(centered_k, tile=128)
+    k_fp6_dense = key.new_empty(
+        (b, key.shape[1], key.shape[2], head_dim // 32 * 24), dtype=torch.uint8
+    )
+    k_scale_dense = key.new_empty(
+        (b, key.shape[1], key.shape[2], head_dim // 32), dtype=torch.uint8
+    )
+    rotate_activation_mxfp6_quant(k_fp6_dense, k_scale_dense, key, 1.0)
+    k_fp6, k_scale = reorder_fp6_k_lds_order_triton(
+        k_fp6_dense, k_scale_dense, tile=128
+    )
     v_fp8, v_scale = _production_quantize_v(value)
     return q_fp6, q_scale, k_fp6, k_scale, v_fp8, v_scale
 
@@ -549,7 +527,7 @@ def generate_test_tensors(
         rotation = create_hadamard_matrix(
             d_head, device=device, dtype=torch.float32
         ) / (d_head**0.5)
-        q_scale_log2 = (d_head**-0.5) * 1.4426950408889634
+        q_scale_log2 = (d_head**-0.5) * MHA_V4_LOG2E
         q_base = torch.matmul(q_rotated, rotation) / q_scale_log2
         k_base = torch.matmul(k_rotated, rotation)
         q = q_base.view(1, 1, sq, d_head).expand(batch, hq, -1, -1).clone()
@@ -1525,7 +1503,7 @@ def make_kernel_runner(
                     )
                 return (
                     *_production_quantize_mxfp6(
-                        q_bshd, k_bshd, v_bshd, softmax_scale, r, cfg["BLOCK_M"]
+                        q_bshd, k_bshd, v_bshd, softmax_scale
                     ),
                     None,
                 )
