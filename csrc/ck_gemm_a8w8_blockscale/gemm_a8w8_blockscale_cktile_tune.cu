@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -59,7 +59,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& Y,
                                                int kernelId,
                                                int splitK,
-                                               bool preshuffleB)
+                                               bool preshuffleB,
+                                               bool y_is_zeroed)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -70,15 +71,18 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
     int K      = XQ.size(1);
     int KBatch = std::pow(2, splitK);
 
+    // When y_is_zeroed=true the caller has guaranteed Y is already zeroed,
+    // so the kernel skips its internal Y.zero_() (used to model the
+    // producer-fused zero-init configuration in tuning).
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_BF16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, y_is_zeroed);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_FP16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, y_is_zeroed);
     }
     else
     {
@@ -94,8 +98,9 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile_tune(torch::Tensor& XQ,
                                                            torch::Tensor& Y,
                                                            int kernelId,
                                                            int splitK,
-                                                           bool preshuffleB)
+                                                           bool preshuffleB,
+                                                           bool y_is_zeroed)
 {
     return gemm_a8w8_blockscale_cktile_tune(
-        XQ, WQ, x_scale, w_scale, Y, kernelId, splitK, preshuffleB);
+        XQ, WQ, x_scale, w_scale, Y, kernelId, splitK, preshuffleB, y_is_zeroed);
 }

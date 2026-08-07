@@ -10,7 +10,8 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::string kernelName = "");
+    std::string kernelName = "",
+    bool y_is_zeroed       = false);
 
 torch::Tensor gemm_a8w8_blockscale_bpreshuffle_tune(
     torch::Tensor &XQ,
@@ -19,4 +20,5 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_tune(
     torch::Tensor &w_scale,
     torch::Tensor &Y,
     int kernelId,
-    int splitK);
+    int splitK,
+    bool y_is_zeroed = false);
