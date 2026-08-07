@@ -35,6 +35,7 @@ Environment
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.util
 import os
 import sys
@@ -164,10 +165,55 @@ def _make_inputs(shape: tuple, device="cuda"):
 # --------------------------------------------------------------------------- #
 _TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 
+# FlyDSL kernel variants get one row each, keyed ``flydsl:<tag>``. The K5 kernel's
+# only compile-time tuning axis is BV (the V-tile width) -- BT=64 is fixed by the
+# K1-K3 pipeline -- so the tags are ``bv16``/``bv32``/``bv64`` plus the special
+# ``auto``, which defers to the kernel's shape-adaptive heuristic per shape.
+FLYDSL_PREFIX = "flydsl:"
+AUTO_VARIANT = "auto"
 
-def _load_impls(which: str) -> dict:
-    """Return {impl_name: callable} for the requested set."""
+
+def _available_variants():
+    """``(tuple_of_tags, default_tag)``, or ``(None, None)`` if FlyDSL is absent."""
+    if _TRITON_ONLY:
+        return None, None
+    try:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            K5_DEFAULT_VARIANT,
+            K5_VARIANTS,
+        )
+    except ImportError:
+        return None, None
+    return tuple(K5_VARIANTS), K5_DEFAULT_VARIANT
+
+
+def _auto_variant_for_shape(shape, cu) -> str | None:
+    """The tag the heuristic picks for this shape, for display purposes.
+
+    Lets the table show ``flydsl:auto(bv64)`` instead of a bare ``auto``, so a
+    sweep records what actually ran. Returns None if it cannot be determined.
+    """
+    _tag, H, Hg, T_flat, N, _K, V, _BT, _gate = shape
+    try:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
+
+        return _auto_variant(
+            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=cu is not None
+        )
+    except Exception:
+        return None
+
+
+def _load_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
+    """Return {impl_name: callable} for the requested set.
+
+    ``flydsl_variants`` is a list of variant tags (or the specials ``all`` /
+    ``auto``); each becomes its own ``flydsl:<tag>`` entry. Defaults to ``auto``,
+    which reproduces the historical single-row behaviour exactly.
+    """
     requested = {s.strip() for s in which.split(",")} if which != "all" else None
+    if flydsl_variants is None:
+        flydsl_variants = [AUTO_VARIANT]
 
     def _want(name: str) -> bool:
         return requested is None or name in requested
@@ -188,7 +234,25 @@ def _load_impls(which: str) -> dict:
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_flydsl,
             )
-            impls["flydsl"] = chunk_gated_delta_rule_fwd_h_flydsl
+            available, _default = _available_variants()
+            tags = list(flydsl_variants)
+            if tags == ["all"]:
+                tags = list(available or ())
+            for tag in tags:
+                if tag == AUTO_VARIANT:
+                    # variant=None -> the kernel's own shape-adaptive selection.
+                    impls[FLYDSL_PREFIX + AUTO_VARIANT] = (
+                        chunk_gated_delta_rule_fwd_h_flydsl
+                    )
+                    continue
+                if available is not None and tag not in available:
+                    raise SystemExit(
+                        f"[error] unknown FlyDSL variant {tag!r}; available: "
+                        f"{list(available)} (or {AUTO_VARIANT!r})."
+                    )
+                impls[FLYDSL_PREFIX + tag] = functools.partial(
+                    chunk_gated_delta_rule_fwd_h_flydsl, variant=tag
+                )
         except ImportError as e:
             warnings.warn(f"FlyDSL K5 not available: {e}")
 
@@ -453,7 +517,19 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
     baseline_times: dict[str, float] = {}
     results_by_impl: dict = {}
 
+    # Label the auto row with the tag the heuristic actually picked for THIS
+    # shape (e.g. "flydsl:auto(bv64)"), so a sweep records what ran. Keys may
+    # differ per shape; both output tables iterate row["impls"] per row, so that
+    # is fine.
+    auto_label = None
+    if FLYDSL_PREFIX + AUTO_VARIANT in impls:
+        resolved = _auto_variant_for_shape(shape, cu)
+        if resolved:
+            auto_label = f"{FLYDSL_PREFIX}{AUTO_VARIANT}({resolved})"
+
     for impl_name, fn in impls.items():
+        if impl_name == FLYDSL_PREFIX + AUTO_VARIANT and auto_label:
+            impl_name = auto_label
         print(f"  {impl_name}...", end=" ", flush=True)
         closure = _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu)
 
@@ -532,7 +608,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
 # Main
 # --------------------------------------------------------------------------- #
 def run(args):
-    impls = _load_impls(args.impl)
+    impls = _load_impls(args.impl, getattr(args, "flydsl_variants", None))
     if not impls:
         print("No implementations available.", file=sys.stderr)
         sys.exit(1)
@@ -613,6 +689,19 @@ def main():
         help="Implementation used as speedup baseline (default: triton).",
     )
     parser.add_argument(
+        "--flydsl-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
+        help=(
+            "Comma-separated FlyDSL kernel-variant tags to benchmark, each as its "
+            "own row (see --list-variants). 'all' runs every registered variant; "
+            "'auto' (default) defers to the kernel's shape-adaptive selection, "
+            "picking one variant per shape."
+        ),
+    )
+    parser.add_argument(
+        "--list-variants", action="store_true",
+        help="List the registered FlyDSL kernel variants and exit.",
+    )
+    parser.add_argument(
         "--gate", default="all", choices=("g", "gk", "all"),
         help="Filter shapes by gate type: g (GDN), gk (KDA), all (default).",
     )
@@ -622,6 +711,27 @@ def main():
     add_verification_args(parser)
 
     args = parser.parse_args()
+
+    if args.list_variants:
+        avail, default = _available_variants()
+        if avail is None:
+            print("FlyDSL is unavailable; no variants to list.")
+        else:
+            print("FlyDSL GDN K5 kernel variants (BV = V-tile width):")
+            for v in avail:
+                print(f"    {v}")
+            print(
+                f"  {'*' if default == AUTO_VARIANT else ' '} {AUTO_VARIANT}"
+                "  (shape-adaptive: picks a variant per shape via _heuristic_bv)"
+            )
+        return
+
+    # Resolve the requested FlyDSL variants (comma list). Validation against what
+    # is actually registered happens in _load_impls, so a --impl triton run still
+    # works when FlyDSL is unavailable.
+    args.flydsl_variants = [
+        v.strip() for v in args.flydsl_variants.split(",") if v.strip()
+    ] or [AUTO_VARIANT]
 
     if args.list:
         print(f"{'#':>3}  {'label':<60}  gate")

@@ -19,6 +19,7 @@ For an end-to-end GDN forward that uses this K5 wrapper, call
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import triton
@@ -86,13 +87,70 @@ def _device_cu_count() -> int:
     return _cu_count_cache
 
 
-# gfx942: minimum grid fill (CTAs / CU_count) at BV=64 for BV=64 to beat the
-# small-BV heuristic. Measured on MI325X (17-shape sweep): BV=64 wins for every
-# shape with fill >= 0.32 and loses for every shape with fill <= 0.21; 0.30 sits
-# safely in that gap. Below it, the BV=64 grid leaves too many CUs idle and the
-# fatter tile cannot compensate; at/above it, BV=64 right-sizes an otherwise
-# wildly over-subscribed BV=16 grid (up to -34%, matching the HIP kernel's grid).
-_GFX942_BV64_MIN_FILL = 0.30
+# gfx942: minimum grid fill (CTAs / CU_count) a tile size must achieve to be
+# chosen. _heuristic_bv takes the LARGEST legal BV clearing this bar.
+#
+# Re-measured on MI325X after the group-major+XOR LDS relayout (070a1c8f1) and
+# the bf16 rounding fix (fad8f74a3), which cut per-CTA cost and moved the
+# trade-off. Full 17-shape x {16,32,64} sweep: BV=64 wins at fill64 >= 0.63 but
+# LOSES at 0.32 (shapes 3/4, where BV=32 is 10-13% faster), so the previous
+# BV=64-specific threshold of 0.30 was too permissive. Anything in [0.45, 0.60]
+# gives the same picks on every preset shape; 0.50 is the midpoint.
+#
+# This supersedes a two-branch rule (special-case BV=64, else a target-CTA
+# heuristic). That version mispicked because its fallback jumped straight to
+# BV=16, skipping BV=32 entirely -- merely raising the old threshold made shapes
+# 3/4 *worse* (76% off best rather than 15%).
+_GFX942_MIN_FILL = 0.50
+
+
+# -- Kernel variants -----------------------------------------------------
+# BV (the V-tile width) is the only compile-time tuning axis for K5: BT=64 is
+# fixed by the K1-K3 pipeline that produces w/u, and everything else is derived.
+# So a variant tag is just the tile size. ``auto`` is not a registered tag --
+# it is the sentinel meaning "defer to _heuristic_bv for this shape".
+K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES)
+K5_DEFAULT_VARIANT = "auto"
+_K5_VARIANT_ENV = "FLYDSL_GDN_K5_VARIANT"
+
+
+def _bv_of_variant(tag: str) -> int:
+    """``"bv64"`` -> ``64``. Raises ValueError on an unknown tag."""
+    if tag not in K5_VARIANTS:
+        raise ValueError(
+            f"unknown GDN K5 variant {tag!r}; available: {list(K5_VARIANTS)} "
+            f"(or {K5_DEFAULT_VARIANT!r} for shape-adaptive selection)"
+        )
+    return int(tag[2:])
+
+
+def _auto_variant(**kw) -> str:
+    """The shape-adaptive choice, as a variant tag.
+
+    Thin wrapper over ``_heuristic_bv`` so the heuristic stays the single source
+    of truth -- callers that want to *display* what auto picked (the benchmark)
+    and callers that want to *use* it go through the same code path.
+    """
+    return f"bv{_heuristic_bv(**kw)}"
+
+
+def _resolve_variant(variant: str | None, **kw) -> str:
+    """Effective variant tag: explicit arg > env var > shape-adaptive.
+
+    Mirrors the resolution chain used by the fp8_mqa_logits kernel.
+    """
+    tag = variant or os.environ.get(_K5_VARIANT_ENV) or _auto_variant(**kw)
+    if tag == K5_DEFAULT_VARIANT:  # env var may legitimately say "auto"
+        tag = _auto_variant(**kw)
+    bv = _bv_of_variant(tag)
+    legal = _legal_bv_candidates(kw["V"])
+    if bv not in legal:
+        raise ValueError(
+            f"GDN K5 variant {tag!r} is not legal for V={kw['V']} "
+            f"(needs BV <= V and V % BV == 0); legal here: "
+            f"{[f'bv{b}' for b in legal]}"
+        )
+    return tag
 
 
 def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
@@ -138,7 +196,13 @@ def _lookup_tuned_bv(
     is_varlen,
     wu_contig,
 ):
-    """Select ``BV`` with the rule-based grid/CU heuristic."""
+    """Select ``BV`` with the rule-based grid/CU heuristic.
+
+    Kept as the stable signature hook for a future tuned lookup table (and
+    referenced from ``aiter/aot/flydsl/chunk_gdn_h.py``). The live selection path
+    is now ``_resolve_variant`` -> ``_auto_variant`` -> ``_heuristic_bv``, which
+    additionally honours an explicit ``variant=`` and the env override.
+    """
     del (
         dtype_str,
         K,
@@ -223,10 +287,21 @@ def _heuristic_bv(
     # grid still fills the CUs (measured cutoff: fill >= ~0.30). Below that the
     # grid starves; the small-BV heuristic (more CTAs) wins. Prefer BV=64 when it
     # is legal for this V and clears the fill bar; otherwise fall through.
-    if _ARCH == "gfx942" and 64 in _legal_bv_candidates(V):
-        fill64 = _grid_ctas(H=H, V=V, N=N, BV=64) / max(_device_cu_count(), 1)
-        if fill64 >= _GFX942_BV64_MIN_FILL:
-            return 64
+    if _ARCH == "gfx942":
+        # Largest tile whose own grid still keeps at least _GFX942_MIN_FILL of the
+        # CUs busy. Bigger BV = fatter tiles and less redundant k/w traffic, but
+        # fewer CTAs; this trades the two off with one physical quantity instead
+        # of special-casing BV=64.
+        cus = max(_device_cu_count(), 1)
+        legal = sorted(_legal_bv_candidates(V), reverse=True)
+        for cand in legal:
+            if _grid_ctas(H=H, V=V, N=N, BV=cand) / cus >= _GFX942_MIN_FILL:
+                return cand
+        # Nothing clears the bar: the shape cannot fill the device at any tile
+        # size (e.g. N=1, few heads). Take the smallest legal tile, which yields
+        # the most CTAs and so salvages what parallelism there is.
+        if legal:
+            return min(legal)
 
     target_bv = _target_bv_for_shape(
         H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
@@ -370,6 +445,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    variant: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -559,23 +635,19 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_h0 = initial_state is not None
     is_varlen = cu_seqlens is not None
 
-    # Resolve BV from the rule-based grid/CU heuristic.
-    BV = _lookup_tuned_bv(
-        dtype_str=str(k.dtype),
-        K=K,
-        V=V,
-        BT=BT,
-        H=H,
-        Hg=Hg,
-        T_flat=T_flat,
-        N=N,
-        use_g=use_g,
-        use_gk=use_gk,
-        use_h0=use_h0,
-        store_fs=bool(output_final_state),
-        save_vn=bool(save_new_value),
-        is_varlen=is_varlen,
-        wu_contig=wu_contiguous,
+    # Resolve BV. Priority: explicit ``variant=`` > FLYDSL_GDN_K5_VARIANT env >
+    # the rule-based grid/CU heuristic. Passing variant=None (the default) keeps
+    # the historical behaviour exactly.
+    BV = _bv_of_variant(
+        _resolve_variant(
+            variant,
+            H=H,
+            Hg=Hg,
+            V=V,
+            T_flat=T_flat,
+            N=N,
+            is_varlen=is_varlen,
+        )
     )
 
     launch_fn = _get_or_compile(
