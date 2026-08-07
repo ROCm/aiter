@@ -66,7 +66,7 @@ jobs:
     needs: [check-signal]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:latest
+      docker-image: rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
       artifact-name: triton_wheelhouse
       retention-days: 3
 
@@ -82,7 +82,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -213,7 +213,7 @@ jobs:
   triton-mi300x:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
-    runs-on: aiter-1gpu-runner
+    runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 60
     needs: [split_triton_tests, prepare_triton_wheel, check-signal]
     strategy:
@@ -221,7 +221,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:

@@ -3,23 +3,29 @@
 
 import functools
 import itertools
-import os
 import json
+import os
 import warnings
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4_decode_persistent as _moe_gemm_a8w4_decode_persistent_gluon,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
+)
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
-    _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
-    _moe_gemm_a8w4_decode_persistent as _moe_gemm_a8w4_decode_persistent_gluon,
-    _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
-)
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
@@ -266,8 +272,11 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         elif n <= 3072:
             block_n = 128
             num_buffers = 2
-        else:
+        elif n <= 4096:
             block_n = 256
+            num_buffers = 1
+        else:
+            block_n = 512
             num_buffers = 1
 
     elif block_m == 32:
@@ -394,7 +403,7 @@ def moe_gemm_a8w4(
     X_SCALE_TDM = False
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
-        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        ASYNC_COPY_MIN_SCALE_WIDTH = 8
         X_SCALE_TDM = (
             mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
         )
@@ -423,7 +432,7 @@ def moe_gemm_a8w4(
         )
         out_dtype = torch.float8_e4m3fn
     else:
-        out_dtype = out_dtype
+        out_dtype = out_dtype  # noqa: PLW0127
     y, y_final = allocate_output(
         M,
         padded_N,
@@ -510,6 +519,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             N_ITERS=config["persistent_iters"],
@@ -563,6 +573,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
