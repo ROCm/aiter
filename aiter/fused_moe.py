@@ -837,8 +837,8 @@ def _fused_moe_impl(
         and expert_mask is not None
     )
     assert (
-        not metadata.flat or get_gfx() == "gfx950"
-    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
+        not metadata.flat or get_gfx() in ("gfx942", "gfx950")
+    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
