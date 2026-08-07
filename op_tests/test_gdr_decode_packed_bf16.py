@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from aiter.ops.hip.gated_delta_net import gdn_decode_packed_bf16_hip
+from aiter import gdr_decode_packed_bf16
 
 NUM_QK_HEADS = 8
 NUM_V_HEADS = 32
@@ -32,7 +32,7 @@ def _is_gfx950() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_gfx950(), reason="packed BF16 GDN decode requires gfx950"
+    not _is_gfx950(), reason="packed BF16 GDR decode requires gfx950"
 )
 
 
@@ -159,7 +159,7 @@ def _reference(
 def _run(
     inputs: dict[str, torch.Tensor], indices: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return gdn_decode_packed_bf16_hip(
+    return gdr_decode_packed_bf16(
         mixed_qkv=inputs["mixed_qkv"],
         a=inputs["a"],
         b=inputs["b"],
@@ -304,4 +304,4 @@ def test_validation_errors(
     }
     kwargs.update(mutation(inputs))
     with pytest.raises(ValueError):
-        gdn_decode_packed_bf16_hip(**kwargs)
+        gdr_decode_packed_bf16(**kwargs)

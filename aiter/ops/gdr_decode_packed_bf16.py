@@ -6,7 +6,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from aiter.jit.core import compile_ops
+from ..jit.core import compile_ops
 
 NUM_QK_HEADS = 8
 NUM_V_HEADS = 32
@@ -14,9 +14,11 @@ HEAD_K_DIM = 128
 HEAD_V_DIM = 128
 QKV_DIM = 6144
 
+__all__ = ["gdr_decode_packed_bf16"]
 
-@compile_ops("module_gdn_decode_packed_bf16", fc_name="gdn_decode_packed_bf16")
-def _gdn_decode_packed_bf16(
+
+@compile_ops("module_gdr_decode_packed_bf16", fc_name="gdr_decode_packed_bf16")
+def _gdr_decode_packed_bf16(
     mixed_qkv: Tensor,
     a: Tensor,
     b: Tensor,
@@ -29,7 +31,7 @@ def _gdn_decode_packed_bf16(
 ) -> None: ...
 
 
-def gdn_decode_packed_bf16_hip(
+def gdr_decode_packed_bf16(
     mixed_qkv: Tensor,
     a: Tensor,
     b: Tensor,
@@ -49,12 +51,12 @@ def gdn_decode_packed_bf16_hip(
     therefore have undefined behavior.
     """
     if not torch.cuda.is_available():
-        raise RuntimeError("packed BF16 GDN decode requires an available ROCm GPU")
+        raise RuntimeError("packed BF16 GDR decode requires an available ROCm GPU")
 
     device = torch.cuda.current_device()
     arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
     if "gfx950" not in arch:
-        raise RuntimeError(f"packed BF16 GDN decode requires gfx950, got {arch!r}")
+        raise RuntimeError(f"packed BF16 GDR decode requires gfx950, got {arch!r}")
 
     expected_scale = HEAD_K_DIM**-0.5
     if scale is None:
@@ -108,7 +110,7 @@ def gdn_decode_packed_bf16_hip(
     if A_log.dtype != torch.float32 or indices.dtype != torch.int32:
         raise ValueError("A_log must be FP32 and indices must be INT32")
 
-    _gdn_decode_packed_bf16(
+    _gdr_decode_packed_bf16(
         mixed_qkv,
         a,
         b,

@@ -3,9 +3,12 @@
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+
+#include "gdr_decode_packed_bf16.h"
+
+#include <hip/hip_bf16.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
-#include <torch/extension.h>
 
 #include <cmath>
 #include <cstdint>
@@ -91,7 +94,7 @@ __device__ __forceinline__ void store_bf16x8_nt(__hip_bfloat16* ptr, const Bf16x
     __builtin_nontemporal_store(raw, reinterpret_cast<Floatx4*>(ptr));
 }
 
-__global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdn_decode_packed_bf16_kernel(
+__global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdr_decode_packed_bf16_kernel(
     const __hip_bfloat16* __restrict__ mixed_qkv,
     const __hip_bfloat16* __restrict__ a,
     const __hip_bfloat16* __restrict__ b,
@@ -262,7 +265,11 @@ __global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdn_decode_packed_bf16_k
     }
 }
 
-void gdn_decode_packed_bf16(const torch::Tensor& mixed_qkv,
+} // namespace
+
+namespace aiter {
+
+void gdr_decode_packed_bf16(const torch::Tensor& mixed_qkv,
                             const torch::Tensor& a,
                             const torch::Tensor& b,
                             const torch::Tensor& dt_bias,
@@ -300,7 +307,7 @@ void gdn_decode_packed_bf16(const torch::Tensor& mixed_qkv,
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const dim3 block(kWarps * kWaveSize);
     const dim3 grid(batch * kVHeads * kVBlocks);
-    hipLaunchKernelGGL(gdn_decode_packed_bf16_kernel,
+    hipLaunchKernelGGL(gdr_decode_packed_bf16_kernel,
                        grid,
                        block,
                        0,
@@ -323,14 +330,8 @@ void gdn_decode_packed_bf16(const torch::Tensor& mixed_qkv,
                        static_cast<float>(scale));
     const hipError_t launch_error = hipGetLastError();
     TORCH_CHECK(launch_error == hipSuccess,
-                "gdn_decode_packed_bf16 kernel launch failed: ",
+                "gdr_decode_packed_bf16 kernel launch failed: ",
                 hipGetErrorString(launch_error));
 }
 
-} // namespace
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
-{
-    module.def(
-        "gdn_decode_packed_bf16", &gdn_decode_packed_bf16, "gfx950 packed BF16 GDN decode (HIP)");
-}
+} // namespace aiter
