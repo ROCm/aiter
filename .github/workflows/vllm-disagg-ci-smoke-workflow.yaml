@@ -28,7 +28,7 @@ on:
         description: "Official vLLM ROCm image used to build and run current AITER"
         required: false
         type: string
-        default: "rocm/vllm-dev:nightly"
+        default: "vllm/vllm-openai-rocm:nightly"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -42,7 +42,7 @@ env:
   VLLM_BRANCH: main
   # TODO: Remove the temporary fetch/cherry-pick after vLLM PR #47030 merges.
   VLLM_DI_PR_NUMBER: "47030"
-  BASE_IMAGE: ${{ inputs.image || 'rocm/vllm-dev:nightly' }}
+  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:nightly' }}
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
   SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
