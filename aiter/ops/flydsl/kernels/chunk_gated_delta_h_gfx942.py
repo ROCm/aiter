@@ -17,6 +17,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import as_ir_value, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import vector as _vector
 
 from .tensor_shim import GTensor, _to_raw
@@ -37,6 +38,51 @@ def _make_fast_exp(g_is_log2_scaled: bool):
             return rocdl.exp2(T.f32, x * _LOG2E)
 
     return _fast_exp
+
+def _to_bf16_fast(val, n=1):
+    """f32 -> bf16 as ``(bitcast<u32>(x) + 0x8000) >> 16`` (round-half-away).
+
+    ``n`` is the element count: 1 for a scalar ``Float32``, N for an f32xN
+    ``Vector``. Returns a raw ``ir.Value`` (accepted by ``fx.ptr_store`` and by
+    the ``GTensor`` store paths).
+
+    Why not ``.truncf()`` / ``.to(BFloat16)``: those emit ``arith.truncf`` with
+    no rounding-mode attribute, which MLIR defines as IEEE round-to-nearest-EVEN.
+    gfx942 has no ``v_cvt_pk_bf16_f32`` (gfx950-only), so the backend expands RNE
+    into ~6 VALU per element -- extract lsb, add the 0x7FFF bias, ``v_cmp_u_f32``
+    NaN test, ``v_cndmask``, then pack with ``v_perm_b32``. At 64 conversions per
+    chunk that was ~90 of the ~193 non-MFMA VALU instructions in the chunk loop,
+    the single largest term. Asking for ``rounding_mode=toward_zero`` instead is
+    NOT an option: it hard-aborts inside MLIR (uncatchable) on this path.
+
+    Pure truncation (what the HIP reference does --
+    ``bit_cast<uint32_t>(x) >> 16``, csrc/kernels/chunk_gated_delta_rule_fwd_h.cu:63)
+    is cheaper still at ~2 VALU, but it was measured to be marginally too lossy
+    here: its one-sided bias, accumulated over the serial chunk scan, put 13 of
+    25.4M h elements past the 5e-2 tolerance (max_abs 0.104). Adding the 0x8000
+    bias first costs one more add and restores <=0.5 ulp symmetric error, which
+    matches RNE except on exact ties.
+
+    Ties round away from zero rather than to even. Values are sign-magnitude, so
+    the same bias works for both signs; the carry can only perturb the exponent
+    within ~1 ulp of FLT_MAX, far outside the range this kernel produces.
+    """
+    is_vec = n > 1
+    i32_ty = T.vec(n, T.i32) if is_vec else T.i32
+    i16_ty = T.vec(n, T.i16) if is_vec else T.i16
+    bf16_ty = T.vec(n, T.bf16) if is_vec else T.bf16
+
+    def _splat(c):
+        return as_ir_value(fx.full(n, c, fx.Int32) if is_vec else fx.Int32(c))
+
+    bits = _arith.bitcast(i32_ty, as_ir_value(val))
+    # The shift may be signed or unsigned: the following trunci keeps only the
+    # low 16 bits, which are bits 16..31 of the input either way.
+    hi = _arith.shrui(_arith.addi(bits, _splat(0x8000)), _splat(16))
+    narrowed = _arith.trunci(i16_ty, hi)
+    cast = _vector.bitcast if is_vec else _arith.bitcast
+    return cast(bf16_ty, narrowed)
+
 
 def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
     """Single ``mfma_f32_16x16x16bf16_1k`` (gfx942 bf16 K=16 MFMA).
@@ -400,7 +446,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     lds_h_v = fx.Int32(nr * 16) + lane_n
                     lds_h_g = fx.Int32(kb * 16) + wid * fx.Int32(4) + lane_m_base
                     fx.ptr_store(
-                        acc_val.truncf(v4bf16_type),
+                        _to_bf16_fast(acc_val, 4),
                         lds_h_ptr + _lds_h_idx(lds_h_v, lds_h_g),
                     )
 
@@ -620,7 +666,7 @@ def compile_chunk_gated_delta_h_gfx942(
                         )
                         if (vn_bt_row < T_local).ir_value():
                             f32_v = vn_val[elem_i]
-                            bf16_v = f32_v.to(fx.BFloat16)
+                            bf16_v = _to_bf16_fast(f32_v)
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
                             _emit_vn_store(vn_off, bf16_v)
 
@@ -661,7 +707,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 vnt_v = fx.Int32(nr * 16) + lane_n
                 vnt_g = wid * fx.Int32(4) + lane_m_base
                 fx.ptr_store(
-                    vn_frags[nr].truncf(v4bf16_type),
+                    _to_bf16_fast(vn_frags[nr], 4),
                     lds_vnt_ptr + _lds_vnt_idx(vnt_v, vnt_g),
                 )
 
@@ -762,7 +808,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     )
                     ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
                     if const_expr(STATE_DTYPE_BF16):
-                        out_vec = acc_val.truncf(T.vec(4, T.bf16))
+                        out_vec = _to_bf16_fast(acc_val, 4)
                     else:
                         out_vec = acc_val
                     ht_.vec_store((fx.Int64(ht_off_base),), out_vec, 4)
