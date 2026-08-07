@@ -1,67 +1,89 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
+"""Benchmark the fp8 x mxfp4 MoE MLP (two moe_gemm_a8w4 calls).
+
+Each batch size is measured three times with `triton.testing.do_bench_cudagraph`
+and reported as three rows, keyed by the `layer` column:
+
+  moe1   the gathered up projection alone   (N = dim2 / TP, K = dim1, + swiglu)
+  moe2   the scattered down projection alone (N = dim1, K = dim2 / TP / 2)
+  total  both back to back, i.e. the whole MLP
+
+`total` is not `moe1 + moe2`: an isolated projection replays the same kernel
+over and over, so its weights stay cache-resident in a way the real layer does
+not. Compare like with like.
+
+--layers picks which of those are measured, e.g. `--layers moe1 moe2` to skip
+the back-to-back run, or `--layers moe1` for one projection on its own. The
+setup is unchanged either way (moe2 needs moe1's output, so layer 1 always runs
+once outside the timed region), so a row means the same thing whichever subset
+it came from.
+
+--act-dtype picks how the activations reach the kernel; the weights are mxfp4
+either way, which is the w4 half of a8w4:
+
+  fp8   e4m3 with one static scale per tensor, which the kernel multiplies back
+        into the accumulator. Layer 1 quantizes its own output in the epilogue
+        (Quant_static_scale), so the hand-off to layer 2 costs no separate
+        quant kernel -- and so `moe1` here includes that quantization.
+  mx8   mxfp8, i.e. e4m3 plus one ue8m0 scale per 32 values along K. Layer 1
+        writes bf16 and layer 2's input is quantized separately.
+
+Both static scales are calibrated from the data they quantize (max / 448),
+outside the timed region; the layer-2 one needs layer 1's output magnitude, so
+it costs one extra untimed bf16 call at setup.
+
+--routed-experts pins how many experts receive tokens -- not to be confused
+with the second value of --experts, which is top-k per token. The per-token
+expert sets are built so exactly that many are hit whatever the batch size,
+which holds the expert weight bytes fixed across a sweep. `batch * top-k`
+routed rows cannot reach more experts than there are rows, so a tiny batch
+pins fewer; the routed_experts column always reports what routing really used.
+
+Everything except the GEMMs -- gating, routing, and the activation quantization
+that feeds each layer -- is built once outside the timed region, so the numbers
+cover the two projections and nothing else.
+
+Unlike moe_gemm_a4w4 there is no backend switch: moe_gemm_a8w4 runs the gluon
+kernels on gfx1250 and the triton kernel everywhere else. On gfx1250 the
+variant follows routing's block_m *and* the projection's K -- persistent decode
+for block_m == 16 with K <= 768, plain decode for the rest of block_m == 16,
+prefill otherwise -- so the two projections can land on different kernels and
+the `kernel` column is per layer. --preshuffle enables the gluon-only gfx1250
+WMMA weight preshuffle.
+"""
 
 import argparse
 import csv
 import inspect
-import tempfile
 from itertools import chain
 from pathlib import Path
 
 import torch
-import triton.profiler as proton
+import triton
 
 from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-    moe_gemm_a8w4,
-)
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
-
-def parse_profile(profile_path, useful_op_regex, reps):
-    """
-    construct a PerfRecord from a (proton) profile path and a regex for useful operations
-    """
-    from triton.profiler import viewer
-
-    gf, _, _, _ = viewer.read(profile_path)
-    # aggregate "useful" flops + bytes
-    useful = gf.filter(
-        f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF"
-    ).dataframe
-    bytes_ = int(useful["bytes"].sum())
-    flops = int(
-        sum(useful[[c for c in ["flops8", "flops16"] if c in useful.columns]].sum())
-    )
-    # take all ops (incl. "not useful" ones) when computing total time
-    allops = gf.filter("MATCH ('*', c) WHERE c IS LEAF").dataframe
-    total_time_ns = allops["time (ns)"].sum()
-    kernel_time_ns = useful["time (ns)"].sum()
-    return {
-        "total_time_ns": total_time_ns,
-        "kernel_time_ns": kernel_time_ns,
-        "flops": flops,
-        "bytes": bytes_,
-        "reps": reps,
-    }
+# measurable layers, in report order; see the module docstring
+LAYERS = ("moe1", "moe2", "total")
+# activation formats --act-dtype accepts; the weights are always mxfp4
+ACT_DTYPES = ("fp8", "mx8")
 
 
 def compute_roofline(
     *args, bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, **kwargs
 ):
-    """
-    Sweeps intensity_proxy_values by injecting them into bench_fn, prints summary, and writes a CSV to out_path.
-    """
     # validate input args
     if not isinstance(intensity_proxy_name, str):
         raise TypeError(
             "intensity_proxy must be a string naming a parameter in target_fn"
         )
-
     # determine position of intensity_proxy in target_fn signature
     sig = inspect.signature(bench_fn)
     params = list(sig.parameters.values())
@@ -72,67 +94,73 @@ def compute_roofline(
     pos_index = [p.name for p in params].index(intensity_proxy_name)
 
     # wrapper to inject intensity proxy into target_fn and call it
-    def inject_proxy_and_call(val, args_, kwargs_):
-        args_list = list(args_)
+    def inject_proxy_and_call(val, args, kwargs):
+        args_list = list(args)
         args_list.insert(pos_index, val)
-        return bench_fn(*args_list, **kwargs_)
-
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        return bench_fn(*args_list, **kwargs)
 
     # collect performance data
-    results: list[tuple[str, dict[str, int | float]]] = []
+    perfs = []
     print("=========================================")
     print(f"{out_path}...")
     print("=========================================")
 
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
-        results.append((val, perf))
+        perfs.append((val, perf))
 
-        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
-        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
-        total_latency_us = perf["total_time_ns"] / 1e3 / perf["reps"]
-        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
+        # one line per value, one "<layer> <us> <TFLOP/s> <TB/s> [<kernel>]"
+        # group per measurement -- the same numbers the CSV carries per row.
+        # The kernel sits in the group because moe1 and moe2 can dispatch to
+        # different variants of the same op (see the module docstring).
+        groups = " | ".join(
+            f"{name} {lp['latency_ms'] * 1e3:.2f}us "
+            f"{lp['flops'] / lp['latency_ms'] * 1e-9:#.4g} TF/s "
+            f"{lp['bytes'] / lp['latency_ms'] * 1e-9:#.4g} TB/s "
+            f"[{lp['kernel']}]"
+            for name, lp in perf["layers"].items()
+        )
         print(
-            f"{intensity_proxy_name}: {val:5d} | "
-            f"Total latency (us): {total_latency_us:.2f} | "
-            f"Kernel latency (us): {kernel_latency_us:.2f} | "
-            f"TFLOPS: {tflops:#.4g} | "
-            f"TBPS: {tbps:.2f}"
+            f"{intensity_proxy_name}: {val:5d} | {groups} | "
+            f"block_m={perf['block_m']} routed_experts={perf['routed_experts']}"
         )
 
-    # write CSV
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # long format: one row per (value, layer), so a sweep stays easy to group
     fieldnames = [
         intensity_proxy_name,  # e.g. "batch"
-        "total_latency_us",
-        "kernel_latency_us",
+        "layer",
+        "latency_us",
         "tflops",
         "tbps",
-        "total_time_ns",
-        "kernel_time_ns",
         "flops",
         "bytes",
-        "reps",
+        "kernel",
+        "block_m",
+        "routed_experts",
     ]
+
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for val, perf in results:
-            w.writerow(
-                {
-                    intensity_proxy_name: val,
-                    "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
-                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                    "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
-                    "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
-                    "total_time_ns": perf["total_time_ns"],
-                    "kernel_time_ns": perf["kernel_time_ns"],
-                    "flops": perf["flops"],
-                    "bytes": perf["bytes"],
-                    "reps": perf["reps"],
-                }
-            )
+        for val, perf in perfs:
+            for name, lp in perf["layers"].items():
+                w.writerow(
+                    {
+                        intensity_proxy_name: val,
+                        "layer": name,
+                        "latency_us": lp["latency_ms"] * 1e3,
+                        "tflops": lp["flops"] / lp["latency_ms"] * 1e-9,
+                        "tbps": lp["bytes"] / lp["latency_ms"] * 1e-9,
+                        "flops": lp["flops"],
+                        "bytes": lp["bytes"],
+                        "kernel": lp["kernel"],
+                        "block_m": perf["block_m"],
+                        "routed_experts": perf["routed_experts"],
+                    }
+                )
 
 
 def check_and_shuffle_scales(scale, N, K):
@@ -150,27 +178,102 @@ def check_and_shuffle_scales(scale, N, K):
         return scale, None
 
 
+def preshuffle_weight(w):
+    """gfx1250 WMMA weight preshuffle.
+
+    `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLED=True.
+    shuffle_weight_gfx1250() asserts K // 2 % 32 and N % 16.
+    """
+    return shuffle_weight_gfx1250(w)
+
+
+def fp8_dtype():
+    """e4m3, in the flavour this arch's kernels take."""
+    return torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
+
+
+def static_scale_of(x):
+    """Per-tensor fp8 scale, as in test_moe_gemm_a8w4.py: `x / scale` fits e4m3
+    and the kernel multiplies `scale` back into the accumulator."""
+    return x.abs().max().float() / 448.0
+
+
 def quantize(x, dtype):
+    """bf16 / mxfp8 / mxfp4 tensors.
+
+    Static-scale fp8 activations do not come through here: they need
+    downcast_to_static_fp8() plus the scale the kernel multiplies back into the
+    accumulator, so the setup below quantizes them inline.
+    """
     if dtype == "bf16":
         x = x.to(torch.bfloat16).transpose(-1, -2).contiguous().transpose(-1, -2)
         return x, None
-    elif dtype == "fp8":
-        scale = x.abs().max().item() / 448.0
-        fp8e4_dtype = (
-            torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
-        )
-        x = x.to(fp8e4_dtype)
-        return x, scale
     elif dtype == "mx8":
-        fp8e4_dtype = (
-            torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
-        )
-        x, scale = downcast_to_mxfp(x, fp8e4_dtype, axis=1)
+        x, scale = downcast_to_mxfp(x, fp8_dtype(), axis=1)
         return x, scale
     else:
         assert dtype == "mx4", f"{dtype=}"
         x, scale = downcast_to_mxfp(x.to(torch.bfloat16), torch.uint8, axis=1)
         return x, scale
+
+
+def pin_routed_experts(logits, n_routed, n_expts_act):
+    """Route to exactly `n_routed` experts -- a pin, not a cap.
+
+    Masking the logits down to a random pool of `n_routed` experts only bounds
+    the routed count from above: nothing makes top-k cover the pool, so a small
+    batch lands on fewer and the count drifts with the batch size. Choose each
+    token's expert set directly instead.
+
+    Every row is rewritten to hold exactly `n_expts_act` finite logits -- the
+    token's chosen experts, at their original values, so the gate softmax is
+    over real scores -- and -inf everywhere else, the same sentinel `_topk`
+    uses for its own out-of-range lanes. Top-k then has no choice but to return
+    that set. Each pool expert is claimed by at least one token and the leftover
+    slots are filled uniformly at random from the pool, which is the same
+    distribution top-k over random logits was already drawing. A histogram with
+    zeros in it is the normal case, so hist / block_pid_map stay consistent.
+
+    `batch * n_expts_act` routed rows cannot reach more experts than there are
+    rows, so the pool shrinks to fit a tiny batch; the returned count is what
+    was actually pinned.
+    """
+    n_tokens, n_expts_tot = logits.shape
+    dev = logits.device
+    n_pinned = min(n_routed, n_tokens * n_expts_act)
+    pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
+
+    # Coverage: pool slot i is claimed by token i % n_tokens. n_pinned <=
+    # n_tokens * n_expts_act bounds any one token's claims by n_expts_act, and
+    # each slot is claimed once, so no token claims the same expert twice.
+    claimed = torch.arange(n_pinned, device=dev) % n_tokens == torch.arange(
+        n_tokens, device=dev
+    ).unsqueeze(1)
+
+    # Rank the pool per token -- claims first, then a random order over the
+    # rest -- and keep the top n_expts_act: every claim survives, and whatever
+    # slots are left over come out random.
+    rank = torch.rand((n_tokens, n_pinned), device=dev) + claimed
+    keep = pool[rank.topk(n_expts_act, dim=-1).indices]
+
+    masked = torch.full_like(logits, float("-inf"))
+    masked.scatter_(1, keep, logits.gather(1, keep))
+    return masked, n_pinned
+
+
+def kernel_variant(block_m, K):
+    """Compiled kernel moe_gemm_a8w4 dispatches to for a K-deep projection.
+
+    There is no backend argument: the op takes the gluon path iff the arch is
+    gfx1250. Within gluon, get_kernel_config_gluon() turns on the persistent
+    decode variant for shallow K, so moe1 and moe2 can differ.
+    """
+    if get_arch() != "gfx1250":
+        return "_moe_gemm_a8w4"
+    if block_m != 16:
+        return "_moe_gemm_a8w4_prefill"
+    return "_moe_gemm_a8w4_decode_persistent" if K <= 768 else "_moe_gemm_a8w4_decode"
 
 
 def bench_mlp_single_weight_init(
@@ -182,13 +285,35 @@ def bench_mlp_single_weight_init(
     x_dtype,
     w_dtype,
     TP,
-    op_regex,
-    preshuffle=False,
+    preshuffle,
+    routed_experts,
+    rep,
+    layers=LAYERS,
 ):
     rank = 0
     dev = f"cuda:{rank}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
+    assert x_dtype in ACT_DTYPES, f"{x_dtype=} must be one of {ACT_DTYPES}"
+    assert w_dtype == "mx4", f"a8w4 weights are mxfp4 (E2M1), got {w_dtype}"
+    if preshuffle:
+        assert (
+            get_arch() == "gfx1250"
+        ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
+    if routed_experts is not None:
+        # every token needs n_expts_act distinct experts, so the pool can't be smaller
+        assert n_expts_act <= routed_experts <= n_expts_tot, (
+            f"--routed-experts must be between top-k ({n_expts_act}) and the total "
+            f"expert count ({n_expts_tot}), got {routed_experts}"
+        )
+        # HERD routes top-(k+1) then drops the least batch-popular expert, which
+        # shrinks the routed set out from under the pin.
+        assert not _USE_HERD, (
+            "--routed-experts pins the routed expert set, which HERD routing "
+            "undoes; unset AITER_TRITON_USE_HERD"
+        )
+    assert layers, "at least one layer must be selected"
+    assert set(layers) <= set(LAYERS), f"unknown layer(s) in {layers=}"
 
     # -- init data --
     # weights
@@ -209,93 +334,155 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
     if preshuffle:
-        w1 = shuffle_weight_gfx1250(w1)
-        w2 = shuffle_weight_gfx1250(w2)
+        w1 = preshuffle_weight(w1)
+        w2 = preshuffle_weight(w2)
 
-    # -- benchmark --
-    x_dtype_str = x_dtype
-    x_dtype = torch.float8_e4m3fn
-    # special treatment of fp8_e4m3 on AMD CDNA3 because it uses fp8_e4m3fnuz
-    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
-        x_dtype = torch.float8_e4m3fnuz
-
-    reps = 100
+    # -- routing + layer-1 activations: built once, outside the timed region --
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
-    xg = x
-    if x_dtype_str == "fp8":
-        static_scale = torch.tensor(1e-4, device=dev)
+    logits = gemm_a16w16(x, wg.T, bg)
+    n_pinned = None
+    if routed_experts is not None:
+        logits, n_pinned = pin_routed_experts(logits, routed_experts, n_expts_act)
+    rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
 
-    # run layer
-    fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
-    for _ in range(reps):
-        logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
-        if x_dtype_str == "fp8":
-            x = downcast_to_static_fp8(x, static_scale)
-            x = moe_gemm_a8w4(
-                x,
-                w1,
-                None,
-                w1_scale,
-                static_scale,
-                static_scale,
-                b1,
-                rdata,
-                gather_indx=gather_indx,
-                swizzle_mx_scale=swizzle_mx_scale1,
-                out_dtype=x_dtype,
-                apply_swiglu=True,
-                preshuffled=preshuffle,
-            )
-            x = moe_gemm_a8w4(
-                x,
-                w2,
-                None,
-                w2_scale,
-                static_scale,
-                None,
-                b2,
-                rdata,
-                scatter_indx=scatter_indx,
-                swizzle_mx_scale=swizzle_mx_scale2,
-                preshuffled=preshuffle,
-            )
-        else:
-            assert x_dtype_str == "mx8"
-            x, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a8w4(
-                x,
-                w1,
-                x_scale,
-                w1_scale,
-                None,
-                None,
-                b1,
-                rdata,
-                gather_indx=gather_indx,
-                swizzle_mx_scale=swizzle_mx_scale1,
-                apply_swiglu=True,
-                preshuffled=preshuffle,
-            )
-            x, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a8w4(
-                x,
-                w2,
-                x_scale,
-                w2_scale,
-                None,
-                None,
-                b2,
-                rdata,
-                scatter_indx=scatter_indx,
-                swizzle_mx_scale=swizzle_mx_scale2,
-                preshuffled=preshuffle,
-            )
-    proton.finalize()
-    return parse_profile(
-        fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
+    static_fp8 = x_dtype == "fp8"
+    if static_fp8:
+        x1_scale = None
+        x1_static_scale = static_scale_of(x)
+        x1 = downcast_to_static_fp8(x, x1_static_scale)
+    else:
+        x1_static_scale = None
+        x1, x1_scale = quantize(x, x_dtype)
+
+    def gemm1(out_dtype, quant_static_scale):
+        return moe_gemm_a8w4(
+            x1,
+            w1,
+            x1_scale,
+            w1_scale,
+            x1_static_scale,
+            quant_static_scale,
+            b1,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swizzle_mx_scale1,
+            out_dtype=out_dtype,
+            apply_swiglu=True,
+            preshuffled=preshuffle,
+        )
+
+    if static_fp8:
+        # Layer 1 quantizes its own swiglu output in the epilogue, so layer 2
+        # reads fp8 with no quant kernel in between -- but the scale has to be
+        # known up front. Calibrate it from one untimed bf16 call so the
+        # hand-off lands in e4m3 range instead of saturating.
+        y1_bf16 = gemm1(torch.bfloat16, None)
+        x2_static_scale = static_scale_of(y1_bf16)
+        del y1_bf16
+        out_dtype1, quant_static_scale1 = fp8_dtype(), x2_static_scale
+    else:
+        x2_static_scale = None
+        out_dtype1, quant_static_scale1 = torch.bfloat16, None
+
+    def layer1():
+        return gemm1(out_dtype1, quant_static_scale1)
+
+    # layer 2 reads layer 1's swiglu output; get it (and, for mxfp8, its
+    # scales) once here so the timed region holds only the two GEMMs. This
+    # doubles as the compile warmup.
+    y1 = layer1()
+    y1_bytes = y1.numel() * y1.element_size()
+    if static_fp8:
+        # already e4m3, quantized by layer 1 with x2_static_scale
+        x2, x2_scale = y1, None
+    else:
+        x2, x2_scale = quantize(y1, x_dtype)
+        del y1
+
+    def layer2():
+        return moe_gemm_a8w4(
+            x2,
+            w2,
+            x2_scale,
+            w2_scale,
+            x2_static_scale,
+            None,
+            b2,
+            rdata,
+            scatter_indx=scatter_indx,
+            swizzle_mx_scale=swizzle_mx_scale2,
+            preshuffled=preshuffle,
+        )
+
+    y2 = layer2()
+    torch.cuda.synchronize()
+
+    def both():
+        layer1()
+        layer2()
+
+    # -- analytic FLOPs / bytes, matching the proton metadata the kernel itself
+    # reports: 2*M*N*K per GEMM, and activations + routed-expert weights +
+    # matmul output for traffic. mx scales (~1/16 of the weight bytes, and of
+    # the activation bytes under --act-dtype mx8) and the moe2 scatter
+    # reduction are not counted; the reduction's runtime is inside
+    # moe_gemm_a8w4 and so is inside the measurement.
+    n_tokens = gather_indx.shape[0]  # routed rows == batch * n_expts_act
+    routed = int((rdata.expt_data.hist > 0).sum())  # experts that got >= 1 token
+    if n_pinned is not None:
+        assert (
+            routed == n_pinned
+        ), f"--routed-experts pinned {n_pinned} experts, routing used {routed}"
+
+    def w_bytes(w):
+        return (w.numel() * w.element_size() // n_expts_tot) * routed
+
+    moe1_flops = 2 * n_tokens * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
+    moe1_bytes = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    moe2_flops = 2 * n_tokens * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
+    # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
+    # uncompressed [n_tokens, dim1] rows the reduction then combines.
+    moe2_bytes = (
+        x2.numel() * x2.element_size()
+        + w_bytes(w2)
+        + n_tokens * dim1 * y2.element_size()
     )
+
+    # the two projections have the same block_m but different K, so they can
+    # land on different gluon variants
+    kernel1 = kernel_variant(rdata.block_m, dim1)
+    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2)
+    kernels = {
+        "moe1": kernel1,
+        "moe2": kernel2,
+        "total": kernel1 if kernel1 == kernel2 else f"{kernel1}+{kernel2}",
+    }
+
+    # -- benchmark: each projection on its own, then the pair back to back,
+    # keeping only what `layers` asked for (in LAYERS order, not argv order).
+    # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
+    # over and over, so its weights stay hotter than they are in the real layer.
+    to_bench = {
+        "moe1": (layer1, moe1_flops, moe1_bytes),
+        "moe2": (layer2, moe2_flops, moe2_bytes),
+        "total": (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
+    }
+    measured = {
+        name: {
+            "latency_ms": triton.testing.do_bench_cudagraph(f, rep=rep),
+            "flops": flops,
+            "bytes": byts,
+            "kernel": kernels[name],
+        }
+        for name, (f, flops, byts) in to_bench.items()
+        if name in layers
+    }
+
+    return {
+        "layers": measured,
+        "block_m": rdata.block_m,
+        "routed_experts": routed,
+    }
 
 
 def bench_mlp(
@@ -307,12 +494,14 @@ def bench_mlp(
     x_dtype,
     w_dtype,
     TP,
-    op_regex,
+    preshuffle,
+    routed_experts,
+    rep,
+    layers=LAYERS,
     num_weight_inits=1,
-    preshuffle=False,
 ):
     all_results = []
-    for _ in range(num_weight_inits):
+    for i in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
             batch,
             dim1,
@@ -322,18 +511,30 @@ def bench_mlp(
             x_dtype,
             w_dtype,
             TP,
-            op_regex,
-            preshuffle=preshuffle,
+            preshuffle,
+            routed_experts,
+            rep,
+            layers,
         )
         all_results.append(result)
 
     num_runs = len(all_results)
     aggregated = {
-        "total_time_ns": sum(r["total_time_ns"] for r in all_results) / num_runs,
-        "kernel_time_ns": sum(r["kernel_time_ns"] for r in all_results) / num_runs,
-        "flops": sum(r["flops"] for r in all_results) / num_runs,
-        "bytes": sum(r["bytes"] for r in all_results) / num_runs,
-        "reps": all_results[0]["reps"],
+        "layers": {
+            name: {
+                **{
+                    key: sum(r["layers"][name][key] for r in all_results) / num_runs
+                    for key in ("latency_ms", "flops", "bytes")
+                },
+                # the dispatched kernel depends on batch/topk/E and the layer's
+                # K, none of which move with the weight draw
+                "kernel": all_results[0]["layers"][name]["kernel"],
+            }
+            for name in all_results[0]["layers"]
+        },
+        # routing block_m depends only on batch/topk/E
+        "block_m": all_results[0]["block_m"],
+        "routed_experts": sum(r["routed_experts"] for r in all_results) / num_runs,
     }
 
     return aggregated
@@ -348,16 +549,31 @@ def roofline_mlp(
     x_dtype,
     w_dtype,
     TP,
-    op_regex,
-    name="",
+    preshuffle,
+    routed_experts,
+    rep,
+    layers=LAYERS,
     num_weight_inits=1,
-    preshuffle=False,
+    name="",
 ):
-    # Avoid creating an empty directory named like the output CSV stem.
+    # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    # Every knob that changes what is measured goes in the filename, so sweeps
+    # over different shapes/dtypes land side by side instead of overwriting.
+    stem = (
+        f"{x_dtype}x-{w_dtype}w-TP{TP}-dim1={dim1}-dim2={dim2}"
+        f"-E={n_expts_tot}-topk={n_expts_act}"
+    )
+    if routed_experts is not None:
+        stem += f"-routed={routed_experts}"
+    if preshuffle:
+        stem += "-preshuffled"
+    if tuple(layers) != LAYERS:
+        # a partial run holds a subset of the rows, so give it its own file
+        stem += "-layers=" + "+".join(layers)
+    out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
         dim1,
@@ -367,13 +583,15 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        op_regex,  # fixed args
-        num_weight_inits,
         preshuffle,
+        routed_experts,
+        rep,  # fixed args
+        layers,
+        num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
-        out_path=out_csv,
+        out_path=out_csv,  # output path
     )
 
 
@@ -391,43 +609,78 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--shape",
         type=int,
-        nargs="+",
-        metavar=("DIM"),
-        help="Input feature dimensions of MoE layers. Must be two integers.",
+        nargs=2,
+        required=True,
+        metavar=("DIM1", "DIM2"),
+        help="The two MLP feature dimensions. DIM1 is the model (hidden) dim, "
+        "i.e. the width of a token vector going into and coming out of the "
+        "layer. DIM2 is the gated up-projection width -- twice the FFN "
+        "intermediate size, since swiglu halves it. Together they fix both "
+        "GEMMs: moe1 is N=DIM2/TP, K=DIM1, and moe2 is N=DIM1, K=DIM2/TP/2.",
     )
     parser.add_argument(
         "--experts",
         type=int,
-        nargs="+",
-        metavar=("DIM"),
-        help="Number of total and active experts in [total experts, active experts] order.",
-    )
-    parser.add_argument(
-        "--op-regex",
-        type=str,
-        default=".*moe_gemm.*",
-        help="Regex to find perf for specific operation by its kernel name.",
+        nargs=2,
+        required=True,
+        metavar=("TOTAL", "TOPK"),
+        help="TOTAL is how many experts the layer holds; TOPK is how many of "
+        "them each token is routed to. TOTAL sets the weight tensors' expert "
+        "dim, TOPK multiplies the row count each GEMM sees (batch * TOPK "
+        "routed rows). Use --routed-experts to pin how many of the TOTAL "
+        "actually receive tokens.",
     )
     parser.add_argument(
         "--act-dtype",
-        type=str,
+        choices=list(ACT_DTYPES),
         default="fp8",
-        help="Activation dtype, fp8 or mx8.",
+        help="Activation format: fp8 (e4m3 with one static scale per tensor, "
+        "layer 1 emitting layer 2's input directly) or mx8 (mxfp8, one ue8m0 "
+        "scale per 32 values along K). Weights are mxfp4 either way. "
+        "Default: fp8.",
+    )
+    parser.add_argument(
+        "--preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
+    )
+    parser.add_argument(
+        "--routed-experts",
+        type=int,
+        default=None,
+        help="Pin the number of experts that receive tokens, fixing the "
+        "routed_experts column (and so the weight bytes read) across the batch "
+        "sweep. Not to be confused with the second value of --experts, which is "
+        "top-k per token. batch * top-k routed rows cannot reach more experts "
+        "than there are rows, so a batch that small pins fewer. Default: unset, "
+        "i.e. random routing over all experts.",
+    )
+    parser.add_argument(
+        "--layers",
+        nargs="+",
+        choices=LAYERS,
+        default=list(LAYERS),
+        help="Which layers to measure: moe1 (up projection), moe2 (down "
+        "projection), total (both back to back). E.g. '--layers moe1 moe2' to "
+        "skip the back-to-back run, or '--layers moe1' for one projection "
+        "alone. Default: all three.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target per batch size, in ms (default: 20).",
     )
     parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
         help="Number of different weight initializations to run for more stable results (default: 1). "
-        "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
+        "Use higher values (e.g., 10) for more stable benchmarks.",
     )
-    parser.add_argument(
-        "--preshuffle",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Preshuffle the mxfp4 weights for the gfx1250 kernel (default: False).",
-    )
-    return parser.parse_args(args=args)
+    args = parser.parse_args(args=args)
+    return args
 
 
 def main(args: list[str] | None = None) -> None:
@@ -448,7 +701,6 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     else:
         batch_sizes_moe = parsed_args.M
-
     quantized_dtypes = [parsed_args.act_dtype, "mx4"]
 
     roofline_mlp(
@@ -460,10 +712,13 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        op_regex=parsed_args.op_regex,
-        name="gpt-oss-x2",
-        num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
+        routed_experts=parsed_args.routed_experts,
+        rep=parsed_args.rep,
+        # dedupe, keeping the canonical report order rather than argv order
+        layers=tuple(n for n in LAYERS if n in parsed_args.layers),
+        num_weight_inits=parsed_args.num_weight_inits,
+        name="moe_gemm_a8w4",
     )
 
 
