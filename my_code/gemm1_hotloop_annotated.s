@@ -1,16 +1,17 @@
 ; ============================================================================
-; gemm1 hot loop -- ISA with the wide-KSL plan inlined as comments
+; gemm1 hot loop -- manually corrected wide-KSL target pipeline
 ;
 ; kernel : gemm_a8w4_tdm_t64x256x256_w1x4_b3_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1
 ; build  : AITER_TDM_WIDE_KSL=1, gfx1250, waves-per-eu=1,1
-; source : 21_final_isa.s lines 828..1092 (the steady-state K256 tile), verbatim
+; basis  : 21_final_isa.s source IDs 828..1093 (loop back-edge at ID 1092)
 ; state  : vgpr_count=346  vgpr_spill_count=0  sgpr_count=90
 ;
-; STATUS: CORRECT (rel_l2 = 2.8725e-03) and on by default for gemm1. An earlier
-;         version of this header blamed it for rel_l2 = nan; that was wrong. The
-;         NaN came from the env knob forcing GEMM2 (KWS=1) into the wide path --
-;         see SESSION_HANDOFF.md section 5, fixed in ad2d3ebab. This loop's only
-;         open problem is DEVIATION 1 below (collapsed hiding window).
+; STATUS: HAND-CORRECTED TARGET. This file is no longer a verbatim compiler dump.
+;         The DS groups and DScnt waits have been manually scheduled into the
+;         requested B0/S0 -> A0 -> B1/S1 -> TDM -> wait12 -> A1 -> KSL0 ->
+;         wait0 -> KSL1 pipeline. The left-column numbers are original compiler
+;         source instruction IDs retained only as provenance tags; after manual
+;         movement they are intentionally non-monotonic and are not line/order IDs.
 ; ============================================================================
 
 
@@ -18,8 +19,15 @@
         ; STEADY-STATE K256 TILE  (.LBB0_27 .. s_cbranch_scc1 .LBB0_27)
         ;
         ; The loop is software-pipelined: plan steps 1-4 sit at the END of the body
-        ; (L924-L1089) and feed the NEXT iteration; the body opens at step 5.
-        ; Execution order per iteration is therefore:  5, 6, 7, 8, 9, then 1, 2, 3, 4.
+        ; and feed the NEXT iteration; the textual body opens at step 5. Starting at
+        ; the cyclic tile boundary, actual order is exactly steps 1 through 9.
+        ;
+        ; KSL boundary in this hand-corrected stream:
+        ;   KSL0 block = IDs 850..868; its 16 WMMA are 850, 853..854, 856..868
+        ;                (IDs 852 and 855 are retained s_set_vgpr_msb)
+        ;   wait0 = source ID 851, manually moved to the boundary
+        ;   KSL1 block = IDs 869..886; its 16 WMMA are 869, 871..872, 874..886
+        ;                (IDs 870 and 873 are retained s_set_vgpr_msb)
         ;
         ; NOTE on register numbers: v256+ is reached through VGPR-MSB indexing
         ; (MI400 Shader Programming #65 sec 3.3.2.3). Where an operand prints as
@@ -66,32 +74,10 @@
   847  	ds_load_b128 v[124:127], v124 offset:13280
   848  	s_set_vgpr_msb 1
 
-        ; !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        ; DEVIATION 1 -- not in the plan.
-        ;
-        ; The plan is:   step 7 (16 WMMA)  ->  step 8 s_wait_dscnt(0)  ->  step 9.
-        ; What LLVM emitted:
-        ;      s_wait_dscnt 0x13     <- extra wait, frontend never asked for it
-        ;      v_wmma  #1
-        ;      s_wait_dscnt 0x0      <- step 8 lands here, after ONE WMMA
-        ;      v_wmma  #2..#32
-        ;
-        ; So only 1 WMMA overlaps the outstanding A1/B1 loads instead of 16; the
-        ; remaining 15 WMMA of step 7 run after everything is already waited on.
-        ; The latency-hiding window the plan asks for collapses from 16 wide to 1.
-        ; The frontend emits only s_wait_dscnt(12) and s_wait_dscnt(0).
-        ; !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-  849  	s_wait_dscnt 0x13
-
         ; PLAN STEP 7 begins here (16 WMMA, activation = v0..v63 = A0).
         ;   4 wm x 4 wn = 16 x WMMAScale_16x16x128
-        ;   Intent: hide the LDS latency of B1/SB1/SA1 + A1 behind these.
-        ;   Actual: see DEVIATION 1 -- only this first one overlaps.
+        ;   All 16 execute before wait0 and hide B1/SB1/SA1 + A1 LDS latency.
   850  	v_wmma_scale_f32_16x16x128_f8f6f4 v[128:135], v[8:15] /*v[264:271]*/, v[48:63], v[128:135], v140, v150 matrix_a_fmt:MATRIX_FMT_FP4
-
-        ; PLAN STEP 8: s_wait_dscnt(0).  MATCHES the immediate, but see DEVIATION 1
-        ; for its position.
-  851  	s_wait_dscnt 0x0
   852  	s_set_vgpr_msb 0x151
   853  	v_wmma_scale_f32_16x16x128_f8f6f4 v[66:73] /*v[322:329]*/, v[24:31] /*v[280:287]*/, v[48:63], v[66:73] /*v[322:329]*/, v141, v150 matrix_a_fmt:MATRIX_FMT_FP4
   854  	v_wmma_scale_f32_16x16x128_f8f6f4 v[74:81] /*v[330:337]*/, v[48:55] /*v[304:311]*/, v[48:63], v[74:81] /*v[330:337]*/, v144, v150 matrix_a_fmt:MATRIX_FMT_FP4
@@ -110,8 +96,11 @@
   867  	v_wmma_scale_f32_16x16x128_f8f6f4 v[232:239], v[24:31] /*v[280:287]*/, v[0:15], v[232:239], v141, v149 matrix_a_fmt:MATRIX_FMT_FP4
   868  	v_wmma_scale_f32_16x16x128_f8f6f4 v[224:231], v[8:15] /*v[264:271]*/, v[0:15], v[224:231], v140, v149 matrix_a_fmt:MATRIX_FMT_FP4
 
+        ; PLAN STEP 8: full DS wait at the exact KSL0/KSL1 boundary.
+  851  	s_wait_dscnt 0x0
+
         ; PLAN STEP 9 begins here (16 WMMA, activation = v64..v127 = A1 loaded at
-        ; L831 this iteration).  16 x WMMAScale_16x16x128.
+        ; source ID 831 this iteration).  16 x WMMAScale_16x16x128.
   869  	v_wmma_scale_f32_16x16x128_f8f6f4 v[128:135], v[0:7] /*v[256:263]*/, v[64:79], v[128:135], v136, v146 matrix_a_fmt:MATRIX_FMT_FP4
   870  	s_set_vgpr_msb 0x151
   871  	v_wmma_scale_f32_16x16x128_f8f6f4 v[66:73] /*v[322:329]*/, v[16:23] /*v[272:279]*/, v[64:79], v[66:73] /*v[322:329]*/, v137, v146 matrix_a_fmt:MATRIX_FMT_FP4
@@ -170,12 +159,39 @@
   920  	s_set_vgpr_msb 0x400
   921  	s_barrier_wait -1
   922  	v_add_nc_u32_e32 v66, 0xc400, v0
+  951  	v_add_nc_u32_e32 v67, 0xc400, v65
+  952  	v_add_nc_u32_e32 v68, 0xc408, v65
   923  	s_wait_alu depctr_va_vdst(0)
+
+        ; ------------------------------------------------------------------------------
+        ; PLAN STEP 1: load B0/SB0/SA0  (for the next tile)
+        ;   - 8 x ds_load_b128: source IDs 954..961
+        ;   - 4 x ds_load_2addr_b32: source IDs 963, 964, 970, 972
+        ;   - destinations are exactly the B/scales consumed by KSL0
+        ; PHYSICAL DS: 12.
+        ; ------------------------------------------------------------------------------
+  953  	s_set_vgpr_msb 64
+  954  	ds_load_b128 v[8:11] /*v[264:267]*/, v64
+  955  	ds_load_b128 v[12:15] /*v[268:271]*/, v64 offset:512
+  956  	ds_load_b128 v[24:27] /*v[280:283]*/, v64 offset:2048
+  957  	ds_load_b128 v[28:31] /*v[284:287]*/, v64 offset:2560
+  958  	ds_load_b128 v[48:51] /*v[304:307]*/, v64 offset:4096
+  959  	ds_load_b128 v[52:55] /*v[308:311]*/, v64 offset:4608
+  960  	ds_load_b128 v[56:59] /*v[312:315]*/, v64 offset:6144
+  961  	ds_load_b128 v[60:63] /*v[316:319]*/, v64 offset:6656
+  962  	s_set_vgpr_msb 0x4000
+  963  	ds_load_2addr_b32 v[140:141], v66 offset0:128 offset1:144
+  964  	ds_load_2addr_b32 v[144:145], v66 offset0:192 offset1:208
+  969  	s_wait_alu depctr_va_vdst(3)
+  970  	ds_load_2addr_b32 v[150:151], v67 offset1:1
+  971  	s_wait_alu depctr_va_vdst(2)
+  972  	ds_load_2addr_b32 v[148:149], v68 offset1:1
 
         ; ------------------------------------------------------------------------------
         ; PLAN STEP 2: load all A0  (for the next tile)
         ;   - wm0..wm3, each 4 x ds_load_b128 -> 16 total
-        ; MATCHES: 16 loads, L924-L939, destinations v0..v63.
+        ;   - destinations v0..v63 are consumed by KSL0
+        ; PHYSICAL DS: 16.
         ; ------------------------------------------------------------------------------
   924  	ds_load_b128 v[48:51], v124
   925  	ds_load_b128 v[52:55], v124 offset:32
@@ -193,16 +209,16 @@
   937  	ds_load_b128 v[4:7], v124 offset:13088
   938  	ds_load_b128 v[8:11], v124 offset:13120
   939  	ds_load_b128 v[12:15], v124 offset:13152
-  940  	s_set_vgpr_msb 64
 
         ; ------------------------------------------------------------------------------
-        ; PLAN STEPS 1 and 3: load_b_and_scales(ksl=0) and (ksl=1)
-        ;   Each is ~12 physical DS:  8 x ds_load_b128 (B) + 4 x ds_load_2addr_b32
-        ;   (the backend pairs the 8 logical scale b32 loads: SB 4 + SA 4).
-        ; MATCHES: L941-948 = 8 b128 (ksl=0 B), L954-961 = 8 b128 (ksl=1 B),
-        ;          L950-976 = 8 x 2addr_b32 = both slices' SB+SA.
-        ;          12 + 12 = 24 phys DS, plus step 2's 16 = 56 per K256 tile.
+        ; PLAN STEP 3: load B1/SB1/SA1  (for the next tile)
+        ;   - 8 x ds_load_b128: source IDs 941..948
+        ;   - 4 x ds_load_2addr_b32: source IDs 950, 968, 974, 976
+        ;   - destinations are exactly the B/scales consumed by KSL1
+        ; PHYSICAL DS: 12. The two v66 scale loads immediately before the VM-source
+        ; wait preserve the original safe point before v64/v65 are repurposed.
         ; ------------------------------------------------------------------------------
+  940  	s_set_vgpr_msb 64
   941  	ds_load_b128 v[0:3] /*v[256:259]*/, v64 offset:1024
   942  	ds_load_b128 v[4:7] /*v[260:263]*/, v64 offset:1536
   943  	ds_load_b128 v[16:19] /*v[272:275]*/, v64 offset:3072
@@ -213,28 +229,10 @@
   948  	ds_load_b128 v[44:47] /*v[300:303]*/, v64 offset:7680
   949  	s_set_vgpr_msb 0x4000
   950  	ds_load_2addr_b32 v[136:137], v66 offset0:160 offset1:176
-  951  	v_add_nc_u32_e32 v67, 0xc400, v65
-  952  	v_add_nc_u32_e32 v68, 0xc408, v65
-  953  	s_set_vgpr_msb 64
-  954  	ds_load_b128 v[8:11] /*v[264:267]*/, v64
-  955  	ds_load_b128 v[12:15] /*v[268:271]*/, v64 offset:512
-  956  	ds_load_b128 v[24:27] /*v[280:283]*/, v64 offset:2048
-  957  	ds_load_b128 v[28:31] /*v[284:287]*/, v64 offset:2560
-  958  	ds_load_b128 v[48:51] /*v[304:307]*/, v64 offset:4096
-  959  	ds_load_b128 v[52:55] /*v[308:311]*/, v64 offset:4608
-  960  	ds_load_b128 v[56:59] /*v[312:315]*/, v64 offset:6144
-  961  	ds_load_b128 v[60:63] /*v[316:319]*/, v64 offset:6656
-  962  	s_set_vgpr_msb 0x4000
-  963  	ds_load_2addr_b32 v[140:141], v66 offset0:128 offset1:144
-  964  	ds_load_2addr_b32 v[144:145], v66 offset0:192 offset1:208
+  968  	ds_load_2addr_b32 v[142:143], v66 offset0:224 offset1:240
   965  	s_wait_alu depctr_vm_vsrc(2)
   966  	v_add_nc_u32_e32 v64, 0xc410, v65
   967  	v_add_nc_u32_e32 v65, 0xc418, v65
-  968  	ds_load_2addr_b32 v[142:143], v66 offset0:224 offset1:240
-  969  	s_wait_alu depctr_va_vdst(3)
-  970  	ds_load_2addr_b32 v[150:151], v67 offset1:1
-  971  	s_wait_alu depctr_va_vdst(2)
-  972  	ds_load_2addr_b32 v[148:149], v68 offset1:1
   973  	s_wait_alu depctr_va_vdst(1)
   974  	ds_load_2addr_b32 v[146:147], v64 offset1:1
   975  	s_wait_alu depctr_va_vdst(0)
@@ -253,13 +251,10 @@
         ; PLAN STEP 4: issue next K-tile TDM
         ;   - writes into another ring buffer
         ;   - uses TENSORcnt, does NOT add to this wave's DScnt
-        ; MATCHES semantically, but see DEVIATION 2.
         ;
-        ; DEVIATION 2: the single logical 'issue' is emitted as 5 predicated
-        ; tensor_load_to_lds (L998/1022/1041/1062/1089), each guarded by its own
-        ; branch, because issue() emits one copy per job and the wave-specialised
-        ; path predicates each on 'wave == j.wave'. Same work, but ~100 lines of
-        ; scalar branching sit between the compute block and the loop back-edge.
+        ; The compiler's five predicated tensor_load_to_lds operations (source IDs
+        ; 998/1022/1041/1062/1089) and their scalar guards are retained unchanged.
+        ; Together they implement the one logical next-tile issue.
         ; ------------------------------------------------------------------------------
   986  	s_cbranch_vccz .LBB0_42
   987  	s_and_b32 vcc_lo, exec_lo, s3
@@ -373,44 +368,33 @@
 ; ============================================================================
 ; SUMMARY
 ;
-;   plan step                                   emitted            verdict
-;   ------------------------------------------  -----------------  ---------
-;   1. load_b_and_scales(ksl=0)  ~12 phys DS    L941-948,950-976   match
-;   2. load all A0               16 x b128      L924-939           match
-;   3. load_b_and_scales(ksl=1)  ~12 phys DS    L954-961,950-976   match
-;   4. issue next K-tile TDM     TENSORcnt      L998..L1089        match, see DEV 2
-;   5. s_wait_dscnt(12)                         L829  (0xc)        match
-;   6. load all A1   DScnt 12->28               L831-847           match
-;   7. execute KSL0  16 x WMMA                  L850-868           match, see DEV 1
-;   8. s_wait_dscnt(0)                          L851               immediate ok,
-;                                                                  position wrong
-;   9. execute KSL1  16 x WMMA                  L869-886           match
+;   Cyclic steady-state order (numbers below are original source IDs):
+;   1. B0/S0:  954..961 + 963/964/970/972       8 b128 + 4 2addr = 12 DS
+;   2. A0:     924..939                          16 b128       = 16 DS
+;   3. B1/S1:  941..948 + 950/968/974/976       8 b128 + 4 2addr = 12 DS
+;   4. next K-tile TDM: 998/1022/1041/1062/1089 (TENSORcnt, not DScnt)
+;   5. s_wait_dscnt(12): 829 (0xc)
+;   6. A1:     831..845, 847                     16 b128       = 16 DS
+;   7. KSL0:   850, 853..854, 856..868           exactly 16 WMMA
+;   8. s_wait_dscnt(0): 851                      exact KSL boundary
+;   9. KSL1:   869, 871..872, 874..886           exactly 16 WMMA
 ;
 ;   Physical DS per K256 tile: 12 + 16 + 12 + 16 = 56, exactly as planned.
 ;   Activation split confirms 7 vs 9: WMMA 1..16 read v0..v63 (A0),
-;   WMMA 17..32 read v64..v127 (A1 loaded at L831).
+;   WMMA 17..32 read v64..v127 (A1 loaded at source ID 831).
 ;
-; DEVIATION 1 (scheduling): s_wait_dscnt(0) is hoisted to after the FIRST WMMA,
-;   so the hiding window is 1 WMMA wide instead of 16. LLVM also inserted an
-;   extra s_wait_dscnt 0x13 that the frontend never emitted. This is why the
-;   wide schedule is not faster, and it is the only thing left to fix here.
-;
-; DEVIATION 2 (code size): one logical TDM issue becomes 5 predicated
-;   tensor_load_to_lds with ~100 lines of scalar branching before the back-edge.
-;
-; STATIC CHECKS, all clean -- consistent with this loop being correct:
+; STATIC TARGET CHECKS:
 ;   - no VGPR/SGPR spill; 346 VGPRs is inside the 1024 wave32 limit (doc :2250)
 ;   - A1 destinations v64..v127 are read by WMMA 17..32 -- not dead, not clobbered
 ;   - no WMMA reads a register that a later load in the same iteration overwrites
 ;   - accumulators (v128..v255, v322..v337) overlap no load destination
-;   - s_wait_dscnt immediates are exactly 12 and 0 as the plan requires
+;   - after the final A1 load there is no DScnt wait before all 16 KSL0 WMMAs
+;   - the only following DScnt wait is wait0, immediately before the 16 KSL1 WMMAs
+;   - steady-state DScnt waits are exactly 12 and 0
 ;   Reading VGPR numbers here requires parsing the /*vNNN*/ comment: v256+ goes
 ;   through VGPR-MSB indexing (doc sec 3.3.2.3 :2249), so the bare 8-bit encoding
 ;   lies. A script that dropped the comment once invented a false overlap.
 ;
-; MEASURED (c9-3, g2_m64_nb3 tiles, same batch, post-fix ad2d3ebab)
-;   unset  : gemm1 349.7 us  gemm2 345.4  e2e 972.6   rel_l2 2.8725e-03
-;   WIDE=1 : gemm1 353.0 us  gemm2 344.6  e2e 977.3   rel_l2 2.8725e-03
-;   Identical, as expected: gemm1 runs this loop either way. Absolute numbers are
-;   not comparable to the b8-2 figures elsewhere -- always re-measure a baseline.
+; This hand-edited target has not been runtime-benchmarked; measurements from the
+; original compiler ordering do not validate this manually corrected schedule.
 ; ============================================================================
