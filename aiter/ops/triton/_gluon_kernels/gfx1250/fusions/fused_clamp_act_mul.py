@@ -87,16 +87,14 @@ def _fused_clamp_silu_mul_kernel(
     # load both gate + up
     gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_up_smem.index(0))
 
-    # 2D parent layouts over a [1, BLOCK_SIZE_N] tile; the 1D row/scale layouts are
-    # slices of them, so each TDM row loads into a SliceLayout of the tile.
     gLayout2D: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
+        size_per_thread=[1, 8],
         threads_per_warp=[1, 32],
-        warps_per_cta=[1, num_warps],                                   # warps per thread block
+        warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
     sLayout2D: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, max(1, NUM_N_Q_GROUPS // (num_warps * 32))], # scale group over lanes, floor 1
+        size_per_thread=[1, 8],
         threads_per_warp=[1, 32],
         warps_per_cta=[1, num_warps],
         order=[1, 0],
@@ -157,8 +155,10 @@ def _fused_clamp_silu_mul_kernel(
         else:
             gl.amd.gfx1250.tdm.async_wait(0)
 
-        gate = gate_up_smem.index(i).slice(0, BLOCK_SIZE_N, dim=1).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
-        up = gate_up_smem.index(i).slice(BLOCK_SIZE_N, BLOCK_SIZE_N, dim=1).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
+        # reshape then slice
+        gate_up = gate_up_smem.index(i).reshape([2 * BLOCK_SIZE_N])
+        gate = gate_up.slice(0, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
+        up = gate_up.slice(BLOCK_SIZE_N, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
 
         # clamp
         if HAVE_SWIGLU_CLAMP:
