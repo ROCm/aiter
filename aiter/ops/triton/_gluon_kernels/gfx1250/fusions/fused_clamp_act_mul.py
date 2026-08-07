@@ -71,24 +71,21 @@ def _fused_clamp_silu_mul_kernel(
     pid = gl.program_id(0)                 
     m_start = pid * ROWS_PER_PROG
 
-    gate_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
-    )
-    up_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
+    # gate + up
+    gate_up_smem = gl.allocate_shared_memory(
+        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, 2 * BLOCK_SIZE_N], shared_tdm_layout_2d
     )
 
     inp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=inp_ptr,
         shape=[M, 2 * n_half],
         strides=[inp_stride_m, inp_stride_n],
-        block_shape=[1, BLOCK_SIZE_N],
+        block_shape=[1, 2 * BLOCK_SIZE_N],
         layout=shared_tdm_layout_2d,
     )
 
-    # first load since static load cant run
-    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_smem.index(0))
-    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, n_half], up_smem.index(0))
+    # load both gate + up
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_up_smem.index(0))
 
     # 2D parent layouts over a [1, BLOCK_SIZE_N] tile; the 1D row/scale layouts are
     # slices of them, so each TDM row loads into a SliceLayout of the tile.
@@ -118,11 +115,10 @@ def _fused_clamp_silu_mul_kernel(
     for i in range(ROWS_PER_PROG):
         row = m_start + i
 
-        # prefetch next row if applicable
+        # prefetch
         if i + 1 < ROWS_PER_PROG:
             nxt = i + 1
-            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_smem.index(nxt))
-            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, n_half], up_smem.index(nxt))
+            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_up_smem.index(nxt))
 
         # weights load
         if HAVE_WEIGHTS:
@@ -157,12 +153,12 @@ def _fused_clamp_silu_mul_kernel(
             bs_offs = 0 # not needed
 
         if i + 1 < ROWS_PER_PROG:
-            gl.amd.gfx1250.tdm.async_wait(2)
+            gl.amd.gfx1250.tdm.async_wait(1)
         else:
             gl.amd.gfx1250.tdm.async_wait(0)
 
-        gate = gate_smem.index(i).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
-        up = up_smem.index(i).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
+        gate = gate_up_smem.index(i).slice(0, BLOCK_SIZE_N, dim=1).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
+        up = gate_up_smem.index(i).slice(BLOCK_SIZE_N, BLOCK_SIZE_N, dim=1).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
 
         # clamp
         if HAVE_SWIGLU_CLAMP:
