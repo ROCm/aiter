@@ -873,8 +873,10 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             exe = _get_compiled_swiglu(inter_dim)
             x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
             out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+            # swiglu_and_mul_kernel takes fx.Pointer args -> pass pointer views
+            # (matches flydsl_swiglu_and_mul_interleaved), not raw tensors.
             # trailing 0 = stream: null/default (compile-only, never launched)
-            _run_compiled(exe, (x, out, rows, 0))
+            _run_compiled(exe, (_ptr_view_safe(x), _ptr_view_safe(out), rows, 0))
             return
 
         exe = _get_compiled_silu_fused(
