@@ -57,6 +57,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .topk_per_row_decode import (
         flydsl_top_k_per_row_decode,
@@ -72,6 +73,7 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
