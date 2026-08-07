@@ -481,7 +481,9 @@ def _get_config(
         dev = arch_info.get_arch()
         if dev not in ["gfx950", "gfx1250"]:
             raise ValueError("Gluon implementation is not supported on this device.")
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm/gemm_afp4wfp4/DEFAULT.json"
+        fpath = (
+            f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm/gemm_afp4wfp4/DEFAULT.json"
+        )
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
