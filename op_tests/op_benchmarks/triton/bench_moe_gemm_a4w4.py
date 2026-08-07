@@ -2,10 +2,21 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 """Benchmark the mxfp4 x mxfp4 MoE MLP (two moe_gemm_a4w4 calls).
 
-Timing is `triton.testing.do_bench_cudagraph` over the two GEMMs. Everything
-else -- gating, routing, and the activation quantization that feeds each layer
--- is built once outside the timed region, mirroring the build()/fn() split in
-mi450-scripts/run_moe_a4w4.py so the numbers are comparable to that runner.
+Each batch size is measured three times with `triton.testing.do_bench_cudagraph`
+and reported as three rows, keyed by the `layer` column:
+
+  moe1   the gathered up projection alone   (N = dim2 / TP, K = dim1, + swiglu)
+  moe2   the scattered down projection alone (N = dim1, K = dim2 / TP / 2)
+  total  both back to back, i.e. the whole MLP
+
+`total` is not `moe1 + moe2`: an isolated projection replays the same kernel
+over and over, so its weights stay cache-resident in a way the real layer does
+not. Compare like with like.
+
+Everything except the GEMMs -- gating, routing, and the activation quantization
+that feeds each layer -- is built once outside the timed region, mirroring the
+build()/fn() split in mi450-scripts/run_moe_a4w4.py so the numbers are
+comparable to that runner (which benches one projection per invocation).
 
 On gfx1250 `moe_gemm_a4w4` defaults to the gluon backend, which dispatches to
 _moe_gemm_a4w4_decode when routing picks block_m == 16 and to
@@ -67,11 +78,14 @@ def compute_roofline(
         perf = inject_proxy_and_call(val, args, kwargs)
         perfs.append((val, perf))
 
+        # one line per value, one "<layer> <us> <TFLOP/s>" group per measurement
+        groups = " | ".join(
+            f"{name} {lp['latency_ms'] * 1e3:.2f}us "
+            f"{lp['flops'] / lp['latency_ms'] * 1e-9:#.4g} TF/s"
+            for name, lp in perf["layers"].items()
+        )
         print(
-            f"{intensity_proxy_name}: {val:5d} | "
-            f"Latency (us): {perf['latency_ms'] * 1e3:.2f} | "
-            f"TFLOPS: {perf['flops'] / perf['latency_ms'] * 1e-9:#.4g} | "
-            f"TBPS: {perf['bytes'] / perf['latency_ms'] * 1e-9:.2f} | "
+            f"{intensity_proxy_name}: {val:5d} | {groups} | "
             f"{perf['kernel']} block_m={perf['block_m']} "
             f"active_experts={perf['active_experts']}"
         )
@@ -79,8 +93,10 @@ def compute_roofline(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # long format: one row per (value, layer), so a sweep stays easy to group
     fieldnames = [
         intensity_proxy_name,  # e.g. "batch"
+        "layer",
         "latency_us",
         "tflops",
         "tbps",
@@ -95,18 +111,21 @@ def compute_roofline(
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for val, perf in perfs:
-            row = {
-                intensity_proxy_name: val,
-                "latency_us": perf["latency_ms"] * 1e3,
-                "tflops": perf["flops"] / perf["latency_ms"] * 1e-9,
-                "tbps": perf["bytes"] / perf["latency_ms"] * 1e-9,
-                "flops": perf["flops"],
-                "bytes": perf["bytes"],
-                "kernel": perf["kernel"],
-                "block_m": perf["block_m"],
-                "active_experts": perf["active_experts"],
-            }
-            w.writerow(row)
+            for name, lp in perf["layers"].items():
+                w.writerow(
+                    {
+                        intensity_proxy_name: val,
+                        "layer": name,
+                        "latency_us": lp["latency_ms"] * 1e3,
+                        "tflops": lp["flops"] / lp["latency_ms"] * 1e-9,
+                        "tbps": lp["bytes"] / lp["latency_ms"] * 1e-9,
+                        "flops": lp["flops"],
+                        "bytes": lp["bytes"],
+                        "kernel": perf["kernel"],
+                        "block_m": perf["block_m"],
+                        "active_experts": perf["active_experts"],
+                    }
+                )
 
 
 def check_and_shuffle_scales(scale, N, K):
@@ -162,12 +181,38 @@ def quantize(x, dtype):
         return x, scale
 
 
+def restrict_routed_experts(logits, n_active):
+    """Restrict routing to a random pool of `n_active` experts.
+
+    Every other expert's logit is pushed to -inf -- the same sentinel `_topk`
+    uses for its own out-of-range lanes -- so they can never win top-k. Routing
+    is otherwise untouched, and a histogram with zeros in it is already the
+    normal case, so hist / block_pid_map stay consistent.
+
+    This caps the experts that receive tokens: a batch too small to cover the
+    pool hits fewer, which is why the reported active_experts is measured from
+    the histogram rather than assumed.
+    """
+    n_expts_tot = logits.shape[-1]
+    keep = torch.randperm(n_expts_tot, device=logits.device)[:n_active]
+    mask = torch.full(
+        (n_expts_tot,), float("-inf"), device=logits.device, dtype=logits.dtype
+    )
+    mask[keep] = 0.0
+    return logits + mask
+
+
+def resolve_backend(backend):
+    """`None` lets moe_gemm_a4w4 pick per arch; resolve it the way it does."""
+    if backend is None:
+        return "gluon" if is_gluon_supported() else "triton"
+    return backend
+
+
 def kernel_variant(block_m, backend):
     """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
     run_moe_a4w4.py's `name` subcommand."""
-    if backend is None:
-        backend = "gluon" if is_gluon_supported() else "triton"
-    if backend != "gluon":
+    if resolve_backend(backend) != "gluon":
         return "_moe_gemm_a4w4"
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
@@ -183,6 +228,7 @@ def bench_mlp_single_weight_init(
     TP,
     backend,
     preshuffle,
+    routed_experts,
     rep,
 ):
     rank = 0
@@ -195,6 +241,12 @@ def bench_mlp_single_weight_init(
         assert (
             get_arch() == "gfx1250"
         ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
+    if routed_experts is not None:
+        # every token needs n_expts_act distinct experts, so the pool can't be smaller
+        assert n_expts_act <= routed_experts <= n_expts_tot, (
+            f"--routed-experts must be between top-k ({n_expts_act}) and the total "
+            f"expert count ({n_expts_tot}), got {routed_experts}"
+        )
 
     # -- init data --
     # weights
@@ -221,6 +273,8 @@ def bench_mlp_single_weight_init(
     # -- routing + layer-1 activations: built once, outside the timed region --
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     logits = gemm_a16w16(x, wg.T, bg)
+    if routed_experts is not None:
+        logits = restrict_routed_experts(logits, routed_experts)
     rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
     x1, x1_scale = mxfp4_quant(x)
 
@@ -267,39 +321,51 @@ def bench_mlp_single_weight_init(
     y2 = layer2()
     torch.cuda.synchronize()
 
-    # -- benchmark --
-    def fn():
+    def both():
         layer1()
         layer2()
-
-    latency_ms = triton.testing.do_bench_cudagraph(fn, rep=rep)
 
     # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
     # the kernel itself reports: 2*M*N*K per GEMM, and activations + active-expert
     # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
-    # and the layer-2 scatter reduction are not counted; the reduction's runtime
-    # is inside moe_gemm_a4w4 and so is inside the measurement.
+    # and the moe2 scatter reduction are not counted; the reduction's runtime is
+    # inside moe_gemm_a4w4 and so is inside the measurement.
     n_tokens = gather_indx.shape[0]  # routed rows == batch * n_expts_act
     active = int((rdata.expt_data.hist > 0).sum())  # experts that got >= 1 token
 
     def w_bytes(w):
         return (w.numel() * w.element_size() // n_expts_tot) * active
 
-    flops = 2 * n_tokens * (dim2 // TP) * dim1  # layer 1: N = dim2 // TP, K = dim1
-    flops += 2 * n_tokens * dim1 * (dim2 // TP // 2)  # layer 2
-    byts = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    moe1_flops = 2 * n_tokens * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
+    moe1_bytes = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    moe2_flops = 2 * n_tokens * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
     # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
     # uncompressed [n_tokens, dim1] rows the reduction then combines.
-    byts += (
+    moe2_bytes = (
         x2.numel() * x2.element_size()
         + w_bytes(w2)
         + n_tokens * dim1 * y2.element_size()
     )
 
+    # -- benchmark: each projection on its own, then the pair back to back.
+    # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
+    # over and over, so its weights stay hotter than they are in the real layer.
+    to_bench = {
+        "moe1": (layer1, moe1_flops, moe1_bytes),
+        "moe2": (layer2, moe2_flops, moe2_bytes),
+        "total": (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
+    }
+    layers = {
+        name: {
+            "latency_ms": triton.testing.do_bench_cudagraph(f, rep=rep),
+            "flops": flops,
+            "bytes": byts,
+        }
+        for name, (f, flops, byts) in to_bench.items()
+    }
+
     return {
-        "latency_ms": latency_ms,
-        "flops": flops,
-        "bytes": byts,
+        "layers": layers,
         "kernel": kernel_variant(rdata.block_m, backend),
         "block_m": rdata.block_m,
         "active_experts": active,
@@ -317,6 +383,7 @@ def bench_mlp(
     TP,
     backend,
     preshuffle,
+    routed_experts,
     rep,
     num_weight_inits=1,
 ):
@@ -333,15 +400,20 @@ def bench_mlp(
             TP,
             backend,
             preshuffle,
+            routed_experts,
             rep,
         )
         all_results.append(result)
 
     num_runs = len(all_results)
     aggregated = {
-        "latency_ms": sum(r["latency_ms"] for r in all_results) / num_runs,
-        "flops": sum(r["flops"] for r in all_results) / num_runs,
-        "bytes": sum(r["bytes"] for r in all_results) / num_runs,
+        "layers": {
+            name: {
+                key: sum(r["layers"][name][key] for r in all_results) / num_runs
+                for key in ("latency_ms", "flops", "bytes")
+            }
+            for name in all_results[0]["layers"]
+        },
         # routing block_m and the dispatched kernel depend only on batch/topk/E
         "kernel": all_results[0]["kernel"],
         "block_m": all_results[0]["block_m"],
@@ -362,6 +434,7 @@ def roofline_mlp(
     TP,
     backend,
     preshuffle,
+    routed_experts,
     rep,
     num_weight_inits=1,
     name="",
@@ -370,7 +443,18 @@ def roofline_mlp(
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    # Every knob that changes what is measured goes in the filename, so sweeps
+    # over different shapes/backends land side by side instead of overwriting.
+    stem = (
+        f"{x_dtype}x-{w_dtype}w-TP{TP}-dim1={dim1}-dim2={dim2}"
+        f"-E={n_expts_tot}-topk={n_expts_act}"
+    )
+    if routed_experts is not None:
+        stem += f"-routed={routed_experts}"
+    stem += f"-{resolve_backend(backend)}"
+    if preshuffle:
+        stem += "-preshuffled"
+    out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
         dim1,
@@ -382,6 +466,7 @@ def roofline_mlp(
         TP,
         backend,
         preshuffle,
+        routed_experts,
         rep,  # fixed args
         num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
@@ -427,6 +512,16 @@ def parse_args(args: list[str] | None = None):
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
+    )
+    parser.add_argument(
+        "--routed-experts",
+        type=int,
+        default=None,
+        help="Route tokens to a random pool of this many experts, capping the "
+        "active_experts column (and so the weight bytes read). Not to be confused "
+        "with the second value of --experts, which is top-k per token. A batch too "
+        "small to cover the pool activates fewer. Default: unset, i.e. random "
+        "routing over all experts.",
     )
     parser.add_argument(
         "--rep",
@@ -476,9 +571,10 @@ def main(args: list[str] | None = None) -> None:
         TP=1,
         backend=None if parsed_args.backend == "auto" else parsed_args.backend,
         preshuffle=parsed_args.preshuffle,
+        routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         num_weight_inits=parsed_args.num_weight_inits,
-        name="gpt-oss-x2",
+        name="moe_gemm_a4w4",
     )
 
 
