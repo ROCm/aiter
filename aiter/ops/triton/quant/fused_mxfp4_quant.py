@@ -513,7 +513,9 @@ def fused_reduce_rms_mxfp4_quant(
 
     # check if args is gluon and arch is not gfx1250
     if args == "gluon" and get_arch() != "gfx1250":
-        raise ValueError("Gluon kernel is not supported on this arch")
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
 
     # select kernel based on args and arch
     kernel = (
