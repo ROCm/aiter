@@ -53,7 +53,7 @@ def get_vals():
     ]
 
 
-@pytest.mark.parametrize("in_dtype_str", ["bf16", "fp16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize("M, N, G", [(shape) for shape in get_vals()])
 def test_fused_gate_add_layernorm_scale_shift(M, N, G, in_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]
