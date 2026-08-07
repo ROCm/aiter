@@ -61,14 +61,16 @@ def get_mhc_config(
 
     cache_key = f"{dev}_{actual_config_name}"
 
-    # Load default config with fallback for unsupported architectures
+    # Load default config with fallback for unsupported architectures.
+    # Load into a temp dict and commit only on success, so a failed load
+    # doesn't leave a stale empty entry that masks the error on later calls.
     if cache_key not in get_mhc_config._config_cache:
-        get_mhc_config._config_cache[cache_key] = {}
+        tmp_cache = {cache_key: {}}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}.json"
 
         # Try loading architecture-specific config first
         if not _load_config_file(
-            get_mhc_config._config_cache,
+            tmp_cache,
             cache_key,
             fpath,
             "default",
@@ -79,12 +81,13 @@ def get_mhc_config(
                 f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}.json"
             )
             _load_config_file(
-                get_mhc_config._config_cache,
+                tmp_cache,
                 cache_key,
                 fpath_fallback,
                 "default",
                 fpath_should_exist=True,
             )
+        get_mhc_config._config_cache[cache_key] = tmp_cache[cache_key]
 
     config_dict_key = "default"
     used_specialized = False

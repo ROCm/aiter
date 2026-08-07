@@ -18,31 +18,26 @@ TO be added features:
 """
 
 import functools
-import json
 
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
 @functools.lru_cache(maxsize=1024)
 def _get_config():
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    config = _get_config._config_dict["any"]
-    return (
-        config.copy()
-    )  # return a copy to avoid mutation of stored config in LRU cache
+    dev = arch_info.get_arch()
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json", required=True
+    )
+    return config[
+        "any"
+    ].copy()  # return a copy to avoid mutation of the shared cached config
 
 
 @triton.jit
