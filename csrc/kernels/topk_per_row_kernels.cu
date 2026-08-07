@@ -679,7 +679,19 @@ unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt)
 
     IdxT best_num_blocks         = 0;
     float best_tail_wave_penalty = 1.0f;
-    const IdxT max_num_blocks    = ceildiv<IdxT>(len, VECTORIZED_READ_SIZE / sizeof(T) * BlockSize);
+    // radix_kernel_persistent joins the gridDim.x blocks of one row on a
+    // spin-wait barrier (atomicInc + the pass_done loop), so every one of them
+    // has to be resident at the same time: a block that was never scheduled can
+    // never arrive, and the ones already spinning never retire to make room for
+    // it. The tail-wave search below is otherwise free to ask for more blocks
+    // than the device can hold — at long sequence lengths it picked thousands of
+    // blocks per row against a few hundred resident slots and the kernel hung
+    // forever. Cap the search at the resident capacity; workgroups launch
+    // x-major, so one whole row fits and rows then drain one after another.
+    const IdxT max_resident_blocks = std::max<IdxT>(1, static_cast<IdxT>(active_blocks));
+    const IdxT max_num_blocks =
+        std::min(ceildiv<IdxT>(len, VECTORIZED_READ_SIZE / sizeof(T) * BlockSize),
+                 max_resident_blocks);
     for(int num_waves = 1;; ++num_waves)
     {
         IdxT num_blocks = std::min(
