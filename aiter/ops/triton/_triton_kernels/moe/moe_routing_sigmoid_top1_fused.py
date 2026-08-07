@@ -2,14 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
 
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 _routing_sigmoid_top1_repr = make_kernel_repr(
     "_routing_sigmoid_top1_kernel",
@@ -127,13 +126,11 @@ def _routing_sigmoid_top1_kernel(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(M, N, K):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
+    dev = arch_info.get_arch()
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json",
+        required=True,
+    )
 
     n_key = "N16" if N <= 16 else "N128"
     m_key = (
@@ -141,4 +138,4 @@ def _get_config(M, N, K):
         if M >= 8192
         else "large" if M >= 4096 else "medium" if M >= 2048 else "small"
     )
-    return _get_config._config_dict[n_key][m_key]
+    return config[n_key][m_key]
