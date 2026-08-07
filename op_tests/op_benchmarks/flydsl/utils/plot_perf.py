@@ -69,6 +69,21 @@ _DEFAULT_COLORS: dict[str, str] = {
 _DEFAULT_BASELINE = "Triton"
 
 
+def category_label(impl_name: str, impl_categories: dict[str, str] | None = None) -> str:
+    """Category label for an impl name, e.g. ``"hip"`` -> ``"HIP"``.
+
+    Use this rather than ``str.capitalize()`` to derive a ``baseline_label``:
+    the labels are not all title-case (``"HIP"``), so capitalising ``"hip"``
+    yields ``"Hip"``, which matches no category and silently blanks every
+    speedup column in the summary table and plot.
+    """
+    cats = impl_categories or _DEFAULT_CATEGORIES
+    for prefix, label in cats.items():
+        if impl_name.startswith(prefix):
+            return label
+    return impl_name.capitalize()
+
+
 # --------------------------------------------------------------------------- #
 # Markdown parser
 # --------------------------------------------------------------------------- #
@@ -112,7 +127,6 @@ def parse_bench_md(path: str, impl_categories: dict[str, str] | None = None) -> 
                     continue
                 row = dict(zip(header_cols, cells))
                 impl_name = row.get("impl", "").strip()
-                mode = row.get("mode", "graph").strip()
                 if not impl_name:
                     continue
 
@@ -122,15 +136,41 @@ def parse_bench_md(path: str, impl_categories: dict[str, str] | None = None) -> 
                     except (ValueError, AttributeError):
                         return None
 
-                entry = {
-                    "time_us":    _float(row.get("time_us", "")),
-                    "tflops":     _float(row.get("tflops", "")),
-                    "verify":     row.get("verify", "N/A"),
-                    "vs_baseline": row.get("vs_baseline", "-"),
+                # ``write_bench_markdown`` emits one column per (metric, mode):
+                # ``time_<mode>_us`` / ``tflops_<mode>`` / ``vs_<baseline>_<mode>``
+                # (headers are lower-cased above), with no separate ``mode``
+                # column. Discover the modes from the time columns. The older
+                # flat ``time_us``/``tflops``/``mode`` layout is still accepted so
+                # previously-written reports keep parsing.
+                per_mode = {
+                    m.group(1)
+                    for m in (re.match(r"time_(.+)_us$", c) for c in row)
+                    if m
                 }
-                if impl_name not in impls:
-                    impls[impl_name] = {}
-                impls[impl_name][mode] = entry
+                if per_mode:
+                    for mode in per_mode:
+                        vs = next(
+                            (
+                                v
+                                for k, v in row.items()
+                                if k.startswith("vs_") and k.endswith(f"_{mode}")
+                            ),
+                            "-",
+                        )
+                        impls.setdefault(impl_name, {})[mode] = {
+                            "time_us": _float(row.get(f"time_{mode}_us", "")),
+                            "tflops": _float(row.get(f"tflops_{mode}", "")),
+                            "verify": row.get("verify", "N/A"),
+                            "vs_baseline": vs,
+                        }
+                else:
+                    mode = row.get("mode", "graph").strip()
+                    impls.setdefault(impl_name, {})[mode] = {
+                        "time_us": _float(row.get("time_us", "")),
+                        "tflops": _float(row.get("tflops", "")),
+                        "verify": row.get("verify", "N/A"),
+                        "vs_baseline": row.get("vs_baseline", "-"),
+                    }
             else:
                 if in_table and line and not line.startswith("|"):
                     in_table = False

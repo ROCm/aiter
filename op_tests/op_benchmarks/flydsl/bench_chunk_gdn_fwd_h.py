@@ -63,7 +63,12 @@ from utils.bench_common import (
     print_result_table,
     write_bench_markdown,
 )
-from utils.plot_perf import make_bar_chart, make_summary_md, parse_bench_md
+from utils.plot_perf import (
+    category_label,
+    make_bar_chart,
+    make_summary_md,
+    parse_bench_md,
+)
 
 # --------------------------------------------------------------------------- #
 # Preset shapes
@@ -517,18 +522,26 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
     baseline_times: dict[str, float] = {}
     results_by_impl: dict = {}
 
-    # Label the auto row with the tag the heuristic actually picked for THIS
-    # shape (e.g. "flydsl:auto(bv64)"), so a sweep records what ran. Keys may
-    # differ per shape; both output tables iterate row["impls"] per row, so that
-    # is fine.
+    # Report the auto row under the concrete variant the heuristic picked for
+    # THIS shape -- i.e. "flydsl:bv32", exactly the label an explicit
+    # --flydsl-variants run produces, so rows are directly comparable across
+    # runs. Keys may differ per shape; both output tables iterate row["impls"]
+    # per row, so that is fine.
+    auto_key = FLYDSL_PREFIX + AUTO_VARIANT
     auto_label = None
-    if FLYDSL_PREFIX + AUTO_VARIANT in impls:
+    if auto_key in impls:
         resolved = _auto_variant_for_shape(shape, cu)
         if resolved:
-            auto_label = f"{FLYDSL_PREFIX}{AUTO_VARIANT}({resolved})"
+            auto_label = FLYDSL_PREFIX + resolved
+            if auto_label in impls:
+                # The same variant was ALSO requested explicitly; it is the same
+                # kernel, so drop the duplicate rather than benchmark it twice
+                # (and rather than let one row silently overwrite the other).
+                print(f"  [skip] {auto_key} resolves to {auto_label}, already requested")
+                impls = {k: v for k, v in impls.items() if k != auto_key}
 
     for impl_name, fn in impls.items():
-        if impl_name == FLYDSL_PREFIX + AUTO_VARIANT and auto_label:
+        if impl_name == auto_key and auto_label:
             impl_name = auto_label
         print(f"  {impl_name}...", end=" ", flush=True)
         closure = _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu)
@@ -656,11 +669,11 @@ def run(args):
             png_path = str(out_dir / f"{stem}-plot.png")
             modes_plot = ["eager", "graph"] if args.mode == "all" else [args.mode]
             make_bar_chart(results, png_path, title=_BENCH_TITLE,
-                           mode=modes_plot[0], baseline_label=args.baseline.capitalize())
+                           mode=modes_plot[0], baseline_label=category_label(args.baseline))
             summary_md = str(out_dir / f"{stem}-summary.md")
             make_summary_md(results, summary_md, png_path, args.output,
                             title=_BENCH_TITLE, mode=modes_plot[0],
-                            baseline_label=args.baseline.capitalize())
+                            baseline_label=category_label(args.baseline))
         except Exception as e:
             warnings.warn(f"Plot/summary generation failed: {e}")
 
