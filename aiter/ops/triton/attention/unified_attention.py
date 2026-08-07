@@ -1050,13 +1050,10 @@ def _gfx950_unified_attention(
     SLIDING_WINDOW = 1 + window_size[0]
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
 
-    if HEAD_SIZE < 128:
-        if ALL_DECODE:
-            waves_per_eu = 1
-        elif SLIDING_WINDOW > 0:
-            waves_per_eu = 0
-        else:
-            waves_per_eu = 3
+    if SLIDING_WINDOW > 0 and not ALL_DECODE and HEAD_SIZE <= 128:
+        waves_per_eu = 0
+    elif HEAD_SIZE < 128:
+        waves_per_eu = 1 if ALL_DECODE else 3
     elif HEAD_SIZE >= 256:
         waves_per_eu = 2 if (Q_FP8 and not ALL_DECODE) else 1
     else:
