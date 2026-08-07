@@ -7,20 +7,22 @@ This module hosts the ``torch``-facing wrappers for the FlyDSL GDN prefill
 kernels, keeping their kernel-compile modules under ``kernels.`` free of any
 ``torch`` dependency (mirroring the layering used by ``kernels.gdr_decode``):
 
-* ``chunk_gated_delta_rule_fwd_h_flydsl`` -- K5 hidden-state recurrence
+* ``chunk_gated_delta_rule_fwd_h_flydsl`` -- hidden-state recurrence
   (``compile_chunk_gated_delta_h``). Prepares tensors, chooses ``BV`` with a
   rule-based grid/CU heuristic, manages the compiled kernel cache and stream.
-* ``gdn_prepare_fwd_flydsl`` -- K1..K4 chunk prepare fused into one kernel
-  (``compile_gdn_prepare``). Allocates the outputs and applies the
-  anti-camping ``grid_x`` padding.
+* ``gdn_prepare_fwd_flydsl`` -- cumsum, gated KKT, triangular inverse and the
+  WY ``w``/``u`` GEMMs fused into one kernel (``compile_gdn_prepare``).
+  Allocates the outputs and applies the anti-camping ``grid_x`` padding.
 
 For an end-to-end GDN forward, call
 ``aiter.ops.triton.gated_delta_net.chunk_gated_delta_rule_opt_vk`` with
-``use_chunk_flydsl=True`` (K5) and/or ``use_prepare_flydsl=True`` (K1..K4).
-The two are independent: the prepare wrapper matches the layout and
-exponent-domain contract of the Triton K1+K2 pair it replaces, so it composes
-with any of the three K5 backends. Use ``gdn_prepare_flydsl_supported`` to
-check a problem shape before selecting it.
+``use_chunk_flydsl=True`` (hidden state) and/or ``use_prepare_flydsl=True``
+(prepare). The two are independent: the prepare wrapper matches the layout and
+exponent-domain contract of the Triton
+``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
+``fused_solve_tril_recompute_w_u`` pair it replaces, so it composes with any of
+the three ``chunk_gated_delta_rule_fwd_h`` backends. Use
+``gdn_prepare_flydsl_supported`` to check a problem shape before selecting it.
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ import triton
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_offsets,
-    prepare_max_seq_chunks,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
@@ -43,7 +44,7 @@ from .kernels.gdn_prepare import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
-# place of exp(g) (matches the Triton VK / HIP K5 convention).
+# place of exp(g) (matches the Triton VK / HIP convention).
 _RCP_LN2 = math.log2(math.e)
 
 
@@ -54,7 +55,7 @@ __all__ = [
 ]
 
 
-# -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
+# -- Hidden-state host wrapper (FlyDSL kernel + rule-based BV selection) ---
 
 _compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
@@ -183,7 +184,7 @@ def _heuristic_bv(
         N: number of sequences in the batch (varlen) or batch size.
         is_varlen: whether the kernel runs in variable-length mode.
         Hg: number of k-heads (per TP rank). Currently only used to scope
-            trace-calibrated rules to the K5 H=32/Hg=16 family.
+            trace-calibrated rules to the hidden-state H=32/Hg=16 family.
 
     Returns:
         A BV from ``_BV_CANDIDATES`` that satisfies ``BV <= V`` and
@@ -317,7 +318,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     num_decode_tokens: int = 0,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """FlyDSL K5 host wrapper.
+    """FlyDSL hidden-state recurrence host wrapper.
 
     Signature is API-compatible with
     ``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h.chunk_gated_delta_rule_fwd_h_opt_vk``:
@@ -327,10 +328,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         w: [B, H, T_flat, K] bf16, head-major contiguous layout.
         u: [B, H, T_flat, V] bf16, head-major contiguous layout.
         g: [B, H, T_total] f32 cumulative gate, head-major contiguous
-            (matches Triton VK / HIP K5), or None. Must be a
+            (matches Triton VK / HIP), or None. Must be a
             ``contiguous()`` tensor with stride-1 along the T dimension.
             Caller passes ``g`` in natural-log space; when
-            ``use_exp2=True`` the K1+K2 producer is expected to have
+            ``use_exp2=True`` the prepare stage is expected to have
             already pre-scaled ``g`` by ``log2(e)`` (i.e. ``g`` is in
             log2 space) -- this matches the Triton VK convention and is
             NOT re-scaled by this wrapper.
@@ -344,9 +345,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         save_new_value: whether to materialize ``v_new``.
         cu_seqlens: [N+1] LongTensor for variable-length batching, or None.
         state_dtype: optional initial/final state dtype (float32 or bfloat16).
-        use_exp2: whether ``g`` is in log2 space. Standalone K5 callers pass
+        use_exp2: whether ``g`` is in log2 space. Standalone callers pass
             natural-log ``g`` by default; end-to-end prefill passes the Triton
-            K1 ``use_exp2`` setting through explicitly.
+            prepare stage's ``use_exp2`` setting through explicitly.
         num_decodes: number of leading decode-only sequences to skip in
             ``cu_seqlens``. When nonzero, ``cu_seqlens`` is the ORIGINAL,
             cache-stable metadata tensor (decode prefix included) and the
@@ -454,27 +455,28 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
 
     # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK /
-    # HIP K5). The kernel reads ``g`` with stride-1 along the T dim; require
+    # HIP). The kernel reads ``g`` with stride-1 along the T dim; require
     # the caller to provide a contiguous head-major tensor.
     if g is not None:
         assert g.is_contiguous(), (
-            "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
-            f"or [H, T_flat]); got strides={g.stride()}, shape={tuple(g.shape)}."
+            "FlyDSL hidden state: ``g`` must be contiguous (head-major "
+            f"[B, H, T_flat] or [H, T_flat]); got strides={g.stride()}, "
+            f"shape={tuple(g.shape)}."
         )
         assert g.shape[-1] == T_flat, (
-            f"FlyDSL K5: ``g.shape[-1]`` must equal T_flat={T_flat}, "
+            f"FlyDSL hidden state: ``g.shape[-1]`` must equal T_flat={T_flat}, "
             f"got g.shape={tuple(g.shape)}."
         )
         assert g.shape[-2] == H, (
-            f"FlyDSL K5: ``g.shape[-2]`` must equal H={H}, "
+            f"FlyDSL hidden state: ``g.shape[-2]`` must equal H={H}, "
             f"got g.shape={tuple(g.shape)}."
         )
     g_arg = g if g is not None else dummy
 
-    # Mirror the Triton VK wrapper: when ``use_exp2=True`` the K5 kernel
-    # interprets ``gk`` in log2 space, so pre-scale by log2(e) here. The
+    # Mirror the Triton VK wrapper: when ``use_exp2=True`` the hidden-state
+    # kernel interprets ``gk`` in log2 space, so pre-scale by log2(e) here. The
     # kernel-side ``_fast_exp`` for ``gk`` is shared with the ``g`` path;
-    # ``g`` itself must already be log2-scaled by the K1+K2 producer when
+    # ``g`` itself must already be log2-scaled by the prepare stage when
     # use_exp2 is on.
     if gk is not None:
         gk = gk.contiguous()
@@ -566,7 +568,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     return h, v_new, final_state
 
 
-# -- K1..K4 prepare host wrapper (single fused FlyDSL kernel) --------------
+# -- GDN prepare host wrapper (single fused FlyDSL kernel) -----------------
 
 
 def _device_index(t: torch.Tensor) -> int:
@@ -574,49 +576,31 @@ def _device_index(t: torch.Tensor) -> int:
     return t.device.index if t.device.index is not None else torch.cuda.current_device()
 
 
-@functools.cache
-def _num_xcd(device_index: int) -> int:
-    """XCD (Accelerator Complex Die) count on the given device.
+def _pad_grid_x_odd(grid_x: int) -> int:
+    """Round grid_x up to odd; only upward, since NT columns are required."""
+    return grid_x | 1
 
-    The HW workgroup->XCD dispatch is the dominant partition behind the grid_x
-    camping (see the anti-camping padding in the wrapper).  On CDNA each XCD
-    holds a fixed number of active CUs, so we recover the XCD count from the
-    visible CU count (also correct under CPX/partitioned modes, which expose
-    fewer CUs):
-        gfx942  MI300X/MI325X = 304 CU, MI300A = 228 CU  @ 38 CU/XCD -> 8 or 6
-        gfx950  MI350/MI355   = 256 CU                    @ 32 CU/XCD -> 8
+
+@functools.cache
+def _is_cdna_mfma_arch() -> bool:
+    """Whether the live GPU has the CDNA bf16 MFMA the prepare kernel needs.
+
+    ``get_gfx_runtime`` is the repo's runtime dispatch helper (``get_gfx`` is
+    for build-time codegen and honors ``GPU_ARCHS``). It raises on archs it does
+    not know, which here just means the fused path is unavailable.
     """
-    p = torch.cuda.get_device_properties(device_index)
-    arch = getattr(p, "gcnArchName", "").split(":")[0]
-    cu_per_xcd = {"gfx942": 38, "gfx950": 32}.get(arch)
-    if cu_per_xcd:
-        return max(1, round(p.multi_processor_count / cu_per_xcd))
-    return 8  # sane CDNA default
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        return get_gfx_runtime().startswith(("gfx94", "gfx95"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
-def _pad_grid_x_coprime(grid_x: int, num_xcd: int) -> int:
-    """Smallest grid_x' >= grid_x that is coprime with num_xcd (>= NT columns
-    are required to cover the longest sequence, so we only pad upward)."""
-    while num_xcd > 1 and math.gcd(grid_x, num_xcd) != 1:
-        grid_x += 1
-    return grid_x
-
-
-@functools.cache
-def _is_cdna_mfma_arch(device_index: int) -> bool:
-    """Whether the device runs the CDNA bf16 MFMA path the prepare kernel needs."""
-    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
-    return arch.split(":")[0].startswith(("gfx94", "gfx95"))
-
-
-# The launch hands flattened views to FlyDSL's C-ABI packer, which describes
-# sizes as C ``int``, so a view of 2**31 elements or more dies with a bare
-# ``struct.error`` before the kernel ever runs. ``w_bar``/``u_bar`` are the
-# widest views at ``B*H*T*K`` elements -- equal to ``v.numel()`` here, since the
-# predicate already pins ``K == V`` -- so bounding v bounds them. Measured on
-# gfx950 (H=32, Hg=16, K=V=128): clean at T_flat=524160, raises at 524288, which
-# is exactly 2**31 output elements. The Triton pair computes both, so falling
-# back keeps that shape working instead of crashing.
+# The launch hands flattened views to FlyDSL's C-ABI packer, which sizes them as
+# C ``int``, so a view of 2**31 elements or more raises ``struct.error`` before
+# the kernel runs. ``w_bar``/``u_bar`` are the widest views and match
+# ``v.numel()`` (the predicate pins ``K == V``), so bounding v bounds them.
 _MAX_FLAT_ELEMS = 2**31
 
 
@@ -629,12 +613,8 @@ def gdn_prepare_flydsl_supported(
     """Whether ``gdn_prepare_fwd_flydsl`` can serve this problem shape.
 
     The fused kernel covers a deliberately narrow slice of what the Triton
-    K1+K2 pair accepts -- ``compile_gdn_prepare`` hard-asserts ``BT=64``,
-    ``K=128`` and ``V=128``, the epilogue emits bf16, the GEMMs are CDNA bf16
-    MFMA, the single launch needs ``k`` and ``v`` co-resident on one device,
-    and the launch ABI caps a flattened view at ``2**31`` elements. Callers use
-    this to pick the fused path only where it applies and fall back to Triton
-    everywhere else, instead of tripping an assert.
+    prepare pair accepts. Callers gate on this to fall back to Triton
+    everywhere else instead of tripping an assert inside the compile.
     """
     return (
         BT == 64
@@ -646,7 +626,7 @@ def gdn_prepare_flydsl_supported(
         and v.is_cuda
         and _device_index(k) == _device_index(v)
         and v.numel() < _MAX_FLAT_ELEMS
-        and _is_cdna_mfma_arch(_device_index(k))
+        and _is_cdna_mfma_arch()
     )
 
 
@@ -664,13 +644,13 @@ def gdn_prepare_fwd_flydsl(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FlyDSL GDN prepare (K1..K4 fused) host wrapper.
+    """FlyDSL GDN prepare host wrapper (cumsum, KKT, inverse and WY fused).
 
     Drop-in for the Triton ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
     ``fused_solve_tril_recompute_w_u`` pair: same inputs, same output layouts
     and exponent domain, one kernel instead of three dispatches. The
     ``A_raw [B, T, H, BT]`` fp32 intermediate those two exchange never
-    materializes here (256 MiB at T=32768, H=32).
+    materializes here.
 
     Args:
         k: [B, T, Hg, K] bf16.
@@ -682,32 +662,31 @@ def gdn_prepare_fwd_flydsl(
         BT: chunk size (must be 64).
         Hg: number of K/V heads; defaults to ``k.shape[2]``. ``H % Hg == 0``.
         use_exp2: when True, publish ``g_cumsum`` in log2 space (pre-scaled by
-            ``log2(e)``) so the downstream K5/K6 kernels can use ``exp2``.
-            Matches the Triton K1 ``use_exp2`` convention, including its
-            default. ``w_bar``/``u_bar`` are unaffected.
+            ``log2(e)``) so the downstream ``chunk_gated_delta_rule_fwd_h`` and
+            ``chunk_fwd_o`` kernels can use ``exp2``. Matches the ``use_exp2``
+            convention of the Triton pair above, including its default.
+            ``w_bar``/``u_bar`` are unaffected.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
             the ORIGINAL ``cu_seqlens`` (the data tensors are expected
-            pre-sliced to the prefill region). Offsets are rebased internally
-            via the cached prologue helpers, which key on the original
-            tensor's identity, so the grid metadata stays cache-warm across
-            forward calls and no per-forward device-to-host read happens.
-        prefill_metadata: prebuilt reusable K1--K6 schedule. Preferred over the
-            cached helpers when several GDR layers share one batch: the grid
-            shape then comes straight off the host-resident schedule.
+            pre-sliced to the prefill region). ``prefill_metadata`` carries the
+            rebased offsets, so no per-forward device-to-host read happens.
+        prefill_metadata: prebuilt reusable prefill schedule, required whenever
+            ``cu_seqlens`` is given and shareable across the GDR layers of one
+            batch. The grid shape comes straight off it, keeping the launch off
+            the device offsets. Raises when absent for a varlen batch, which the
+            ``chunk_gated_delta_rule_*`` entry points pre-empt by warning and
+            falling back to the Triton prepare pair.
         stream: launch stream; defaults to the current stream.
 
     Returns:
         (w_bar [B, H, T, K] bf16, u_bar [B, H, T, V] bf16,
         g_cumsum [B, H, T] f32) -- all head-major contiguous, i.e. stride 1
-        along T within a head, as K5 and K6 require.
+        along T within a head, as ``chunk_gated_delta_rule_fwd_h`` and
+        ``chunk_fwd_o`` require.
 
     All three outputs are shaped on the caller's ``T``; ``T`` need not be a
-    multiple of ``BT`` (the ragged last chunk is handled by the kernel's
-    ``seqlen`` guards, so no input padding is done).
-
-    KKT, the triangular inverse, and the WY GEMMs all run on MFMA bf16
-    16x16x16; see ``kernels.gdn_prepare.compile_gdn_prepare`` for the LDS
-    layout and the fixed ``s_vT`` bank-swizzle.
+    multiple of ``BT``, as the kernel guards the ragged last chunk on
+    ``seqlen`` instead of requiring padded inputs.
     """
     B, T, Hg_in, K = k.shape
     H = v.shape[2]
@@ -716,13 +695,10 @@ def gdn_prepare_fwd_flydsl(
         Hg = Hg_in
     assert H % Hg == 0
 
-    # ``w_bar``/``u_bar`` are emitted as bf16, so silently up/down-casting a
-    # non-bf16 ``k``/``v`` here would hand the downstream K5 a ``w``/``u`` whose
-    # dtype disagrees with ``k`` -- and K5 derives ``h`` from ``k.dtype`` but
-    # ``v_new`` from ``u.dtype``, so the mismatch surfaces as mixed-precision
-    # garbage in K6 rather than as an error. Reject it here instead. Callers who
-    # need fp16 should stay on the Triton K1+K2 pair, which follows the input
-    # dtype.
+    # Casting a non-bf16 ``k``/``v`` here would leave ``w``/``u`` disagreeing
+    # with ``k``, which ``chunk_gated_delta_rule_fwd_h`` turns into silent
+    # mixed precision downstream rather than an error. Callers needing fp16
+    # should stay on the Triton prepare pair, which follows the input dtype.
     if k.dtype is not torch.bfloat16 or v.dtype is not torch.bfloat16:
         raise TypeError(
             "gdn_prepare_fwd_flydsl emits bf16 `w_bar`/`u_bar` and therefore "
@@ -733,16 +709,16 @@ def gdn_prepare_fwd_flydsl(
             "`num_decodes` / `num_decode_tokens` describe a packed varlen batch "
             "and require `cu_seqlens`."
         )
-    # Everything past this point assumes the supported slice: an unsupported
-    # arch or head dim would otherwise surface as a compile-time assert, and a
-    # host-side or cross-device tensor as a segfault inside the launch.
+    # Everything past this point assumes the supported slice; unchecked, an
+    # unsupported shape surfaces as a compile assert and a cross-device tensor
+    # as a segfault inside the launch.
     if not gdn_prepare_flydsl_supported(k, v, BT=BT):
         raise ValueError(
             "gdn_prepare_fwd_flydsl serves bf16 `k`/`v` with K=V=128 and BT=64, "
             "co-resident on one CDNA device, under 2**31 flattened elements; "
             f"got k={tuple(k.shape)} {k.dtype} on {k.device}, "
             f"v={tuple(v.shape)} {v.dtype} on {v.device}, BT={BT}. Gate on "
-            "`gdn_prepare_flydsl_supported` and use the Triton K1+K2 pair "
+            "`gdn_prepare_flydsl_supported` and use the Triton prepare pair "
             "wherever it returns False."
         )
 
@@ -754,58 +730,51 @@ def gdn_prepare_fwd_flydsl(
     is_varlen = cu_seqlens is not None
     if is_varlen:
         assert B == 1
-        # The launch grid is rectangular -- ``NT`` chunk columns by
-        # ``num_seqs * H`` rows -- so it needs the LONGEST sequence's chunk
-        # count, not the flattened total. Both host ints come from the shared
-        # schedule (or the identity-keyed caches), so no per-forward D2H.
-        if prefill_metadata is not None:
-            prefill_metadata.validate(
-                cu_seqlens=cu_seqlens,
-                chunk_size=BT,
-                num_decodes=num_decodes,
-                num_decode_tokens=num_decode_tokens,
-                total_prefill_tokens=T,
-                num_sequences=len(cu_seqlens) - 1,
+        # The grid is rectangular -- ``NT`` chunk columns by ``num_seqs * H``
+        # rows -- so it needs the LONGEST sequence's chunk count, not the
+        # flattened total. Only the host-resident schedule carries that, and
+        # deriving it from ``cu_seqlens`` would cost a device-to-host read per
+        # layer per forward, so refuse it here. Callers coming through
+        # ``chunk_gated_delta_rule_*`` warn and use the Triton pair instead.
+        if prefill_metadata is None:
+            raise ValueError(
+                "gdn_prepare_fwd_flydsl needs `prefill_metadata` for a varlen "
+                "batch: its launch grid is sized by the longest sequence's chunk "
+                "count, which is only available on the host from the prefill "
+                "schedule. Build one with "
+                "`build_gated_delta_rule_prefill_metadata`, or use the Triton "
+                "prepare pair."
             )
-            schedule = prefill_metadata.get_chunk_schedule(
-                BT,
-                num_decodes=num_decodes,
-                num_decode_tokens=num_decode_tokens,
-            )
-            kernel_cu_seqlens = schedule.kernel_cu_seqlens
-            num_seqs = schedule.n_prefill
-            NT = schedule.max_seq_chunks
-        else:
-            # Pass the ORIGINAL (cache-stable) cu_seqlens plus the decode ints
-            # into the cached helpers; handing them a freshly-rebased tensor
-            # would key the caches on an unstable identity and re-fire the D2H
-            # every call.
-            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-                cu_seqlens, num_decodes, num_decode_tokens
-            )
-            num_seqs = len(kernel_cu_seqlens) - 1
-            NT = prepare_max_seq_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
-        # Device-to-device narrowing cast; the result feeds only the launch, so
-        # its identity does not matter to the caches above.
-        cu = kernel_cu_seqlens.to(device=k.device, dtype=torch.int32).contiguous()
+        prefill_metadata.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            total_prefill_tokens=T,
+            num_sequences=len(cu_seqlens) - 1,
+        )
+        schedule = prefill_metadata.get_chunk_schedule(
+            BT,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+        num_seqs = schedule.n_prefill
+        NT = schedule.max_seq_chunks
+        cu = schedule.kernel_cu_seqlens.to(
+            device=k.device, dtype=torch.int32
+        ).contiguous()
     else:
-        # The dense build never dereferences ``cu_t``, so hand it ``k`` as the
-        # placeholder pointer instead of allocating a dummy buffer for it.
+        # The dense build never dereferences ``cu``, so hand it ``k`` as the
+        # placeholder pointer instead of allocating a dummy buffer.
         cu = k
         num_seqs = B
-        # No input padding for a ragged last chunk: every global access in the
-        # kernel is already bounded by ``seqlen`` -- the buffer descriptors are
-        # clamped to the sequence's last row, so out-of-range loads return zero
-        # and out-of-range stores are dropped, in hardware.  A dense tail
-        # therefore behaves exactly like varlen's ragged last chunk.  Padding
-        # instead cost four input copies plus an oversized output allocation,
-        # and forced a trailing ``[:, :T]`` slice that returned non-contiguous
-        # tensors for B > 1.
+        # A ragged last chunk needs no input padding: the kernel bounds every
+        # global access on ``seqlen``, so a dense tail behaves exactly like
+        # varlen's ragged last chunk.
         NT = (T + BT - 1) // BT
 
-    # The kernel writes every output position (dense: row r is written by chunk
-    # r // BT; varlen: each packed token is written by exactly one block), so
-    # empty is safe and avoids two ~5us fill kernels.
+    # Every output position is written by exactly one block, so ``empty`` is
+    # safe and skips two fill kernels.
     w_bar = torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
     u_bar = torch.empty(B, H, T, V, dtype=torch.bfloat16, device=k.device)
     g_cumsum = torch.empty(B, H, T, dtype=torch.float32, device=k.device)
@@ -813,20 +782,13 @@ def gdn_prepare_fwd_flydsl(
     grid_x = NT
     grid_y = num_seqs * H
 
-    # Anti partition-camping: the HW dispatches workgroups to the GPU's XCDs
-    # (8 on MI300X/MI325X/MI350, 6 on MI300A; each XCD = 4 shader engines).
-    # When varlen work is skewed (one long sequence among many short ones) and
-    # grid_x (== NT) shares a factor with the XCD count, the long sequence's
-    # chunk blocks pile onto a few XCDs/SEs while the rest idle -> up to ~8x
-    # slower.  Measured (grid_x=16 on 8 XCDs): all heavy work landed on 1 XCD,
-    # SQ_BUSY per-SE CV 1.73 / max-mean 7.5x; camping strength tracks
-    # gcd(grid_x, num_xcd).  Padding grid_x up to the nearest value coprime
-    # with num_xcd stripes the blocks across every XCD (coprime with an even
-    # num_xcd => odd => also clears the 4-SE tier).  The extra chunk column(s)
-    # are >= every seqlen so they early-exit and the output is bit-identical.
-    # Only varlen skews (dense = uniform full chunks).
+    # Anti-camping. With an even grid_x, a skewed varlen batch -- one long
+    # sequence among short ones -- spreads its chunk columns unevenly and leaves
+    # much of the device idle: measured 25us against 17us at NT=32. An odd
+    # grid_x spreads them, and the extra column exceeds every seqlen, so it
+    # early-exits and the output is unchanged. Dense batches never skew.
     if is_varlen and NT >= 2:
-        grid_x = _pad_grid_x_coprime(NT, _num_xcd(_device_index(k)))
+        grid_x = _pad_grid_x_odd(NT)
 
     if stream is None:
         stream = torch.cuda.current_stream()

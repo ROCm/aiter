@@ -1,6 +1,7 @@
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import os
+import warnings
 
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
@@ -1274,13 +1275,13 @@ def test_chunk_opt_vk_varlen(
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
-# --- Fused FlyDSL K1..K4 prepare (use_prepare_flydsl) ---------------------
+# --- Fused FlyDSL GDN prepare (use_prepare_flydsl) ------------------------
 #
-# The fused kernel replaces the Triton K1+K2 pair and reproduces its output
-# layouts ([B, H, T, K/V] head-major w/u, [B, H, T] g_cumsum) and exponent
-# domain exactly, so the tests below hold K5/K6 fixed and compare the flag on
-# vs off. Checking against recurrent_gated_delta_rule_ref instead would bury
-# the swap under the pipeline's own, much larger, algebraic error.
+# The fused kernel reproduces the output layouts and exponent domain of the
+# Triton fused_chunk_local_cumsum_scaled_dot_kkt_fwd +
+# fused_solve_tril_recompute_w_u pair exactly, so the tests below compare the
+# flag on vs off. Checking against recurrent_gated_delta_rule_ref instead would
+# bury the swap under the pipeline's own, much larger, algebraic error.
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
@@ -1297,27 +1298,24 @@ requires_flydsl_prepare = pytest.mark.skipif(
     reason="flydsl is not installed, so use_prepare_flydsl cannot be exercised",
 )
 
-# The swap only perturbs the last bits of the bf16 w/u handed to K5, but K5
-# accumulates them across chunks and K6 mixes them into o, so the end-to-end gap
-# is a few bf16 ULPs on values of order 1. Asserted on absolute error rather
-# than via assert_close: the whole claim is bit-level agreement between two
-# paths, and assert_close's relative ratio downgrades to a warning under
-# FLA_CI_ENV, which would let a real divergence through.
+# The swap perturbs only the last bits of w/u, which the pipeline accumulates
+# into a few bf16 ULPs end to end. Asserted on absolute error rather than via
+# assert_close, whose relative ratio downgrades to a warning under FLA_CI_ENV
+# and would let a real divergence through.
 _PREPARE_ATOL_O = 6e-3
 _PREPARE_ATOL_HT = 1e-2
 
-# The fused prepare emits one set of w/u/g_cumsum regardless of which K5 reads
-# them, and each K5 backend's own correctness is covered by the tests above, so
+# The fused prepare emits the same w/u/g_cumsum whichever backend reads them, so
 # the backend sweep rides on the varlen case only -- the harder address path.
-_PREPARE_K5_BACKENDS = [
-    pytest.param({}, id="k5_triton_vk"),
-    pytest.param({"use_chunk_flydsl": True}, id="k5_flydsl"),
+_PREPARE_HIDDEN_BACKENDS = [
+    pytest.param({}, id="hidden_triton_vk"),
+    pytest.param({"use_chunk_flydsl": True}, id="hidden_flydsl"),
     pytest.param(
         {"use_chunk_hip": True},
-        id="k5_hip",
+        id="hidden_hip",
         marks=pytest.mark.skipif(
             not IS_AMD or _is_gfx12_runtime(),
-            reason="HIP K5 kernel requires a non-gfx12 AMD device",
+            reason="HIP hidden-state kernel requires a non-gfx12 AMD device",
         ),
     ),
 ]
@@ -1372,41 +1370,30 @@ def _assert_prepare_swap_is_transparent(inputs, *, cu_seqlens, **kwargs):
 
 
 @requires_flydsl_prepare
-@pytest.mark.parametrize(
-    ("B", "T", "Hg", "H", "seed"),
-    [
-        # B > 1 takes the dense head-major output base ((i_b*H + i_h)*T), a
-        # different branch from varlen's (i_h*T + bos).
-        pytest.param(2, 192, 4, 4, 1, id="dense_b2"),
-        # Hg != H exercises the i_h // (H//Hg) key/value broadcast.
-        pytest.param(1, 256, 4, 16, 2, id="dense_gqa"),
-        # T % 64 != 0 exercises the ragged-tail store clamp, which is
-        # per-(sequence, head) under the head-major epilogue: a sequence-level
-        # limit would spill the tail rows into the NEXT head's slab instead of
-        # out of the tensor.
-        pytest.param(1, 300, 4, 8, 3, id="dense_ragged"),
-    ],
-)
-def test_chunk_opt_vk_prepare_flydsl(B: int, T: int, Hg: int, H: int, seed: int):
-    inputs = _prepare_make_inputs(B, T, Hg, H, 128, n_state=B, seed=seed)
+def test_chunk_opt_vk_prepare_flydsl_dense():
+    """B > 1 dense, the one output-base branch varlen cannot reach (it needs B == 1).
+
+    The GQA and ragged-tail shapes are covered against both oracles in
+    op_tests/flydsl_tests/test_flydsl_gdn_prepare.py and ride through this
+    pipeline in the varlen case below, so they are not repeated here.
+    """
+    inputs = _prepare_make_inputs(2, 192, 4, 4, 128, n_state=2, seed=1)
     _assert_prepare_swap_is_transparent(inputs, cu_seqlens=None)
 
 
 @requires_flydsl_prepare
-@pytest.mark.parametrize("k5_kwargs", _PREPARE_K5_BACKENDS)
-@pytest.mark.parametrize("with_metadata", [False, True], ids=["cached", "metadata"])
+@pytest.mark.parametrize("hidden_kwargs", _PREPARE_HIDDEN_BACKENDS)
 @pytest.mark.skipif(
     os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
     reason="Skipping varlen test because SKIP_TEST_CHUNK_VARLEN is set",
 )
-def test_chunk_opt_vk_prepare_flydsl_varlen(with_metadata: bool, k5_kwargs: dict):
-    """Skewed, GQA, ragged varlen batch against every K5 backend.
+def test_chunk_opt_vk_prepare_flydsl_varlen(hidden_kwargs: dict):
+    """Skewed, GQA, ragged varlen batch against every hidden-state backend.
 
     The fused prepare launches a rectangular (chunk column, sequence x head)
     grid, so it needs the LONGEST sequence's chunk count -- not the flattened
     total the other stages use. Mixing one long sequence with short ragged ones
-    is what catches that, and ``with_metadata`` covers both ways the count is
-    derived: off the prebuilt schedule, or off the identity-keyed caches.
+    is what catches that.
     """
     seq_lens = [1024, 15, 100, 300]
     cu_list = [0]
@@ -1417,18 +1404,16 @@ def test_chunk_opt_vk_prepare_flydsl_varlen(with_metadata: bool, k5_kwargs: dict
         1, cu_list[-1], 4, 16, 128, n_state=len(seq_lens), seed=4
     )
 
-    kwargs = dict(k5_kwargs)
-    if with_metadata:
-        kwargs["prefill_metadata"] = build_gated_delta_rule_prefill_metadata(
-            seq_lens, cu_seqlens=cu_seqlens, chunk_size=64
-        )
+    kwargs = dict(hidden_kwargs)
+    kwargs["prefill_metadata"] = build_gated_delta_rule_prefill_metadata(
+        seq_lens, cu_seqlens=cu_seqlens, chunk_size=64
+    )
 
     _assert_prepare_swap_is_transparent(inputs, cu_seqlens=cu_seqlens, **kwargs)
 
 
 @requires_flydsl_prepare
-@pytest.mark.parametrize("with_metadata", [False, True], ids=["cached", "metadata"])
-def test_chunk_opt_vk_prepare_flydsl_decode_prefix(with_metadata: bool):
+def test_chunk_opt_vk_prepare_flydsl_decode_prefix():
     """Leading decode-only sequences must be rebased away, as Triton does.
 
     ``cu_seqlens`` keeps the decode prefix while the data tensors are pre-sliced
@@ -1452,34 +1437,30 @@ def test_chunk_opt_vk_prepare_flydsl_decode_prefix(with_metadata: bool):
     kwargs = {
         "num_decodes": num_decodes,
         "num_decode_tokens": num_decode_tokens,
-    }
-    if with_metadata:
-        kwargs["prefill_metadata"] = build_gated_delta_rule_prefill_metadata(
+        "prefill_metadata": build_gated_delta_rule_prefill_metadata(
             seq_lens,
             cu_seqlens=cu_seqlens,
             chunk_size=64,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
-        )
+        ),
+    }
 
     _assert_prepare_swap_is_transparent(inputs, cu_seqlens=cu_seqlens, **kwargs)
 
 
 @requires_flydsl_prepare
-@pytest.mark.parametrize(
-    ("dtype", "D"),
-    [
-        # fp16 is the dangerous one: the fused kernel emits bf16 w/u, and K5
-        # takes h from k.dtype but v_new from u.dtype, so accepting fp16 would
-        # feed K6 mixed precision instead of raising.
-        pytest.param(torch.float16, 128, id="fp16"),
-        # D != 128 would trip compile_gdn_prepare's hard assert.
-        pytest.param(torch.bfloat16, 64, id="head_dim_64"),
-    ],
-)
-def test_chunk_opt_vk_prepare_flydsl_falls_back(dtype: torch.dtype, D: int):
-    """Outside the fused kernel's support the flag must be refused, not asserted."""
-    inputs = _prepare_make_inputs(1, 192, 4, 4, D, n_state=1, seed=6, dtype=dtype)
+def test_chunk_opt_vk_prepare_flydsl_falls_back():
+    """Outside the fused kernel's support the flag must be refused, not asserted.
+
+    fp16 stands in for the whole unsupported slice, which
+    op_tests/flydsl_tests/test_flydsl_gdn_prepare.py enumerates: it is the
+    dangerous one, because the fused kernel emits bf16 w/u and accepting it
+    would feed the rest of the pipeline mixed precision.
+    """
+    inputs = _prepare_make_inputs(
+        1, 192, 4, 4, 128, n_state=1, seed=6, dtype=torch.float16
+    )
     assert not gdn_prepare_flydsl_supported(inputs["k"], inputs["v"])
 
     o_flag, ht_flag = _run_prepare_pipeline(
@@ -1495,30 +1476,81 @@ def test_chunk_opt_vk_prepare_flydsl_falls_back(dtype: torch.dtype, D: int):
 
 
 @requires_flydsl_prepare
+def test_chunk_opt_vk_prepare_flydsl_varlen_without_schedule_warns():
+    """A varlen batch with no schedule warns and runs the Triton pair.
+
+    The rectangular grid needs the longest sequence's chunk count, which without
+    a schedule could only come from a device-to-host read per layer per forward.
+    Falling back keeps such a caller working, but it has to say so, or the kernel
+    silently never runs and the flag looks effective when it is not.
+    """
+    seq_lens = [128, 172]
+    cu_list = [0]
+    for length in seq_lens:
+        cu_list.append(cu_list[-1] + length)
+    cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
+    inputs = _prepare_make_inputs(
+        1, cu_list[-1], 4, 8, 128, n_state=len(seq_lens), seed=8
+    )
+
+    with pytest.warns(UserWarning, match="prefill_metadata"):
+        o_flag, ht_flag = _run_prepare_pipeline(
+            inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True
+        )
+    o_ref, ht_ref = _run_prepare_pipeline(
+        inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=False
+    )
+
+    assert torch.equal(o_flag, o_ref)
+    assert torch.equal(ht_flag, ht_ref)
+
+    # seq_lens_cpu builds the schedule for the caller, so no warning is due.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        _run_prepare_pipeline(
+            inputs,
+            cu_seqlens=cu_seqlens,
+            use_prepare_flydsl=True,
+            seq_lens_cpu=seq_lens,
+        )
+
+
+@requires_flydsl_prepare
 def test_chunk_opt_vk_prepare_flydsl_does_not_sync():
     """A warmed-up varlen forward must not read anything back to the host.
 
-    The wrapper originally derived its grid with ``.tolist()`` on the device
-    offsets, which blocks once per layer per forward; the identity-keyed caches
-    exist to remove exactly that. Only the cached path is pinned here -- with a
-    prebuilt schedule every host value is host-resident by construction.
+    The fused prepare takes its grid off the host-resident schedule; every other
+    stage takes its chunk indices off the identity-keyed caches. A device read
+    slipping into either would block once per layer per forward.
     """
-    cu_list = [0, 128, 300, 600]
+    seq_lens = [128, 172, 300]
+    cu_list = [0]
+    for length in seq_lens:
+        cu_list.append(cu_list[-1] + length)
     cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
     inputs = _prepare_make_inputs(
-        1, cu_list[-1], 4, 8, 128, n_state=len(cu_list) - 1, seed=7
+        1, cu_list[-1], 4, 8, 128, n_state=len(seq_lens), seed=7
     )
+    # Built once outside the measured region, as a server does per batch: the
+    # build itself copies the host lengths to the device.
+    kwargs = {
+        "cu_seqlens": cu_seqlens,
+        "use_prepare_flydsl": True,
+        "prefill_metadata": build_gated_delta_rule_prefill_metadata(
+            seq_lens, cu_seqlens=cu_seqlens, chunk_size=64
+        ),
+    }
 
     # Warm up: JIT compilation and the one-shot memoized offset reads may
     # synchronize; steady-state forwards may not.
     for _ in range(2):
-        _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
+        _run_prepare_pipeline(inputs, **kwargs)
     torch.cuda.synchronize()
 
     prev_sync_debug_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
+        _run_prepare_pipeline(inputs, **kwargs)
     finally:
         torch.cuda.set_sync_debug_mode(prev_sync_debug_mode)
 
