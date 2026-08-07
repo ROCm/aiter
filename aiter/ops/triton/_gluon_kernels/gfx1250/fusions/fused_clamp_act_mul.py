@@ -106,30 +106,17 @@ def _fused_clamp_silu_mul_kernel(
     )
 
     # setup + setup store
-    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
-    mask = offs < n_half                        
-    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        
-    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  
-
-    out_acc = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
-    )
-
-    # store
-    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=out_ptr,
-        shape=[M, n_half],
-        strides=[out_stride_m, out_stride_n],
-        block_shape=[1, BLOCK_SIZE_N],
-        layout=shared_tdm_layout_2d,
-    )
+    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)
+    mask = offs < n_half
+    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)
+    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)
+    store_col_offs = (offs * out_stride_n).to(gl.int32)
 
     # main loop
     for i in range(ROWS_PER_PROG):
         row = m_start + i
 
-        # prefetch the NEXT row's gate/up one iteration ahead (fixed lookahead of
-        # 1) so its loads overlap this row's weights load + compute.
+        # prefetch next row if applicable
         if i + 1 < ROWS_PER_PROG:
             nxt = i + 1
             gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_smem.index(nxt))
@@ -138,12 +125,14 @@ def _fused_clamp_silu_mul_kernel(
         # weights load
         if HAVE_WEIGHTS:
             if WEIGHT_BROADCAST:
-                w = gl.load(weights_ptr + row * weights_stride_m).to(gl.float32)  # scalar applied to all out
+                w = gl.load(weights_ptr + row * weights_stride_m)  # scalar applied to all out
             else:
-                w = gl.load(
-                    weights_ptr + row * weights_stride_m + offs * weights_stride_n,
-                    mask=mask, other=0.0, cache_modifier=cache_modifier,
-                ).to(gl.float32)
+                # buffer load weight, also gives slightly better perf
+                w = gl.amd.gfx1250.buffer_load(
+                    weights_ptr + row.to(gl.int64) * weights_stride_m,
+                    (offs * weights_stride_n).to(gl.int32),
+                    mask=mask, other=0.0, cache=cache_modifier,
+                )
 
         if SHUFFLE:
             bs_offs_0 = row // 32          # row-tile of 32
@@ -183,7 +172,7 @@ def _fused_clamp_silu_mul_kernel(
 
         # apply weights
         if HAVE_WEIGHTS:
-            out = out * w
+            out = out * w.to(gl.float32)
 
         # group quant and store
         if HAS_QUANT:
@@ -219,8 +208,7 @@ def _fused_clamp_silu_mul_kernel(
                     gl.reshape(scale_out, [NUM_N_Q_GROUPS]), row_scale_layout
                 )
 
-            # accumulate
-            out_acc.index(i).reshape([BLOCK_SIZE_N]).store(out_q.to(out_ptr.dtype.element_ty))
+            result = out_q
 
             if SHUFFLE:
                 gl.store(
@@ -236,15 +224,12 @@ def _fused_clamp_silu_mul_kernel(
                 )
         else:
             # no quant
-            out_acc.index(i).reshape([BLOCK_SIZE_N]).store(out.to(out_ptr.dtype.element_ty))
+            result = out
 
-    if num_warps > 1:
-        gl.barrier()
-
-    # issue all stores
-    for i in range(ROWS_PER_PROG):
-        row = m_start + i
-        gl.amd.gfx1250.tdm.async_store(out_desc, [row, 0], out_acc.index(i))
-
-    # wait for all stores to complete
-    gl.amd.gfx1250.tdm.async_wait(0)
+        # buffer store for a bit of perf uplift
+        gl.amd.gfx1250.buffer_store(
+            result.to(out_ptr.dtype.element_ty),
+            out_ptr + row.to(gl.int64) * out_stride_m,
+            store_col_offs,
+            mask=mask & (row < M),
+        )
