@@ -301,7 +301,7 @@ def dynamic_mxfp8_quant(
 def dynamic_mxfp8_quant_n32k4_mbn(
     o: torch.Tensor,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused per-1x32 MXFP8 quant + n32k4 scale preshuffle for an mbn activation.
 
     Single Triton launch: quantizes ``o`` to FP8 e4m3 and writes the e8m0 scale
