@@ -1,6 +1,3 @@
-.rocprofv3/
-workloads/
-
 # aiter version
 aiter/_version.py
 
