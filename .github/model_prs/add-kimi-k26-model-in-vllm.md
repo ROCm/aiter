@@ -7,7 +7,9 @@
 - Router type: vllm-router
 - RUN_AFTER_HEALTH: accuracy
 - Co-author: lcskrishna <lollachaitanya@gmail.com>
-- YAML change: add `Kimi-K2.6-MXFP4` to the vLLM benchmark matrix in `.github/workflows/vllm_benchmark.yaml`.
+- YAML changes:
+  - Add `Kimi-K2.6-MXFP4` to the vLLM benchmark matrix in `.github/workflows/vllm_benchmark.yaml`.
+  - Point `.github/workflows/vllm-disagg-ci-smoke-workflow.yaml` at the vLLM disagg config that defines `Kimi-K2.6-MXFP4`.
 - Note: no AITER runtime code change unless follow-up integration is requested.
 - Migration note: moved from the mistaken ATOM repo target to AITER.
 
