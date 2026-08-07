@@ -18,26 +18,16 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
 void rotate_activation(aiter_tensor_t& out,
                        const aiter_tensor_t& input);
 
-void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
-                                   aiter_tensor_t& scale,
-                                   const aiter_tensor_t& input,
-                                   float multiplier);
-
-void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
-                                   aiter_tensor_t& scale,
-                                   const aiter_tensor_t& input,
-                                   float multiplier);
-
 void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
-                                                                         aiter_tensor_t& scale,
-                                                                         const aiter_tensor_t& input,
-                                                                         const aiter_tensor_t& cos,
-                                                                         const aiter_tensor_t& sin,
-                                                                         const aiter_tensor_t& positions,
-                                                                         int32_t rope_dim,
-                                                                         int32_t group_size = 32,
-                                                                         bool shuffle_scale = true,
-                                                                         bool do_rotate_act = true);
+                                            aiter_tensor_t& scale,
+                                            const aiter_tensor_t& input,
+                                            const aiter_tensor_t& cos,
+                                            const aiter_tensor_t& sin,
+                                            const aiter_tensor_t& positions,
+                                            int32_t rope_dim,
+                                            int32_t group_size = 32,
+                                            bool shuffle_scale = true,
+                                            bool do_rotate_act = true);
 
 // rope+hadamard, bf16/fp16 in-place (out shares dtype/stride with input).
 void rope_rotate_activation(aiter_tensor_t& out,

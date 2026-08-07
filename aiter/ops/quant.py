@@ -1250,26 +1250,6 @@ def _rotate_activation_bf16(
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_mxfp6_quant(
-    out: torch.Tensor,
-    scale: torch.Tensor,
-    input: torch.Tensor,
-    multiplier: float,
-) -> None:
-    """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
-
-
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_mxfp4_quant(
-    out: torch.Tensor,
-    scale: torch.Tensor,
-    input: torch.Tensor,
-    multiplier: float,
-) -> None:
-    """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP4 E2M1."""
-
-
 def rotate_activation(
     out: torch.Tensor,
     input: torch.Tensor,

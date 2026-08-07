@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "torch/mha_v4_fwd.h"
+#include "torch/mha_v4_quant.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -21,4 +22,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
           py::arg("softmax_scale"));
+    m.def("rotate_activation_mxfp6_quant",
+          &aiter::torch_itfs::rotate_activation_mxfp6_quant,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"),
+          py::arg("multiplier"));
+    m.def("rotate_activation_mxfp4_quant",
+          &aiter::torch_itfs::rotate_activation_mxfp4_quant,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"),
+          py::arg("multiplier"));
 }

@@ -1659,18 +1659,6 @@ namespace py = pybind11;
           py::arg("group_size")    = 32,                                                     \
           py::arg("shuffle_scale") = true);                                                  \
     m.def("rotate_activation", &aiter::rotate_activation, py::arg("out"), py::arg("input")); \
-    m.def("rotate_activation_mxfp6_quant",                                              \
-          &aiter::rotate_activation_mxfp6_quant,                                        \
-          py::arg("out"),                                                               \
-          py::arg("scale"),                                                             \
-          py::arg("input"),                                                             \
-          py::arg("multiplier"));                                                       \
-    m.def("rotate_activation_mxfp4_quant",                                              \
-          &aiter::rotate_activation_mxfp4_quant,                                        \
-          py::arg("out"),                                                               \
-          py::arg("scale"),                                                             \
-          py::arg("input"),                                                             \
-          py::arg("multiplier"));                                                       \
     m.def("rope_rotate_activation_fp4quant",                                                 \
           &aiter::rope_rotate_activation_fp4quant,                                           \
           py::arg("out"),                                                                    \
