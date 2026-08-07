@@ -54,6 +54,56 @@ def _detect_gfx1250() -> bool:
         return False
 
 
+# PyTorch allocator-config env vars that may carry expandable_segments, in
+# PyTorch's own precedence order (the first one that is set wins; they are not
+# merged). Used only as a fallback when the allocator snapshot is unavailable.
+_ALLOC_CONF_ENV_VARS = (
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
+)
+
+
+def _parse_expandable_segments(conf: str) -> bool:
+    """Extract ``expandable_segments:<bool>`` from a PyTorch alloc-conf string."""
+    for field in conf.split(","):
+        key, _, value = field.partition(":")
+        if key.strip() == "expandable_segments":
+            return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _expandable_segments_enabled() -> bool:
+    """Whether PyTorch's caching allocator has expandable segments active.
+
+    Under expandable_segments the allocator hands out virtual-memory-managed
+    pointers that cannot be exported through hipIpcGetMemHandle (issue #4174).
+    The classic IPC graph-capture path binds the input tensor's own pointer as
+    an IPC handle, so it would fail; detecting this lets us force the copy-in
+    path instead, which stages into the plain-hipMalloc input pool.
+
+    The allocator snapshot is authoritative — it reflects programmatic changes
+    (e.g. torch.cuda.memory._set_allocator_settings) and, importantly, whether
+    the platform actually honors the setting. Environment parsing is only a
+    fallback for PyTorch builds whose snapshot lacks the field.
+    """
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            settings = torch.cuda.memory._snapshot().get("allocator_settings")
+        if settings is not None and "expandable_segments" in settings:
+            return bool(settings["expandable_segments"])
+    except Exception:  # noqa: BLE001
+        pass
+    for name in _ALLOC_CONF_ENV_VARS:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return _parse_expandable_segments(raw)
+    return False
+
+
 # ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
 # back to the HIP VMM transport (i.e. gfx1250 uses VMM only on ROCm < 7.14).
 # NOTE: bisect this across ROCm versions on real hardware (use
@@ -349,11 +399,17 @@ class IPCBuffer:
     device address.  All IPC handle / broadcast / registration logic lives
     in IPCBufferPool.
 
-    When *uncached* is False (default), memory is allocated through PyTorch's
-    caching allocator (torch.empty).  When True, memory is allocated via
-    hipExtMallocWithFlags with hipDeviceMallocUncached, bypassing the cache.
-    Uncached buffers are suitable for cross-GPU synchronization metadata and
-    signal buffers where cache coherence overhead is undesirable.
+    Three allocation modes:
+      * uncached=True: raw device memory via hipExtMallocWithFlags with
+        hipDeviceMallocUncached, bypassing the cache. Suitable for cross-GPU
+        synchronization metadata and signal buffers.
+      * raw_cached=True: raw *cached* device memory via a plain hipMalloc. Like
+        uncached it is a raw allocation (no torch tensor view), but it keeps the
+        cache. Used for the IPC input pool, which must be exportable via
+        hipIpcGetMemHandle even under PyTorch expandable segments — where
+        torch.empty pointers live in a hipMallocAsync pool and cannot be
+        exported (see issue #4174).
+      * neither (default): PyTorch's caching allocator (torch.empty).
     """
 
     def __init__(
@@ -361,15 +417,21 @@ class IPCBuffer:
         size: int,
         device: torch.device,
         uncached: bool = False,
+        raw_cached: bool = False,
         alloc_fn=None,
         free_fn=None,
     ):
         self._size = size
         self._uncached = uncached
+        self._raw_cached = raw_cached
         self._free_fn = free_fn or ops.free_meta_buffer
         if uncached:
             self._buffer = None
             _alloc = alloc_fn or ops.allocate_meta_buffer
+            self._raw_ptr = _alloc(size)
+        elif raw_cached:
+            self._buffer = None
+            _alloc = alloc_fn or ops.allocate_data_buffer
             self._raw_ptr = _alloc(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
@@ -396,7 +458,7 @@ class IPCBuffer:
         return self._uncached
 
     def __del__(self):
-        if self._uncached and self._raw_ptr:
+        if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
 
@@ -442,6 +504,7 @@ class IPCBufferPool:
         self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
         self._graph_register_fn = graph_register_fn or ops.register_graph_buffers
         self._alloc_fn = alloc_fn or ops.allocate_meta_buffer
+        self._data_alloc_fn = ops.allocate_data_buffer
         self._free_fn = free_fn or ops.free_meta_buffer
 
         self._store = dist.distributed_c10d._get_default_store()
@@ -468,22 +531,30 @@ class IPCBufferPool:
 
     # ---- Buffer lifecycle ----
 
-    def create(self, key: str, size: int, uncached: bool = False) -> IPCBuffer:
+    def create(
+        self, key: str, size: int, uncached: bool = False, raw_cached: bool = False
+    ) -> IPCBuffer:
         """Allocate a new IPCBuffer and store it under *key*.
 
         Args:
             key: unique name for this buffer in the pool.
             size: buffer size in bytes.
-            uncached: if True, allocate via hipMalloc (uncached);
-                      if False (default), allocate via torch.empty (cached).
+            uncached: if True, allocate raw uncached device memory
+                      (hipDeviceMallocUncached).
+            raw_cached: if True, allocate raw cached device memory (hipMalloc),
+                      IPC-exportable under expandable segments. Mutually
+                      exclusive with uncached.
+            (if neither is set, allocate via torch.empty).
         """
         if key in self._buffers:
             raise KeyError(f"IPCBuffer '{key}' already exists in the pool")
+        assert not (uncached and raw_cached), "uncached and raw_cached are exclusive"
         buf = IPCBuffer(
             size,
             self._device,
             uncached=uncached,
-            alloc_fn=self._alloc_fn,
+            raw_cached=raw_cached,
+            alloc_fn=self._data_alloc_fn if raw_cached else self._alloc_fn,
             free_fn=self._free_fn,
         )
         self._buffers[key] = buf
@@ -816,6 +887,21 @@ class CustomAllreduce:
         # kernel (arch), so both VMM and IPC gfx1250 paths use copy-in.
         if self._is_gfx1250:
             enable_register_for_capturing = False
+        # PyTorch expandable_segments hands out VMM-managed pointers that cannot
+        # be exported via hipIpcGetMemHandle (issue #4174). The classic IPC
+        # capture path binds the input tensor's own pointer as an IPC handle, so
+        # it would fail. Force the copy-in path, which stages into the plain
+        # hipMalloc input pool (IPC-exportable). The VMM transport does its own
+        # pointer exchange and is unaffected, so only guard the IPC path.
+        if not self._use_vmm and _expandable_segments_enabled():
+            if enable_register_for_capturing:
+                logger.warning(
+                    "PyTorch expandable_segments is enabled; forcing custom "
+                    "allreduce copy-in during CUDA graph capture because "
+                    "expandable-segment pointers cannot be IPC-exported "
+                    "(issue #4174)."
+                )
+            enable_register_for_capturing = False
         self.enable_register_for_capturing = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
@@ -966,7 +1052,10 @@ class CustomAllreduce:
         # Create IPC buffer pool and allocate all named buffers.
         self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
         self._pool.create("meta", meta_size, uncached=True)
-        self._pool.create("input", max_size)
+        # Cached raw hipMalloc (not torch.empty): the input pool is IPC-exported
+        # via hipIpcGetMemHandle, which fails on PyTorch expandable-segment pool
+        # pointers (issue #4174). A plain hipMalloc allocation stays exportable.
+        self._pool.create("input", max_size, raw_cached=True)
 
         handles, offsets = self._pool.get_ipc_meta("meta")
         self._ptr = self._ops_init_custom_ar(

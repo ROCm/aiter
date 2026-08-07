@@ -397,6 +397,21 @@ void free_meta_buffer(int64_t ptr)
     HIP_CALL(hipFree((void*)ptr));
 }
 
+int64_t allocate_data_buffer(int64_t size)
+{
+    // Cached device allocation for the IPC input pool. Unlike the meta buffer
+    // (uncached sync flags), this holds bulk data and must be exportable via
+    // hipIpcGetMemHandle, so it uses a plain hipMalloc instead of PyTorch's
+    // caching allocator (whose expandable-segment pool pointers cannot be
+    // exported). Not zero-initialized: the pool is overwritten before use.
+    int device_index;
+    HIP_CALL(hipGetDevice(&device_index));
+    HipDeviceGuard device_guard(device_index);
+    void* buffer;
+    HIP_CALL(hipMalloc((void**)&buffer, size));
+    return (int64_t)buffer;
+}
+
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
 {
     HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, (void*)inp_ptr));
