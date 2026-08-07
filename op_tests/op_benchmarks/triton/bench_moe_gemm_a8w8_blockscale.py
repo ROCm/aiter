@@ -12,15 +12,15 @@ import torch
 import triton.profiler as proton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 
 # Default group_m, group_n, group_k
 group_shape = (128, 128, 128)

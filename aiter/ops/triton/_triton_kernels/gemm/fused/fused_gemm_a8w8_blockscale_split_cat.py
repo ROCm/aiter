@@ -624,8 +624,6 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ) -> dict:
-    # No lru_cache: get_gemm_config caches internally and returns a fresh
-    # deep copy — memoizing here would hand callers a shared mutable dict.
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
