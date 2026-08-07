@@ -1950,10 +1950,9 @@ def _flash_attn_forward(
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        if not (hdim_q == 192 and hdim_v == 128):
-            return False
-        # Large KV (>= 4GiB per head row): hybrid buffer path in the Opus kernel.
-        return _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
+        # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
+        # 32-bit buffer-offset limit no longer bounds the per-head KV row.
+        return hdim_q == 192 and hdim_v == 128
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2909,7 +2908,6 @@ def _flash_attn_varlen_forward(
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
         ret = ret and (not return_lse) and (not return_softmax)
-        ret = ret and _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
