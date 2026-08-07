@@ -226,6 +226,10 @@ iterations, so load cost is excluded. The smoke CLI uses no hidden warmup:
 By default, `tdm_adapter.py --iters N` uses
 `aiter.test_common.run_perftest(..., testGraph=False)`, the same path as
 `op_tests/test_flydsl_grouped_gemm_gfx1250.py` uses for isolated GEMM timing.
+The adapter times both the captured real production GEMM and the ISA kernel
+with identical warmup/iteration settings. Their results are reported as
+`production_benchmark` and `benchmark`; `benchmark_comparison` reports the ISA
+speedup relative to production.
 
 Set `FLYDSL_TIMER=1` to use FlyDSL
 `tests/kernels/benchmark_common.py::bench_kernel_us` semantics instead: L2 is

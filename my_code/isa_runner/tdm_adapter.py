@@ -379,6 +379,40 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
             )
             record._out_tensor = out_tensor
             record.out_nbytes = out_tensor.numel() * out_tensor.element_size()
+            launch_kw = dict(kw)
+
+            def production_launch():
+                return real_launch(
+                    arg_c,
+                    arg_a,
+                    arg_b,
+                    arg_scale_a,
+                    arg_scale_b,
+                    i32_m,
+                    torch.cuda.current_stream(out_tensor.device),
+                    N,
+                    K,
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                    m_warp,
+                    n_warp,
+                    out_is_f16,
+                    num_buffers,
+                    a_is_fp4,
+                    arg_m_tile_map,
+                    n_experts,
+                    stage1_act,
+                    has_bias,
+                    arg_bias,
+                    f32_swiglu_limit,
+                    stage1_quant_out,
+                    quant_wmma_rep,
+                    arg_quant_scale,
+                    **launch_kw,
+                )
+
+            record._production_launch = production_launch
             records.append(record)
         else:
             record = None
@@ -497,6 +531,7 @@ def _benchmark_like_flydsl(
     iters,
     warmup,
     flush_l2,
+    launch_fn=None,
 ):
     """Use the FlyDSL MoE test's per-iteration event/median methodology."""
     import torch
@@ -531,9 +566,14 @@ def _benchmark_like_flydsl(
         # interval and gives every launch the same destination state.
         live.fill_(_POISON)
 
+    def launch():
+        if launch_fn is not None:
+            return launch_fn()
+        return mod.launch(name, args, spec)
+
     for _ in range(warmup):
         prepare()
-        mod.launch(name, args, spec)
+        launch()
     torch.cuda.synchronize(live.device)
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
@@ -541,7 +581,7 @@ def _benchmark_like_flydsl(
     for i in range(iters):
         prepare()
         starts[i].record(stream)
-        mod.launch(name, args, spec)
+        launch()
         ends[i].record(stream)
     torch.cuda.synchronize(live.device)
 
@@ -577,7 +617,16 @@ def _flydsl_timer_enabled() -> bool:
     )
 
 
-def _benchmark_with_run_perftest(mod, name, args, spec, *, iters, warmup):
+def _benchmark_with_run_perftest(
+    mod,
+    name,
+    args,
+    spec,
+    *,
+    iters,
+    warmup,
+    launch_fn=None,
+):
     """Match the production grouped-MoE kernel benchmark path."""
     from aiter.test_common import run_perftest
 
@@ -587,6 +636,8 @@ def _benchmark_with_run_perftest(mod, name, args, spec, *, iters, warmup):
         raise IsaRunnerError(f"benchmark warmup must be non-negative, got {warmup}")
 
     def launch():
+        if launch_fn is not None:
+            return launch_fn()
         mod.launch(name, args, spec)
 
     _, per_launch_us = run_perftest(
@@ -606,6 +657,41 @@ def _benchmark_with_run_perftest(mod, name, args, spec, *, iters, warmup):
         "block": list(spec.block),
         "shared_mem_bytes": spec.shared_mem_bytes,
     }
+
+
+def _benchmark_dispatch(
+    mod,
+    name,
+    args,
+    spec,
+    live,
+    *,
+    iters,
+    warmup,
+    flush_l2,
+    launch_fn=None,
+):
+    if _flydsl_timer_enabled():
+        return _benchmark_like_flydsl(
+            mod,
+            name,
+            args,
+            spec,
+            live,
+            iters=iters,
+            warmup=warmup,
+            flush_l2=flush_l2,
+            launch_fn=launch_fn,
+        )
+    return _benchmark_with_run_perftest(
+        mod,
+        name,
+        args,
+        spec,
+        iters=iters,
+        warmup=warmup,
+        launch_fn=launch_fn,
+    )
 
 
 def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
@@ -666,27 +752,42 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         }
 
         if iters:
+            production_launch = getattr(cap, "_production_launch", None)
+            if production_launch is None:
+                raise IsaRunnerError(
+                    "no production launch callable captured; rerun capture in-process"
+                )
             kernargs = cap.pack_kernargs()
-            if _flydsl_timer_enabled():
-                report["benchmark"] = _benchmark_like_flydsl(
-                    mod,
-                    name,
-                    kernargs,
-                    spec,
-                    live,
-                    iters=iters,
-                    warmup=warmup,
-                    flush_l2=flush_l2,
-                )
-            else:
-                report["benchmark"] = _benchmark_with_run_perftest(
-                    mod,
-                    name,
-                    kernargs,
-                    spec,
-                    iters=iters,
-                    warmup=warmup,
-                )
+            report["production_benchmark"] = _benchmark_dispatch(
+                None,
+                cap.kernel,
+                None,
+                spec,
+                live,
+                iters=iters,
+                warmup=warmup,
+                flush_l2=flush_l2,
+                launch_fn=production_launch,
+            )
+            report["benchmark"] = _benchmark_dispatch(
+                mod,
+                name,
+                kernargs,
+                spec,
+                live,
+                iters=iters,
+                warmup=warmup,
+                flush_l2=flush_l2,
+            )
+            production_us = report["production_benchmark"]["per_launch_us"]
+            isa_us = report["benchmark"]["per_launch_us"]
+            report["benchmark_comparison"] = {
+                "production_per_launch_us": production_us,
+                "isa_per_launch_us": isa_us,
+                "isa_speedup_vs_production": (
+                    production_us / isa_us if isa_us else None
+                ),
+            }
     finally:
         mod.close()
 

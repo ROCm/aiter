@@ -11,6 +11,7 @@ try:
 except ModuleNotFoundError:
     torch = None
 
+import tdm_adapter as adapter
 from tdm_adapter import (
     _POISON,
     _compare_outputs,
@@ -54,6 +55,32 @@ class TdmAdapterInterfaceTest(unittest.TestCase):
             self.assertFalse(_flydsl_timer_enabled())
         with patch.dict(os.environ, {"FLYDSL_TIMER": "1"}):
             self.assertTrue(_flydsl_timer_enabled())
+
+    def test_benchmark_dispatch_forwards_production_callable(self):
+        production_launch = object()
+        expected = {"per_launch_us": 1.0}
+        with (
+            patch.object(adapter, "_flydsl_timer_enabled", return_value=False),
+            patch.object(
+                adapter,
+                "_benchmark_with_run_perftest",
+                return_value=expected,
+            ) as timer,
+        ):
+            result = adapter._benchmark_dispatch(
+                None,
+                "production_kernel",
+                None,
+                object(),
+                None,
+                iters=100,
+                warmup=20,
+                flush_l2=True,
+                launch_fn=production_launch,
+            )
+
+        self.assertIs(result, expected)
+        self.assertIs(timer.call_args.kwargs["launch_fn"], production_launch)
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
