@@ -17,7 +17,6 @@ TO be added features:
     -
 """
 
-import functools
 
 import triton
 import triton.language as tl
@@ -29,15 +28,16 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_j
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config():
+    # No lru_cache here: load_config_json already caches the parse, and
+    # caching the .copy() would hand every caller the same mutable object.
     dev = arch_info.get_arch()
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json", required=True
     )
     return config[
         "any"
-    ].copy()  # return a copy to avoid mutation of the shared cached config
+    ].copy()  # fresh copy per call — safe for callers to mutate
 
 
 @triton.jit

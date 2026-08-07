@@ -11,10 +11,11 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
-    _get_config,
-)
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
@@ -215,7 +216,8 @@ def bench_mlp_single_weight_init(
     fpath = Path(tempfile.mktemp())
     M, K = xg.shape
     K, N = wg.shape
-    config, _ = _get_config(M, N, K)
+    config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+    compute_splitk_params(config, K)
     config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
     config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
     config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)

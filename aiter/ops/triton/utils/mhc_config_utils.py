@@ -3,13 +3,42 @@
 
 import functools
 import glob
-import json
 import os
 import re
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.gemm_config_utils import USE_LRU_CACHE, _load_config_file
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_CONFIGS_PATH,
+    USE_LRU_CACHE,
+    load_config_json,
+)
+
+_FALLBACK_DEV = "gfx942"
+
+
+def _load_with_fallback(dev: str, fname: str, required: bool = False) -> dict | None:
+    """Load ``{dev}-{fname}``, falling back to the gfx942 copy for arches
+    without tuned MHC configs (may be suboptimal)."""
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{fname}")
+    if config is None:
+        config = load_config_json(
+            f"{AITER_TRITON_CONFIGS_PATH}/{_FALLBACK_DEV}-{fname}", required=required
+        )
+    return config
+
+
+@functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
+def _c_thresholds(dev: str, actual_config_name: str) -> tuple[int, ...]:
+    """C values that have a specialized config file (arch-specific plus the
+    gfx942 fallback), sorted ascending."""
+    thresholds = set()
+    for d in {dev, _FALLBACK_DEV}:
+        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{d}-{actual_config_name}-C=*.json"
+        for fpath in glob.glob(pattern):
+            match = re.search(r"-C=(\d+)\.json$", os.path.basename(fpath))
+            if match:
+                thresholds.add(int(match.group(1)))
+    return tuple(sorted(thresholds))
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -49,106 +78,26 @@ def get_mhc_config(
         ValueError: If mode is invalid or missing when required
         KeyError: If no matching config found
     """
-    if not hasattr(get_mhc_config, "_config_cache"):
-        get_mhc_config._config_cache = {}
-
     dev = arch_info.get_arch()
-    fallback_dev = "gfx942"
 
     if mode is None or mode != "sinkhorn":
         raise ValueError(f"mode must be 'sinkhorn', got '{mode}'")
     actual_config_name = f"{config_name}_{mode.upper()}"
 
-    cache_key = f"{dev}_{actual_config_name}"
-
-    # Load default config with fallback for unsupported architectures.
-    # Load into a temp dict and commit only on success, so a failed load
-    # doesn't leave a stale empty entry that masks the error on later calls.
-    if cache_key not in get_mhc_config._config_cache:
-        tmp_cache = {cache_key: {}}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}.json"
-
-        # Try loading architecture-specific config first
-        if not _load_config_file(
-            tmp_cache,
-            cache_key,
-            fpath,
-            "default",
-            fpath_should_exist=False,
-        ):
-            # Fallback to gfx942 configs if architecture-specific config doesn't exist
-            fpath_fallback = (
-                f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}.json"
-            )
-            _load_config_file(
-                tmp_cache,
-                cache_key,
-                fpath_fallback,
-                "default",
-                fpath_should_exist=True,
-            )
-        get_mhc_config._config_cache[cache_key] = tmp_cache[cache_key]
-
-    config_dict_key = "default"
+    # Default config (must exist for the arch or the gfx942 fallback)
+    config_dict = _load_with_fallback(dev, f"{actual_config_name}.json", required=True)
     used_specialized = False
 
-    # Try C-specific config (threshold matching: largest C <= input C)
-    c_thresholds_key = f"{cache_key}_c_thresholds"
-
-    # Discover available C-specific config files once per cache_key
-    if c_thresholds_key not in get_mhc_config._config_cache:
-        c_thresholds = []
-
-        # Check architecture-specific C configs
-        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C=*.json"
-        for fpath in glob.glob(pattern):
-            basename = os.path.basename(fpath)
-            match = re.search(r"-C=(\d+)\.json$", basename)
-            if match:
-                c_thresholds.append(int(match.group(1)))
-
-        # Also check fallback architecture C configs
-        if dev != fallback_dev:
-            pattern_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C=*.json"
-            for fpath in glob.glob(pattern_fallback):
-                basename = os.path.basename(fpath)
-                match = re.search(r"-C=(\d+)\.json$", basename)
-                if match:
-                    c_val = int(match.group(1))
-                    if c_val not in c_thresholds:
-                        c_thresholds.append(c_val)
-
-        c_thresholds.sort()
-        get_mhc_config._config_cache[c_thresholds_key] = c_thresholds
-
-    # Find largest C threshold <= input C
-    for c_threshold in reversed(get_mhc_config._config_cache[c_thresholds_key]):
+    # C-specific config: largest discovered threshold <= input C wins
+    for c_threshold in reversed(_c_thresholds(dev, actual_config_name)):
         if C >= c_threshold:
-            c_key = f"C_{c_threshold}"
-            if c_key not in get_mhc_config._config_cache[cache_key]:
-                fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C={c_threshold}.json"
-                # Try architecture-specific C config first, fallback to gfx942 if needed
-                if not _load_config_file(
-                    get_mhc_config._config_cache,
-                    cache_key,
-                    fpath,
-                    c_key,
-                    fpath_should_exist=False,
-                ):
-                    fpath_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C={c_threshold}.json"
-                    _load_config_file(
-                        get_mhc_config._config_cache,
-                        cache_key,
-                        fpath_fallback,
-                        c_key,
-                        fpath_should_exist=False,
-                    )
-            if c_key in get_mhc_config._config_cache[cache_key]:
-                config_dict_key = c_key
+            specialized = _load_with_fallback(
+                dev, f"{actual_config_name}-C={c_threshold}.json"
+            )
+            if specialized is not None:
+                config_dict = specialized
                 used_specialized = True
                 break
-
-    config_dict = get_mhc_config._config_cache[cache_key][config_dict_key]
 
     # Extract M_LEQ_x keys and their thresholds, sorted ascending
     m_leq_keys = []
@@ -187,29 +136,10 @@ def get_mhc_post_config(M: int, C: int) -> dict:
 
     Picks the largest ``C_<value> <= C``, else ``"default"``.
     """
-    if M <= 1024 and C == 4096:
-        return {
-            "BLOCK_M": 8,
-            "BLOCK_C": 512,
-            "num_warps": 8,
-            "num_stages": 1,
-            "waves_per_eu": 3,
-        }
-
-    if not hasattr(get_mhc_post_config, "_file_cache"):
-        get_mhc_post_config._file_cache = {}
-
     dev = arch_info.get_arch()
-    if dev not in get_mhc_post_config._file_cache:
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json"
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(
-                f"Required MHC_POST config file doesn't exist: {fpath}"
-            )
-        with open(fpath, "r") as f:
-            get_mhc_post_config._file_cache[dev] = json.load(f)
-
-    cfg = get_mhc_post_config._file_cache[dev]
+    cfg = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json", required=True
+    )
 
     c_thresholds = sorted(
         int(k[2:]) for k in cfg if k.startswith("C_") and k[2:].isdigit()

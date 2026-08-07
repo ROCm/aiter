@@ -115,16 +115,20 @@ Consequences to keep in mind:
   would change which file gfx1250 resolves to — verify that is intended.
 - Results are cached twice: `functools.lru_cache` on the full argument
   tuple, plus a per-path cache of parsed JSON
-  (`_load_json`) that also caches negative results (missing files). Adding a
-  config file at runtime therefore has no effect; restart the process
-  (tooling may call `_load_json.cache_clear()` instead).
+  (`utils/core.py::load_config_json`) that also caches negative results
+  (missing files). Adding a config file at runtime therefore has no effect;
+  restart the process (tooling may call `load_config_json.cache_clear()`
+  instead).
+- `.github/scripts/select_triton_tests.py` only globs the legacy flat
+  `configs/gemm/` — configs in the nested layout are invisible to CI test
+  selection until it learns the `<d_type>/` layout.
 
-Direct-path loaders bypass all of this. Grep for
-`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything — `gluon/gemm_a8w8.py`
-and `gluon/gemm_a8w8_blockscale.py` still build legacy `gemm/gluon/` paths by
-hand and must be edited when their configs move. `gluon/gemm_afp4wfp4.py`
-builds the nested `<arch>/gluon/gemm/gemm_afp4wfp4/DEFAULT.json` path by hand
-and must be kept in sync with any future layout change.
+Direct-path loaders bypass the resolver's directory probe. Grep for
+`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —
+`gluon/gemm_a8w8_blockscale.py` still builds legacy `gemm/gluon/` paths by
+hand (via `load_config_json`) and must be edited when its configs move.
+`gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
+`get_gemm_config(backend="gluon")` and need no changes.
 
 ---
 
@@ -141,9 +145,9 @@ Required top-level shape:
 ```
 
 - `M_LEQ_x` is searched ascending over `STANDARD_M_BOUNDS =
-  (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`, then `M_GEQ_x`
-  descending, then `any`. A caller may override with `bounds=(...)`, which must
-  be strictly increasing positive ints.
+  (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`, then
+  `M_GEQ_x` descending, then `any`. A caller may override with
+  `bounds=(...)`, which must be strictly increasing positive ints.
 - `any` must exist unless every reachable `M` is covered by an explicit bound.
 - The deprecated `{"large": ..., "small": ...}` shape must not be introduced.
 - A `KeyError` at lookup time means no bound matched — usually a missing `any`.
@@ -194,7 +198,7 @@ Dashes, underscores, and case all fold together, so new config names must stay
 distinct under that transform — `GEMM-FOO-BAR` and `GEMM-FOO_BAR` would collide.
 
 Config-name patterns: `GEMM-A{x}W{y}`, `BATCHED_GEMM-A{x}W{y}`,
-`GEMM_PREQUANT-...`, `FUSED-GEMM-{op}`, `FF-A{x}W{y}-fused`; variant suffixes
+`FUSED-GEMM-{op}`, `FF-A{x}W{y}-fused`; variant suffixes
 `_PRESHUFFLED`, `_BLOCKSCALE`.
 
 **`K` in AFP4WFP4 filenames is the logical K, i.e. `2 * K_bytes`.** The kernel

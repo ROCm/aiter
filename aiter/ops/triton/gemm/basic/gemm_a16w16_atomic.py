@@ -67,13 +67,6 @@ def gemm_a16w16_atomic_(
     else:
         config = deserialize_str(config)
 
-    # For compatability reasons, these keys may not exist in the config
-    # TODO: This needs to be embedded in the configs later
-    if "NUM_KSPLIT" not in config:
-        config["NUM_KSPLIT"] = 1
-    if "cache_modifier" not in config:
-        config["cache_modifier"] = ""
-
     if y is None:
         # atomic add requires 0 tensor
         if config["NUM_KSPLIT"] == 1:
