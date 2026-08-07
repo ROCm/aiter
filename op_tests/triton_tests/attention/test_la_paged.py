@@ -18,7 +18,9 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
         (1, 96, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
+        # h * n_ctx * d == 3.22e9 elements, past INT32_MAX. Guards the 64-bit
+        # widening of the per-head K/V offset in la_persistent_paged.
+        (1, 96, 16, [524288], 64, 912, torch.float16, 16, 256, 2, 4),
         (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
         (1, 128, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
@@ -59,11 +61,6 @@ def test_persistent_lean_attention(
 
     torch.manual_seed(20)
     random.seed(20)
-    # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue
-    # WA with shorter d and longer BLOCK_N
-    if any(item > 524288 for item in n_ctx):
-        BLOCK_N = 256
-        d = 16
 
     assert batch == len(n_ctx)
 
