@@ -6,23 +6,13 @@ on:
     - cron: '30 18 * * *'
   workflow_dispatch:
     inputs:
-      vllm_repository:
-        description: "vLLM repository to clone"
-        required: false
-        type: string
-        default: "itej89/vllm"
-      vllm_ref:
-        description: "vLLM branch/ref with lcskrishna/vllm PR #5 changes"
-        required: false
-        type: string
-        default: "fix/moriio-ep8-dp8-read-rdma-session-routing"
       model_name:
-        description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
+        description: "MODEL_NAME passed to the upstream vLLM disagg case"
         required: false
         type: string
         default: "DeepSeek-V3"
       disagg_scripts_stage:
-        description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
+        description: "Shared path visible to Spur login and compute nodes"
         required: false
         type: string
         default: "/data/xinhuang/vllm-disagg-logs/"
@@ -32,20 +22,15 @@ on:
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
-        description: "Docker image passed to run_xPyD disagg Slurm script"
+        description: "Official vLLM ROCm image used to build and run current AITER"
         required: false
         type: string
-        default: "vllm/vllm-openai-rocm:v0.23.0"
-      slurm_script:
-        description: "Slurm script under .buildkite/amd-disagg"
+        default: "rocm/vllm-dev:nightly"
+      slurm_time_limit:
+        description: "Wall-clock limit passed to the upstream vLLM Slurm case"
         required: false
         type: string
-        default: "run_xPyD_diagg.slurm"
-      wait_timeout_minutes:
-        description: "Maximum time to wait for the Slurm job"
-        required: false
-        type: string
-        default: "420"
+        default: "08:30:00"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -54,59 +39,96 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  VLLM_REPOSITORY_URL: https://github.com/vllm-project/vllm.git
+  VLLM_BRANCH: main
+  # TODO: Remove the temporary fetch/cherry-pick after vLLM PR #47030 merges.
+  VLLM_DI_PR_NUMBER: "47030"
+  BASE_IMAGE: ${{ inputs.image || 'rocm/vllm-dev:nightly' }}
+  MODEL_NAME: ${{ inputs.model_name || 'DeepSeek-V3' }}
+  DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
+  SPUR_NODELIST: ${{ inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
+  SLURM_TIME_LIMIT: ${{ inputs.slurm_time_limit || '08:30:00' }}
+  AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-whl-${{ github.run_id }}
+
 jobs:
-  vllm-disagg-smoke:
-    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
-    timeout-minutes: 480
-    env:
-      VLLM_REPOSITORY_DEFAULT: itej89/vllm
-      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
-      MODEL_NAME_DEFAULT: DeepSeek-V3
-      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
-      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
-      IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
-      ROUTER_TYPE_DEFAULT: vllm-router
-      MORIIO_READ_MODE_DEFAULT: "0"
-      VLLM_ROUTER_IMAGE_DEFAULT: vllm/vllm-router:nightly
-      SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
-      WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
+  build_aiter_wheel:
+    name: Build Aiter wheel
+    runs-on: build-only-aiter
     steps:
-      - name: Apply vLLM disagg inputs
+      - name: Checkout AITER
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
-          import json
-          import os
-          import sys
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
 
-          with open(sys.argv[1], encoding="utf-8") as f:
-              event = json.load(f)
+      - name: Docker login
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
-          inputs = event.get("inputs") or {}
+      - name: Build AITER wheel in the vLLM nightly image
+        run: |
+          set -euo pipefail
+          bash .github/scripts/docker_pull_with_retry.sh "${BASE_IMAGE}"
+          docker run --rm \
+            --network=host \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            -e AITER_USE_SYSTEM_TRITON=1 \
+            "${BASE_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              shopt -s nullglob
+              rm -rf dist build aiter_meta ./*.egg-info
+              pip uninstall -y aiter amd-aiter || true
+              pip config set global.default-timeout 60
+              pip config set global.retries 10
+              pip install -r requirements.txt
+              pip install --upgrade pandas pyzmq einops numpy==1.26.2
+              pip install --upgrade "pybind11>=3.0.1"
+              pip install --upgrade "ninja>=1.11.1"
+              pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
+              pip install tabulate
+              python setup.py bdist_wheel
+              ls -lh dist/*.whl
+            '
 
-          def value(name: str, default_env: str) -> str:
-              raw = inputs.get(name, "")
-              default = os.environ[default_env]
-              return raw if raw not in ("", None) else default
+      - name: Upload AITER wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: dist/*.whl
+          retention-days: 14
 
-          print(f"VLLM_REPOSITORY={value('vllm_repository', 'VLLM_REPOSITORY_DEFAULT')}")
-          print(f"VLLM_REF={value('vllm_ref', 'VLLM_REF_DEFAULT')}")
-          print(f"MODEL_NAME={value('model_name', 'MODEL_NAME_DEFAULT')}")
-          print(
-              "DISAGG_SCRIPTS_STAGE="
-              + value("disagg_scripts_stage", "DISAGG_SCRIPTS_STAGE_DEFAULT")
-          )
-          print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
-          print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
-          print(f"ROUTER_TYPE={os.environ['ROUTER_TYPE_DEFAULT']}")
-          print(f"MORIIO_READ_MODE={os.environ['MORIIO_READ_MODE_DEFAULT']}")
-          print(f"VLLM_ROUTER_IMAGE={os.environ['VLLM_ROUTER_IMAGE_DEFAULT']}")
-          print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
-          print(
-              "WAIT_TIMEOUT_MINUTES="
-              + value("wait_timeout_minutes", "WAIT_TIMEOUT_MINUTES_DEFAULT")
-          )
-          PY
+  vllm-disagg-smoke:
+    needs: build_aiter_wheel
+    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
+    timeout-minutes: 600
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+    steps:
+      - name: Download current AITER wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: aiter_wheels
 
       - name: Show runner and Slurm state
         run: |
@@ -116,177 +138,169 @@ jobs:
           pwd
           command -v git
           command -v sbatch
-          command -v squeue
+          command -v scontrol
           command -v scancel
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM disagg branch
+      - name: Checkout vLLM main and apply PR 47030
         run: |
           set -euo pipefail
           rm -rf vllm
           git init vllm
           cd vllm
-          git remote add origin "https://github.com/${VLLM_REPOSITORY}.git"
-          git fetch --depth=1 origin "${VLLM_REF}"
+          git remote add origin "${VLLM_REPOSITORY_URL}"
+          git fetch --depth=1 origin "${VLLM_BRANCH}"
           git checkout --detach FETCH_HEAD
+          base_sha="$(git rev-parse HEAD)"
+
+          # Fetch the PR commit and its parent so cherry-pick computes the PR
+          # patch instead of treating the shallow commit as a root commit.
+          git fetch --depth=2 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
+          pr_sha="$(git rev-parse FETCH_HEAD)"
+          git config user.name "AITER CI"
+          git config user.email "aiter-ci@users.noreply.github.com"
+          if ! git cherry-pick "${pr_sha}"; then
+            if git diff --quiet && git diff --cached --quiet; then
+              echo "vLLM PR #${VLLM_DI_PR_NUMBER} is already present on ${VLLM_BRANCH}"
+              git cherry-pick --skip
+            else
+              echo "Failed to apply vLLM PR #${VLLM_DI_PR_NUMBER} to ${VLLM_BRANCH}" >&2
+              exit 1
+            fi
+          fi
+
+          echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
+          echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
+          echo "VLLM_TEST_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Add current AITER wheel overlay to the upstream case
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=("${GITHUB_WORKSPACE}"/aiter_wheels/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+
+          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
+          test -d "${disagg_dir}"
+          mkdir -p "${disagg_dir}/aiter_wheels"
+          cp -f "${wheels[0]}" "${disagg_dir}/aiter_wheels/"
+
+          # The upstream case bind-mounts this directory into every compute-node
+          # container. Install the artifact into a writable overlay before vLLM
+          # starts, leaving the nightly image itself unchanged.
+          python3 - "${disagg_dir}/vllm_disagg.sh" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          content = path.read_text(encoding="utf-8")
+          anchor = 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+          hook = r'''
+
+          install_current_aiter() {
+              shopt -s nullglob
+              local wheels=("${SCRIPT_DIR}"/aiter_wheels/*.whl)
+              if (( ${#wheels[@]} != 1 )); then
+                  echo "[aiter-overlay] expected one wheel, found ${#wheels[@]}" >&2
+                  return 1
+              fi
+
+              local overlay="${AITER_OVERLAY_DIR:-/tmp/aiter_overlay}"
+              rm -rf "${overlay}"
+              mkdir -p "${overlay}"
+              python3 -m pip install --disable-pip-version-check --no-deps \
+                  --target "${overlay}" "${wheels[0]}"
+              export PYTHONPATH="${overlay}${PYTHONPATH:+:${PYTHONPATH}}"
+              python3 -c 'import pathlib, sys, aiter; root = pathlib.Path(sys.argv[1]).resolve(); loaded = pathlib.Path(aiter.__file__).resolve(); print(f"[aiter-overlay] loaded {loaded}"); raise SystemExit(0 if root in loaded.parents else 1)' "${overlay}"
+          }
+
+          install_current_aiter
+          '''
+          if anchor not in content:
+              raise SystemExit(f"Could not find SCRIPT_DIR anchor in {path}")
+          if "install_current_aiter" in content:
+              raise SystemExit(f"AITER overlay hook already exists in {path}")
+          path.write_text(content.replace(anchor, anchor + hook, 1), encoding="utf-8")
+          PY
+
+          ls -lh "${disagg_dir}/aiter_wheels"
+          grep -n "aiter-overlay" "${disagg_dir}/vllm_disagg.sh"
 
       - name: Show vLLM disagg inputs
         run: |
           set -euo pipefail
-          cd vllm
-          git rev-parse HEAD
           {
             echo "### vLLM disagg smoke input"
             echo
-            echo "- vLLM repository: \`${VLLM_REPOSITORY}\`"
-            echo "- vLLM ref: \`${VLLM_REF}\`"
-            echo "- vLLM SHA: \`$(git rev-parse HEAD)\`"
+            echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
+            echo "- vLLM branch: \`${VLLM_BRANCH}\`"
+            echo "- vLLM base SHA: \`${VLLM_BASE_SHA}\`"
+            echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
+            echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
+            echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- MODEL_NAME: \`${MODEL_NAME}\`"
-            echo "- DISAGG_SCRIPTS_STAGE: \`${DISAGG_SCRIPTS_STAGE}\`"
+            echo "- IMAGE: \`${BASE_IMAGE}\`"
             echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
-            echo "- IMAGE: \`${IMAGE}\`"
-            echo "- Requested Slurm script: \`${SLURM_SCRIPT}\`"
+            echo "- SLURM_TIME_LIMIT: \`${SLURM_TIME_LIMIT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Submit and monitor vLLM disagg Slurm job
+      - name: Run upstream vLLM disagg case
         run: |
           set -euo pipefail
-          workdir="vllm/.buildkite/amd-disagg"
-          if [[ ! -d "${workdir}" ]]; then
-            echo "Missing ${workdir}" >&2
-            exit 1
-          fi
-          cd "${workdir}"
+          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
+          cd "${disagg_dir}"
 
-          script="${SLURM_SCRIPT}"
-          if [[ ! -f "${script}" ]]; then
-            for candidate in run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
-              if [[ -f "${candidate}" ]]; then
-                echo "Requested Slurm script ${script} not found; using ${candidate}"
-                script="${candidate}"
-                break
-              fi
-            done
-          fi
-          if [[ ! -f "${script}" ]]; then
-            echo "No run_xPyD disagg Slurm script found under ${PWD}" >&2
-            find . -maxdepth 2 -type f | sort >&2
-            exit 1
+          script="run-slurm-disagg-test.sh"
+          job_script="run_xPyD_disagg.slurm"
+          test -f "${script}"
+          test -f "${job_script}"
+
+          # Spur requires fixed nodes in an in-script directive rather than as
+          # sbatch CLI resource flags. Keep this AITER-runner detail outside the
+          # upstream vLLM environment/model configuration.
+          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${job_script}"; then
+            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${job_script}"
+            echo "Pinned nodes via #SBATCH --nodelist=${SPUR_NODELIST}"
           fi
 
-          log_root="${DISAGG_SCRIPTS_STAGE%/}"
-          mkdir -p "${DISAGG_SCRIPTS_STAGE}" "${log_root}"
-          # run_xPyD_disagg.slurm bind-mounts DISAGG_SCRIPTS_DIR into the container
-          # at /vllm-workspace/.buildkite/amd-disagg and runs vllm_disagg.sh from
-          # there. The runner checkout is login-node-local (invisible to compute
-          # nodes), and Spur sets SLURM_SUBMIT_DIR=/tmp, so stage the scripts into
-          # the compute-visible shared dir and point DISAGG_SCRIPTS_DIR at it.
-          echo "Staging disagg scripts from ${PWD} to ${DISAGG_SCRIPTS_STAGE}"
-          cp -rf ./. "${DISAGG_SCRIPTS_STAGE}/"
-          proxy_src="../../examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py"
-          if [[ ! -f "${proxy_src}" ]]; then
-            echo "Missing MoRIIO toy proxy script: ${proxy_src}" >&2
-            exit 1
-          fi
-          cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
-          squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
-          : > "${squeue_log}"
-          : > "${sacct_log}"
+          log_root="${DISAGG_SCRIPTS_STAGE%/}"
+          mkdir -p "${log_root}"
 
-          # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
-          # resource flags (--nodelist/--nodes/--ntasks/--gres/...), but in-script
-          # #SBATCH directives ARE honored (proven pattern: ATOM pd_submit.sh
-          # writes #SBATCH --nodelist into the submitted script + bare sbatch).
-          # So pin nodes by injecting an in-script #SBATCH --nodelist rather than
-          # passing it on the CLI; the rest stays in the script's own #SBATCH
-          # (nodes=2, ntasks-per-node=1, gres=gpu:8, exclusive).
-          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${script}"; then
-            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${script}"
-            echo "Pinned nodes via in-script directive: #SBATCH --nodelist=${SPUR_NODELIST}"
-          fi
-          sbatch_args=()
-
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
-          LOG_ROOT="${log_root}" \
+          echo "Running upstream vLLM disagg case from PR #${VLLM_DI_PR_NUMBER}"
+          set +e
+          env \
+            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             MODEL_NAME="${MODEL_NAME}" \
-            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
+            IMAGE="${BASE_IMAGE}" \
+            NODES=2 \
+            GPUS_PER_NODE=8 \
+            WAIT=1 \
+            SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
-            IMAGE="${IMAGE}" \
-            ROUTER_TYPE="${ROUTER_TYPE}" \
-            MORIIO_READ_MODE="${MORIIO_READ_MODE}" \
-            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
-            sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
+            LOG_ROOT="${log_root}" \
+            bash "${script}" 2>&1 | tee "${submit_log}"
+          wrapper_rc=${PIPESTATUS[0]}
+          set -e
 
-          job_id="$(
-            python3 - "${submit_log}" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          text = Path(sys.argv[1]).read_text(encoding="utf-8")
-          match = re.search(r"Submitted batch job\s+(\d+)", text)
-          if not match:
-              raise SystemExit(f"Could not parse Slurm job id from: {text!r}")
-          print(match.group(1))
-          PY
-          )"
-          echo "Submitted Slurm job ${job_id}"
-          echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
-
-          cancel_slurm_job() {
-            local rc=$?
-            if [[ "${rc}" -ne 0 && -n "${job_id:-}" ]]; then
-              echo "Cancelling Slurm job ${job_id} after workflow rc=${rc}"
-              scancel "${job_id}" || true
-            fi
-            exit "${rc}"
-          }
-          trap cancel_slurm_job EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-
-          deadline=$((SECONDS + WAIT_TIMEOUT_MINUTES * 60))
-          while true; do
-            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            queue_status="$(squeue -h -j "${job_id}" -o "%i|%T|%M|%D|%R" || true)"
-            if [[ -n "${queue_status}" ]]; then
-              echo "${queue_status}" | tee -a "${squeue_log}"
-              if (( SECONDS >= deadline )); then
-                echo "Timed out waiting for Slurm job ${job_id} after ${WAIT_TIMEOUT_MINUTES} minutes" >&2
-                exit 124
-              fi
-              echo "${now} job ${job_id} still running or pending"
-              sleep 60
-            else
-              echo "${now} job ${job_id} no longer appears in squeue" | tee -a "${squeue_log}"
-              break
-            fi
-          done
-
-          if command -v sacct >/dev/null 2>&1; then
-            for _ in 1 2 3 4 5; do
-              sacct -j "${job_id}" \
-                --format=JobID,State,ExitCode,Elapsed,NodeList \
+          job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" | grep -oE '[0-9]+' | tail -1 || true)"
+          if [[ -n "${job_id}" ]]; then
+            echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
+            if command -v sacct >/dev/null 2>&1; then
+              sacct -j "${job_id}" --format=JobID,State,ExitCode,Elapsed,NodeList \
                 | tee "${sacct_log}" || true
-              if awk -v job="${job_id}" '$1 == job { found=1 } END { exit !found }' "${sacct_log}" >/dev/null 2>&1; then
-                break
-              fi
-              sleep 10
-            done
-
-            state="$(
-              awk -v job="${job_id}" '$1 == job { print $2; exit }' "${sacct_log}"
-            )"
-            echo "Slurm job ${job_id} final state: ${state:-unknown}"
-            if [[ "${state}" != COMPLETED* ]]; then
-              exit 1
             fi
           else
-            echo "sacct is unavailable; submitted job ${job_id} and observed it leave squeue"
+            echo "Could not parse Slurm job id from ${submit_log}" >&2
+            wrapper_rc=1
           fi
+
+          exit "${wrapper_rc}"
 
       - name: Summarize Slurm result
         if: always()
@@ -297,48 +311,30 @@ jobs:
             echo "### vLLM disagg smoke result"
             echo
             echo "- Model: \`${MODEL_NAME:-unknown}\`"
-            echo "- Image: \`${IMAGE:-unknown}\`"
+            echo "- Image: \`${BASE_IMAGE:-unknown}\`"
+            echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
             if [[ -f slurm-sacct.txt && -n "${SLURM_JOB_ID:-}" ]]; then
-              _row="$(awk -v j="${SLURM_JOB_ID}" '$1==j{print $2, $3, $4; exit}' slurm-sacct.txt || true)"
-              read -r _st _ec _el <<< "${_row}" || true
-              echo "- State: \`${_st:-unknown}\` · ExitCode: \`${_ec:-unknown}\` · Elapsed: \`${_el:-unknown}\`"
-              if [[ "${_ec:-}" == "-1:0" || "${_el:-}" == "00:00:00" ]]; then
-                echo "- ⚠️ Slurm launch failure (NODE_FAIL): the workload never ran — NOT a real pass."
-              fi
+              row="$(awk -v job="${SLURM_JOB_ID}" '$1 == job { print $2, $3, $4; exit }' slurm-sacct.txt || true)"
+              read -r state exit_code elapsed <<< "${row}" || true
+              echo "- State: \`${state:-unknown}\`; ExitCode: \`${exit_code:-unknown}\`; Elapsed: \`${elapsed:-unknown}\`"
             fi
-            echo
-            _pd_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
-            if [[ -f "${_pd_log}" ]]; then
-              _verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL):' "${_pd_log}" | tail -1 || true)"
-              if [[ -n "${_verdict}" ]]; then
-                echo "#### Accuracy verdict"
-                echo '```text'
-                echo "${_verdict}"
-                echo '```'
+
+            job_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
+            if [[ -f "${job_log}" ]]; then
+              cp -f "${job_log}" vllm-disagg-job.log
+              overlay_line="$(grep -ahE '\[aiter-overlay\] loaded ' "${job_log}" | head -1 || true)"
+              verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL|VERDICT):' "${job_log}" | tail -1 || true)"
+              if [[ -n "${overlay_line}" ]]; then
+                echo "- AITER overlay: \`${overlay_line}\`"
+              else
+                echo "- AITER overlay: no load confirmation found"
               fi
-              _tbl="$(grep -ahE '^\|' "${_pd_log}" || true)"
-              if [[ -n "${_tbl}" ]]; then
-                echo "#### gsm8k"
-                echo '```text'
-                echo "${_tbl}"
-                echo '```'
+              if [[ -n "${verdict}" ]]; then
+                echo "- Accuracy verdict: \`${verdict}\`"
               fi
             else
-              echo "> No PD log at \`${_pd_log}\` — disagg workload likely never launched."
-            fi
-            echo
-            if [[ -f slurm-submit.txt ]]; then
-              echo "#### sbatch output"
-              echo '```text'
-              cat slurm-submit.txt
-              echo '```'
-            fi
-            if [[ -f slurm-sacct.txt ]]; then
-              echo "#### sacct"
-              echo '```text'
-              cat slurm-sacct.txt
-              echo '```'
+              echo "> No job log at \`${job_log}\`; the workload may not have launched."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -351,5 +347,5 @@ jobs:
           retention-days: 7
           path: |
             slurm-submit.txt
-            slurm-squeue.log
             slurm-sacct.txt
+            vllm-disagg-job.log
