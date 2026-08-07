@@ -65,6 +65,10 @@ FAMILIES = [
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    (
+        "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
+        "mxscale_preshuffle_tuned_gemm",
+    ),
 ]
 
 
@@ -210,6 +214,12 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_mxscale_preshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
+            "mxscale_preshuffle_tuned_gemm",
+        )
 
 
 def _fix_real_tree():

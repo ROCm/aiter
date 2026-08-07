@@ -13,7 +13,7 @@ from packaging.version import Version
 from .moe_common import GateMode
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+_MIN_FLYDSL_VERSION = Version("0.3.0")
 
 __all__ = [
     "GateMode",
@@ -58,6 +58,11 @@ if is_flydsl_available():
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from .mxscale_preshuffle_kernels import (
+        flydsl_mxscale_preshuffle_gemm,
+        gemm_mxscale_preshuffle,
+        get_mxscale_preshuffle_config,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -70,10 +75,13 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_mxscale_preshuffle_gemm",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "gemm_mxscale_preshuffle",
+        "get_mxscale_preshuffle_config",
         # "flydsl_gdr_decode",
     ]
