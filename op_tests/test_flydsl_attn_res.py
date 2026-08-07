@@ -27,6 +27,8 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 _D = 7168
+_D_SMALL = 1024
+_D_UNSUPPORTED = 520
 _MAX_BLOCKS = 8
 _EPS = 1e-5
 _ATOL = 8e-2
@@ -34,17 +36,19 @@ _RTOL = 3e-2
 _PEAK_BW_GBPS_GFX950 = 8000.0
 
 
-def _make_inputs(tokens: int, pad: int = 0):
-    torch.manual_seed(20260804 + tokens)
-    prefix_parent = torch.randn(tokens, _D + pad, dtype=torch.bfloat16)
-    delta_parent = torch.randn(tokens, _D + pad, dtype=torch.bfloat16)
-    blocks_parent = torch.randn(tokens, _MAX_BLOCKS, _D + pad, dtype=torch.bfloat16)
-    prefix = prefix_parent[..., :_D]
-    delta = delta_parent[..., :_D]
-    blocks = blocks_parent[..., :_D]
-    norm_weight = (1.0 + 0.1 * torch.randn(_D)).to(torch.bfloat16)
-    qk_weight = (torch.randn(_D) / math.sqrt(_D)).to(torch.bfloat16)
-    output_norm_weight = (1.0 + 0.1 * torch.randn(_D)).to(torch.bfloat16)
+def _make_inputs(tokens: int, hidden_size: int = _D, pad: int = 0):
+    torch.manual_seed(20260804 + tokens + hidden_size - _D + pad)
+    prefix_parent = torch.randn(tokens, hidden_size + pad, dtype=torch.bfloat16)
+    delta_parent = torch.randn(tokens, hidden_size + pad, dtype=torch.bfloat16)
+    blocks_parent = torch.randn(
+        tokens, _MAX_BLOCKS, hidden_size + pad, dtype=torch.bfloat16
+    )
+    prefix = prefix_parent[..., :hidden_size]
+    delta = delta_parent[..., :hidden_size]
+    blocks = blocks_parent[..., :hidden_size]
+    norm_weight = (1.0 + 0.1 * torch.randn(hidden_size)).to(torch.bfloat16)
+    qk_weight = (torch.randn(hidden_size) / math.sqrt(hidden_size)).to(torch.bfloat16)
+    output_norm_weight = (1.0 + 0.1 * torch.randn(hidden_size)).to(torch.bfloat16)
     return (
         prefix,
         delta,
@@ -63,6 +67,7 @@ def _run_and_check(
     write_block: bool,
     apply_output_norm: bool,
     pad: int = 0,
+    hidden_size: int = _D,
 ):
     block_write_idx = num_blocks if write_block else -1
     (
@@ -73,11 +78,13 @@ def _run_and_check(
         qk_weight,
         output_norm_weight,
         padded_parents,
-    ) = _make_inputs(tokens, pad)
+    ) = _make_inputs(tokens, hidden_size=hidden_size, pad=pad)
     prefix_before = prefix.clone()
     delta_before = delta.clone()
     blocks_before = blocks.clone()
-    padding_before = tuple(parent[..., _D:].clone() for parent in padded_parents)
+    padding_before = tuple(
+        parent[..., hidden_size:].clone() for parent in padded_parents
+    )
     delta_arg = delta if has_delta else None
     output_norm_weight_arg = output_norm_weight if apply_output_norm else None
 
@@ -119,12 +126,13 @@ def _run_and_check(
             "AttnRes "
             f"delta={has_delta}, write={write_block}, "
             f"output_norm={apply_output_norm}, "
-            f"T={tokens}, num_blocks={num_blocks}, pad={pad}: "
+            f"T={tokens}, D={hidden_size}, num_blocks={num_blocks}, pad={pad}: "
         ),
     )
-    assert (
-        error == 0
-    ), f"AttnRes output mismatch for T={tokens}, pad={pad}: error ratio={error}"
+    assert error == 0, (
+        "AttnRes output mismatch for "
+        f"T={tokens}, D={hidden_size}, pad={pad}: error ratio={error}"
+    )
     expected_prefix = prefix_expected if has_delta else prefix_before
     assert torch.equal(prefix, expected_prefix), "prefix side effect mismatch"
     assert torch.equal(blocks, blocks_expected), "blocks side effect mismatch"
@@ -133,7 +141,7 @@ def _run_and_check(
         ("prefix", "delta", "blocks"), padded_parents, padding_before
     ):
         assert torch.equal(
-            parent[..., _D:], expected_padding
+            parent[..., hidden_size:], expected_padding
         ), f"kernel modified {name} padding"
     assert output.is_contiguous(), "output must be contiguous"
 
@@ -150,6 +158,18 @@ def test_flydsl_attn_res_correctness():
     _run_and_check(17, 0, True, True, True)
     _run_and_check(17, _MAX_BLOCKS, False, False, False)
     _run_and_check(17, _MAX_BLOCKS, True, False, True)
+
+    _run_and_check(17, _MAX_BLOCKS, False, False, False, hidden_size=_D_SMALL)
+    _run_and_check(17, _MAX_BLOCKS - 1, True, True, True, hidden_size=_D_SMALL)
+    _run_and_check(
+        17,
+        _MAX_BLOCKS - 1,
+        True,
+        True,
+        True,
+        pad=8,
+        hidden_size=_D_SMALL,
+    )
 
     for tokens in (1, 320):
         _run_and_check(tokens, _MAX_BLOCKS, False, False, False)
@@ -223,6 +243,27 @@ def test_flydsl_attn_res_rejects_invalid_specializations(
         )
 
 
+def test_flydsl_attn_res_rejects_unsupported_hidden_size_before_empty_return():
+    """Reject an unsupported D even when T=0 would otherwise skip the launch."""
+    prefix, _, blocks, norm_weight, qk_weight, _, _ = _make_inputs(
+        0, hidden_size=_D_UNSUPPORTED
+    )
+
+    with pytest.raises(ValueError, match="no wave-aligned block size"):
+        flydsl_attn_res(
+            prefix,
+            None,
+            blocks,
+            norm_weight,
+            qk_weight,
+            None,
+            0,
+            -1,
+            _EPS,
+            _EPS,
+        )
+
+
 @pytest.mark.parametrize(
     "layout",
     ("pad7", "non_unit_trailing_stride", "misaligned_base"),
@@ -261,6 +302,7 @@ def benchmark_flydsl_attn_res(
     write_block: bool,
     apply_output_norm: bool,
     pad: int = 0,
+    hidden_size: int = _D,
 ):
     """Validate and measure one supported prefill flag specialization."""
     block_write_idx = num_blocks if write_block else -1
@@ -270,7 +312,8 @@ def benchmark_flydsl_attn_res(
         has_delta,
         write_block,
         apply_output_norm,
-        pad,
+        pad=pad,
+        hidden_size=hidden_size,
     )
 
     # Allocate fresh buffers for timing: delta and snapshot paths mutate inputs
@@ -283,7 +326,7 @@ def benchmark_flydsl_attn_res(
         qk_weight,
         output_norm_weight,
         _,
-    ) = _make_inputs(tokens, pad)
+    ) = _make_inputs(tokens, hidden_size=hidden_size, pad=pad)
     _, us = run_perftest(
         flydsl_attn_res,
         prefix,
@@ -302,10 +345,11 @@ def benchmark_flydsl_attn_res(
     # write, and one output write; all counted rows are BF16.
     k = num_blocks + 1
     rows = k + 2 * int(has_delta) + int(write_block) + 1
-    moved_bytes = rows * tokens * _D * 2
+    moved_bytes = rows * tokens * hidden_size * 2
     gbps = moved_bytes / (us * 1e-6) / 1e9
     floor_us = moved_bytes / (_PEAK_BW_GBPS_GFX950 * 1e9) * 1e6
     return {
+        "D": hidden_size,
         "k": k,
         "has_delta": has_delta,
         "write_block": write_block,
@@ -330,12 +374,15 @@ def main():
     )
     args = parser.parse_args()
     configs = (
-        (_MAX_BLOCKS, False, False, False, 0),
-        (_MAX_BLOCKS - 1, True, True, True, 0),
-        (0, True, True, True, 0),
-        (_MAX_BLOCKS, True, False, False, 0),
-        (_MAX_BLOCKS, False, False, True, 0),
-        (_MAX_BLOCKS - 1, True, True, True, 8),
+        (_D, _MAX_BLOCKS, False, False, False, 0),
+        (_D, _MAX_BLOCKS - 1, True, True, True, 0),
+        (_D, 0, True, True, True, 0),
+        (_D, _MAX_BLOCKS, True, False, False, 0),
+        (_D, _MAX_BLOCKS, False, False, True, 0),
+        (_D, _MAX_BLOCKS - 1, True, True, True, 8),
+        (_D_SMALL, _MAX_BLOCKS, False, False, False, 0),
+        (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 0),
+        (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 8),
     )
     results = [
         benchmark_flydsl_attn_res(
@@ -344,9 +391,10 @@ def main():
             has_delta,
             write_block,
             apply_output_norm,
-            pad,
+            pad=pad,
+            hidden_size=hidden_size,
         )
-        for num_blocks, has_delta, write_block, apply_output_norm, pad in configs
+        for hidden_size, num_blocks, has_delta, write_block, apply_output_norm, pad in configs
         for tokens in args.tokens
     ]
     print(pd.DataFrame(results).to_string(index=False))

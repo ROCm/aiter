@@ -3,11 +3,13 @@
 
 """FlyDSL AttnRes prefill kernel for Kimi-K3.
 
-Each workgroup owns one BF16 token row at D=7168. Inputs may be contiguous or
-have padded leading dimensions when their trailing stride is one and their row
-starts are 16-byte aligned. The kernel reads up to eight block sources plus the
-live prefix, scores sources with RMS-normalized keys, and mixes raw values with
-an online softmax accumulator.
+Each workgroup owns one BF16 token row. Its wave-aligned size is derived from
+the hidden size, preserving the tuned 448-thread configuration at D=7168 and
+using one wave at D=1024. Inputs may be contiguous or have padded leading
+dimensions when their trailing stride is one and their row starts are 16-byte
+aligned. The kernel reads up to eight block sources plus the live prefix,
+scores sources with RMS-normalized keys, and mixes raw values with an online
+softmax accumulator.
 
 Delta update, canonical append snapshot, and output RMSNorm are independent
 compile-time specializations. ``block_write_idx=-1`` disables the snapshot;
@@ -33,12 +35,27 @@ from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flydsl_attn_res"
 
-_HIDDEN_SIZE = 7168
 _MAX_BLOCKS = 8
-_BLOCK_THREADS = 448
 _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
+_TILE_CANDIDATES = (2, 4, 8, 1)
+_MAX_BLOCK_THREADS = 1024
 _LOG2E = math.log2(math.e)
+
+
+def _block_threads_for(num_vec: int) -> int:
+    """Return a wave-aligned block size that prefers two vector tiles per thread."""
+    if num_vec <= 0:
+        raise ValueError(f"num_vec must be positive, got {num_vec}")
+
+    for tiles_per_thread in _TILE_CANDIDATES:
+        if num_vec % tiles_per_thread:
+            continue
+        block_threads = num_vec // tiles_per_thread
+        if block_threads % _WARP_SIZE == 0 and block_threads <= _MAX_BLOCK_THREADS:
+            return block_threads
+
+    raise ValueError(f"no wave-aligned block size covers {num_vec} vectors per row")
 
 
 @lru_cache(maxsize=256)
@@ -52,10 +69,8 @@ def _build_attn_res(
     apply_output_norm: bool,
 ):
     """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
-    if hidden_size != _HIDDEN_SIZE:
-        raise ValueError(
-            f"only hidden_size={_HIDDEN_SIZE} is supported, got {hidden_size}"
-        )
+    if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
+        raise ValueError(f"D={hidden_size} must be a positive multiple of {_VEC_WIDTH}")
     if not 0 <= num_blocks <= _MAX_BLOCKS:
         raise ValueError(f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
     if not -1 <= block_write_idx < _MAX_BLOCKS:
@@ -70,16 +85,13 @@ def _build_attn_res(
         )
 
     num_vec = hidden_size // _VEC_WIDTH
-    if hidden_size % _VEC_WIDTH != 0 or num_vec % _BLOCK_THREADS != 0:
-        raise ValueError(
-            f"D={hidden_size} must divide into {_BLOCK_THREADS}-thread vector tiles"
-        )
-    tiles_per_thread = num_vec // _BLOCK_THREADS
-    red_slots = _BLOCK_THREADS // _WARP_SIZE
+    block_threads = _block_threads_for(num_vec)
+    tiles_per_thread = num_vec // block_threads
+    red_slots = block_threads // _WARP_SIZE
     num_sources = num_blocks + 1
     write_block = block_write_idx >= 0
     kernel_name = (
-        f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{_BLOCK_THREADS}"
+        f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{block_threads}"
         f"_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
         f"_onorm{int(apply_output_norm)}"
     )
@@ -89,7 +101,7 @@ def _build_attn_res(
         sumsq: fx.Array[fx.Float32, red_slots, 16]
         dot: fx.Array[fx.Float32, red_slots, 16]
 
-    @flyc.kernel(name=kernel_name, known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def attn_res_kernel(
         prefix: fx.Tensor,
         delta: fx.Tensor,
@@ -121,6 +133,9 @@ def _build_attn_res(
             return reduced
 
         def block_reduce_add2(sumsq_local, dot_local):
+            if const_expr(red_slots == 1):
+                return wave_reduce_add(sumsq_local), wave_reduce_add(dot_local)
+
             # The previous source's callers must all finish reading slot zero
             # before this source's wave leaders reuse the LDS arrays.
             gpu.barrier()
@@ -153,6 +168,9 @@ def _build_attn_res(
             return fx.memref_load(s_sumsq, 0), fx.memref_load(s_dot, 0)
 
         def block_reduce_add(value):
+            if const_expr(red_slots == 1):
+                return wave_reduce_add(value)
+
             # Keep this structurally aligned with block_reduce_add2. The output
             # RMSNorm epilogue has one payload, so reducing a dummy zero through
             # s_dot would spend shuffles and LDS traffic for no result.
@@ -218,7 +236,7 @@ def _build_attn_res(
         q_local = []
         prefix_local = []
         for tile in range_constexpr(tiles_per_thread):
-            vector_index = tid + tile * _BLOCK_THREADS
+            vector_index = tid + tile * block_threads
             gamma = load_bf16_vec(norm_weight_div, vector_index).to(fx.Float32)
             weight = load_bf16_vec(qk_weight_div, vector_index).to(fx.Float32)
             q_local.append(gamma * weight)
@@ -235,7 +253,7 @@ def _build_attn_res(
             block_out_row = fx.slice(blocks_buf, (token, block_write_idx, None))
             block_out_div = fx.logical_divide(block_out_row, vector_layout)
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = tid + tile * _BLOCK_THREADS
+                vector_index = tid + tile * block_threads
                 store_bf16_vec(prefix_local[tile], block_out_div, vector_index)
 
         mixed_local = [
@@ -287,7 +305,7 @@ def _build_attn_res(
             block_div = fx.logical_divide(block_row, vector_layout)
             source_local = []
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = tid + tile * _BLOCK_THREADS
+                vector_index = tid + tile * block_threads
                 source_local.append(load_bf16_vec(block_div, vector_index))
             max_logit, denominator, mixed_local = consume_source(
                 source_local, max_logit, denominator, mixed_local
@@ -314,7 +332,7 @@ def _build_attn_res(
                 output_norm_weight_buf, vector_layout
             )
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = tid + tile * _BLOCK_THREADS
+                vector_index = tid + tile * block_threads
                 output_gamma = load_bf16_vec(output_norm_weight_div, vector_index).to(
                     fx.Float32
                 )
@@ -323,7 +341,7 @@ def _build_attn_res(
         else:
             inverse_denominator = 1.0 / denominator
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = tid + tile * _BLOCK_THREADS
+                vector_index = tid + tile * block_threads
                 result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
                 store_bf16_vec(result, out_div, vector_index)
 
@@ -349,7 +367,7 @@ def _build_attn_res(
             out,
         ).launch(
             grid=(num_tokens, 1, 1),
-            block=(_BLOCK_THREADS, 1, 1),
+            block=(block_threads, 1, 1),
             stream=stream,
         )
 
@@ -405,6 +423,8 @@ def flydsl_attn_res(
     Multi-dimensional inputs must have unit trailing stride, positive leading
     strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
     pointer for ``BufferCopy128b``. Weight vectors must have ``stride(0) == 1``.
+    ``D`` must be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned
+    block size; D=7168 and D=1024 use 448 and 64 threads respectively.
     """
     has_delta = delta is not None
     apply_output_norm = output_norm_weight is not None
@@ -423,31 +443,37 @@ def flydsl_attn_res(
             f"block_write_idx={block_write_idx}, num_blocks={num_blocks}"
         )
 
-    if prefix.ndim != 2 or prefix.shape[1] != _HIDDEN_SIZE:
+    if prefix.ndim != 2:
+        raise ValueError(f"prefix must have shape [T, D], got {tuple(prefix.shape)}")
+    hidden_size = prefix.shape[1]
+    if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
         raise ValueError(
-            f"prefix must have shape [T, {_HIDDEN_SIZE}], got {tuple(prefix.shape)}"
+            f"prefix hidden size must be a positive multiple of {_VEC_WIDTH}, "
+            f"got {hidden_size}"
         )
+    _block_threads_for(hidden_size // _VEC_WIDTH)
+
     if blocks.ndim != 3 or blocks.shape != (
         prefix.shape[0],
         _MAX_BLOCKS,
-        _HIDDEN_SIZE,
+        hidden_size,
     ):
         raise ValueError(
             "blocks must have shape "
-            f"[T, {_MAX_BLOCKS}, {_HIDDEN_SIZE}], got {tuple(blocks.shape)}"
+            f"[T, {_MAX_BLOCKS}, {hidden_size}], got {tuple(blocks.shape)}"
         )
-    if norm_weight.shape != (_HIDDEN_SIZE,) or qk_weight.shape != (_HIDDEN_SIZE,):
+    if norm_weight.shape != (hidden_size,) or qk_weight.shape != (hidden_size,):
         raise ValueError(
-            f"norm_weight and qk_weight must each have shape ({_HIDDEN_SIZE},)"
+            f"norm_weight and qk_weight must each have shape ({hidden_size},)"
         )
     if has_delta and delta.shape != prefix.shape:
         raise ValueError(
             f"delta must have shape {tuple(prefix.shape)}, got {tuple(delta.shape)}"
         )
-    if apply_output_norm and output_norm_weight.shape != (_HIDDEN_SIZE,):
+    if apply_output_norm and output_norm_weight.shape != (hidden_size,):
         raise ValueError(
             "output_norm_weight must have shape "
-            f"({_HIDDEN_SIZE},), got {tuple(output_norm_weight.shape)}"
+            f"({hidden_size},), got {tuple(output_norm_weight.shape)}"
         )
 
     tensors = (prefix, blocks, norm_weight, qk_weight)
@@ -489,7 +515,7 @@ def flydsl_attn_res(
     delta_arg = delta if has_delta else prefix
     output_norm_weight_arg = output_norm_weight if apply_output_norm else norm_weight
     launcher = _build_attn_res(
-        prefix.shape[1],
+        hidden_size,
         num_blocks,
         float(eps),
         float(output_norm_eps) if apply_output_norm else 0.0,
