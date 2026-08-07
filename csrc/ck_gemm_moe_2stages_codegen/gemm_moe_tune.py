@@ -46,6 +46,11 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
@@ -113,13 +118,6 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
-
-# SiTUv2 params (Kimi-K3 config.json), passed to BOTH the torch reference and
-# the kernel launch -- they used to fall back to their own differing defaults
-# ((2.0, 1.5) vs (1.0, 1.0)), which scored every SiTUv2 stage1 candidate at
-# ~35% err and failed them all against --errRatio.
-_TUNER_SITU_BETA = 4.0
-_TUNER_SITU_LINEAR_BETA = 25.0
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -661,11 +659,6 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = (
-            "swiglu"
-            if act_type == ActivationType.Swiglu
-            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
-        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -683,9 +676,9 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=_out_dtype,
-            act=act,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            act=get_flydsl_activation_name(act_type),
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
@@ -819,6 +812,8 @@ class FmoeTuner(TunerCommon):
             blockM,
             adtype=adtype,
             activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
@@ -869,7 +864,6 @@ class FmoeTuner(TunerCommon):
     ):
         # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
         # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
         out, _scale = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_shuf,
@@ -884,7 +878,9 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
-            act=act,
+            act=get_flydsl_activation_name(act_type),
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
             w1_scale=w1_scale_shuf,
             a1_scale=a1_scale_sort,
             sorted_weights=None,
@@ -921,6 +917,8 @@ class FmoeTuner(TunerCommon):
             blockM,
             adtype=adtype,
             activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         _v2_populate_stage2(d, v, token, topk, blockM)
@@ -1955,8 +1953,8 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
-        situ_beta=_TUNER_SITU_BETA,
-        situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -2260,8 +2258,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
