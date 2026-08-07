@@ -265,7 +265,9 @@ def test_multi_step_bf16_state_drift() -> None:
         actual_state = returned_state
 
     torch.cuda.synchronize()
-    assert torch.equal(actual_state[2].view(torch.int16), untouched_before.view(torch.int16))
+    assert torch.equal(
+        actual_state[2].view(torch.int16), untouched_before.view(torch.int16)
+    )
 
 
 def _bad_scale(inputs: dict[str, torch.Tensor]) -> dict[str, object]:
