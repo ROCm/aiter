@@ -305,6 +305,9 @@ def launch_gemm_a8w4_tdm(
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
         WS8 = num_waves >= 8
         WAVE_SPEC = num_waves >= 4 and tile_m >= 64 and tile_n >= 64
+        # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
+        # Both the tensorcnt arithmetic and the WMMA interleave count in these.
+        TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -647,7 +650,17 @@ def launch_gemm_a8w4_tdm(
 
         # ``nxt_ksl`` is the next subtile inside this tile, ``xt_buf`` the next
         # tile's buffer. Both paths prefetch a complete A/B/scale state.
-        def k_step(buf, act, wt, sb_k, sa_k, nxt_ksl, xt_buf=None, xt_wait=None):
+        def k_step(
+            buf,
+            act,
+            wt,
+            sb_k,
+            sa_k,
+            nxt_ksl,
+            xt_buf=None,
+            xt_wait=None,
+            issue_fn=None,
+        ):
             if const_expr(nxt_ksl is not None):
                 prefetch = load_state(buf, nxt_ksl)
             else:
@@ -657,11 +670,16 @@ def launch_gemm_a8w4_tdm(
                 # READY fence belongs here and not at the tile top: the TDM gets
                 # this tile's whole compute to land. The barrier is not optional --
                 # under WAVE_SPEC a wave's tensorcnt covers only the TDMs it issued
-                # itself, while xt_store reads rows a different wave loaded -- and
-                # it doubles as the REUSE barrier for the next tile's issue, so the
-                # loop still has exactly one barrier per iteration.
+                # itself, while xt_store reads rows a different wave loaded.
                 if const_expr(xt_wait is not None):
                     pipeline_fence(outstanding=xt_wait)
+                # That same barrier is also the REUSE barrier for ``issue_fn``,
+                # which overwrites the buffer this tile computed from: every read
+                # of it (this tile's load_state, the previous tile's xt_store) is
+                # behind the barrier, so this is the earliest legal issue point --
+                # a whole tile-tail earlier than issuing at the next tile's top.
+                if const_expr(issue_fn is not None):
+                    issue_fn()
                 xt_store(xt_buf)
             mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
@@ -689,9 +707,18 @@ def launch_gemm_a8w4_tdm(
             ``my_jobs`` is the owner list already selected by ``unswitch``; it only
             reaches ``issue`` and is unused when ``prefetch_kt`` is None.
             """
-            if const_expr(prefetch_kt is not None):
-                rocdl.sched_barrier(0)
+            # With the carry on, ``prefetch_kt`` rides the fence at the last k128
+            # instead of the tile top, so it is issued a tile-tail earlier and can
+            # interleave with that k128's WMMA. Without the carry there is no fence
+            # to hang it on, so it stays at the top, walled off by sched_barrier.
+            tail_issue = prefetch_kt is not None and nxt_buf is not None
+
+            def do_issue():
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
+
+            if const_expr(prefetch_kt is not None and not tail_issue):
+                rocdl.sched_barrier(0)
+                do_issue()
                 rocdl.sched_barrier(0)
             prev = xt_read() if const_expr(from_xt) else load_state(buf, 0)
             for ksl in range_constexpr(KWS):
@@ -706,6 +733,7 @@ def launch_gemm_a8w4_tdm(
                     nxt_ksl,
                     xt_buf,
                     nxt_wait if const_expr(xt_buf is not None) else None,
+                    do_issue if const_expr(tail_issue and xt_buf is not None) else None,
                 )
             front_mma = front_wm * wmma_n_rep
             back_mma = len(BACK) * wmma_n_rep
@@ -733,7 +761,19 @@ def launch_gemm_a8w4_tdm(
                 future_schedule = spread(
                     STATE_DS if has_next else 0, schedule_slots
                 )
+                # The tail issue lands in this k128, so its TDMs are spread over
+                # the WMMA groups rather than left as one burst in front of them:
+                # a burst blocks the MFMA pipe for its whole descriptor setup,
+                # while the interleave keeps issuing WMMA between the loads. They
+                # go before the WMMA in each slot -- these are the loads the next
+                # tile waits on, so within a slot they are the earlier work.
+                tdm_schedule = spread(
+                    TDM_PER if (tail_issue and ksl + 1 == KWS) else 0,
+                    schedule_slots,
+                )
                 for i in range_constexpr(schedule_slots):
+                    if const_expr(tdm_schedule[i] > 0):
+                        rocdl.sched_vmem(tdm_schedule[i])
                     rocdl.sched_mfma(mma_group)
                     if const_expr(future_schedule[i] > 0):
                         rocdl.sched_dsrd(future_schedule[i])
@@ -741,7 +781,6 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
-            TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
             # Post-compute issue (double-buffered) wins for decode (small tile_m)
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
@@ -799,22 +838,27 @@ def launch_gemm_a8w4_tdm(
                     compute_ktile(buf, None, XT, nxt_buf)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m). This
-                # branch is only reached with num_buffers >= 3: the next tile's TDM
-                # is issued at the top of this tile's compute, so a tile of overlap
-                # survives even when the fence itself leaves nothing in flight.
+                # branch is only reached with num_buffers >= 3, so the pipeline
+                # always has a tile of overlap to give away.
                 XT = xt_on
-                for i in range_constexpr(num_buffers - 1):
+                # Tiles resident before the loop, and equally the issue lead: a
+                # steady tile issues the one that is PRE tiles ahead of it. With
+                # the carry that issue happens at the tile's own tail rather than
+                # the next tile's top, so the prologue has to prefill one more
+                # tile -- every buffer -- and the drain runs one tile longer.
+                PRE = num_buffers if XT else num_buffers - 1
+                for i in range_constexpr(PRE):
                     issue(i, i)
-                n_steady = K_TILES - (num_buffers - 1)
+                n_steady = K_TILES - PRE
                 if const_expr(XT):
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                    pipeline_fence(outstanding=TDM_PER * (PRE - 1))
                     xt_store(ptr_to_idx(buf_ptr(0)))
 
                 # With XT the tile's only fence lives at its last k128, next to the
-                # xt_store that needs it (see k_step), and the tile top carries none:
-                # this tile's buffer was already fenced by the previous tile's, and
-                # that same barrier orders the previous tile's reads before the issue
-                # below. Buffer 0 / the first drain tile hang off the prologue fence.
+                # xt_store and the issue that need it (see k_step), and the tile top
+                # carries none: this tile's buffer was already fenced by the previous
+                # tile's fence. Buffer 0 and the first drain tile hang off the
+                # prologue fence, so the chain holds even when n_steady == 0.
                 def steady_mid(my_jobs):
                     for kt in range(n_steady):
                         s = kt % num_buffers
@@ -828,20 +872,20 @@ def launch_gemm_a8w4_tdm(
                         )
                         compute_ktile(
                             buf,
-                            kt + (num_buffers - 1),
+                            kt + PRE,
                             XT,
                             nxt_buf,
                             my_jobs,
-                            # After this tile's issue: kt+num_buffers tiles are out
-                            # and everything through kt+1 must have landed.
+                            # At the fence, before this tile's issue: kt+PRE tiles
+                            # are out and everything through kt+1 must have landed.
                             TDM_PER * (num_buffers - 2) if const_expr(XT) else None,
                         )
 
                 unswitch(steady_mid)
-                for j in range_constexpr(num_buffers - 1):
+                for j in range_constexpr(PRE):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    has_next = XT and j + 1 < num_buffers - 1
+                    has_next = XT and j + 1 < PRE
                     if const_expr(not XT):
                         pipeline_fence(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
@@ -858,7 +902,7 @@ def launch_gemm_a8w4_tdm(
                         nxt_buf,
                         None,
                         (
-                            TDM_PER * max(0, num_buffers - 3 - j)
+                            TDM_PER * max(0, num_buffers - 2 - j)
                             if const_expr(has_next)
                             else None
                         ),
