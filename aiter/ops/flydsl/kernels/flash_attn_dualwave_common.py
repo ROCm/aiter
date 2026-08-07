@@ -91,6 +91,34 @@ _VMCNT_HI_SHIFT = 14
 _VMCNT_HI_MASK = 0x3
 
 
+def stagger_extra_barrier_if_zero(stagger_i32):
+    """Emit `s_barrier` only on waves with stagger == 0.
+
+    Hand-written asm rather than a flyc.jit conditional: the branch must not be
+    sunk, duplicated, or fenced, and this form emits no sched_barrier. Byte-
+    identical to upstream flash_attn_utils.py:5489 at v0.3.0.
+    """
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [stagger_i32],
+        ("s_cmp_eq_u32 $0, 0\n\ts_cbranch_scc0 1f\n\ts_barrier\n\t1:"),
+        "s",
+        has_side_effects=True,
+    )
+
+
+@flyc.jit
+def stagger_extra_barrier_if_one(stagger_i32):
+    """Emit `sched_barrier(0); s_barrier` only on waves with stagger != 0.
+
+    Mirrors upstream flash_attn_utils.py:5500. Carries the sched_barrier the
+    _if_zero form omits, matching the cluster-boundary shape it stands in for.
+    """
+    if fx.Int32(stagger_i32) != fx.Int32(0):
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier()
+
+
 def waitcnt_vm_n(n):
     """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7).
 

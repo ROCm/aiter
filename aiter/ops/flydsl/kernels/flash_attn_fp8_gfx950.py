@@ -36,6 +36,8 @@ from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
     _sched_barrier_exp_pairs,
     _sched_barrier_pairs,
     dualwave_splitk_workspace_elems,  # noqa: F401
+    stagger_extra_barrier_if_one,
+    stagger_extra_barrier_if_zero,
     waitcnt_vm_n,
 )
 from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import dtype_to_elem_type
@@ -233,7 +235,36 @@ def build_flash_attn_dualwave_swp_fp8_module(
         t0 = ctx.split_t0
         t_end = ctx.split_t_end
 
+        def _cluster_boundary(drain=False):
+            """Close a cluster: retire its LDS reads, then sync the whole CTA.
+
+            The sched_barrier(0) on both sides is what scopes a cluster as a
+            scheduling region -- IGroupLP cannot move an instruction across a
+            mask-0 fence, which is why per-cluster sched_group_barrier group ids
+            can repeat every iteration without colliding.
+
+            Intermediate boundaries wait on lgkmcnt only: the ds_reads feeding
+            this cluster's MFMAs must land, but the prefetch DMAs are for tiles
+            two iterations out and are deliberately left in flight. Only the
+            back edge drains, because that is the boundary that publishes them.
+            """
+            if const_expr(drain):
+                rocdl.s_waitcnt(0)
+            else:
+                rocdl.s_waitcnt(traits.LGKMCNT_0_ONLY)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
         def _subtile_tail(v_s, v_v, v_o, l_row, m_new):
+            # Raise issue priority for the whole softmax+PV region. This is the
+            # body of compute clusters C5 and C7, and under the stagger the
+            # other wave group is in a memory cluster whenever we are here --
+            # so the address VALU it issues is exactly what this outbids.
+            # Inert without the stagger: all 8 waves would run in lockstep with
+            # no competitor, which is why it is step 3 and not step 1.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.s_setprio(1)
             v_s = softmax_helper.sub_m(v_s, m_new)
             v_p = softmax_helper.exp2(v_s, 0, 16)
             v_p = softmax_helper.exp2(v_p, 16, 16)
@@ -244,6 +275,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
             v_o = gemm_helper.pv(v_p, v_v, v_o)
             v_o = softmax_helper.anchor_v_o(v_o)
+            # Drop priority before the cluster boundary, after anchor_v_o has
+            # pinned the accumulators, so the release cannot migrate into the
+            # PV block it is meant to follow.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.s_setprio(0)
             return v_o, l_row
 
         def _mask_sub(v_s, tile_idx):
@@ -297,6 +333,21 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
+            # Open the wave-group phase shift. Waves 4-7 take one extra barrier
+            # that waves 0-3 skip, so from here every rendezvous pairs group B
+            # at cluster N+1 against group A at cluster N. s_barrier is an
+            # arrival count, not a program point, which is what makes that
+            # legal. The result is that one group is always inside a compute
+            # cluster while the other is in a memory cluster.
+            #
+            # Only sound with the 8-cluster decomposition above: at one barrier
+            # per iteration this same offset is a FULL-iteration skew and every
+            # LDS producer/consumer handoff desynchronises. The complementary
+            # barrier for group A is in the epilogue, keeping arrival counts
+            # equal over the kernel's lifetime.
+            if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
+                stagger_extra_barrier_if_one(ctx.stagger_i32)
+
             m_row = ctx.c_neg_inf
             l_row = ctx.c_zero_f
             v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
@@ -343,39 +394,82 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 f_a_buf = _ring_wrap(a_buf + fx.Index(4))
                 f_b_buf = _ring_wrap(a_buf + fx.Index(5))
 
-                v_k_a = kv_lds_to_regs.load_k(a_buf)
-                v_k_b = kv_lds_to_regs.load_k(b_buf)
+                # Eight clusters, memory and compute strictly alternating, one
+                # barrier each. Mirrors the bf16 sibling's decomposition, which
+                # the wave stagger needs: a one-barrier loop makes the stagger a
+                # full-iteration skew, and every LDS handoff desynchronises.
+                #
+                # Two of bf16's mechanisms are deliberately NOT ported, because
+                # fp8 cannot represent them. It carries a half-computed P across
+                # the back edge and rescales an already-cast P between PV steps;
+                # both need a P that survives an ext/scale/trunc round trip.
+                # e4m3 has 3 mantissa bits and does not. So the merged max stays
+                # (both score sets live at C3, which is what BN128 buys) and
+                # _subtile_tail stays barrier-free: sub_m -> exp2 -> exp2 ->
+                # reduce_sum -> cast -> pv has to be one straight-line region
+                # because cvt_pk_fp8_f32 is lossy and one-way.
 
+                # C0 (mem): K for subtile a.
+                v_k_a = kv_lds_to_regs.load_k(a_buf)
+                _cluster_boundary()
+
+                # C1 (cmp): QK for subtile a. v_k_a dies here, before v_k_b is
+                # loaded -- today both are live at once, so this costs 32 fewer
+                # VGPRs at peak rather than more.
                 v_s_a = gemm_helper.qk(v_k_a, q_wide)
                 v_s_a = _mask_sub(v_s_a, j)
+                _sched_barrier_pairs(traits, 4, 6, 14)
+                _cluster_boundary()
+
+                # C2 (mem): K for subtile b.
+                v_k_b = kv_lds_to_regs.load_k(b_buf)
+                _cluster_boundary()
+
+                # C3 (cmp): QK for subtile b, then the pair-wide softmax
+                # correction. The merged max and lazy_correct_o must both see
+                # both score sets, so this is the earliest point either can run.
+                # The boundary goes after lazy_correct_o returns, never inside
+                # it: its scf.if is gated on a per-wave ballot, so waves can
+                # diverge there and a barrier would deadlock.
                 v_s_b = gemm_helper.qk(v_k_b, q_wide)
                 v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
                 v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
+                m_tile = _merge_tile_max(v_s_a, v_s_b)
+                v_o, m_new, l_row = softmax_helper.lazy_correct_o(v_o, m_row, l_row, m_tile)
+                v_o = softmax_helper.anchor_v_o(v_o)
+                _sched_barrier_pairs(traits, 4, 6, 15)
+                _cluster_boundary()
 
+                # C4 (mem): V for subtile a, plus the K half of the prefetch.
+                # The prefetch writes slots a+4/a+5, which are a-2/a-1 mod NPF
+                # -- the slots the PREVIOUS iteration read. The end-of-iteration
+                # barrier is what separates them; issuing later in the body than
+                # before only widens that margin.
                 v_v_a = kv_lds_to_regs.load_v(a_buf)
-
                 pf_a = _pf_tile(j + fx.Index(4))
                 pf_b = _pf_tile(j + fx.Index(5))
                 kv_gmem_to_lds.load_k(pf_a * BN, f_a_buf)
                 kv_gmem_to_lds.load_k(pf_b * BN, f_b_buf)
+                _cluster_boundary()
+
+                # C5 (cmp): softmax and PV for subtile a. Carries its own
+                # group-13 hints from _subtile_tail.
+                v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
+                _cluster_boundary()
+
+                # C6 (mem): V for subtile b, plus the V half of the prefetch.
+                v_v_b = kv_lds_to_regs.load_v(b_buf)
                 kv_gmem_to_lds.load_v(pf_a * BN, f_a_buf)
                 kv_gmem_to_lds.load_v(pf_b * BN, f_b_buf)
+                _cluster_boundary()
 
-                m_tile = _merge_tile_max(v_s_a, v_s_b)
-                v_o, m_new, l_row = softmax_helper.lazy_correct_o(v_o, m_row, l_row, m_tile)
-                v_o = softmax_helper.anchor_v_o(v_o)
-
-                v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
-                v_v_b = kv_lds_to_regs.load_v(b_buf)
+                # C7 (cmp): softmax and PV for subtile b, then the loop back
+                # edge. This boundary keeps the full drain: it is the one that
+                # publishes this iteration's prefetch DMAs and releases the
+                # slots the next iteration overwrites.
                 v_o, l_row = _subtile_tail(v_s_b, v_v_b, v_o, l_row, m_new)
                 m_row = m_new
-
-                _sched_barrier_exp_pairs(traits, 8, 16, 11)
-                _sched_barrier_pairs(traits, 8, 25, 11)
-                rocdl.s_waitcnt(0)
-                rocdl.sched_barrier(0)
-                rocdl.s_barrier()
-                rocdl.sched_barrier(0)
+                _cluster_boundary(drain=True)
 
                 loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
             m_row = loop_results[0]
@@ -387,6 +481,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             if const_expr(traits.FP8_PV):
                 inv_l = ArithValue(inv_l) * ctx.vd_fp8
             softmax_helper.scale_o(v_o, inv_l)
+            # Close the phase shift: group A takes the barrier group B took in
+            # the prologue, so both groups have executed the same number over
+            # the kernel's lifetime and neither is left waiting at a rendezvous
+            # no one else reaches. Placed after the last compute and before the
+            # store, the final point where the two groups still need to agree.
+            if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
+                stagger_extra_barrier_if_zero(ctx.stagger_i32)
             rocdl.s_barrier()
             if const_expr(not SPLITK):
                 output_store.store_final_o(v_o, q_row)
