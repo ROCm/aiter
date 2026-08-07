@@ -3,74 +3,39 @@
 
 """Fused per-token RMSNorm + GPT-J RoPE + optional FP8 quant (FlyDSL).
 
-Q + KV combined into a single kernel launch (grid Y = num_tokens, grid X =
-num_q_heads + 1: bid_x ? [0, H) handle Q heads, bid_x == H handles KV).
-
-Hard-coded MVP shape: D=512, RD=64, BLOCK_THREADS=64. Each block uses one
-wave (64 threads x 8 bf16 = 512 elems = D), so reductions are wave-local
-(shuffle_xor, no LDS, no barrier).
-
-Layout per block:
-  - thread t ? [0, ROPE_THREAD_LO) owns NOPE elements [t*8, t*8+8)
-  - thread t ? [ROPE_THREAD_LO, 64) owns ROPE elements [t*8, t*8+8) which
-    form ``PAIRS_PER_THREAD`` GPT-J pairs (2k, 2k+1)
-
-GPT-J RoPE with REUSE_FREQS_FRONT_PART=True: cos/sin shape (..., RD/2),
-each pair (2k, 2k+1) shares cos[k], sin[k]. Each rope-thread loads
-PAIRS_PER_THREAD cos + PAIRS_PER_THREAD sin (one dwordx2 buffer load each).
-
-FP8 fast-path uses the rstd-cancellation algebra (matches the Triton kernel
-in ``atom/model_ops/v4_kernels/qk_norm_rope_maybe_quant.py``):
+Q + KV in one launch (grid Y = num_tokens, grid X = num_q_heads + 1: bid_x in
+[0, H) handle Q heads, bid_x == H handles KV). Hard-wired D=512, VEC=8,
+BLOCK_THREADS=64: one wave per block, so reductions are wave-local (shuffle_xor,
+no LDS/barrier). FP8 fast-path uses the rstd-cancellation algebra (matches the
+Triton kernel in ``atom/model_ops/v4_kernels/qk_norm_rope_maybe_quant.py``):
 
     scale  = abs_max(x_norm) * SQRT2 / FP8_MAX     (sqrt(2) upper bound on rope mag)
     factor = FP8_MAX / (abs_max(x_in) * SQRT2)     (rstd cancels algebraically)
-    out_nope = x_in * factor              -> fp8
-    out_pe   = (pe_in * factor) RoPEd     -> fp8
 
-(For the weighted KV path the algebra carries the per-channel weight: amax
-is taken over |x_in * w|, factor multiplies in w on the store side.)
-
-Public API: ``flydsl_qk_norm_rope_quant`` (torch-friendly, allocates outputs,
-binds current stream, handles strided KV and 4D cos/sin views). Internal
-``compile_flydsl_qk_norm_rope_quant`` returns the cached launcher for callers
-who already have all buffers and want the lowest-overhead path.
+(The weighted KV path carries the per-channel weight into amax and factor.)
+Public API ``flydsl_qk_norm_rope_quant``; ``compile_flydsl_qk_norm_rope_quant``
+returns the cached launcher for pre-allocated callers.
 """
 
-# NOTE: do NOT add `from __future__ import annotations` to this file.
-# PEP 563 turns all annotations into strings, which defeats flydsl's
-# JitFunction._make_cache_key runtime detection:
-#   is_runtime = hasattr(ann, "__get_c_pointers__")
-# A string like 'fx.Int32' fails that check, so flydsl treats the
-# `kv_in_row_stride` and `num_tokens` Int32 parameters as compile-time
-# constants and embeds their VALUE in the cache key. Every distinct
-# batch size / KV stride then triggers a fresh ~30-70ms JIT compile
-# instead of hitting the in-memory CallState cache.
+# do NOT add `from __future__ import annotations`: PEP 563 stringifies
+# annotations, defeating flydsl's JitFunction._make_cache_key runtime detection
+# (is_runtime = hasattr(ann, "__get_c_pointers__")). Int32 params like
+# kv_in_row_stride / num_tokens would then be baked into the cache key per value,
+# forcing a fresh ~30-70ms JIT compile per batch size / KV stride.
 
 import math
 from functools import lru_cache
 
-# NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
-# whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
-# into ``module_aiter_core``. That JIT module is not yet built when
-# setup.py's AOT-compile pass walks the package, so importing dtypes at
-# module load time crashes setup with ``KeyError: 'module_aiter_core'``.
-# Defer the import until the first runtime call instead -- sibling modules
-# (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import rocdl
-from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate
+from flydsl.expr.arith import FastMathFlags  # fastmath kwarg object for fx fp ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
-# JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
-# pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
-# access; we only pull the int classes here so module import stays JIT-free
-# (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
+# JIT-free MX-format int mirrors (keep module import JIT-free; aiter.utility
+# .dtypes transitively JITs module_aiter_core, unbuilt during setup.py AOT walk).
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
@@ -79,26 +44,20 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
-from .tensor_shim import GTensor, _run_compiled, _to_raw
+from .tensor_shim import _run_compiled
 
-# --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
-
-# SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
 
 
 @lru_cache(maxsize=1)
 def _fp8_const():
-    """Lazy-resolve fp8 algebra coefficients (per-GFX native fp8).
+    """Lazy-resolve per-GFX native fp8 algebra coefficients.
 
-    ``aiter.utility.dtypes.fp8`` selects e4m3fnuz on gfx942 MI300 and
-    e4m3fn on gfx950 MI355 / gfx1250. ``cvt_pk_fp8_f32`` emits bytes in
-    the per-gfx native format, so FP8_MAX must track that -- hardcoding
-    e4m3fnuz's 240 on gfx950 would (a) clip outputs to a stricter range
-    than needed and (b) leave the stored dequant scale inconsistent with
-    downstream consumers reading the tensor as ``aiter.dtypes.fp8``.
-    Cached on first call (kernel build / launcher call), not at import.
+    ``aiter.utility.dtypes.fp8`` is e4m3fnuz (max 240) on gfx942 and e4m3fn
+    (max 448) on gfx950+; ``cvt_pk_fp8_f32`` emits in that native format, so
+    FP8_MAX must track it or the stored dequant scale desyncs from downstream
+    consumers reading the tensor as ``aiter.dtypes.fp8``. Cached, not at import.
     """
     from aiter.utility import dtypes as aiter_dtypes
 
@@ -112,11 +71,9 @@ def _fp8_const():
     }
 
 
-# --- supported quant-group sizes (1 x group_size block-scales) --------------
 # group_size == head_dim -> per-row scale (single scale per token-head).
 GROUP_SIZE_OPTIONS = (32, 64, 128)
 
-# --- scale-dtype constants --------------------------------------------------
 SCALE_DTYPE_FP32 = "fp32"
 SCALE_DTYPE_E8M0 = "e8m0"
 SCALE_DTYPE_OPTIONS = (SCALE_DTYPE_FP32, SCALE_DTYPE_E8M0)
@@ -127,67 +84,106 @@ _TORCH_DTYPE_FOR_SCALE = {
 }
 
 
-# ============================================================================
-# Store helpers (module-level so they're easy to reuse / unit-test)
-# ============================================================================
+def _bf16_row_view(base_i64, num_elems, nbytes):
+    """Build a ``(1, num_elems)`` bf16 buffer-tensor view at a folded base ptr.
+
+    ``base_i64`` already includes the per-token / per-head byte shift;
+    num_records bounds the OOB clamp (base + off with an i32 voffset)."""
+    pt = fx.PointerType.get(
+        fx.BFloat16.ir_type, address_space=fx.AddressSpace.Global, alignment=2
+    )
+    view = fx.make_view(
+        fx.inttoptr(pt, base_i64), fx.make_layout((1, num_elems), (num_elems, 1))
+    )
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
 
 
-def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
-    """Convert VEC fp32 values to a bf16 vector and store via a GTensor whose
-    base is already shifted per-token. ``row_off_elems`` is this head's row
-    offset within the token (i32 elements); ``idx`` is the lane id."""
+# 1-element copy atoms sized per scalar dtype; the OOB-checked buffer tensor
+# clamps a stray voffset, so a max-size resource over a wide 1-D span is safe.
+_SCALAR_MAX_RECORDS = 1 << 24
+
+
+def _scalar_view(base_i64, fx_dt):
+    """A ``(N, 1)`` buffer-tensor view at i64 base ``base_i64`` for scalar
+    element-indexed loads/stores (slice ``(idx, None)`` keeps one dim)."""
+    pt = fx.PointerType.get(
+        fx_dt.ir_type, address_space=fx.AddressSpace.Global, alignment=fx_dt.width // 8
+    )
+    view = fx.make_view(
+        fx.inttoptr(pt, fx.Int64(base_i64)),
+        fx.make_layout((_SCALAR_MAX_RECORDS, 1), (1, 1)),
+    )
+    return fx.rocdl.make_buffer_tensor(view, max_size=True)
+
+
+def _scalar_load(base_i64, idx, fx_dt, copy_bits):
+    """Load one ``fx_dt`` element at element index ``idx`` from base ``base_i64``."""
+    buf = _scalar_view(base_i64, fx_dt)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
+    r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
+    fx.copy_atom_call(atom, fx.slice(buf, (idx, None)), r)
+    return fx.memref_load_vec(r)[0]
+
+
+def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
+    """Store one ``fx_dt`` value at element index ``idx`` into base ``base_i64``."""
+    buf = _scalar_view(base_i64, fx_dt)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
+    r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
+    fx.memref_store_vec(fx.Vector.from_elements([val.ir_value()], dtype=fx_dt), r)
+    fx.copy_atom_call(atom, r, fx.slice(buf, (idx, None)))
+
+
+def _store_bf16_tiled(vals_list, p_dst, copy, vec):
+    """Convert VEC fp32 values to a bf16 fragment and tiled-copy to ``p_dst``.
+
+    ``p_dst`` is this thread's D-partition of a ``(1, D)`` bf16 row view; the
+    partition already places lane ``tid`` at element ``tid*VEC``."""
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
     f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
-    my_off = fx.Int32(row_off_elems) + fx.Int32(idx) * vec
-    g_out.store(my_off, bf16v, vec_size=vec)
+    frag = fx.make_fragment_like(p_dst)
+    fx.memref_store_vec(bf16v, frag)
+    fx.copy(copy, frag, p_dst)
 
 
 def _store_fp8_packed(
-    vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
+    vals_list, out_base_i64, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
+    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store 8 bytes per thread
+    (2 packed dwords = one i64) at ``out_base + row_base_bytes + idx*8``.
 
-    Emits one ``buffer_store_dwordx2`` per thread (VEC=8 -> 2 dwords = 8 bytes).
-
-    Workaround for the e4m3fnuz NaN encoding 0x80: cvt_pk_fp8_f32 returns
-    0x80 (NaN) for inputs that round to negative zero, which propagates
-    through downstream attention as NaN. Clamp v in (-2^-8, 0) to +0 first.
-
-    On gfx950+ (OCP e4m3fn), 0x80 encodes -0 (not NaN), so the clamp is
-    unnecessary.  Pass ``skip_fnuz_clamp=True`` to elide it and save ~4
-    ALU ops per element.
+    fnuz clamp rationale: on e4m3fnuz, cvt_pk_fp8_f32 returns 0x80 (NaN) for
+    inputs rounding to -0, which propagates as NaN through attention -- so clamp
+    v in (-2^-8, 0) to +0. On gfx950+ (OCP e4m3fn) 0x80 is -0, not NaN, so
+    ``skip_fnuz_clamp=True`` elides the clamp (~4 ALU ops/elem).
     """
-    f32 = T.f32
     i32 = T.i32
 
     if skip_fnuz_clamp:
         safe = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
     else:
-        c0 = arith.constant(0.0, type=f32)
-        c_neg_uf = arith.constant(-(2.0**-8), type=f32)
+        c0 = fx.Float32(0.0)
+        c_neg_uf = fx.Float32(-(2.0**-8))
         safe = []
         for v in vals_list:
-            vv = v.ir_value() if hasattr(v, "ir_value") else v
-            is_tn = arith.andi(
-                arith.cmpf(CmpFPredicate.OLT, vv, c0),
-                arith.cmpf(CmpFPredicate.OGT, vv, c_neg_uf),
-            )
-            safe.append(arith.select(is_tn, c0, vv))
+            vv = v if hasattr(v, "ir_value") else fx.Float32(v)
+            is_tn = (vv < c0) & (vv > c_neg_uf)
+            safe.append(is_tn.select(c0, vv).ir_value())
 
-    # Pack each pair (s[2i], s[2i+1]) into a packed-fp8 i32, then
-    # combine 4 fp8 into one i32 via cvt_pk_fp8_f32 (lane 0 + lane 1).
     assert vec == 8, "fp8 store helper hardcoded for VEC=8"
-    p0 = arith.constant(0, type=i32)
-    p0 = rocdl.cvt_pk_fp8_f32(i32, safe[0], safe[1], p0, 0)
-    p0 = rocdl.cvt_pk_fp8_f32(i32, safe[2], safe[3], p0, 1)
-    p1 = arith.constant(0, type=i32)
-    p1 = rocdl.cvt_pk_fp8_f32(i32, safe[4], safe[5], p1, 0)
-    p1 = rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
+    p0 = fx.Int32(0).ir_value()
+    p0 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[0], safe[1], p0, 0)
+    p0 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[2], safe[3], p0, 1)
+    p1 = fx.Int32(0).ir_value()
+    p1 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[4], safe[5], p1, 0)
+    p1 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
 
-    off_bytes = fx.Int32(row_base_bytes) + fx.Int32(idx) * 8
-    store_vec = fx.Vector.from_elements([p0, p1], dtype=fx.Int32)
-    buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
+    # Fold row_base_bytes into the base ptr; store one i64 (= 2 packed dwords)
+    # at i64-element index idx (idx*8 bytes) via the OOB-checked buffer tensor.
+    base = out_base_i64 + fx.Int64(row_base_bytes)
+    packed_i64 = fx.Vector.from_elements([p0, p1], dtype=fx.Int32).bitcast(fx.Int64)[0]
+    _scalar_store(base, idx, fx.Int64(packed_i64), fx.Int64, 64)
 
 
 # ============================================================================
@@ -209,17 +205,10 @@ def _build_kernel(
 ):
     """Build the @flyc.kernel + @flyc.jit launcher for a given config.
 
-    All shape constants are captured via closure (NOT module globals), so two
-    launchers with different (H, D, RD, group_size, scale_dtype, q_weighted)
-    coexist safely. Returns the launcher.
-
-    quant=True writes fp8 (e4m3fnuz) with one scale per ``group_size``-wide
-    block of D. When ``group_size == head_dim`` the scale degenerates to
-    per-row (NG=1). scale_dtype controls the stored scale encoding
-    (``"fp32"`` or ``"e8m0"``).
-
-    q_weighted=True applies a per-channel weight to Q after RMSNorm (same
-    pattern as KV). Default False keeps Q weightless (V4-Pro convention).
+    Shape constants are captured via closure (not module globals) so launchers
+    for different configs coexist. quant=True writes fp8 with one scale per
+    ``group_size``-wide block (per-row when group_size == head_dim); scale_dtype
+    picks the stored encoding. q_weighted applies a per-channel Q weight.
     """
     H = num_q_heads
     D = head_dim
@@ -235,22 +224,15 @@ def _build_kernel(
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
-    # Current MVP is hard-wired to VEC=8 (= D=512 with BLOCK_THREADS=64):
-    # - ``BufferCopy128b`` atom expects 16 bytes / thread
-    # - rope ``BufferCopy(64)`` atom expects 8 bytes / thread (= 4 bf16 pairs)
-    # - ``_store_fp8_packed`` is hand-rolled for VEC=8 -> 2 dwords
-    # Supporting other D values needs the atom widths + fp8 packing pattern
-    # generalised. Reject other VECs with a clear message rather than dump
-    # core inside LLVM lowering.
+    # Hard-wired VEC=8 (D=512): atom widths and _store_fp8_packed assume it.
     assert VEC == 8, (
         f"VEC={VEC} unsupported (D={D}); only D=512 / VEC=8 is implemented. "
         "Atom widths and fp8 packing assume VEC=8 -- generalising requires "
         "a wider refactor."
     )
 
-    # --- quant-group layout ------------------------------------------------
-    # group_size must divide D evenly AND be a multiple of VEC (so a single
-    # thread's VEC-wide slice never crosses a group boundary).
+    # group_size must divide D and be a multiple of VEC (so a thread's VEC-wide
+    # slice never crosses a group boundary).
     assert (
         group_size > 0 and D % group_size == 0
     ), f"group_size {group_size} must divide head_dim {D}"
@@ -276,14 +258,12 @@ def _build_kernel(
     elem_dtype = fx.BFloat16
     is_e8m0 = scale_dtype == SCALE_DTYPE_E8M0
 
-    # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
-    # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
-    # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
+    # FP8 element dtype follows the arch (matches _fp8_const); emit_mx_e8m0_scale
+    # uses it to pick the right max_pos reciprocal.
     _is_fnuz = _fp8_const()["dtype"] == torch.float8_e4m3fnuz
     _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if _is_fnuz else _D.FP8_E4M3
 
-    # Kernel name: only include flags that affect the compiled binary.
-    # Default (not quant, not q_weighted) -> "qk_norm_rope_H16_D512_RD64_flydsl"
+    # Kernel name: only flags that affect the compiled binary.
     _name_parts = ["qk_norm_rope", f"H{H}", f"D{D}", f"RD{RD}"]
     if q_weighted:
         _name_parts.append("qw")
@@ -319,8 +299,7 @@ def _build_kernel(
         swa_cache_size: Int32,  # ring slot count
     ):
         f32 = T.f32
-        i32 = T.i32
-        fm_fast = arith.FastMathFlags.fast
+        fm_fast = FastMathFlags.fast
 
         full_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(64), 16)
@@ -337,23 +316,31 @@ def _build_kernel(
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
         bid_t = fx.block_idx.y  # token id (chunked at MAX_GRID_Y per launch)
         tid = fx.thread_idx.x
-        bid_t_idx = arith.index_cast(T.index, _to_raw(bid_t))
 
-        def _ptr_buffer_resource(ptr, num_records_bytes=None):
-            addr = fx.ptrtoint(ptr)
-            addr_i64 = arith.index_cast(T.i64, addr)
-            if num_records_bytes is None:
-                return buffer_ops.create_buffer_resource_from_addr(addr_i64)
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr_i64, num_records_bytes=num_records_bytes
+        # TV-tiled copy over one (1, D) bf16 row: thread t owns VEC contiguous
+        # head elems [t*VEC, (t+1)*VEC) -- the SAME thread->element map the
+        # shuffle_xor reductions assume.
+        row_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        row_tile_mn, row_tv = fx.make_layout_tv(
+            fx.make_layout((1, BLOCK_THREADS), (BLOCK_THREADS, 1)),
+            fx.make_layout((1, VEC), (VEC, 1)),
+        )
+        row_thr = fx.make_tiled_copy(row_copy, row_tv, row_tile_mn).get_slice(tid)
+
+        def _row_part_S(buf):
+            return row_thr.partition_S(
+                fx.slice(fx.zipped_divide(buf, row_tile_mn), (None, (0, 0)))
             )
 
-        # --- shared: load position (i64 -> i32) ---
-        pos_rsrc = _ptr_buffer_resource(positions)
-        pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = arith.trunci(i32, pos_val_i64)
+        def _row_part_D(buf):
+            return row_thr.partition_D(
+                fx.slice(fx.zipped_divide(buf, row_tile_mn), (None, (0, 0)))
+            )
 
-        # --- shared: cos/sin buffer tensors (used by rope-threads only) ---
+        pos_val_i64 = _scalar_load(fx.Int64(ptrtoint(positions)), bid_t, fx.Int64, 64)
+        pos_i32 = fx.Int64(pos_val_i64).to(fx.Int32)
+
+        # cos/sin buffer tensors (rope-threads only)
         cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
         sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
         cos_row = fx.slice(cos_buf, (pos_i32, None))
@@ -362,11 +349,11 @@ def _build_kernel(
         sin_div = fx.logical_divide(sin_row, rope_lay)
 
         def wave_reduce_add(x):
-            w = _to_raw(x)
+            w = fx.Float32(x)
             for sh_exp in range_constexpr(int(math.log2(BLOCK_THREADS))):
                 off = BLOCK_THREADS // (2 << sh_exp)
-                peer = _to_raw(ArithValue(w).shuffle_xor(off, BLOCK_THREADS))
-                w = arith.AddFOp(w, peer, fastmath=fm_fast).result
+                peer = w.shuffle_xor(off, BLOCK_THREADS)
+                w = w.addf(peer, fastmath=fm_fast)
             return w
 
         def emit_body(
@@ -374,17 +361,16 @@ def _build_kernel(
             weighted: bool,
             x_f32_vec,
             w_f32_vec,  # None for Q
-            bf16_out_g,  # GTensor with per-token shifted base (when not quant)
-            bf16_out_row_off,  # i32 element offset of this head's row within token
-            fp8_out_rsrc,  # (rsrc_token_shifted, row_base_bytes_within_token) when quant
-            scale_rsrc,
+            bf16_out_part,  # D-partition of the (1,D) out row view (when not quant)
+            fp8_out_base,  # (out_base_i64, row_base_bytes_within_token) when quant
+            scale_base_i64,  # i64 base of the scale ptr (None when not quant)
             scale_base_off,  # base elem-offset; per-lane adds (tid // TPG)
-            swa_out_g=None,  # GTensor (swa ring, per-token base) when kv_write
+            swa_out_part=None,  # D-partition of swa ring row view when kv_write
             do_swa=None,  # i1 predicate (batch_id >= 0); None when no kv_write
         ):
-            """Apply RMSNorm + GPT-J RoPE (+ optional FP8 quant) for the row
-            held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
-            VEC-wide fp32 vectors already loaded by the caller."""
+            """RMSNorm + GPT-J RoPE (+ optional FP8 quant) for this block's row.
+            ``x_f32_vec`` / ``w_f32_vec`` are VEC-wide fp32 vectors from the
+            caller (``w_f32_vec`` None for Q)."""
             x2 = x_f32_vec * x_f32_vec
             sq_local = x2.reduce(ReductionOp.ADD, fastmath=fm_fast)
 
@@ -395,27 +381,19 @@ def _build_kernel(
                 else:
                     am_local = fmath.absf(x_f32_vec).reduce(ReductionOp.MAX)
 
-                # Fused wave reduce: interleave sumsq-ADD and amax-MAX
-                # shuffles in one loop so the LLVM scheduler can overlap the
-                # two shuffle chains (each shuffle has ~4-cycle XCC latency
-                # on gfx950; running them serially doubles latency).
-                #
-                # sumsq reduces over the FULL row (RMSNorm scope = D).
-                # amax reduces over a single QUANT GROUP (TPG threads,
-                # = group_size elements). Both can interleave in the loop's
-                # "tail" steps where shuffle offset < TPG; earlier steps do
-                # sumsq-only (amax would cross group boundaries).
-                w_sq = _to_raw(sq_local)
-                w_am = _to_raw(am_local)
+                # Fused wave reduce: interleave sumsq-ADD (full row, RMSNorm
+                # scope=D) and amax-MAX (one quant group, TPG threads) shuffles
+                # so the scheduler overlaps both chains. amax only in tail steps
+                # where shuffle offset < TPG; earlier steps would cross groups.
+                w_sq = fx.Float32(sq_local)
+                w_am = fx.Float32(am_local)
                 for sh_exp in range_constexpr(log2_block):
                     off = BLOCK_THREADS // (2 << sh_exp)
-                    peer_sq = _to_raw(ArithValue(w_sq).shuffle_xor(off, BLOCK_THREADS))
-                    w_sq = arith.AddFOp(w_sq, peer_sq, fastmath=fm_fast).result
+                    w_sq = w_sq.addf(
+                        w_sq.shuffle_xor(off, BLOCK_THREADS), fastmath=fm_fast
+                    )
                     if const_expr(sh_exp >= amax_start_step):
-                        peer_am = _to_raw(
-                            ArithValue(w_am).shuffle_xor(off, BLOCK_THREADS)
-                        )
-                        w_am = arith.maximumf(w_am, peer_am)
+                        w_am = w_am.maximumf(w_am.shuffle_xor(off, BLOCK_THREADS))
                 sq_block = w_sq
                 am_group = w_am  # per-group after partial butterfly
             else:
@@ -424,64 +402,56 @@ def _build_kernel(
             rstd = fmath.rsqrt(sq_block * (1.0 / D) + 1e-6, fastmath=fm_fast)
 
             if const_expr(quant):
-                am_safe = arith.maximumf(am_group, arith.constant(1e-12, type=f32))
+                am_safe = fx.Float32(am_group).maximumf(fx.Float32(1e-12))
 
                 if const_expr(is_e8m0):
-                    # MX E8M0 RoundUp scale. ``amax_post`` folds rstd (per-row)
-                    # and SQRT2 (post-RoPE upper bound) so the forward factor
-                    # applied to x_norm bounds the result by ``max_pos`` of the
-                    # target FP8 dtype (e4m3fn 448 on gfx950+, e4m3fnuz 240 on
-                    # gfx942). The same NV ROUND_UP / torchao RCEIL formula is
-                    # used by silu_and_mul_fq and mixed_moe_gemm_2stage.
-                    c_sqrt2 = arith.constant(_SQRT2, type=f32)
-                    amax_post = am_safe * rstd * c_sqrt2
+                    # MX E8M0 RoundUp scale (NV ROUND_UP / torchao RCEIL, as in
+                    # silu_and_mul_fq / mixed_moe_gemm_2stage). amax_post folds
+                    # rstd (per-row) and SQRT2 (post-RoPE bound) so the forward
+                    # factor bounds x_norm by the target fp8 max_pos.
+                    amax_post = (am_safe * rstd * _SQRT2).ir_value()
 
-                    e8m0_biased = emit_mx_e8m0_scale(
-                        amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
+                    e8m0_biased = fx.Int32(
+                        emit_mx_e8m0_scale(
+                            amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
+                        )
                     )
-                    # quant_scale = 2^(127 - e8m0_biased) for x_norm. We apply
-                    # to x_in directly, so absorb the per-row rstd: factor =
-                    # rstd * quant_scale.
-                    quant_exp = arith.constant(254, type=T.i32) - e8m0_biased
-                    quant_scale = (quant_exp << arith.constant(23, type=T.i32)).bitcast(
-                        T.f32
-                    )
+                    # quant_scale = 2^(127 - e8m0_biased) for x_norm; applied to
+                    # x_in directly, so absorb rstd: factor = rstd * quant_scale.
+                    quant_exp = fx.Int32(254) - e8m0_biased
+                    quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
                     factor = rstd * quant_scale
+                    scale_to_store = e8m0_biased.to(fx.Int8)
+                    scale_store_dt, scale_store_bits = fx.Int8, 8
                 else:
                     # FP32 scale with the rstd-cancellation trick.
                     # scale_val = amax * rstd * SQRT2 / FP8_MAX  (stored)
                     # factor   = FP8_MAX / (amax * SQRT2)        (applied to x_in)
                     # The rstd factor cancels algebraically: store(out) =
                     # x_in * factor -> dequant: x_norm = scale * out = x_in * rstd.
-                    rcp_am = fx.rocdl.rcp(f32, am_safe)
+                    rcp_am = fx.Float32(fx.rocdl.rcp(f32, am_safe))
                     _fc = _fp8_const()
-                    factor = arith.constant(_fc["max_over_sqrt2"], type=f32) * rcp_am
-                    scale_val = (
-                        am_safe * rstd * arith.constant(_fc["inv_max_sqrt2"], type=f32)
-                    )
+                    factor = rcp_am * _fc["max_over_sqrt2"]
+                    scale_to_store = am_safe * rstd * _fc["inv_max_sqrt2"]
+                    scale_store_dt, scale_store_bits = fx.Float32, 32
 
-                # Group-leader lanes (one per quant group) write the scale.
-                # Predicate: tid & (TPG-1) == 0. For TPG=64 (per-row) this is
-                # `tid == 0`; for TPG<64 multiple lanes fire concurrently.
-                # Per-lane scale_off = scale_base_off + (tid / TPG).
-                # NOTE: tried buffer_ops.buffer_store(mask=...) for
-                # predication but the mask path sets offset to 0x7FFFFFFF on
-                # masked-off lanes -> OOB GPU fault on gfx950. Stay with the
-                # predicated (lane-leader) branch instead.
+                # Group-leader lanes (tid & (TPG-1) == 0) write the scale at
+                # scale_base_off + tid/TPG. NOTE: a masked store sets offset
+                # 0x7FFFFFFF on masked-off lanes -> OOB fault on gfx950; use the
+                # predicated lane-leader branch instead.
                 group_idx = tid >> fx.Int32(log2_tpg)
                 lane_in_group = tid & fx.Int32(TPG - 1)
                 if lane_in_group == 0:
                     my_scale_off = scale_base_off + group_idx
-                    if const_expr(is_e8m0):
-                        e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased).result
-                        buffer_ops.buffer_store(e8m0_i8, scale_rsrc, my_scale_off)
-                    else:
-                        buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
+                    _scalar_store(
+                        scale_base_i64,
+                        my_scale_off,
+                        scale_to_store,
+                        scale_store_dt,
+                        scale_store_bits,
+                    )
 
-            # ---- Common: scale-multiply for ALL threads (hoisted) ----
-            # This computation was previously duplicated inside both the
-            # ROPE and NOPE branches.  Hoisting it eliminates ~VEC ALU ops
-            # of redundant work in the divergent NOPE path.
+            # Scale-multiply for ALL threads (hoisted out of rope/nope split).
             scaled = []
             for vi in range_constexpr(VEC):
                 xi = x_f32_vec[vi]
@@ -492,13 +462,13 @@ def _build_kernel(
                 else:
                     scaled.append(xi * rstd)
 
-            # ---- Store scaled to rmem for cross-branch value passing ----
+            # Round-trip scaled values through rmem so both branches share them.
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-            scaled_raw = [_to_raw(s) for s in scaled]
+            scaled_raw = [s.ir_value() for s in scaled]
             scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
-            # ---- ROPE branch: load from rmem, rotate, store back ----
+            # ROPE branch: load from rmem, rotate the GPT-J pairs, store back.
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
             if is_rope:
                 rope_rel = tid - fx.Int32(ROPE_THREAD_LO)
@@ -514,65 +484,54 @@ def _build_kernel(
                     o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_elems.append(_to_raw(e * c - o * s))
-                    rope_elems.append(_to_raw(e * s + o * c))
+                    rope_elems.append((e * c - o * s).ir_value())
+                    rope_elems.append((e * s + o * c).ir_value())
                 rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
-            # ---- Unified store: all threads read from rmem and write ----
+            # Unified store: all threads read the final row from rmem and write.
             final = fx.memref_load_vec(out_rmem)
             final_list = [final[i] for i in range(VEC)]
 
             if const_expr(quant):
-                rsrc, row_base = fp8_out_rsrc
+                out_base, row_base = fp8_out_base
                 _store_fp8_packed(
-                    final_list, rsrc, row_base, tid, VEC, skip_fnuz_clamp=not _is_fnuz
+                    final_list,
+                    out_base,
+                    row_base,
+                    tid,
+                    VEC,
+                    skip_fnuz_clamp=not _is_fnuz,
                 )
             else:
-                _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
+                _store_bf16_tiled(final_list, bf16_out_part, row_copy, VEC)
                 if const_expr(kv_write) and do_swa:
-                    _store_bf16_vec_g(final_list, swa_out_g, 0, tid, VEC)
+                    _store_bf16_tiled(final_list, swa_out_part, row_copy, VEC)
 
-        # ============ runtime dispatch on bid_x < H ============
-        # Per-token byte offsets fold ``bid_t`` into the buffer descriptor
-        # base so the runtime offset within each load/store stays in i32
-        # range. This lets the kernel handle arbitrary T (only HW grid Y
-        # limits T per launch) without the bf16 element offset overflowing
-        # signed i32 at H*D = 65k+ per token.
-        # Per-token byte offset, computed in index type (= platform pointer
-        # width, 64-bit on AMD). GTensor.get_llvm_ptr does
-        # arith.index_cast(i64, ...) on this value, which is only valid when
-        # the input is index-typed. Doing the math in index avoids large
-        # H*D configs (e.g. H=128 D=512 -> 128 KB/token, max offset 8.6 GiB
-        # at bid_t=65534) silently producing garbage if we feed i64.
-        q_tok_off_bytes = arith.MulIOp(
-            bid_t_idx, arith.constant(H * D * 2, type=T.index)
-        ).result
-
+        # Runtime dispatch bid_x < H (Q heads) vs == H (KV). Each in/out base
+        # folds bid_t (and the runtime kv row stride) into the descriptor base
+        # ptr in i64, so the in-thread voffset stays small (bounded by D) and
+        # large H*D configs never overflow i32 (>4GiB spans).
         if bid_x < fx.Int32(H):
             # ---------- Q path ----------
             head_idx = bid_x
-            # Q in: per-token shifted base via GTensor. Each thread reads VEC
-            # bf16 at (head_idx, tid*VEC) -- element offset is bounded by H*D
-            # = 64K (fits i32 with huge headroom).
-            q_in_tok = GTensor(
-                q_in,
-                dtype=T.bf16,
-                shape=(H, D),
-                static_bytes_offset_i64=q_tok_off_bytes,
+            q_in_base = (
+                fx.Int64(ptrtoint(q_in))
+                + fx.Int64(bid_t) * fx.Int64(H * D * 2)
+                + fx.Int64(head_idx) * fx.Int64(D * 2)
             )
-            q_my_off = head_idx * D + tid * VEC
-            raw_x_vec = q_in_tok.load(q_my_off, vec_size=VEC)
-            # Round-trip through rmem so the rest of emit_body (.to/.reduce)
-            # sees a Fly-wrapped vec instead of a raw MLIR vec.
+            q_in_row = _bf16_row_view(q_in_base, D, D * 2)
+            q_in_part = _row_part_S(q_in_row)
+            q_frag = fx.make_fragment_like(q_in_part)
+            fx.copy(row_copy, q_in_part, q_frag)
+            # Round-trip through full_lay rmem so downstream sees the same vector
+            # type as the buffer_load path; otherwise the tiled-copy fragment's
+            # memref canonicalizes to ub.poison, which ROCm LLVM cannot lower.
             q_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
-            fx.memref_store_vec(raw_x_vec, q_rmem)
+            fx.memref_store_vec(fx.memref_load_vec(q_frag), q_rmem)
             x_vec = fx.memref_load_vec(q_rmem)
             x_f32 = x_vec.to(fx.Float32)
 
-            # Optional per-channel Q weight (RMSNorm gamma for Q). Loaded only
-            # when q_weighted=True; otherwise q_weight tensor is a dummy and
-            # never read.
             if const_expr(q_weighted):
                 qw_buf = fx.rocdl.make_buffer_tensor(q_weight)
                 qw_div = fx.logical_divide(qw_buf, full_lay)
@@ -581,71 +540,55 @@ def _build_kernel(
             else:
                 qw_f32 = None
 
-            row_off_q_elems = head_idx * D
             if const_expr(quant):
-                # Per-token shifted base for q_out (fp8 = 1 byte/elem).
-                q_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(H * D, type=T.index)
-                ).result
-                qo_g_tmp = GTensor(
-                    q_out,
-                    dtype=T.i8,
-                    shape=(H, D),
-                    static_bytes_offset_i64=q_tok_off_fp8,
-                )
-                qo_rsrc = qo_g_tmp.rsrc
-                # row_base_bytes is now token-relative (head_idx * D bytes for fp8).
+                # fp8 store: fold only the per-token base into the i64 base;
+                # row_base_bytes = head_idx*D added per-lane at store.
+                qo_base = fx.Int64(ptrtoint(q_out)) + fx.Int64(bid_t) * fx.Int64(H * D)
                 row_base_bytes = head_idx * D
-                qs_rsrc = _ptr_buffer_resource(q_scale)
-                # q_scale layout (T, H, NG) flat: bid_t * H*NG + head_idx * NG.
-                # Per-lane adds group_idx inside emit_body.
+                qs_base = fx.Int64(ptrtoint(q_scale))
+                # q_scale (T, H, NG) flat; per-lane adds group_idx in emit_body.
                 scale_base_off_q = bid_t * (H * NG) + head_idx * NG
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
                     w_f32_vec=qw_f32,
-                    bf16_out_g=None,
-                    bf16_out_row_off=None,
-                    fp8_out_rsrc=(qo_rsrc, row_base_bytes),
-                    scale_rsrc=qs_rsrc,
+                    bf16_out_part=None,
+                    fp8_out_base=(qo_base, row_base_bytes),
+                    scale_base_i64=qs_base,
                     scale_base_off=scale_base_off_q,
                 )
             else:
-                # Per-token shifted base for q_out (bf16 = 2 bytes/elem).
-                # Reuses q_tok_off_bytes computed above (the bf16 byte offset).
-                qo_g = GTensor(
-                    q_out,
-                    dtype=T.bf16,
-                    shape=(H, D),
-                    static_bytes_offset_i64=q_tok_off_bytes,
+                # bf16 q_out: per-token + per-head base -> (1,D) tiled-copy store.
+                qo_base = (
+                    fx.Int64(ptrtoint(q_out))
+                    + fx.Int64(bid_t) * fx.Int64(H * D * 2)
+                    + fx.Int64(head_idx) * fx.Int64(D * 2)
                 )
+                qo_part = _row_part_D(_bf16_row_view(qo_base, D, D * 2))
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
                     w_f32_vec=qw_f32,
-                    bf16_out_g=qo_g,
-                    bf16_out_row_off=row_off_q_elems,
-                    fp8_out_rsrc=None,
-                    scale_rsrc=None,
+                    bf16_out_part=qo_part,
+                    fp8_out_base=None,
+                    scale_base_i64=None,
                     scale_base_off=None,
                 )
         else:
             # ---------- KV path ----------
-            # KV is often a strided slice of a wider tensor (V4: kv = split of
-            # qkv_a -> row stride = q_lora + head_dim). fx.slice/logical_divide
-            # do not pull stride from torch.Tensor metadata, so use raw
-            # buffer_ops with the explicit kv_in_row_stride argument, then
-            # round-trip through an rmem tensor to get a Fly-wrapped vec that
-            # the rest of emit_body (.to/.reduce/[i]) expects.
-            kv_rsrc = _ptr_buffer_resource(kv_in)
-            kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
-            kv_off_dw = kv_off_elems >> 1
-            x_raw = buffer_ops.buffer_load(
-                kv_rsrc, kv_off_dw, vec_width=VEC // 2, dtype=i32
+            # KV is often a strided slice (V4: split of qkv_a). The runtime row
+            # stride (bf16 elems) is folded into the base ptr as bytes, then the
+            # token row is a plain contiguous (1, D) tiled-copy like Q.
+            kv_in_base = fx.Int64(ptrtoint(kv_in)) + fx.Int64(bid_t) * (
+                fx.Int64(kv_in_row_stride) * fx.Int64(2)
             )
-            x_vec_bf16_raw = fx.Vector(x_raw).bitcast(fx.BFloat16)
+            kv_in_row = _bf16_row_view(kv_in_base, D, D * 2)
+            kv_in_part = _row_part_S(kv_in_row)
+            kv_frag = fx.make_fragment_like(kv_in_part)
+            fx.copy(row_copy, kv_in_part, kv_frag)
+            # Round-trip through full_lay rmem (see Q path note re: ub.poison).
             kv_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
-            fx.memref_store_vec(x_vec_bf16_raw, kv_rmem)
+            fx.memref_store_vec(fx.memref_load_vec(kv_frag), kv_rmem)
             x_vec = fx.memref_load_vec(kv_rmem)
 
             kvw_buf = fx.rocdl.make_buffer_tensor(kv_weight)
@@ -655,132 +598,106 @@ def _build_kernel(
             w_f32 = w_vec.to(fx.Float32)
 
             if const_expr(quant):
-                # Per-token shifted base for kv_out (fp8 = 1 byte/elem).
-                kv_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D, type=T.index)
-                ).result
-                kvo_g_tmp = GTensor(
-                    kv_out,
-                    dtype=T.i8,
-                    shape=(D,),
-                    static_bytes_offset_i64=kv_tok_off_fp8,
-                )
-                kvo_rsrc = kvo_g_tmp.rsrc
-                row_base_bytes = arith.constant(0, type=i32)  # already at token base
-                kvs_rsrc = _ptr_buffer_resource(kv_scale)
-                # kv_scale layout (T, NG) flat: bid_t * NG. Per-lane adds
-                # group_idx inside emit_body.
+                # fp8 kv_out: fold per-token base into the i64 base (already at
+                # token base -> row_base_bytes = 0).
+                kvo_base = fx.Int64(ptrtoint(kv_out)) + fx.Int64(bid_t) * fx.Int64(D)
+                row_base_bytes = 0
+                kvs_base = fx.Int64(ptrtoint(kv_scale))
+                # kv_scale (T, NG) flat; per-lane adds group_idx in emit_body.
                 scale_base_off_kv = bid_t * NG
                 emit_body(
                     weighted=True,
                     x_f32_vec=x_f32,
                     w_f32_vec=w_f32,
-                    bf16_out_g=None,
-                    bf16_out_row_off=None,
-                    fp8_out_rsrc=(kvo_rsrc, row_base_bytes),
-                    scale_rsrc=kvs_rsrc,
+                    bf16_out_part=None,
+                    fp8_out_base=(kvo_base, row_base_bytes),
+                    scale_base_i64=kvs_base,
                     scale_base_off=scale_base_off_kv,
                 )
             else:
-                # Per-token shifted base for kv_out (bf16 = 2 bytes/elem).
-                kv_tok_off_bf16 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D * 2, type=T.index)
-                ).result
-                kvo_g = GTensor(
-                    kv_out,
-                    dtype=T.bf16,
-                    shape=(D,),
-                    static_bytes_offset_i64=kv_tok_off_bf16,
+                # bf16 kv_out: per-token (1,D) row view + tiled-copy store.
+                kvo_base = fx.Int64(ptrtoint(kv_out)) + fx.Int64(bid_t) * fx.Int64(
+                    D * 2
                 )
+                kvo_part = _row_part_D(_bf16_row_view(kvo_base, D, D * 2))
 
                 # ---- Fused SWA scatter setup (kv_write only) ----
                 # Target row comes from `swa_index`, whose meaning `paged`
                 # selects: a block table to walk, or this token's row outright.
-                # batch_id is i32 with -1 sentinel on CG-pad tokens; clamp it to
-                # 0 for the (predicated-off) load to keep it in-bounds, and gate
-                # the actual store on do_swa.
-                swa_out_g = None
+                # batch_id has a -1 sentinel on CG-pad tokens; clamp to 0 to keep
+                # the load in-bounds and gate the store on do_swa.
+                swa_out_part = None
                 do_swa = None
                 if const_expr(kv_write):
-                    bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
-                    bid_i32 = buffer_ops.buffer_load(
-                        bid_rsrc, bid_t, vec_width=1, dtype=i32
+                    bid_i32 = fx.Int32(
+                        _scalar_load(
+                            fx.Int64(ptrtoint(batch_id_per_token)),
+                            bid_t,
+                            fx.Int32,
+                            32,
+                        )
                     )
                     do_swa = bid_i32 >= fx.Int32(0)
-                    bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
+                    bid_safe = (bid_i32 >= fx.Int32(0)).select(bid_i32, fx.Int32(0))
                     if const_expr(paged):
-                        # paged / content-addressed SWA: swa_kv is the FLAT
-                        # [num_pages, D] pool, swa_index is block_tables
-                        # [bs, max_blocks], swa_slot_stride is max_blocks (its
-                        # row stride), swa_cache_size is block_size,
-                        # swa_pos_stride is D. Physical row =
-                        #   block_tables[bid, pos//block_size]*block_size
-                        #   + pos % block_size
-                        blk = arith.divsi(pos_i32, _to_raw(swa_cache_size))
-                        bt_off = ArithValue(bid_safe) * ArithValue(
-                            swa_slot_stride
-                        ) + ArithValue(blk)
-                        bt_rsrc = _ptr_buffer_resource(swa_index)
-                        phys = buffer_ops.buffer_load(
-                            bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
+                        # paged / content-addressed SWA (DeepSeek-V4 #1417):
+                        # swa_kv is the FLAT [num_pages, D] pool; `swa_index` is
+                        # block_tables[bs, max_blocks], swa_slot_stride=max_blocks,
+                        # swa_cache_size=block_size, swa_pos_stride=D. Physical row
+                        # = block_tables[bid, pos//bs]*bs + pos%bs.
+                        blk = pos_i32 // swa_cache_size
+                        bt_off = bid_safe * swa_slot_stride + blk
+                        phys = fx.Int32(
+                            _scalar_load(
+                                fx.Int64(ptrtoint(swa_index)),
+                                bt_off,
+                                fx.Int32,
+                                32,
+                            )
                         )
-                        in_blk = arith.remsi(pos_i32, _to_raw(swa_cache_size))
-                        row = ArithValue(phys) * ArithValue(
-                            swa_cache_size
-                        ) + ArithValue(in_blk)
-                        row_safe = _to_raw(row)
+                        in_blk = pos_i32 % swa_cache_size
+                        row = phys * swa_cache_size + in_blk
                     else:
                         # Direct: the caller already resolved this token's row.
-                        # A `-1` row means "skip", same as a `-1` batch id --
-                        # a caller whose window is not expressible here needs a
-                        # way to say so per token, not just per request.
-                        row_rsrc = _ptr_buffer_resource(swa_index)
-                        row = buffer_ops.buffer_load(
-                            row_rsrc, bid_t, vec_width=1, dtype=i32
+                        # A -1 row means "skip", same as a -1 batch id -- a caller
+                        # whose window this kernel cannot express needs a way to
+                        # say so per token, not just per request.
+                        dest = fx.Int32(
+                            _scalar_load(
+                                fx.Int64(ptrtoint(swa_index)),
+                                bid_t,
+                                fx.Int32,
+                                32,
+                            )
                         )
-                        do_swa = arith.andi(do_swa, ArithValue(row) >= 0)
-                        row_safe = arith.maxsi(row, arith.constant(0, type=i32))
-                    # The row index fits 32 bits; `row * D * 2` does not. A
-                    # unified V4 pool runs to ~150M rows, so a 32-bit byte
-                    # offset wraps 3% of the way in, and the sliding windows
-                    # this writes live at the far end. Widen before either
-                    # multiply, and let it reach the descriptor through the
-                    # base address (`static_bytes_offset_i64`) rather than
-                    # through the 32-bit offset field, whose window is 4 GiB.
-                    swa_off_bytes = arith.index_cast(
-                        T.index,
-                        arith.muli(
-                            arith.muli(
-                                arith.extsi(T.i64, row_safe),
-                                arith.extsi(T.i64, _to_raw(swa_pos_stride)),
-                            ),
-                            arith.constant(2, type=T.i64),
-                        ),
-                    )
-                    swa_out_g = GTensor(
-                        swa_kv,
-                        dtype=T.bf16,
-                        shape=(D,),
-                        static_bytes_offset_i64=swa_off_bytes,
-                    )
+                        do_swa = do_swa & (dest >= fx.Int32(0))
+                        row = (dest >= fx.Int32(0)).select(dest, fx.Int32(0))
+                    # Fold the row's byte offset into the base ptr; the per-token
+                    # row is then a plain (1, D) tiled-copy store like kv_out.
+                    # Widen BEFORE the element product: a unified V4 pool runs to
+                    # ~150M rows, so at D=512 `row * swa_pos_stride` passes 2^31
+                    # 3% of the way in, and the windows this writes live at the
+                    # far end. The base address is 64-bit; the descriptor's own
+                    # offset field is not.
+                    swa_base = fx.Int64(ptrtoint(swa_kv)) + fx.Int64(row) * fx.Int64(
+                        swa_pos_stride
+                    ) * fx.Int64(2)
+                    swa_out_part = _row_part_D(_bf16_row_view(swa_base, D, D * 2))
 
                 emit_body(
                     weighted=True,
                     x_f32_vec=x_f32,
                     w_f32_vec=w_f32,
-                    bf16_out_g=kvo_g,
-                    bf16_out_row_off=arith.constant(0, type=i32),
-                    fp8_out_rsrc=None,
-                    scale_rsrc=None,
+                    bf16_out_part=kvo_part,
+                    fp8_out_base=None,
+                    scale_base_i64=None,
                     scale_base_off=None,
-                    swa_out_g=swa_out_g,
+                    swa_out_part=swa_out_part,
                     do_swa=do_swa,
                 )
 
-    # Name the launcher explicitly so the flydsl disk cache directory becomes
-    # `~/.flydsl/cache/launch_qk_norm_rope_quant_<hash>/` instead of the
-    # generic `launcher_<hash>/`, which collides visually with every other
-    # @flyc.jit function in the codebase.
+    # Named launcher so the flydsl disk cache dir is
+    # launch_qk_norm_rope_quant_<hash>/ instead of the generic launcher_<hash>/.
     @flyc.jit
     def launch_qk_norm_rope_quant(
         q_in: fx.Pointer,
@@ -838,9 +755,8 @@ def _build_kernel(
 # Cached compile + public API
 # ============================================================================
 
-# Empirically (sweep on MI355X V4-Pro shape) ``waves_per_eu=8, fast_fp_math
-# =True, unsafe_fp_math=True`` gives the best occupancy at small/mid T with
-# no measurable regression at large T. See logs_claude/sweep_hints.py.
+# Empirically best occupancy on MI355X V4-Pro (sweep): waves_per_eu=8 +
+# fast/unsafe fp math, no regression at large T.
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 8,
     "fast_fp_math": True,
@@ -848,10 +764,6 @@ _DEFAULT_COMPILE_HINTS = {
 }
 
 
-# Bounded to keep parity with sibling flydsl ops (see fmha_kernels._get_kernel).
-# In V4-Pro deployment only a handful of (H, D, RD, quant, group_size,
-# scale_dtype, q_weighted) combinations actually fire, so 32 leaves wide
-# headroom while preventing unbounded growth from sweep/test enumeration.
 @lru_cache(maxsize=32)
 def compile_flydsl_qk_norm_rope_quant(
     *,
@@ -865,13 +777,9 @@ def compile_flydsl_qk_norm_rope_quant(
     kv_write: bool = False,
     paged: bool = False,
 ):
-    """Compile (and cache) the launcher for a given config.
-
-    Cache key includes (H, D, RD, quant, group_size, scale_dtype, q_weighted,
-    kv_write, paged). Returns the @flyc.jit launcher; call it directly if you've
-    already allocated outputs and want to avoid the per-call torch-side
-    overhead in ``flydsl_qk_norm_rope_quant``.
-    """
+    """Compile (and cache) the launcher for a given config. Returns the
+    @flyc.jit launcher; call it directly to skip the per-call torch overhead in
+    ``flydsl_qk_norm_rope_quant`` (bounded lru; sibling ops do the same)."""
     launcher = _build_kernel(
         num_q_heads=num_q_heads,
         head_dim=head_dim,
@@ -921,63 +829,46 @@ def flydsl_qk_norm_rope_quant(
     """Fused RMSNorm + GPT-J RoPE + optional FP8 quant for Q and KV in one launch.
 
     Args:
-        q: Q activations, shape ``[T, H*D]`` (will be ``.view``-reshaped to
-            ``[T, H, D]``) or already ``[T, H, D]``. Must be bf16 and contig
-            in the (H, D) inner dims.
-        kv: KV pre-RoPE/norm, shape ``[T, D]``, bf16. May be a strided view
-            of a wider tensor (e.g. the KV half of a ``torch.split``); the
-            row stride is read from ``kv.stride(0)`` and passed through.
-        kv_weight: per-channel RMSNorm weight for KV, shape ``[D]``, bf16.
-        cos_cache, sin_cache: RoPE cos/sin, last dim ``rope_head_dim/2``,
-            any leading shape that ``view``-reshapes to ``[max_pos, RD/2]``
-            (e.g. ``[max_pos, 1, 1, RD/2]`` from DeepSeek-V4). bf16.
-        positions: per-token RoPE position indices, shape ``[T]``, int64.
-        num_q_heads: H (per-rank Q head count).
-        head_dim: D (per-head hidden dim).
-        rope_head_dim: RD (size of the RoPE-rotated tail; first D-RD elements
-            are passed through as NOPE).
-        q_weight: optional per-channel RMSNorm weight for Q, shape ``[D]``,
-            bf16. When ``None`` (default, V4-Pro), Q is weightless. When
-            provided, applied just like ``kv_weight``.
-        quant: if True, write fp8 in the per-GFX native encoding selected by
-            ``aiter.dtypes.fp8`` (typically ``e4m3fnuz`` on gfx942 and
-            ``e4m3fn`` on gfx950); else bf16.
-        quant_group_size: width of the 1xG scale block. Defaults to
-            ``head_dim`` (per-row scale). Any value that divides ``head_dim``
-            is accepted by the wrapper; the underlying kernel currently
-            requires ``G`` to be a multiple of ``head_dim // BLOCK_THREADS``
-            (= 8 for V4-Pro at D=512, BLOCK_THREADS=64), so the typical
-            sub-row choices are ``{32, 64, 128}``.
-        scale_dtype: ``"fp32"`` (default) or ``"e8m0"`` (MX-format uint8).
-        q_out, kv_out, q_scale, kv_scale: output buffers; allocated if None.
-            ``q_out`` shape ``[T, H, D]``, ``kv_out`` shape ``[T, D]``,
-            ``q_scale`` shape ``[T, H, NG]``, ``kv_scale`` shape ``[T, NG]``
-            where ``NG = head_dim // quant_group_size``. Scale dtype is
-            ``torch.float32`` for ``scale_dtype="fp32"``, ``torch.uint8``
-            for ``"e8m0"`` (reinterpret as e8m0 downstream).
-        stream: torch CUDA stream to launch on. Defaults to the current
-            stream. **Must NOT be left at ``fx.Stream(None)`` default in
-            caller code unless you accept the default-stream pitfall under
-            CUDA-graph capture** (NULL stream -> empty captured graph).
-        swa_kv: optional bf16 SWA pool. When provided (BF16 only;
-            incompatible with ``quant``), the post-norm/rope KV row is
-            additionally scattered into it in the same launch, fusing the
-            standalone ``swa_write``. Flat ``[num_rows, D]`` with
-            ``swa_dest_rows``; flat ``[num_pages, D]`` with
-            ``swa_block_tables``.
-        swa_dest_rows: ``[T]`` int32 -- the row THIS TOKEN's KV goes to, one
-            entry per token (not per request: with speculation a request
-            writes several positions in one launch and they do not share a
-            row). ``-1`` skips the token. Lets a caller whose window layout
-            this kernel cannot express resolve the row itself. Required when
-            ``swa_kv`` is set and ``swa_block_tables`` is not.
-        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens -- token->seq
-            map for the fused SWA scatter (store gated off on ``-1``). Required
-            when ``swa_kv`` is set.
+        q: Q activations, bf16, ``[T, H*D]`` (``.view``-reshaped) or ``[T, H, D]``;
+            must be contig in the (H, D) inner dims.
+        kv: KV pre-RoPE/norm, ``[T, D]`` bf16. May be a strided view (the row
+            stride from ``kv.stride(0)`` is passed through).
+        kv_weight: per-channel KV RMSNorm weight, ``[D]`` bf16.
+        cos_cache, sin_cache: RoPE cos/sin, last dim RD/2, any leading shape that
+            ``view``-reshapes to ``[max_pos, RD/2]`` (bf16).
+        positions: per-token RoPE indices, ``[T]`` int64.
+        num_q_heads / head_dim / rope_head_dim: H / D / RD (RD-tail is rotated,
+            first D-RD elements pass through as NOPE).
+        q_weight: optional per-channel Q RMSNorm weight ``[D]`` bf16; None ->
+            weightless Q (V4-Pro default).
+        quant: if True write fp8 in the per-GFX native encoding from
+            ``aiter.dtypes.fp8`` (e4m3fnuz gfx942 / e4m3fn gfx950); else bf16.
+        quant_group_size: 1xG scale block width; default head_dim (per-row).
+            Kernel needs G a multiple of head_dim//BLOCK_THREADS (8), so
+            typical sub-row choices are {32, 64, 128}.
+        scale_dtype: ``"fp32"`` (default) or ``"e8m0"`` (MX uint8).
+        q_out, kv_out, q_scale, kv_scale: output buffers (allocated if None);
+            q_out [T,H,D], kv_out [T,D], q_scale [T,H,NG], kv_scale [T,NG] with
+            NG = head_dim // quant_group_size; fp32 or uint8 (e8m0) scales.
+        stream: launch stream (default current). Do NOT leave at
+            ``fx.Stream(None)`` under CUDA-graph capture (NULL stream -> empty
+            captured graph).
+        swa_kv: optional flat bf16 SWA pool (bf16 only, incompatible with quant);
+            the post-norm/rope KV row is also scattered into it in the same
+            launch, fusing the standalone swa_write. ``[num_rows, D]`` with
+            ``swa_dest_rows``, ``[num_pages, D]`` with ``swa_block_tables``.
+        swa_dest_rows: ``[T]`` int32 -- the row THIS TOKEN's KV goes to, one entry
+            per token (not per request: under speculation one request writes
+            several positions in a launch and they do not share a row). ``-1``
+            skips the token, letting a caller whose window layout this kernel
+            cannot express resolve the row itself. Required w/ swa_kv unless
+            ``swa_block_tables`` is given.
+        batch_id_per_token: ``[T]`` int32, -1 on CG-pad tokens (store gated off);
+            required w/ swa_kv.
 
     Returns:
-        (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
-        Scales are ``None`` when ``quant=False``.
+        (q_out, kv_out, q_scale_or_None, kv_scale_or_None); scales None when
+        ``quant=False``.
     """
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
@@ -1011,9 +902,8 @@ def flydsl_qk_norm_rope_quant(
             stream=stream,
         )
 
-    # Validate user-facing inputs with raise (not assert) so the checks are
-    # not stripped under ``python -O``. Internal codegen invariants inside
-    # _build_kernel/_store_*_vec_g remain as asserts on purpose.
+    # User-facing inputs use raise (not stripped under python -O); internal
+    # codegen invariants in _build_kernel stay as asserts.
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q must be bf16, got {q.dtype}")
     if kv.dtype != torch.bfloat16:
@@ -1022,10 +912,8 @@ def flydsl_qk_norm_rope_quant(
         raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
     if kv.stride(-1) != 1:
         raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
-    # The KV inner loop casts bf16 vectors to dword (i32) and computes the
-    # buffer-load offset as ``(row * kv.stride(0) + tid * VEC) >> 1``. That
-    # ``>> 1`` is only correct when the byte offset is dword-aligned for every
-    # row, which requires the row stride (in bf16 elements) to be even.
+    # KV loads cast bf16->dword; the >>1 in the offset is only correct when the
+    # per-row byte offset is dword-aligned, i.e. the bf16 row stride is even.
     if kv.stride(0) % 2 != 0:
         raise ValueError(
             "kv row stride (in bf16 elements) must be even for dword-cast "
@@ -1045,10 +933,8 @@ def flydsl_qk_norm_rope_quant(
     if D % G != 0:
         raise ValueError(f"head_dim {D} must be divisible by quant_group_size {G}")
     q_weighted = q_weight is not None
-    # Kernel always reads the q_weight parameter; pass a 1-elem dummy when
-    # q_weighted=False (the const_expr gate inside the kernel ensures the
-    # load is dead-code-eliminated, but the parameter binding still needs a
-    # valid tensor).
+    # Kernel always binds q_weight; pass a dummy when unused (const_expr gate
+    # DCEs the load but the param binding still needs a valid tensor).
     q_weight_arg = q_weight if q_weighted else kv_weight
 
     # Normalize Q to [T, H, D] (the kernel expects 3D).
@@ -1064,10 +950,8 @@ def flydsl_qk_norm_rope_quant(
                 f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})"
             )
         q_view = q
-        # The kernel linearly indexes q_in as if it were dense [T,H,D] with
-        # the (H,D) inner block contiguous. Strided views (e.g. a slice of a
-        # wider tensor along an inner axis) would silently read the wrong
-        # elements, so reject anything that is not dense in the (H,D) tail.
+        # Kernel indexes q_in as dense [T,H,D]; reject non-dense (H,D) tails
+        # (strided views would silently read the wrong elements).
         if q_view.stride(-1) != 1 or q_view.stride(-2) != D:
             raise ValueError(
                 "3D q must be contiguous in the (H, D) inner block "
@@ -1093,8 +977,8 @@ def flydsl_qk_norm_rope_quant(
     if kv_out is None:
         kv_out = torch.empty((T_tok, D), dtype=out_dtype, device=kv.device)
 
-    # Scale buffers must always be passed to the launcher (the kernel reads
-    # the parameter regardless of QUANT_*). Allocate dummies when not quant.
+    # Scale buffers are always bound (kernel reads the param regardless of
+    # quant); allocate dummies when not quant.
     scale_torch_dtype = _TORCH_DTYPE_FOR_SCALE[scale_dtype]
     if quant:
         if q_scale is None:
@@ -1111,14 +995,13 @@ def flydsl_qk_norm_rope_quant(
         kv_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
 
     # ---- Fused SWA cache-write (BF16 only) ----
-    # Two modes (both write the post-norm/rope KV row in the same launch,
-    # avoiding a separate swa_write launch + kv HBM round-trip; bf16 only):
-    #   direct (swa_dest_rows given): swa_kv[swa_dest_rows[t], :]
-    #   paged  (swa_block_tables given): content-addressed flat pool
-    #                         swa_kv[block_tables[bid, pos//bs]*bs + pos%bs, :].
-    #                         Repurposes the scalars: ssm_arg=block_tables,
-    #                         swa_slot_stride=max_blocks,
-    #                         swa_cache_size=block_size, swa_pos_stride=D.
+    # Two modes, both writing the post-norm/rope KV row in the same launch
+    # (no separate swa_write launch, no kv HBM round-trip; bf16 only):
+    #   direct (swa_dest_rows): flat pool swa_kv[swa_dest_rows[t], :]
+    #   paged  (swa_block_tables): flat pool swa_kv[bt[bid, pos//bs]*bs + pos%bs]
+    #                              (DeepSeek-V4 #1417; repurposes the ring
+    #                              scalars: swa_slot_stride=max_blocks,
+    #                              swa_cache_size=block_size, swa_pos_stride=D).
     paged = swa_block_tables is not None
     kv_write = swa_kv is not None
     if kv_write and quant:
@@ -1200,16 +1083,10 @@ def flydsl_qk_norm_rope_quant(
     def _ptr_arg(t):
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
-    # kernel uses per-token GTensor base-shift so each chunk's resource span
-    # is small (just the chunk's tokens), but the grid Y dim itself is HW-
-    # bounded. We tried folding T across gridY+gridZ to do a single launch,
-    # but flydsl's ``if cond: return`` does NOT actually early-exit inside a
-    # @flyc.kernel body (the rest of the kernel still runs with bid_t past
-    # num_tokens, causing OOB memory faults at tail blocks). Wrapping the
-    # full kernel body in a positive ``if bid_t < num_tokens:`` works but
-    # requires indenting ~400 lines. The Python-loop chunk is the pragmatic
-    # solution -- overhead is one launch per 65k tokens.
+    # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch and
+    # chunk tokens in Python. (flydsl's ``if cond: return`` does NOT early-exit
+    # inside a @flyc.kernel body -- the rest still runs with bid_t past
+    # num_tokens, faulting at tail blocks -- so a single folded launch is out.)
     MAX_GRID_Y = 65535
     for start in range(0, T_tok, MAX_GRID_Y):
         n = min(MAX_GRID_Y, T_tok - start)
