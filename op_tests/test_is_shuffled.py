@@ -13,6 +13,7 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import gemm_a16w16
 from aiter.utility import fp4_utils
@@ -46,6 +47,9 @@ def run_moe(
 
 
 def test_fused_moe_cloned_fp4_weights():
+    if get_gfx() not in ["gfx950"]:
+        print(f"Skipping fp4 MoE test on {get_gfx()} (per_1x32 requires gfx950)")
+        return
     num_experts, model_dim, inter_dim, top_k, num_tokens = 257, 4096, 1024, 9, 8
     generator = torch.Generator(device="cuda").manual_seed(42)
 
