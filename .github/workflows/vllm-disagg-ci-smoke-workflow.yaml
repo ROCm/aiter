@@ -159,7 +159,7 @@ jobs:
             fi
           fi
 
-      - name: Select DeepSeek vLLM-router cases
+      - name: Select vLLM-router cases
         id: select
         run: |
           set -euo pipefail
@@ -172,6 +172,13 @@ jobs:
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
           models = {"DeepSeek-V3", "DeepSeek-R1-MXFP4"}
+          models.update(
+              {
+                  'Kimi-K2.5-MXFP4',
+                  'Kimi-K2.6-MXFP4',
+                  'MiniMax-M3-MXFP8',
+              }
+          )
           topologies = {
               "1P1D": "1P1D-TP8",
               "2P2D": "2P2D-TP8",
