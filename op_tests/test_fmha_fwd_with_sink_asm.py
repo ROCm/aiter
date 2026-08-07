@@ -173,22 +173,12 @@ _CORRECTNESS_SHAPES = [
     (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
 ]
 
-# Perf-only shapes; sq == sk.  hq=64, hk=8 (D64) / 4 (D128), batch=1, sbhd.
-# The torch reference is O(s^2) in memory (e.g. 32768 -> ~256 GB of scores) so
-# these are timed but NOT correctness-checked here (use _CORRECTNESS_SHAPES).
-# (head_dim, seqlen)
-_PERF_SHAPES = [
-    (64, 1024),
-    (64, 4096),
-    (64, 8192),
-    (64, 16384),
-    (64, 32768),
-    (128, 1024),
-    (128, 2048),
-    (128, 4096),
-    (128, 8192),
-    (128, 16384),
-]
+# Perf-only seqlens; sq == sk.  hq=64, hk=8 (D64) / 4 (D128), batch=1, sbhd.
+# The perf table is the cross product of --head_dim x --seqlen, so every seqlen
+# here is timed at both head dims.  The torch reference is O(s^2) in memory
+# (e.g. 32768 -> ~256 GB of scores) so these are timed but NOT correctness-checked
+# (use _CORRECTNESS_SHAPES for that).  This is the default for -s/--seqlen.
+_PERF_SEQLENS = [1024, 2048, 4096, 8192, 16384, 32768]
 
 
 # ---------------------------------------------------------------------------
@@ -315,24 +305,34 @@ def main():
         default=["randn", "const0.25"],
         help="q/k/v init pattern(s) (default: randn const0.25)",
     )
+    parser.add_argument(
+        "-s",
+        "--seqlen",
+        type=int,
+        nargs="*",
+        default=_PERF_SEQLENS,
+        help="square seqlen(s) sq==sk for the perf table; swept against\n"
+        "--head_dim (default: 1024 2048 4096 8192 16384 32768).\n"
+        "e.g. -s 16384 32768 runs only those two seqlens.",
+    )
     args = parser.parse_args()
     causal_modes = [bool(c) for c in args.causal]
 
     # ---- correctness + perf table ----
     df = []
-    for head_dim, hq, hk, sq, sk, batch in _CORRECTNESS_SHAPES:
-        if head_dim not in args.head_dim:
-            continue
-        for is_causal, layout, init in itertools.product(
-            causal_modes, args.layout, args.init
-        ):
-            if not is_causal and sk % 256 != 0:  # mask=0 kernel needs sk%256==0
+    # init outermost so same-init rows group together (matches the perf table).
+    for init in args.init:
+        for head_dim, hq, hk, sq, sk, batch in _CORRECTNESS_SHAPES:
+            if head_dim not in args.head_dim:
                 continue
-            df.append(
-                test_fmha_fwd_with_sink_asm(
-                    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init
+            for is_causal, layout in itertools.product(causal_modes, args.layout):
+                if not is_causal and sk % 256 != 0:  # mask=0 kernel needs sk%256==0
+                    continue
+                df.append(
+                    test_fmha_fwd_with_sink_asm(
+                        head_dim, hq, hk, sq, sk, batch, is_causal, layout, init
+                    )
                 )
-            )
     df = pd.DataFrame(df)
     aiter.logger.info(
         "fmha_fwd_with_sink_asm correctness summary (markdown):\n%s",
@@ -340,17 +340,19 @@ def main():
     )
 
     # ---- perf-only table (large shapes; ref infeasible) ----
+    # init is the OUTERMOST axis so the table groups all rows of one init
+    # pattern together (not interleaved); then head_dim x seqlen x causal.
+    # sq == sk.
     df = []
-    for head_dim, seqlen in _PERF_SHAPES:
-        if head_dim not in args.head_dim:
-            continue
+    for init, head_dim, seqlen, is_causal in itertools.product(
+        args.init, args.head_dim, args.seqlen, causal_modes
+    ):
         hk = 8 if head_dim == 64 else 4
-        for is_causal, init in itertools.product(causal_modes, args.init):
-            df.append(
-                test_fmha_fwd_with_sink_asm_perf(
-                    head_dim, 64, hk, seqlen, seqlen, 1, is_causal, init
-                )
+        df.append(
+            test_fmha_fwd_with_sink_asm_perf(
+                head_dim, 64, hk, seqlen, seqlen, 1, is_causal, init
             )
+        )
     df = pd.DataFrame(df)
     aiter.logger.info(
         "fmha_fwd_with_sink_asm perf summary (markdown):\n%s",
