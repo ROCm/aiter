@@ -430,6 +430,88 @@ jobs:
           cd "${GITHUB_WORKSPACE}/vllm"
           echo "Running upstream vLLM case from PR #${VLLM_DI_PR_NUMBER}: ${CASE_NAME}"
           echo "${UPSTREAM_CASE_COMMAND}"
+
+          stream_disagg_logs() {
+            local submit_log="$1"
+            local done_file="$2"
+            local log_root="$3"
+            local job_id=""
+            local job_log=""
+            local role_dir=""
+            local logfile=""
+            local tail_pid=""
+            local -A followed=()
+            local -a tail_pids=()
+
+            while [[ ! -f "${done_file}" ]]; do
+              job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || true)"
+              [[ -n "${job_id}" ]] && break
+              sleep 1
+            done
+
+            if [[ -z "${job_id}" ]]; then
+              job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || true)"
+            fi
+            if [[ -z "${job_id}" ]]; then
+              echo "[live-log] no Slurm job id found; nothing to stream"
+              return 0
+            fi
+
+            job_log="${log_root}/vllm-disagg-pd-${job_id}.log"
+            role_dir="${log_root}/${job_id}"
+            echo "[live-log] Slurm job ${job_id}; watching ${job_log} and ${role_dir}/*.log"
+
+            while [[ ! -f "${done_file}" ]]; do
+              while IFS= read -r -d '' logfile; do
+                if [[ -n "${followed[${logfile}]+x}" ]]; then
+                  continue
+                fi
+                followed["${logfile}"]=1
+                echo "[live-log] following ${logfile}"
+                tail -n +1 -F -- "${logfile}" &
+                tail_pids+=("$!")
+              done < <(
+                if [[ -f "${job_log}" ]]; then
+                  printf '%s\0' "${job_log}"
+                fi
+                if [[ -d "${role_dir}" ]]; then
+                  find "${role_dir}" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null
+                fi
+              )
+              sleep 5
+            done
+
+            # Give existing followers a moment to flush terminal diagnostics,
+            # then print any log that appeared between the final scan and exit.
+            sleep 2
+            while IFS= read -r -d '' logfile; do
+              if [[ -z "${followed[${logfile}]+x}" ]]; then
+                echo "[live-log] final ${logfile}"
+                tail -n +1 -- "${logfile}" || true
+              fi
+            done < <(
+              if [[ -f "${job_log}" ]]; then
+                printf '%s\0' "${job_log}"
+              fi
+              if [[ -d "${role_dir}" ]]; then
+                find "${role_dir}" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null
+              fi
+            )
+
+            for tail_pid in "${tail_pids[@]}"; do
+              kill "${tail_pid}" 2>/dev/null || true
+            done
+            for tail_pid in "${tail_pids[@]}"; do
+              wait "${tail_pid}" 2>/dev/null || true
+            done
+            echo "[live-log] stopped streaming Slurm job ${job_id}"
+          }
+
+          stream_done="${GITHUB_WORKSPACE}/.vllm-disagg-stream-done"
+          rm -f "${stream_done}"
+          stream_disagg_logs "${submit_log}" "${stream_done}" "${log_root}" &
+          stream_pid=$!
+
           set +e
           env \
             BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
@@ -438,6 +520,8 @@ jobs:
             LOG_ROOT="${log_root}" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
+          touch "${stream_done}"
+          wait "${stream_pid}" || true
           set -e
 
           job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" | grep -oE '[0-9]+' | tail -1 || true)"
