@@ -265,6 +265,15 @@ jobs:
           fi
           echo "PIP_INSTALL_FLAGS=${PIP_INSTALL_FLAGS}" >> "$GITHUB_ENV"
 
+      - name: Remove preinstalled Aiter packages (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
+        run: |
+          set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          "${CONTAINER_PYTHON}" -m pip uninstall ${PIP_INSTALL_FLAGS} -y amd-aiter aiter || true
+
       - name: Install Dependencies (legacy container)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
