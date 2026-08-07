@@ -176,3 +176,5 @@ gfx950,256,8,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,
 gfx950,256,512,32,6144,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,11.4144,native,0.0,17.64,588.51
 gfx950,256,512,256,6144,False,torch.bfloat16,torch.bfloat16,False,False,asm,3,5,13.4051,_ZN5aiter39bf16gemm_fp32bf16_tn_48x64_splitk_cleanE,0.0155,120.15,723.56
 gfx950,256,512,2624,6144,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,41.8564,native,0.0,394.41,984.85
+gfx950,256,8192,256,6144,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,5148,1,49.4605,flydsl_gemm3_abf16_wbf16_bf16_t64x128x128_split_k1_block_m_warp4_block_n_warp4_block_k_warp1_async_copyTrue_b_to_ldsTrue_b_preshuffleFalse_c_to_ldsFalse_gfx950,0.0,521.02,2183.63
+gfx950,256,32768,256,6144,False,torch.bfloat16,torch.bfloat16,False,False,opus,1401,0,120.0567,opus_gemm_mono_tile_512x128x256x64_2x4_16x16x32_0x0x0_nooob,0.0,858.59,3519.8
