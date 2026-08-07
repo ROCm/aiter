@@ -400,8 +400,8 @@ def test_guards():
     with pytest.raises(AssertionError):  # BV must divide V
         fused_recurrent_kda(**args, BV=48)
 
-    with pytest.raises(AssertionError):  # BV must cover 32*num_warps lanes
-        fused_recurrent_kda(**args, BV=32, num_warps=4)
+    with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps lanes
+        fused_recurrent_kda(**args, BV=32, num_warps=4, SK=1)
 
     with pytest.raises(AssertionError):  # gate chain needs A_log
         fused_recurrent_kda(**args, use_gate_in_kernel=True)
@@ -543,8 +543,9 @@ def test_beta_headwise(T):
 
 
 @pytest.mark.parametrize("num_buffers", [1, 2, 3])
-def test_num_buffers(num_buffers):
-    """Snapshot pipelining depth must not change results (paged path)."""
+@pytest.mark.parametrize("use_tdm_store", [False, True])
+def test_num_buffers(num_buffers, use_tdm_store):
+    """Operand prefetch mode and store path must not change results (paged)."""
     B, T, H, D = 2, 4, 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
     total_T = B * T
@@ -565,6 +566,7 @@ def test_num_buffers(num_buffers):
         cu_seqlens=cu,
         ssm_state_indices=indices,
         num_buffers=num_buffers,
+        use_tdm_store=use_tdm_store,
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):
