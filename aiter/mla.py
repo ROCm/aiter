@@ -4,23 +4,180 @@
 # user interface
 
 import functools
-from typing import Optional
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+
+_FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
+_FLYDSL_MLA_REDUCE_TARGET_H = 16
+_FLYDSL_MLA_REDUCE_TARGET_DV = 512
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_mla_reduce_available() -> bool:
+    """Whether the optional FlyDSL package is available on this device."""
+    try:
+        from aiter.ops.flydsl import is_flydsl_available
+
+        return is_flydsl_available()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _flydsl_mla_reduce_supported(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+) -> bool:
+    """Whether a single-token decode reduction is within FlyDSL's scope."""
+    if (
+        get_gfx() not in _FLYDSL_MLA_REDUCE_TARGET_GFX
+        or isinstance(max_seqlen_q, bool)
+        or max_seqlen_q != 1
+    ):
+        return False
+    tensors = (partial_output, partial_lse, final_output)
+    if not all(
+        isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        return False
+    if (
+        partial_output.dtype != dtypes.fp32
+        or partial_lse.dtype != dtypes.fp32
+        or partial_output.device != final_output.device
+        or partial_lse.device != final_output.device
+    ):
+        return False
+    if (
+        partial_output.ndim != 4
+        or partial_output.size(1) != 1
+        or partial_lse.ndim != 4
+        or tuple(partial_lse.shape)
+        != (
+            partial_output.size(0),
+            1,
+            partial_output.size(-2),
+            1,
+        )
+    ):
+        return False
+    if final_output.ndim != 3:
+        return False
+    if (
+        partial_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
+        or partial_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
+        or tuple(final_output.shape[1:])
+        != (_FLYDSL_MLA_REDUCE_TARGET_H, _FLYDSL_MLA_REDUCE_TARGET_DV)
+    ):
+        return False
+    if final_output.dtype not in (dtypes.bf16, dtypes.fp16):
+        return False
+    return (
+        isinstance(num_kv_splits, int)
+        and not isinstance(num_kv_splits, bool)
+        and (num_kv_splits == 0 or num_kv_splits <= get_cu_num())
+    )
+
+
+def _flydsl_mla_reduce_enabled() -> bool:
+    """Opt-in gate for the FlyDSL MLA reduce port.
+
+    Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
+    Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
+    The opt-in scope is H=16, Dv=512 single-token decode. MTP decode and prefill
+    use the HIP path; the latter is routed directly by its caller rather than
+    inferred from ``max_seqlen_q``. Calls outside the permitted ABI and shape scope
+    use the HIP path.
+    Not memoized, so the env var can be toggled at runtime; only the optional
+    package availability probe above is cached.
+    """
+    try:
+        from flydsl.utils.env import EnvManager, OptBool
+
+        class _Env(EnvManager):
+            enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
+
+        if not _Env().enabled:
+            return False
+        return _flydsl_mla_reduce_available()
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _mla_decode_reduce_v1_dispatch(
+    partial_output,
+    partial_lse,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    max_seqlen_q,
+    num_kv_splits,
+    final_output,
+    final_lse,
+):
+    """Dispatch a decode MLA reduction to HIP (default) or FlyDSL (opt-in).
+
+    Signature mirrors ``aiter.mla_reduce_v1`` (num_kv_splits at slot 7, between
+    max_seqlen_q and final_output) so it is a drop-in swap. The HIP kernel uses
+    max(SM_count, num_kv_splits); 0 means "auto" (SM_count). FlyDSL derives its
+    regular launch grid from num_cu + CSR width and uses num_kv_splits as the
+    split-K engagement budget.
+
+    The FlyDSL device-adaptive split-K gate (``actual_max_splits`` = the true
+    ``max_t(n_splits)`` over active tiles) is resolved inside the FlyDSL wrapper
+    from ``reduce_indptr`` via a capture-safe warmup cache, so this seam does not
+    thread it. The HIP path ignores it entirely.
+    """
+    if _flydsl_mla_reduce_enabled() and _flydsl_mla_reduce_supported(
+        partial_output,
+        partial_lse,
+        final_output,
+        max_seqlen_q,
+        num_kv_splits,
+    ):
+        from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+        flydsl_mla_reduce_v1(
+            partial_output.view(partial_output.size(0), *partial_output.shape[-2:]),
+            partial_lse.view(partial_lse.size(0), -1),
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_q,
+            final_output,
+            final_lse,
+            num_kv_splits=num_kv_splits,
+        )
+        return
+    aiter.mla_reduce_v1(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        final_output,
+        final_lse,
+    )
 
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     qo_indptr,
     kv_indptr,
@@ -91,7 +248,7 @@ def _fwd_kernel_stage2_asm(
             e_sum = 0.0
             e_max = -float("inf")
             acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
-            for split_kv_id in range(0, num_valid_kv_splits):
+            for split_kv_id in range(num_valid_kv_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
                     mask=mask_d,
@@ -121,14 +278,27 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_meta_param(
-    num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype, tg_factor=1
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
 ):
+    # ignore_total_kv: experiment switch (default 0 = legacy behavior). When 1,
+    # the split-count search ignores `total_kv` entirely: the auto-search keeps
+    # only the CU-occupancy factor (drops the avg_kv / (avg_kv + overhead*i) HBM
+    # term) and the fp8 min-block cap is skipped. This yields the pure
+    # occupancy-driven pick (fill bs_occ*splits into cu_num, capped at 16),
+    # independent of how long each sequence's KV is.
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
-    # a larger logical head count from multiple WGs — e.g. the v4 nm gqa=128
-    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
+    # a larger logical head count from multiple WGs -- e.g. the v4 nm gqa=128
+    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) -- the GPU's CU occupancy
     # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
     # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
     # all stay keyed on the real `bs`. The auto-search keeps V3's cap of 16.
@@ -148,18 +318,29 @@ def get_meta_param(
         is_gfx1250 = get_gfx() == "gfx1250"
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
-        tmp = [
-            (
-                bs_occ
-                * i
-                / ((bs_occ * i + cu_num - 1) // cu_num * cu_num)
-                * avg_kv
-                / (avg_kv + overhead * i),
-                i,
-            )
-            for i in range(1, 17)
-        ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        if ignore_total_kv:
+            # Occupancy-only: drop the avg_kv HBM term so the pick depends solely
+            # on how well bs_occ*i fills cu_num (ties -> smallest i).
+            tmp = [
+                (
+                    bs_occ * i / ((bs_occ * i + cu_num - 1) // cu_num * cu_num),
+                    i,
+                )
+                for i in range(1, 17)
+            ]
+        else:
+            tmp = [
+                (
+                    bs_occ
+                    * i
+                    / ((bs_occ * i + cu_num - 1) // cu_num * cu_num)
+                    * avg_kv
+                    / (avg_kv + overhead * i),
+                    i,
+                )
+                for i in range(1, 17)
+            ]
+        num_kv_splits = max(tmp, key=lambda x: x[0])[1]
 
     get_block_n_fp8 = {
         8: 64,
@@ -174,7 +355,7 @@ def get_meta_param(
         512: 32,
     }
 
-    if dtype == dtypes.fp8:
+    if dtype == dtypes.fp8 and not ignore_total_kv:
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
@@ -192,6 +373,151 @@ def get_meta_param(
     )
 
     return num_kv_splits, num_kv_splits_indptr
+
+
+# Persistent MLA-decode kernel gate: the persistent kernel
+# ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
+# ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
+# 16-head decode). Fall back to non-persistent at/above the batch threshold.
+# Env-tunable (0 disables the gate). Provisional default pending microbench
+# calibration (AIOSS-5156).
+_MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
+
+
+@functools.lru_cache(maxsize=1)
+def _persistent_mla_decode_max_batch():
+    """Cached read of AITER_MLA_DECODE_PERSISTENT_MAX_BATCH (read once per process)."""
+    try:
+        return int(
+            os.getenv(
+                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
+                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+
+def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
+    """Whether to keep the persistent MLA decode kernel.
+
+    True keeps the caller's persistent request; False falls back to the
+    non-persistent split-KV kernel at/above the concurrency (batch) threshold.
+    Scoped to the characterized gfx950 bf16 16-head single-token decode profile.
+    """
+    is_regression_profile = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and nhead == 16
+        and max_seqlen_q == 1
+    )
+    if not is_regression_profile:
+        return True
+
+    max_batch = _persistent_mla_decode_max_batch()
+
+    # max_batch <= 0 disables the gate (always keep persistent).
+    if max_batch <= 0:
+        return True
+    return bs < max_batch
+
+
+def mla_decode_fwd_ds32(
+    q_nope_buffer,  # [total_s, H, D_NOPE]          fp8
+    q_rope_buffer,  # [total_s, H, D_ROPE]          bf16
+    kv_nope_buffer,  # [total_tokens, D_NOPE]  fp8
+    kv_rope_buffer,  # [total_tokens, D_ROPE]  bf16
+    o,  # [total_s, H, D_NOPE] bf16 (allocated if None)
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    page_size=1,
+    nhead_kv=1,
+    sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
+    # aiter persistent metadata (generated by the caller) -- ds_32 reuses it.
+    num_kv_splits=None,
+    work_meta_data=None,  # accepted for API parity; unused by ds_32 stage1
+    work_indptr=None,
+    work_info_set=None,
+    reduce_indptr=None,
+    reduce_final_map=None,
+    reduce_partial_map=None,
+    intra_batch_mode=False,  # accepted for API parity; unused
+    q_scale=None,  # [total_s, H, D_SCALE]         E8M0 uint8 or float factors
+    kv_scale=None,  # [total_tokens, D_SCALE] E8M0 uint8 or float factors
+    return_lse=False,
+):
+    """DSA v3.2 (ds_32) MLA decode fp8 (OpFoundry opus_attn/dsa_v32), gfx950 only.
+
+    Reuses aiter's metadata (work_indptr/work_info_set) and reduce (mla_reduce_v1):
+    stage1 writes per-split partials to logits/attn_lse (or the final o for no-split
+    work items), then mla_reduce_v1 combines the splits. NoPE is per-block
+    E8M0-scaled fp8; RoPE is bf16; V is the NoPE part.
+    """
+    assert get_gfx() == "gfx950", "mla_decode_fwd_ds32 is only supported on gfx950"
+    device = q_nope_buffer.device
+    total_s, H, d_nope = q_nope_buffer.shape
+    d_rope = q_rope_buffer.shape[-1]
+    nhead, v_head_dim = H, d_nope
+
+    if sm_scale is None:
+        sm_scale = 1.0 / ((d_nope + d_rope) ** 0.5)
+    if o is None:
+        o = torch.empty((total_s, H, d_nope), dtype=dtypes.bf16, device=device)
+
+    num_partials = reduce_partial_map.size(0)
+    logits = torch.empty(
+        (num_partials * max_seqlen_q, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (num_partials * max_seqlen_q, 1, nhead, 1), dtype=dtypes.fp32, device=device
+    )
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else torch.empty(0, dtype=dtypes.fp32, device=device)
+    )
+
+    aiter.mla_decode_stage1_opus_fwd_ds32(
+        q_nope_buffer,
+        q_rope_buffer,
+        kv_nope_buffer,
+        kv_rope_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        page_size,
+        nhead_kv,
+        sm_scale,
+        logits,
+        attn_lse,
+        o,
+        final_lse,
+        q_scale,
+        kv_scale,
+    )
+
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        o,
+        final_lse if return_lse else None,
+    )
+    return o, (final_lse if return_lse else None)
 
 
 def mla_decode_fwd(
@@ -239,12 +565,26 @@ def mla_decode_fwd(
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    ori_total_s, ori_nhead, ori_v_head_dim = o.shape
+    ori_total_s, ori_nhead, _ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
     persistent_mode = work_meta_data is not None
+
+    # Above the concurrency threshold the persistent kernel is slower, so
+    # fall back to the non-persistent split-KV path (which rebuilds its own
+    # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
+    #
+    # Scope: only the dense vLLM-style decode (num_kv_splits left to aiter) is
+    # gated. Callers that pass an explicit num_kv_splits -- the sparse/expert
+    # op paths -- depend on the persistent kernel's work_meta_data layout; the
+    # non-persistent fallback can't honor their top-k/split scheme and would
+    # return wrong results, so never downgrade them.
+    if persistent_mode and num_kv_splits is None:
+        persistent_mode = _use_persistent_mla_decode(
+            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+        )
 
     io_transformed = False
     qseqlen_folded = False
@@ -404,7 +744,10 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             **extra_kargs,
         )
@@ -440,18 +783,7 @@ def mla_decode_fwd(
                 get_gfx() == "gfx950"
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and (
-                    (nhead == 32 and max_seqlen_q == 4)
-                    or (nhead == 64)
-                    or (nhead == 128)
-                )
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 32
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 2
+                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
             )
             or (
                 get_gfx() == "gfx950"
@@ -468,15 +800,8 @@ def mla_decode_fwd(
                 and max_seqlen_q == 2
             )
             or (
-                get_gfx() in ("gfx942", "gfx950")
+                get_gfx() == "gfx942"
                 and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 32
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 1
@@ -591,7 +916,7 @@ def mla_decode_fwd(
                 0,
             )
 
-        aiter.mla_reduce_v1(
+        _mla_decode_reduce_v1_dispatch(
             logits,
             attn_lse,
             reduce_indptr,
@@ -793,7 +1118,7 @@ def mla_prefill_fwd(
     num_kv_splits=None,  # for experts only!!!
 ):
     device = q.device
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
+    _num_page, _page_size, _nhead_kv, qk_head_dim = kv_buffer.shape
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
@@ -834,17 +1159,17 @@ def mla_prefill_ps_fwd(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    work_indptr: Optional[torch.Tensor],
-    work_info_set: Optional[torch.Tensor],
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
     max_seqlen_q: int,
     is_causal: bool,
-    reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tensor] = None,
-    reduce_partial_map: Optional[torch.Tensor] = None,
-    softmax_scale: float = None,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    reduce_indptr: torch.Tensor | None = None,
+    reduce_final_map: torch.Tensor | None = None,
+    reduce_partial_map: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -967,7 +1292,7 @@ def _mla_prefill_reduce_kernel(
             ) * stride_lse_tok + head_id * stride_lse_head
             lse = tl.load(partial_lse_ptr + lse_offset)
 
-            is_valid = lse == lse
+            is_valid = lse == lse  # noqa: PLR0124
             lse = tl.where(is_valid, lse, -float("inf"))
 
             lse_values = tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse, lse_values)
@@ -1018,7 +1343,7 @@ def _mla_prefill_reduce_kernel(
                 )
 
                 # Handle NaN in output (NaN != NaN)
-                is_valid_out = partial_out == partial_out
+                is_valid_out = partial_out == partial_out  # noqa: PLR0124
                 partial_out = tl.where(is_valid_out, partial_out, 0.0)
 
                 acc += scale * partial_out
@@ -1043,7 +1368,9 @@ def mla_prefill_reduce_triton(
     reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
     output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
     tile_q: int = 256,  # Q tile size (for padding)
-    max_partials_static: int = None,  # Maximum number of partials, defaults to num_cu
+    max_partials_static: (
+        int | None
+    ) = None,  # Maximum number of partials, defaults to num_cu
 ) -> None:
     """Triton version of mla_prefill_reduce.
     All heads are uniformly split and reduced together.
@@ -1125,14 +1452,14 @@ def mla_prefill_reduce(
                 output,
                 tile_q,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
 
     # torch implementation, just for reference
     num_reduce_groups = reduce_indptr.shape[0] - 1
     device = partial_output.device
     dtype = partial_output.dtype
-    _, num_heads, v_head_dim = partial_output.shape
+    _, num_heads, _v_head_dim = partial_output.shape
 
     for group_id in range(num_reduce_groups):
         start_idx = reduce_indptr[group_id].item()  # 0
@@ -1209,7 +1536,7 @@ def mla_prefill_reduce(
 
 
 # ---------------------------------------------------------------------------
-# DSv4 MLA — additive entry point. Does NOT touch any existing
+# DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
@@ -1221,22 +1548,25 @@ def mla_decode_fwd_v4_nm(
     qo_indptr,  # [num_seqs+1]
     kv_indptr,  # [num_seqs+1]
     kv_page_indices,  # [num_page_used]
-    kv_last_page_lens,  # [num_seqs]
     max_seqlen_q,
     *,
-    sink,  # REQUIRED [num_heads] FP32 — attention sink logit
+    sink,  # REQUIRED [num_heads] FP32 -- attention sink logit
     split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
-    out_16_nosplit=0,
+    out_16_nosplit=0,  # DEPRECATED/IGNORED: derived internally from num_kv_splits (V3-style)
     num_kv_splits=None,  # None -> auto-pick via V3 get_meta_param heuristic
     logits=None,
     attn_lse=None,
+    kv_last_page_lens=None,  # [num_seqs] int32; OPTIONAL, defaults None. Unused on
+    # the nm path (page_size=1 -> kv_seq_len comes from the token-level kv_indptr).
+    # None flows through to a nullptr kernarg; the host guards the deref and the
+    # kernel never loads through it, so no buffer is allocated.
 ):
     """v4 MLA decode forward.
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    `(logits, attn_lse)` — both 4D, in **kernel-native layout**:
+    `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
     where `total_q = num_seqs * max_seqlen_q` and
@@ -1244,14 +1574,17 @@ def mla_decode_fwd_v4_nm(
     convention).
 
     Single-pass mode (`num_kv_splits == 1`):
-      Returned `logits[:, 0]` already holds the per-token output (no merge
-      needed). `output[total_q, num_heads, v_head_dim]` BF16 is only written
-      by the kernel when `out_16_nosplit == 1`.
+      V3-style: the kernel ALWAYS writes the final packed-BF16 result straight
+      into `output` (zero-copy). `out_16_nosplit` is derived internally (=1
+      here) and the caller-facing arg is ignored. The returned `logits` is a
+      BF16 view aliased onto `output` (shape [total_q, 1, num_heads,
+      v_head_dim]); read the per-token result from `output` (or `logits[:, 0]`,
+      same bytes). There is no separate FP32 partial to reduce.
 
     Split-count selection (`num_kv_splits`):
       `None` (default) auto-picks the split count via V3's `get_meta_param`
       heuristic (CU-occupancy x HBM-efficiency, capped by the fp8 min block
-      for the kernel tile) — identical to `mla_decode_fwd`'s non-persistent
+      for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
 
@@ -1260,7 +1593,7 @@ def mla_decode_fwd_v4_nm(
          `[0, N, 2N, ..., bs*N]` so every seq uses all N passes. When
          `num_kv_splits` is auto-picked, `get_meta_param` returns this
          indptr directly.
-      2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+      2. Force `out_16_nosplit = 0` -- the kernel's bf16-direct-write path
          does not support multi-pass.
       3. After the kernel returns FP32 partials, run V3's
          `_fwd_kernel_stage2_asm` triton kernel which performs the
@@ -1323,6 +1656,10 @@ def mla_decode_fwd_v4_nm(
     total_kv = kv_page_indices.shape[0]
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+        # v4 nm forces occupancy-only split selection: ignore total_kv so the
+        # split count is driven purely by CU occupancy (drops the avg_kv HBM
+        # term + fp8 min-block cap in get_meta_param).
+        ignore_total_kv = 1
         meta_num_kv_splits, meta_split_indptr = get_meta_param(
             num_kv_splits,
             num_seqs,
@@ -1331,19 +1668,14 @@ def mla_decode_fwd_v4_nm(
             max_seqlen_q,
             q.dtype,
             tg_factor,
+            ignore_total_kv,
         )
         if num_kv_splits is None:
             num_kv_splits = meta_num_kv_splits
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
 
-    # ---- Multi-pass requires the FP32 split-output path ----
-    if num_kv_splits > 1 and out_16_nosplit != 0:
-        raise ValueError(
-            f"mla_decode_fwd_v4_nm: num_kv_splits={num_kv_splits} requires "
-            f"out_16_nosplit=0 (the kernel's bf16-direct-write path only "
-            f"supports passes==1). Got out_16_nosplit={out_16_nosplit}."
-        )
+    out_16_nosplit = 1 if num_kv_splits == 1 else 0
 
     # ---- Allocate splitData / splitLse in KERNEL-NATIVE layout --------------
     # kernel-native layout:   [num_seqs, max_seqlen_q, num_kv_splits, num_heads, v_head_dim]
@@ -1367,7 +1699,12 @@ def mla_decode_fwd_v4_nm(
 
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
-    if logits is None:
+    if out_16_nosplit != 0:
+        # V3-style zero-copy final output. When out_16_nosplit=1 (single-pass),
+        # the kernel writes the final DENSELY-PACKED BF16 result into ptr_R
+        # (= the `logits`/splitData buffer).
+        logits = output.view(expected_logits_shape)
+    elif logits is None:
         logits = torch.empty(
             expected_logits_shape,
             dtype=dtypes.fp32,
@@ -1417,7 +1754,6 @@ def mla_decode_fwd_v4_nm(
         qo_indptr,
         kv_indptr,
         kv_page_indices,
-        kv_last_page_lens,
         split_indptr,
         sink,
         max_seqlen_q,
@@ -1429,6 +1765,7 @@ def mla_decode_fwd_v4_nm(
         output,
         valid_split_count,
         use_valid_split_count_reduce,
+        kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
     )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
@@ -1474,27 +1811,12 @@ def mla_decode_fwd_v4_nm(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             waves_per_eu=4,
         )
-
-    # ---- out_16_nosplit=1: resolve the kernel's packed-BF16 output ----------
-    # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
-    # `output` buffer. Instead it writes the final result as DENSELY-PACKED
-    # BF16 into the `logits` allocation. Global layout is identical to the
-    # fp32 path — [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
-    # num_heads — but each element is 2 bytes (R16_BPP=2), so the per-head
-    # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
-    # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
-    # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
-    # caller's `output` so `output` is the single authoritative result buffer
-    # (mirrors the multi-split stage2 path, which also lands in `output`).
-    if out_16_nosplit != 0:
-        n_bf16 = total_q * num_heads * v_head_dim
-        packed_bf16 = (
-            logits.contiguous().view(torch.bfloat16).flatten()[:n_bf16]
-        ).view(total_q, num_heads, v_head_dim)
-        output.copy_(packed_bf16)
 
     return logits, attn_lse

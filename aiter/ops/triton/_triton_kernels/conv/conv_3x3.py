@@ -3,10 +3,12 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+
+from ..activation import _gelu_tanh, _relu, _relu6
 from .helpers import CONV_AUTOTUNE_ENABLED
-from ..activation import _relu, _relu6, _gelu_tanh
 
 
 def _get_config_nhwc(shape_key=None, M=None):
@@ -345,6 +347,27 @@ AUTOTUNE_3x3_NHWC_CONFIGS = [
         num_warps=4,
         num_stages=1,
     ),
+    # gfx1100 (RDNA3): smaller tiles / fewer warps.
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=2,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=2,
+        num_stages=1,
+    ),
 ]
 
 AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
@@ -371,6 +394,28 @@ AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
+        num_stages=1,
+    ),
+    # gfx1100 (RDNA3): smaller tiles / fewer warps. BLOCK_K kept <= Cb (64) to
+    # preserve coalesced channel loads (see DESIGN.md §5.3).
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=2,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=2,
         num_stages=1,
     ),
 ]

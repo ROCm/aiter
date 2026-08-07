@@ -15,9 +15,10 @@
 * limitations under the License.
 """
 
+import os
 import pickle
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -26,12 +27,22 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
+from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.utility.dtypes import fp8
+
+from .rocm_version import get_rocm_version
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _detect_gfx1250() -> bool:
+    # Escape hatch for validating the old-arch (IPC + old kernel) path on gfx1250
+    # hardware: forces the non-gfx1250 code path end to end.
+    if _env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
+        return False
     try:
         import torch
 
@@ -39,11 +50,178 @@ def _detect_gfx1250() -> bool:
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return "gfx1250" in getattr(props, "gcnArchName", "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
+# ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
+# back to the HIP VMM transport (i.e. gfx1250 uses VMM only on ROCm < 7.14).
+# NOTE: bisect this across ROCm versions on real hardware (use
+# AITER_CUSTOM_AR_FORCE_IPC together with AITER_ROCM_VERSION) and update once
+# confirmed.
+_IPC_MIN_ROCM = (7, 14)
+
+
+# Default custom-AR size cutoff (bytes): inputs at or below this run on the
+# custom kernels, larger ones fall back to RCCL. 64 MiB == 8192*8192, matching
+# the historical decode threshold.
+_DEFAULT_CAR_MAX_SIZE = 8192 * 8192
+
+# Env var to override the custom-AR size cutoff (in bytes). See
+# _resolve_car_max_size for the semantics.
+_CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
+
+# Custom-AR lower size bound (bytes). Inputs at or below this run on RCCL
+# instead of the custom kernels; only inputs strictly above it are routed to
+# custom AR. Default 0 (no lower bound) — unchanged behavior. Together with
+# _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR runs.
+_DEFAULT_CAR_MIN_SIZE = 0
+
+# Env var to override the custom-AR lower size bound (in bytes). See
+# _resolve_car_min_size for the semantics.
+_CAR_MIN_SIZE_ENV = "AITER_CUSTOM_AR_MIN_SIZE"
+
+
+def _resolve_car_max_size(pool_size: int) -> int:
+    """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
+
+    Semantics:
+      * unset / empty / unparyable  -> default (64 MiB), i.e. unchanged behavior.
+      * 0                           -> 0: custom AR disabled, everything uses RCCL.
+      * 0 < v <= pool_size          -> v: custom AR used up to v bytes.
+      * v > pool_size               -> too large: the registered pool cannot hold
+                                       it. Raise (then catch), warn, and fall back
+                                       to the 64 MiB default.
+
+    ``pool_size`` is the registered input-buffer size (``CustomAllreduce.max_size``).
+    """
+    raw = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+    if raw == "":
+        return _DEFAULT_CAR_MAX_SIZE
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default %d bytes.",
+            _CAR_MAX_SIZE_ENV,
+            raw,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    if v < 0:
+        logger.warning(
+            "%s=%d is negative; using default %d bytes.",
+            _CAR_MAX_SIZE_ENV,
+            v,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    if v == 0:
+        logger.info(
+            "%s=0: custom allreduce disabled; all sizes fall back to RCCL.",
+            _CAR_MAX_SIZE_ENV,
+        )
+        return 0
+    try:
+        if v > pool_size:
+            raise ValueError(
+                f"{_CAR_MAX_SIZE_ENV}={v} exceeds the custom-AR pool size "
+                f"({pool_size} bytes); the registered buffer cannot hold inputs "
+                f"that large."
+            )
+    except ValueError as e:
+        logger.warning(
+            "%s Falling back to the default %d bytes (64 MiB).",
+            e,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    logger.info(
+        "Custom allreduce size cutoff overridden to %d bytes via %s.",
+        v,
+        _CAR_MAX_SIZE_ENV,
+    )
+    return v
+
+
+def _resolve_car_min_size() -> int:
+    """Resolve the custom-AR lower size bound (bytes) from
+    ``AITER_CUSTOM_AR_MIN_SIZE``.
+
+    Semantics:
+      * unset / empty / unparsable -> default (0), i.e. no lower bound.
+      * negative                   -> default (0).
+      * v >= 0                     -> v: inputs at or below v bytes fall back to
+                                      RCCL; only inputs above v run on custom AR.
+
+    Bounds are combined in ``_fits_custom_ar_size`` as a (min, max] window; if
+    the resolved min is >= the max cutoff, no size fits and everything falls
+    back to RCCL.
+    """
+    raw = os.environ.get(_CAR_MIN_SIZE_ENV, "").strip()
+    if raw == "":
+        return _DEFAULT_CAR_MIN_SIZE
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default %d bytes.",
+            _CAR_MIN_SIZE_ENV,
+            raw,
+            _DEFAULT_CAR_MIN_SIZE,
+        )
+        return _DEFAULT_CAR_MIN_SIZE
+    if v < 0:
+        logger.warning(
+            "%s=%d is negative; using default %d bytes.",
+            _CAR_MIN_SIZE_ENV,
+            v,
+            _DEFAULT_CAR_MIN_SIZE,
+        )
+        return _DEFAULT_CAR_MIN_SIZE
+    if v > 0:
+        logger.info(
+            "Custom allreduce lower size bound set to %d bytes via %s; "
+            "inputs at or below this fall back to RCCL.",
+            v,
+            _CAR_MIN_SIZE_ENV,
+        )
+    return v
+
+
+def _should_use_vmm(is_gfx1250: bool) -> bool:
+    """Decide the cross-device buffer transport for gfx1250.
+
+    VMM (fd-based) is used on gfx1250 only while hipIpc is unusable — i.e. on
+    ROCm older than ``_IPC_MIN_ROCM`` (or when the version can't be determined).
+    On old archs hipIpc always works, so VMM is never used there.
+    """
+    if not is_gfx1250:
+        return False
+    if _env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
+        return False
+    if _env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
+        return True
+    v = get_rocm_version()
+    if v is None:
+        # Unknown version — keep the conservative VMM path (prior behavior).
+        logger.warning(
+            "Custom allreduce: ROCm version undetectable on gfx1250; "
+            "using VMM transport. Set AITER_CUSTOM_AR_FORCE_IPC=1 to override."
+        )
+        return True
+    use_vmm = v[:2] < _IPC_MIN_ROCM
+    logger.info(
+        "Custom allreduce gfx1250 transport: %s (ROCm %s, IPC threshold %s)",
+        "VMM" if use_vmm else "IPC",
+        v,
+        _IPC_MIN_ROCM,
+    )
+    return use_vmm
+
+
 _is_gfx1250 = _detect_gfx1250()
+_use_vmm = _should_use_vmm(_is_gfx1250)
 
 try:
     if _is_gfx1250:
@@ -51,7 +229,7 @@ try:
     else:
         ops.meta_size()
     custom_ar = True
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     # For CPUs
     custom_ar = False
     logger.warning(f"Custom allreduce is disabled: {e}")
@@ -258,7 +436,7 @@ class IPCBufferPool:
         self._group = group
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
-        self._buffers: Dict[str, IPCBuffer] = {}
+        self._buffers: dict[str, IPCBuffer] = {}
         self._ipc_handle_fn = ipc_handle_fn or ops.get_meta_buffer_ipc_handle
         self._graph_count_fn = graph_count_fn or ops.get_graph_buffer_count
         self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
@@ -319,14 +497,14 @@ class IPCBufferPool:
 
     # ---- Eager mode: named buffer IPC meta ----
 
-    def get_ipc_meta(self, key: str) -> Tuple[List, List]:
+    def get_ipc_meta(self, key: str) -> tuple[list, list]:
         """Broadcast IPC handles for the named buffer across all ranks."""
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
 
     # ---- Graph mode: external buffer IPC meta ----
 
-    def get_external_ipc_meta(self, tensor: torch.Tensor) -> Tuple[List, List]:
+    def get_external_ipc_meta(self, tensor: torch.Tensor) -> tuple[list, list]:
         """Broadcast IPC handles for an arbitrary external tensor."""
         return self._broadcast_ipc(tensor.data_ptr())
 
@@ -354,13 +532,13 @@ class IPCBufferPool:
 
     # ---- Private IPC primitives ----
 
-    def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
+    def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
-    def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
 
         Each rank writes its serialised *shard_data* under a unique key, then
@@ -426,8 +604,9 @@ class _GFX1250BufferProxy:
 
     def get_external_ipc_meta(self, tensor):
         """Exchange a tensor's pointer across ranks using VMM."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange
         import torch.distributed as dist
+
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         ca = self._ca
         store = dist.distributed_c10d._get_default_store()
@@ -437,7 +616,7 @@ class _GFX1250BufferProxy:
         # Copy tensor data into VMM buffer
         import ctypes
 
-        _hip = ctypes.CDLL("libamdhip64.so")
+        _hip = load_hip_runtime()
         _hip.hipMemcpyAsync(
             ctypes.c_void_p(vmm_buf.data_ptr),
             ctypes.c_void_p(tensor.data_ptr()),
@@ -464,22 +643,44 @@ class _GFX1250BufferProxy:
 
 class CustomAllreduce:
 
-    _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
-        """Select the correct ops backend based on GPU architecture."""
+        """Select the ops backend.
+
+        Two orthogonal dimensions:
+          * kernel — gfx1250 vs old, keyed on ``self._is_gfx1250`` (arch).
+            Covers meta_size / all_reduce / all_gather / reduce_scatter / dispose
+            and the graph-ptr helpers.
+          * transport — how peer pointers are shared, keyed on ``self._use_vmm``.
+            Covers init_custom_ar and register_input/output_buffer, whose
+            argument shape differs (VMM: raw ptr list; IPC: handles + offsets).
+
+        gfx1250 supports both transports: VMM (ptr-list ops) on old ROCm, and
+        IPC (the ``*_gfx1250_ipc`` ops, same handle+offset signature as the
+        old-arch ops) on ROCm >= 7.15.
+        """
         if self._is_gfx1250:
+            # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
-            self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
-            self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
-            self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
             self._ops_get_graph_buffer_count = ops.get_graph_buffer_count_gfx1250
             self._ops_get_graph_buffer_ptrs = ops.get_graph_buffer_ptrs_gfx1250
             self._ops_register_graph_buffers = ops.register_graph_buffers_gfx1250
+            # transport-coupled ops (init / register)
+            if self._use_vmm:
+                self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
+                self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
+                self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
+            else:
+                self._ops_init_custom_ar = ops.init_custom_ar_gfx1250_ipc
+                self._ops_register_input_buffer = ops.register_input_buffer_gfx1250_ipc
+                self._ops_register_output_buffer = (
+                    ops.register_output_buffer_gfx1250_ipc
+                )
         else:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
@@ -497,7 +698,7 @@ class CustomAllreduce:
     def __init__(
         self,
         group: ProcessGroup,
-        device: Union[int, str, torch.device],
+        device: int | str | torch.device,
         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
     ) -> None:
@@ -513,7 +714,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
-        self._is_gfx1250 = _is_gfx1250
+        self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
+        self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._select_ops()
 
         if not custom_ar:
@@ -604,13 +806,14 @@ class CustomAllreduce:
 
         self.disabled = False
         # gfx1250 (MI450) cannot register CUDA-graph-captured buffers across
-        # ranks: `flush_graph_buffers` / `register_graph_buffers` are no-ops
-        # there (VMM-based graph exchange not yet implemented). The "registered"
-        # capture path bakes raw input pointers that peers would dereference at
-        # replay without ever being registered → GPU page fault on the first
-        # graph replay (e.g. V4 TP=2 decode). Force the copy-in "unreg" path
-        # during capture, which routes through the pre-registered VMM pool
-        # (exchanged at init, address-stable across replays).
+        # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
+        # gfx1250 transports (VMM fd exchange, and IPC graph-meta ops). The
+        # "registered" capture path bakes raw input pointers that peers would
+        # dereference at replay without ever being registered → GPU page fault
+        # on the first graph replay (e.g. V4 TP=2 decode). Force the copy-in
+        # "unreg" path during capture, which routes through the pre-registered
+        # pool (exchanged at init, address-stable across replays). Keyed on the
+        # kernel (arch), so both VMM and IPC gfx1250 paths use copy-in.
         if self._is_gfx1250:
             enable_register_for_capturing = False
         self.enable_register_for_capturing = enable_register_for_capturing
@@ -623,20 +826,29 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
+        # Custom-AR size cutoff (bytes): inputs at or below this run on the
+        # custom kernels; larger ones fall back to RCCL. Overridable via
+        # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
+        self._car_max_size = _resolve_car_max_size(max_size)
+        # Custom-AR lower size bound (bytes): inputs at or below this fall back
+        # to RCCL. Default 0 (no lower bound). Overridable via
+        # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
+        self._car_min_size = _resolve_car_min_size()
         self.rank = rank
         self.world_size = world_size
 
         self.fully_connected = fully_connected
 
-        if self._is_gfx1250:
+        if self._use_vmm:
             self._init_gfx1250(rank, world_size, max_size)
         else:
             self._init_ipc(rank, world_size, max_size)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
-        """gfx1250 init: hipIpc unavailable, use HIP VMM API to share
-        GPU buffers across processes via exported fd + Unix socket."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange
+        """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
+        GPU buffers across processes via the HIP VMM API (exported fd + Unix
+        socket) instead of IPC handles."""
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
         # gfx1250 is 1-stage only — no tmp buffer after Signal needed
@@ -653,7 +865,7 @@ class CustomAllreduce:
         self._vmm_meta = VMMBuffer(total_meta, device_id)
         import ctypes
 
-        _hip = ctypes.CDLL("libamdhip64.so")
+        _hip = load_hip_runtime()
         _hip.hipMemsetAsync(
             ctypes.c_void_p(self._vmm_meta.data_ptr),
             0,
@@ -704,10 +916,56 @@ class CustomAllreduce:
         self._pool = _GFX1250BufferProxy(self._vmm_meta, self._vmm_input, self)
 
     def _init_ipc(self, rank: int, world_size: int, max_size: int):
-        """Standard init path using hipIpc handles."""
+        """Init path using hipIpc handles.
+
+        Shared by the old-arch kernel and the gfx1250 kernel (ROCm >= 7.15):
+        both consume handle+offset init/register ops. Only the meta buffer
+        layout differs — the gfx1250 kernel is 1-stage (no trailing 2x tmp
+        region), but its meta_size() now also carries the LL fast-path staging
+        scratch appended after the Signal struct (see meta_size() in
+        custom_all_reduce_gfx1250.cu).
+        """
+        # Meta/Signal buffer: uncached device memory (cross-GPU sync flags must
+        # bypass the cache), zero-initialized by allocate_meta_buffer, exchanged
+        # over IPC. Same allocation mode as the old-arch path.
+        #
+        # hipIpcGetMemHandle on a hipDeviceMallocUncached allocation has two
+        # regimes, split at the 2 MB coarse-grained allocation granularity
+        # (what hipMemGetAllocationGranularity reports on this GPU):
+        #   * size >= 2 MB: backed coarse-grained (2 MB-aligned) -> the handle
+        #     always exports, regardless of page-multiple. Verified: 2 MB + 2 KB
+        #     (non-page-multiple) succeeds.
+        #   * size <  2 MB: backed fine-grained at page granularity -> the handle
+        #     exports only if the requested size is a whole number of 4 KB pages.
+        #     Verified: 34816 B / 100 KB / 1.5 MB (non-page-multiple) FAIL with
+        #     "invalid argument"; 36864 / 65536 (page-multiple) succeed.
+        #
+        # old arch: meta_size() + 2x tmp region (2-stage kernel) is GB-scale, so
+        # it lands in the first regime and exports fine despite meta_size()=5504
+        # (not a page multiple).
+        # gfx1250: meta_size_gfx1250() = Signal (~34 KB) + LL staging scratch
+        # (~4 MiB, see kLLScratchOffset/llScratchBytes). That is already well
+        # above 2 MB, so it lands in the always-safe coarse-grained regime; the
+        # round-up to a 2 MB multiple below is a no-op guard that also keeps the
+        # allocation 2 MB-aligned. The kernel touches the leading Signal struct
+        # (sync flags) plus the trailing scratch region (LL fast path).
+        _COARSE_GRAIN = 2 * 1024 * 1024
+        if self._is_gfx1250:
+            meta_size = (
+                (self._ops_meta_size() + _COARSE_GRAIN - 1) // _COARSE_GRAIN
+            ) * _COARSE_GRAIN
+        else:
+            meta_size = self._ops_meta_size() + max_size * 2
+        # Wire the pool's graph helpers to the kernel-matching ops so that
+        # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
+        # `fa` through the old-arch graph ops. Graph-buffer registration itself
+        # stays disabled on gfx1250 (copy-in path → count is always 0).
+        pool_kwargs = {}
+        if self._is_gfx1250:
+            pool_kwargs["graph_count_fn"] = self._ops_get_graph_buffer_count
         # Create IPC buffer pool and allocate all named buffers.
-        self._pool = IPCBufferPool(self.device, self.group)
-        self._pool.create("meta", self._ops_meta_size() + max_size * 2, uncached=True)
+        self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
+        self._pool.create("meta", meta_size, uncached=True)
         self._pool.create("input", max_size)
 
         handles, offsets = self._pool.get_ipc_meta("meta")
@@ -746,7 +1004,9 @@ class CustomAllreduce:
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
-        if self._is_gfx1250:
+        # Branch on transport: VMM returns a raw peer-ptr list; IPC (both
+        # old-arch and gfx1250 kernels) returns handles + offsets.
+        if self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(inp)
             self._ops_register_input_buffer(self._ptr, inp.data_ptr(), all_ptrs)
         else:
@@ -757,7 +1017,7 @@ class CustomAllreduce:
 
     def register_output_buffer(self, out: torch.Tensor):
         """Register an external tensor as an IPC output buffer."""
-        if self._is_gfx1250:
+        if self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(out)
             self._ops_register_output_buffer(self._ptr, out.data_ptr(), all_ptrs)
         else:
@@ -777,16 +1037,24 @@ class CustomAllreduce:
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
+        # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
+        if self._car_max_size <= 0:
+            return False
+        # AITER_CUSTOM_AR_MIN_SIZE lower bound: inputs at or below it fall back
+        # to RCCL (custom AR runs only in the (min, max] window). Default 0 keeps
+        # the historical behavior of accepting all sizes down to 16 bytes.
+        if inp_size <= self._car_min_size:
+            return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            # decode
+            # decode: env-controlled cutoff (default 64 MiB).
             if not prefill_support:
-                return inp_size <= 8192 * 8192
-            # prefill
+                return inp_size <= self._car_max_size
+            # prefill: also bounded by the 2x tmp buffer (max_size / 2).
             else:
-                return inp_size <= (self.max_size / 2)
+                return inp_size <= min(self._car_max_size, self.max_size / 2)
         return False
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
@@ -820,7 +1088,7 @@ class CustomAllreduce:
         self,
         inp: torch.Tensor,
         *,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
         registered_input: bool = False,
@@ -849,7 +1117,7 @@ class CustomAllreduce:
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -960,7 +1228,7 @@ class CustomAllreduce:
 
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled or this shape/dim is unsupported,
         # this will be None and the caller is expected to fall back to an
         # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
@@ -1056,15 +1324,13 @@ class CustomAllreduce:
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
     # ints as same-size floats so callers gathering token-id tensors work
     # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
-    _INT_TO_FP_VIEW = {
+    _INT_TO_FP_VIEW: ClassVar[dict[str, Any]] = {
         torch.int64: torch.float64,
         torch.int32: torch.float32,
         torch.int16: torch.float16,
     }
 
-    def custom_all_gather(
-        self, inp: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    def custom_all_gather(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
         orig_dtype = inp.dtype
         view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype) or orig_dtype
 
@@ -1094,9 +1360,9 @@ class CustomAllreduce:
         inp: torch.Tensor,
         res_inp: torch.Tensor,
         *,
-        res_out: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        scale_out: Optional[torch.Tensor] = None,
+        res_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
         w: torch.Tensor,
         eps: float,
         registered: bool = False,
@@ -1194,7 +1460,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1246,7 +1512,7 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
         # materializing an intermediate contiguous tensor in Python.
@@ -1352,6 +1618,7 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
@@ -1363,9 +1630,15 @@ class CustomAllreduce:
         res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
-        scale_out = torch.empty(
-            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
-        )
+        if transpose_scale:
+            M = inp.shape[0]
+            scale_out = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=inp.device
+            ).transpose(0, 1)
+        else:
+            scale_out = torch.empty(
+                inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+            )
         # Optional bf16/fp16 mirror of the pre-quantization normed output.
         # Requested by GDN-style layers that also need an unquantized view
         # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
@@ -1391,6 +1664,7 @@ class CustomAllreduce:
             reg_bytes,
             use_1stage,
             bf16_ptr,
+            transpose_scale,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -1658,6 +1932,7 @@ class CustomAllreduce:
         group_size: int = 128,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1672,16 +1947,23 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
             else:
                 K = input.shape[-1]
                 num_groups = K // group_size
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                dummy_scale = torch.zeros(
-                    input.shape[:-1] + (num_groups,),
-                    dtype=torch.float32,
-                    device=input.device,
-                )
+                if transpose_scale:
+                    M = input.shape[0]
+                    dummy_scale = torch.zeros(
+                        (num_groups, M), dtype=torch.float32, device=input.device
+                    ).transpose(0, 1)
+                else:
+                    dummy_scale = torch.zeros(
+                        input.shape[:-1] + (num_groups,),
+                        dtype=torch.float32,
+                        device=input.device,
+                    )
                 if emit_bf16:
                     return (
                         dummy_out,
@@ -1700,6 +1982,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
 
     def custom_fused_ar_rms_mxfp4_quant(
