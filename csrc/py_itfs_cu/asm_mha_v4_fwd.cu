@@ -207,20 +207,20 @@ void set_descale_strides(const at::Tensor& tensor,
 
 } // namespace
 
-at::Tensor fmha_v4_fwd(const at::Tensor& q,
-                       const at::Tensor& k,
-                       const at::Tensor& v,
-                       const at::Tensor& q_descale,
-                       const at::Tensor& k_descale,
-                       const at::Tensor& v_descale,
-                       at::Tensor out,
-                       int64_t q_format,
-                       int64_t k_format,
-                       int64_t v_format,
-                       int64_t q_scale_mode,
-                       int64_t k_scale_mode,
-                       int64_t v_scale_mode,
-                       double softmax_scale)
+void fmha_v4_fwd(const at::Tensor& q,
+                 const at::Tensor& k,
+                 const at::Tensor& v,
+                 const at::Tensor& q_descale,
+                 const at::Tensor& k_descale,
+                 const at::Tensor& v_descale,
+                 at::Tensor out,
+                 int64_t q_format,
+                 int64_t k_format,
+                 int64_t v_format,
+                 int64_t q_scale_mode,
+                 int64_t k_scale_mode,
+                 int64_t v_scale_mode,
+                 double softmax_scale)
 {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(),
                 "Q, K, V, and out must be GPU tensors");
@@ -363,7 +363,6 @@ at::Tensor fmha_v4_fwd(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
-    return out;
 }
 
 } // namespace torch_itfs
