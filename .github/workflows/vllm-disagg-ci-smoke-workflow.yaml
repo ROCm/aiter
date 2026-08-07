@@ -96,8 +96,9 @@ jobs:
             -w /workspace \
             -e AITER_USE_SYSTEM_TRITON=1 \
             -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
+            --entrypoint /bin/bash \
             "${BASE_IMAGE}" \
-            bash -lc '
+            -lc '
               set -euo pipefail
               git config --global --add safe.directory /workspace
               shopt -s nullglob
