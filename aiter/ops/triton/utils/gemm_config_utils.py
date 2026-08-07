@@ -1,7 +1,6 @@
 import copy
 import functools
 import itertools
-import json
 import os
 
 import triton
@@ -14,35 +13,13 @@ from aiter.ops.triton.utils.core import (
 )
 
 # Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
-STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 def _dtype_dir(config_name: str) -> str:
     """Nested-layout directory for a config family:
     ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
     return config_name.lower().replace("-", "_")
-
-
-def _load_config_file(
-    cache_dict: dict,
-    cache_key: str,
-    fpath: str,
-    config_key: str,
-    fpath_should_exist: bool = False,
-) -> bool:
-    """
-    Helper function to load a config file and cache it.
-
-    Retained for mhc_config_utils.py — the GEMM resolver uses _load_json().
-    """
-    if os.path.exists(fpath):
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        cache_dict[cache_key][config_key] = config
-        return True
-    elif fpath_should_exist:
-        raise AssertionError(f"Required config file doesn't exist: {fpath}")
-    return False
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
