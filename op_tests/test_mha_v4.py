@@ -180,6 +180,33 @@ def test_mha_v4_packed_i8fp8_compile_parity():
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+def test_mha_v4_native_schema_mutates_only_out():
+    q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    mha_v4_packed(
+        q,
+        q,
+        q,
+        scale,
+        scale,
+        scale,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+
+    schema = str(torch.ops.aiter.mha_v4_fwd_launch.default._schema)
+    assert "Tensor q" in schema
+    assert "Tensor k" in schema
+    assert "Tensor v" in schema
+    assert "Tensor(a6!) out" in schema
+    assert schema.endswith("-> ()")
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [

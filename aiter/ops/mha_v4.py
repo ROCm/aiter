@@ -162,11 +162,11 @@ def _fmha_v4_fwd_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
-) -> Tensor:
+) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    return out
+    del out
 
 
 @compile_ops(
@@ -189,7 +189,64 @@ def _fmha_v4_fwd(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
-) -> Tensor: ...
+) -> None: ...
+
+
+@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out",))
+def _mha_v4_fwd_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+) -> None:
+    _fmha_v4_fwd(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        out,
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        softmax_scale,
+    )
+
+
+@_mha_v4_fwd_launch.register_fake
+def _mha_v4_fwd_launch_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+) -> None:
+    del q, k, v, q_descale, k_descale, v_descale, out
+    del q_format, k_format, v_format
+    del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
 
 
 def mha_v4_packed(
@@ -260,7 +317,7 @@ def mha_v4_packed(
     elif out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must be a BF16 tensor on the same device as Q")
 
-    return _fmha_v4_fwd(
+    _mha_v4_fwd_launch(
         q,
         k,
         v,
@@ -276,6 +333,7 @@ def mha_v4_packed(
         int(v_scale_mode),
         softmax_scale,
     )
+    return out
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_int8", mutates_args=())
