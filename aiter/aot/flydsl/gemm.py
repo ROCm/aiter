@@ -51,10 +51,7 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
-from aiter.ops.flydsl.gemm_kernels import (
-    SPLIT_K_SEMAPHORE_MAX_LEN,
-    get_flydsl_splitk_hgemm_kernel_params,
-)
+from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -260,16 +257,9 @@ def _compile_hgemm_to_cache(
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    signal = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
+    # Split-K fp32 workspace slot. Only the pointer's presence matters at
+    # compile time, never its size, so a 1-element stand-in is enough.
+    workspace = torch.empty((1,), device=dev, dtype=torch.float32)
     stream = fx.Stream(0)
 
     exe = compile_flydsl_hgemm_kernel(
@@ -295,8 +285,8 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
-    # optional bias and split-K sync tensors.
+    # FlyDSL JIT does not accept None for tensor slots; pass a real buffer for
+    # the optional bias.
     launch_bias = bias if has_bias else b
     _compile_executable_to_cache(
         exe,
@@ -305,8 +295,7 @@ def _compile_hgemm_to_cache(
         _ptr_view_safe(b),
         _ptr_view_safe(launch_bias),
         m,
-        _ptr_view_safe(semaphore),
-        _ptr_view_safe(signal),
+        _ptr_view_safe(workspace),
         stream,
     )
 
