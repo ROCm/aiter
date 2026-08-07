@@ -2,7 +2,10 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
+import contextlib
 import os
+
+from flydsl.compiler.kernel_function import CompilationContext
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -78,6 +81,19 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     return m_block_idx, n_block_idx
 
 
+# Tuned scheduling/staging defaults for the gfx950 a8w4 stage2 gemm; all are
+# bit-exact against the stock kernel.
+_G2_KUNROLL_DEFAULT = 1
+# bit2 = 4-way C-slab split, bit3 = wide route-out store, bit5 = LDS bank swizzle.
+_G2_EPI_DEFAULT = 44
+# GroupNum=32, M01=1 block->tile swizzle, for L2 reuse of the B weights.
+_G2_SPART_DEFAULT = 3201
+_G2_WPE_DEFAULT = 0  # 0 = let the compiler pick
+_G2_WCPL_DEFAULT = 0
+# 0/1 = off.  G>1 = each block owns G consecutive n-tiles of one m-tile.
+_G2_NLOOP_DEFAULT = 2
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -97,6 +113,12 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
+    g2_diag=None,
+    g2_kunroll=None,
+    g2_epi=None,
+    g2_wpe=None,
+    g2_wcpl=None,
+    g2_nloop=None,
     out_dtype="bf16",
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
@@ -131,7 +153,7 @@ def compile_gemm2_a4w4_port(
         g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_ascale_pf = bool(g2_ascale_pf)
     if g2_spart is None:
-        g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
+        g2_spart = int(os.environ.get("MXFP4_G2_SPART", str(_G2_SPART_DEFAULT)))
     g2_spart = int(g2_spart)
     g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
@@ -146,11 +168,67 @@ def compile_gemm2_a4w4_port(
     if g2_bf16_lds is None:
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    # MXFP4_G2_DIAG: PERF-ATTRIBUTION ONLY, produces WRONG results. Each bit drops
+    # one phase of the kernel to size how much of the runtime it owns.
+    if g2_diag is None:
+        g2_diag = int(os.environ.get("MXFP4_G2_DIAG", "0"))
+    g2_diag = int(g2_diag)
+    # g2_kunroll: fully unroll the K loop, one LDS slot per A K-tile.  Legal only
+    # when the runtime inter_dim equals INTER_MAX (the host entry asserts this).
+    if g2_kunroll is None:
+        g2_kunroll = int(os.environ.get("MXFP4_G2_KUNROLL", _G2_KUNROLL_DEFAULT))
+    # 0 = rolled K loop, 1 = unroll with per-tile registers, 2 = unroll with shared ones.
+    g2_kunroll = int(g2_kunroll)
+    # g2_epi bitmask, all bit-exact with g2_epi=0:
+    #   1 = 32-byte XOR-swizzled C slab + vectorised cshuffle readback + fused
+    #       8-byte fp8 value store.
+    #   2 = stage the cshuffle in 2 row slices, 4 = in 4 slices, which keeps the C
+    #       slab off the LDS high-water mark so more workgroups fit per CU.
+    if g2_epi is None:
+        g2_epi = int(os.environ.get("MXFP4_G2_EPI", str(_G2_EPI_DEFAULT)))
+    g2_epi = int(g2_epi)
+    # g2_wpe: --amdgpu-waves-per-eu.  Occupancy here is capped by the register file
+    # (64 f32 accumulators per wave), not LDS, and every non-zero value measures
+    # worse than the compiler's own heuristic.
+    if g2_wpe is None:
+        g2_wpe = int(os.environ.get("MXFP4_G2_WPE", str(_G2_WPE_DEFAULT)))
+    g2_wpe = int(g2_wpe)
+    if g2_wcpl is None:
+        g2_wcpl = int(os.environ.get("MXFP4_G2_WCPL", str(_G2_WCPL_DEFAULT)))
+    if g2_nloop is None:
+        g2_nloop = int(os.environ.get("MXFP4_G2_NLOOP", str(_G2_NLOOP_DEFAULT)))
+    # The group must tile the n range exactly, or the tail n-tiles are never computed.
+    g2_nloop = int(g2_nloop)
+    if g2_nloop > 1 and (HIDDEN_MAX // BN) % g2_nloop:
+        g2_nloop = 1
+    g2_wcpl = int(g2_wcpl)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    aStages = 2 if g2_bf16_lds else 3
-    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
-    lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    # A-slot count must exceed kStages (=2): with aStages==2 the DMA for tile
+    # kt+kStages targets the slot tile kt is still being ds-read from, and since a
+    # wave DMAs only its own BM/4 rows but reads all BM, that is a cross-wave WAR
+    # race on the A operands.  aStages=3 is free -- the C slab dominates the union.
+    aStages = 3
+    a_prologue_tiles = kStages
+    if g2_kunroll:
+        # One slot per K-tile: the prologue DMAs the whole contraction up front.
+        a_prologue_tiles = aStages = INTER_MAX // BK
+    # g2_epi>=2 stages the cshuffle in 2 (or 4) row slices, so only part of the
+    # C slab is live at a time.
+    c_split = 4 if (g2_epi & 4) else (2 if (g2_epi & 2) else 1)
+    while c_split > 1 and ((BM // 16) % c_split or (BM // 8) % c_split):
+        c_split //= 2
+    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4) // c_split
+    # N-loop keeps A live across every n-tile, so the C slab cannot union with it.
+    c_lds_off = (aStages * slot_bytes) if g2_nloop > 1 else 0
+    lds_bytes = (
+        c_lds_off + c_lds_bytes
+        if g2_nloop > 1
+        else max(c_lds_bytes, aStages * slot_bytes)
+    )
+    # MXFP4_G2_LDSPAD: DIAGNOSTIC. Inflate the LDS request without using it, to find
+    # the workgroups/CU cliff.  Correct results; perf only.
+    lds_bytes = max(lds_bytes, int(os.environ.get("MXFP4_G2_LDSPAD", "0")))
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -178,9 +256,14 @@ def compile_gemm2_a4w4_port(
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
+    diag_tag = f"_diag{g2_diag}" if g2_diag else ""
+    kunroll_tag = f"_kunroll{g2_kunroll}" if g2_kunroll else ""
+    epi_tag = f"_epi{g2_epi}" if g2_epi else ""
+    epi_tag += f"_wcpl{g2_wcpl}" if (g2_epi & 8) and g2_wcpl else ""
+    nloop_tag = f"_nloop{g2_nloop}" if g2_nloop > 1 else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{diag_tag}{kunroll_tag}{epi_tag}{nloop_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -221,7 +304,9 @@ def compile_gemm2_a4w4_port(
 
         # Preload the first kStages K-tiles (the streaming prologue).
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
+            if const_expr(bool(g2_diag & 32)):  # attribution: drop the A->LDS DMA
+                return
+            for slot in range_constexpr(a_prologue_tiles):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -273,10 +358,39 @@ def compile_gemm2_a4w4_port(
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
+                g2_diag=g2_diag,
+                g2_kunroll=g2_kunroll,
+                g2_epi=g2_epi,
+                g2_wcpl=g2_wcpl,
                 route_out_fp8=route_out_fp8,
+                c_lds_off=c_lds_off,
             )
 
-        if const_expr(not persist and g2_spart <= 0):
+        if const_expr(not persist and g2_nloop > 1):
+            # N-group schedule: a block owns g2_nloop CONSECUTIVE n-tiles of one
+            # m-tile, so the A->LDS prologue and the sorted_token_ids/sorted_weights
+            # row metadata are paid once per group instead of once per n-tile.  The
+            # group is unrolled at compile time, and the grid stays large enough to
+            # keep independent workgroups per CU hiding each other's epilogues.
+            num_n_groups = num_n_blocks // fx.Int32(g2_nloop)
+            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
+            total_m_blocks = cumsum0 // BM
+            bound = total_m_blocks * num_n_groups
+
+            if fx.Int32(bx_i32) < bound:
+                m_block_idx, n_group_idx = _spart_output_tile_index(
+                    bx_i32, total_m_blocks, num_n_groups, g2_group_num, g2_m01
+                )
+                issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                rocdl.sched_barrier(0)
+                n_block0 = n_group_idx * fx.Int32(g2_nloop)
+                for _j in range_constexpr(g2_nloop):
+                    run_unit(
+                        m_block_idx * fx.Int32(num_n_blocks)
+                        + n_block0
+                        + fx.Int32(_j)
+                    )
+        elif const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
             issue_all_a_loads((bx_i32 // num_n_blocks) * fx.Int32(BM))
             rocdl.sched_barrier(0)
@@ -395,7 +509,12 @@ def compile_gemm2_a4w4_port(
     ):
         # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
-        grid_x = i32_grid_blocks * num_n_blocks
+        # N-loop folds the n dimension into the kernel, so the grid is m-tiles only.
+        grid_x = (
+            i32_grid_blocks * (num_n_blocks // fx.Int32(g2_nloop))
+            if (g2_nloop > 1 and not persist)
+            else i32_grid_blocks * num_n_blocks
+        )
         gemm2_kernel(
             arg_aq,
             arg_ascale,
@@ -448,8 +567,19 @@ def get_g2(
     g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
-    g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
+    # These MUST use the same fallbacks as compile_gemm2_a4w4_port: the key is built
+    # here but the kernel is compiled there, so any disagreement silently hands back
+    # a launcher that does not match the key.
+    g2_spart = int(os.environ.get("MXFP4_G2_SPART", str(_G2_SPART_DEFAULT)))
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
+    g2_kunroll = int(os.environ.get("MXFP4_G2_KUNROLL", _G2_KUNROLL_DEFAULT))
+    g2_diag = int(os.environ.get("MXFP4_G2_DIAG", "0"))
+    g2_epi = int(os.environ.get("MXFP4_G2_EPI", str(_G2_EPI_DEFAULT)))
+    g2_wpe = int(os.environ.get("MXFP4_G2_WPE", str(_G2_WPE_DEFAULT)))
+    g2_wcpl = int(os.environ.get("MXFP4_G2_WCPL", str(_G2_WCPL_DEFAULT)))
+    g2_nloop = int(os.environ.get("MXFP4_G2_NLOOP", str(_G2_NLOOP_DEFAULT)))
+    if g2_nloop > 1 and (HIDDEN_MAX // BN) % g2_nloop:
+        g2_nloop = 1
     key = (
         BM,
         BN,
@@ -469,6 +599,12 @@ def get_g2(
         g2_ascale_pf,
         g2_spart,
         g2_bf16_lds,
+        g2_kunroll,
+        g2_diag,
+        g2_epi,
+        g2_wpe,
+        g2_wcpl,
+        g2_nloop,
         out_dtype,
     )
     launch = G2_CACHE.get(key)
@@ -492,6 +628,11 @@ def get_g2(
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
+            g2_kunroll=g2_kunroll,
+            g2_diag=g2_diag,
+            g2_epi=g2_epi,
+            g2_wpe=g2_wpe,
+            g2_wcpl=g2_wcpl,
             out_dtype=out_dtype,
         )
         G2_CACHE[key] = launch
@@ -560,6 +701,15 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
+    if int(os.environ.get("MXFP4_G2_KUNROLL", _G2_KUNROLL_DEFAULT)):
+        # The unrolled K path folds the tile count at compile time, so the compile
+        # bucket must be the exact runtime K (one launcher per inter_dim).
+        INTER_MAX = D_INTER
+    if int(os.environ.get("MXFP4_G2_NLOOP", _G2_NLOOP_DEFAULT)) > 1:
+        # Same for the n-group schedule: the group count must divide the n range
+        # exactly, so a bucket shared with a different model_dim could drop a tail
+        # n-tile.  One launcher per model_dim.
+        HIDDEN_MAX = D_HIDDEN
     launch = get_g2(
         BM,
         BN,
@@ -590,25 +740,34 @@ def mxfp4_moe_gemm2(
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
     # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after
     # i32_hidden; when has_pad is False they are 0 and the kernel folds pad math away.
-    run_compiled(
-        launch,
-        inter_sorted_quant.data_ptr(),
-        inter_sorted_shuffled_scale.data_ptr(),
-        w2_u8.data_ptr(),
-        w2_scale_u8.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        cumsum_tensor.data_ptr(),
-        sorted_token_ids.data_ptr(),
-        sorted_weights.data_ptr(),
-        M_logical,
-        max_m_blocks,
-        grid_blocks,
-        D_INTER,
-        D_HIDDEN,
-        int(inter_dim_pad),
-        int(model_dim_pad),
-        out.data_ptr(),
-        out_scale.data_ptr(),
-        torch.cuda.current_stream() if stream is None else stream,
+    # Codegen happens on the first run_compiled for a given launcher, so the
+    # waves-per-EU hint has to be live here rather than at definition time.
+    _wpe = int(os.environ.get("MXFP4_G2_WPE", str(_G2_WPE_DEFAULT)))
+    _hint = (
+        CompilationContext.compile_hints({"waves_per_eu": _wpe})
+        if _wpe
+        else contextlib.nullcontext()
     )
+    with _hint:
+        run_compiled(
+            launch,
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            w2_u8.data_ptr(),
+            w2_scale_u8.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            M_logical,
+            max_m_blocks,
+            grid_blocks,
+            D_INTER,
+            D_HIDDEN,
+            int(inter_dim_pad),
+            int(model_dim_pad),
+            out.data_ptr(),
+            out_scale.data_ptr(),
+            torch.cuda.current_stream() if stream is None else stream,
+        )
     return out

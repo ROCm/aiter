@@ -2617,15 +2617,28 @@ def get_2stage_cfgs(
             _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
-        elif token < 16384:
+        elif token < 8192:
             _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        # Stage2 tiling is picked independently of the sorting block.
+        if token >= 4096:
+            _s2_tm, _s2_tn, _s2_mode = 64, 256, "reduce"
+        else:
+            _s2_tm, _s2_tn, _s2_mode = _tile_m, 128, "atomic"
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2,
+            _a_type,
+            _w_type,
+            _out_type,
+            _s2_tm,
+            _s2_tn,
+            _s2_tk,
+            _s2_mode,
+            sort_block_m=_tile_m,
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
