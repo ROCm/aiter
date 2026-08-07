@@ -67,9 +67,11 @@ def _stats(ref: torch.Tensor, got: torch.Tensor):
 
 def _run_a8w4_mbn(o_mbn: torch.Tensor, w_bnk: torch.Tensor, dtype=torch.bfloat16):
     """Full quant + preshuffle + launch, mirroring the intended _attn_post path."""
-    B, N, K = w_bnk.shape
-    a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)          # [M,B,K], [M//32,B,(K//32)*32]
-    w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)  # [B,N//16,(K//2)*16], [B,N//32,(K//32)*32]
+    N = w_bnk.shape[1]
+    a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)  # [M,B,K], [M//32,B,(K//32)*32]
+    w_codes, w_scales = preshuffle_a8w4_weight_mbn(
+        w_bnk
+    )  # [B,N//16,(K//2)*16], [B,N//32,(K//32)*32]
     y = flydsl_batched_gemm_a8w4_v2(
         a_fp8, w_codes, a_scales, w_scales, N=N, dtype=dtype, layout="mbn"
     )  # [B, M, N] view
@@ -91,10 +93,10 @@ def _ref_quant_n32k4_mbn(o_mbn: torch.Tensor):
     """Reference (pre-fusion) path: dynamic_mxfp8_quant + torch n32k4 reshuffle.
 
     Kept here as the bit-exact oracle for the fused
-    ``dynamic_mxfp8_quant_n32k4_mbn`` kernel (方案 B).
+    ``dynamic_mxfp8_quant_n32k4_mbn`` kernel.
     """
-    from aiter.ops.triton.quant import dynamic_mxfp8_quant
     from aiter.ops.shuffle import shuffle_scale_n32k4
+    from aiter.ops.triton.quant import dynamic_mxfp8_quant
 
     M, B, K = o_mbn.shape
     a_fp8, a_scale = dynamic_mxfp8_quant(o_mbn.reshape(M * B, K))
@@ -114,7 +116,7 @@ def _ref_quant_n32k4_mbn(o_mbn: torch.Tensor):
 @_skip_gfx1250
 @pytest.mark.parametrize("M,B,N,K", _SHAPES)
 def test_fused_quant_n32k4_matches_torch(M, B, N, K):
-    """方案 B: fused quant+preshuffle scale must be bit-exact vs the torch path.
+    """Fused quant+preshuffle scale must be bit-exact vs the torch path.
 
     Only the padded (m >= M) super rows may differ; both are pre-zeroed so the
     comparison covers the full buffer.
@@ -128,9 +130,9 @@ def test_fused_quant_n32k4_matches_torch(M, B, N, K):
     got_fp8, got_scale = dynamic_mxfp8_quant_n32k4_mbn(o)
 
     assert got_fp8.shape == ref_fp8.shape
-    assert got_scale.shape == ref_scale.shape, (
-        f"{tuple(got_scale.shape)} vs {tuple(ref_scale.shape)}"
-    )
+    assert (
+        got_scale.shape == ref_scale.shape
+    ), f"{tuple(got_scale.shape)} vs {tuple(ref_scale.shape)}"
     # fp8 payload: bit-exact (same quant math).
     assert torch.equal(got_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
     # e8m0 scale in n32k4 layout: bit-exact.
@@ -157,7 +159,7 @@ def test_wo_a_a8w4_matches_bf16(M, B, N, K):
 if __name__ == "__main__":
     if not _IS_GFX1250:
         raise SystemExit(f"requires gfx1250, got {get_gfx()}")
-    for (M, B, N, K) in _SHAPES:
+    for M, B, N, K in _SHAPES:
         torch.manual_seed(0)
         o = torch.randn(M, B, K, dtype=torch.bfloat16) * 0.1
         w = torch.randn(B, N, K, dtype=torch.bfloat16) * 0.1
