@@ -756,7 +756,7 @@ def launch_gemm_a8w4_tdm(
                 mma_total = front_mma + back_mma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = 16 if KWS > 1 else 1
+                mma_group = 4 if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
                 future_schedule = spread(
                     STATE_DS if has_next else 0, schedule_slots
