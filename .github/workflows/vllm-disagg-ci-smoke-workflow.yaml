@@ -10,10 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       model_name:
-        description: "MODEL_NAME passed to the upstream vLLM disagg case"
+        description: "DeepSeek model passed to the upstream vLLM disagg case"
         required: false
-        type: string
+        type: choice
         default: "DeepSeek-V3"
+        options:
+          - "DeepSeek-V3"
+          - "DeepSeek-R1-MXFP4"
       disagg_scripts_stage:
         description: "Shared path visible to Spur login and compute nodes"
         required: false
