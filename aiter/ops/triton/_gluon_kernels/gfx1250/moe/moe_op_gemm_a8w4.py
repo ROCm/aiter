@@ -1076,38 +1076,51 @@ def _moe_gemm_a8w4_decode(
             [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0]
         )
 
-        offs_xs_m = off_x_m + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
-        )
-        offs_xs_m = offs_xs_m % M
-        offs_xs_k = gl.arange(
-            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
-        )
-        if GatherIndx is None:
-            XMxScale += start_m.to(index_type) * stride_x_mx_m
-            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=XMxScale,
-                shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
-                strides=(stride_x_mx_m, stride_x_mx_k),
-                block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
-                layout=SHARED_LAYOUT_X_SCALES,
+        if NUM_BUFFERS > 1:
+            offs_xs_m = off_x_m + gl.arange(
+                0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
             )
+            offs_xs_k = gl.arange(
+                0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
+            )
+        else:
+            offs_xs_m = off_x_m + gl.arange(
+                0, BLOCK_M, layout=gl.SliceLayout(1, DOT_LAYOUT_X_SCALES)
+            )
+            offs_xs_k = gl.arange(
+                0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES)
+            )
+        offs_xs_m = offs_xs_m % M
+
+        if GatherIndx is None:
+            XMxScale += start_m * stride_x_mx_m
+            if X_SCALE_TDM:
+                x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=XMxScale,
+                    shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
+                    strides=(stride_x_mx_m, stride_x_mx_k),
+                    block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
+                    layout=SHARED_LAYOUT_X_SCALES,
+                )
             xs_row = offs_xs_m
         else:
-            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=XMxScale,
-                shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
-                strides=(stride_x_mx_m, stride_x_mx_k),
-                block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
-                layout=SHARED_LAYOUT_X_SCALES,
-            )
+            if X_SCALE_TDM:
+                x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=XMxScale,
+                    shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
+                    strides=(stride_x_mx_m, stride_x_mx_k),
+                    block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
+                    layout=SHARED_LAYOUT_X_SCALES,
+                )
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
-        xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
-        xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
-        xs_ptrs = gl.max_contiguous(
-            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
-            (1, MX_SCALE_BLOCK_K),
-        )
+
+        xs_offs = xs_row[:, None] * stride_x_mx_m + offs_xs_k[None, :]
+        if NUM_BUFFERS > 1:
+            xs_ptrs = XMxScale + xs_offs
+            xs_ptrs = gl.max_contiguous(
+                gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+                (1, MX_SCALE_BLOCK_K),
+            )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -1120,11 +1133,11 @@ def _moe_gemm_a8w4_decode(
         shape=[NUM_BUFFERS] + w_scales_desc.block_shape,
         layout=w_scales_desc.layout,
     )
-    if is_x_microscaled:
+    if is_x_microscaled and (X_SCALE_TDM or NUM_BUFFERS > 1):
         x_scales_buffer = gl.allocate_shared_memory(
-            x_scales_desc.dtype,
-            shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
-            layout=x_scales_desc.layout,
+            XMxScale.dtype.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_M, MX_SCALE_BLOCK_K],
+            layout=SHARED_LAYOUT_X_SCALES,
         )
 
     read_idx = 0
@@ -1232,12 +1245,16 @@ def _moe_gemm_a8w4_decode(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
-                async_copy.global_to_shared(
-                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    xs_ptrs,
-                )
-                async_copy.commit_group()
-                xs_ptrs += MX_SCALE_BLOCK_K
+                if NUM_BUFFERS > 1:
+                    async_copy.global_to_shared(
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        xs_ptrs,
+                    )
+                    async_copy.commit_group()
+                    xs_ptrs += MX_SCALE_BLOCK_K
+                else:
+                    cur_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, xs_offs)
+                    xs_offs += MX_SCALE_BLOCK_K
 
         w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_desc, add_offsets=[0, PACKED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
@@ -1266,7 +1283,7 @@ def _moe_gemm_a8w4_decode(
         cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        if is_x_microscaled and not X_SCALE_TDM:
+        if is_x_microscaled and not X_SCALE_TDM and NUM_BUFFERS > 1:
             async_copy.wait_group(NUM_BUFFERS - 1)
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
@@ -1279,7 +1296,7 @@ def _moe_gemm_a8w4_decode(
                 SCALE_KWIDTH,
             )
         cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
-        if is_x_microscaled:
+        if is_x_microscaled and (X_SCALE_TDM or NUM_BUFFERS > 1):
             cur_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
                 layout=DOT_LAYOUT_X_SCALES
             )
