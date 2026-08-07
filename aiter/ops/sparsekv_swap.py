@@ -52,6 +52,9 @@ def sparsekv_swap_and_translate(
     out_translated: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    skip_gather: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -74,8 +77,12 @@ def sparsekv_swap_and_translate_record(
     plan_miss_tok: torch.Tensor,
     plan_miss_slot: torch.Tensor,
     plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    skip_gather: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -101,8 +108,28 @@ def sparsekv_copy_planned(
 
 
 @compile_ops("module_sparsekv_swap")
+def sparsekv_gather_planned(
+    base_dev_ptr: int,
+    hot_buffer: torch.Tensor,
+    req_slots: torch.Tensor,
+    plan_miss_tok: torch.Tensor,
+    plan_miss_slot: torch.Tensor,
+    plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
+    target_home: int,
+    cache_locs: torch.Tensor,
+    cache_stride: int,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+    topk: int,
+) -> None: ...
+
+
+@compile_ops("module_sparsekv_swap")
 def sparsekv_backup_into_assigned(
     cold_pool_dev_ptr: int,
+    gpu_cold_pool_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
     src_slots: torch.Tensor,
@@ -111,6 +138,8 @@ def sparsekv_backup_into_assigned(
     token_to_slot: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -120,6 +149,7 @@ def sparsekv_backup_into_assigned(
 @compile_ops("module_sparsekv_swap")
 def sparsekv_backup_new_token(
     cold_pool_dev_ptr: int,
+    gpu_cold_pool_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
     src_slots: torch.Tensor,
@@ -131,6 +161,8 @@ def sparsekv_backup_new_token(
     recency: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -141,6 +173,7 @@ __all__ = [
     "sparsekv_backup_into_assigned",
     "sparsekv_backup_new_token",
     "sparsekv_copy_planned",
+    "sparsekv_gather_planned",
     "sparsekv_host_get_device_pointer",
     "sparsekv_swap_and_translate",
     "sparsekv_swap_and_translate_record",

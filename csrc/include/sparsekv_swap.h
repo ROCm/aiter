@@ -39,6 +39,9 @@ void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr,
                                  at::Tensor out_translated,
                                  at::Tensor host_cache_locs,
                                  int64_t host_stride,
+                                 at::Tensor gpu_cache_locs,
+                                 int64_t gpu_stride,
+                                 int64_t skip_gather,
                                  int64_t item_size_bytes,
                                  int64_t hot_slots,
                                  int64_t cold_depth,
@@ -62,12 +65,37 @@ void sparsekv_swap_and_translate_record(int64_t cold_pool_dev_ptr,
                                         at::Tensor plan_miss_tok,
                                         at::Tensor plan_miss_slot,
                                         at::Tensor plan_miss_count,
+                                        at::Tensor plan_miss_home,
                                         at::Tensor host_cache_locs,
                                         int64_t host_stride,
+                                        at::Tensor gpu_cache_locs,
+                                        int64_t gpu_stride,
+                                        int64_t skip_gather,
                                         int64_t item_size_bytes,
                                         int64_t hot_slots,
                                         int64_t cold_depth,
                                         int64_t topk);
+
+// Replay one home's share of a recorded miss plan into a layer's hot buffer
+// (Design Y dual-source swap). Gathers only misses whose recorded home matches
+// target_home (0=host, 1=gpu), indirecting through that home's translation table
+// and cold pool base. The coordinator issues this twice per layer (host + gpu)
+// after a record-only detect so a mixed-home top-k lands fully in the hot buffer.
+// Pure IO, fixed launch shape (CUDAGraph-capturable).
+void sparsekv_gather_planned(int64_t base_dev_ptr,
+                             at::Tensor hot_buffer,
+                             at::Tensor req_slots,
+                             at::Tensor plan_miss_tok,
+                             at::Tensor plan_miss_slot,
+                             at::Tensor plan_miss_count,
+                             at::Tensor plan_miss_home,
+                             int64_t target_home,
+                             at::Tensor cache_locs,
+                             int64_t cache_stride,
+                             int64_t item_size_bytes,
+                             int64_t hot_slots,
+                             int64_t cold_depth,
+                             int64_t topk);
 
 // Replay a recorded miss plan (from an anchor's swap_and_translate_record) into a
 // shared-index layer's hot buffer. Pure host->device gather, no bookkeeping. One
@@ -90,6 +118,7 @@ void sparsekv_copy_planned(int64_t cold_pool_dev_ptr,
 // writes cold pool + the assigned hot slot, no LRU/recency mutation. One block
 // per decode query token; no host sync.
 void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr,
+                                   int64_t gpu_cold_pool_ptr,
                                    at::Tensor hot_buffer,
                                    at::Tensor layer_kv,
                                    at::Tensor src_slots,
@@ -98,6 +127,8 @@ void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr,
                                    at::Tensor token_to_slot,
                                    at::Tensor host_cache_locs,
                                    int64_t host_stride,
+                                   at::Tensor gpu_cache_locs,
+                                   int64_t gpu_stride,
                                    int64_t item_size_bytes,
                                    int64_t hot_slots,
                                    int64_t cold_depth);
@@ -106,6 +137,7 @@ void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr,
 // src_slot) into the cold pool and allocate it a hot-buffer slot with maximal
 // recency. One block per decode query token; no host sync.
 void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr,
+                               int64_t gpu_cold_pool_ptr,
                                at::Tensor hot_buffer,
                                at::Tensor layer_kv,
                                at::Tensor src_slots,
@@ -117,6 +149,8 @@ void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr,
                                at::Tensor recency,
                                at::Tensor host_cache_locs,
                                int64_t host_stride,
+                               at::Tensor gpu_cache_locs,
+                               int64_t gpu_stride,
                                int64_t item_size_bytes,
                                int64_t hot_slots,
                                int64_t cold_depth);

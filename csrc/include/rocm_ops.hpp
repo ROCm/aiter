@@ -1427,6 +1427,9 @@ namespace py = pybind11;
           py::arg("out_translated"),                     \
           py::arg("host_cache_locs"),                    \
           py::arg("host_stride"),                        \
+          py::arg("gpu_cache_locs"),                     \
+          py::arg("gpu_stride"),                         \
+          py::arg("skip_gather"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
@@ -1446,8 +1449,12 @@ namespace py = pybind11;
           py::arg("plan_miss_tok"),                      \
           py::arg("plan_miss_slot"),                     \
           py::arg("plan_miss_count"),                    \
+          py::arg("plan_miss_home"),                     \
           py::arg("host_cache_locs"),                    \
           py::arg("host_stride"),                        \
+          py::arg("gpu_cache_locs"),                     \
+          py::arg("gpu_stride"),                         \
+          py::arg("skip_gather"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
@@ -1466,9 +1473,26 @@ namespace py = pybind11;
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
           py::arg("topk"));                              \
+    m.def("sparsekv_gather_planned",                     \
+          &sparsekv_gather_planned,                      \
+          py::arg("base_dev_ptr"),                       \
+          py::arg("hot_buffer"),                         \
+          py::arg("req_slots"),                          \
+          py::arg("plan_miss_tok"),                      \
+          py::arg("plan_miss_slot"),                     \
+          py::arg("plan_miss_count"),                    \
+          py::arg("plan_miss_home"),                     \
+          py::arg("target_home"),                        \
+          py::arg("cache_locs"),                         \
+          py::arg("cache_stride"),                       \
+          py::arg("item_size_bytes"),                    \
+          py::arg("hot_slots"),                          \
+          py::arg("cold_depth"),                         \
+          py::arg("topk"));                              \
     m.def("sparsekv_backup_into_assigned",               \
           &sparsekv_backup_into_assigned,                \
           py::arg("cold_pool_dev_ptr"),                  \
+          py::arg("gpu_cold_pool_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("layer_kv"),                           \
           py::arg("src_slots"),                          \
@@ -1477,12 +1501,15 @@ namespace py = pybind11;
           py::arg("token_to_slot"),                      \
           py::arg("host_cache_locs"),                    \
           py::arg("host_stride"),                        \
+          py::arg("gpu_cache_locs"),                     \
+          py::arg("gpu_stride"),                         \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"));                        \
     m.def("sparsekv_backup_new_token",                   \
           &sparsekv_backup_new_token,                    \
           py::arg("cold_pool_dev_ptr"),                  \
+          py::arg("gpu_cold_pool_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("layer_kv"),                           \
           py::arg("src_slots"),                          \
@@ -1494,6 +1521,8 @@ namespace py = pybind11;
           py::arg("recency"),                            \
           py::arg("host_cache_locs"),                    \
           py::arg("host_stride"),                        \
+          py::arg("gpu_cache_locs"),                     \
+          py::arg("gpu_stride"),                         \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"));

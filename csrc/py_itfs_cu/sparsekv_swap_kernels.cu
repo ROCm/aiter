@@ -112,9 +112,13 @@ __global__ void sparsekv_swap_and_translate_kernel(
     int32_t* __restrict__ plan_miss_tok,       // [n, topk] or nullptr
     int32_t* __restrict__ plan_miss_slot,      // [n, topk] or nullptr
     int32_t* __restrict__ plan_miss_count,     // [n] or nullptr
+    int32_t* __restrict__ plan_miss_home,      // [n, topk] or nullptr (0=host,1=gpu)
     int record_plan,
     const int32_t* __restrict__ host_cache_locs,  // [R, host_stride] or nullptr
     int host_stride,
+    const int32_t* __restrict__ gpu_cache_locs,   // [R, gpu_stride] or nullptr
+    int gpu_stride,
+    int skip_gather,                              // 1 = detect+translate only (no gather)
     int64_t item_size_bytes, int hot_slots, int cold_depth, int topk)
 {
     extern __shared__ int smem[];
@@ -153,15 +157,21 @@ __global__ void sparsekv_swap_and_translate_kernel(
     for (int k = threadIdx.x; k < runlen; k += blockDim.x) {
         int tok = topk_q[k];
         if (tok < 0 || tok >= cold_depth) continue;
-        // Skip logical positions with no backing cold-pool row. With a paged host
-        // pool req_to_host_pool[r][tok] == -1 for any token outside the request's
-        // allocated range; gathering it would dereference cold_pool at row -1 ->
-        // GPU memory fault. Such a token has no KV to fetch, so treat it as
-        // padding: never make it resident (the translate loop maps any unresolved
-        // top-k entry to slot 0). This is the per-request length guard the dense
-        // r*cold_depth+tok path gets for free but the paged path must do here.
-        if (host_cache_locs &&
-            host_cache_locs[(int64_t)r * host_stride + tok] < 0) continue;
+        // Skip logical positions with no backing cold-pool row. A token's home is
+        // in exactly one tier: req_to_host_pool[r][tok] >= 0 (host-home) or, with
+        // the GPU cold tier active, req_to_gpu_pool[r][tok] >= 0 (gpu-home). Both
+        // == -1 means the position is outside the request's allocated range;
+        // gathering it would dereference a cold pool at row -1 -> GPU memory fault.
+        // Such a token has no KV to fetch, so treat it as padding: never make it
+        // resident (the translate loop maps any unresolved top-k entry to slot 0).
+        // With a dense pool (host_cache_locs == nullptr) every in-range token is
+        // host-backed, unchanged from Phase 0.
+        bool host_home = host_cache_locs
+                             ? (host_cache_locs[(int64_t)r * host_stride + tok] >= 0)
+                             : true;
+        bool gpu_home = gpu_cache_locs &&
+                        (gpu_cache_locs[(int64_t)r * gpu_stride + tok] >= 0);
+        if (!host_home && !gpu_home) continue;
         int s = tts_base[tok];
         if (s >= 0) {
             lu_base[s] = tick;  // hit: most recent
@@ -225,23 +235,36 @@ __global__ void sparsekv_swap_and_translate_kernel(
             if (record_plan) {
                 plan_miss_tok[(int64_t)q * topk + i]  = tok;
                 plan_miss_slot[(int64_t)q * topk + i] = v;
+                // home: gpu-home iff the GPU table backs this token, else host.
+                // A miss token is backed (unbacked tokens were skipped above), so
+                // exactly one tier claims it.
+                int home = (gpu_cache_locs &&
+                            gpu_cache_locs[(int64_t)r * gpu_stride + tok] >= 0)
+                               ? 1
+                               : 0;
+                plan_miss_home[(int64_t)q * topk + i] = home;
             }
         }
         __syncthreads();
 
-        // Gather: one warp per miss token.
-        const int warp_id = threadIdx.x / WARP_SIZE;
-        const int lane_id = threadIdx.x % WARP_SIZE;
-        const int warps_per_block = blockDim.x / WARP_SIZE;
-        for (int i = warp_id; i < m; i += warps_per_block) {
-            int tok = miss_tok[i];
-            int v   = vic[i];
-            const int64_t src =
-                cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok) *
-                item_size_bytes;
-            const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
-            transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
-                               item_size_bytes);
+        // Gather: one warp per miss token. Skipped in dual-source mode
+        // (skip_gather=1): the coordinator instead replays the recorded plan with
+        // per-home gather passes so gpu-home tokens read the GPU cold pool (their
+        // host_cache_locs row is -1 and would fault through this single-base path).
+        if (!skip_gather) {
+            const int warp_id = threadIdx.x / WARP_SIZE;
+            const int lane_id = threadIdx.x % WARP_SIZE;
+            const int warps_per_block = blockDim.x / WARP_SIZE;
+            for (int i = warp_id; i < m; i += warps_per_block) {
+                int tok = miss_tok[i];
+                int v   = vic[i];
+                const int64_t src =
+                    cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok) *
+                    item_size_bytes;
+                const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
+                transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
+                                   item_size_bytes);
+            }
         }
         __syncthreads();
     }
@@ -259,6 +282,7 @@ __global__ void sparsekv_swap_and_translate_kernel(
 // One block per decode query token.
 __global__ void sparsekv_backup_kernel(
     char* __restrict__ cold_pool,          // device-mapped host cold pool, layer
+    char* __restrict__ gpu_cold_pool,      // GPU cold tier pool, this layer or nullptr
     char* __restrict__ hot_buffer,         // GPU hot buffer, this layer
     const char* __restrict__ layer_kv,     // GPU layer KV cache (flat rows)
     const int32_t* __restrict__ src_slots, // [n] physical row in layer_kv
@@ -270,6 +294,8 @@ __global__ void sparsekv_backup_kernel(
     int64_t* __restrict__ recency,         // [R]
     const int32_t* __restrict__ host_cache_locs,  // [R, host_stride] or nullptr
     int host_stride,
+    const int32_t* __restrict__ gpu_cache_locs,   // [R, gpu_stride] or nullptr
+    int gpu_stride,
     int64_t item_size_bytes, int hot_slots, int cold_depth)
 {
     __shared__ int64_t s_min;
@@ -316,16 +342,29 @@ __global__ void sparsekv_backup_kernel(
     }
     __syncthreads();
 
-    // Copy the new token's KV: layer_kv[src] -> cold pool[r*C+pos] and hot[r*H1+v].
+    // Copy the new token's KV: layer_kv[src] -> its home cold pool[pos] and
+    // hot[r*H1+v]. A new token's home is whichever tier grow_cold_for_new_token
+    // backed it in: gpu-home (req_to_gpu_pool[r][pos] >= 0) writes the GPU cold
+    // tier, else host-home writes the pinned host cold pool.
     const int lane_id = threadIdx.x % WARP_SIZE;
     if (threadIdx.x < WARP_SIZE) {
-        const int64_t cold_row =
-            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
-        if (cold_row >= 0) {  // pos is normally backed; guard against a fault
-            const int64_t kv_off   = (int64_t)src * item_size_bytes;
-            const int64_t cold_off = cold_row * item_size_bytes;
-            transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+        const int64_t kv_off = (int64_t)src * item_size_bytes;
+        int64_t gpu_row = -1;
+        if (gpu_cold_pool && gpu_cache_locs) {
+            gpu_row = (int64_t)gpu_cache_locs[(int64_t)r * gpu_stride + pos];
+        }
+        if (gpu_row >= 0) {
+            const int64_t cold_off = gpu_row * item_size_bytes;
+            transfer_item_warp(lane_id, layer_kv + kv_off, gpu_cold_pool + cold_off,
                                item_size_bytes);
+        } else {
+            const int64_t cold_row =
+                cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
+            if (cold_row >= 0) {  // pos is normally backed; guard against a fault
+                const int64_t cold_off = cold_row * item_size_bytes;
+                transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                                   item_size_bytes);
+            }
         }
     } else if (threadIdx.x < 2 * WARP_SIZE) {
         const int64_t kv_off  = (int64_t)src * item_size_bytes;
@@ -374,12 +413,59 @@ __global__ void sparsekv_copy_planned_kernel(
     }
 }
 
+// Replay one home's share of a recorded miss plan (Design Y dual-source swap).
+// Same fixed launch shape and pure-IO semantics as sparsekv_copy_planned_kernel,
+// but only gathers misses whose recorded home matches target_home, indirecting
+// through that home's translation table (host req_to_host_pool with the
+// device-mapped host cold pool as base, or gpu req_to_gpu_pool with the GPU cold
+// pool as base). The coordinator issues two calls per layer (host then gpu) so a
+// mixed-home top-k lands entirely in the hot buffer. One block per query token.
+__global__ void sparsekv_gather_planned_kernel(
+    const char* __restrict__ base_ptr,          // this home's cold pool base, layer
+    char* __restrict__ hot_buffer,              // GPU hot buffer, this layer
+    const int32_t* __restrict__ req_slots,      // [n]
+    const int32_t* __restrict__ plan_miss_tok,  // [n, topk]
+    const int32_t* __restrict__ plan_miss_slot, // [n, topk]
+    const int32_t* __restrict__ plan_miss_count,// [n]
+    const int32_t* __restrict__ plan_miss_home, // [n, topk] (0=host, 1=gpu)
+    int target_home,                            // gather only misses with this home
+    const int32_t* __restrict__ cache_locs,     // this home's [R, cache_stride] table
+    int cache_stride,
+    int64_t item_size_bytes, int hot_slots, int cold_depth, int topk)
+{
+    const int q = blockIdx.x;
+    const int m = plan_miss_count[q];
+    if (m <= 0) return;
+    const int r = req_slots[q];
+    const int32_t* tok_q  = plan_miss_tok + (int64_t)q * topk;
+    const int32_t* slot_q = plan_miss_slot + (int64_t)q * topk;
+    const int32_t* home_q = plan_miss_home + (int64_t)q * topk;
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    for (int i = warp_id; i < m; i += warps_per_block) {
+        if (home_q[i] != target_home) continue;  // other home's gather pass owns it
+        const int tok = tok_q[i];
+        const int v   = slot_q[i];
+        if (tok < 0 || tok >= cold_depth || v < 0 || v >= hot_slots) continue;
+        const int64_t cold_row =
+            cold_row_of(cache_locs, cache_stride, r, cold_depth, tok);
+        if (cold_row < 0) continue;  // unbacked in this home: nothing to gather
+        const int64_t src = cold_row * item_size_bytes;
+        const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
+        transfer_item_warp(lane_id, base_ptr + src, hot_buffer + dst,
+                           item_size_bytes);
+    }
+}
+
 // Backup a shared-index layer's freshly generated token into the hot slot the
 // anchor already assigned to it (token_to_slot is the ANCHOR's table). Data
 // only: no LRU/recency writes, so the group's shared slot table is untouched.
 // One block per decode query token.
 __global__ void sparsekv_backup_into_assigned_kernel(
     char* __restrict__ cold_pool,          // device-mapped host cold pool, layer
+    char* __restrict__ gpu_cold_pool,      // GPU cold tier pool, this layer or nullptr
     char* __restrict__ hot_buffer,         // GPU hot buffer, this layer
     const char* __restrict__ layer_kv,     // GPU layer KV cache (flat rows)
     const int32_t* __restrict__ src_slots, // [n] physical row in layer_kv
@@ -388,6 +474,8 @@ __global__ void sparsekv_backup_into_assigned_kernel(
     const int32_t* __restrict__ token_to_slot, // [R, cold_depth] (anchor's)
     const int32_t* __restrict__ host_cache_locs,  // [R, host_stride] or nullptr
     int host_stride,
+    const int32_t* __restrict__ gpu_cache_locs,   // [R, gpu_stride] or nullptr
+    int gpu_stride,
     int64_t item_size_bytes, int hot_slots, int cold_depth)
 {
     const int q = blockIdx.x;
@@ -400,13 +488,25 @@ __global__ void sparsekv_backup_into_assigned_kernel(
 
     const int lane_id = threadIdx.x % WARP_SIZE;
     if (threadIdx.x < WARP_SIZE) {
-        const int64_t cold_row =
-            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
-        if (cold_row >= 0) {  // pos is normally backed; guard against a fault
-            const int64_t kv_off   = (int64_t)src * item_size_bytes;
-            const int64_t cold_off = cold_row * item_size_bytes;
-            transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+        // Write this layer's KV to the token's home tier (same home the anchor's
+        // grow_cold_for_new_token chose): gpu-home -> GPU cold tier, else host.
+        const int64_t kv_off = (int64_t)src * item_size_bytes;
+        int64_t gpu_row = -1;
+        if (gpu_cold_pool && gpu_cache_locs) {
+            gpu_row = (int64_t)gpu_cache_locs[(int64_t)r * gpu_stride + pos];
+        }
+        if (gpu_row >= 0) {
+            const int64_t cold_off = gpu_row * item_size_bytes;
+            transfer_item_warp(lane_id, layer_kv + kv_off, gpu_cold_pool + cold_off,
                                item_size_bytes);
+        } else {
+            const int64_t cold_row =
+                cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
+            if (cold_row >= 0) {  // pos is normally backed; guard against a fault
+                const int64_t cold_off = cold_row * item_size_bytes;
+                transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                                   item_size_bytes);
+            }
         }
     } else if (threadIdx.x < 2 * WARP_SIZE) {
         const int64_t kv_off  = (int64_t)src * item_size_bytes;
@@ -477,6 +577,8 @@ void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr, at::Tensor hot_buffe
                                  at::Tensor last_used, at::Tensor token_to_slot,
                                  at::Tensor recency, at::Tensor out_translated,
                                  at::Tensor host_cache_locs, int64_t host_stride,
+                                 at::Tensor gpu_cache_locs, int64_t gpu_stride,
+                                 int64_t skip_gather,
                                  int64_t item_size_bytes, int64_t hot_slots,
                                  int64_t cold_depth, int64_t topk)
 {
@@ -484,6 +586,12 @@ void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr, at::Tensor hot_buffe
     if (n == 0) return;
     TORCH_CHECK(item_size_bytes % 8 == 0,
                 "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    // The non-record entry point records no plan, so skipping the inline gather
+    // would leave the assigned slots unfilled with nothing to replay them. Dual-
+    // source callers must use sparsekv_swap_and_translate_record instead.
+    TORCH_CHECK(skip_gather == 0,
+                "sparsekv_swap_and_translate cannot skip_gather (no plan recorded "
+                "to replay); use sparsekv_swap_and_translate_record for dual-source");
     TORCH_CHECK(hot_buffer.is_cuda() && topk_logical.is_cuda() &&
                     indptr.is_cuda() && req_slots.is_cuda() &&
                     slot_token.is_cuda() && last_used.is_cuda() &&
@@ -497,6 +605,7 @@ void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr, at::Tensor hot_buffe
     char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
     const char* cold = reinterpret_cast<const char*>(cold_pool_dev_ptr);
     const int32_t* hcl = sparsekv_host_cache_locs_ptr(host_cache_locs, host_stride);
+    const int32_t* gcl = sparsekv_host_cache_locs_ptr(gpu_cache_locs, gpu_stride);
     const size_t shmem = (size_t)(2 * topk) * sizeof(int);
     hipStream_t stream = at::hip::getCurrentHIPStream();
     sparsekv_swap_and_translate_kernel<<<dim3(n), dim3(BLOCK), shmem, stream>>>(
@@ -504,7 +613,8 @@ void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr, at::Tensor hot_buffe
         req_slots.data_ptr<int32_t>(), slot_token.data_ptr<int32_t>(),
         last_used.data_ptr<int64_t>(), token_to_slot.data_ptr<int32_t>(),
         recency.data_ptr<int64_t>(), out_translated.data_ptr<int32_t>(),
-        nullptr, nullptr, nullptr, 0, hcl, (int)host_stride,
+        nullptr, nullptr, nullptr, nullptr, 0, hcl, (int)host_stride,
+        gcl, (int)gpu_stride, (int)skip_gather,
         item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
 }
 
@@ -513,7 +623,9 @@ void sparsekv_swap_and_translate_record(
     at::Tensor indptr, at::Tensor req_slots, at::Tensor slot_token,
     at::Tensor last_used, at::Tensor token_to_slot, at::Tensor recency,
     at::Tensor out_translated, at::Tensor plan_miss_tok, at::Tensor plan_miss_slot,
-    at::Tensor plan_miss_count, at::Tensor host_cache_locs, int64_t host_stride,
+    at::Tensor plan_miss_count, at::Tensor plan_miss_home,
+    at::Tensor host_cache_locs, int64_t host_stride,
+    at::Tensor gpu_cache_locs, int64_t gpu_stride, int64_t skip_gather,
     int64_t item_size_bytes, int64_t hot_slots,
     int64_t cold_depth, int64_t topk)
 {
@@ -526,7 +638,8 @@ void sparsekv_swap_and_translate_record(
                     slot_token.is_cuda() && last_used.is_cuda() &&
                     token_to_slot.is_cuda() && recency.is_cuda() &&
                     out_translated.is_cuda() && plan_miss_tok.is_cuda() &&
-                    plan_miss_slot.is_cuda() && plan_miss_count.is_cuda(),
+                    plan_miss_slot.is_cuda() && plan_miss_count.is_cuda() &&
+                    plan_miss_home.is_cuda(),
                 "all sparsekv_swap_and_translate_record tensors must be CUDA");
     TORCH_CHECK(last_used.scalar_type() == at::kLong &&
                     recency.scalar_type() == at::kLong,
@@ -535,6 +648,7 @@ void sparsekv_swap_and_translate_record(
     char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
     const char* cold = reinterpret_cast<const char*>(cold_pool_dev_ptr);
     const int32_t* hcl = sparsekv_host_cache_locs_ptr(host_cache_locs, host_stride);
+    const int32_t* gcl = sparsekv_host_cache_locs_ptr(gpu_cache_locs, gpu_stride);
     const size_t shmem = (size_t)(2 * topk) * sizeof(int);
     hipStream_t stream = at::hip::getCurrentHIPStream();
     sparsekv_swap_and_translate_kernel<<<dim3(n), dim3(BLOCK), shmem, stream>>>(
@@ -543,7 +657,8 @@ void sparsekv_swap_and_translate_record(
         last_used.data_ptr<int64_t>(), token_to_slot.data_ptr<int32_t>(),
         recency.data_ptr<int64_t>(), out_translated.data_ptr<int32_t>(),
         plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
-        plan_miss_count.data_ptr<int32_t>(), 1, hcl, (int)host_stride,
+        plan_miss_count.data_ptr<int32_t>(), plan_miss_home.data_ptr<int32_t>(),
+        1, hcl, (int)host_stride, gcl, (int)gpu_stride, (int)skip_gather,
         item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
 }
 
@@ -579,11 +694,48 @@ void sparsekv_copy_planned(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
         item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
 }
 
-void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+void sparsekv_gather_planned(int64_t base_dev_ptr, at::Tensor hot_buffer,
+                             at::Tensor req_slots, at::Tensor plan_miss_tok,
+                             at::Tensor plan_miss_slot, at::Tensor plan_miss_count,
+                             at::Tensor plan_miss_home, int64_t target_home,
+                             at::Tensor cache_locs, int64_t cache_stride,
+                             int64_t item_size_bytes, int64_t hot_slots,
+                             int64_t cold_depth, int64_t topk)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && req_slots.is_cuda() &&
+                    plan_miss_tok.is_cuda() && plan_miss_slot.is_cuda() &&
+                    plan_miss_count.is_cuda() && plan_miss_home.is_cuda(),
+                "all sparsekv_gather_planned tensors must be CUDA");
+    TORCH_CHECK(req_slots.scalar_type() == at::kInt &&
+                    plan_miss_tok.scalar_type() == at::kInt &&
+                    plan_miss_slot.scalar_type() == at::kInt &&
+                    plan_miss_count.scalar_type() == at::kInt &&
+                    plan_miss_home.scalar_type() == at::kInt,
+                "sparsekv_gather_planned req_slots/plan tensors must be int32");
+
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* base = reinterpret_cast<const char*>(base_dev_ptr);
+    const int32_t* cl = sparsekv_host_cache_locs_ptr(cache_locs, cache_stride);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    sparsekv_gather_planned_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
+        base, hot, req_slots.data_ptr<int32_t>(),
+        plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
+        plan_miss_count.data_ptr<int32_t>(), plan_miss_home.data_ptr<int32_t>(),
+        (int)target_home, cl, (int)cache_stride,
+        item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
+}
+
+void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr,
+                                   int64_t gpu_cold_pool_ptr, at::Tensor hot_buffer,
                                    at::Tensor layer_kv, at::Tensor src_slots,
                                    at::Tensor req_slots, at::Tensor logical_pos,
                                    at::Tensor token_to_slot,
                                    at::Tensor host_cache_locs, int64_t host_stride,
+                                   at::Tensor gpu_cache_locs, int64_t gpu_stride,
                                    int64_t item_size_bytes,
                                    int64_t hot_slots, int64_t cold_depth)
 {
@@ -600,23 +752,28 @@ void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr, at::Tensor hot_buf
                     token_to_slot.scalar_type() == at::kInt,
                 "sparsekv_backup_into_assigned int32 index tensors required");
     char* cold = reinterpret_cast<char*>(cold_pool_dev_ptr);
+    char* gpu_cold = reinterpret_cast<char*>(gpu_cold_pool_ptr);
     char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
     const char* kv = reinterpret_cast<const char*>(layer_kv.data_ptr());
     const int32_t* hcl = sparsekv_host_cache_locs_ptr(host_cache_locs, host_stride);
+    const int32_t* gcl = sparsekv_host_cache_locs_ptr(gpu_cache_locs, gpu_stride);
     hipStream_t stream = at::hip::getCurrentHIPStream();
     sparsekv_backup_into_assigned_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
-        cold, hot, kv, src_slots.data_ptr<int32_t>(),
+        cold, gpu_cold, hot, kv, src_slots.data_ptr<int32_t>(),
         req_slots.data_ptr<int32_t>(), logical_pos.data_ptr<int32_t>(),
         token_to_slot.data_ptr<int32_t>(), hcl, (int)host_stride,
+        gcl, (int)gpu_stride,
         item_size_bytes, (int)hot_slots, (int)cold_depth);
 }
 
-void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr, int64_t gpu_cold_pool_ptr,
+                               at::Tensor hot_buffer,
                                at::Tensor layer_kv, at::Tensor src_slots,
                                at::Tensor req_slots, at::Tensor logical_pos,
                                at::Tensor slot_token, at::Tensor last_used,
                                at::Tensor token_to_slot, at::Tensor recency,
                                at::Tensor host_cache_locs, int64_t host_stride,
+                               at::Tensor gpu_cache_locs, int64_t gpu_stride,
                                int64_t item_size_bytes, int64_t hot_slots,
                                int64_t cold_depth)
 {
@@ -627,15 +784,17 @@ void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
     TORCH_CHECK(hot_buffer.is_cuda() && layer_kv.is_cuda(),
                 "hot_buffer/layer_kv must be CUDA");
     char* cold = reinterpret_cast<char*>(cold_pool_dev_ptr);
+    char* gpu_cold = reinterpret_cast<char*>(gpu_cold_pool_ptr);
     char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
     const char* kv = reinterpret_cast<const char*>(layer_kv.data_ptr());
     const int32_t* hcl = sparsekv_host_cache_locs_ptr(host_cache_locs, host_stride);
+    const int32_t* gcl = sparsekv_host_cache_locs_ptr(gpu_cache_locs, gpu_stride);
     hipStream_t stream = at::hip::getCurrentHIPStream();
     sparsekv_backup_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
-        cold, hot, kv, src_slots.data_ptr<int32_t>(),
+        cold, gpu_cold, hot, kv, src_slots.data_ptr<int32_t>(),
         req_slots.data_ptr<int32_t>(), logical_pos.data_ptr<int32_t>(),
         slot_token.data_ptr<int32_t>(), last_used.data_ptr<int64_t>(),
         token_to_slot.data_ptr<int32_t>(), recency.data_ptr<int64_t>(),
-        hcl, (int)host_stride,
+        hcl, (int)host_stride, gcl, (int)gpu_stride,
         item_size_bytes, (int)hot_slots, (int)cold_depth);
 }
