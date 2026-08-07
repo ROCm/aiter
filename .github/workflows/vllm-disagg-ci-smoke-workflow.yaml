@@ -143,21 +143,15 @@ jobs:
           fetch-depth: 1
           path: vllm
 
-      - name: Apply vLLM PR 47030
+      - name: Apply full vLLM PR 47030 patch series
         working-directory: vllm
         run: |
           set -euo pipefail
-          git fetch --depth=2 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
-          pr_sha="$(git rev-parse FETCH_HEAD)"
           git config user.name "AITER CI"
           git config user.email "aiter-ci@users.noreply.github.com"
-          if ! git cherry-pick "${pr_sha}"; then
-            if git diff --quiet && git diff --cached --quiet; then
-              git cherry-pick --skip
-            else
-              exit 1
-            fi
-          fi
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
+            git am -3
 
       - name: Select vLLM-router cases
         id: select
@@ -309,7 +303,7 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM main and apply PR 47030
+      - name: Checkout vLLM main and apply full PR 47030 patch series
         run: |
           set -euo pipefail
           rm -rf vllm
@@ -320,21 +314,13 @@ jobs:
           git checkout --detach FETCH_HEAD
           base_sha="$(git rev-parse HEAD)"
 
-          # Fetch the PR commit and its parent so cherry-pick computes the PR
-          # patch instead of treating the shallow commit as a root commit.
-          git fetch --depth=2 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
+          git fetch --depth=1 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
           pr_sha="$(git rev-parse FETCH_HEAD)"
           git config user.name "AITER CI"
           git config user.email "aiter-ci@users.noreply.github.com"
-          if ! git cherry-pick "${pr_sha}"; then
-            if git diff --quiet && git diff --cached --quiet; then
-              echo "vLLM PR #${VLLM_DI_PR_NUMBER} is already present on ${VLLM_BRANCH}"
-              git cherry-pick --skip
-            else
-              echo "Failed to apply vLLM PR #${VLLM_DI_PR_NUMBER} to ${VLLM_BRANCH}" >&2
-              exit 1
-            fi
-          fi
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
+            git am -3
 
           echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
           echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
