@@ -1,6 +1,9 @@
 name: vLLM disagg CI smoke workflow
 
 on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
   schedule:
     # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
     - cron: '30 18 * * *'
@@ -54,6 +57,11 @@ env:
 jobs:
   build_aiter_wheel:
     name: Build Aiter wheel
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: build-only-aiter
     steps:
       - name: Checkout AITER
@@ -66,6 +74,7 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
@@ -119,6 +128,11 @@ jobs:
 
   vllm-disagg-smoke:
     needs: build_aiter_wheel
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
     timeout-minutes: 600
     env:
