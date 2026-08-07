@@ -3,9 +3,11 @@
 
 """FlyDSL AttnRes prefill kernel for Kimi-K3.
 
-Each workgroup owns one contiguous BF16 token row at D=7168. It reads up to
-eight block sources plus the live prefix, scores sources with RMS-normalized
-keys, and mixes raw values with an online softmax accumulator.
+Each workgroup owns one BF16 token row at D=7168. Inputs may be contiguous or
+have padded leading dimensions when their trailing stride is one and their row
+starts are 16-byte aligned. The kernel reads up to eight block sources plus the
+live prefix, scores sources with RMS-normalized keys, and mixes raw values with
+an online softmax accumulator.
 
 Delta update, canonical append snapshot, and output RMSNorm are independent
 compile-time specializations. ``block_write_idx=-1`` disables the snapshot;
@@ -55,9 +57,7 @@ def _build_attn_res(
             f"only hidden_size={_HIDDEN_SIZE} is supported, got {hidden_size}"
         )
     if not 0 <= num_blocks <= _MAX_BLOCKS:
-        raise ValueError(
-            f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}"
-        )
+        raise ValueError(f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
     if not -1 <= block_write_idx < _MAX_BLOCKS:
         raise ValueError(
             f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
@@ -225,9 +225,9 @@ def _build_attn_res(
             prefix_value = load_bf16_vec(prefix_div, vector_index)
             if const_expr(has_delta):
                 delta_value = load_bf16_vec(delta_div, vector_index).to(fx.Float32)
-                prefix_value = (
-                    prefix_value.to(fx.Float32) + delta_value
-                ).to(fx.BFloat16)
+                prefix_value = (prefix_value.to(fx.Float32) + delta_value).to(
+                    fx.BFloat16
+                )
                 store_bf16_vec(prefix_value, prefix_div, vector_index)
             prefix_local.append(prefix_value)
 
@@ -305,8 +305,7 @@ def _build_attn_res(
                 ).reduce(ReductionOp.ADD, fastmath=fm_fast)
             sumsq = block_reduce_add(thread_sumsq)
             scale = fmath.rsqrt(
-                sumsq * inv_hidden_size
-                + output_norm_eps * denominator * denominator,
+                sumsq * inv_hidden_size + output_norm_eps * denominator * denominator,
                 fastmath=fm_fast,
             )
 
@@ -316,12 +315,10 @@ def _build_attn_res(
             )
             for tile in range_constexpr(tiles_per_thread):
                 vector_index = tid + tile * _BLOCK_THREADS
-                output_gamma = load_bf16_vec(
-                    output_norm_weight_div, vector_index
-                ).to(fx.Float32)
-                result = (
-                    mixed_local[tile] * scale * output_gamma
-                ).to(fx.BFloat16)
+                output_gamma = load_bf16_vec(output_norm_weight_div, vector_index).to(
+                    fx.Float32
+                )
+                result = (mixed_local[tile] * scale * output_gamma).to(fx.BFloat16)
                 store_bf16_vec(result, out_div, vector_index)
         else:
             inverse_denominator = 1.0 / denominator
@@ -359,6 +356,30 @@ def _build_attn_res(
     return launch_attn_res
 
 
+def _check_row_layout(tensor: torch.Tensor, name: str) -> None:
+    """Validate a vector-copy-compatible layout for a multi-dimensional tensor."""
+    if tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must have unit trailing stride, got strides {tensor.stride()}"
+        )
+
+    for dim in range(tensor.ndim - 1):
+        stride = tensor.stride(dim)
+        if stride <= 0 or stride % _VEC_WIDTH:
+            raise ValueError(
+                f"{name}.stride({dim})={stride} must be a positive multiple of "
+                f"{_VEC_WIDTH} so every row start is "
+                f"{_VEC_WIDTH * 2}-byte aligned for BufferCopy128b"
+            )
+
+    alignment_bytes = _VEC_WIDTH * tensor.element_size()
+    if tensor.data_ptr() % alignment_bytes:
+        raise ValueError(
+            f"{name} base pointer must be {alignment_bytes}-byte aligned for "
+            "BufferCopy128b"
+        )
+
+
 def flydsl_attn_res(
     prefix: torch.Tensor,
     delta: torch.Tensor | None,
@@ -372,7 +393,7 @@ def flydsl_attn_res(
     output_norm_eps: float,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Run a contiguous BF16 prefill AttnRes specialization.
+    """Run a BF16 prefill AttnRes specialization on contiguous or padded rows.
 
     ``delta`` and ``output_norm_weight`` independently enable the in-place
     prefix update and output RMSNorm. ``block_write_idx=-1`` disables snapshots;
@@ -380,13 +401,15 @@ def flydsl_attn_res(
     (post-delta when present) in ``blocks[:, block_write_idx]``. Non-canonical
     in-range write indices raise ``NotImplementedError``. Out-of-range
     ``block_write_idx`` or ``num_blocks`` values raise ``ValueError``.
+
+    Multi-dimensional inputs must have unit trailing stride, positive leading
+    strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
+    pointer for ``BufferCopy128b``. Weight vectors must have ``stride(0) == 1``.
     """
     has_delta = delta is not None
     apply_output_norm = output_norm_weight is not None
     if not 0 <= num_blocks <= _MAX_BLOCKS:
-        raise ValueError(
-            f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}"
-        )
+        raise ValueError(f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
     if not -1 <= block_write_idx < _MAX_BLOCKS:
         raise ValueError(
             f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
@@ -435,11 +458,27 @@ def flydsl_attn_res(
     if any(t.device != prefix.device for t in tensors):
         raise ValueError("all tensors must be on prefix.device")
     if any(t.dtype != torch.bfloat16 for t in tensors):
-        raise TypeError("only contiguous BF16 inputs are supported")
+        raise TypeError("only BF16 inputs are supported")
     if not all(t.is_cuda for t in tensors):
         raise ValueError("all tensors must be CUDA tensors")
-    if not all(t.is_contiguous() for t in tensors):
-        raise ValueError("Currently supports contiguous tensors only")
+
+    _check_row_layout(prefix, "prefix")
+    _check_row_layout(blocks, "blocks")
+    if has_delta:
+        _check_row_layout(delta, "delta")
+    for tensor, name in (
+        (norm_weight, "norm_weight"),
+        (qk_weight, "qk_weight"),
+    ):
+        if tensor.stride(0) != 1:
+            raise ValueError(
+                f"{name}.stride(0) must be 1, got strides {tensor.stride()}"
+            )
+    if apply_output_norm and output_norm_weight.stride(0) != 1:
+        raise ValueError(
+            "output_norm_weight.stride(0) must be 1, got strides "
+            f"{output_norm_weight.stride()}"
+        )
 
     out = torch.empty(prefix.shape, device=prefix.device, dtype=prefix.dtype)
     if prefix.shape[0] == 0:
@@ -448,9 +487,7 @@ def flydsl_attn_res(
     if stream is None:
         stream = torch.cuda.current_stream(prefix.device)
     delta_arg = delta if has_delta else prefix
-    output_norm_weight_arg = (
-        output_norm_weight if apply_output_norm else norm_weight
-    )
+    output_norm_weight_arg = output_norm_weight if apply_output_norm else norm_weight
     launcher = _build_attn_res(
         prefix.shape[1],
         num_blocks,
