@@ -327,6 +327,24 @@ def _f4f4_v_kperm(device):
     return kp
 
 
+FP4_V_TILE_TOKENS = 128
+FP4_V_PACKED_BYTES_PER_TOKEN = 64
+FP4_V_BUFFER_SLACK_BYTES = 64
+
+
+def fp4_v_padded_sequence(sequence):
+    """Round a V sequence length up to the 128-token FP4 packing tile."""
+    return ((sequence + FP4_V_TILE_TOKENS - 1) // FP4_V_TILE_TOKENS) * FP4_V_TILE_TOKENS
+
+
+def fp4_v_raw_buffer_size(batch, sequence, heads):
+    """Return bytes for the packed FP4 V backing buffer, including view slack."""
+    return (
+        batch * fp4_v_padded_sequence(sequence) * heads * FP4_V_PACKED_BYTES_PER_TOKEN
+        + FP4_V_BUFFER_SLACK_BYTES
+    )
+
+
 def sage_quant_v_f4f4(v, layout="bshd"):
     """Pack per-channel FP4 V into the F4F4 kernel's col-major LDS layout."""
     if layout == "bshd":
@@ -338,7 +356,7 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
-    tile = 128
+    tile = FP4_V_TILE_TOKENS
     assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
     assert kv_len % tile == 0, (
         f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
@@ -347,7 +365,11 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     amax = v_tok.abs().amax(dim=-2).to(torch.float32)
     v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
     kperm = _f4f4_v_kperm(v.device)
-    packed = torch.empty((b, h_kv, nT * 8192), dtype=torch.uint8, device=v.device)
+    packed = torch.empty(
+        (b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN),
+        dtype=torch.uint8,
+        device=v.device,
+    )
     sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
         v_tok,
         packed,
@@ -365,11 +387,18 @@ def sage_quant_v_f4f4(v, layout="bshd"):
         nT,
         kv_len,
     )
-    buf = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
+    buf = torch.cat(
+        [packed.reshape(-1), packed.new_zeros(FP4_V_BUFFER_SLACK_BYTES)]
+    )
     v_fp4_view = torch.as_strided(
         buf,
         (b, kv_len, h_kv, 128),
-        (h_kv * kv_len * 64, 64, kv_len * 64, 1),
+        (
+            h_kv * kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            FP4_V_PACKED_BYTES_PER_TOKEN,
+            kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            1,
+        ),
     )
     return v_fp4_view, v_descale
 
