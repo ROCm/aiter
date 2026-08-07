@@ -691,6 +691,8 @@ def _fused_moe_impl(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    if gate_mode == GateMode.SEPARATED and getattr(w1, "is_guinterleave", False):
+        gate_mode = GateMode.INTERLEAVE
 
     global_E = E
     if expert_mask is not None:
@@ -1361,6 +1363,7 @@ def _flydsl_stage1_wrapper(
     situ_linear_beta: float = 1.0,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    zero_out=None,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
     **_kwargs,
@@ -1413,6 +1416,7 @@ def _flydsl_stage1_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
+        zero_out=zero_out,
         v2_output_layout=v2_output_layout,
     )
 
@@ -1435,6 +1439,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    klane_inner=False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1483,6 +1488,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        klane_inner=klane_inner,
     )
 
 
@@ -2076,7 +2082,11 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
         if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
+            df = df[df["_tag"].fillna("") == ""]
+        for col in ("topk", "expert", "cu_num"):
+            if col in df.columns:
+                df = df[pd.to_numeric(df[col], errors="coerce").notna()]
+                df[col] = df[col].astype(int)
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -2898,6 +2908,10 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # fp4_bf16 INTERLEAVE: q_dtype_a is bf16 (set above). For INTERLEAVE, get_inter_dim
+    # returns inter_dim*2 (physical weight dim); correct it so CSV lookup uses the right shape.
+    if gate_mode == GateMode.INTERLEAVE and w1.dtype == dtypes.fp4x2:
+        inter_dim = w1.shape[1] // 2
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -2967,6 +2981,15 @@ def fused_moe_2stages(
                 sorted_weights=sorted_weights,
             )
 
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+    ):
+        # fp4_bf16 SEPARATED/INTERLEAVE: MXFP4 weights, bf16 activations; no activation quant
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
         a1 = hidden_states.to(dtype)
@@ -3027,6 +3050,18 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    stage1_kernel_name = getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
+    stage1_kernel_params = (
+        aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(stage1_kernel_name)
+        if stage1_func is _flydsl_stage1_wrapper
+        else None
+    )
+    fuse_stage2_zero = bool(
+        stage1_kernel_params
+        and stage1_kernel_params.get("b_dtype") == "fp4bf16"
+        and not metadata.fuse_quant
+        and int(os.environ.get("AITER_FLYDSL_FUSE_STAGE2_ZERO", "1"))
+    )
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -3036,6 +3071,8 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+        if fuse_stage2_zero:
+            extra_stage1_args["zero_out"] = moe_out
     if stage1_func is _flydsl_stage1_wrapper:
         if stage2_func is _flydsl_v2_stage2_wrapper:
             extra_stage1_args["v2_output_layout"] = True
@@ -3150,6 +3187,14 @@ def fused_moe_2stages(
         else:
             a2 = a2.to(dtypes.fp8)
             a2_scale = a1_scale
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+    ):
+        # fp4_bf16 SEPARATED/INTERLEAVE: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
@@ -3184,6 +3229,19 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
+
+    # fp4bf16 stage2 uses buffer_atomic_pk_add_bf16 and expects a zeroed output
+    # buffer. moe_out comes from moe_sorting (torch.empty, uninitialized), so
+    # zero it here. Only needed for fp4bf16; other dtypes handle zeroing
+    # themselves or don't require it.
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if (
+        stage2_func is _flydsl_stage2_wrapper
+        and not fuse_stage2_zero
+        and stage1_kernel_params
+        and stage1_kernel_params.get("b_dtype") == "fp4bf16"
+    ):
+        moe_out.zero_()
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
     _stage2_call = functools.partial(

@@ -520,6 +520,77 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> dict[str, dict]:
+    """Return {kernelName: params} for all supported fp4_bf16 (MXFP4) stage1 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "fp4bf16"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    k_batches = [1, 2, 3, 4, 6, 7, 14]
+
+    for gate_mode in ("interleave",):
+        for tm in tile_ms:
+            for tn in tile_ns:
+                for tk in tile_ks:
+                    for kb in k_batches:
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                        )
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        name += "_gui"
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "in_dtype": "fp4_bf16",
+                            "k_batch": kb,
+                            "gate_mode": gate_mode,
+                        }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp4_bf16(out_dtype: str) -> dict[str, dict]:
+    """Return {kernelName: params} for all supported fp4_bf16 (MXFP4 SEPARATED) stage2 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "fp4bf16"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp4_bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {**base_params, "persist": True}
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -535,6 +606,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # fp4_bf16 (MXFP4 SEPARATED) configs
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp4_bf16(out))
 
 
 _register_all_configs()
@@ -567,6 +642,8 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    swiglu_limit: float = 0.0,
+    zero_stage2_output: bool = False,
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
@@ -658,6 +735,30 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "bf16" and b_dtype == "fp4bf16":
+        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 block scales), bf16 activations.
+        # INTERLEAVE gate mode (gate/up interleaved along N axis).
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp4_bf16",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            k_batch=k_batch,
+            gate_mode=gate_mode,
+            swiglu_limit=swiglu_limit,
+            act=act,
+            zero_stage2_output=zero_stage2_output,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -687,6 +788,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    klane_inner: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
@@ -764,6 +866,24 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             scale_is_bf16=True,
         )
+    elif a_dtype == "bf16" and b_dtype == "fp4bf16":
+        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 block scales), bf16 activations, SEPARATED gate/up
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp4_bf16",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            klane_inner=klane_inner,
+        )
     else:
         raise ValueError(
             f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -817,6 +937,8 @@ def _s1_args_fp4(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    stage2_out=None,
+    include_stage2_out=False,
     pass_swiglu_limit: bool = True,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
@@ -840,6 +962,8 @@ def _s1_args_fp4(
         k_in,
         size_expert_ids_in,
     )
+    if include_stage2_out:
+        args = (args[0], ptr_arg(stage2_out), *args[1:])
     if pass_swiglu_limit:
         return args + (float(swiglu_limit), stream)
     return args + (stream,)
@@ -860,10 +984,12 @@ def _s1_args_std(
     k_in,
     size_expert_ids_in,
     stream=None,
+    stage2_out=None,
+    include_stage2_out=False,
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
-    return (
+    args = (
         ptr_arg(out),
         ptr_arg(a),
         ptr_arg(w),
@@ -879,6 +1005,9 @@ def _s1_args_std(
         size_expert_ids_in,
         stream,
     )
+    if include_stage2_out:
+        return (args[0], ptr_arg(stage2_out), *args[1:])
+    return args
 
 
 def _s2_args_fp4(
@@ -1404,6 +1533,7 @@ def _flydsl_moe_stage1_impl(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    zero_out: torch.Tensor | None = None,
     v2_output_layout: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
@@ -1460,7 +1590,7 @@ def _flydsl_moe_stage1_impl(
     _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
 
     dev = a.device
-    _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+    _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4", "fp4bf16")
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
     # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
     # or memfault). Downgrade to a divisor (128). Applies to both a16w4
@@ -1557,11 +1687,14 @@ def _flydsl_moe_stage1_impl(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
     use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
+
+    empty_zero_out = torch.empty(0, dtype=torch.uint8, device=dev)
+    stage2_out = zero_out if zero_out is not None else empty_zero_out
+    zero_stage2_output = zero_out is not None
 
     if use_mx_gemm:
         args = _build_mx_args(
@@ -1586,6 +1719,8 @@ def _flydsl_moe_stage1_impl(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
+            stage2_out=stage2_out.view(-1),
+            include_stage2_out=False,
             pass_swiglu_limit=not _is_a16w4,
         )
     else:
@@ -1603,6 +1738,8 @@ def _flydsl_moe_stage1_impl(
             _n_in,
             _k_in,
             _grid_y,
+            stage2_out=stage2_out.view(-1),
+            include_stage2_out=True,
         )
 
     compile_kwargs = {
@@ -1632,6 +1769,8 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        "swiglu_limit": _swiglu_limit_val,
+        "zero_stage2_output": zero_stage2_output,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
@@ -1813,6 +1952,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    zero_out: torch.Tensor | None = None,
     v2_output_layout: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
@@ -1870,6 +2010,7 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        zero_out=zero_out,
         v2_output_layout=v2_output_layout,
     )
 
@@ -1906,6 +2047,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    klane_inner: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2077,6 +2219,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        klane_inner=klane_inner,
     )
     _run_compiled(exe, args)
 
@@ -2132,6 +2275,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    klane_inner: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2185,6 +2329,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        klane_inner=klane_inner,
     )
 
 

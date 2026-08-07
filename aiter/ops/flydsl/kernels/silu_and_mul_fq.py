@@ -146,12 +146,12 @@ def build_silu_and_mul_fq_module(
         scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
         tid_rsrc = _ptr_buffer_resource(sorted_ids)
         nv_rsrc = _ptr_buffer_resource(num_valid_ids)
-        if enable_bias:
+        if const_expr(enable_bias):
             topk_rsrc = _ptr_buffer_resource(topk_ids)
             bias_rsrc = _ptr_buffer_resource(bias)
 
-            def _load_bias_scalar(offset):
-                return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
+        def _load_bias_scalar(offset):
+            return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
 
         num_valid = fx.Int32(
             buffer_ops.buffer_load(nv_rsrc, 0, vec_width=1, dtype=T.i32)
@@ -179,8 +179,6 @@ def build_silu_and_mul_fq_module(
                 if is_valid:
                     in_row = token_id * topk + slot_id
                     if enable_bias:
-                        # sorted_ids encodes token and slot, not expert. Use topk_ids
-                        # to recover the expert-specific bias row for this token slot.
                         expert_id = fx.Int32(
                             buffer_ops.buffer_load(
                                 topk_rsrc, in_row, vec_width=1, dtype=T.i32
