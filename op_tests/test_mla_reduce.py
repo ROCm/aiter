@@ -273,7 +273,12 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
         atol=2e-2,
         msg=f"[{tag}] lse    ",
     )
-    ok = (err_out == 0) and (err_lse == 0)
+    finite = (
+        torch.isfinite(gpu_out).all().item() and torch.isfinite(gpu_lse).all().item()
+    )
+    if not finite:
+        print(f"FAIL  [{tag}] non-finite kernel output")
+    ok = finite and (err_out == 0) and (err_lse == 0)
     print(f"{'PASS' if ok else 'FAIL'}  {tag}  {us:>8.2f} us")
 
     # Bytes moved by the reduce: read all partial outputs + partial lses +
@@ -331,7 +336,8 @@ def main():
 
     # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
     heads_for_dim = {
-        128: [1, 16, 128],
+        # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
+        128: [1, 16, 96, 128],
         512: [8, 16, 128],
     }
 
@@ -346,9 +352,7 @@ def main():
         [33],  # massive, single large tile
         [300],  # massive, exercises the >4*wave_size LDS-spill bucket
         [2, 4, 16, 64],  # mixed: simple + massive tiles
-    ] + [
-        [6] * 40
-    ]  # many tiles -> exercises persistent-grid path
+    ] + [[6] * 40]  # many tiles -> exercises persistent-grid path
 
     all_ok = True
     df = []
