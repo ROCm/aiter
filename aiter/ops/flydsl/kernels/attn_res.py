@@ -355,7 +355,7 @@ def _build_attn_res(
         output_norm_weight: fx.Tensor,
         out: fx.Tensor,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         attn_res_kernel(
             prefix,
