@@ -176,6 +176,49 @@ def run_hip(
     return output, residual_out, scale, None
 
 
+def test_i8_group_quant_rounds_to_nearest():
+    group_size = 64
+    target_ratios = torch.tensor(
+        [
+            -15.75,
+            -15.25,
+            -7.75,
+            -7.25,
+            -3.75,
+            -3.25,
+            -2.75,
+            -2.25,
+            -1.75,
+            -1.25,
+            -0.75,
+            -0.25,
+            0.25,
+            0.75,
+            1.25,
+            127.0,
+        ],
+        dtype=torch.float32,
+    )
+    group_weight = (target_ratios / 127.0).to(torch.bfloat16).repeat(4)
+    hidden_size = 1024
+    groups = hidden_size // group_size
+    weight = group_weight.repeat(groups)
+    input = torch.ones((1, hidden_size), dtype=torch.bfloat16)
+    output = torch.empty_like(input, dtype=torch.int8)
+    scale = torch.empty((1, groups), dtype=torch.float32)
+
+    aiter.rmsnorm_quant(output, input, scale, weight, 1e-6, group_size)
+
+    realized_weight = weight.float().reshape(groups, group_size)
+    realized_ratio = (
+        realized_weight / realized_weight.abs().amax(dim=-1, keepdim=True) * 127.0
+    )
+    expected = torch.round(realized_ratio).clamp(-127, 127).to(torch.int8)
+    assert torch.equal(
+        output.reshape_as(expected), expected
+    ), "rmsnorm_quant INT8 output must use round-to-nearest conversion"
+
+
 @benchmark()
 def test_rmsnorm(
     m,
@@ -331,6 +374,8 @@ if __name__ == "__main__":
         choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
     )
     args = parser.parse_args()
+    if args.quant_dtype == dtypes.i8:
+        test_i8_group_quant_rounds_to_nearest()
     if args.mode == 1:
         test_rmsnorm_func = partial(
             test_rmsnorm, quant_type=QuantType.No, add_residual=False
