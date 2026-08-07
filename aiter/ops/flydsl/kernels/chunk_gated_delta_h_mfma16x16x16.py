@@ -464,6 +464,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             NT = (T_local + (BT - 1)) // BT
             boh = i_n * NT
 
+        # A row past the sequence end is clamped to row 0 rather than masked:
+        # the buffer descriptors are max_size, so this clamp is what keeps the
+        # w / k / u accesses in range. The padding rows it aliases contribute
+        # nothing downstream, being zeroed by the gate.
+        def _clamp_row(row):
+            return (row < T_local).select(row, 0)
+
         # -- Global tensor views --
         # Bases stay i64 because long-context snapshot tensors can exceed 2^31
         # elements; the coordinates are per-chunk and fit in i32.
@@ -559,6 +566,14 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # -- MFMA lane mapping for 16x16 tiles --
         lane_n = lane % 16
         lane_m_base = lane // 16
+        # The k_group this lane owns within a 64-K panel; the 4 warps together
+        # cover all 16 row_blocks.
+        row_block = wid * 4 + lane_m_base
+
+        # The [V, K] state cell of v-repeat ``slot`` in 64-K block ``kb``. h0
+        # load and ht store must address the same cell, so they share this.
+        def _state_coord(kb, slot):
+            return i_v * BV + slot * 16 + lane_n, kb * 16 + row_block
 
         # One accumulator fragment per 64-K block; the per-lane element for
         # v-repeat ``nr`` is ``frag[None, None, nr]``.
@@ -570,8 +585,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
-                    h0_col = i_v * BV + (slot * 16) + lane_n
-                    h0_kgroup = kb * 16 + wid * 4 + lane_m_base
+                    h0_col, h0_kgroup = _state_coord(kb, slot)
                     loaded_vec = _load_vec(
                         cp_state_x4,
                         fx.slice(h0_view, (h0_col, h0_kgroup, None)),
@@ -595,6 +609,69 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         k_t0_pf = k_pair_col_pf * 2
         k_t1_pf = k_t0_pf + 1
 
+        # Cooperative staging of one chunk's w / k. Load and store are split so
+        # the main loop can issue the loads early (hidden behind GEMM1 / the h
+        # store) and publish to LDS only at the GEMM2 end, while the prologue
+        # runs the two back to back. ``row_base=None`` is chunk 0, where the
+        # absolute row IS the in-chunk row -- passing 0 would emit a dead add.
+        def _load_w_rows(row_base=None):
+            rows = []
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    row = batch * ROWS_PER_BATCH_64 + load_row_in_batch
+                    abs_row = row if row_base is None else row_base + row
+                    wvec = _load_vec(
+                        cp_bf16x8,
+                        fx.slice(
+                            w_view, (_clamp_row(abs_row), kb * 8 + load_vec_group, None)
+                        ),
+                        LOAD_VEC_WIDTH,
+                        fx.BFloat16,
+                    )
+                    rows.append((kb, row, wvec))
+            return rows
+
+        def _store_w_rows(rows):
+            for kb, row, wvec in rows:
+                _lds_write_x4(
+                    fx.slice(sW, (row, (None, load_col_group, kb))),
+                    wvec.shuffle(wvec, [0, 1, 2, 3]),
+                )
+                _lds_write_x4(
+                    fx.slice(sW, (row, (None, load_col_group + 1, kb))),
+                    wvec.shuffle(wvec, [4, 5, 6, 7]),
+                )
+
+        def _load_k_pairs(row_base=None):
+            t0 = k_t0_pf if row_base is None else row_base + k_t0_pf
+            t1 = k_t1_pf if row_base is None else row_base + k_t1_pf
+            safe_t0 = _clamp_row(t0)
+            safe_t1 = _clamp_row(t1)
+            pairs = []
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                k_vec_col = kb * 8 + k_vec_group_pf
+                kvec_t0 = _load_vec(
+                    cp_bf16x8,
+                    fx.slice(k_view, (safe_t0, k_vec_col, None)),
+                    LOAD_VEC_WIDTH,
+                    fx.BFloat16,
+                )
+                kvec_t1 = _load_vec(
+                    cp_bf16x8,
+                    fx.slice(k_view, (safe_t1, k_vec_col, None)),
+                    LOAD_VEC_WIDTH,
+                    fx.BFloat16,
+                )
+                pairs.append((kb, kvec_t0, kvec_t1))
+            return pairs
+
+        def _store_k_pairs(pairs):
+            for kb, kvec_t0, kvec_t1 in pairs:
+                for i in range_constexpr(LOAD_VEC_WIDTH):
+                    _k_panel_store_pair(
+                        kb, k_row_base_pf + i, k_pair_col_pf, kvec_t0[i], kvec_t1[i]
+                    )
+
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
@@ -606,55 +683,14 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # included) is also correct because the main loop then runs 0 times and
         # h0 simply passes through to ht.
         #
-        # The body is a closure so the ``if`` holds only "call + barrier": the
-        # views and copy atoms stay free variables instead of appearing inside
-        # the if, where the AST rewriter would try to carry them as scf.if
-        # state.
-        def _load_chunk0_to_lds():
-            # Chunk 0, so the absolute row is just the in-chunk row.
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = batch * ROWS_PER_BATCH_64 + load_row_in_batch
-                    safe_row = (row < T_local).select(row, 0)
-                    wvec = _load_vec(
-                        cp_bf16x8,
-                        fx.slice(w_view, (safe_row, kb * 8 + load_vec_group, None)),
-                        LOAD_VEC_WIDTH,
-                        fx.BFloat16,
-                    )
-                    _lds_write_x4(
-                        fx.slice(sW, (row, (None, load_col_group, kb))),
-                        wvec.shuffle(wvec, [0, 1, 2, 3]),
-                    )
-                    _lds_write_x4(
-                        fx.slice(sW, (row, (None, load_col_group + 1, kb))),
-                        wvec.shuffle(wvec, [4, 5, 6, 7]),
-                    )
-            k_safe_t0_prol = (k_t0_pf < T_local).select(k_t0_pf, 0)
-            k_safe_t1_prol = (k_t1_pf < T_local).select(k_t1_pf, 0)
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                k_vec_col = kb * 8 + k_vec_group_pf
-                kvec_t0 = _load_vec(
-                    cp_bf16x8,
-                    fx.slice(k_view, (k_safe_t0_prol, k_vec_col, None)),
-                    LOAD_VEC_WIDTH,
-                    fx.BFloat16,
-                )
-                kvec_t1 = _load_vec(
-                    cp_bf16x8,
-                    fx.slice(k_view, (k_safe_t1_prol, k_vec_col, None)),
-                    LOAD_VEC_WIDTH,
-                    fx.BFloat16,
-                )
-                for i in range_constexpr(LOAD_VEC_WIDTH):
-                    row_i = k_row_base_pf + i
-                    _k_panel_store_pair(
-                        kb, row_i, k_pair_col_pf, kvec_t0[i], kvec_t1[i]
-                    )
-
+        # The staging helpers are closures so the ``if`` holds only calls and a
+        # barrier: the views and copy atoms stay free variables instead of
+        # appearing inside the if, where the AST rewriter would try to carry
+        # them as scf.if state.
         has_work = NT > 0
         if has_work:
-            _load_chunk0_to_lds()
+            _store_w_rows(_load_w_rows())
+            _store_k_pairs(_load_k_pairs())
             gpu.barrier()
 
         # The accumulator fragments are the loop-carried state; scf.for wants
@@ -672,29 +708,29 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # re-wraps at its use site.
             i_t_i32 = fx.Int32(i_t)
 
+            # Absolute token row of MFMA C element ``elem_i`` for this lane:
+            # C hands lane l the rows wid*16 + (l//16)*4 + elem_i (see the
+            # mma_atom comment), and the chunk contributes i_t*BT.
+            def _bt_abs_row(elem_i):
+                return i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
+
             # Stage h_accs into (a) the h_state panels for the GEMM1 B operand
             # and (b) the [V][K] transpose buffer for the b128 HBM store.
             # split-M mapping: wid -> K sub-tile, acc_j -> V-tile.
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for acc_j in range_constexpr(N_REPEAT):
-                    acc_val = fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
+                    acc_bf16 = _f32x4_to_bf16x4(
+                        fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
+                    )
                     hp_col = acc_j * 16 + lane_n
-
-                    # This lane owns k_group (row_block = wid*4+lane_m_base) at
-                    # V-col acc_j*16+lane_n; the 4 warps together fill all 16
-                    # row_blocks.
-                    hp_row_block = wid * 4 + lane_m_base
                     _lds_write_x4(
-                        fx.slice(sH, (hp_col, (None, hp_row_block, kb))),
-                        _f32x4_to_bf16x4(acc_val),
+                        fx.slice(sH, (hp_col, (None, row_block, kb))), acc_bf16
                     )
 
                     # The sHT swizzle breaks bank conflicts on this scatter
                     # write while keeping a k_group contiguous -> one b64.
-                    ht_kg = kb * 16 + wid * 4 + lane_m_base
                     _lds_write_x4(
-                        fx.slice(sHT, (hp_col, ht_kg, None)),
-                        _f32x4_to_bf16x4(acc_val),
+                        fx.slice(sHT, (hp_col, kb * 16 + row_block, None)), acc_bf16
                     )
 
             # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
@@ -713,8 +749,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             u_prefetch = []  # N_REPEAT x 4 bf16 scalars
             for idx in range_constexpr(N_REPEAT):
                 for elem_i in range_constexpr(4):
-                    u_bt_row_raw = i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
-                    safe_u_row = (u_bt_row_raw < T_local).select(u_bt_row_raw, 0)
+                    safe_u_row = _clamp_row(_bt_abs_row(elem_i))
                     u_prefetch.append(
                         _load_vec(
                             cp_bf16,
@@ -730,7 +765,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 )
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
-                    abs_row = i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
+                    abs_row = _bt_abs_row(elem_i)
                     in_bounds = abs_row < T_local
                     safe_row = in_bounds.select(abs_row, 0)
                     g_row_pf.append(
@@ -788,24 +823,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # Prefetch the next chunk's w.
             next_i_t = i_t_i32 + 1
-            w_next_vecs = []
-            w_next_coord = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = batch * ROWS_PER_BATCH_64 + load_row_in_batch
-                    abs_row_next = next_i_t * BT + row
-                    safe_row_next = (abs_row_next < T_local).select(abs_row_next, 0)
-                    w_next_vecs.append(
-                        _load_vec(
-                            cp_bf16x8,
-                            fx.slice(
-                                w_view, (safe_row_next, kb * 8 + load_vec_group, None)
-                            ),
-                            LOAD_VEC_WIDTH,
-                            fx.BFloat16,
-                        )
-                    )
-                    w_next_coord.append((kb, row))
+            next_chunk_base = next_i_t * BT
+            w_next = _load_w_rows(next_chunk_base)
 
             # Remaining K-blocks; their MFMA hide the u/g/w_next HBM latency.
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
@@ -832,8 +851,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 # free via gate=0; here a 0/1 mask does the same.
                 mask_elems = []
                 for elem_i in range_constexpr(4):
-                    abs_row = i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
-                    in_bounds = abs_row < T_local
+                    in_bounds = _bt_abs_row(elem_i) < T_local
                     mask_elems.append(
                         in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
                     )
@@ -849,11 +867,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
                 if const_expr(SAVE_NEW_VALUE):
                     vn_bf16 = _f32x4_to_bf16x4(vn_val)
-                    bt_tile_base = wid * 16
                     for elem_i in range_constexpr(4):
-                        vn_bt_row = (
-                            i_t_i32 * BT + bt_tile_base + lane_m_base * 4 + elem_i
-                        )
+                        vn_bt_row = _bt_abs_row(elem_i)
                         if vn_bt_row < T_local:
                             bf16_v = vn_bf16[elem_i]
                             _store_vec(
@@ -868,37 +883,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 # pure 0/1 padding mask -- either way OOB rows contribute 0.
                 gated_val = vn_val * gate_vec
                 gv_col = idx * 16 + lane_n
-                gv_row_block = wid * 4 + lane_m_base
                 _lds_write_x4(
-                    fx.slice(sGV, (gv_col, (None, gv_row_block))),
+                    fx.slice(sGV, (gv_col, (None, row_block))),
                     _f32x4_to_bf16x4(gated_val),
                 )
 
             # Prefetch the next chunk's k; overlaps the barrier + h store below.
-            k_abs_t0_next = next_i_t * BT + k_t0_pf
-            k_abs_t1_next = next_i_t * BT + k_t1_pf
-            k_safe_t0_next = (k_abs_t0_next < T_local).select(k_abs_t0_next, 0)
-            k_safe_t1_next = (k_abs_t1_next < T_local).select(k_abs_t1_next, 0)
-            k_next_vecs_t0 = []
-            k_next_vecs_t1 = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                k_vec_col_pf = kb * 8 + k_vec_group_pf
-                k_next_vecs_t0.append(
-                    _load_vec(
-                        cp_bf16x8,
-                        fx.slice(k_view, (k_safe_t0_next, k_vec_col_pf, None)),
-                        LOAD_VEC_WIDTH,
-                        fx.BFloat16,
-                    )
-                )
-                k_next_vecs_t1.append(
-                    _load_vec(
-                        cp_bf16x8,
-                        fx.slice(k_view, (k_safe_t1_next, k_vec_col_pf, None)),
-                        LOAD_VEC_WIDTH,
-                        fx.BFloat16,
-                    )
-                )
+            k_next = _load_k_pairs(next_chunk_base)
 
             if const_expr(USE_G):
                 for kb in range_constexpr(NUM_K_BLOCKS):
@@ -982,28 +973,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # Publish the prefetched w_next/k_next to LDS for the next
             # iteration; the barrier ensures GEMM2 is done with the old panels.
-            has_next = next_i_t * BT < T_local
+            has_next = next_chunk_base < T_local
             if has_next:
                 gpu.barrier()
-                for pf_idx in range_constexpr(NUM_K_BLOCKS * NUM_LOAD_BATCHES_64):
-                    wvec_pf = w_next_vecs[pf_idx]
-                    kb_pf, row_pf = w_next_coord[pf_idx]
-                    _lds_write_x4(
-                        fx.slice(sW, (row_pf, (None, load_col_group, kb_pf))),
-                        wvec_pf.shuffle(wvec_pf, [0, 1, 2, 3]),
-                    )
-                    _lds_write_x4(
-                        fx.slice(sW, (row_pf, (None, load_col_group + 1, kb_pf))),
-                        wvec_pf.shuffle(wvec_pf, [4, 5, 6, 7]),
-                    )
-                for kb in range_constexpr(NUM_K_BLOCKS):
-                    kvec_t0_pf = k_next_vecs_t0[kb]
-                    kvec_t1_pf = k_next_vecs_t1[kb]
-                    for i in range_constexpr(LOAD_VEC_WIDTH):
-                        row_i = k_row_base_pf + i
-                        _k_panel_store_pair(
-                            kb, row_i, k_pair_col_pf, kvec_t0_pf[i], kvec_t1_pf[i]
-                        )
+                _store_w_rows(w_next)
+                _store_k_pairs(k_next)
 
             results = yield [
                 frag_h_accs[kb].load() for kb in range_constexpr(NUM_K_BLOCKS)
@@ -1019,8 +993,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
                     acc_val = fx.Vector(frag_h_accs[kb][None, None, slot].load())
-                    ht_col = i_v * BV + (slot * 16) + lane_n
-                    ht_kgroup = kb * 16 + wid * 4 + lane_m_base
+                    ht_col, ht_kgroup = _state_coord(kb, slot)
                     if const_expr(STATE_DTYPE_BF16):
                         out_vec = _f32x4_to_bf16x4(acc_val)
                     else:
