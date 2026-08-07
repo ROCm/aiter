@@ -1306,6 +1306,20 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
         ]
     },
+    "module_fmha_v4_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_v4_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_v4_fwd_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v4_fwd --output_dir {{}}'"
+        ]
+    },
     "module_vsa_sparse_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/vsa_sparse_attention_kernels.cu'",

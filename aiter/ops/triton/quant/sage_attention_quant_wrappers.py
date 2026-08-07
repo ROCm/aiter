@@ -398,7 +398,7 @@ def sage_quant_f4f4(
 
     Returns (q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s), where
     v_fp4_view is a strided [b, sk, h_kv, 128] uint8 view over a [b, h_kv, nT*8192]+64 B
-    backing buffer (seq stride 64). flash_attn_mxfp4_func consumes it directly -- do NOT
+    backing buffer (seq stride 64). mha_v4_packed consumes it directly -- do NOT
     call .contiguous() on it (that would drop the col-major LDS layout -> garbage). The
     kernel's V loads are bounds-checked (num_records = kv_len*64), so the last-token
     strided window is safe; the +64 B slack only keeps the torch view in storage bounds.
