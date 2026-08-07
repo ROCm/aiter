@@ -31,9 +31,7 @@ def attn_res(
     """Return the AttnRes output and post-delta prefix."""
     hidden_size = prefix.shape[-1]
     if delta is not None:
-        prefix = (prefix.to(torch.float32) + delta.to(torch.float32)).to(
-            torch.bfloat16
-        )
+        prefix = (prefix.to(torch.float32) + delta.to(torch.float32)).to(torch.bfloat16)
 
     values = torch.cat((blocks[:, :num_blocks], prefix.unsqueeze(1)), dim=1)
     keys = F.rms_norm(values, (hidden_size,), norm_weight, eps)
