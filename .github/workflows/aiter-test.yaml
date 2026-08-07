@@ -400,35 +400,35 @@ jobs:
             label: MI35X
             shard_total: 8
             shard_idx: 7
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 0
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 1
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 2
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 3
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 4
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 5
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 6
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 7
@@ -700,7 +700,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in {linux-aiter-mi35x-1,linux-aiter-oci-mi300x-1}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -723,8 +723,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-8
+            label: MI350X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -920,7 +920,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
-        timeout-minutes: 75
+        timeout-minutes: 120
         run: |
           set -ex
           docker exec \

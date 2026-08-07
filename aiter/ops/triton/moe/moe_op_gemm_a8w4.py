@@ -272,8 +272,11 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         elif n <= 3072:
             block_n = 128
             num_buffers = 2
-        else:
+        elif n <= 4096:
             block_n = 256
+            num_buffers = 1
+        else:
+            block_n = 512
             num_buffers = 1
 
     elif block_m == 32:
@@ -400,7 +403,7 @@ def moe_gemm_a8w4(
     X_SCALE_TDM = False
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
-        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        ASYNC_COPY_MIN_SCALE_WIDTH = 8
         X_SCALE_TDM = (
             mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
         )
@@ -516,6 +519,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             N_ITERS=config["persistent_iters"],
@@ -569,6 +573,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],

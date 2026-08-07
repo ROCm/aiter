@@ -53,7 +53,14 @@ def _as_index_ir_value(value):
         from flydsl.expr import arith as _arith_ext
 
         return _arith_ext.constant(value, index=True)
-    return as_ir_value(value)
+    v = as_ir_value(value)
+    # vector/memref indices must be index-typed; cast integer offsets
+    # (e.g. fx.Int64/i32) so callers can pass explicit-width offsets.
+    if isinstance(v.type, ir.IntegerType):
+        from flydsl._mlir.dialects import arith as _std_arith
+
+        v = _std_arith.IndexCastOp(ir.IndexType.get(), v).result
+    return v
 
 
 @dsl_loc_tracing

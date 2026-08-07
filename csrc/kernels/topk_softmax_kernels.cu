@@ -60,7 +60,11 @@ class alignas(Alignment) AlignedArray
 // in the softmax kernel when we extend this module to support expert-choice routing.
 template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
-    void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
+    void moeSoftmax(const DTYPE* input,
+                    const bool* finished,
+                    float* output,
+                    const int num_cols,
+                    const int input_row_stride)
 {
     using BlockReduce = hipcub::BlockReduce<float, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
@@ -68,7 +72,10 @@ __launch_bounds__(TPB) __global__
     __shared__ float normalizing_factor;
     __shared__ float float_max;
 
-    const int thread_row_offset = blockIdx.x * num_cols;
+    // `input` is the caller's gating tensor, whose rows may be strided; `output` is the
+    // compact fp32 workspace, so the two need separate row offsets.
+    const int thread_row_offset = blockIdx.x * input_row_stride;
+    const int output_row_offset = blockIdx.x * num_cols;
 
     hipcub::Sum sum;
     float threadData(-FLT_MAX);
@@ -110,9 +117,10 @@ __launch_bounds__(TPB) __global__
 
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
-        const int idx   = thread_row_offset + ii;
-        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
-        output[idx]     = val;
+        const float val =
+            exp((static_cast<float>(input[thread_row_offset + ii]) - float_max)) *
+            normalizing_factor;
+        output[output_row_offset + ii] = val;
     }
 }
 
@@ -126,6 +134,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const int k,
                                                const int start_expert,
                                                const int end_expert,
+                                               const int output_row_stride,
+                                               const int index_row_stride,
                                                const bool need_renorm)
 {
 
@@ -156,7 +166,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 
             for(int prior_k = 0; prior_k < k_idx; ++prior_k)
             {
-                const int prior_winning_expert = indices[k * block_row + prior_k];
+                const int prior_winning_expert = indices[index_row_stride * block_row + prior_k];
 
                 if(prior_winning_expert == expert)
                 {
@@ -175,11 +185,13 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             const bool node_uses_expert   = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
 
-            const int idx = k * block_row + k_idx;
-            output[idx]   = result_kvp.value;
-            indices[idx]  = should_process_row ? (expert - start_expert) : num_experts;
-            assert(indices[idx] >= 0);
-            source_rows[idx] = k_idx * num_rows + block_row;
+            // source_rows stays compactly packed, matching the fast path.
+            const int output_idx  = output_row_stride * block_row + k_idx;
+            const int indices_idx = index_row_stride * block_row + k_idx;
+            output[output_idx]    = result_kvp.value;
+            indices[indices_idx]  = should_process_row ? (expert - start_expert) : num_experts;
+            assert(indices[indices_idx] >= 0);
+            source_rows[k * block_row + k_idx] = k_idx * num_rows + block_row;
 
             if(need_renorm)
             {
@@ -194,7 +206,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
         renorm_value = 1 / renorm_value;
         for(int k_idx = 0; k_idx < k; k_idx++)
         {
-            int64_t const idx = k * block_row + k_idx;
+            int64_t const idx = output_row_stride * block_row + k_idx;
             output[idx] *= renorm_value;
         }
     }
@@ -703,7 +715,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
         moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
-            gating_output, nullptr, softmax_workspace, num_experts);
+            gating_output, nullptr, softmax_workspace, num_experts, gating_token_stride);
         moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
@@ -713,6 +725,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                                      topk,
                                                      0,
                                                      num_experts,
+                                                     topk_weights_stride,
+                                                     topk_id_stride,
                                                      need_renorm);
 
         // Handle shared experts for non-power-of-2 case
