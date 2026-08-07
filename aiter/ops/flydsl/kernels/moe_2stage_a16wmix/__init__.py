@@ -26,8 +26,9 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .gemm1 import a16wmix_use_k16, compile_gemm1_a16w4_port, gemm1_a16w4_grid
+from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
+from .utils import a16wmix_use_k16
 
 __all__ = [
     "compile_gemm1_a16w4_port",
@@ -157,8 +158,8 @@ def flydsl_a16w4_gemm1(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier (0=cached, 2=nt),
     ``xcd_swizzle`` -> XCD/HBM grid remap, ``k_wave`` -> intra-block slice-K ({1,2,4}).
     ``k_batch``/``gate_mode`` accepted for parity (only k_batch=1/separated supported).
-    Tiles are CSV/registry-driven and always supplied by the caller; ``b_nt=None``
-    falls back to the per-M U-shape (nt mid-band, cached at ends).
+    Tiles are CSV/registry-driven and always supplied by the caller; ``b_nt`` is
+    the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
     """
@@ -174,7 +175,7 @@ def flydsl_a16w4_gemm1(
     TILE_N = tile_n
     # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
     # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
-    b_cache_mod = (2 if (16 <= int(n_tokens) <= 1024) else 0) if b_nt is None else b_nt
+    b_cache_mod = 2 if b_nt is None else b_nt
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
@@ -268,8 +269,8 @@ def flydsl_a16w4_gemm2(
 
     Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
-    grid remap. ``k_batch`` for parity (must be 1). ``b_nt=None`` keeps the per-M
-    U-shape (cached at ends, nt mid-band).
+    grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
+    modifier (0=cached, 2=nt), taken as-is (cached when unset).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -277,7 +278,6 @@ def flydsl_a16w4_gemm2(
     BM = tile_m
     TILE_N = tile_n
     TILE_K = tile_k
-    _m = int(M_logical)
     # Tile config is CSV/registry-driven: the caller resolves tile_n/tile_k/b_nt/
     # xcd_swizzle from the tuned kernelName2 and always passes them.
     if D_INTER % TILE_K != 0:
@@ -289,9 +289,9 @@ def flydsl_a16w4_gemm2(
             f"a16w4 gemm2 requires D_HIDDEN (model_dim) % {TILE_N} == 0, got H={D_HIDDEN}"
         )
 
-    # B cache modifier per-token U-shape: cached (0) at both ends (small M reuse / large
-    # M L2 residency), nt (2) mid-band (32..1024). Caller may override via b_nt.
-    _b_cache_mod = (0 if (_m <= 16 or _m >= 2048) else 2) if b_nt is None else b_nt
+    # W-load cache modifier (0=cached, 2=nt): CSV/registry-driven via b_nt, taken
+    # as-is (cached when unset).
+    _b_cache_mod = 0 if b_nt is None else b_nt
     max_m_blocks = int(sorted_expert_ids.numel())
     # Persistent CU-limited grid (opt-in, default OFF; byte-identical when off): does NOT
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an

@@ -11,7 +11,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 
-from .gemm1 import (
+from .utils import (
     A16WI4_GROUP_SIZE,
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,

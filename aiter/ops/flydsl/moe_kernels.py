@@ -579,10 +579,8 @@ def compile_flydsl_moe_stage1(
     if a_dtype == "bf16" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
-        from .kernels.moe_2stage_a16wmix.gemm1 import (
-            a16wmix_use_k16,
-            compile_gemm1_a16w4_port,
-        )
+        from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+        from .kernels.moe_2stage_a16wmix.utils import a16wmix_use_k16
 
         return compile_gemm1_a16w4_port(
             BM=tile_m,
@@ -692,8 +690,8 @@ def compile_flydsl_moe_stage2(
     if a_dtype == "bf16" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
-        from .kernels.moe_2stage_a16wmix.gemm1 import a16wmix_use_k16
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
+        from .kernels.moe_2stage_a16wmix.utils import a16wmix_use_k16
 
         return compile_gemm2_a16w4_port(
             BM=tile_m,

@@ -14,171 +14,24 @@ from aiter.ops.flydsl.kernels.act import _silu_mul_batch, _situ_mul_batch
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
-
-def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
-    """CDNA3/gfx950-encoded s_waitcnt shim (aiter's FlyDSL has the bitfield form only)."""
-    v = 63 if vmcnt is None else int(vmcnt)
-    e = 7 if expcnt is None else int(expcnt)
-    lk = 15 if lgkmcnt is None else int(lgkmcnt)
-    encoded_vmcnt = (v & 0xF) | ((v & 0x30) << 10)
-    return rocdl.s_waitcnt(encoded_vmcnt | (lk << 8) | (e << 4))
-
-
-# =============================================================================
-# Shared low-level helpers for the a16w4/a16wi4/a16w16 fused MoE kernels. Used by
-# both stage1 (this module) and stage2 (:mod:`gemm2`, imported from here).
-# =============================================================================
-
-_PTR3 = "!llvm.ptr<3>"
-
-
-def a16wmix_use_k16(arch):
-    """True for the gfx942 (CDNA3) codepath: K=16 MFMA + scalar int4 dequant.
-
-    Arch-gate: gfx950 (CDNA4) has K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32;
-    gfx942 has neither and falls back to K=16 MFMA + scalar-trunc dequant. The caller
-    passes the target arch (e.g. ``get_rocm_arch()``).
-    """
-    return "gfx95" not in str(arch)
-
-
-def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
-
-
-def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
-
-
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
-def _global_i32_at(addr_i64, idx):
-    return _global_i32_ptr(addr_i64)[idx]
-
-
-def _global_i32_buffer_view(addr_i64, num_bytes):
-    # fx.copy BufferCopy atoms take soffset as an element count (not bytes); the
-    # make_layout dynamic-shape leaf must be i32/i64, not fx.Index.
-    num_bytes_i64 = fx.Int64(num_bytes)
-    view = fx.Tensor(
-        fx.make_view(
-            _global_i32_ptr(addr_i64), fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)
-        )
-    )
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=False, num_records_bytes=num_bytes_i64
-    )
-
-
-def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-    return fx.logical_divide(
-        _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-    )
-
-
-def _buffer_i32_scalar_read(tiles1, idx, atom):
-    """Read one i32 dword at element ``idx`` from a ``_global_i32_buffer_tiles(..., 1)``
-    view via the layout-API BufferCopy atom (buffer_load_dword; OOB-clamped by the
-    buffer resource). ``tiles1`` is 1-dword tiles so the tile index == ``idx``.
-    """
-    r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-    fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
-    return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
-
-
-def _lds_ptr3(base_i32, byte_off_i32):
-    addr_i64 = fx.Int64(base_i32 + byte_off_i32)
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
-
-
-def _global_base_ptr1(addr_i64):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
-
-
-def _gep(base_ptr, byte_off_i32):
-    # Byte GEP; polymorphic in the base ptr's address space (global ptr<1> / LDS ptr<3>).
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
-    # Side-effecting v_cvt_pk_bf16_f32 (pack 2 f32 -> 2xbf16 in i32). LOAD-BEARING:
-    # the stateless rocdl.cvt_pk_bf16_f32 gets CSE-merged/reordered across K steps in
-    # the a16wi4 gemm1 hot loop (garbage output); side_effects pins each call.
-    return llvm.inline_asm(
-        ir.IntegerType.get_signless(32),
-        [_raw(src_a_f32), _raw(src_b_f32)],
-        "v_cvt_pk_bf16_f32 $0, $1, $2",
-        "=v,v,v",
-        has_side_effects=True,
-    )
-
-
-def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
-    """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
-
-    ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the
-    mxfp4 sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8,
-    and scales the mantissa by 16, so the x16 is folded into eff = scale*16.
-    ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar .to(BFloat16).
-    """
-    eff = scale_f32 * fx.Float32(16.0)
-    raw_even = fx.Int32(raw_i32)
-    raw_odd = raw_even.shrui(fx.Int32(4))
-    if use_k16:
-        # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
-        bf16s = []
-        for j in range_constexpr(4):
-            f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
-            f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            bf16s.append(f_lo.to(fx.BFloat16))
-            bf16s.append(f_hi.to(fx.BFloat16))
-        return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
-    # byte_sel loads (1 shift total); side-effecting pk-convert.
-    i32s = []
-    for j in range_constexpr(4):
-        f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
-        f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-        i32s.append(fx.Int32(_cvt_pk_bf16_f32_se(_raw(f_lo), _raw(f_hi))))
-    v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
-    return v4i32.bitcast(fx.BFloat16)  # v8bf16
-
-
-def kmchunks_for(BM):
-    return BM // 16
-
-
-def lds_acc_bytes_for(rows, BN):
-    return rows * BN * 4
-
+from .utils import (
+    A16WI4_GROUP_SIZE,
+    _a16w4_swizzle_xor16,
+    _buffer_i32_scalar_read,
+    _e8m0_byte_to_f32,
+    _gep,
+    _global_i32_at,
+    _global_i32_buffer_tiles,
+    _global_i32_buffer_view,
+    _int4_nibble_to_bf16x8,
+    _lds_ptr3,
+    _udiv,
+    _umod,
+)
 
 # =============================================================================
 # Stage1 (gate+up GEMM + SiLU/SiTUv2)
 # =============================================================================
-
-# a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
-# K-group). Scale packed bf16 pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
-A16WI4_GROUP_SIZE = 32
-
-
-def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
-    """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
-
-    Both the DMA write and the LDS read go through this helper so the physical layout
-    stays consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
-    """
-    if not enable:
-        return col_bytes
-    rem = row & fx.Int32(k_blocks16 - 1)
-    return col_bytes ^ (rem * fx.Int32(16))
 
 
 def _gemm1_body_a16w4(
@@ -252,7 +105,7 @@ def _gemm1_body_a16w4(
     k_blocks16 = KH_TILE_BYTES // 16
     # Software pipeline (aiter-aligned): A-LDS double-buffered (tile K+1 DMA -> pong while
     # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
-    # completes on lgkmcnt, so only s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
+    # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
     _PIPE = K_TILES_TOTAL > 1
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
@@ -764,7 +617,7 @@ def _gemm1_body_a16w4(
     if const_expr(not _PIPE):
         dma_x_tile_to_lds(k_base, slot=0)
         b0 = load_b_tile(k_base)
-        s_waitcnt(lgkmcnt=0)
+        rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
@@ -775,7 +628,7 @@ def _gemm1_body_a16w4(
         for kt in range_constexpr(K_TILES_TOTAL):
             cur_slot = kt % A_LDS_STAGES
             # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
-            s_waitcnt(lgkmcnt=0)
+            rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()  # single barrier: A(kt) visible before ds_read
             # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
             # so they overlap the MFMA cluster.
@@ -861,12 +714,6 @@ def _gemm1_body_a16w4(
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
                 buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
-
-
-def _e8m0_byte_to_f32(packed_i32, byte_pos):
-    shift = byte_pos * fx.Int32(8)
-    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
-    return (b << fx.Int32(23)).bitcast(fx.Float32)
 
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
