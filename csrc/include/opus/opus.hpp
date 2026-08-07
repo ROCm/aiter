@@ -1714,7 +1714,7 @@ OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, 
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
-    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15;
 
 OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, u32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
 OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
@@ -1761,7 +1761,7 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 #pragma clang diagnostic pop
 #endif
 
-// ── buffer atomic feature guards ───────────────────────────────────────────────
+// -- buffer atomic feature guards -----------------------------------------------
 // per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
 //   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
 //   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
@@ -1910,12 +1910,7 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 16) {
 #if defined(__gfx1250__) && (__clang_major__ <= 22)
-            // clang<=22 (HIP<=7.2) miscompiles a bounded b128 store under high C-store reg
-            // expansion (large gfx1250 clusterlaunch 128x128 tiles): it sinks the uniform
-            // voffset part into the buffer BASE via readfirstlane, corrupting high address
-            // bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier
-            // keeps voffset opaque so the full offset stays in the bounds-checked VGPR.
-            // Fixed in clang-23/HIP 7.14, where this branch compiles out.
+            // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
             int vo_ = v_os;
             asm volatile("" : "+v"(vo_));
             __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, vo_, s_os, aux);
@@ -2428,7 +2423,7 @@ OPUS_H_D u32_t tdm_saturating_sub(u32_t e, u32_t o) {
 #endif
 }
 
-// wg_mask: seq<i0, i1, ...> index i → bit i. WgCount=0 → mask=0 (no multicast).
+// wg_mask: seq<i0, i1, ...> index i -> bit i. WgCount=0 -> mask=0 (no multicast).
 template<index_t WgCount, typename Wgs> struct tdm_wg_mask;
 template<index_t WgCount, index_t... Is> struct tdm_wg_mask<WgCount, seq<Is...>> {
     static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tdm_desc: bad selected workgroups");
@@ -2458,7 +2453,7 @@ struct tdm_desc {
     static constexpr u64_t wg_mask   = impl::tdm_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
     static constexpr u32_t ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
 
-    // Compile-time dword inits (only slots holding ≥1 compile-time field):
+    // Compile-time dword inits (only slots holding >=1 compile-time field):
     static constexpr u32_t sg0_init0 = u32_t(Count & 0x1) | (u32_t(GatherIndexSize & 0x1) << 30) | (u32_t(GatherMode & 0x1) << 31);                                            // count | gather flags
     static constexpr u32_t sg0_init3 = (u32_t(TypeLo & 0x1) << 30) | (u32_t(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
     static constexpr u32_t sg1_init0 = u32_t(wg_mask & 0xFFFF) | (u32_t(data_size & 0x3) << 16) | (u32_t(AtomicBarrierEn & 0x1) << 18) | (u32_t(IterateEn & 0x1) << 19) | (u32_t(LdsPadEn & 0x1) << 20) | (u32_t(McEarlyTimeout & 0x1) << 21) | (u32_t(PadInterval & 0x7) << 22) | (u32_t(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
