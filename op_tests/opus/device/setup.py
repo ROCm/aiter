@@ -39,7 +39,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
-    "test_tdm_feature_gfx1250.cu",
+    "test_tdm_gfx1250.cu",
     "test_finfo.cu",
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",
@@ -152,7 +152,7 @@ def build(verbose=False, jobs=None):
     # list that silently goes wrong every time a new one appears.
     _ARCH_ONLY_SOURCES = {
         # The tensor DMA opcodes are gfx1250-only.
-        "test_tdm_feature_gfx1250.cu": {"gfx1250"},
+        "test_tdm_gfx1250.cu": {"gfx1250"},
     }
 
     skip = set(_ARCH_SKIP_SOURCES.get(arch, set()))

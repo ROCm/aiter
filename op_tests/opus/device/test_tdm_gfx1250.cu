@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_tdm_feature_gfx1250.cu
+ * @file test_tdm_gfx1250.cu
  * @brief Functional coverage for opus::tdm on gfx1250: every feature of the descriptor
  *        and its wrapper, checked byte-exactly.
  *
