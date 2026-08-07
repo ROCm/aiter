@@ -34,9 +34,6 @@ WARP_SIZE = 64
 BLOCK_THREADS = 256
 
 
-# MFMA helpers
-
-
 def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
     """Apply one bf16 16x16x16 MMA with an fp32 accumulator."""
     frag_a = fx.make_rmem_tensor(4, fx.BFloat16)

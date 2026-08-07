@@ -485,7 +485,8 @@ def chunk_gated_delta_rule_opt_vk(
         k (torch.Tensor): keys of shape `[B, T, H, K]`.
         v (torch.Tensor): values of shape `[B, T, H, V]`.
         o (torch.Tensor, optional): pre-allocated `[B, T, H, V]` output buffer
-            written in place by K6. If None, a fresh buffer is allocated.
+            written in place by the output stage. If None, a fresh buffer is
+            allocated.
         g (torch.Tensor): g (decays in log space) of shape `[B, T, H]`.
         beta (torch.Tensor): betas of shape `[B, T, H]`.
         scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
@@ -494,14 +495,17 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state (bool): Whether to output final state `[N, H, V, K]`.
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
-        use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
-        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
+        use_chunk_hip (bool): Use HIP kernel for hidden state.
+        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state.
             Mutually exclusive with ``use_chunk_hip``.
-        use_prepare_flydsl (bool): Use the fused FlyDSL kernel for K1..K4
-            (cumsum + KKT + triangular solve + w/u) in place of the Triton
-            pair, which also drops their `A_raw` fp32 intermediate.
-            Independent of the two K5 flags; falls back to Triton when the
-            shape/dtype/arch is outside the fused kernel's support.
+        use_prepare_flydsl (bool): Use the fused FlyDSL kernel for the prepare
+            stages (cumsum + KKT + triangular solve + w/u) in place of the
+            Triton pair, which also drops their `A_raw` fp32 intermediate.
+            Independent of the two hidden-state flags; falls back to Triton
+            outside the fused kernel's support. With ``cu_seqlens`` it also
+            needs a prefill schedule; without one it warns and falls back, so
+            pass ``seq_lens_cpu`` or ``prefill_metadata`` to actually get the
+            kernel.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
@@ -515,8 +519,8 @@ def chunk_gated_delta_rule_opt_vk(
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
         seq_lens_cpu: Original sequence lengths on the host, including any
-            leading decode-only sequences. When supplied, one shared metadata
-            schedule is built for K1--K6 without reading device values.
+            leading decode-only sequences. When supplied, one metadata schedule
+            shared by every stage is built without reading device values.
         prefill_metadata: Reusable schedule created by
             ``build_gated_delta_rule_prefill_metadata``. Prefer this over
             ``seq_lens_cpu`` when several GDR layers process the same batch.

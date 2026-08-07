@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unit tests for the FlyDSL GDN prepare kernel (K1..K4 fused).
+"""Unit tests for the fused FlyDSL GDN prepare kernel.
 
 The kernel under test is ``gdn_prepare_fwd_flydsl``, which computes in one
 launch what the Triton ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
@@ -9,9 +9,9 @@ launch what the Triton ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
 checked against two oracles:
 
 * ``_gdn_prepare_reference`` -- the pure-PyTorch algebraic spec in this file
-  (fp32 triangular solve, bf16-rounded WY operands to mimic the MFMA GEMMs).
-* the Triton K1+K2 pair itself, compared directly: the FlyDSL kernel is meant
-  to be a drop-in, so any layout or exponent-domain shim here would defeat the
+  (fp32 triangular solve, bf16-rounded WY operands to mimic the kernel's GEMMs).
+* that Triton pair itself, compared directly: the FlyDSL kernel is meant to be
+  a drop-in, so any layout or exponent-domain shim here would defeat the
   purpose of the check.
 
 Usage:
@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import pytest
@@ -40,6 +41,9 @@ try:
         gdn_prepare_flydsl_supported,
         gdn_prepare_fwd_flydsl,
     )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        build_gated_delta_rule_prefill_metadata,
+    )
 except ImportError as exc:
     pytest.skip(
         f"Unable to import the FlyDSL GDN prepare kernel: {exc}",
@@ -54,13 +58,13 @@ try:
         fused_solve_tril_recompute_w_u,
     )
 
-    _HAS_TRITON_K12 = True
+    _HAS_TRITON_PREPARE = True
 except Exception:  # noqa: BLE001
-    _HAS_TRITON_K12 = False
+    _HAS_TRITON_PREPARE = False
 
 
-# g_cumsum leaves the in-chunk prefix sum untouched, so it must stay tight;
-# w_bar / u_bar go through bf16 MFMA GEMMs and a bf16 Neumann-squaring inverse.
+# g_cumsum stays in fp32 end to end, so it must stay tight; w_bar / u_bar go
+# through bf16 GEMMs and a bf16 inverse.
 ATOL_G = 1e-3
 ATOL_WU = 5e-2
 
@@ -98,7 +102,7 @@ def _gdn_prepare_reference(
     head-major like the kernel.
 
     The inverse is always taken in fp32; the WY operands are rounded to bf16
-    to mimic the kernel's MFMA bf16 GEMMs.
+    to mimic the kernel's bf16 GEMMs.
     """
     B, T, Hg_in, K = k.shape
     H, V = v.shape[2], v.shape[3]
@@ -197,28 +201,51 @@ def _make_inputs(B, T, Hg, H, K, V, *, cu_list=None, seed=0, device="cuda"):
 
 # (tag, B, T, Hg, H, K, V, cu_list, seed). Sequence lengths that are not a
 # multiple of BT=64 exercise the kernel's ragged-tail guards.
+_VARLEN_CASE = ("varlen_gqa", 1, 600, 4, 16, 128, 128, [0, 128, 300, 600], 5)
 CASES = [
     ("dense_mha", 1, 256, 8, 8, 128, 128, None, 1),
     ("dense_mha_b2", 2, 192, 4, 4, 128, 128, None, 2),
     ("dense_gqa", 1, 256, 4, 16, 128, 128, None, 3),
     ("dense_ragged", 1, 300, 4, 8, 128, 128, None, 4),
-    ("varlen_gqa", 1, 600, 4, 16, 128, 128, [0, 128, 300, 600], 5),
+    _VARLEN_CASE,
 ]
-CASE_IDS = [c[0] for c in CASES]
+
+# use_exp2 only rescales the published g_cumsum by log2(e) -- w/u come out
+# bit-identical either way -- so the natlog variant rides on the varlen case
+# instead of doubling the sweep.
+SHAPE_MODE_CASES = [pytest.param(c, True, id=f"{c[0]}-exp2") for c in CASES] + [
+    pytest.param(_VARLEN_CASE, False, id=f"{_VARLEN_CASE[0]}-natlog")
+]
 
 
 def _max_abs(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
-@pytest.mark.parametrize("use_exp2", [True, False], ids=["exp2", "natlog"])
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def _prefill_metadata(cu, cu_list):
+    """The schedule the varlen kernel requires; dense needs none."""
+    if cu_list is None:
+        return None
+    seq_lens = [end - start for start, end in itertools.pairwise(cu_list)]
+    return build_gated_delta_rule_prefill_metadata(
+        seq_lens, cu_seqlens=cu, chunk_size=64
+    )
+
+
+@pytest.mark.parametrize(("case", "use_exp2"), SHAPE_MODE_CASES)
 def test_gdn_prepare_matches_reference(case, use_exp2):
     _, B, T, Hg, H, K, V, cu_list, seed = case
     k, v, g, beta, cu = _make_inputs(B, T, Hg, H, K, V, cu_list=cu_list, seed=seed)
 
     w_f, u_f, gc_f = gdn_prepare_fwd_flydsl(
-        k, v, g, beta, cu_seqlens=cu, Hg=Hg, use_exp2=use_exp2
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu,
+        Hg=Hg,
+        use_exp2=use_exp2,
+        prefill_metadata=_prefill_metadata(cu, cu_list),
     )
     w_r, u_r, gc_r = _gdn_prepare_reference(
         k, v, g, beta, cu_seqlens=cu, Hg=Hg, use_exp2=use_exp2
@@ -234,11 +261,10 @@ def test_gdn_prepare_matches_reference(case, use_exp2):
     assert _max_abs(u_f, u_r) < ATOL_WU
 
 
-@pytest.mark.skipif(not _HAS_TRITON_K12, reason="Triton K1+K2 kernels unavailable")
-@pytest.mark.parametrize("use_exp2", [True, False], ids=["exp2", "natlog"])
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_gdn_prepare_matches_triton_k1_k2(case, use_exp2):
-    """The fused kernel is a drop-in for the Triton K1+K2 pair.
+@pytest.mark.skipif(not _HAS_TRITON_PREPARE, reason="Triton prepare pair unavailable")
+@pytest.mark.parametrize(("case", "use_exp2"), SHAPE_MODE_CASES)
+def test_gdn_prepare_matches_triton_prepare_pair(case, use_exp2):
+    """The fused kernel is a drop-in for the Triton prepare pair.
 
     Compared with no reshaping and no rescaling on either side: matching the
     Triton head-major layout and its ``use_exp2`` exponent domain is the whole
@@ -249,7 +275,14 @@ def test_gdn_prepare_matches_triton_k1_k2(case, use_exp2):
     cu_long = None if cu is None else cu.long()
 
     w_f, u_f, gc_f = gdn_prepare_fwd_flydsl(
-        k, v, g, beta, cu_seqlens=cu, Hg=Hg, use_exp2=use_exp2
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu,
+        Hg=Hg,
+        use_exp2=use_exp2,
+        prefill_metadata=_prefill_metadata(cu, cu_list),
     )
 
     gc_t, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
@@ -270,9 +303,8 @@ def test_gdn_prepare_refuses_unsupported_inputs():
     """The predicate and the wrapper agree on the supported slice.
 
     ``chunk.py`` selects the fused path off the predicate alone, so anything the
-    single launch cannot serve has to be refused up front -- a head dim the
-    kernel does not compile for, or an operand on another device, would
-    otherwise surface as a compile assert or a fault inside the launch.
+    launch cannot serve has to be refused up front rather than surfacing as a
+    compile assert or a fault.
     """
     k, v, g, beta, _ = _make_inputs(1, 128, 4, 4, 128, 128, seed=11)
     assert gdn_prepare_flydsl_supported(k, v)
@@ -295,3 +327,26 @@ def test_gdn_prepare_refuses_unsupported_inputs():
     # because silently emitting bf16 w/u is the dangerous case.
     with pytest.raises(TypeError):
         gdn_prepare_fwd_flydsl(k.half(), v.half(), g, beta)
+
+
+def test_gdn_prepare_refuses_varlen_without_schedule():
+    """A varlen batch with no schedule is refused, not charged a device read.
+
+    ``chunk.py`` warns and picks Triton for such a caller, so this wrapper never
+    has to guess the longest sequence's chunk count.
+    """
+    cu_list = [0, 128, 300, 600]
+    k, v, g, beta, cu = _make_inputs(1, 600, 4, 16, 128, 128, cu_list=cu_list, seed=13)
+
+    with pytest.raises(ValueError, match="prefill_metadata"):
+        gdn_prepare_fwd_flydsl(k, v, g, beta, cu_seqlens=cu, Hg=4)
+
+    gdn_prepare_fwd_flydsl(
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu,
+        Hg=4,
+        prefill_metadata=_prefill_metadata(cu, cu_list),
+    )
