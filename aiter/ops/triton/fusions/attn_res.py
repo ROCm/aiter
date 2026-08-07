@@ -43,6 +43,31 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
+# Static per-token-count launch table (ATOM-style), replacing @triton.autotune.
+# Each bucket maps an upper-bound token count N to (num_warps, num_stages); BL is
+# set to L2 at launch so the whole candidate axis is a single tile. Dispatch rounds
+# N UP to the smallest bucket >= N (ceil-to-bucket), so a handful of fixed sizes
+# compile one config each -- bounded compile cost and CUDAGraph-capture safe (autotune
+# would JIT many configs on a cold cache and invalidate the capture). N above the
+# largest bucket falls through to the catch-all. The values are conservative defaults;
+# retune them with op_benchmarks/triton/bench_attn_res.py in the perf PR.
+_ATTN_RES_CONFIGS = (
+    # (max_tokens, num_warps, num_stages)
+    (16, 8, 1),
+    (64, 8, 1),
+    (256, 8, 1),
+    (1024, 16, 1),
+)
+_ATTN_RES_CATCHALL = (16, 1)  # N > largest bucket
+
+
+def _pick_attn_res_config(tokens: int) -> tuple[int, int]:
+    for max_tokens, num_warps, num_stages in _ATTN_RES_CONFIGS:
+        if tokens <= max_tokens:
+            return num_warps, num_stages
+    return _ATTN_RES_CATCHALL
+
+
 def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
     # Pad the per-source tuple to a power-of-2 length so Triton compiles one
     # kernel per L2 bucket instead of one per L. Padded slots reuse tensors[0]
@@ -117,6 +142,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
 
     o = torch.empty((N, D), device=device, dtype=dtype)
     L2 = max(1, triton.next_power_of_2(L))
+    num_warps, num_stages = _pick_attn_res_config(N)
 
     attnres_fwd_kernel[(N,)](
         q=q_flat,
@@ -140,6 +166,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         D=D,
         eps=rms_eps,
         scale=scale,
+        BL=L2,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -149,6 +176,8 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         DO_ADD=False,
         WRITE_PREF=False,
         HAS_W=True,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o.view(output_shape)
 
@@ -172,10 +201,12 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
 
     o = torch.empty((N, D), device=device, dtype=dtype)
     L2 = max(1, triton.next_power_of_2(L))
+    num_warps, num_stages = _pick_attn_res_config(N)
 
     attnres_fwd_kernel[(N,)](
         q=q_flat,
-        res=(packed,) * L2,  # unused when IS_PACKED (sequence branch is dead)
+        res=None,  # unused when IS_PACKED (sequence branch is dead); None keeps
+        # the L2 dead pointer slots out of the kernarg segment
         w=w_flat,
         ow=ow_flat,
         o=o,
@@ -195,6 +226,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         D=D,
         eps=rms_eps,
         scale=scale,
+        BL=L2,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -204,6 +236,8 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         DO_ADD=False,
         WRITE_PREF=False,
         HAS_W=True,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o.view(output_shape)
 
@@ -282,10 +316,12 @@ def attn_res_gate(
         prefix_out = pf
 
     L2 = max(1, triton.next_power_of_2(L))
+    num_warps, num_stages = _pick_attn_res_config(N)
 
     attnres_fwd_kernel[(N,)](
         q=sw,
-        res=(br,) * L2,  # unused when IS_PACKED (sequence branch is dead)
+        res=None,  # unused when IS_PACKED (sequence branch is dead); None keeps
+        # the L2 dead pointer slots out of the kernarg segment
         w=sw,
         ow=ow,
         o=y,
@@ -305,6 +341,7 @@ def attn_res_gate(
         D=D,
         eps=eps,
         scale=scale,
+        BL=L2,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -314,5 +351,7 @@ def attn_res_gate(
         DO_ADD=do_add,
         WRITE_PREF=do_add,
         HAS_W=False,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return y.view(output_shape), (prefix_out.view(output_shape) if do_add else prefix)

@@ -5,23 +5,9 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BL": BL}, num_warps=nw, num_stages=ns)
-        for BL in [1, 2, 4, 8]
-        for nw in [4, 8, 16]
-        for ns in [2, 3]
-    ],
-    key=[
-        "L2",
-        "D",
-        "HAS_ONORM",
-        "IS_PACKED",
-        "HAS_PREFIX",
-        "DO_ADD",
-        "HAS_W",
-    ],
-)
+# num_warps / num_stages / BL come from the static per-token-count table in the
+# wrapper (see _pick_attn_res_config), not from @triton.autotune: a single config
+# per shape keeps compile cost bounded and does not break CUDAGraph capture.
 @triton.jit(do_not_specialize=["L"])
 def attnres_fwd_kernel(
     q,
@@ -124,7 +110,11 @@ def attnres_fwd_kernel(
                 l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
             else:
                 m_res = m_l
-                l_safe = o_l
+                # Clamp padded lanes (o_l >= L when L is not a power of 2) to the
+                # last valid row so their address stays in-bounds; they are masked
+                # out anyway. Avoids the buffer-ops OOB sentinel (0x80000000) path
+                # that faults on gfx1250 when the drop is not honored.
+                l_safe = tl.minimum(o_l, L - 1)
             b_v = tl.load(
                 res_packed
                 + i_n * stride_res_n
