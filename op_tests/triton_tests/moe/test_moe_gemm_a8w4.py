@@ -10,6 +10,7 @@ from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+    get_gluon_a8w4_ctas_per_cga,
     moe_gemm_a8w4,
     moe_gemm_torch,
 )
@@ -48,7 +49,11 @@ def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
     logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
-    routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
+    routing_data, gather_idx, scatter_idx = routing(
+        logits,
+        n_expts_act,
+        tile_m_scale=get_gluon_a8w4_ctas_per_cga(m * n_expts_act)[0],
+    )
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
     scatter_idx = scatter_idx if do_scatter else None
