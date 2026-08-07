@@ -1320,7 +1320,7 @@ def _unified_attention_gluon_kernel(
     stride_v_cache_2: gl.constexpr,
     stride_v_cache_3: gl.constexpr,
     block_table_stride: gl.constexpr,
-    num_seqs: gl.constexpr,
+    num_seqs: tl.int32,
     SCALE: gl.constexpr,
     NUM_QUERY_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
