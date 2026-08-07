@@ -788,7 +788,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
 # Kernel-ready packed views (GPU): bench / integration entry points
 # ---------------------------------------------------------------------------
 # These return tensors in the EXACT shape+stride the fwd_hd128_mxfp6 kernel
-# consumes, so a consumer just hands them to flash_attn_mxfp4_func. They own the
+# consumes, so a consumer hands them to mha_v4_packed. They own the
 # kernel-ABI knowledge -- the coalesced LDS-order K gather and the d-major
 # tile-flat V byte strides -- that used to live in the benchmark. Both support
 # S % 128 != 0 (the kernel masks the partial tail tile in softmax).
