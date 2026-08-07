@@ -95,8 +95,8 @@ def _expandable_segments_enabled() -> bool:
             settings = torch.cuda.memory._snapshot().get("allocator_settings")
         if settings is not None and "expandable_segments" in settings:
             return bool(settings["expandable_segments"])
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Allocator snapshot unavailable (%s); falling back to env.", e)
     for name in _ALLOC_CONF_ENV_VARS:
         raw = os.environ.get(name, "").strip()
         if raw:
