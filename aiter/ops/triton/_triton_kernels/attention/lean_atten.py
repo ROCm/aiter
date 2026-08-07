@@ -17,7 +17,6 @@ TO be added features:
     -
 """
 
-
 import triton
 import triton.language as tl
 
@@ -35,9 +34,7 @@ def _get_config():
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json", required=True
     )
-    return config[
-        "any"
-    ].copy()  # fresh copy per call — safe for callers to mutate
+    return config["any"].copy()  # fresh copy per call — safe for callers to mutate
 
 
 @triton.jit

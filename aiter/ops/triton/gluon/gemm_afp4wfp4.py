@@ -474,8 +474,6 @@ def _get_config(
 ):
     if arch_info.get_arch() not in ["gfx950", "gfx1250"]:
         raise ValueError("Gluon implementation is not supported on this device.")
-    # get_gemm_config caches internally and returns a fresh deep copy, safe
-    # for the callers below that write derived fields into the config.
     config, _ = get_gemm_config("GEMM-AFP4WFP4", M, N, K, backend="gluon")
     return config
 
