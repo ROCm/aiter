@@ -624,8 +624,8 @@ def launch_gemm_a8w4_tdm(
             # (nxt[1] = (ba, bb, bsa, bsb)); extends their live ranges further than
             # the pf_load-tail placement so the allocator can't reuse them anywhere
             # in the compute either.
-            if const_expr(nxt is not None):
-                lds_addr_keepalive(*nxt[1])
+            # if const_expr(nxt is not None):
+            #     lds_addr_keepalive(*nxt[1])
 
             rocdl.sched_barrier(0)
 
@@ -639,7 +639,8 @@ def launch_gemm_a8w4_tdm(
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
             # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            # if const_expr(tile_m <= 64 or num_buffers <= 2):
+            if const_expr(tile_m <= 64 or num_buffers <= 3):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
@@ -903,5 +904,5 @@ def launch_gemm_a8w4_tdm(
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
-    "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
+    "amdgpu-expert-scheduling-mode": True,
 }
