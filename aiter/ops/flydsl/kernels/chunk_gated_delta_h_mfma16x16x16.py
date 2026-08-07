@@ -710,8 +710,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # Absolute token row of MFMA C element ``elem_i`` for this lane:
             # C hands lane l the rows wid*16 + (l//16)*4 + elem_i (see the
-            # mma_atom comment), and the chunk contributes i_t*BT.
-            def _bt_abs_row(elem_i):
+            # mma_atom comment), and the chunk contributes i_t*BT. The chunk
+            # index is bound as a default argument because the closure is
+            # defined inside the chunk loop (ruff B023); it is only ever called
+            # while tracing that same iteration.
+            def _bt_abs_row(elem_i, i_t_i32=i_t_i32):
                 return i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
 
             # Stage h_accs into (a) the h_state panels for the GEMM1 B operand
