@@ -24,7 +24,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-_LOG2E = math.log2(math.e)  # 1.4426950408889634
+_LOG2E = math.log2(math.e)
 
 
 def _gview(tensor, base, shape, stride):
@@ -237,8 +237,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # sequence count itself is carried by the grid.y extent.
         N_val: fx.Int32,
     ):
-        i_v = fx.Int32(gpu.block_id("x"))
-        i_nh = fx.Int32(gpu.block_id("y"))
+        i_v = fx.block_idx.x
+        i_nh = fx.block_idx.y
         i_n = i_nh // H
         i_h = i_nh % H
 
@@ -259,7 +259,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             state_n = i_n
         state_nh = state_n * H + i_h
 
-        tid = fx.Int32(gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
 
@@ -425,6 +425,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         frag_gv_rt = thr_cp_b.retile(frag_gv)
         # Accumulators: b_v (GEMM1) over the full (BT, BV) tile, and one h state
         # accumulator per 64-K block (GEMM2's M tile is a 64-K block).
+        #
+        # A fragment's ``load()`` keeps the partition's NESTED shape (e.g.
+        # ((4,1),1,1)) while every vector built by hand below is flat (4,).
+        # Vector arithmetic broadcasts on that Python-side shape, so mixing the
+        # two expands 4 elements to 16 and raises. ``fx.Vector(frag.load())``
+        # re-derives the shape from the IR type: a reshape, NOT a redundant
+        # wrap -- do not strip it.
         frag_bv = fx.make_rmem_tensor(
             fx.tiled_mma_partition_shape(fx.MmaOperand.C, tiled_mma, (BT, BV)),
             fx.Float32,
