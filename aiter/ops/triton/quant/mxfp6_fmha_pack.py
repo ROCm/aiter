@@ -934,7 +934,7 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     Use ``quantize_fp6_lastdim_triton`` followed by ``reorder_fp6_k_lds_order_triton`` when dense
     quantization should be scheduled independently from the kernel-specific LDS layout conversion.
     """
-    b, sk, h, d = k_thd.shape
+    _b, sk, _h, d = k_thd.shape
     assert d == 128 and tile == 128, (d, sk, tile)
     packed, scale = quantize_fp6_lastdim_triton(k_thd)
     return reorder_fp6_k_lds_order_triton(packed, scale, tile=tile, return_raw=return_raw)

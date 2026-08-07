@@ -404,11 +404,11 @@ def sage_quant_f4f4(
     strided window is safe; the +64 B slack only keeps the torch view in storage bounds.
     """
     if layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
+        _b, _qo_len, _h_qo, head_dim = q.shape
+        _, kv_len, _h_kv, _ = v.shape
     elif layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
+        _b, _h_qo, _qo_len, head_dim = q.shape
+        _, _h_kv, kv_len, _ = v.shape
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
@@ -471,6 +471,7 @@ def sage_quant_mxfp6(
     """
     if q_packer is None or k_packer is None:
         import os as _os
+
         from aiter.ops.triton.quant import mxfp6_fmha_pack as _hp
 
         # Default to the fused TRITON packers (single in-graph kernels; hide the all-to-all far
@@ -490,7 +491,7 @@ def sage_quant_mxfp6(
                 return _hp.quantize_fp6_k_lds_order_torch(_k, tile=128)
 
     assert layout == "bshd", f"sage_quant_mxfp6 expects bshd, got {layout}"
-    b, qo_len, h_qo, head_dim = q.shape
+    b, _qo_len, _h_qo, head_dim = q.shape
     _, kv_len, h_kv, _ = v.shape
     if sm_scale is None:
         sm_scale = head_dim**-0.5

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, Literal
 
 import torch
 import triton
@@ -27,7 +27,17 @@ from aiter.ops.mha_v4 import (
     native_fp8_format,
     scale_modes_for_formats,
 )
+from aiter.ops.quant import (
+    rotate_activation_mxfp4_quant,
+    rotate_activation_mxfp6_quant,
+)
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
+    _rot_k_only_kernel,
+    sage_quant_v_amax_finalize_kernel,
+    sage_quant_v_amax_partial_kernel,
+    sage_quant_v_kernel,
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -40,26 +50,16 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    quantize_fp6_k_lds_order_direct_triton,
+)
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
-    sage_quant_mxfp4,
     sage_quant_f4f4,
-    sage_quant_v_f4f4,
+    sage_quant_mxfp4,
     sage_quant_mxfp6,
-)
-from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
-    _rot_k_only_kernel,
-    sage_quant_v_amax_finalize_kernel,
-    sage_quant_v_amax_partial_kernel,
-    sage_quant_v_kernel,
-)
-from aiter.ops.quant import (
-    rotate_activation_mxfp4_quant,
-    rotate_activation_mxfp6_quant,
-)
-from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-    quantize_fp6_k_lds_order_direct_triton,
+    sage_quant_v_f4f4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -285,7 +285,7 @@ class AllKernelRow:
     kernel: str
     ms: float
     tflops: float
-    accuracy: Optional[AccuracyMetrics] = None
+    accuracy: AccuracyMetrics | None = None
 
 
 def layout_preprocess(
@@ -319,7 +319,7 @@ def _generate_transformer_qkv(
     d_head: int,
     d_head_v: int,
     device: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Realistic LLM activations: RMS-norm + per-channel log-normal scales + shared low-rank Q/K component + V outlier dims/tokens. Returns fp32 q/k/v.
     q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
     k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
@@ -2613,7 +2613,7 @@ def benchmark_all_kernel_row(
     k: torch.Tensor,
     v: torch.Tensor,
     total_flops: float,
-    ref_primary: Optional[torch.Tensor],
+    ref_primary: torch.Tensor | None,
 ) -> AllKernelRow:
     saved_kernel = args.kernel
     args.kernel = kernel_name
