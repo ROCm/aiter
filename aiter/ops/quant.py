@@ -1258,7 +1258,6 @@ def rotate_activation_mxfp6_quant(
     multiplier: float,
 ) -> None:
     """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
@@ -1269,7 +1268,6 @@ def rotate_activation_mxfp4_quant(
     multiplier: float,
 ) -> None:
     """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP4 E2M1."""
-    ...
 
 
 def rotate_activation(

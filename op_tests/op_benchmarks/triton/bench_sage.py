@@ -375,7 +375,7 @@ def generate_test_tensors(
     dtype: torch.dtype,
     device: str,
     distribution: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # "normal": plain iid Gaussian Q/K/V -- the simplest smoke-test inputs.
     if distribution == "normal":
         q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
@@ -803,7 +803,7 @@ def i8fp8_quantize(
     v: torch.Tensor,
     q_clip: float = 1.0,
     k_clip: float = 1.0,
-) -> Tuple[
+) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Quantize Q/K to int8, V to fp8 (Sage-style)."""
@@ -2636,7 +2636,7 @@ def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
 
 
 def print_all_kernel_table(
-    rows: List[AllKernelRow],
+    rows: list[AllKernelRow],
     include_accuracy: bool,
 ) -> None:
     if not include_accuracy:
@@ -2703,7 +2703,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
         * (shape.d_head + shape.d_head_v)
     )
 
-    rows: List[AllKernelRow] = []
+    rows: list[AllKernelRow] = []
 
     for kernel_name in ALL_KERNELS:
         try:
