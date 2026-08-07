@@ -1,39 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL GDN prefill chunk-prepare kernel, fusing K1..K4 (BT=64 main path).
+"""FlyDSL GDN prefill chunk-prepare kernel for the BT=64 path.
 
-For each chunk of ``BT`` tokens, with ``C = (I + A)^-1`` and ``A`` the strictly
-lower-triangular gated KKT matrix
-``A[s, r] = (k_s . k_r) * beta_s * exp(g_cumsum_s - g_cumsum_r)`` for ``s > r``:
+For each chunk, form the strictly lower-triangular gated KKT matrix ``A`` and
+``C = (I + A)^-1``, then produce:
 
-    g_cumsum : [B, H, T]    fp32   in-chunk inclusive prefix sum of g
-    w_bar    : [B, H, T, K] bf16   = C @ (k * beta * exp(g_cumsum))
-    u_bar    : [B, H, T, V] bf16   = C @ (v * beta)
+    g_cumsum : [B, H, T]    in-chunk prefix sum of g
+    w_bar    : [B, H, T, K] C @ (k * beta * exp(g_cumsum))
+    u_bar    : [B, H, T, V] C @ (v * beta)
 
-This is the single-kernel equivalent of the Triton
-``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` + ``fused_solve_tril_recompute_w_u``
-pair, and reproduces that pair's contract: the inputs stay token-major while all
-three outputs are published head-major (stride 1 along T within a head, as K5
-and K6 require), and the ``g_cumsum`` domain follows ``g_scale`` -- natural log
-by default, log2 for downstream ``exp2`` consumers.
-
-Single production build: MFMA bf16 16x16x16 for the hot GEMMs and the
-triangular inverse, on the Opus-style LDS layout (full-K staging, fp32 ``s_A``,
-in-place Schur merge, register-cached C) with a wave-local vec8 output epilogue,
-a cached K scale, an elided final-K fence, native exp2, and the SR=16 ``s_vT``
-bank-swizzle.
-
-There is exactly one build: every A/B variant and tuning knob this kernel was
-developed through (Horner base, ``lds_opt``, ``ktile``, the Opt4
-tail/alias/partial/rhs4 controls, the varlen flat chunk-list launch, and the
-swizzle SR/MULT/address-specialisation env overrides) has been removed after
-being measured; the surviving choices are the ones that won.
-
-NOTE: the torch host wrapper, the XCD probe and the anti-camping grid padding
-live in ``aiter.ops.flydsl.linear_attention_prefill_kernels`` to keep this
-module free of any ``torch`` dependency (mirrors the layering used by
-``aiter.ops.flydsl.kernels.chunk_gated_delta_h``).
+Inputs are token-major and outputs are head-major. ``g_scale`` controls whether
+``g_cumsum`` is published in natural-log or log2 space.
 """
 
 import functools
@@ -44,132 +22,31 @@ from flydsl.expr import (
     const_expr,
     gpu,
     range_constexpr,
-    rocdl,
 )
 
 
 def _exp2_f32(x):
-    """Base-2 exponential lowering to a single ``v_exp_f32``.
-
-    The ``rocdl`` intrinsic rather than ``fx.exp2``: both keep the 17 ``v_exp_f32``
-    but routing through ``math.exp2`` adds 83 instructions of range handling this
-    kernel's inputs (a non-positive decay exponent) never need.
-    """
-    return fx.Float32(rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
+    """Evaluate exp2 directly; decay exponents are always non-positive."""
+    return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
 
 
 WARP_SIZE = 64
-BLOCK_THREADS = 256  # 4 warps
+BLOCK_THREADS = 256
 
 
-# ---------------------------------------------------------------------------
-# Naming of the access helpers below -- they compose as <space><op><shape>:
-#   _g… / _s…  global memory / LDS        …ld / …st  load / store
-#   …2         2-D (row, col) indexing    …_vec      n contiguous elements
-#   …_vt       carries s_vT's coupled column-group XOR swizzle (see _swz_vt)
-# Two things do not follow it: `_ld` reads LDS despite the missing `s`, and the
-# MFMA fragment helpers spell the verb out (`_load_mfma_tile`, `_store_fp32_tile`)
-# because they move a whole 16x16 tile rather than one address.  All of them are
-# calls rather than inline subscripting, for the reason spelled out in `_sst`.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# MFMA bf16 16x16x16 helpers (stage-2). Faithful FlyDSL port of the HIP
-# gdn_mfma utilities (load_mfma_tile / mfma / accum_to_src / *_fp32_tile).
-#
-# CDNA wave-64 fragment lane map (matches the HIP kernel exactly):
-#   row index within a 16x16 tile = lane % 16
-#   K-group (4 contiguous elems)  = lane // 16   -> element base (lane//16)*4
-#   accumulator C[m,n]: m = (lane//16)*4 + p (p in 0..3), n = lane % 16
-# ---------------------------------------------------------------------------
-def _F32X4():
-    return fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
-
-
-def _BF16X4():
-    return fx.Vector.filled(4, 0.0, fx.BFloat16).ir_value()
-
-
-class _LTensor:
-    """A row-major LDS region addressed through its layout view.
-
-    Scalar access goes through the view's ``(row, col)`` coordinate, so the
-    layout -- not the caller -- does the index math.  Vector access takes a
-    narrower view of ``n`` contiguous elements at that coordinate.
-
-    A dynamic row offset carries no divisibility, so ``fly.add_offset`` drops the
-    base pointer's ``align`` and the access is lowered at the *value type's*
-    natural alignment -- an over-promise on a row stride that does not provide
-    it, and 0.3.0 cannot declare a weaker alignment on a view.  :meth:`vec_store`
-    therefore narrows the value to the widest chunk the stride does guarantee;
-    for ``KS`` a vec8 bf16 becomes 2 x vec4, which the backend re-fuses into one
-    ``ds_write2_b64``.
-    """
-
-    __slots__ = ("row_stride", "view")
-
-    def __init__(self, arr, rows, row_stride=0):
-        self.row_stride = row_stride
-        self.view = arr.view(
-            fx.make_layout((rows, row_stride), (row_stride, 1))
-            if row_stride
-            else fx.make_layout(rows, 1)
-        )
-
-    def _sub(self, off, n):
-        """A view of ``n`` contiguous elements at element offset ``off``."""
-        return fx.make_view(fx.get_iter(self.view) + off, fx.make_layout(n, 1))
-
-    def _off(self, idx):
-        if isinstance(idx, tuple):
-            row, col = idx
-            return row * fx.Int32(self.row_stride) + col
-        return idx
-
-    def __getitem__(self, idx):
-        return self.view[idx]
-
-    def __setitem__(self, idx, val):
-        self.view[idx] = val
-
-    def vec_load(self, idx, n):
-        return self._sub(self._off(idx), n).load()
-
-    def vec_store(self, idx, val, n):
-        base = self._off(idx)
-        # Widest chunk the row stride keeps naturally aligned (its 2-adic part).
-        chunk = min(n, self.row_stride & -self.row_stride) if self.row_stride else n
-        if chunk == n:
-            self._sub(base, n).store(val)
-            return
-        v = fx.Vector(val)
-        for c in range(0, n, chunk):
-            self._sub(base + fx.Int32(c), chunk).store(
-                v.shuffle(v, list(range(c, c + chunk)))
-            )
-
-
-def _ext(v, i):
-    """Extract lane ``i`` from a vector at a statically known position."""
-    return fx.Vector(v)[i]
-
+# MFMA helpers
 
 def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
-    """D[m,n] = sum_k A[m,k]*B[n,k] + C  (bf16 in, fp32 acc).
-
-    The atom takes memrefs, so the vectors go through register fragments;
-    ``fly-promote-regmem-to-vectorssa`` folds them back to the intrinsic's own ISA.
-    """
+    """Apply one bf16 16x16x16 MMA with an fp32 accumulator."""
     frag_a = fx.make_rmem_tensor(4, fx.BFloat16)
     frag_b = fx.make_rmem_tensor(4, fx.BFloat16)
     frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    frag_a.store(fx.Vector(a_bf16x4))
-    frag_b.store(fx.Vector(b_bf16x4))
-    frag_c.store(fx.Vector(c_f32x4))
+    frag_a.store(fx.BFloat16x4(a_bf16x4))
+    frag_b.store(fx.BFloat16x4(b_bf16x4))
+    frag_c.store(fx.Float32x4(c_f32x4))
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    fx.mma_atom_call(mma, frag_c, frag_a, frag_b, frag_c)
-    return frag_c.load().ir_value()
+    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    return fx.Float32x4(frag_c.load())
 
 
 def _acc16_n4():
@@ -180,224 +57,92 @@ def _acc16_n4():
 
 
 def _gemm16_n4(frag_c, a_bf16x4, bs):
-    """frag_c[:, 0, n] += A @ B[n] for the four N tiles, as one atom loop.
+    """Accumulate four N tiles while keeping A and B as rank-2 fragments.
 
-    ``fx.gemm`` takes the tile counts off mode 1 of A (M) and of B (N), and off
-    modes 1/2 of C (M, N); mode 0 is the atom's own fragment.  A and B must stay
-    rank 2 -- a rank-3 operand selects the lowering's K-loop path instead.
-
-    The fragment fill has to stay in a helper: in the kernel body the AST
-    rewriter turns these loops into ``scf.for``, and the dynamic element offsets
-    then stop ``fly-promote-regmem-to-vectorssa`` from lifting the fragments,
-    leaving them in scratch.
+    Keep the static fragment fill in this helper so it remains register promoted.
     """
     frag_a = fx.make_rmem_tensor((4, 1), fx.BFloat16)
     frag_b = fx.make_rmem_tensor((4, 4), fx.BFloat16)
-    a_v = fx.Vector(a_bf16x4)
+    a_v = fx.BFloat16x4(a_bf16x4)
     for p in range(4):
         frag_a[p, 0] = a_v[p]
         for en in range(4):
-            frag_b[p, en] = fx.Vector(bs[en])[p]
+            frag_b[p, en] = fx.BFloat16x4(bs[en])[p]
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
     fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
 
 
 def _accum_to_bf16x4(d_f32x4):
-    """v4f32 accumulator -> v4bf16 operand (element-wise truncf), for MFMA chaining."""
-    elems = [_ext(d_f32x4, p).to(fx.BFloat16) for p in range(4)]
-    return fx.Vector.from_elements(elems).ir_value()
+    """Convert an fp32 accumulator to a bf16 MMA operand."""
+    d = fx.Float32x4(d_f32x4)
+    return fx.BFloat16x4([d[p].to(fx.BFloat16) for p in range(4)])
 
 
-def _load_mfma_tile(s_t, row_base, col_base, lane):
-    """bf16 LDS -> v4bf16 fragment: 4 contiguous along the inner (K) dim."""
-    row = row_base + (lane % fx.Int32(16))
-    col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    return s_t.vec_load((row, col), 4)
-
-
-# --- coupled XOR bank-swizzle (s_vT only) -----------------------------------
-# The dominant gfx950 LDS conflict is the s_vT scatter WRITE: the scatter maps
-# row0=(p%16)*4 into 4 columns/warp, so at VTS=68 it hits only 16/64 banks, 4-way.
-# Swizzling the column group as cg' = cg ^ (row // SWZ_SR), identically on the
-# write and the read, spreads those rows; XOR is bijective so output is unchanged.
-# SWZ_SR=16 on both production archs, and it wins on *address cost* rather than
-# conflict rate: the arithmetic drops this build 74 -> 64 VGPR, 6 -> 8 waves/SIMD.
-# Re-tuning (VTS, SWZ_SR) against a bank-conflict probe was measured and rejected
-# -- see gdn_prepare_opt_plan.md §3 (SR choice) and §6 (why the probe mispredicted).
+# Apply the same XOR layout to s_vT writes and reads.
 SWZ_SR = 16
 
 
-def _swz_vt(row):
-    return (row // fx.Int32(SWZ_SR)) % fx.Int32(16)
+def _swizzled_vt_view(s_t):
+    """Logical ``[feature, token]`` view over the XOR-swizzled s_vT storage."""
+    coord_swizzle = fx.static(
+        fx.CoordSwizzleType.get(2, SWZ_SR.bit_length() - 1, [0], 2, [1])
+    )
+    logical_coords = fx.make_composed_layout(
+        coord_swizzle, fx.make_identity_layout((WARP_SIZE, WARP_SIZE))
+    )
+    row_stride = fx.get(fx.get_stride(fx.get_layout(s_t)), 0)
+    physical = fx.make_layout((WARP_SIZE, row_stride), (row_stride, 1))
+    return fx.make_view(
+        fx.get_iter(s_t),
+        fx.make_composed_layout(physical, logical_coords),
+    )
 
 
-def _load_mfma_tile_vt_tiled(s_t, row_tile, col_tile, n16, mb4):
-    """Load one WY B tile from the swizzled ``s_vT``.
-
-    ``row_tile``/``col_tile`` are the constexpr 16x16 tile coordinates.  At
-    SWZ_SR=16 and ``row = row_tile*16 + lane%16`` the swizzle mask is exactly
-    ``row_tile``.  Since both the lane-group and the mask occupy only the low two
-    bits, ``((4*col_tile + lane_group) ^ row_tile) * 4`` simplifies to
-    ``16*col_tile + (mb4 ^ (4*row_tile))``.  Passing the already-computed
-    ``n16``/``mb4`` also prevents rebuilding lane div/rem in every unrolled load.
-    """
-    row = fx.Int32(row_tile * 16) + n16
-    col = fx.Int32(col_tile * 16) + (mb4 ^ fx.Int32(row_tile * 4))
-    return s_t.vec_load((row, col), 4)
+def _load_mfma_tile_vt_tiled(
+    s_t, n_tile, k_tile, lane, tiled_copy, copy_atom
+):
+    """Load a swizzled WY B tile through its MMA-matched copy."""
+    tile = _tile16_view(s_t, fx.Int32(n_tile * 16), fx.Int32(k_tile * 16))
+    # Match the copy thread coordinate to the swizzled storage layout.
+    thr_copy = tiled_copy.get_slice(lane ^ fx.Int32(n_tile * 16))
+    part_src = thr_copy.partition_S(tile)
+    frag = fx.make_fragment_like(part_src)
+    fx.copy(copy_atom, part_src, frag)
+    return fx.BFloat16x4(frag.load())
 
 
-def _sst2_vt(s_t, n, j, val):
-    """s_vT scalar scatter write with the matching coupled col-group XOR swizzle."""
-    cg = (j // fx.Int32(4)) ^ _swz_vt(n)
-    s_t[n, cg * fx.Int32(4) + (j % fx.Int32(4))] = val
+def _tile16_view(s_t, row_base, col_base, transpose=False):
+    layout = fx.get_layout(s_t)
+    row_stride = fx.get(fx.get_stride(layout), 0)
+    strides = (1, row_stride) if transpose else (row_stride, 1)
+    offset = fx.crd2idx((row_base, col_base), layout)
+    return fx.make_view(
+        fx.get_iter(s_t) + offset,
+        fx.make_layout((16, 16), strides),
+    )
 
 
-# --- s_out is deliberately left unswizzled and unpadded ---------------------
-# Its epilogue write is 2-way bank-conflicted (~41% of the kernel's LDS bank
-# conflicts), but that traffic is off the critical path: OUT_S padding (68, 72) and
-# a column XOR were each measured on gfx950 and each lost on the production shapes,
-# including the variant that removes the conflict outright at no LDS or occupancy
-# cost.  See gdn_prepare_opt_plan.md §6 -- bank conflicts here are a red herring,
-# not a bottleneck.
+def _load_fp32_tile(
+    s_t, row_base, col_base, thr_copy, copy_atom, transpose=False, negate=False
+):
+    """Load one fp32 LDS tile through an MMA-matched copy and cast to bf16."""
+    src = _tile16_view(s_t, row_base, col_base, transpose)
+    part_src = thr_copy.partition_S(src)
+    frag = fx.make_fragment_like(part_src)
+    fx.copy(copy_atom, part_src, frag)
+    vals = fx.Float32x4(frag.load())
+    if negate:
+        vals = -vals
+    return fx.BFloat16x4([vals[p].to(fx.BFloat16) for p in range(4)])
 
 
-def _load_fp32_tile(s_t, row_base, col_base, lane):
-    """fp32 LDS -> v4bf16 fragment (same lane map as _load_mfma_tile, cast to bf16)."""
-    row = row_base + (lane % fx.Int32(16))
-    col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    # Read the four elements singly rather than as one v4f32: ``ASA`` leaves odd
-    # rows only 4B-aligned, so a full-width load would be lowered at the v4f32's
-    # natural 16 B (see :class:`_LTensor`).  The backend still pairs the adjacent
-    # reads into ds_read2_b32.
-    elems = [s_t[row, col + fx.Int32(p)].to(fx.BFloat16) for p in range(4)]
-    return fx.Vector.from_elements(elems).ir_value()
-
-
-def _load_fp32_tile_T(s_t, row_base, col_base, lane):
-    """fp32 LDS -> v4bf16 fragment of the TRANSPOSED tile (B-operand = M^T)."""
-    n = lane % fx.Int32(16)
-    col = col_base + n
-    kb4 = (lane // fx.Int32(16)) * fx.Int32(4)
-    elems = [s_t[row_base + kb4 + fx.Int32(p), col].to(fx.BFloat16) for p in range(4)]
-    return fx.Vector.from_elements(elems).ir_value()
-
-
-def _load_neg_fp32_tile(s_t, row_base, col_base, lane):
-    """fp32 LDS -> v4bf16 fragment of (-tile) with _load_mfma_tile lane map."""
-    row = row_base + (lane % fx.Int32(16))
-    col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    elems = [
-        (s_t[row, col + fx.Int32(p)] * fx.Float32(-1.0)).to(fx.BFloat16)
-        for p in range(4)
-    ]
-    return fx.Vector.from_elements(elems).ir_value()
-
-
-def _load_neg_fp32_tile_T(s_t, row_base, col_base, lane):
-    """fp32 LDS -> v4bf16 fragment of (-tile)^T (the ``loadB(-A)`` operand).
-
-    Same native [k,n] lane map as :func:`_load_fp32_tile_T`, negated.  Pairs with
-    :func:`_load_neg_fp32_tile` (``loadA(-A)``) so a single
-    ``_mfma16(loadA(B), loadB(B)) = B @ B`` squares ``B = -A`` with no LDS
-    round-trip -- the operand feeder for the Neumann-*squaring* diagonal inverse
-    (mirrors the opus HIP kernel)."""
-    n = lane % fx.Int32(16)
-    col = col_base + n
-    kb4 = (lane // fx.Int32(16)) * fx.Int32(4)
-    elems = [
-        (s_t[row_base + kb4 + fx.Int32(p), col] * fx.Float32(-1.0)).to(fx.BFloat16)
-        for p in range(4)
-    ]
-    return fx.Vector.from_elements(elems).ir_value()
-
-
-def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, lane):
-    """Store a v4f32 accumulator back to fp32 LDS (accumulator lane map)."""
-    n = lane % fx.Int32(16)
-    mb4 = (lane // fx.Int32(16)) * fx.Int32(4)
-    for p in range(4):
-        s_t[row_base + mb4 + fx.Int32(p), col_base + n] = _ext(d_f32x4, p)
-
-
-def _negate4(d_f32x4):
-    """Element-wise negate a v4f32 accumulator."""
-    elems = [_ext(d_f32x4, p) * fx.Float32(-1.0) for p in range(4)]
-    return fx.Vector.from_elements(elems).ir_value()
-
-
-class _BufG:
-    """A global tensor addressed through a buffer descriptor.
-
-    With ``num_records_bytes`` the descriptor is clamped, so every access past
-    the limit is dropped by the buffer hardware -- loads return zero, stores are
-    discarded -- which is exactly the ``row < seqlen`` bound the callers would
-    otherwise hand-roll as two selects per load (clamp the index to 0, then
-    substitute a zero vector) plus an ``scf.if`` per store.  Limits are always a
-    whole multiple of the row stride and every access stays inside one row's
-    feature dim, so an access is either entirely in range or entirely out of it
-    -- it can never straddle the limit and come back partially zeroed.
-
-    Omitting it leaves the descriptor at its max size, i.e. unclamped, for
-    operands whose indices are already known to be in range."""
-
-    def __init__(self, t, dtype, num_records_bytes=None):
-        self.dtype = dtype
-        buf = fx.rocdl.make_buffer_tensor(t, num_records_bytes=num_records_bytes)
-        self.ptr = fx.get_iter(buf)
-
-    def load(self, offset, vec_size=1):
-        p = self.ptr + offset
-        if vec_size == 1:
-            return fx.ptr_load(p)
-        return fx.ptr_load(p, result_type=fx.Vector.make_type(vec_size, self.dtype))
-
-    def store(self, offset, value):
-        fx.ptr_store(value, self.ptr + offset)
-
-
-def _gld(g, off):
-    """Scalar global load via a function call (see :func:`_sst`)."""
-    return g.load(off, vec_size=1)
-
-
-def _gld_vec(g, off, n):
-    """Vector global load (``n`` contiguous elements) via a function call."""
-    return g.load(off, vec_size=n)
-
-
-def _sst_vec(t, i, j, val, n):
-    """Vector LDS store (``n`` contiguous elements) via a function call."""
-    t.vec_store((i, j), val, n)
-
-
-def _gst(g, off, val):
-    """Global store via a function call (see :func:`_sst`).
-
-    Width comes from ``val``'s own type, so this serves both the scalar
-    ``g_cumsum`` store and the vector ``w_bar``/``u_bar`` epilogue stores.
-    """
-    g.store(off, val)
-
-
-def _sst(t, idx, val):
-    """1-D LDS store via a function call.
-
-    Routing LDS writes through a call (instead of ``t[i] = v`` in the kernel
-    body) keeps the FlyDSL AST rewriter from treating the shared-memory region
-    as a state variable that must be threaded through the enclosing dynamic
-    ``scf.if`` (which fails for Python objects).
-    """
-    t[idx] = val
-
-
-def _sst2(t, i, j, val):
-    """2-D LDS store via a function call (see :func:`_sst`)."""
-    t[i, j] = val
-
-
-def _ld(t, idx):
-    """1-D LDS scalar read."""
-    return t[idx]
+def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, thr_copy, copy_atom):
+    """Store one MFMA accumulator through its matched C-copy layout."""
+    dst = _tile16_view(s_t, row_base, col_base)
+    part_dst = thr_copy.partition_D(dst)
+    frag = fx.make_fragment_like(part_dst)
+    frag.store(fx.Float32x4(d_f32x4))
+    fx.copy(copy_atom, frag, part_dst)
 
 
 def _identity_frag(lane):
@@ -408,109 +153,49 @@ def _identity_frag(lane):
         ((mb4 + fx.Int32(p)) == n).select(fx.Float32(1.0), fx.Float32(0.0))
         for p in range(4)
     ]
-    return fx.Vector.from_elements(elems).ir_value()
+    return fx.Float32x4(elems)
 
 
-def _wy_prefetch(
-    src_g, base_in, in_row_stride, off, tid, stage_iters, svec_per_row, svec
-):
-    """Prefetch one WY sub-iteration's RHS into registers (``stage_iters`` vec-``svec``
-    global loads; **no LDS touched**).
-
-    Returns a Python list of loaded bf16 vectors. Because it writes no shared
-    memory, the caller issues it one sub-iteration ahead of the matching
-    :func:`_wy_scatter`, so the global-load latency overlaps the previous
-    sub-iter's MFMA (which barely stalls) -- hiding ``wait_vm`` at iso-LDS and
-    iso-VGPR, i.e. without giving up any occupancy.
-
-    Rows past ``seqlen`` need no guard: ``src_g`` is a :class:`_BufG`
-    handle, so the buffer hardware zero-fills them."""
-    regs = []
-    for it in range(stage_iters):
-        p = tid + fx.Int32(it * BLOCK_THREADS)
-        j = p // fx.Int32(svec_per_row)
-        col = (p % fx.Int32(svec_per_row)) * fx.Int32(svec)
-        regs.append(_gld_vec(src_g, base_in + j * in_row_stride + off + col, svec))
+def _wy_prefetch(src, copy_atom, thr_copy):
+    """Prefetch one tiled WY RHS into registers."""
+    part_src = thr_copy.partition_S(src)
+    regs = fx.make_fragment_like(part_src)
+    fx.copy(copy_atom, part_src, regs)
     return regs
+
+
+def _wy_epilogue_to_lds(wy, dst, copy_atom):
+    """Store a WY accumulator through its matched tiled copy."""
+    for en in range_constexpr(4):
+        for p in range_constexpr(4):
+            dst_p = dst[(None, p), 0, en]
+            frag_p = fx.make_fragment_like(dst_p)
+            frag_p.store(fx.BFloat16x1(wy[p, 0, en].to(fx.BFloat16)))
+            fx.copy(copy_atom, frag_p, dst_p)
 
 
 def _wy_scatter(regs, s_vT, s_beta, gc, is_k, tid, stage_iters, svec_per_row, svec):
-    """Scale prefetched RHS regs by ``beta`` (v) or the cached ``beta*exp(g)``
-    (k, read from the dead ``g_cumsum`` slot) and scalar-scatter (transposed)
-    into ``s_vT`` -- the LDS RHS the WY MFMA reads."""
+    """Scale and transpose prefetched RHS values into ``s_vT``.
+
+    Scalar leaves are required because the composed transpose/swizzle cannot be
+    represented by the plain TV layout expected by ``TiledCopy``.
+    """
     for it in range(stage_iters):
-        vals = regs[it]
+        vals = fx.Vector(regs[None, it, 0].load())
         p = tid + fx.Int32(it * BLOCK_THREADS)
         j = p // fx.Int32(svec_per_row)
         row0 = (p % fx.Int32(svec_per_row)) * fx.Int32(svec)
-        scale_j = _ld(gc if is_k else s_beta, j)
+        scale_j = (gc if is_k else s_beta)[j]
         for vv in range(svec):
-            val = _ext(vals, vv).to(fx.Float32)
-            _sst2_vt(s_vT, row0 + fx.Int32(vv), j, (val * scale_j).to(fx.BFloat16))
-
-
-def _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16):
-    """Write the 4x4 WY MFMA accumulator (accumulator lane map: row = warp16 +
-    (lane//16)*4 + p, col = en*16 + lane%16) into an LDS tile ``s_out`` so it can
-    be read back coalesced for wide global stores.
-
-    Keeping the row and column plain is what lets all 64 stores share one address
-    register plus immediate offsets; see the note above s_out's layout for why the
-    bank-conflict-free alternatives were measured and rejected.
-    """
-    for en in range(4):
-        for p in range(4):
-            s = warp16 + mb4 + fx.Int32(p)
-            col = fx.Int32(en * 16) + n16
-            val = wy[p, 0, en].to(fx.BFloat16)
-            _sst2(s_out, s, col, val)
-
-
-def _sld_vec(s_t, i, j, n):
-    """LDS vector load (``n`` contiguous elems along the inner dim) via a call
-    (mirrors :func:`_gld_vec`; the readback of the WY output tile uses this)."""
-    return s_t.vec_load((i, j), n)
-
-
-def _k_prefetch(k_g, base_k, k_row_stride, tid, n_per, k_v, kvec):
-    """Issue the Phase-1b k-tile global loads into registers (``n_per`` vec-``kvec``
-    buffer_loads; **no LDS touched**).  Called after the g/beta loads are issued, so
-    these sit behind them in the vmem queue: vmem retires in order, so waiting on
-    g/beta for the prefix-sum leaves these still in flight, and their latency is
-    hidden by that scan and the k-scatter -- no extra LDS, no exposed ``wait_vm``
-    like the old serial k stage had.
-
-    Rows past ``seqlen`` are zero-filled by the buffer hardware (see
-    :class:`_BufG`), so no per-load guard is needed."""
-    regs = []
-    for it in range(n_per):
-        p = tid + fx.Int32(it * BLOCK_THREADS)
-        j = p // fx.Int32(k_v)
-        cv = (p % fx.Int32(k_v)) * fx.Int32(kvec)
-        regs.append(_gld_vec(k_g, base_k + j * k_row_stride + cv, kvec))
-    return regs
-
-
-def _k_scatter(regs, s_k, tid, n_per, k_v, kvec):
-    """Scatter the prefetched k regs into ``s_k`` [BT,K] (vec-``kvec`` LDS store);
-    the k loads have drained during the prefix-sum, so this barely stalls."""
-    for it in range(n_per):
-        p = tid + fx.Int32(it * BLOCK_THREADS)
-        j = p // fx.Int32(k_v)
-        cv = (p % fx.Int32(k_v)) * fx.Int32(kvec)
-        _sst_vec(s_k, j, cv, regs[it], kvec)
+            val = vals[vv].to(fx.Float32)
+            s_vT[row0 + fx.Int32(vv), j] = (val * scale_j).to(fx.BFloat16)
 
 
 def _wave_inclusive_scan(val, tid, width, zero):
-    """In-wave inclusive prefix sum over ``width`` lanes via register shuffles.
-    Uses the **same** stride-doubling add order as the old LDS Hillis-Steele
-    (lane i at step s adds lane i-2^s, masked when i<2^s), so the result is
-    bit-identical -- but with 0 barriers instead of log2(width) LDS round-trips.
-    Requires width == wavefront size (here BT == WARP_SIZE == 64)."""
+    """Inclusive prefix sum with a fixed stride-doubling addition order."""
     csum = val
     s = 1
     while s < width:
-        # mode="up": lane k reads lane k-s.
         prev = gpu.shuffle(csum, s, width, mode="up")
         csum = csum + (tid >= fx.Int32(s)).select(prev, zero)
         s <<= 1
@@ -526,46 +211,21 @@ def compile_gdn_prepare(
     is_varlen: bool = False,
     g_scale: float = 1.0,
 ):
-    """Chunk prepare: KKT, triangular inverse, and WY GEMMs via MFMA bf16 16x16x16.
+    """Compile the KKT, triangular inverse, and WY preparation kernel.
 
-    ``g_scale`` scales ``g_cumsum`` on the way out only (the in-chunk decay keeps
-    using the natural-log value it just scanned). Pass ``log2(e)`` to publish
-    ``g_cumsum`` in log2 space for downstream ``exp2`` consumers -- the same
-    ``G_SCALE`` trick the Triton K1 kernel uses -- or 1.0 to leave it in the
-    natural-log domain, in which case no multiply is emitted at all.
-
-    LDS layout, 17,408 B total (rocprof rounds the static object up to the 256-B
-    granule):
-        s_g     fp32[BT]        in-wave scan result (g_cumsum, later the K scale)
-        s_beta  fp32[BT]
-        region P0, a union because its members are live at disjoint times:
-          s_k     bf16[BT,KS]   staged k (KKT input + w_bar RHS source)  KS=K+4
-          s_A     fp32[BT,ASA]  KKT result, then in-place (I+A)^-1       ASA=BT+1
-          s_vT    bf16[BT,VTS]  transposed scaled WY RHS                 VTS=BT+4
-          + s_out bf16[BT,OUT_S] WY output staging, live alongside s_vT
-
-    ``s_vT`` (8,704 B) + ``s_out`` (8,192 B) exactly equal the dead full-K
-    ``s_k`` slab (16,896 B), so the coalescing output staging costs no LDS and
-    no occupancy.  Each wave reads back the same 16 output rows it wrote, which
-    removes the cross-wave publish barrier while preserving the pre-write fence.
-
-    Opus reports 18,176 B for the same phases because its phase-2 budget also
-    reserves one fp32 16x16 tile after ``s_A``; this port never addresses that
-    tile, so P0 is 768 B smaller.  Occupancy is unaffected either way -- it is
-    capped by VGPRs (64 -> 8 waves/SIMD) and the 32-wave/CU limit, not by LDS.
+    ``g_scale`` affects only the published ``g_cumsum``; decay calculations
+    remain in the natural-log domain.
     """
     assert BT == 64 and K == 128 and V == 128, "gdn_prepare targets the BT=64 main path"
     LOG2E = 1.4426950408889634
 
-    KS = K + 4  # Opus's k stride; odd rows are only 8B-aligned, which is what
-    # splits the vec8 staging store (see :class:`_LTensor`).
-    VTS = BT + 4  # s_vT row stride
-    ASA = BT + 1  # Opus's fp32 A stride
+    KS = K + 4
+    VTS = BT + 4
+    ASA = BT + 1
     BK_SUB = 64
-    OUT_S = BK_SUB  # WY output-staging row stride (128B rows -> 16B-aligned vec8)
-    N_K_ITERS = K // BK_SUB  # 2
-    N_V_ITERS = V // BK_SUB  # 2
-    # s_vT and s_out must both fit in P0 alongside the larger of s_k / s_A.
+    OUT_S = BK_SUB
+    N_K_ITERS = K // BK_SUB
+    N_V_ITERS = V // BK_SUB
     assert BT * VTS * 2 + BT * OUT_S * 2 <= max(BT * KS * 2, BT * ASA * 4)
 
     @fx.struct
@@ -573,9 +233,7 @@ def compile_gdn_prepare(
         s_vT: fx.Array[fx.BFloat16, BT * VTS, 16]
         s_out: fx.Array[fx.BFloat16, BT * OUT_S, 16]
 
-    # A union, so SharedAllocator emits one LDS object sized by the largest
-    # member instead of summing them: the overlap of the three phases is the
-    # layout, not an accident of adjacent struct leaves.
+    # These fields alias because their lifetimes do not overlap.
     @fx.union
     class _P0:
         s_k: fx.Array[fx.BFloat16, BT * KS, 16]
@@ -604,20 +262,32 @@ def compile_gdn_prepare(
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         rep = H // Hg
+        buf_copy_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        buf_copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
         lane = tid % fx.Int32(WARP_SIZE)
         warp = tid // fx.Int32(WARP_SIZE)
         warp16 = warp * fx.Int32(16)
 
-        # --- workgroup -> (sequence, chunk) mapping + sequence bounds ---
+        # Map the workgroup to a sequence chunk and head.
         i_t = fx.Int32(gpu.block_id("x"))
         i_bh = fx.Int32(gpu.block_id("y"))
         i_b = i_bh // H
         i_h = i_bh % H
         if const_expr(is_varlen):
-            cu_g = _BufG(cu_t, fx.Int32)
-            bos = fx.Int32(_gld(cu_g, i_b))
-            nxt = fx.Int32(_gld(cu_g, i_b + fx.Int32(1)))
+            cu_g = fx.rocdl.make_buffer_tensor(cu_t)
+            bos_src = fx.make_view(
+                fx.get_iter(cu_g) + i_b, fx.make_layout(1, 1)
+            )
+            nxt_src = fx.make_view(
+                fx.get_iter(cu_g) + i_b + fx.Int32(1), fx.make_layout(1, 1)
+            )
+            bos_reg = fx.make_fragment_like(bos_src)
+            nxt_reg = fx.make_fragment_like(nxt_src)
+            fx.copy(buf_copy_i32, bos_src, bos_reg)
+            fx.copy(buf_copy_i32, nxt_src, nxt_reg)
+            bos = fx.Int32(bos_reg[0])
+            nxt = fx.Int32(nxt_reg[0])
             seqlen = nxt - bos
         else:
             bos = i_b * T
@@ -629,26 +299,13 @@ def compile_gdn_prepare(
         active = i_t < n_chunks
 
         if active:
-            # Build all global/shared tensor handles *inside* the dynamic-if body
-            # so the AST rewriter does not try to thread them as scf.if state
-            # (method calls on pre-if locals get captured as state variables).
-            # Clamp every descriptor to this sequence's last row, so the buffer
-            # hardware -- not two selects per access -- enforces the `row <
-            # seqlen` bound for the ragged final chunk.  Byte limits, one whole
-            # row stride each.  The token-major inputs ([.,H] f32 g/beta,
-            # [.,Hg,K] and [.,H,V] bf16 k/v) bound on the sequence's last token;
-            # the head-major outputs bound on this head's slab end (see
-            # ``hm_end`` below) -- a workgroup owns exactly one (sequence, head),
-            # so a per-workgroup limit is enough to stop a ragged tail row from
-            # spilling into the next head.
+            # Keep handles inside this branch to avoid threading them through
+            # scf.if. Bounded descriptors handle ragged final chunks.
             seq_end = bos + seqlen
             lim_gb = (seq_end * H * fx.Int32(4)).ir_value()
             lim_k = (seq_end * Hg * fx.Int32(K * 2)).ir_value()
             lim_v = (seq_end * H * fx.Int32(V * 2)).ir_value()
-            # Head-major output slab: [B, H, T, *] with stride 1 along T inside a
-            # head, matching what the Triton K1/K2 pair hands to K5/K6.  A
-            # workgroup writes only rows [chunk_start, chunk_start + BT) of the
-            # (i_b, i_h) slab.
+            # Head-major output slab owned by this workgroup.
             if const_expr(is_varlen):
                 hm_row = i_h * T + bos  # B == 1, T == T_flat
                 hm_end = i_h * T + seq_end
@@ -659,84 +316,138 @@ def compile_gdn_prepare(
             lim_gcs = (hm_end * fx.Int32(4)).ir_value()
             lim_ub = (hm_end * fx.Int32(V * 2)).ir_value()
             lim_wb = (hm_end * fx.Int32(K * 2)).ir_value()
-            k_g = _BufG(k_t, fx.BFloat16, lim_k)
-            v_g = _BufG(v_t, fx.BFloat16, lim_v)
-            g_g = _BufG(g_t, fx.Float32, lim_gb)
-            beta_g = _BufG(beta_t, fx.Float32, lim_gb)
-            gcs_g = _BufG(gcs_t, fx.Float32, lim_gcs)
-            wbar_g = _BufG(wbar_t, fx.BFloat16, lim_wb)
-            ubar_g = _BufG(ubar_t, fx.BFloat16, lim_ub)
+            k_g = fx.rocdl.make_buffer_tensor(k_t, num_records_bytes=lim_k)
+            v_g = fx.rocdl.make_buffer_tensor(v_t, num_records_bytes=lim_v)
+            g_g = fx.rocdl.make_buffer_tensor(g_t, num_records_bytes=lim_gb)
+            beta_g = fx.rocdl.make_buffer_tensor(
+                beta_t, num_records_bytes=lim_gb
+            )
+            gcs_g = fx.rocdl.make_buffer_tensor(gcs_t, num_records_bytes=lim_gcs)
+            wbar_g = fx.rocdl.make_buffer_tensor(
+                wbar_t, num_records_bytes=lim_wb
+            )
+            ubar_g = fx.rocdl.make_buffer_tensor(
+                ubar_t, num_records_bytes=lim_ub
+            )
 
             lds = fx.SharedAllocator().allocate(_SharedStorage)
-            s_g = _LTensor(lds.s_g.peek(), BT)
-            s_beta = _LTensor(lds.s_beta.peek(), BT)
-            s_k = _LTensor(lds.p0.s_k.peek(), BT, KS)
-            s_A = _LTensor(lds.p0.s_A.peek(), BT, ASA)
-            s_vT = _LTensor(lds.p0.wy.s_vT.peek(), BT, VTS)
-            # WY output staging alongside s_vT in P0, read back coalesced (vec8)
-            # for wide global stores.
-            s_out = _LTensor(lds.p0.wy.s_out.peek(), BT, OUT_S)
+            s_g = lds.s_g.peek().view(fx.make_layout(BT, 1))
+            s_beta = lds.s_beta.peek().view(fx.make_layout(BT, 1))
+            s_k = lds.p0.s_k.peek().view(fx.make_layout((BT, K), (KS, 1)))
+            s_A = lds.p0.s_A.peek().view(fx.make_layout((BT, BT), (ASA, 1)))
+            s_vT = lds.p0.wy.s_vT.peek().view(
+                fx.make_layout((BT, BT), (VTS, 1))
+            )
+            s_vT_swz = _swizzled_vt_view(s_vT)
+            s_out = lds.p0.wy.s_out.peek().view(
+                fx.make_layout((BT, OUT_S), (OUT_S, 1))
+            )
 
-            base_gb = (bos + chunk_start) * H + i_h  # [.,H]      (g/beta in)
-            base_k = ((bos + chunk_start) * Hg + i_hg) * fx.Int32(K)  # [.,Hg,K]
-            base_v = ((bos + chunk_start) * H + i_h) * fx.Int32(V)  # [.,H,V]
-            base_gcs = hm_row  # [.,H,T]      (g_cumsum out)
-            base_ub = hm_row * fx.Int32(V)  # [.,H,T,V]    (u_bar out)
-            base_wb = hm_row * fx.Int32(K)  # [.,H,T,K]    (w_bar out)
+            base_gb = (bos + chunk_start) * H + i_h
+            base_k = ((bos + chunk_start) * Hg + i_hg) * fx.Int32(K)
+            base_v = ((bos + chunk_start) * H + i_h) * fx.Int32(V)
+            base_gcs = hm_row
+            base_ub = hm_row * fx.Int32(V)
+            base_wb = hm_row * fx.Int32(K)
             zero_f = fx.Float32(0.0)
             is_lane = tid < fx.Int32(BT)
 
-            # ---- Phase 1a: load g + beta, in-wave inclusive scan of g ----
-            # BT == WARP_SIZE, so the prefix-sum is a single-wave (wave 0) scan:
-            # run it entirely in registers via shuffle -> 0 barriers (was 6 LDS
-            # round-trips).  Same add order as before => bit-identical g_cumsum.
-            if is_lane:
-                # Rows past seqlen read as zero and their g_cumsum store is
-                # dropped, both in hardware (bounded descriptors above).
-                gi = base_gb + tid * H
-                gv = fx.Float32(_gld(g_g, gi))
-                bv = fx.Float32(_gld(beta_g, gi))
-                csum = _wave_inclusive_scan(gv, tid, BT, zero_f)
-                _sst(s_g, tid, csum)  # g_cumsum -> LDS (random-access by KKT)
-                _sst(s_beta, tid, bv)
-                # Published head-major, so the 64 lanes of this store land in one
-                # contiguous 256-B run instead of striding H rows apart.
-                out = csum if g_scale == 1.0 else csum * fx.Float32(g_scale)
-                _gst(gcs_g, base_gcs + tid, out)
+            buf_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            lds_copy16 = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
+            lds_copy32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+            lds_copy128 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            # KS=132 requires 64-bit copies for every s_k row to stay aligned.
+            lds_copy64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
 
-            # Prefetch Phase-1b k-tile into registers (queued behind g/beta, so waiting
-            # on g/beta does not drain these); its global-load latency overlaps the
-            # prefix-sum and the k-scatter below. iso-LDS.
-            KVEC = 8
-            k_row = Hg * fx.Int32(K)
-            kkt = _acc16_n4()
-            K_V = K // KVEC  # 16
-            KKv = BT * K_V  # 1024 (== n_per*BLOCK_THREADS, no tail)
-            n_per = (KKv + BLOCK_THREADS - 1) // BLOCK_THREADS  # 4
-            assert n_per * BLOCK_THREADS == KKv
-            kregs = _k_prefetch(k_g, base_k, k_row, tid, n_per, K_V, KVEC)
-            gc = s_g  # final g_cumsum in LDS
-            # ---- Phase 1b: scatter the prefetched k regs -> s_k [BT,K] (vec8) ----
-            # No barrier between the scan and here: s_g/s_beta are their own LDS
-            # objects, disjoint from the P0 union that s_k occupies, and
-            # nothing before the next barrier reads them -- Phase 1c is their first
-            # reader, so the s_k barrier below publishes g_cumsum too.  Dropping the
-            # extra barrier lets waves 1-3 scatter k *during* wave 0's g/beta load
-            # latency + prefix-sum instead of idling through it (ATT: that barrier
-            # alone was 14.2% of all kernel stall cycles, per-wave [8, ~7k, ~7k, ~7k]).
-            _k_scatter(kregs, s_k, tid, n_per, K_V, KVEC)
-            gpu.barrier()  # publish s_k + g_cumsum/beta
-            # ---- Phase 1c: KKT via MFMA (1x4x8), gate-scaled strict-lower -> s_A ----
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+            block_mma = fx.make_tiled_mma(
+                mma_atom, fx.make_layout((4, 1, 1), (1, 0, 0))
+            )
+            block_thr_mma = block_mma.thr_slice(tid)
+            block_copy_A = fx.make_tiled_copy_A(lds_copy64, block_mma).get_slice(tid)
+            block_copy_B = fx.make_tiled_copy_B(lds_copy64, block_mma).get_slice(tid)
+            block_copy_C32 = fx.make_tiled_copy_C(lds_copy32, block_mma).get_slice(tid)
+            block_copy_C16 = fx.make_tiled_copy_C(lds_copy16, block_mma).get_slice(tid)
+
+            wave_mma = fx.make_tiled_mma(
+                mma_atom, fx.make_layout((1, 1, 1), (0, 0, 0))
+            )
+            wave_copy_A32 = fx.make_tiled_copy_A(lds_copy32, wave_mma).get_slice(lane)
+            wave_copy_B32 = fx.make_tiled_copy_B(lds_copy32, wave_mma).get_slice(lane)
+            wave_tiled_copy_B16 = fx.make_tiled_copy_B(lds_copy64, wave_mma)
+            wave_copy_C32 = fx.make_tiled_copy_C(lds_copy32, wave_mma).get_slice(lane)
+
+            k_load_copy = fx.make_tiled_copy_tv(
+                buf_copy,
+                fx.make_layout((16, 16), (16, 1)),
+                fx.make_layout((1, 8), (1, 1)),
+            ).get_slice(tid)
+            k_store_copy = fx.make_tiled_copy_tv(
+                lds_copy64,
+                fx.make_layout((16, 16), (16, 1)),
+                fx.make_layout((1, 8), (1, 1)),
+            ).get_slice(tid)
+            k_src = k_load_copy.partition_S(
+                fx.make_view(
+                    fx.get_iter(k_g) + base_k,
+                    fx.make_layout((BT, K), (Hg * fx.Int32(K), 1)),
+                )
+            )
+            k_dst = k_store_copy.partition_D(s_k)
+
+            # Phase 1a: load g and beta, then scan g.
+            if is_lane:
+                gi = base_gb + tid * H
+                g_src = fx.make_view(fx.get_iter(g_g) + gi, fx.make_layout(1, 1))
+                beta_src = fx.make_view(
+                    fx.get_iter(beta_g) + gi, fx.make_layout(1, 1)
+                )
+                g_reg = fx.make_fragment_like(g_src)
+                beta_reg = fx.make_fragment_like(beta_src)
+                fx.copy(buf_copy_f32, g_src, g_reg)
+                fx.copy(buf_copy_f32, beta_src, beta_reg)
+                gv = g_reg[0]
+                bv = beta_reg[0]
+                csum = _wave_inclusive_scan(gv, tid, BT, zero_f)
+                s_g[tid] = csum
+                s_beta[tid] = bv
+                out = csum if g_scale == 1.0 else csum * fx.Float32(g_scale)
+                gcs_dst = fx.make_view(
+                    fx.get_iter(gcs_g) + base_gcs + tid, fx.make_layout(1, 1)
+                )
+                gcs_reg = fx.make_fragment_like(gcs_dst)
+                gcs_reg[0] = out
+                fx.copy(buf_copy_f32, gcs_reg, gcs_dst)
+
+            kkt = block_thr_mma.make_fragment_C(s_A)
+            kkt.fill(0.0)
+            kregs = fx.make_fragment_like(k_src)
+            fx.copy(buf_copy, k_src, kregs)
+            gc = s_g
+            # Phase 1b: stage k. The following barrier also publishes g and beta.
+            fx.copy(lds_copy64, k_store_copy.retile(kregs), k_dst)
+            gpu.barrier()
+
+            # Phase 1c: form the gated, strictly lower-triangular KKT matrix.
             for ek in range_constexpr(K // 16):
-                a = _load_mfma_tile(s_k, warp16, fx.Int32(ek * 16), lane)
-                bs = [
-                    _load_mfma_tile(s_k, fx.Int32(en * 16), fx.Int32(ek * 16), lane)
-                    for en in range(4)
-                ]
-                _gemm16_n4(kkt, a, bs)
-            # s_A aliases s_k's LDS region: ensure every warp has finished
-            # reading s_k (B-operand spans all 64 rows) before any post-scale
-            # store overwrites the region as s_A.
+                s_k_tile = fx.make_view(
+                    fx.get_iter(s_k) + fx.Int32(ek * 16),
+                    fx.make_layout((BT, 16), (KS, 1)),
+                )
+                frag_a = block_thr_mma.make_fragment_A(s_k_tile)
+                frag_b = block_thr_mma.make_fragment_B(s_k_tile)
+                fx.copy(
+                    lds_copy64,
+                    block_copy_A.partition_S(s_k_tile),
+                    block_copy_A.retile(frag_a),
+                )
+                fx.copy(
+                    lds_copy64,
+                    block_copy_B.partition_S(s_k_tile),
+                    block_copy_B.retile(frag_b),
+                )
+                fx.gemm(mma_atom, kkt, frag_a, frag_b, kkt)
+            # s_A aliases s_k, so all s_k reads must complete before storing s_A.
             gpu.barrier()
             n16 = lane % fx.Int32(16)
             mb4 = (lane // fx.Int32(16)) * fx.Int32(4)
@@ -744,76 +455,82 @@ def compile_gdn_prepare(
                 for p in range_constexpr(4):
                     s = warp16 + mb4 + fx.Int32(p)
                     r = fx.Int32(en * 16) + n16
-                    cval = kkt[p, 0, en]
-                    beta_s = _ld(s_beta, s)
-                    gc_s = _ld(gc, s)
-                    gc_r = _ld(gc, r)
+                    cval = kkt[(p, 0), 0, en]
+                    beta_s = s_beta[s]
+                    gc_s = gc[s]
+                    gc_r = gc[r]
                     decay = _exp2_f32((gc_s - gc_r) * fx.Float32(LOG2E))
                     aval = (s > r).select(cval * beta_s * decay, zero_f)
-                    _sst2(s_A, s, r, aval)
+                    kkt[(p, 0), 0, en] = aval
+            fx.copy(
+                lds_copy32,
+                block_copy_C32.retile(kkt),
+                block_copy_C32.partition_D(s_A),
+            )
             gpu.barrier()
 
-            # g_cumsum is dead after A is materialized. Cache the K-side
-            # beta*exp(g) scale in-place; later inverse/Schur barriers publish it
-            # before the first K WY scatter.
+            # Reuse dead g_cumsum storage for the K-side scale.
             if is_lane:
-                gc_j = _ld(gc, tid)
-                beta_j = _ld(s_beta, tid)
-                _sst(gc, tid, beta_j * _exp2_f32(gc_j * fx.Float32(LOG2E)))
+                gc_j = gc[tid]
+                beta_j = s_beta[tid]
+                gc[tid] = beta_j * _exp2_f32(gc_j * fx.Float32(LOG2E))
 
-            # ---- Phase 2: C = (I + A)^{-1} via MFMA ----
-            # Phase 2a: invert each 16x16 strictly-lower diagonal block via the
-            # nilpotent Neumann series (I+A)^-1 = sum (-A)^n, B := -A (B^16 = 0),
-            # in the Opus-style 8-MFMA *squaring* form.  Factor the 16-term series
-            # as C = (I+B)(I+B^2)(I+B^4)(I+B^8) (every n in 0..15 has a unique
-            # 4-bit binary expansion) -> 8 MFMAs (6 products + 2 transposes)
-            # instead of Horner's 15 on the per-warp critical path.  An
-            # accumulator reused as the MFMA A-operand is implicitly TRANSPOSED,
-            # so we carry each power AND its transpose (b2/b2t, b4/b4t);
-            # loadA(B)=neg_A with loadB(B)=neg_A_T squares B with no LDS
-            # round-trip.  Each warp owns one diagonal block.
+            # Phase 2a: invert each diagonal block using
+            # (I+B)(I+B^2)(I+B^4)(I+B^8), where B = -A.
             br = warp16
-            neg_A = _load_neg_fp32_tile(s_A, br, br, lane)  # loadA(B)
+            neg_A = _load_fp32_tile(
+                s_A, br, br, wave_copy_A32, lds_copy32, negate=True
+            )
             I_acc = _identity_frag(lane)
-            z4 = _F32X4()  # zero v4f32 MFMA accumulator seed (phases 2a+2b)
-            neg_A_T = _load_neg_fp32_tile_T(s_A, br, br, lane)  # loadB(B)
-            b2 = _mfma16(neg_A, neg_A_T, z4)  # B^2 = B.B
-            b2t = _mfma16(neg_A_T, neg_A, z4)  # (B^2)^T
+            z4 = fx.Float32x4(0.0)
+            neg_A_T = _load_fp32_tile(
+                s_A,
+                br,
+                br,
+                wave_copy_B32,
+                lds_copy32,
+                transpose=True,
+                negate=True,
+            )
+            b2 = _mfma16(neg_A, neg_A_T, z4)
+            b2t = _mfma16(neg_A_T, neg_A, z4)
             b2_o = _accum_to_bf16x4(b2)
             b2t_o = _accum_to_bf16x4(b2t)
-            b4 = _mfma16(b2t_o, b2_o, z4)  # B^4 = B^2.B^2
-            b4t = _mfma16(b2_o, b2t_o, z4)  # (B^4)^T
+            b4 = _mfma16(b2t_o, b2_o, z4)
+            b4t = _mfma16(b2_o, b2t_o, z4)
             b4_o = _accum_to_bf16x4(b4)
             b4t_o = _accum_to_bf16x4(b4t)
-            C_acc = _mfma16(b4t_o, b4_o, I_acc)  # I + B^8
-            C_acc = _mfma16(b4t_o, _accum_to_bf16x4(C_acc), C_acc)  # (I+B^4).
-            C_acc = _mfma16(b2t_o, _accum_to_bf16x4(C_acc), C_acc)  # (I+B^2).
-            C_acc = _mfma16(neg_A, _accum_to_bf16x4(C_acc), C_acc)  # (I+B).
-            _store_fp32_tile(s_A, br, br, C_acc, lane)
+            C_acc = _mfma16(b4t_o, b4_o, I_acc)
+            C_acc = _mfma16(b4t_o, _accum_to_bf16x4(C_acc), C_acc)
+            C_acc = _mfma16(b2t_o, _accum_to_bf16x4(C_acc), C_acc)
+            C_acc = _mfma16(neg_A, _accum_to_bf16x4(C_acc), C_acc)
+            _store_fp32_tile(
+                s_A, br, br, C_acc, wave_copy_C32, lds_copy32
+            )
             for it in range_constexpr((16 * 16 + WARP_SIZE - 1) // WARP_SIZE):
                 idx = lane + fx.Int32(it * WARP_SIZE)
                 rr = idx // fx.Int32(16)
                 cc = idx % fx.Int32(16)
                 if rr < cc:
-                    _sst2(s_A, br + rr, br + cc, zero_f)
+                    s_A[br + rr, br + cc] = zero_f
             gpu.barrier()
 
-            # Phase 2b: Opus's in-place, level-ordered Schur DAG.  Only the L
-            # blocks that a sibling warp is about to overwrite are kept in VGPRs.
-            sav_L32 = _BF16X4()
-            sav_L43 = _BF16X4()
-            sav_L42 = _BF16X4()
+            # Phase 2b: merge the diagonal inverses in place.
+            sav_L32 = fx.BFloat16x4(0.0)
+            sav_L43 = fx.BFloat16x4(0.0)
+            sav_L42 = fx.BFloat16x4(0.0)
             if warp == fx.Int32(0):
-                sav_L32 = _load_fp32_tile(s_A, 32, 16, lane)
-                # L42 is only overwritten (by wave 1) in the *second* Schur
-                # level, and no wave writes [48,16] in the first, so it can be
-                # captured here with the other preloads instead of behind an
-                # extra barrier between the two levels.
-                sav_L42 = _load_fp32_tile(s_A, 48, 16, lane)
+                sav_L32 = _load_fp32_tile(
+                    s_A, 32, 16, wave_copy_A32, lds_copy32
+                )
+                sav_L42 = _load_fp32_tile(
+                    s_A, 48, 16, wave_copy_A32, lds_copy32
+                )
             if warp < fx.Int32(2):
-                sav_L43 = _load_fp32_tile(s_A, 48, 32, lane)
-            # Sibling waves overwrite L32/L42/L43 below. Publish completion of
-            # the register preloads before any wave can start those stores.
+                sav_L43 = _load_fp32_tile(
+                    s_A, 48, 32, wave_copy_A32, lds_copy32
+                )
+            # Complete aliased block preloads before sibling stores.
             gpu.barrier()
 
             kept_c21 = z4
@@ -821,240 +538,286 @@ def compile_gdn_prepare(
             kept_c31 = z4
             if warp == fx.Int32(0):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 16, 0, lane),
-                    _load_fp32_tile_T(s_A, 0, 0, lane),
+                    _load_fp32_tile(s_A, 16, 0, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 0, 0, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
-                kept_c21 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 16, 16, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                kept_c21 = -_mfma16(
+                    _load_fp32_tile(s_A, 16, 16, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 16, 0, kept_c21, lane)
+                _store_fp32_tile(
+                    s_A, 16, 0, kept_c21, wave_copy_C32, lds_copy32
+                )
             if warp == fx.Int32(1):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 32, 16, lane),
-                    _load_fp32_tile_T(s_A, 16, 16, lane),
+                    _load_fp32_tile(s_A, 32, 16, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 16, 16, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
-                kept_c32 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 32, 32, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                kept_c32 = -_mfma16(
+                    _load_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 32, 16, kept_c32, lane)
+                _store_fp32_tile(
+                    s_A, 32, 16, kept_c32, wave_copy_C32, lds_copy32
+                )
             if warp == fx.Int32(2):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 32, lane),
-                    _load_fp32_tile_T(s_A, 32, 32, lane),
+                    _load_fp32_tile(s_A, 48, 32, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 32, 32, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
-                c43 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 48, 48, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                c43 = -_mfma16(
+                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 48, 32, c43, lane)
+                _store_fp32_tile(
+                    s_A, 48, 32, c43, wave_copy_C32, lds_copy32
+                )
             gpu.barrier()
 
             if warp == fx.Int32(0):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 32, 0, lane),
-                    _load_fp32_tile_T(s_A, 0, 0, lane),
+                    _load_fp32_tile(s_A, 32, 0, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 0, 0, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
                 t = _mfma16(sav_L32, _accum_to_bf16x4(kept_c21), t)
-                kept_c31 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 32, 32, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                kept_c31 = -_mfma16(
+                    _load_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 32, 0, kept_c31, lane)
+                _store_fp32_tile(
+                    s_A, 32, 0, kept_c31, wave_copy_C32, lds_copy32
+                )
             if warp == fx.Int32(1):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 16, lane),
-                    _load_fp32_tile_T(s_A, 16, 16, lane),
+                    _load_fp32_tile(s_A, 48, 16, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 16, 16, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
                 t = _mfma16(sav_L43, _accum_to_bf16x4(kept_c32), t)
-                c42 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 48, 48, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                c42 = -_mfma16(
+                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 48, 16, c42, lane)
+                _store_fp32_tile(
+                    s_A, 48, 16, c42, wave_copy_C32, lds_copy32
+                )
             gpu.barrier()
 
             if warp == fx.Int32(0):
                 t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 0, lane),
-                    _load_fp32_tile_T(s_A, 0, 0, lane),
+                    _load_fp32_tile(s_A, 48, 0, wave_copy_A32, lds_copy32),
+                    _load_fp32_tile(
+                        s_A, 0, 0, wave_copy_B32, lds_copy32, True
+                    ),
                     z4,
                 )
                 t = _mfma16(sav_L42, _accum_to_bf16x4(kept_c21), t)
                 t = _mfma16(sav_L43, _accum_to_bf16x4(kept_c31), t)
-                c41 = _negate4(
-                    _mfma16(
-                        _load_fp32_tile(s_A, 48, 48, lane),
-                        _accum_to_bf16x4(t),
-                        z4,
-                    )
+                c41 = -_mfma16(
+                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    _accum_to_bf16x4(t),
+                    z4,
                 )
-                _store_fp32_tile(s_A, 48, 0, c41, lane)
+                _store_fp32_tile(
+                    s_A, 48, 0, c41, wave_copy_C32, lds_copy32
+                )
             gpu.barrier()
 
-            # ---- Phase 2c setup: WY RHS software-pipeline (register prefetch) ----
-            # u_bar = C @ (v*beta);  w_bar = C @ (k*beta*exp(g)).  RHS is transposed
-            # into s_vT (scalar scatter) with bf16x8 HBM reads.  Each sub-iter's
-            # global loads are issued into registers one step ahead
-            # (_wy_prefetch) so their latency overlaps the previous sub-iter's MFMA.
-            # s_vT stays a single LDS buffer -> occupancy unchanged.
+            # Phase 2c: compute u_bar and w_bar with prefetched, transposed RHS tiles.
             SVEC = 8
-            SVEC_PER_ROW = BK_SUB // SVEC  # 8 vec-groups per WY RHS row
-            STAGE_ITERS = (BT * SVEC_PER_ROW + BLOCK_THREADS - 1) // BLOCK_THREADS  # 2
+            SVEC_PER_ROW = BK_SUB // SVEC
+            STAGE_ITERS = (BT * SVEC_PER_ROW + BLOCK_THREADS - 1) // BLOCK_THREADS
             assert (
                 STAGE_ITERS * BLOCK_THREADS == BT * SVEC_PER_ROW
-            )  # 1:1 lane map, no tail guard
+            )
+            wy_copy = fx.make_tiled_copy_tv(
+                buf_copy,
+                fx.make_layout((32, 8), (8, 1)),
+                fx.make_layout((1, SVEC), (1, 1)),
+            ).get_slice(tid)
             v_row_stride = H * fx.Int32(V)
             k_row_stride = Hg * fx.Int32(K)
-            # Head-major outputs: consecutive rows are one row apart, not H.
             ub_row_stride = fx.Int32(V)
             wb_row_stride = fx.Int32(K)
-            # Coalesced WY output store: s_out[BT,BK_SUB] -> global as vec8 bf16.
             GVEC = 8
-            VPR = BK_SUB // GVEC  # 8 vec-groups per output row
-            NVEC = BT * BK_SUB // GVEC  # 512 vec8 stores per sub-iter tile
-            NIT_OUT = (NVEC + BLOCK_THREADS - 1) // BLOCK_THREADS  # 2
-            assert NIT_OUT * BLOCK_THREADS == NVEC  # 1:1 lane map, no tail guard
-            # Prefetch v-tile 0 while the final C representation is prepared.
+            out_copy = fx.make_tiled_copy_tv(
+                buf_copy,
+                fx.make_layout((8, 8), (8, 1)),
+                fx.make_layout((1, GVEC), (1, 1)),
+            ).get_slice(lane)
+            out_src = out_copy.partition_S(
+                fx.make_view(
+                    fx.get_iter(s_out) + warp16 * fx.Int32(OUT_S),
+                    fx.make_layout((16, BK_SUB), (OUT_S, 1)),
+                )
+            )
+            wy_lds_dst = block_copy_C16.partition_D(s_out)
             reg = _wy_prefetch(
-                v_g,
-                base_v,
-                v_row_stride,
-                fx.Int32(0),
-                tid,
-                STAGE_ITERS,
-                SVEC_PER_ROW,
-                SVEC,
+                fx.make_view(
+                    fx.get_iter(v_g) + base_v,
+                    fx.make_layout((BT, BK_SUB), (v_row_stride, 1)),
+                ),
+                buf_copy,
+                wy_copy,
             )
 
-            # Each warp caches its 16x64 row of C.  s_A can then be reused as
-            # s_vT/s_out without a second LDS region.
+            # Cache C before reusing its aliased shared storage.
             cached_C = [
-                _load_fp32_tile(s_A, warp16, fx.Int32(ek * 16), lane) for ek in range(4)
+                _load_fp32_tile(
+                    s_A,
+                    warp16,
+                    fx.Int32(ek * 16),
+                    wave_copy_A32,
+                    lds_copy32,
+                )
+                for ek in range(4)
             ]
-            # FlyDSL may schedule another wave's first s_vT stores before all
-            # four C loads retire; make the read->alias lifetime explicit.
             gpu.barrier()
 
-            # ---- Phase 2c: WY GEMMs via MFMA (1x4x4), register-prefetch pipeline ----
             # u_bar = C @ (v*beta)
             for v_it in range_constexpr(N_V_ITERS):
                 voff = fx.Int32(v_it * BK_SUB)
-                # Read-completion fence for the *previous* sub-iter's s_vT reads,
-                # placed here rather than right after the MFMA loop: the epilogue
-                # only touches s_out (disjoint from s_vT) and only this wave's own
-                # 16 rows of it, so a wave can run its whole epilogue without
-                # waiting for the slowest wave's MFMA.  That turns
-                # max(MFMA) + epilogue into max(MFMA_i + epilogue_i).  v_it == 0
-                # needs nothing: the cached_C fence above already separates it.
+                # Fence the previous s_vT reads before overwriting the tile.
                 if const_expr(v_it > 0):
                     gpu.barrier()
                 _wy_scatter(
-                    reg, s_vT, s_beta, gc, False, tid, STAGE_ITERS, SVEC_PER_ROW, SVEC
+                    reg,
+                    s_vT_swz,
+                    s_beta,
+                    gc,
+                    False,
+                    tid,
+                    STAGE_ITERS,
+                    SVEC_PER_ROW,
+                    SVEC,
                 )
-                # prefetch next sub-iter (next v-tile, or k-tile 0 across the boundary)
                 if v_it + 1 < N_V_ITERS:
                     reg = _wy_prefetch(
-                        v_g,
-                        base_v,
-                        v_row_stride,
-                        fx.Int32((v_it + 1) * BK_SUB),
-                        tid,
-                        STAGE_ITERS,
-                        SVEC_PER_ROW,
-                        SVEC,
+                        fx.make_view(
+                            fx.get_iter(v_g)
+                            + base_v
+                            + fx.Int32((v_it + 1) * BK_SUB),
+                            fx.make_layout((BT, BK_SUB), (v_row_stride, 1)),
+                        ),
+                        buf_copy,
+                        wy_copy,
                     )
                 else:
                     reg = _wy_prefetch(
-                        k_g,
-                        base_k,
-                        k_row_stride,
-                        fx.Int32(0),
-                        tid,
-                        STAGE_ITERS,
-                        SVEC_PER_ROW,
-                        SVEC,
+                        fx.make_view(
+                            fx.get_iter(k_g) + base_k,
+                            fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
+                        ),
+                        buf_copy,
+                        wy_copy,
                     )
                 gpu.barrier()
                 wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
                     a = cached_C[ek]
                     bs = [
-                        _load_mfma_tile_vt_tiled(s_vT, en, ek, n16, mb4)
+                        _load_mfma_tile_vt_tiled(
+                            s_vT,
+                            en,
+                            ek,
+                            lane,
+                            wave_tiled_copy_B16,
+                            lds_copy64,
+                        )
                         for en in range(4)
                     ]
                     _gemm16_n4(wy, a, bs)
-                # Epilogue: accumulator -> s_out (LDS) -> coalesced vec8 global store.
-                # Unfenced on purpose (see the fence at the top of the loop).
-                _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16)
-                rocdl.s_waitcnt(0)
-                for it in range_constexpr(NIT_OUT):
-                    q = warp * fx.Int32(16 * VPR) + lane + fx.Int32(it * WARP_SIZE)
-                    row = q // fx.Int32(VPR)
-                    vc = (q % fx.Int32(VPR)) * fx.Int32(GVEC)
-                    vals = _sld_vec(s_out, row, vc, GVEC)
-                    _gst(ubar_g, base_ub + row * ub_row_stride + voff + vc, vals)
+                # Stage the accumulator for a coalesced global store.
+                _wy_epilogue_to_lds(wy, wy_lds_dst, lds_copy16)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                out_regs = fx.make_fragment_like(out_src)
+                fx.copy(lds_copy128, out_src, out_regs)
+                out_dst = out_copy.partition_D(
+                    fx.make_view(
+                        fx.get_iter(ubar_g)
+                        + base_ub
+                        + warp16 * ub_row_stride
+                        + voff,
+                        fx.make_layout((16, BK_SUB), (ub_row_stride, 1)),
+                    )
+                )
+                fx.copy(buf_copy, out_regs, out_dst)
 
-            # w_bar = C @ (k*beta*exp(g))   (reg already holds k-tile 0)
+            # w_bar = C @ (k * beta * exp(g))
             for k_it in range_constexpr(N_K_ITERS):
                 koff = fx.Int32(k_it * BK_SUB)
-                # Always needed here: the previous sub-iter is the last v tile
-                # (k_it == 0) or the previous k tile, and both read s_vT.
                 gpu.barrier()
                 _wy_scatter(
-                    reg, s_vT, s_beta, gc, True, tid, STAGE_ITERS, SVEC_PER_ROW, SVEC
+                    reg,
+                    s_vT_swz,
+                    s_beta,
+                    gc,
+                    True,
+                    tid,
+                    STAGE_ITERS,
+                    SVEC_PER_ROW,
+                    SVEC,
                 )
                 if k_it + 1 < N_K_ITERS:
                     reg = _wy_prefetch(
-                        k_g,
-                        base_k,
-                        k_row_stride,
-                        fx.Int32((k_it + 1) * BK_SUB),
-                        tid,
-                        STAGE_ITERS,
-                        SVEC_PER_ROW,
-                        SVEC,
+                        fx.make_view(
+                            fx.get_iter(k_g)
+                            + base_k
+                            + fx.Int32((k_it + 1) * BK_SUB),
+                            fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
+                        ),
+                        buf_copy,
+                        wy_copy,
                     )
                 gpu.barrier()
                 wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
                     a = cached_C[ek]
                     bs = [
-                        _load_mfma_tile_vt_tiled(s_vT, en, ek, n16, mb4)
+                        _load_mfma_tile_vt_tiled(
+                            s_vT,
+                            en,
+                            ek,
+                            lane,
+                            wave_tiled_copy_B16,
+                            lds_copy64,
+                        )
                         for en in range(4)
                     ]
                     _gemm16_n4(wy, a, bs)
-                # Unfenced, as in the v loop.  The final K tile needs no trailing
-                # fence at all: nothing overwrites s_vT afterwards.
-                _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16)
-                rocdl.s_waitcnt(0)
-                for it in range_constexpr(NIT_OUT):
-                    q = warp * fx.Int32(16 * VPR) + lane + fx.Int32(it * WARP_SIZE)
-                    row = q // fx.Int32(VPR)
-                    vc = (q % fx.Int32(VPR)) * fx.Int32(GVEC)
-                    vals = _sld_vec(s_out, row, vc, GVEC)
-                    _gst(wbar_g, base_wb + row * wb_row_stride + koff + vc, vals)
+                _wy_epilogue_to_lds(wy, wy_lds_dst, lds_copy16)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                out_regs = fx.make_fragment_like(out_src)
+                fx.copy(lds_copy128, out_src, out_regs)
+                out_dst = out_copy.partition_D(
+                    fx.make_view(
+                        fx.get_iter(wbar_g)
+                        + base_wb
+                        + warp16 * wb_row_stride
+                        + koff,
+                        fx.make_layout((16, BK_SUB), (wb_row_stride, 1)),
+                    )
+                )
+                fx.copy(buf_copy, out_regs, out_dst)
 
     @flyc.jit
     def launch_gdn_prepare(
