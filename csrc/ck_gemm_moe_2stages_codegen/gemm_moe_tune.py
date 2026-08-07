@@ -120,24 +120,24 @@ TUNE_MOE_EXPERT_BALANCE = (
 COS_DIFF_THRESHOLD = 1e-1
 
 
-def _a16w_sorted_row_map(sorted_ids, sorted_expert_ids, topk_ids, token_num, tile_m):
-    """Map a16w-mix SORTED rows <-> unsorted ``[token, topk, inter]`` per the moe_sorting
-    contract: ``tok = sorted_ids & 0xFFFFFF``; the row's expert is
-    ``sorted_expert_ids[row // tile_m]``; the topk_slot is the index where
-    ``topk_ids[tok] == expert`` (same rule as ``v2_stage1_sorted_ref``). Returns the valid
-    ``(rows, token, topk_slot)`` index arrays. NOTE: the topk_slot must be resolved by
-    expert-match, NOT by decoding ``sorted_ids >> 24`` (which is not the topk slot).
+def _a16w_sorted_cos(ref, res, msg="", printLog=True):
+    """compare_fn for a16w-mix stage1/stage2 in SORTED layout: ref is the sorted bf16
+    reference ([max_sorted, inter], padding rows all-zero), res the kernel's sorted
+    output. Cosine-diff over the valid (non-zero-ref) rows only. Same semantics as
+    cosine_diff_compare (0 == exact); avoids the gather/re-sort that would otherwise
+    pollute the kernel's tuned latency.
     """
-    sid = sorted_ids.to(torch.int64)
-    tok = sid & 0xFFFFFF
-    row_expert = sorted_expert_ids.to(torch.int64)[
-        torch.arange(sid.numel(), device=sid.device) // int(tile_m)
-    ]
-    cand = (tok < token_num).nonzero(as_tuple=True)[0]
-    match = topk_ids.to(torch.int64)[tok[cand]] == row_expert[cand].unsqueeze(1)
-    has = match.any(dim=1)
-    rows = cand[has]
-    return rows, tok[rows], match[has].to(torch.int32).argmax(dim=1)
+    n = ref.shape[0]
+    valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+    if valid.numel() == 0:
+        return 1.0
+    x = ref[valid].double().flatten()
+    y = res[:n][valid].double().flatten()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    if printLog:
+        tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
+        print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
+    return cos_diff
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -671,7 +671,6 @@ class FmoeTuner(TunerCommon):
         w1_scale_aiter,
         a1_scale,
         bias,
-        topk_ids,
         dtype,
         topk,
         kparams,
@@ -722,20 +721,9 @@ class FmoeTuner(TunerCommon):
             else:
                 # fuse_fp8: out_raw is fp8 tensor, shape (token_num, topk, inter_dim)
                 return out_raw.reshape(token_num, topk, -1)
-        # a16w-mix (bf16/fp16 activation) returns a SORTED bf16 buffer
-        # [sorted_size, inter] (moe_kernels _flydsl_moe_stage1_impl inter_sorted);
-        # gather it back to the unsorted [token, topk, inter] torch-ref layout.
-        if q_dtype_a in (dtypes.bf16, dtypes.fp16) and result.dim() == 2:
-            rows, tok, slot = _a16w_sorted_row_map(
-                sorted_ids, sorted_expert_ids, topk_ids, token_num, kparams["tile_m"]
-            )
-            out_unsorted = torch.zeros(
-                (token_num, topk, result.shape[1]),
-                dtype=result.dtype,
-                device=result.device,
-            )
-            out_unsorted[tok, slot] = result[rows]
-            return out_unsorted
+        # a16w-mix (bf16/fp16 activation) returns the SORTED [sorted_size, inter] bf16
+        # intermediate as-is (kernel-only, so the tuned latency is clean); it is
+        # compared in sorted space against run_a16w_stage1_sorted_ref.
         return result
 
     @staticmethod
@@ -784,7 +772,6 @@ class FmoeTuner(TunerCommon):
         a2_scale,
         moe_buf,
         bias,
-        topk_ids,
         dtype,
         topk,
         kparams,
@@ -798,21 +785,10 @@ class FmoeTuner(TunerCommon):
         sort_block_m = kparams.get("sort_block_m", 0)
         persist = kparams.get("persist", None)
 
-        # a16w-mix (bf16 activation) stage2 consumes a SORTED bf16 intermediate
-        # [sorted_size, inter]; the tuner's a2_qt is the unsorted [token, topk, inter]
-        # torch intermediate. Scatter it into sorted layout and drop a2_scale (bf16,
-        # no inter-stage act quant). Feeding the unsorted 3D tensor OOB-faults.
+        # a16w-mix (bf16 activation) stage2 consumes a SORTED bf16 intermediate; the
+        # tuner feeds the pre-sorted a2 ("a2_a16w_sorted", built once in generate_data,
+        # not per timed iter) and no inter-stage act scale.
         if kparams["a_dtype"] == "bf16":
-            token_num, _, inter = a2_qt.shape
-            sorted_size = int(sorted_expert_ids.shape[0]) * int(kparams["tile_m"])
-            rows, tok, slot = _a16w_sorted_row_map(
-                sorted_ids, sorted_expert_ids, topk_ids, token_num, kparams["tile_m"]
-            )
-            a2_sorted = torch.zeros(
-                (sorted_size, inter), dtype=torch.bfloat16, device=a2_qt.device
-            )
-            a2_sorted[rows] = a2_qt[tok, slot].to(torch.bfloat16)
-            a2_qt = a2_sorted
             a2_scale = None
 
         return flydsl_moe_stage2(
@@ -1074,6 +1050,57 @@ class FmoeTuner(TunerCommon):
             inter_dim=inter_dim,
             bm_s1=bm_s1,
             max_sorted=sti.numel(),
+        )
+
+    @staticmethod
+    def run_a16w_stage1_sorted_ref(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        dtype,
+        act_type,
+        quant_type,
+        doweight_stage1,
+        topk,
+        blockM,
+        inter_dim,
+    ):
+        """a16w-mix stage1 reference in SORTED [max_sorted, inter] bf16 layout, to
+        compare against the kernel's sorted output directly (so run_flydsl_stage1_out
+        stays kernel-only and its timing isn't polluted by a re-sort). Computes the
+        unsorted torch ref then gathers it to sorted order via the expert-match rule.
+        """
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            a1_scale=None,
+            w1_scale=w1_scale,
+            dtype=dtype,
+            activation=act_type,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            topk=topk,
+        )
+        n = int(num_valid_ids.reshape(-1)[0].item())
+        return _v2_stage1_ref(
+            ref1.view(a1_qt.shape[0], topk, inter_dim),
+            topk_ids,
+            sorted_ids,
+            sorted_expert_ids,
+            n,
+            token=a1_qt.shape[0],
+            inter_dim=inter_dim,
+            bm_s1=blockM,
+            max_sorted=sorted_ids.numel(),
         )
 
     @staticmethod
@@ -1787,6 +1814,7 @@ class FmoeTuner(TunerCommon):
             )
             # ref1 is always bf16
             ref1_bf16 = ref1
+            a2_a16w_sorted = None  # a16w-mix stage2 pre-sorted input (set below)
 
             if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                 # a16wi4: bf16 passthrough, no inter-stage quant
@@ -1818,10 +1846,23 @@ class FmoeTuner(TunerCommon):
                 and q_dtype_w == dtypes.fp4x2
             ):
                 # a16w4 mxfp4: the abf16 stage2 consumes the bf16 intermediate
-                # directly -- no inter-stage activation quant (a2_scale=None).
+                # directly -- no inter-stage activation quant (a2_scale=None). The
+                # kernel wants it in SORTED [max_sorted, inter] layout; build that
+                # once here (untimed) so run_flydsl_stage2_out stays kernel-only.
                 a2_qt = ref1
                 a2_scale = None
                 a2_scale_mxfp4_sort = None
+                a2_a16w_sorted = _v2_stage1_ref(
+                    ref1.view(token, topk, inter_dim),
+                    topk_ids,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    int(num_valid_ids.reshape(-1)[0].item()),
+                    token=token,
+                    inter_dim=inter_dim,
+                    bm_s1=blockM,
+                    max_sorted=sorted_ids.numel(),
+                )
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
                 # FlyDSL stage2 receives fp8 input
                 a2_qt = ref1.to(dtypes.fp8)
@@ -1871,6 +1912,7 @@ class FmoeTuner(TunerCommon):
                 "topk_weights": topk_weights,
                 "topk_ids": topk_ids,
                 "a2_scale_mxfp4_sort": a2_scale_mxfp4_sort,
+                "a2_a16w_sorted": a2_a16w_sorted,
                 "w2_scale_aiter": w2_scale_aiter,
                 "w1_qt_shffle_flydsl": w1_qt_shffle_flydsl,
                 "w2_qt_shffle_flydsl": w2_qt_shffle_flydsl,
@@ -3441,6 +3483,32 @@ class FmoeTuner(TunerCommon):
                         ref_args_extra = ref_args_extra + (False, True)
                     s1_ref_func = FmoeTuner.run_torch_moe_stage1
                     s1_ref_args = ref_args_extra
+                    if a_dtype_str == "bf16":
+                        # a16w-mix: kernel returns SORTED output; compare against a
+                        # SORTED torch ref (sorting done here in the untimed ref, not
+                        # in run_flydsl_stage1_out) so the tuned latency is kernel-only.
+                        s1_ref_func = FmoeTuner.run_a16w_stage1_sorted_ref
+                        s1_ref_args = (
+                            [
+                                "a1_qt",
+                                "w1_qt",
+                                "w2_qt",
+                                "topk_weights",
+                                "topk_ids",
+                                "w1_scale",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "num_valid_ids",
+                            ],
+                            dtype,
+                            act_type,
+                            q_type,
+                            doweight_stage1,
+                            topk,
+                            blockM,
+                            inter_dim,
+                        )
+                        s1_compare_fn = _a16w_sorted_cos
                     s1_ref_kwargs = {}
                     s1_ref = None
 
@@ -3477,7 +3545,6 @@ class FmoeTuner(TunerCommon):
                                     "w1_scale_aiter",
                                     "a1_scale_fp4_sort",
                                     "bias",
-                                    "topk_ids",
                                 ],
                                 dtype,
                                 topk,
@@ -3581,7 +3648,7 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                "a2_qt",
+                                ("a2_a16w_sorted" if a_dtype_str == "bf16" else "a2_qt"),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -3591,7 +3658,6 @@ class FmoeTuner(TunerCommon):
                                 "a2_scale_mxfp4_sort",
                                 "moe_buf",
                                 "bias",
-                                "topk_ids",
                             ],
                             dtype,
                             topk,
@@ -4120,7 +4186,6 @@ class FmoeTuner(TunerCommon):
                                 "w1_scale_flydsl",
                                 "a1_scale_fp4_sort",
                                 "bias",
-                                "topk_ids",
                             ],
                             dtype,
                             topk,
@@ -4215,7 +4280,7 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                "a2_qt",
+                                ("a2_a16w_sorted" if a_dtype_str == "bf16" else "a2_qt"),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -4225,7 +4290,6 @@ class FmoeTuner(TunerCommon):
                                 "a2_scale_mxfp4_sort",
                                 "moe_buf",
                                 "bias",
-                                "topk_ids",
                             ],
                             dtype,
                             topk,
