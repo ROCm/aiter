@@ -993,13 +993,12 @@ def _get_config(
             raise ValueError(
                 "Gluon implementation is not supported on this device (requires CDNA4)."
             )
-        _get_config._config_dict = {}
         fpath = (
             f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
         )
         with open(fpath, "r") as file:
             config = json.load(file)
-        _get_config._config_dict["default"] = config
+        _get_config._config_dict = {"default": config}
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict:

@@ -113,9 +113,11 @@ Consequences to keep in mind:
   gluon default (currently gfx1250 `GEMM-AFP4WFP4`), lookup falls through to
   gluon. Adding `configs/gfx1250/triton/gemm/gemm_afp4wfp4/DEFAULT.json` later
   would change which file gfx1250 resolves to — verify that is intended.
-- Results are cached per `(arch, config_name, backend)` via
-  `functools.lru_cache` plus `_config_cache`. Adding a file at runtime after a
-  lookup has happened has no effect; restart the process.
+- Results are cached twice: `functools.lru_cache` on the full argument
+  tuple, plus a per-path cache of parsed JSON
+  (`_load_json`) that also caches negative results (missing files). Adding a
+  config file at runtime therefore has no effect; restart the process
+  (tooling may call `_load_json.cache_clear()` instead).
 
 Direct-path loaders bypass all of this. Grep for
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything — `gluon/gemm_a8w8.py`

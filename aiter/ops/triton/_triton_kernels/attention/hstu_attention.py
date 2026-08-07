@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import functools
-import json
 
 # @manual=//triton:triton
 import triton
@@ -24,7 +23,7 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 try:
     from triton.language.extra.libdevice import (
@@ -871,12 +870,11 @@ def _hstu_attn_bwd(
 def _get_fwd_config(
     AUTOTUNE_Z: int,
 ):
-    if not hasattr(_get_fwd_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_fwd_config._config_dict = config
+    dev = arch_info.get_arch()
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json",
+        required=True,
+    )
 
     if AUTOTUNE_Z < 512:
         batch_key = "small_batch"
@@ -885,23 +883,22 @@ def _get_fwd_config(
     else:
         batch_key = "large_batch"
 
-    return _get_fwd_config._config_dict[batch_key]
+    return config[batch_key]
 
 
 @functools.lru_cache(maxsize=1024)
 def _get_bwd_config(
     AUTOTUNE_Z: int,
 ):
-    if not hasattr(_get_bwd_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_bwd_config._config_dict = config
+    dev = arch_info.get_arch()
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json",
+        required=True,
+    )
 
     if AUTOTUNE_Z < 512:
         batch_key = "small_batch"
     else:
         batch_key = "large_batch"
 
-    return _get_bwd_config._config_dict[batch_key]
+    return config[batch_key]
