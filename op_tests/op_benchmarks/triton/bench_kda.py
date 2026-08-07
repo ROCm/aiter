@@ -7,8 +7,8 @@ import sys
 import torch
 import torch.nn.functional as F
 import triton
-
 from aiter.ops.triton._triton_kernels.kda import fused_recurrent_kda_triton
+
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
