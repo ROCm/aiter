@@ -335,11 +335,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # the innermost 4 elements are one k_group, which is exactly one MFMA
         # operand and one b64 access. The swizzles use base=2 (elements -> 8 B),
         # so those 4 elements always stay contiguous.
-        # The k panel is the one exception and keeps hand-written bit math: its
-        # rotating-pair address needs three overlapping XOR terms, while a
-        # layout carries a single swizzle.
+        # The k panel needs TWO chained swizzles (see sK below), which is still
+        # a composed layout, just a nested one.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        lds_kp_ptr = lds.kp.ptr  # k panels (rotating-pair swizzle)
 
         KG_PER_BLOCK = 64 // 4  # k_groups per 64-K panel
 
@@ -375,6 +373,57 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             lds.hp.ptr + LDS_HP_PANEL_ELEMS,
             fx.make_layout((BV, (4, BT // 4)), (4, (1, BV * 4))),
         )
+
+        # GEMM2 A -- k panels as (64, BT), i.e. one panel is k^T for a 64-K
+        # block. Per panel this is [64][BT] row-major + S<2,2,8> + S<4,2,4>,
+        # the layout form of HIP's ``k_panel_rotating_pair_addr_bytes``
+        # (verified bit-exact on all 64*BT addresses of both panels).
+        #
+        # Two chained swizzles are required, unlike every other panel here.
+        # k is the only panel written along one axis and read along the other
+        # (it stages k^T): the cooperative store varies K-row bits 3..5 across
+        # lanes while the MFMA A-fragment read varies K-row bits 0..3, so all
+        # six row bits have to be folded into the token field to keep both
+        # sides conflict-free. Only bits 3..6 of the address are available for
+        # that (bit 2 must stay put or the 4 elements of a k_group are no
+        # longer contiguous and the b64 operand read is lost), so 6 bits fold
+        # into 4 and the XOR windows overlap -- the "rotating" in the HIP name.
+        # A single SwizzleType is one XOR of one contiguous window at one fixed
+        # shift, so it takes two: row bits 0..3 at shift 4 and row bits 4..5 at
+        # shift 8.
+        #
+        # The panel base is an iterator shift rather than a layout mode: it is
+        # LDS_KP_PANEL_ELEMS = 64*BT, a multiple of both swizzle periods
+        # (2^(4+2+4) and 2^(2+2+8)), so swizzle(base + x) == base + swizzle(x)
+        # and the two panels can share one layout.
+        #
+        # NOTE: unlike sW / sH / sGV, this view is indexed with fx.slice rather
+        # than partitioned with partition_S / make_tiled_copy. The partition
+        # path mis-handles a NESTED composed layout: it silently produces wrong
+        # addresses here, while the same view read through fx.slice (crd2idx)
+        # is correct, and a single-swizzle view is correct through either path.
+        # The wrong addresses are not merely "inner swizzle ignored" either --
+        # pairing a partitioned two-level read with a single-level write does
+        # not agree. So the GEMM2 A fragment is filled by an explicit
+        # per-k-tile fx.slice below.
+        def _k_panel_view(kb, group):
+            """k panel ``kb`` as (64, (group, BT/group)) -- same addresses for
+            every ``group``, only the token mode is regrouped: ``group=4`` is
+            the MFMA A operand (one k_group per b64), ``group=2`` the
+            cooperative store (one token pair per b32)."""
+            return fx.make_view(
+                lds.kp.ptr + kb * LDS_KP_PANEL_ELEMS,
+                fx.make_composed_layout(
+                    fx.static(fx.SwizzleType.get(4, 2, 4)),
+                    fx.make_composed_layout(
+                        fx.static(fx.SwizzleType.get(2, 2, 8)),
+                        fx.make_layout((64, (group, BT // group)), (BT, (1, group))),
+                    ),
+                ),
+            )
+
+        sK = [_k_panel_view(kb, 4) for kb in range(NUM_K_BLOCKS)]
+        sKw = [_k_panel_view(kb, 2) for kb in range(NUM_K_BLOCKS)]
         # [V][K] transpose buffer: [BV][K] row-major + S<4,2,5>, the layout form
         # of the hand-written ``k_group ^ (v & 0xF)`` scatter. Not an MMA
         # operand -- it only stages the h snapshot for the b128 HBM store -- so
@@ -399,7 +448,19 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         def _lds_write_x4(tile, vec4):
             _store_vec(cp_lds_x4, tile, vec4, 4, fx.BFloat16)
 
-        v4bf16 = T.vec(4, T.bf16)
+        cp_lds_x2 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.BFloat16)
+
+        # k panel scatter store: the adjacent token pair (2*pc, 2*pc+1) of K-row
+        # ``row`` in panel ``kb``, addressed through the same swizzled layout
+        # the GEMM2 A read uses.
+        def _k_panel_store_pair(kb, row, pc, v0, v1):
+            _store_vec(
+                cp_lds_x2,
+                fx.slice(sKw[kb], (row, (None, pc))),
+                fx.Vector.from_elements([v0, v1], dtype=fx.BFloat16),
+                2,
+                fx.BFloat16,
+            )
 
         # 16x16x16 bf16 MFMA (K-tile 16, so A/B are bf16x4 -- one b64 read --
         # and C is f32x4), tiled over the 4 waves along M. That atom's TV layout
@@ -432,17 +493,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         frag_w = tiled_mma.make_fragment_A(sW)
         frag_h = tiled_mma.make_fragment_B(sH)
         frag_gv = tiled_mma.make_fragment_B(sGV)
+        frag_k = [tiled_mma.make_fragment_A(v) for v in sK]
         frag_w_rt = thr_cp_a.retile(frag_w)
         frag_h_rt = thr_cp_b.retile(frag_h)
         frag_gv_rt = thr_cp_b.retile(frag_gv)
-
-        # GEMM2's A operand is the rotating-pair k panel, whose address is not
-        # expressible as a layout, so its fragment is filled by hand below
-        # instead of by a partitioned fx.copy.
-        frag_k = fx.make_rmem_tensor(
-            fx.tiled_mma_partition_shape(fx.MmaOperand.A, tiled_mma, (64, BT)),
-            fx.BFloat16,
-        )
         # Accumulators: b_v (GEMM1) over the full (BT, BV) tile, and one h state
         # accumulator per 64-K block (GEMM2's M tile is a 64-K block).
         frag_bv = fx.make_rmem_tensor(
@@ -463,35 +517,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # block, i.e. the global-view column coordinate.
         load_vec_group = tid % THREADS_PER_ROW_64
         load_col_group = load_vec_group * (LOAD_VEC_WIDTH // 4)
-
-        # k_panel rotating-pair swizzle address computation.
-        # Port of HIP's k_panel_rotating_pair_base_bytes / _addr_bytes.
-        # Returns a BYTE offset within a panel; caller converts to element
-        # offset (>> 1) before indexing the bf16 LDS pointer.
-        def _k_panel_rotating_pair_addr_bytes(row, pair_col):
-            row_block = row >> 3
-            row_in_block = row & 7
-            # k_panel_rotating_pair_base_bytes(row_block, pair_col)
-            tid_like = (pair_col << 3) | row_block
-            lane_1_2 = tid_like & 6
-            base = lane_1_2 << 10
-            low = (lane_1_2 << 2) ^ ((tid_like & 0xF8) >> 1)
-            toggle = (tid_like & 1) * 0x440
-            low = low ^ toggle
-            base_bytes = base | low
-            return (base_bytes ^ (row_in_block << 3)) + (row_in_block << 7)
-
-        # load_a_k_fragment_rotating -- GEMM2 A operand read.
-        # Mirrors HIP's load_a_k_fragment_rotating(base, row_base, t_base, lane).
-        def _load_a_k_rotating(panel_base_elems, row_base, t_base):
-            row = row_base + lane_n
-            t0 = t_base + lane_m_base * 4
-            pair_col = t0 >> 1
-            byte_off = _k_panel_rotating_pair_addr_bytes(row, pair_col)
-            elem_off = byte_off >> 1
-            return fx.ptr_load(
-                lds_kp_ptr + (panel_base_elems + elem_off), result_type=v4bf16
-            )
 
         # -- Prologue: compute bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
@@ -692,7 +717,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             k_safe_t0_prol = (k_t0_pf < T_local).select(k_t0_pf, 0)
             k_safe_t1_prol = (k_t1_pf < T_local).select(k_t1_pf, 0)
             for kb in range_constexpr(NUM_K_BLOCKS):
-                kp_pbase = kb * LDS_KP_PANEL_ELEMS
                 k_vec_col = kb * 8 + k_vec_group_pf
                 kvec_t0 = _load_vec(
                     cp_bf16x8,
@@ -708,12 +732,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 )
                 for i in range_constexpr(LOAD_VEC_WIDTH):
                     row_i = k_row_base_pf + i
-                    byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
-                    elem_off = byte_off >> 1
-                    fx.ptr_store(kvec_t0[i], lds_kp_ptr + (kp_pbase + elem_off))
-                    fx.ptr_store(
-                        kvec_t1[i],
-                        lds_kp_ptr + (kp_pbase + elem_off + 1),
+                    _k_panel_store_pair(
+                        kb, row_i, k_pair_col_pf, kvec_t0[i], kvec_t1[i]
                     )
 
         has_work = NT > 0
@@ -1033,21 +1053,22 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 )
 
             # -- GEMM2: h += k^T @ v_new_gated (no w prefetch/interleave).
-            # The A operand comes from the rotating-pair k panel, which has no
-            # layout form, so it is read by hand into frag_k; B is a normal
-            # partitioned copy. Each 64-K block is its own M tile, hence its own
-            # accumulator fragment. The hand-filled A is also why this stays a
-            # per-k-tile loop rather than one whole-partition fx.gemm.
+            # Each 64-K block is its own M tile, hence its own k panel view and
+            # accumulator fragment. The A operand is read by an explicit
+            # fx.slice per k-tile rather than a partitioned fx.copy (see the
+            # nested-swizzle note on _k_panel_view); the coordinate is the MFMA
+            # A mapping, lane l holding A[wid*16 + l%16][k_tile*16 + (l//16)*4].
             BT_STEPS = BT // K_STEP
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
                     for half in range_constexpr(K_STEP // 16):
                         kt = bt_s * (K_STEP // 16) + half
-                        frag_k[None, None, kt].store(
-                            _load_a_k_rotating(
-                                kb * LDS_KP_PANEL_ELEMS,
-                                wid * 16,
-                                bt_s * K_STEP + half * 16,
+                        frag_k[kb][None, None, kt].store(
+                            _lds_read_x4(
+                                fx.slice(
+                                    sK[kb],
+                                    (wid * 16 + lane_n, (None, kt * 4 + lane_m_base)),
+                                )
                             )
                         )
                         fx.copy(
@@ -1058,7 +1079,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         fx.gemm(
                             tiled_mma,
                             frag_h_accs[kb],
-                            frag_k[None, None, kt],
+                            frag_k[kb][None, None, kt],
                             frag_gv[None, None, kt],
                             frag_h_accs[kb],
                         )
@@ -1081,19 +1102,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         wvec_pf.shuffle(wvec_pf, [4, 5, 6, 7]),
                     )
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    kp_pbase = kb * LDS_KP_PANEL_ELEMS
                     kvec_t0_pf = k_next_vecs_t0[kb]
                     kvec_t1_pf = k_next_vecs_t1[kb]
                     for i in range_constexpr(LOAD_VEC_WIDTH):
                         row_i = k_row_base_pf + i
-                        byte_off = _k_panel_rotating_pair_addr_bytes(
-                            row_i, k_pair_col_pf
-                        )
-                        elem_off = byte_off >> 1
-                        fx.ptr_store(kvec_t0_pf[i], lds_kp_ptr + (kp_pbase + elem_off))
-                        fx.ptr_store(
-                            kvec_t1_pf[i],
-                            lds_kp_ptr + (kp_pbase + elem_off + 1),
+                        _k_panel_store_pair(
+                            kb, row_i, k_pair_col_pf, kvec_t0_pf[i], kvec_t1_pf[i]
                         )
 
             results = yield [
