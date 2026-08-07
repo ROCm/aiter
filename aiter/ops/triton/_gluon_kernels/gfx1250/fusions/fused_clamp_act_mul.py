@@ -90,20 +90,22 @@ def _fused_clamp_silu_mul_kernel(
     gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_smem.index(0))
     gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, n_half], up_smem.index(0))
 
-    # 1D layouts for rows, 2D layouts give bad perf and buffer_load is not good for perf with llvm currently
-    # TDM is more efficient than regular load
-    row_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
-        threads_per_warp=[32],
-        warps_per_cta=[num_warps], # warps per thread block
-        order=[0],
+    # 2D parent layouts over a [1, BLOCK_SIZE_N] tile; the 1D row/scale layouts are
+    # slices of them, so each TDM row loads into a SliceLayout of the tile.
+    gLayout2D: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
+        threads_per_warp=[1, 32],
+        warps_per_cta=[1, num_warps],                                   # warps per thread block
+        order=[1, 0],
     )
-    row_scale_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[max(1, NUM_N_Q_GROUPS // (num_warps * 32))], # scale group over lanes, floor 1
-        threads_per_warp=[32],
-        warps_per_cta=[num_warps],
-        order=[0],
+    sLayout2D: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, max(1, NUM_N_Q_GROUPS // (num_warps * 32))], # scale group over lanes, floor 1
+        threads_per_warp=[1, 32],
+        warps_per_cta=[1, num_warps],
+        order=[1, 0],
     )
+    row_layout: gl.constexpr = gl.SliceLayout(0, gLayout2D)         # [BLOCK_SIZE_N] row slice
+    row_scale_layout: gl.constexpr = gl.SliceLayout(0, sLayout2D)   # [NUM_N_Q_GROUPS] scale slice
 
     # setup + setup store
     offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)
