@@ -41,7 +41,9 @@ _U32_LIMIT = 1 << 32
 _REF_KV_CHUNK = 8192
 
 
-def kv_byte_extent(seqlen: int, dq: int, dv: int, elem_size: int = 2) -> tuple[int, int]:
+def kv_byte_extent(
+    seqlen: int, dq: int, dv: int, elem_size: int = 2
+) -> tuple[int, int]:
     k_bytes = seqlen * dq * elem_size
     v_bytes = seqlen * dv * elem_size
     return k_bytes, v_bytes
@@ -126,7 +128,9 @@ def _flops_bytes(S, nheads, nheads_k, dq, dv, causal, elem_size):
 
 
 @benchmark()
-def test_mha_varlen_large_kv(nheads, gqa_ratio, seqlen, causal, dq, dv, check_rows, seed):
+def test_mha_varlen_large_kv(
+    nheads, gqa_ratio, seqlen, causal, dq, dv, check_rows, seed
+):
     assert nheads % gqa_ratio == 0
     nheads_k = nheads // gqa_ratio
     S = seqlen
@@ -143,9 +147,9 @@ def test_mha_varlen_large_kv(nheads, gqa_ratio, seqlen, causal, dq, dv, check_ro
 
     k_bytes, v_bytes = kv_byte_extent(S, dq, dv, q.element_size())
     backend = expect_backend(S, dq, dv)
-    assert backend == "opus", (
-        f"S={S}: KV k={k_bytes} v={v_bytes} < 4GiB; use -s >= ~11185853 for opus"
-    )
+    assert (
+        backend == "opus"
+    ), f"S={S}: KV k={k_bytes} v={v_bytes} < 4GiB; use -s >= ~11185853 for opus"
     flops, nbytes = _flops_bytes(S, nheads, nheads_k, dq, dv, causal, q.element_size())
 
     candidates = {
@@ -261,10 +265,20 @@ def main():
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
-            aiter.logger.warning("hd192 large-kv path is bf16-only; skipping dtype %s", dtype)
+            aiter.logger.warning(
+                "hd192 large-kv path is bf16-only; skipping dtype %s", dtype
+            )
             continue
         df = []
-        for (dq, dv), nheads, gqa_ratio, seqlen, causal, check_rows, seed in itertools.product(
+        for (
+            (dq, dv),
+            nheads,
+            gqa_ratio,
+            seqlen,
+            causal,
+            check_rows,
+            seed,
+        ) in itertools.product(
             args.d_qk_v,
             args.nheads,
             args.gqa_ratio,
