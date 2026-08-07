@@ -30,6 +30,7 @@ from .kernels.pa_decode_gfx1250 import (
     compile_pa_decode_main,
     compile_pa_decode_reduce,
 )
+from .kernels.tensor_shim import _run_compiled
 
 _DEFAULT_PARTITION_SIZE = 256
 _DEFAULT_KV_COMPUTE_BLOCK_SIZE = 64
@@ -52,6 +53,7 @@ def flydsl_paged_attention_decode(
     seq_lens: torch.Tensor,
     attn_scale: float,
     *,
+    max_seq_len: int,
     partition_size: int = _DEFAULT_PARTITION_SIZE,
     kv_compute_block_size: int = _DEFAULT_KV_COMPUTE_BLOCK_SIZE,
     stream: torch.cuda.Stream | None = None,
@@ -66,6 +68,7 @@ def flydsl_paged_attention_decode(
         block_tables: [num_seqs, max_num_blocks_per_seq], int32.
         seq_lens: [num_seqs], int32.
         attn_scale: Softmax scale (usually 1/sqrt(head_size)).
+        max_seq_len: Maximum value in ``seq_lens``.
         partition_size: Number of KV tokens per partition. Must be a multiple of
             ``kv_compute_block_size``.
         kv_compute_block_size: Number of KV tokens handled per loop iteration. Must
@@ -204,8 +207,7 @@ def flydsl_paged_attention_decode(
     if not seq_lens.is_contiguous():
         raise ValueError("seq_lens must be contiguous")
 
-    max_seq_len = int(seq_lens.max().item()) if num_seqs > 0 else 0
-    if max_seq_len == 0:
+    if num_seqs == 0 or max_seq_len == 0:
         output.zero_()
         return output
 
@@ -263,7 +265,8 @@ def flydsl_paged_attention_decode(
         )
 
         # Launch main kernel. Flatten tensors to 1D views the kernels can index.
-        main_launch(
+        _run_compiled(
+            main_launch,
             tmp_out.view(-1),
             max_logits.view(-1),
             exp_sums.view(-1),
@@ -280,7 +283,8 @@ def flydsl_paged_attention_decode(
             stream,
         )
 
-        reduce_launch(
+        _run_compiled(
+            reduce_launch,
             output.view(-1),
             tmp_out.view(-1),
             max_logits.view(-1),

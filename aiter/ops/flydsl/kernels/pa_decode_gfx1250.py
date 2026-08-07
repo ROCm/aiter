@@ -36,6 +36,8 @@ BLOCKS_PER_COMPUTE TDM ops DMA each block into its sub-slice of the K/V LDS
 stage. 2-stage double buffer overlaps the next tile's loads with current compute.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -44,7 +46,6 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     gpu,
     math as fmath,
     range_constexpr,
@@ -52,10 +53,11 @@ from flydsl.expr import (
     tdm_ops,
 )
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.typing import T
-from flydsl.expr.vector import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def _build_v4i32_buffer_rsrc(tensor, num_records_bytes=0xFFFFFFFF, arch=None):
@@ -174,6 +176,7 @@ WMMA_K = 32
 LDS_PAD_ELEMS = 8  # in bf16/f16 elements (= 16 bytes)
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_pa_decode_main(
     *,
     HEAD_SIZE: int = 128,
@@ -911,6 +914,7 @@ def compile_pa_decode_main(
 # ============================================================================
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_pa_decode_reduce(
     *,
     HEAD_SIZE: int = 128,

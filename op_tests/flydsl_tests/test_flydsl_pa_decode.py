@@ -210,6 +210,7 @@ def test_flydsl_pa_decode(
         block_tables,
         seq_lens,
         attn_scale,
+        max_seq_len=seq_len,
         partition_size=partition_size,
         kv_compute_block_size=kv_compute_block_size,
     )
