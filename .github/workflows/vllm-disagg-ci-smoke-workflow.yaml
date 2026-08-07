@@ -46,6 +46,7 @@ env:
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
   SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  AITER_GPU_ARCHS: gfx950
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-whl-${{ github.run_id }}
 
 jobs:
@@ -94,6 +95,7 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             -e AITER_USE_SYSTEM_TRITON=1 \
+            -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
             "${BASE_IMAGE}" \
             bash -lc '
               set -euo pipefail
@@ -109,6 +111,7 @@ jobs:
               pip install --upgrade "ninja>=1.11.1"
               pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
               pip install tabulate
+              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}"
               python setup.py bdist_wheel
               ls -lh dist/*.whl
             '
@@ -283,7 +286,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels
+          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
 
       - name: Show runner and Slurm state
         run: |
@@ -333,9 +336,11 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          wheels=("${GITHUB_WORKSPACE}"/aiter_wheels/*.whl)
+          wheel_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
+          wheels=("${wheel_dir}"/*.whl)
           if [[ "${#wheels[@]}" -ne 1 ]]; then
-            echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
+            echo "Expected exactly one AITER wheel in ${wheel_dir}, found ${#wheels[@]}" >&2
+            find "${wheel_dir}" -maxdepth 1 -type f -printf '%f\n' >&2 || true
             exit 1
           fi
 
@@ -367,6 +372,7 @@ jobs:
               local overlay="${AITER_OVERLAY_DIR:-/tmp/aiter_overlay}"
               rm -rf "${overlay}"
               mkdir -p "${overlay}"
+              export GPU_ARCHS="gfx950"
               python3 -m pip install --disable-pip-version-check \
                   --target "${overlay}" "${wheels[0]}"
               export PYTHONPATH="${overlay}${PYTHONPATH:+:${PYTHONPATH}}"
