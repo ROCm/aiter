@@ -126,6 +126,7 @@ def _gemm1_body(
     b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
     N_REPS = BN // 64
+    B_SCALE_REPS = 1 if interleave and BN == 128 else 2
 
     mem_1x1 = fx.make_layout(1, 1)
     mem_4x1 = fx.make_layout(4, 1)
@@ -226,7 +227,7 @@ def _gemm1_body(
             np_gate = n_block_idx * fx.Int32(BN // 64) + wave
         np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
-    for mw in range_constexpr(2):
+    for mw in range_constexpr(B_SCALE_REPS):
         base = (
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
@@ -1103,7 +1104,6 @@ def compile_gemm1_a4w4_port(
     assert (
         BN in (128, 256) and BK == 256
     ), f"only BN in (128, 256) and BK==256 supported, got BN={BN} BK={BK}"
-    assert BN == 256 or not interleave, "BN=128 only supports separated gate/up layout"
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     assert (
         D_HIDDEN % BK == 0
