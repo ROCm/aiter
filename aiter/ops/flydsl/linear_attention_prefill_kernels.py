@@ -109,19 +109,45 @@ _GFX942_MIN_FILL = 0.50
 # fixed by the K1-K3 pipeline that produces w/u, and everything else is derived.
 # So a variant tag is just the tile size. ``auto`` is not a registered tag --
 # it is the sentinel meaning "defer to _heuristic_bv for this shape".
-K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES)
+#
+# A second axis was added on gfx942: ``w<N>`` = the number of waves in the
+# workgroup. The default (4) is the historical kernel. Wider workgroups split
+# the N_REPEAT (V) axis across waves, which multiplies RESIDENT waves per CU --
+# LDS pins gfx942 to one workgroup per CU, so a 4-wave block is 1 wave/SIMD and
+# cannot hide HBM latency. See docs/gdn_k5_algorithmic_comparison.md §9.
+# ``bv32`` is shorthand for ``bv32w4``.
+_WAVE_CANDIDATES = (4, 8, 16)
+K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES) + tuple(
+    f"bv{b}w{w}"
+    for b in _BV_CANDIDATES
+    for w in _WAVE_CANDIDATES
+    # NR_SPLIT = w/4 must divide N_REPEAT = b/16
+    if w > 4 and (b // 16) % (w // 4) == 0
+)
 K5_DEFAULT_VARIANT = "auto"
 _K5_VARIANT_ENV = "FLYDSL_GDN_K5_VARIANT"
 
 
 def _bv_of_variant(tag: str) -> int:
-    """``"bv64"`` -> ``64``. Raises ValueError on an unknown tag."""
+    """``"bv64"`` -> ``64``, ``"bv64w16"`` -> ``64``."""
+    return _bv_waves_of_variant(tag)[0]
+
+
+def _bv_waves_of_variant(tag: str) -> tuple[int, int]:
+    """``"bv64w16"`` -> ``(64, 16)``; ``"bv32"`` -> ``(32, 4)``.
+
+    Raises ValueError on an unknown tag.
+    """
     if tag not in K5_VARIANTS:
         raise ValueError(
             f"unknown GDN K5 variant {tag!r}; available: {list(K5_VARIANTS)} "
             f"(or {K5_DEFAULT_VARIANT!r} for shape-adaptive selection)"
         )
-    return int(tag[2:])
+    body = tag[2:]
+    if "w" in body:
+        bv_s, w_s = body.split("w")
+        return int(bv_s), int(w_s)
+    return int(body), 4
 
 
 def _auto_variant(**kw) -> str:
@@ -332,6 +358,7 @@ def _get_or_compile(
     wu_contig,
     state_bf16=False,
     g_log2_scaled=False,
+    num_waves=4,
 ):
     cache_key = (
         K,
@@ -349,6 +376,7 @@ def _get_or_compile(
         wu_contig,
         state_bf16,
         g_log2_scaled,
+        num_waves,
     )
     if cache_key not in _compiled_kernels:
         _compile_kwargs = dict(
@@ -369,12 +397,18 @@ def _get_or_compile(
             G_IS_LOG2_SCALED=g_log2_scaled,
         )
         if _ARCH == "gfx950":
+            if num_waves != 4:
+                raise ValueError(
+                    "the wave-widening variant axis (w8/w16) is gfx942-only; "
+                    f"got num_waves={num_waves} on {_ARCH}"
+                )
             _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
                 **_compile_kwargs
             )
         elif _ARCH == "gfx942":
+            # NR_SPLIT = waves / (BT/16); BT/16 = 4 waves is the historical block.
             _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
-                **_compile_kwargs
+                **_compile_kwargs, NR_SPLIT=num_waves // (BT // 16)
             )
         else:
             raise ValueError(
@@ -638,7 +672,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # Resolve BV. Priority: explicit ``variant=`` > FLYDSL_GDN_K5_VARIANT env >
     # the rule-based grid/CU heuristic. Passing variant=None (the default) keeps
     # the historical behaviour exactly.
-    BV = _bv_of_variant(
+    BV, num_waves = _bv_waves_of_variant(
         _resolve_variant(
             variant,
             H=H,
@@ -666,6 +700,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         wu_contiguous,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
+        num_waves=num_waves,
     )
     _launch_kernel(
         launch_fn,

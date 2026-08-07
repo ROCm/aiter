@@ -116,6 +116,7 @@ def compile_chunk_gated_delta_h_gfx942(
     WU_CONTIGUOUS: bool = True,
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
+    NR_SPLIT: int = 1,
 ):
     """Build the gfx942 GDN K5 launcher for one compile-time configuration.
 
@@ -137,14 +138,45 @@ def compile_chunk_gated_delta_h_gfx942(
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
 
     WARP_SIZE = 64
-    NUM_WARPS = 4
-    BLOCK_THREADS = NUM_WARPS * WARP_SIZE
 
     WMMA_N = 16
     WMMA_K = 16  # gfx942: K=16
     N_REPEAT = BV // WMMA_N
 
-    NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
+    # -- Wave decomposition (NR_SPLIT: the "wave widening" axis) --
+    # A wave is identified by (wid_m, wid_n):
+    #   wid_m in [0, M_WAVES)  -- the BT tile for GEMM1 / the K tile for GEMM2.
+    #                             This is the ONLY axis the original kernel had,
+    #                             and BT=64 pins it to 4.
+    #   wid_n in [0, NR_SPLIT) -- a slice of the N_REPEAT (V) axis. Each wave
+    #                             owns N_REPEAT_LOCAL of the N_REPEAT column
+    #                             tiles instead of looping over all of them.
+    #
+    # Why: LDS (38-56 KiB) allows only ONE workgroup per CU on gfx942's 64 KiB,
+    # so a CU holds NUM_WARPS waves and no more. With NUM_WARPS=4 that is 1
+    # wave/SIMD, far too little to hide HBM latency in a kernel that is
+    # memory-bound at ~33% of peak. Splitting the V axis across waves multiplies
+    # resident waves by NR_SPLIT at ZERO extra HBM traffic and identical CU
+    # coverage: LDS depends only on BV, and each wave's share of the h
+    # accumulators (and hence its VGPR footprint) shrinks by the same factor.
+    #
+    # NR_SPLIT=1 reproduces the original 4-wave kernel exactly.
+    M_WAVES = BT // 16
+    assert N_REPEAT % NR_SPLIT == 0, (
+        f"NR_SPLIT={NR_SPLIT} must divide N_REPEAT={N_REPEAT} (=BV/16); "
+        f"BV={BV} supports NR_SPLIT in "
+        f"{[s for s in (1, 2, 4, 8) if N_REPEAT % s == 0]}"
+    )
+    N_REPEAT_LOCAL = N_REPEAT // NR_SPLIT
+    NUM_WARPS = M_WAVES * NR_SPLIT
+    BLOCK_THREADS = NUM_WARPS * WARP_SIZE
+    assert BLOCK_THREADS <= 1024, (
+        f"BLOCK_THREADS={BLOCK_THREADS} exceeds the gfx942 workgroup limit "
+        f"(1024); reduce NR_SPLIT."
+    )
+
+    # Per-wave accumulators: only this wave's slice of the N_REPEAT axis.
+    NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
 
     # -- LDS layout --
     # All four buffers use the same GROUP-MAJOR + XOR scheme (see _grp_idx in the
@@ -196,6 +228,15 @@ def compile_chunk_gated_delta_h_gfx942(
     LDS_H_NG = K // 4
     LDS_H_ELEMS = BV * K  # BV rows of V per CTA, no padding
 
+    # The LDS->HBM snapshot drain walks BV*LDS_H_NG groups BLOCK_THREADS at a
+    # time, so the block must tile it. This holds for every legal NR_SPLIT
+    # (BLOCK_THREADS = 256*NR_SPLIT <= 16*BV, and BV*LDS_H_NG = 32*BV), but
+    # assert it rather than rely on the algebra.
+    assert (BV * LDS_H_NG) % BLOCK_THREADS == 0, (
+        f"h snapshot drain ({BV * LDS_H_NG} groups) must tile "
+        f"BLOCK_THREADS={BLOCK_THREADS}"
+    )
+
     @fx.struct
     class SharedStorage:
         lds_w: fx.Array[fx.BFloat16, LDS_W_ELEMS, 16]
@@ -204,10 +245,40 @@ def compile_chunk_gated_delta_h_gfx942(
         lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
 
     # Cooperative load parameters (bf16x8 = dwordx4)
+    #
+    # Two decompositions of the [BT, K] w tile:
+    #
+    #  * BATCHED (the historical one): thread -> (k-block, row-batch), giving
+    #    each thread NUM_K_BLOCKS x NUM_LOAD_BATCHES_64 slots that pair 2 rows
+    #    with 2 k-blocks. Kept verbatim wherever it is still valid: switching
+    #    BV=64 to the linear mapping below measured 19% slower on shape 6
+    #    (283 -> 340 us) at an essentially unchanged VGPR count (240 vs 242).
+    #    The mapping decides which (row, grp) each thread writes to lds_w, and
+    #    hence the bank pattern of the XOR swizzle that 3e tuned to the conflict
+    #    floor -- so a "harmless" reindex silently reintroduces bank conflicts.
+    #    Any change here must be re-checked against the swizzle, not just the
+    #    coalescing.
+    #  * LINEAR: slot s = i*BLOCK_THREADS + tid over the whole tile. Needed once
+    #    BLOCK_THREADS > BT * THREADS_PER_ROW_64, where the batched form divides
+    #    BT by a rows-per-batch larger than BT and silently yields 0 batches.
+    #
+    # Both give W_THREADS_PER_ROW-consecutive tids one contiguous row segment,
+    # so global coalescing is equivalent; only the register live-ranges differ.
     LOAD_VEC_WIDTH = 8
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
-    ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
-    NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
+    ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64
+    W_BATCHED = ROWS_PER_BATCH_64 <= BT and BT % ROWS_PER_BATCH_64 == 0
+    NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64 if W_BATCHED else 0
+
+    W_THREADS_PER_ROW = K // LOAD_VEC_WIDTH  # 16 for K=128
+    W_SLOTS = BT * W_THREADS_PER_ROW  # 1024 for BT=64, K=128
+    assert W_SLOTS % BLOCK_THREADS == 0, (
+        f"w tile ({W_SLOTS} vec{LOAD_VEC_WIDTH} slots) must tile "
+        f"BLOCK_THREADS={BLOCK_THREADS}"
+    )
+    W_LOADS_PER_THREAD = (
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64 if W_BATCHED else W_SLOTS // BLOCK_THREADS
+    )
 
     K_STEPS_PER_BLOCK = 64 // WMMA_K  # 4
     BT_STEPS = BT // WMMA_K  # 4
@@ -220,7 +291,13 @@ def compile_chunk_gated_delta_h_gfx942(
     # k-cols: then for each k-col the 4 values are one bt-group, so an in-register
     # transpose turns 8 scalar writes into one packed ds_write_b64 each.
     # A "slot" is one (row-quad, k-col-group) pair; each slot is 4 vec8 loads.
-    K_COL_GROUPS = K // LOAD_VEC_WIDTH
+    # The per-thread k vector width shrinks as the block widens, so that the
+    # (row-quad, k-col-group) slots keep tiling the block exactly. The ROW QUAD
+    # stays 4 regardless -- that is what makes the transposed store a packed
+    # ds_write_b64 -- so widening the block costs load width, not LDS width.
+    #   256 thr -> vec8 (dwordx4) | 512 thr -> vec4 (dwordx2) | 1024 thr -> vec2
+    K_VEC_WIDTH = min(LOAD_VEC_WIDTH, max(2, (BT // 4) * K // BLOCK_THREADS))
+    K_COL_GROUPS = K // K_VEC_WIDTH
     K_ROW_QUADS = BT // 4
     K_XPOSE_SLOTS = K_ROW_QUADS * K_COL_GROUPS
     # Only take this path when the slots tile the block exactly (true for K=128
@@ -229,7 +306,17 @@ def compile_chunk_gated_delta_h_gfx942(
     K_SLOTS_PER_THREAD = K_XPOSE_SLOTS // BLOCK_THREADS if K_PACKED_XPOSE else 0
     K_ROW_QUAD_STRIDE = BLOCK_THREADS // K_COL_GROUPS if K_PACKED_XPOSE else 0
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_vk")
+    # known_block_size is REQUIRED once BLOCK_THREADS > 256 (the AMDGPU default
+    # max_flat_workgroup_size), but must NOT be declared at 256: it raises the
+    # backend's per-wave register budget, and at BV=64 that lets the allocator
+    # go from 152 to 242 VGPRs, which measured 19% slower on shape 6 (286 ->
+    # 340 us). Leaving the default in place at 4 waves keeps the historical
+    # codegen bit-for-bit.
+    _kernel_deco_kwargs = (
+        {} if BLOCK_THREADS == 256 else {"known_block_size": [BLOCK_THREADS, 1, 1]}
+    )
+
+    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_vk", **_kernel_deco_kwargs)
     def gdn_h_kernel(
         k_tensor: fx.Tensor,
         v_tensor: fx.Tensor,
@@ -254,6 +341,26 @@ def compile_chunk_gated_delta_h_gfx942(
         tid = fx.thread_idx.x
         wid = tid // fx.Int32(WARP_SIZE)
         lane = tid % fx.Int32(WARP_SIZE)
+
+        # Wave split (see NR_SPLIT above). wid_m keeps the original role (BT tile
+        # for GEMM1, K tile for GEMM2); wid_n selects this wave's slice of the
+        # N_REPEAT (V) axis. At NR_SPLIT == 1 wid_n is identically 0 and wid_m is
+        # wid, so the generated code is unchanged from the 4-wave kernel.
+        if const_expr(NR_SPLIT == 1):
+            wid_m = wid
+        else:
+            wid_m = wid % fx.Int32(M_WAVES)
+        wid_n = wid // fx.Int32(M_WAVES)
+
+        def _nr_v(nr_local):
+            """V-offset (in elements) of this wave's local column tile ``nr_local``.
+
+            Global tile index is ``wid_n * N_REPEAT_LOCAL + nr_local``; returns
+            that times 16. Compile-time constant when NR_SPLIT == 1.
+            """
+            if const_expr(NR_SPLIT == 1):
+                return fx.Int32(nr_local * 16)
+            return wid_n * fx.Int32(N_REPEAT_LOCAL * 16) + fx.Int32(nr_local * 16)
 
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
         v_ = GTensor(v_tensor, dtype=T.bf16, shape=(-1,))
@@ -322,14 +429,32 @@ def compile_chunk_gated_delta_h_gfx942(
             return _grp_idx(v_local, bt_grp, BT, LDS_VNT_NG)
 
         # -- Cooperative load decomposition --
-        load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
-        load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
+        # See W_BATCHED above: the batched form is the historical mapping and is
+        # preserved wherever valid; the linear form only kicks in at 1024 threads.
+        if const_expr(W_BATCHED):
+            load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
+            load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(
+                LOAD_VEC_WIDTH
+            )
+
+            def _w_slot(i_load):
+                kb, batch = divmod(i_load, NUM_LOAD_BATCHES_64)
+                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                return row, fx.Int32(kb * 64) + load_col_base
+
+        else:
+
+            def _w_slot(i_load):
+                s = fx.Int32(i_load * BLOCK_THREADS) + tid
+                row = s // fx.Int32(W_THREADS_PER_ROW)
+                col_grp = s % fx.Int32(W_THREADS_PER_ROW)
+                return row, col_grp * fx.Int32(LOAD_VEC_WIDTH)
 
         # k uses its own mapping so the transpose store can be packed: thread ->
         # (row-quad, k-col-group). Consecutive tids walk k-col groups, so a full
         # K-row is covered by K_COL_GROUPS consecutive threads (contiguous HBM).
         if const_expr(K_PACKED_XPOSE):
-            kx_col_base = (tid % fx.Int32(K_COL_GROUPS)) * fx.Int32(LOAD_VEC_WIDTH)
+            kx_col_base = (tid % fx.Int32(K_COL_GROUPS)) * fx.Int32(K_VEC_WIDTH)
             kx_row_quad = tid // fx.Int32(K_COL_GROUPS)
 
         # -- Prologue: compute bos, T_local, NT, boh --
@@ -386,7 +511,7 @@ def compile_chunk_gated_delta_h_gfx942(
         acc_zero = fx.full(4, 0.0, fx.Float32)
         h_accs = []
         for _kb in range_constexpr(NUM_K_BLOCKS):
-            for _nr in range_constexpr(N_REPEAT):
+            for _nr in range_constexpr(N_REPEAT_LOCAL):
                 h_accs.append(acc_zero)
 
         # -- Load initial state if provided --
@@ -394,32 +519,31 @@ def compile_chunk_gated_delta_h_gfx942(
         #                              k = kb*64 + wid*16 + lane_m_base*4 + e]
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    h0_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    h0_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     h0_row_base = (
                         fx.Int32(kb * 64)
-                        + wid * fx.Int32(16)
+                        + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                     )
                     h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
                     loaded_vec = h0_.vec_load((fx.Int64(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
-                    acc_idx = kb * N_REPEAT + nr
+                    acc_idx = kb * N_REPEAT_LOCAL + nr
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
-        NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_W_LOADS = W_LOADS_PER_THREAD
 
         # -- Prologue: pre-load first chunk's w data --
         i_t0_i32 = fx.Int32(0)
         w_prefetch_init = []
-        for kb in range_constexpr(NUM_K_BLOCKS):
-            for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                abs_row = i_t0_i32 * fx.Int32(BT) + row
-                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                g_off = w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
+        for i_load in range_constexpr(W_LOADS_PER_THREAD):
+            row, col = _w_slot(i_load)
+            abs_row = i_t0_i32 * fx.Int32(BT) + row
+            safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+            g_off = w_base + safe_row * stride_w + col
+            w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
 
         init_state = [_to_raw(v) for v in h_accs] + [
             _to_raw(v) for v in w_prefetch_init
@@ -440,13 +564,12 @@ def compile_chunk_gated_delta_h_gfx942(
             # hotter A-frag read (below) conflict-free, and matches what the HIP
             # reference does for its w panels.
             w_prefetch_lds_all = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    grp = fx.Int32(kb * (64 // 4)) + load_col_base // fx.Int32(4)
-                    w_prefetch_lds_all.append(
-                        (_lds_w_idx(row, grp), _lds_w_idx(row, grp + fx.Int32(1)))
-                    )
+            for i_load in range_constexpr(W_LOADS_PER_THREAD):
+                row, col = _w_slot(i_load)
+                grp = col // fx.Int32(4)
+                w_prefetch_lds_all.append(
+                    (_lds_w_idx(row, grp), _lds_w_idx(row, grp + fx.Int32(1)))
+                )
 
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
             # h_accs element e = h[v_local = nr*16 + lane_n, k = kb*64 + wid*16 +
@@ -454,11 +577,11 @@ def compile_chunk_gated_delta_h_gfx942(
             # k-group, so the whole f32x4 accumulator packs into a single bf16x4
             # (one ds_write_b64) instead of 4 scalar ds_write_b16.
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + nr
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    acc_idx = kb * N_REPEAT_LOCAL + nr
                     acc_val = h_accs_in[acc_idx]
-                    lds_h_v = fx.Int32(nr * 16) + lane_n
-                    lds_h_g = fx.Int32(kb * 16) + wid * fx.Int32(4) + lane_m_base
+                    lds_h_v = _nr_v(nr) + lane_n
+                    lds_h_g = fx.Int32(kb * 16) + wid_m * fx.Int32(4) + lane_m_base
                     fx.ptr_store(
                         _to_bf16_fast(acc_val, 4),
                         lds_h_ptr + _lds_h_idx(lds_h_v, lds_h_g),
@@ -517,30 +640,22 @@ def compile_chunk_gated_delta_h_gfx942(
                         safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                         k_off = k_base + safe_row * stride_k + kx_col_base
                         quad_rows.append(
-                            k_.vec_load((fx.Int64(k_off),), LOAD_VEC_WIDTH)
+                            k_.vec_load((fx.Int64(k_off),), K_VEC_WIDTH)
                         )
                     k_prefetch.append(quad_rows)
                     k_prefetch_lds_t.append(row_quad)
             else:
-                for kb in range_constexpr(NUM_K_BLOCKS):
-                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                        row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                        abs_row = i_t_i32 * fx.Int32(BT) + row
-                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                        k_off = (
-                            k_base
-                            + safe_row * stride_k
-                            + fx.Int32(kb * 64)
-                            + load_col_base
-                        )
-                        k_prefetch.append(
-                            k_.vec_load((fx.Int64(k_off),), LOAD_VEC_WIDTH)
-                        )
-                        # this vec holds k[row, kb*64 + load_col_base + (0..7)];
-                        # store each element transposed to lds_kt[kcol, row].
-                        k_prefetch_lds_t.append(
-                            (row, fx.Int32(kb * 64) + load_col_base)
-                        )
+                for i_load in range_constexpr(W_LOADS_PER_THREAD):
+                    row, col = _w_slot(i_load)
+                    abs_row = i_t_i32 * fx.Int32(BT) + row
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    k_off = k_base + safe_row * stride_k + col
+                    k_prefetch.append(
+                        k_.vec_load((fx.Int64(k_off),), LOAD_VEC_WIDTH)
+                    )
+                    # this vec holds k[row, col + (0..7)]; store each element
+                    # transposed to lds_kt[kcol, row].
+                    k_prefetch_lds_t.append((row, col))
 
             # last_idx for gating
             next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
@@ -556,7 +671,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 for elem_i in range_constexpr(4):
                     abs_row = (
                         i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
+                        + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                         + fx.Int32(elem_i)
                     )
@@ -573,7 +688,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     for elem_i in range_constexpr(4):
                         global_k = (
                             fx.Int32(kb * 64)
-                            + wid * fx.Int32(16)
+                            + wid_m * fx.Int32(16)
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
@@ -582,12 +697,12 @@ def compile_chunk_gated_delta_h_gfx942(
                     gk_last_prefetch.append(kb_elems)
 
             u_prefetch = []
-            for nr in range_constexpr(N_REPEAT):
-                u_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+            for nr in range_constexpr(N_REPEAT_LOCAL):
+                u_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                 for elem_i in range_constexpr(4):
                     u_bt_row_raw = (
                         i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
+                        + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                         + fx.Int32(elem_i)
                     )
@@ -603,24 +718,24 @@ def compile_chunk_gated_delta_h_gfx942(
             #   transposed access = 4 contiguous k for fixed v (since lds_h is
             #   [v, k] with k contiguous, a run over k IS contiguous).
             bv_accs = []
-            for _nr in range_constexpr(N_REPEAT):
+            for _nr in range_constexpr(N_REPEAT_LOCAL):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
                     # w A-frag: 4 bf16 K-elems for this lane's BT row.
                     # A[m=BT row=wid*16+lane_n, k=kb*64+ks*16 + lane_m_base*4 + e]
-                    w_row = wid * fx.Int32(16) + lane_n
+                    w_row = wid_m * fx.Int32(16) + lane_n
                     w_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
                     a_frag = fx.ptr_load(
                         lds_w_ptr + _lds_w_idx(w_row, w_g), result_type=v4bf16_type
                     )
 
-                    for nr in range_constexpr(N_REPEAT):
+                    for nr in range_constexpr(N_REPEAT_LOCAL):
                         # h B-frag: B[k=kb*64+ks*16 + lane_m_base*4 + e, n=V=nr*16+lane_n]
                         # The 4 k-elements are exactly one k-group, so the whole
                         # fragment is a single ds_read_b64.
-                        h_v = fx.Int32(nr * 16) + lane_n
+                        h_v = _nr_v(nr) + lane_n
                         h_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
                         b_frag = fx.ptr_load(
                             lds_h_ptr + _lds_h_idx(h_v, h_g), result_type=v4bf16_type
@@ -629,7 +744,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- v_new = u - bv --
             vn_frags = []
-            for nr in range_constexpr(N_REPEAT):
+            for nr in range_constexpr(N_REPEAT_LOCAL):
                 bv_val = bv_accs[nr]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
@@ -650,7 +765,7 @@ def compile_chunk_gated_delta_h_gfx942(
             for elem_i in range_constexpr(4):
                 bt_row = (
                     i_t_i32 * fx.Int32(BT)
-                    + wid * fx.Int32(16)
+                    + wid_m * fx.Int32(16)
                     + lane_m_base * fx.Int32(4)
                     + fx.Int32(elem_i)
                 )
@@ -659,7 +774,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
                 )
             row_mask_vec = fx.Vector.from_elements(row_mask_elems, dtype=fx.Float32)
-            for nr in range_constexpr(N_REPEAT):
+            for nr in range_constexpr(N_REPEAT_LOCAL):
                 vn_frags[nr] = vn_frags[nr] * row_mask_vec
 
             # -- 2b. Store v_new (pre-gating) for output --
@@ -668,13 +783,13 @@ def compile_chunk_gated_delta_h_gfx942(
                 def _emit_vn_store(off, value):
                     vn_[fx.Int64(off)] = value
 
-                for nr in range_constexpr(N_REPEAT):
+                for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_val = vn_frags[nr]
-                    vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                    vn_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
                         vn_bt_row = (
                             i_t_i32 * fx.Int32(BT)
-                            + wid * fx.Int32(16)
+                            + wid_m * fx.Int32(16)
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
@@ -693,12 +808,12 @@ def compile_chunk_gated_delta_h_gfx942(
                     gate = _fast_exp(g_last_val - g_row)
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
-                for nr in range_constexpr(N_REPEAT):
+                for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
                 exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    for nr in range_constexpr(N_REPEAT):
-                        acc_idx = kb * N_REPEAT + nr
+                    for nr in range_constexpr(N_REPEAT_LOCAL):
+                        acc_idx = kb * N_REPEAT_LOCAL + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_vec
 
             if const_expr(USE_GK):
@@ -707,8 +822,8 @@ def compile_chunk_gated_delta_h_gfx942(
                         [gk_last_prefetch[kb][elem_i] for elem_i in range_constexpr(4)],
                         dtype=fx.Float32,
                     )
-                    for nr in range_constexpr(N_REPEAT):
-                        acc_idx = kb * N_REPEAT + nr
+                    for nr in range_constexpr(N_REPEAT_LOCAL):
+                        acc_idx = kb * N_REPEAT_LOCAL + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
 
             # -- 4. State update: h += k^T @ v_new_gated --
@@ -717,9 +832,9 @@ def compile_chunk_gated_delta_h_gfx942(
             # BT row = wid*16 + lane_m_base*4 + e, V col = nr*16 + lane_n.
             # The 4 accumulator elements are 4 consecutive BT = one bt-group, so
             # the fragment packs into a single ds_write_b64.
-            for nr in range_constexpr(N_REPEAT):
-                vnt_v = fx.Int32(nr * 16) + lane_n
-                vnt_g = wid * fx.Int32(4) + lane_m_base
+            for nr in range_constexpr(N_REPEAT_LOCAL):
+                vnt_v = _nr_v(nr) + lane_n
+                vnt_g = wid_m * fx.Int32(4) + lane_m_base
                 fx.ptr_store(
                     _to_bf16_fast(vn_frags[nr], 4),
                     lds_vnt_ptr + _lds_vnt_idx(vnt_v, vnt_g),
@@ -733,7 +848,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 for s in range_constexpr(K_SLOTS_PER_THREAD):
                     quad_rows = k_prefetch[s]
                     row_quad = k_prefetch_lds_t[s]
-                    for e in range_constexpr(LOAD_VEC_WIDTH):
+                    for e in range_constexpr(K_VEC_WIDTH):
                         bt_grp = fx.Vector.from_elements(
                             [quad_rows[j][e] for j in range_constexpr(4)],
                             dtype=fx.BFloat16,
@@ -760,17 +875,12 @@ def compile_chunk_gated_delta_h_gfx942(
             # -- next iteration's w prefetch (batched) --
             next_i_t_i32 = i_t_i32 + fx.Int32(1)
             w_next_prefetch = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    abs_row = next_i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                    )
-                    w_next_prefetch.append(
-                        w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH)
-                    )
+            for i_load in range_constexpr(W_LOADS_PER_THREAD):
+                row, col = _w_slot(i_load)
+                abs_row = next_i_t_i32 * fx.Int32(BT) + row
+                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                g_off = w_base + safe_row * stride_w + col
+                w_next_prefetch.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             # A-frag (k): lane holds k[m=V head dim? no] -> k is [BT, K]; we want
@@ -782,22 +892,22 @@ def compile_chunk_gated_delta_h_gfx942(
                 for bt_s in range_constexpr(BT_STEPS):
                     # A-frag k: m = K row = kb*64 + wid*16 + lane_n,
                     #           contraction bt = bt_s*16 + lane_m_base*4 + e
-                    k_m = fx.Int32(kb * 64) + wid * fx.Int32(16) + lane_n
+                    k_m = fx.Int32(kb * 64) + wid_m * fx.Int32(16) + lane_n
                     k_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
                     k_a_frag = fx.ptr_load(
                         lds_kt_ptr + _lds_kt_idx(k_m, k_g), result_type=v4bf16_type
                     )
 
-                    for nr in range_constexpr(N_REPEAT):
+                    for nr in range_constexpr(N_REPEAT_LOCAL):
                         # B-frag v_new: n = V = nr*16 + lane_n,
                         #               contraction bt = bt_s*16 + lane_m_base*4 + e
-                        vn_v = fx.Int32(nr * 16) + lane_n
+                        vn_v = _nr_v(nr) + lane_n
                         vn_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
                         vn_b_frag = fx.ptr_load(
                             lds_vnt_ptr + _lds_vnt_idx(vn_v, vn_g),
                             result_type=v4bf16_type,
                         )
-                        acc_idx = kb * N_REPEAT + nr
+                        acc_idx = kb * N_REPEAT_LOCAL + nr
                         h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
                             k_a_frag, vn_b_frag, h_accs_in[acc_idx]
                         )
@@ -811,13 +921,13 @@ def compile_chunk_gated_delta_h_gfx942(
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + nr
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    acc_idx = kb * N_REPEAT_LOCAL + nr
                     acc_val = h_accs_final[acc_idx]
-                    ht_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                    ht_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     ht_row_base = (
                         fx.Int32(kb * 64)
-                        + wid * fx.Int32(16)
+                        + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                     )
                     ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
