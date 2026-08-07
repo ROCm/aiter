@@ -713,7 +713,6 @@ class _GFX1250BufferProxy:
 
 
 class CustomAllreduce:
-
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
@@ -796,9 +795,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
