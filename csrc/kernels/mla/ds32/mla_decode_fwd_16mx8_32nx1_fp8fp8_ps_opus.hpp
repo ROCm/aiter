@@ -989,9 +989,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // the last tile's scores sit in a buffer picked by the tile count's parity. Its LDS
     // slot and its mask were already handled by the phase (or by the prologue when the
     // request is a single tile).
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    // stage_end();
-    stage_end_2();
     // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
     // this part depends on the parity; keeping the V read and the PV outside the branch
     // is what keeps the 128-VGPR v_o off scratch -- inlining a compute_pv into both
