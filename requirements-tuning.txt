@@ -1,0 +1,3 @@
+# Optional dependencies for AI-assisted offline tuning tools.
+# Keep exact pins for reproducible tuning environments.
+openai==2.53.0

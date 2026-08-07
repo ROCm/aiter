@@ -5696,6 +5696,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
     XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 2, 4)
+    A4W4_INTERLEAVE_BNS: ClassVar[tuple[int, ...]] = (128,)
     STAGE1_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = ("gemm1_a4w4_port_",)
     STAGE2_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = (
         "mfma_moe2_",
@@ -5743,6 +5744,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         elif epilog == "nonatomic_cshuffle":
             name += "_cshuffle"
         return name
+
+    @classmethod
+    def _a4w4_interleave_options(cls, bn):
+        return (False, True) if bn in cls.A4W4_INTERLEAVE_BNS else (False,)
 
     @staticmethod
     def _mixed_g2_knames(sort_block_m, g1_xcd_swizzle):
@@ -5896,17 +5901,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 variant for variant in _SUPPORTED_BY_DTYPE["fp4"] if variant[0] == bm
             ):
                 for bn in (128, 256):
-                    for xcd_swizzle in self.XCD_SWIZZLES:
-                        kn1 = self._g1_kname(
-                            bm,
-                            bn,
-                            use_nt,
-                            inline_quant,
-                            xcd_swizzle,
-                            act=act,
-                            enable_bias=act == "swiglu",
-                        )
-                        cands.append(self._candidate_row(row, bm, kn1, locked_g2))
+                    for interleave in self._a4w4_interleave_options(bn):
+                        for xcd_swizzle in self.XCD_SWIZZLES:
+                            kn1 = self._g1_kname(
+                                bm,
+                                bn,
+                                use_nt,
+                                inline_quant,
+                                xcd_swizzle,
+                                act=act,
+                                interleave=interleave,
+                                enable_bias=act == "swiglu",
+                            )
+                            cands.append(self._candidate_row(row, bm, kn1, locked_g2))
             return cands
 
         for bm in sorted({v[0] for v in G1}):
@@ -5914,29 +5921,40 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 continue
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 for bn in (128, 256):
-                    for xcd_swizzle in self.XCD_SWIZZLES:
-                        kn1 = self._g1_kname(bm, bn, n1, iq1, xcd_swizzle)
-                        # (A) native mxmoe GEMM2 candidates.
-                        if bm in g2_bms:
-                            for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                                cands.append(
-                                    self._candidate_row(
-                                        row, bm, kn1, self._g2_kname(bm, n2, ep)
+                    for interleave in self._a4w4_interleave_options(bn):
+                        for xcd_swizzle in self.XCD_SWIZZLES:
+                            kn1 = self._g1_kname(
+                                bm,
+                                bn,
+                                n1,
+                                iq1,
+                                xcd_swizzle,
+                                interleave=interleave,
+                            )
+                            # (A) native mxmoe GEMM2 candidates.
+                            if bm in g2_bms:
+                                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                                    cands.append(
+                                        self._candidate_row(
+                                            row,
+                                            bm,
+                                            kn1,
+                                            self._g2_kname(bm, n2, ep),
+                                        )
                                     )
-                                )
-                        # (B) layout-API GEMM2 candidates. Only native
-                        # SBM==tile_m==bm variants are supported with this GEMM1.
-                        for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                            "fp4",
-                            "fp4",
-                            "bf16",
-                            bm,
-                            model_dim=int(row["model_dim"]),
-                            inter_dim=int(row["inter_dim"]),
-                        ).items():
-                            if kp["tile_m"] != bm:
-                                continue
-                            cands.append(self._candidate_row(row, bm, kn1, kn2v))
+                            # (B) layout-API GEMM2 candidates. Only native
+                            # SBM==tile_m==bm variants are supported with this GEMM1.
+                            for kn2v, kp in get_flydsl_stage2_v2_kernels(
+                                "fp4",
+                                "fp4",
+                                "bf16",
+                                bm,
+                                model_dim=int(row["model_dim"]),
+                                inter_dim=int(row["inter_dim"]),
+                            ).items():
+                                if kp["tile_m"] != bm:
+                                    continue
+                                cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
     @classmethod
@@ -6031,15 +6049,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["w2s_a16"] = data["w2s_mixed"]
             return data
 
-        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
-        # so prepare weights/scales with is_guinterleave=False. The interleaved
-        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
-        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        # Prepare both gate/up layouts. The candidate's ``interleave`` flag
+        # selects the matching pair at launch time. w2 has no gate/up mode and
+        # is layout-invariant.
         data["w1_a16"] = shuffle_weight(
             data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
         )
         data["w1s_a16"] = shuffle_scale(
             data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+        )
+        data["w1_a16_interleaved"] = shuffle_weight(
+            data["w1_qt"], (16, 16), is_guinterleave=True, gate_up=True
+        )
+        data["w1s_a16_interleaved"] = shuffle_scale(
+            data["w1_scale"], expert, is_guinterleave=True, gate_up=True
         )
         data["w2_a16"] = shuffle_weight(
             data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
@@ -6051,6 +6074,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
         data["w2_mixed"] = shuffle_weight_a16w4(data["w2_qt"], 16, False)
         data["w2s_mixed"] = shuffle_scale_a16w4(data["w2_scale"], expert, False)
         return data
+
+    @staticmethod
+    def _a4w4_stage1_inputs(data, interleave):
+        if interleave:
+            return data["w1_a16_interleaved"], data["w1s_a16_interleaved"]
+        return data["w1_a16"], data["w1s_a16"]
 
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, model_dim_pad=0):
@@ -6127,6 +6156,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         g2 = parse_g2_kname_any(kn2)
         BM = g2["BM"]
         atomic = g2["atomic"]
+        w1_a16, w1s_a16 = Mxfp4FlydslTuner._a4w4_stage1_inputs(data, p1["interleave"])
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
             data["topk_weights"],
@@ -6140,7 +6170,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             data["input"],
-            data["w1_a16"],
+            w1_a16,
             data["w2_a16"],
             sti,
             sei,
@@ -6148,7 +6178,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             None,
             topk,
             block_m=BM1,
-            w1_scale=data["w1s_a16"],
+            w1_scale=w1s_a16,
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
@@ -6162,7 +6192,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
-            data["w1_a16"],
+            w1_a16,
             data["w2_a16"],
             sti,
             sei,
