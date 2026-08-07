@@ -286,11 +286,25 @@ def compile_chunk_gated_delta_h_gfx942(
         # NG = C/4 groups of 4 bf16 (8 B = one MFMA fragment), and the group index
         # is XOR-swizzled by the row so that the 16 lanes of a fragment (whose row
         # indices are 16 consecutive values) map to 16 distinct groups -- covering
-        # all 32 banks exactly once. Returns the ELEMENT index of the group base.
+        # all 32 banks exactly once. Returns the element index of the group base.
         def _grp_idx(row, grp, cols, ng):
-            return row * fx.Int32(cols) + (
-                (grp ^ (row & fx.Int32(ng - 1))) * fx.Int32(4)
-            )
+            # The mask folds the row's bits 3+ down onto its low bits before the
+            # XOR. Most sites vary the row's low bits across lanes (all four MFMA
+            # fragment reads use row = ...*16 + lane_n), so a plain ``row & (ng-1)``
+            # spreads them sufficiently. But the k store-transpose writes rows
+            # ``(tid%16)*8 + e`` -- across its 16 lanes ``row & 15`` takes only two
+            # distinct values, so a plain mask cannot spread it and that causes
+            # 8-way bank multiplicity.
+            # Folding in ``row >> 3`` keys the swizzle on the bits that site does
+            # vary, and a sweep over all nine LDS sites puts every one at minimum 
+            # bank conflict rate.
+            #
+            # Safe by construction: this only permutes group slots within a row, XOR
+            # by a fixed per-row value is a bijection on the group index, and writes
+            # and reads derive the mask from the same row. Each (row, grp) still
+            # maps to a unique slot.
+            mask = (row ^ (row >> fx.Int32(3))) & fx.Int32(ng - 1)
+            return row * fx.Int32(cols) + ((grp ^ mask) * fx.Int32(4))
 
         # 4 bf16 = 8 B: one ds_read_b64 / ds_write_b64, and one MFMA A/B fragment.
         v4bf16_type = T.vec(4, T.bf16)
