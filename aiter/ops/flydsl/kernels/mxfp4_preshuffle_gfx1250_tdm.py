@@ -647,26 +647,44 @@ def launch_gemm_a8w4_tdm(
 
         # ``nxt_ksl`` is the next subtile inside this tile, ``xt_buf`` the next
         # tile's buffer. Both paths prefetch a complete A/B/scale state.
-        def k_step(buf, act, wt, sb_k, sa_k, nxt_ksl, xt_buf=None):
+        def k_step(buf, act, wt, sb_k, sa_k, nxt_ksl, xt_buf=None, xt_wait=None):
             if const_expr(nxt_ksl is not None):
                 prefetch = load_state(buf, nxt_ksl)
             else:
                 prefetch = None
             if const_expr(xt_buf is not None):
+                # ``xt_buf`` is read only here, at the tail of this tile, so its
+                # READY fence belongs here and not at the tile top: the TDM gets
+                # this tile's whole compute to land. The barrier is not optional --
+                # under WAVE_SPEC a wave's tensorcnt covers only the TDMs it issued
+                # itself, while xt_store reads rows a different wave loaded -- and
+                # it doubles as the REUSE barrier for the next tile's issue, so the
+                # loop still has exactly one barrier per iteration.
+                if const_expr(xt_wait is not None):
+                    pipeline_fence(outstanding=xt_wait)
                 xt_store(xt_buf)
             mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, act[front_wm:], wt, sa_k, sb_k)
             return prefetch
 
-        def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None, my_jobs=None):
+        def compute_ktile(
+            buf,
+            prefetch_kt,
+            from_xt=False,
+            nxt_buf=None,
+            my_jobs=None,
+            nxt_wait=None,
+        ):
             """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
 
             ``from_xt`` takes this tile's subtile-0 A/B/scales from the carry slots,
             where the previous tile's last k128 put them. ``nxt_buf`` is the next
             tile's LDS buffer, whose subtile 0 is loaded during this tile's last
-            k128 -- so the tile boundary no longer exposes those ds_reads. The
-            caller must have waited for ``nxt_buf``'s TDM to land.
+            k128 -- so the tile boundary no longer exposes those ds_reads.
+            ``nxt_wait`` is the tensorcnt that fences ``nxt_buf``, emitted at that
+            last k128 instead of by the caller at the tile top; pass None only when
+            some earlier fence already covers ``nxt_buf``.
 
             ``my_jobs`` is the owner list already selected by ``unswitch``; it only
             reaches ``issue`` and is unused when ``prefetch_kt`` is None.
@@ -687,6 +705,7 @@ def launch_gemm_a8w4_tdm(
                     prev[3],
                     nxt_ksl,
                     xt_buf,
+                    nxt_wait if const_expr(xt_buf is not None) else None,
                 )
             front_mma = front_wm * wmma_n_rep
             back_mma = len(BACK) * wmma_n_rep
@@ -728,11 +747,10 @@ def launch_gemm_a8w4_tdm(
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
             # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
             # Reading the next tile's A/B/scales during this tile's last k128 means
-            # that tile must already be in LDS, so both schedules rotate their wait
-            # one tile earlier. num_buffers >= 3 is what that costs: it trades one
-            # tile of global-load latency hiding for the tile-boundary ds_read
-            # stall, which is why it stays off at num_buffers == 2 (there the wait
-            # would leave nothing in flight at all).
+            # that tile must already be in LDS, so one more tile has to be resident
+            # than the schedule otherwise needs -- hence num_buffers >= 3, and why
+            # it stays off at num_buffers == 2 (there the extra tile would leave
+            # nothing in flight at all).
             if const_expr(tile_m <= 64 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 XT = xt_on
@@ -781,12 +799,10 @@ def launch_gemm_a8w4_tdm(
                     compute_ktile(buf, None, XT, nxt_buf)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m). This
-                # branch is only reached with num_buffers >= 3, and its fence then
-                # goes to num_buffers-3 == 0: the next tile's TDM is issued at the
-                # top of this tile's compute, so one tile of overlap survives even
-                # though nothing is in flight at the fence itself.
+                # branch is only reached with num_buffers >= 3: the next tile's TDM
+                # is issued at the top of this tile's compute, so a tile of overlap
+                # survives even when the fence itself leaves nothing in flight.
                 XT = xt_on
-                XT_W = 1 if XT else 0
                 for i in range_constexpr(num_buffers - 1):
                     issue(i, i)
                 n_steady = K_TILES - (num_buffers - 1)
@@ -794,33 +810,59 @@ def launch_gemm_a8w4_tdm(
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
                     xt_store(ptr_to_idx(buf_ptr(0)))
 
+                # With XT the tile's only fence lives at its last k128, next to the
+                # xt_store that needs it (see k_step), and the tile top carries none:
+                # this tile's buffer was already fenced by the previous tile's, and
+                # that same barrier orders the previous tile's reads before the issue
+                # below. Buffer 0 / the first drain tile hang off the prologue fence.
                 def steady_mid(my_jobs):
                     for kt in range(n_steady):
                         s = kt % num_buffers
                         buf = ptr_to_idx(buf_ptr(s))
-                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - XT_W))
+                        if const_expr(not XT):
+                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
                         nxt_buf = (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                             if const_expr(XT)
                             else None
                         )
-                        compute_ktile(buf, kt + (num_buffers - 1), XT, nxt_buf, my_jobs)
+                        compute_ktile(
+                            buf,
+                            kt + (num_buffers - 1),
+                            XT,
+                            nxt_buf,
+                            my_jobs,
+                            # After this tile's issue: kt+num_buffers tiles are out
+                            # and everything through kt+1 must have landed.
+                            TDM_PER * (num_buffers - 2) if const_expr(XT) else None,
+                        )
 
                 unswitch(steady_mid)
                 for j in range_constexpr(num_buffers - 1):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     has_next = XT and j + 1 < num_buffers - 1
-                    pipeline_fence(
-                        outstanding=TDM_PER
-                        * max(0, num_buffers - 2 - j - (1 if has_next else 0))
-                    )
+                    if const_expr(not XT):
+                        pipeline_fence(
+                            outstanding=TDM_PER * max(0, num_buffers - 2 - j)
+                        )
                     nxt_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
                         else None
                     )
-                    compute_ktile(buf, None, XT, nxt_buf)
+                    compute_ktile(
+                        buf,
+                        None,
+                        XT,
+                        nxt_buf,
+                        None,
+                        (
+                            TDM_PER * max(0, num_buffers - 3 - j)
+                            if const_expr(has_next)
+                            else None
+                        ),
+                    )
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             # The epilogue below reuses this LDS arena to stage C. Draining this
