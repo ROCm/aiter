@@ -266,3 +266,68 @@ def test_gemm_a16_w16_split_k_output_buffer_zeroed(sk):
     out2 = gemm_a16w16(x, w, **common).clone()  # reuse y -> must re-zero, not 2x
 
     torch.testing.assert_close(out2, out1, atol=1e-2, rtol=1e-3)
+
+
+def _oob_configs():
+    return [
+        (100, 100, 256, 128, 128, 32, 2, 4, 3),
+        (129, 257, 512, 128, 128, 32, 2, 4, 3),
+        (65, 190, 256, 128, 128, 32, 2, 4, 3),
+        (250, 120, 512, 64, 64, 128, 2, 2, 2),
+        (100, 128, 256, 128, 128, 32, 2, 4, 3),
+        (128, 100, 256, 128, 128, 32, 2, 4, 3),
+        (33, 65, 256, 32, 32, 128, 2, 2, 3),
+    ]
+
+
+@pytest.mark.parametrize("M,N,K,tm,tn,tk,mw,nw,nb", _oob_configs())
+def test_gemm_a16_w16_oob_tile_edges(M, N, K, tm, tn, tk, mw, nw, nb):
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+
+    torch_out = F.linear(x, w, bias=None)
+    kernel_out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.bfloat16,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        m_warp=mw,
+        n_warp=nw,
+        num_buffers=nb,
+    )
+
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M,N,K,tm,tn,tk,mw,nw,nb",
+    [
+        (100, 128, 256, 128, 128, 32, 2, 4, 3),
+        (65, 64, 512, 64, 64, 128, 2, 2, 2),
+    ],
+)
+def test_gemm_a16_w16_oob_guard_region(M, N, K, tm, tn, tk, mw, nw, nb):
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    sentinel = 777.0
+    parent = torch.full((M + tm, N), sentinel, dtype=torch.bfloat16, device="cuda")
+    y = parent[:M]
+
+    torch_out = F.linear(x, w, bias=None)
+    kernel_out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.bfloat16,
+        y=y,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        m_warp=mw,
+        n_warp=nw,
+        num_buffers=nb,
+    )
+
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+    assert torch.all(parent[M:] == sentinel)
