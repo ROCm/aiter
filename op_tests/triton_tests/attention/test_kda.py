@@ -772,3 +772,100 @@ def test_non_contiguous_inputs():
     o, ht = run(q_nc, k, v, g, beta, h0.clone())
     assert_close("o", ref, o)
     assert_close("ht", ref_ht, ht)
+
+
+# (BV, SK, num_warps) -> ROWS = BV*SK // (32*num_warps); SK lanes split the K axis
+SK_CONFIGS = [
+    (32, 1, 1),
+    (32, 2, 2),
+    (32, 4, 4),
+    (32, 8, 8),
+    (32, 32, 4),
+    (64, 2, 4),
+    (128, 4, 8),
+]
+
+
+@pytest.mark.parametrize("BV, SK, num_warps", SK_CONFIGS)
+@pytest.mark.parametrize("state_v_first", [True, False])
+def test_sk_equivalence(BV, SK, num_warps, state_v_first):
+    """Splitting K across SK lanes must not change results, in either layout."""
+    B, T, H, D = 2, 3, 4, 128
+    q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
+    ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
+
+    state = to_vk(h0) if state_v_first else h0.clone()
+    o, ht = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        output_final_state=True,
+        state_v_first=state_v_first,
+        BV=BV,
+        SK=SK,
+        num_warps=num_warps,
+    )
+    assert_close("o", ref, o)
+    assert_close("ht", ref_ht, ht.transpose(-1, -2) if state_v_first else ht)
+
+
+@pytest.mark.parametrize("SK", [2, 4, 8])
+def test_sk_paged(SK):
+    """SK on the paged snapshot path, where the LDS staging layout also changes."""
+    B, T, H, D = 2, 3, 8, 128
+    pool_kv, indices, untouched = make_pool(B, T, H, D)
+    total_T = B * T
+    q, k, v = make_qkv(1, total_T, H, H, D, torch.float32)
+    q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
+    g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float32, device=DEVICE))
+    beta = torch.rand(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+    cu = torch.arange(0, total_T + 1, step=T, device=DEVICE).long()
+
+    o, state = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=to_vk(pool_kv),
+        output_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        BV=32,
+        SK=SK,
+        num_warps=SK,
+    )
+    pool_out = state.transpose(-1, -2)
+    for n in range(B):
+        b, e = n * T, (n + 1) * T
+        ref, ref_ht = naive_recurrent_kda(
+            q[:, b:e],
+            k[:, b:e],
+            v[:, b:e],
+            g[:, b:e],
+            beta[:, b:e],
+            initial_state=pool_kv[int(indices[n, 0]) : int(indices[n, 0]) + 1],
+        )
+        assert_close(f"o[{n}]", ref, o[:, b:e])
+        assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
+    assert torch.equal(pool_out[untouched], pool_kv[untouched]), "wrote outside slots"
+
+
+def test_sk_guards():
+    B, T, H, D = 1, 1, 4, 128
+    q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
+    args = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "initial_state": to_vk(h0),
+    }
+    with pytest.raises(AssertionError):  # SK must divide the wave
+        fused_recurrent_kda(**args, SK=3)
+    with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps
+        fused_recurrent_kda(**args, BV=32, SK=2, num_warps=4)

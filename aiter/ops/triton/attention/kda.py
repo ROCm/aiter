@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
+import math
 import warnings
 
 import torch
@@ -11,6 +13,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
 
 _TRITON_GE_36 = Version(triton.__version__.split("+")[0]) >= Version("3.6.0")
 _ARCH = arch_info.get_arch()
@@ -46,9 +49,11 @@ def fused_recurrent_kda(
     out: torch.Tensor | None = None,
     state_out: torch.Tensor | None = None,
     BV: int = 32,
+    SK: int | None = None,
     num_warps: int | None = None,
-    num_buffers: int = 2,
-    lds_pad: int = 4,
+    num_buffers: int = 1,
+    load_buffers: int | None = None,
+    nt_stream: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
@@ -79,7 +84,14 @@ def fused_recurrent_kda(
     if state_v_first is None:
         state_v_first = True
 
-    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and g.is_contiguous()
+        and beta.is_contiguous()
+    ):
+        q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
 
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[-1]
@@ -111,10 +123,21 @@ def fused_recurrent_kda(
     if dt_bias is not None:
         assert dt_bias.numel() == HV * K, "dt_bias must be [HV, K]"
 
+    if cu_seqlens is not None:
+        avg_T = max(1, T // max(1, N))
+    else:
+        avg_T = T
+    if SK is None:
+        SK = 16 if avg_T > 1 and K % 16 == 0 and BV * 16 >= 64 else math.gcd(32, K)
+        if num_warps is None and avg_T > 1:
+            num_warps = max(1, min(2, BV * SK // 32))
     if num_warps is None:
-        num_warps = max(1, min(8, BV // 32))
+        num_warps = max(1, min(4, BV * SK // 32))
     assert V % BV == 0, f"BV={BV} must divide V={V}"
-    assert BV % (32 * num_warps) == 0, f"BV={BV} must be a multiple of 32*{num_warps}"
+    assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
+    assert (BV * SK) % (
+        32 * num_warps
+    ) == 0, f"BV*SK={BV * SK} must be a multiple of 32*{num_warps}"
 
     # [V, K] or the reference's default [K, V]; the innermost dim sets the row size
     state_shape = (HV, V, K) if state_v_first else (HV, K, V)
@@ -166,26 +189,34 @@ def fused_recurrent_kda(
 
     def _rows(t):
         if t is None:
-            return 1, 1
-        assert (
-            t.stride(0) % row == 0
-        ), "state slot stride must be a whole number of rows"
-        assert t.stride()[1:] == (
+            return 1
+        st = t.stride()
+        assert st[0] % row == 0, "state slot stride must be a whole number of rows"
+        assert st[1:] == (
             state_shape[1] * state_shape[2],
             state_shape[2],
             1,
         ), "state slabs must be dense in [HV, ., .]"
-        sr = t.stride(0) // row
-        return sr, t.shape[0] * sr
+        return st[0] // row
 
-    slot_rows_in, rows_in = _rows(initial_state)
-    slot_rows_out, rows_out = _rows(final_state)
-    assert num_buffers >= 1, "num_buffers must be >= 1"
-
-    _LOGGER.info(
-        f"KDA_DECODE: B={B} T={T} N={N} H={H} HV={HV} K={K} V={V} BV={BV} "
-        f"warps={num_warps} paged={is_paged} gate={use_gate_in_kernel}"
+    slot_rows_in = _rows(initial_state)
+    slot_rows_out = (
+        slot_rows_in if final_state is initial_state else _rows(final_state)
     )
+    assert num_buffers >= 1, "num_buffers must be >= 1"
+    if load_buffers is None:
+        load_buffers = 2
+    assert load_buffers in (
+        1,
+        2,
+        3,
+    ), "load_buffers must be 1 (sync), 2 (register prefetch) or 3 (TDM ring)"
+
+    if _LOG_INFO:
+        _LOGGER.info(
+            f"KDA_DECODE: B={B} T={T} N={N} H={H} HV={HV} K={K} V={V} BV={BV} "
+            f"warps={num_warps} paged={is_paged} gate={use_gate_in_kernel}"
+        )
 
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_packed_decode_kernel[grid](
@@ -207,8 +238,6 @@ def fused_recurrent_kda(
         stride_indices_seq=stride_indices_seq,
         stride_state_slot_rows=slot_rows_in,
         stride_state_out_slot_rows=slot_rows_out,
-        state_rows=rows_in,
-        state_out_rows=rows_out,
         scale=scale,
         H=H,
         HV=HV,
@@ -216,8 +245,10 @@ def fused_recurrent_kda(
         V=V,
         BV=BV,
         NUM_WARPS=num_warps,
+        SK=SK,
         NUM_BUFFERS=num_buffers,
-        LDS_PAD=lds_pad,
+        LOAD_BUFFERS=load_buffers,
+        NT_STREAM=nt_stream,
         IS_VARLEN=cu_seqlens is not None,
         IS_CONTINUOUS_BATCHING=is_paged,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
