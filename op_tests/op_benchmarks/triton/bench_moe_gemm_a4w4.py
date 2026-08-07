@@ -1,53 +1,37 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
+"""Benchmark the mxfp4 x mxfp4 MoE MLP (two moe_gemm_a4w4 calls).
+
+Timing is `triton.testing.do_bench_cudagraph` over the two GEMMs. Everything
+else -- gating, routing, and the activation quantization that feeds each layer
+-- is built once outside the timed region, mirroring the build()/fn() split in
+mi450-scripts/run_moe_a4w4.py so the numbers are comparable to that runner.
+
+On gfx1250 `moe_gemm_a4w4` defaults to the gluon backend, which dispatches to
+_moe_gemm_a4w4_decode when routing picks block_m == 16 and to
+_moe_gemm_a4w4_prefill otherwise. --backend pins the backend, and --preshuffle
+enables the gluon-only gfx1250 WMMA weight preshuffle.
+"""
 
 import argparse
 import csv
 import inspect
-import tempfile
 from itertools import chain
 from pathlib import Path
 
 import torch
-import triton.profiler as proton
+import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     moe_gemm_a4w4,
     mxfp4_quant,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-
-
-def parse_profile(profile_path, useful_op_regex, reps):
-    """
-    construct a PerfRecord from a (proton) profile path and a regex for useful operations
-    """
-    from triton.profiler import viewer
-
-    gf, _, _, _ = viewer.read(profile_path)
-    # aggregate "useful" flops + bytes
-    useful = gf.filter(
-        f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF"
-    ).dataframe
-    bytes = int(useful["bytes"].sum())
-    flops = int(
-        sum(useful[[c for c in ["flops8", "flops16"] if c in useful.columns]].sum())
-    )
-    # take all ops (incl. "not useful" ones) when computing total time
-    allops = gf.filter("MATCH ('*', c) WHERE c IS LEAF").dataframe
-    total_time_ns = allops["time (ns)"].sum()
-    kernel_time_ns = useful["time (ns)"].sum()
-    return {
-        "total_time_ns": total_time_ns,
-        "kernel_time_ns": kernel_time_ns,
-        "flops": flops,
-        "bytes": bytes,
-        "reps": reps,
-    }
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe, shuffle_weight
 
 
 def compute_roofline(
@@ -83,16 +67,13 @@ def compute_roofline(
         perf = inject_proxy_and_call(val, args, kwargs)
         perfs.append((val, perf))
 
-        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
-        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
-        total_latency = perf["total_time_ns"] / 1e3 / perf["reps"]
-        kernel_latency = perf["kernel_time_ns"] / 1e3 / perf["reps"]
         print(
             f"{intensity_proxy_name}: {val:5d} | "
-            f"Total latency (us): {total_latency:.2f} | "
-            f"Kernel latency (us): {kernel_latency:.2f} | "
-            f"TFLOPS: {tflops:#.4g} | "
-            f"TBPS: {tbps:.2f}"
+            f"Latency (us): {perf['latency_ms'] * 1e3:.2f} | "
+            f"TFLOPS: {perf['flops'] / perf['latency_ms'] * 1e-9:#.4g} | "
+            f"TBPS: {perf['bytes'] / perf['latency_ms'] * 1e-9:.2f} | "
+            f"{perf['kernel']} block_m={perf['block_m']} "
+            f"active_experts={perf['active_experts']}"
         )
 
     out_path = Path(out_path)
@@ -100,16 +81,14 @@ def compute_roofline(
 
     fieldnames = [
         intensity_proxy_name,  # e.g. "batch"
-        "total_latency_us",
-        "kernel_latency_us",
+        "latency_us",
         "tflops",
         "tbps",
-        # raw counters from proton:
-        "total_time_ns",
-        "kernel_time_ns",
         "flops",
         "bytes",
-        "reps",
+        "kernel",
+        "block_m",
+        "active_experts",
     ]
 
     with out_path.open("w", newline="") as f:
@@ -118,15 +97,14 @@ def compute_roofline(
         for val, perf in perfs:
             row = {
                 intensity_proxy_name: val,
-                "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
-                "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
-                "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
-                "total_time_ns": perf["total_time_ns"],
-                "kernel_time_ns": perf["kernel_time_ns"],
+                "latency_us": perf["latency_ms"] * 1e3,
+                "tflops": perf["flops"] / perf["latency_ms"] * 1e-9,
+                "tbps": perf["bytes"] / perf["latency_ms"] * 1e-9,
                 "flops": perf["flops"],
                 "bytes": perf["bytes"],
-                "reps": perf["reps"],
+                "kernel": perf["kernel"],
+                "block_m": perf["block_m"],
+                "active_experts": perf["active_experts"],
             }
             w.writerow(row)
 
@@ -144,6 +122,21 @@ def check_and_shuffle_scales(scale, N, K):
         return scale, "GFX1250_SCALE"
     else:
         return scale, None
+
+
+def preshuffle_weight(w):
+    """gfx1250 WMMA weight preshuffle, as in run_moe_a4w4.py's build().
+
+    `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with
+    PRESHUFFLE_WEIGHTS=True. shuffle_weight() asserts K // 2 % 32 and N % 16.
+    """
+    E, K_packed, N = w.shape
+    return (
+        shuffle_weight(w, arch="gfx1250")
+        .view(E, N // 16, K_packed * 16)
+        .transpose(-1, -2)
+    )
 
 
 def quantize(x, dtype):
@@ -169,8 +162,28 @@ def quantize(x, dtype):
         return x, scale
 
 
+def kernel_variant(block_m, backend):
+    """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
+    run_moe_a4w4.py's `name` subcommand."""
+    if backend is None:
+        backend = "gluon" if is_gluon_supported() else "triton"
+    if backend != "gluon":
+        return "_moe_gemm_a4w4"
+    return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
+
+
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    backend,
+    preshuffle,
+    rep,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -178,6 +191,10 @@ def bench_mlp_single_weight_init(
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {x_dtype}"
     assert w_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {w_dtype}"
+    if preshuffle:
+        assert (
+            get_arch() == "gfx1250"
+        ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
 
     # -- init data --
     # weights
@@ -197,25 +214,21 @@ def bench_mlp_single_weight_init(
     w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
+    if preshuffle:
+        w1 = preshuffle_weight(w1)
+        w2 = preshuffle_weight(w2)
 
-    # -- benchmark --
-    x_dtype_str = x_dtype
-
-    reps = 100
+    # -- routing + layer-1 activations: built once, outside the timed region --
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
-    xg = x
-    # run layer
-    fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
-    for i in range(reps):
-        logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
-        assert x_dtype_str == "mx4"
-        x, x_scale = mxfp4_quant(x)
-        x = moe_gemm_a4w4(
-            x,
+    logits = gemm_a16w16(x, wg.T, bg)
+    rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+    x1, x1_scale = mxfp4_quant(x)
+
+    def layer1():
+        return moe_gemm_a4w4(
+            x1,
             w1,
-            x_scale,
+            x1_scale,
             w1_scale,
             None,
             None,
@@ -223,13 +236,23 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale1,
+            preshuffle_weights=preshuffle,
             apply_swiglu=True,
+            backend=backend,
         )
-        x, x_scale = mxfp4_quant(x)
-        x = moe_gemm_a4w4(
-            x,
+
+    # layer 2 reads layer 1's swiglu output; quantize it once here so the timed
+    # region holds only the two GEMMs. This doubles as the compile warmup.
+    y1 = layer1()
+    y1_bytes = y1.numel() * y1.element_size()
+    x2, x2_scale = mxfp4_quant(y1)
+    del y1
+
+    def layer2():
+        return moe_gemm_a4w4(
+            x2,
             w2,
-            x_scale,
+            x2_scale,
             w2_scale,
             None,
             None,
@@ -237,11 +260,50 @@ def bench_mlp_single_weight_init(
             rdata,
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
+            preshuffle_weights=preshuffle,
+            backend=backend,
         )
-    proton.finalize()
-    return parse_profile(
-        fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
+
+    y2 = layer2()
+    torch.cuda.synchronize()
+
+    # -- benchmark --
+    def fn():
+        layer1()
+        layer2()
+
+    latency_ms = triton.testing.do_bench_cudagraph(fn, rep=rep)
+
+    # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
+    # the kernel itself reports: 2*M*N*K per GEMM, and activations + active-expert
+    # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
+    # and the layer-2 scatter reduction are not counted; the reduction's runtime
+    # is inside moe_gemm_a4w4 and so is inside the measurement.
+    n_tokens = gather_indx.shape[0]  # routed rows == batch * n_expts_act
+    active = int((rdata.expt_data.hist > 0).sum())  # experts that got >= 1 token
+
+    def w_bytes(w):
+        return (w.numel() * w.element_size() // n_expts_tot) * active
+
+    flops = 2 * n_tokens * (dim2 // TP) * dim1  # layer 1: N = dim2 // TP, K = dim1
+    flops += 2 * n_tokens * dim1 * (dim2 // TP // 2)  # layer 2
+    byts = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
+    # uncompressed [n_tokens, dim1] rows the reduction then combines.
+    byts += (
+        x2.numel() * x2.element_size()
+        + w_bytes(w2)
+        + n_tokens * dim1 * y2.element_size()
     )
+
+    return {
+        "latency_ms": latency_ms,
+        "flops": flops,
+        "bytes": byts,
+        "kernel": kernel_variant(rdata.block_m, backend),
+        "block_m": rdata.block_m,
+        "active_experts": active,
+    }
 
 
 def bench_mlp(
@@ -253,23 +315,37 @@ def bench_mlp(
     x_dtype,
     w_dtype,
     TP,
-    op_regex,
+    backend,
+    preshuffle,
+    rep,
     num_weight_inits=1,
 ):
     all_results = []
     for i in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            backend,
+            preshuffle,
+            rep,
         )
         all_results.append(result)
 
     num_runs = len(all_results)
     aggregated = {
-        "total_time_ns": sum(r["total_time_ns"] for r in all_results) / num_runs,
-        "kernel_time_ns": sum(r["kernel_time_ns"] for r in all_results) / num_runs,
+        "latency_ms": sum(r["latency_ms"] for r in all_results) / num_runs,
         "flops": sum(r["flops"] for r in all_results) / num_runs,
         "bytes": sum(r["bytes"] for r in all_results) / num_runs,
-        "reps": all_results[0]["reps"],
+        # routing block_m and the dispatched kernel depend only on batch/topk/E
+        "kernel": all_results[0]["kernel"],
+        "block_m": all_results[0]["block_m"],
+        "active_experts": sum(r["active_experts"] for r in all_results) / num_runs,
     }
 
     return aggregated
@@ -284,7 +360,9 @@ def roofline_mlp(
     x_dtype,
     w_dtype,
     TP,
-    op_regex,
+    backend,
+    preshuffle,
+    rep,
     num_weight_inits=1,
     name="",
 ):
@@ -302,7 +380,9 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        op_regex,  # fixed args
+        backend,
+        preshuffle,
+        rep,  # fixed args
         num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
@@ -337,17 +417,29 @@ def parse_args(args: list[str] | None = None):
         help="Number of total and active experts in [total experts, active experts] order.",
     )
     parser.add_argument(
-        "--op-regex",
-        type=str,
-        default=".*moe_gemm.*",
-        help="Regex to find perf for specific operation by its kernel name.",
+        "--backend",
+        choices=["auto", "triton", "gluon"],
+        default="auto",
+        help="moe_gemm_a4w4 backend (default: auto, which is gluon on gfx1250).",
+    )
+    parser.add_argument(
+        "--preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target per batch size, in ms (default: 20).",
     )
     parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
         help="Number of different weight initializations to run for more stable results (default: 1). "
-        "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
+        "Use higher values (e.g., 10) for more stable benchmarks.",
     )
     args = parser.parse_args(args=args)
     return args
@@ -382,7 +474,9 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        op_regex=parsed_args.op_regex,
+        backend=None if parsed_args.backend == "auto" else parsed_args.backend,
+        preshuffle=parsed_args.preshuffle,
+        rep=parsed_args.rep,
         num_weight_inits=parsed_args.num_weight_inits,
         name="gpt-oss-x2",
     )
