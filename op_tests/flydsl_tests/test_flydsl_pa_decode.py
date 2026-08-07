@@ -11,8 +11,8 @@ import random
 
 import pytest
 import torch
-from aiter.ops.flydsl import is_flydsl_available  # noqa: E402
 
+from aiter.ops.flydsl import is_flydsl_available
 from aiter.ops.flydsl.pa_decode import flydsl_paged_attention_decode
 
 
@@ -21,7 +21,7 @@ def _is_gfx1250() -> bool:
         return False
     try:
         arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure to read the arch means "not gfx1250"
         return False
     return arch.lower().split(":")[0].startswith("gfx1250")
 
@@ -40,7 +40,7 @@ def _torch_reference(
     block_tables[:seq_lens[i]], then do standard scaled dot-product
     attention with one query token per sequence.
     """
-    num_seqs, num_q_heads, head_size = query.shape
+    num_seqs, num_q_heads, _head_size = query.shape
     _, num_kv_heads, kv_block_size, _ = key_cache.shape
     query_group_size = num_q_heads // num_kv_heads
     dtype = query.dtype

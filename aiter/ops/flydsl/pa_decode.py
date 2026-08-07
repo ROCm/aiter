@@ -135,7 +135,7 @@ def flydsl_paged_attention_decode(
     # --- Architecture check: kernel is gfx1250-only. ---
     try:
         arch = torch.cuda.get_device_properties(query.device.index).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure to read the arch means "not gfx1250"
         arch = ""
     arch_base = arch.lower().split(":")[0] if arch else ""
     if not arch_base.startswith("gfx1250"):
@@ -145,7 +145,7 @@ def flydsl_paged_attention_decode(
 
     # --- Shape derivations + GQA / head-size checks ---
     num_seqs, num_q_heads, head_size = query.shape
-    num_blocks, num_kv_heads, kv_block_size, head_size_kv = key_cache.shape
+    _num_blocks, num_kv_heads, kv_block_size, head_size_kv = key_cache.shape
     if head_size != head_size_kv:
         raise ValueError(f"Q head_size {head_size} != KV head_size {head_size_kv}")
     if num_q_heads % num_kv_heads != 0:

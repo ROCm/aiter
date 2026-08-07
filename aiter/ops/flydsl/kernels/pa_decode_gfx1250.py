@@ -36,22 +36,18 @@ BLOCKS_PER_COMPUTE TDM ops DMA each block into its sub-slice of the K/V LDS
 stage. 2-stage double buffer overlaps the next tile's loads with current compute.
 """
 
+# B023 false positive: closures are called within the same loop iteration.
+# ruff: noqa: B023
+
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    gpu,
-    math as fmath,
-    range_constexpr,
-    rocdl,
-    tdm_ops,
-)
+from flydsl.expr import arith, gpu, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import math as fmath
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
