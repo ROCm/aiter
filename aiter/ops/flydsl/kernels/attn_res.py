@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL AttnRes mix kernel for Kimi-K3.
+"""FlyDSL AttnRes prefill kernel for Kimi-K3.
 
-This first implementation deliberately covers only the bandwidth-critical
-prefill mix path:
+Each workgroup owns one contiguous BF16 token row at D=7168. It reads up to
+eight block sources plus the live prefix, scores sources with RMS-normalized
+keys, and mixes raw values with an online softmax accumulator.
 
-* BF16 contiguous ``prefix`` and ``blocks``;
-* D=7168, eight block sources plus the live prefix;
-* no delta update, block snapshot write, or output RMSNorm.
-
-Each workgroup owns one token row.  It reads every source once, calculates the
-source RMS score, and uses an online softmax accumulator to mix the raw source
-values without a second HBM pass.
+Delta update, canonical append snapshot, and output RMSNorm are independent
+compile-time specializations. ``block_write_idx=-1`` disables the snapshot;
+otherwise it must equal ``num_blocks`` in 0..7, so the current prefix is stored
+in the first unused block slot.
 """
 
 # Do not add ``from __future__ import annotations``: FlyDSL inspects annotations
@@ -41,14 +39,14 @@ _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _LOG2E = math.log2(math.e)
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def _build_attn_res(
     hidden_size: int,
     num_blocks: int,
     eps: float,
     output_norm_eps: float,
     has_delta: bool,
-    write_block: bool,
+    block_write_idx: int,
     apply_output_norm: bool,
 ):
     """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
@@ -60,6 +58,16 @@ def _build_attn_res(
         raise ValueError(
             f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}"
         )
+    if not -1 <= block_write_idx < _MAX_BLOCKS:
+        raise ValueError(
+            f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
+            f"got {block_write_idx}"
+        )
+    if block_write_idx >= 0 and block_write_idx != num_blocks:
+        raise ValueError(
+            "this build only emits the canonical append slot: "
+            f"block_write_idx={block_write_idx}, num_blocks={num_blocks}"
+        )
 
     num_vec = hidden_size // _VEC_WIDTH
     if hidden_size % _VEC_WIDTH != 0 or num_vec % _BLOCK_THREADS != 0:
@@ -69,6 +77,7 @@ def _build_attn_res(
     tiles_per_thread = num_vec // _BLOCK_THREADS
     red_slots = _BLOCK_THREADS // _WARP_SIZE
     num_sources = num_blocks + 1
+    write_block = block_write_idx >= 0
     kernel_name = (
         f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{_BLOCK_THREADS}"
         f"_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
@@ -89,7 +98,6 @@ def _build_attn_res(
         qk_weight: fx.Tensor,
         output_norm_weight: fx.Tensor,
         out: fx.Tensor,
-        block_write_idx: fx.Int32,
     ):
         token = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -331,7 +339,6 @@ def _build_attn_res(
         qk_weight: fx.Tensor,
         output_norm_weight: fx.Tensor,
         out: fx.Tensor,
-        block_write_idx: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -343,7 +350,6 @@ def _build_attn_res(
             qk_weight,
             output_norm_weight,
             out,
-            block_write_idx,
         ).launch(
             grid=(num_tokens, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -366,32 +372,32 @@ def flydsl_attn_res(
     output_norm_eps: float,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Run one supported contiguous BF16 FlyDSL AttnRes specialization.
+    """Run a contiguous BF16 prefill AttnRes specialization.
 
-    The mix-only path reads eight block snapshots plus ``prefix``. The canonical
-    all-on append path updates ``prefix`` in place, stores that updated row in
-    ``blocks[:, block_write_idx]``, and applies output RMSNorm in the same launch.
+    ``delta`` and ``output_norm_weight`` independently enable the in-place
+    prefix update and output RMSNorm. ``block_write_idx=-1`` disables snapshots;
+    otherwise it must equal ``num_blocks`` in 0..7 and stores the current prefix
+    (post-delta when present) in ``blocks[:, block_write_idx]``. Non-canonical
+    in-range write indices raise ``NotImplementedError``. Out-of-range
+    ``block_write_idx`` or ``num_blocks`` values raise ``ValueError``.
     """
     has_delta = delta is not None
-    write_block = block_write_idx >= 0
     apply_output_norm = output_norm_weight is not None
-    flags = (has_delta, write_block, apply_output_norm)
-    if flags not in ((False, False, False), (True, True, True)):
-        raise NotImplementedError(
-            "supported configurations are mix-only at num_blocks=8 and fully "
-            "fused append at block_write_idx == num_blocks < 8; "
-            f"got has_delta/write_block/output_norm={flags}"
+    if not 0 <= num_blocks <= _MAX_BLOCKS:
+        raise ValueError(
+            f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}"
         )
-    if not has_delta:
-        if num_blocks != _MAX_BLOCKS or block_write_idx != -1:
-            raise NotImplementedError(
-                "mix-only requires num_blocks=8 and block_write_idx=-1"
-            )
-    elif not (
-        0 <= num_blocks < _MAX_BLOCKS and block_write_idx == num_blocks
-    ):
+    if not -1 <= block_write_idx < _MAX_BLOCKS:
+        raise ValueError(
+            f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
+            f"got {block_write_idx}"
+        )
+    write_block = block_write_idx >= 0
+    if write_block and block_write_idx != num_blocks:
         raise NotImplementedError(
-            "fully fused append requires block_write_idx == num_blocks in [0, 7]"
+            "snapshot writes are limited to the canonical append slot: "
+            f"block_write_idx must equal num_blocks, got "
+            f"block_write_idx={block_write_idx}, num_blocks={num_blocks}"
         )
 
     if prefix.ndim != 2 or prefix.shape[1] != _HIDDEN_SIZE:
@@ -445,14 +451,13 @@ def flydsl_attn_res(
     output_norm_weight_arg = (
         output_norm_weight if apply_output_norm else norm_weight
     )
-    block_write_idx_arg = block_write_idx if write_block else 0
     launcher = _build_attn_res(
         prefix.shape[1],
         num_blocks,
         float(eps),
         float(output_norm_eps) if apply_output_norm else 0.0,
         has_delta,
-        write_block,
+        block_write_idx,
         apply_output_norm,
     )
     _run_compiled(
@@ -464,7 +469,6 @@ def flydsl_attn_res(
         qk_weight,
         output_norm_weight_arg,
         out,
-        block_write_idx_arg,
         prefix.shape[0],
         Stream(stream),
     )
