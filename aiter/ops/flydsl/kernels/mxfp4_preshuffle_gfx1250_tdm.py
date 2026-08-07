@@ -20,10 +20,12 @@ from .gemm_common_gfx1250 import (
     lds_addr_keepalive,
     lds_load_b32_raw,
     lds_load_b128_raw,
+    opaque_const_i32,
     lds_store_b32_raw,
     lds_store_b64_raw,
     lds_store_b128_raw,
     pipeline_fence,
+    vgpr_keepalive,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -573,12 +575,12 @@ def launch_gemm_a8w4_tdm(
 
         def pf_load(p, bases, ksl):
             ba, bb, bsa, bsb = bases
-            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
-            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 pf_act[p][wm].store(load_a(ba, wm, ksl))
             for wn in range_constexpr(wmma_n_rep):
                 pf_wt[p][wn].store(load_b(bb, wn, ksl))
+            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             # Pack all scales into one wide rmem vector store. from_elements
             # consumes the ds-reads exactly like load_a/load_b's shuffle, so the
             # backend tracks the ds->pack dependency; no manual wait here.
@@ -624,8 +626,8 @@ def launch_gemm_a8w4_tdm(
             # (nxt[1] = (ba, bb, bsa, bsb)); extends their live ranges further than
             # the pf_load-tail placement so the allocator can't reuse them anywhere
             # in the compute either.
-            if const_expr(nxt is not None):
-                lds_addr_keepalive(*nxt[1])
+            # if const_expr(nxt is not None):
+            #     lds_addr_keepalive(*nxt[1])
 
             rocdl.sched_barrier(0)
 
@@ -639,7 +641,8 @@ def launch_gemm_a8w4_tdm(
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
             # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            # if const_expr(tile_m <= 64 or num_buffers <= 2):
+            if const_expr(tile_m <= 64 or num_buffers <= 3):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
@@ -676,11 +679,32 @@ def launch_gemm_a8w4_tdm(
                             pf_step(ksl % 2, nxt)
 
                     pipeline_fence(outstanding=0)
+
+                    # The drain is fully unrolled, so its slot index is a
+                    # compile-time constant and slot*PITCH is a constant the
+                    # backend fuses into every ds_load byte offset -- that
+                    # overflows the ds immediate range and forces a per-load
+                    # v_add (see the tail vs steady ISA). The steady loop is
+                    # immune because its slot*PITCH is derived from the runtime
+                    # loop counter and lives in an SGPR. Launder the drain's
+                    # slot*PITCH through an opaque inline-asm SGPR so it likewise
+                    # cannot fold into the offset: the region base is then formed
+                    # once (base + slot) and each ds_load keeps its small
+                    # compile-time immediate offset. (readfirstlane does not work
+                    # -- LLVM folds readfirstlane of a uniform constant away.)
+                    def drain_buf_idx(slot):
+                        slot = slot % num_buffers
+                        if slot == 0:
+                            return stC_idx
+                        return stC_idx + fx.index_cast(
+                            T.index, opaque_const_i32(slot * PITCH)
+                        )
+
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
                         s = kt % num_buffers
-                        bases = bases_of(ptr_to_idx(buf_ptr(s)))
-                        bases1 = bases_of(ptr_to_idx(buf_ptr((kt + 1) % num_buffers)))
+                        bases = bases_of(drain_buf_idx(s))
+                        bases1 = bases_of(drain_buf_idx(kt + 1))
                         has_next = kt + 1 < K_TILES
                         for ksl in range_constexpr(KWS):
                             nxt = ((((ksl + 1) % 2), bases, ksl + 1) if const_expr(ksl < KWS - 1)
@@ -818,8 +842,22 @@ def launch_gemm_a8w4_tdm(
                         alignment=2,
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+                # Software-pipeline the b128 store data across STORE_PIPE_DEPTH+1
+                # VGPR banks: pin the previous STORE_PIPE_DEPTH wm rows' store
+                # data live across this row's cvt batch so the allocator gives
+                # this row's cvts fresh registers instead of reusing an older
+                # row's (which its in-flight ds_stores still read). Depth 1
+                # removes the WAR s_wait_alu(vm_vsrc) from reuse; deeper reserves
+                # more banks so the scheduler can hoist this row's cvts ahead of
+                # the older rows' stores, hiding the cvt latency and removing the
+                # RAW s_wait_alu(va_vdst) too. Only the passthrough b128 path
+                # reuses a narrow register window; the b64 act path is untouched.
+                STORE_PIPE_DEPTH = 4
+                STORE_PIN_STRIDE = 2
+                recent_hv_rows = []
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
+                    cur_hv_raws = []
                     for wn in range_constexpr(wmma_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
                         acc = Vec(accs[wm * wmma_n_rep + wn])
@@ -853,11 +891,46 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
-                            lds_store_b128_raw(
-                                stC_idx,
-                                (row_rel * STORE_N + col_rel) * 2,
-                                hv.bitcast(fx.Int32).ir_value(),
+                            # The compile-time row byte offset wm*16*STORE_N*2
+                            # grows past the 16-bit ds immediate range for the
+                            # higher wm rows (STORE_N == tile_n on this
+                            # passthrough path), which would force a per-store
+                            # address v_add. When it overflows, launder that row
+                            # offset into the base through an opaque SGPR (row_rel
+                            # loses the wm*16 term, which now lives in the base)
+                            # so each ds_store keeps its small wn immediate --
+                            # same fix as the drain ds_loads.
+                            row_byte = wm * 16 * STORE_N * 2
+                            spill = const_expr(
+                                row_byte + (wmma_n_rep - 1) * 16 * 2 > 0xFFFF
                             )
+                            st_base = (
+                                stC_idx
+                                + fx.index_cast(T.index, opaque_const_i32(row_byte))
+                            ) if spill else stC_idx
+                            st_off = (
+                                ((wmb + lane16) * STORE_N + col_rel) * 2
+                            ) if spill else ((row_rel * STORE_N + col_rel) * 2)
+                            hv_i32 = hv.bitcast(fx.Int32).ir_value()
+                            lds_store_b128_raw(st_base, st_off, hv_i32)
+                            cur_hv_raws.append(hv_i32)
+                    if const_expr(not stage1_act):
+                        # Pin the last STORE_PIPE_DEPTH rows' store data across
+                        # this row's cvts. The keepalive is side-effecting, so it
+                        # is also a scheduling barrier; fire it only every
+                        # STORE_PIN_STRIDE rows so the scheduler keeps large
+                        # barrier-free windows to hoist cvts in (kills the RAW
+                        # va_vdst) while still forcing fresh banks (kills the WAR
+                        # vm_vsrc).
+                        recent_hv_rows.append(cur_hv_raws)
+                        if const_expr(wm % STORE_PIN_STRIDE == STORE_PIN_STRIDE - 1):
+                            pin = [
+                                r
+                                for row in recent_hv_rows[-STORE_PIPE_DEPTH:]
+                                for r in row
+                            ]
+                            if pin:
+                                vgpr_keepalive(*pin)
 
             # -- Shared LDS -> TDM store to global --
             workgroup_barrier()
@@ -903,5 +976,5 @@ def launch_gemm_a8w4_tdm(
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
-    "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
+    "amdgpu-expert-scheduling-mode": True,
 }
