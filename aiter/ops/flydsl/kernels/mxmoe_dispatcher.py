@@ -230,11 +230,12 @@ def compile_gemm2_a4w4_port(
     sbm_tag = "" if SBM == BM else f"_sbm{SBM}"
     if persist and cu_num <= 0:
         raise AssertionError(f"persist=True requires cu_num>0, got {cu_num}")
-    if persist and is_f8:
-        # fp8-A gemm2 persist is a known-broken F2 combo (cos=0 at large M); fail fast.
+    if persist and is_f8 and not persist_flat:
+        # fp8-A fixed-N persist is a known-broken F2 combo. Flat persistence
+        # uses independent M+N work-unit remapping and is supported.
         raise AssertionError(
-            "a8w4/fp8-A gemm2 persist is not supported (known-broken F2 path: cos=0 at large M). "
-            "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
+            "a8w4/fp8-A fixed-N persist is not supported (known-broken F2 path: "
+            "cos=0 at large M). Use MXFP4_G2_PERSIST_FLAT=1 or persist=False."
         )
     persist_tag = "" if not persist else f"_persist_cu{cu_num}"
     pad_tag = (
@@ -421,6 +422,7 @@ def compile_gemm2_a4w4_port(
                 )
                 m_block = unit_bx // fx.Int32(num_n_blocks)
                 issue_all_a_loads(m_block * fx.Int32(BM))
+                rocdl.sched_barrier(0)
                 run_unit(unit_bx)
         else:
             # Persistent-m: fixed cu_num*num_n_blocks grid; each block grid-strides m-tiles by cu_num (aiter `_persist`).
@@ -694,6 +696,9 @@ def mxfp4_moe_gemm2(
     """
     import torch
 
+    # Runtime opt-in: flat persistence is itself a scheduling request, so it
+    # does not require the tuned kernel name to also carry a ``_persist`` tag.
+    persist = bool(persist or _jit_persist_flat_enabled(True))
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
