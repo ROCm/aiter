@@ -29,11 +29,6 @@ on:
         required: false
         type: string
         default: "rocm/vllm-dev:nightly"
-      slurm_time_limit:
-        description: "Wall-clock limit passed to the upstream vLLM Slurm case"
-        required: false
-        type: string
-        default: "08:30:00"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -51,7 +46,6 @@ env:
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
   SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
-  SLURM_TIME_LIMIT: ${{ inputs.slurm_time_limit || '08:30:00' }}
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-whl-${{ github.run_id }}
 
 jobs:
@@ -126,9 +120,131 @@ jobs:
           path: dist/*.whl
           retention-days: 14
 
+  select_vllm_cases:
+    name: Select upstream vLLM cases
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Checkout vLLM main
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: main
+          fetch-depth: 1
+          path: vllm
+
+      - name: Apply vLLM PR 47030
+        working-directory: vllm
+        run: |
+          set -euo pipefail
+          git fetch --depth=2 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
+          pr_sha="$(git rev-parse FETCH_HEAD)"
+          git config user.name "AITER CI"
+          git config user.email "aiter-ci@users.noreply.github.com"
+          if ! git cherry-pick "${pr_sha}"; then
+            if git diff --quiet && git diff --cached --quiet; then
+              git cherry-pick --skip
+            else
+              exit 1
+            fi
+          fi
+
+      - name: Select DeepSeek vLLM-router cases
+        id: select
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import itertools
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
+          models = {"DeepSeek-V3", "DeepSeek-R1-MXFP4"}
+          topologies = {
+              "1P1D": "1P1D-TP8",
+              "2P2D": "2P2D-TP8",
+          }
+          cases = []
+          label = None
+
+          for line in pipeline.read_text(encoding="utf-8").splitlines():
+              label_match = re.match(r'\s*-\s+label:\s+["\'](.+)["\']\s*$', line)
+              if label_match:
+                  label = label_match.group(1)
+                  continue
+
+              command_match = re.match(
+                  r"\s*-\s+(MODEL_NAME=.*run-slurm-disagg-test\.sh)\s*$",
+                  line,
+              )
+              if not command_match or not label or not label.endswith("-vllm-router"):
+                  continue
+
+              command = command_match.group(1)
+              model_match = re.search(r"(?:^|\s)MODEL_NAME=([^\s]+)", command)
+              nodes_match = re.search(r"(?:^|\s)NODES=([0-9]+)", command)
+              if not model_match or not nodes_match:
+                  continue
+              model = model_match.group(1)
+              if model not in models:
+                  continue
+
+              topology_key = next(
+                  (key for key in topologies if f"-PD-{key}-" in label),
+                  None,
+              )
+              if topology_key is None:
+                  continue
+
+              topology = topologies[topology_key]
+              slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{model}-{topology}")
+              cases.append(
+                  {
+                      "case_name": label,
+                      "case_slug": slug,
+                      "command": command,
+                      "model_name": model,
+                      "topology": topology,
+                      "nodes": int(nodes_match.group(1)),
+                  }
+              )
+
+          expected = set(itertools.product(models, topologies.values()))
+          selected = {(case["model_name"], case["topology"]) for case in cases}
+          if selected != expected or len(cases) != len(expected):
+              raise SystemExit(
+                  f"Expected exactly {sorted(expected)!r}; selected {sorted(selected)!r} "
+                  f"from {pipeline}"
+              )
+
+          matrix = json.dumps({"include": cases}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"matrix={matrix}", file=output)
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as output:
+              print("### Selected upstream vLLM cases\n", file=output)
+              print("| Case | Nodes | Upstream command |", file=output)
+              print("|---|---:|---|", file=output)
+              for case in cases:
+                  print(
+                      f'| `{case["case_name"]}` | {case["nodes"]} | '
+                      f'`{case["command"]}` |',
+                      file=output,
+                  )
+          PY
+
   vllm-disagg-smoke:
-    name: ${{ matrix.model_name }} ${{ matrix.topology }}
-    needs: build_aiter_wheel
+    name: ${{ matrix.case_name }}
+    needs: [build_aiter_wheel, select_vllm_cases]
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -139,35 +255,15 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 1
-      matrix:
-        include:
-          - model_name: DeepSeek-V3
-            topology: 1P1D-TP8
-            nodes: 2
-            xp: 1
-            yd: 1
-          - model_name: DeepSeek-R1-MXFP4
-            topology: 1P1D-TP8
-            nodes: 2
-            xp: 1
-            yd: 1
-          - model_name: DeepSeek-V3
-            topology: 2P2D-TP8
-            nodes: 4
-            xp: 2
-            yd: 2
-          - model_name: DeepSeek-R1-MXFP4
-            topology: 2P2D-TP8
-            nodes: 4
-            xp: 2
-            yd: 2
+      matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+      UPSTREAM_CASE_COMMAND: ${{ matrix.command }}
+      CASE_NAME: ${{ matrix.case_name }}
+      CASE_SLUG: ${{ matrix.case_slug }}
       MODEL_NAME: ${{ matrix.model_name }}
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
-      XP: ${{ matrix.xp }}
-      YD: ${{ matrix.yd }}
     steps:
       - name: Select Spur nodes for topology
         run: |
@@ -181,7 +277,7 @@ jobs:
             exit 1
           fi
           echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
-          echo "Selected ${TOPOLOGY}: xP=${XP}, yD=${YD}, nodes=${NODES}, nodelist=${nodelist}"
+          echo "Selected upstream case ${CASE_NAME}: nodes=${NODES}, nodelist=${nodelist}"
 
       - name: Download current AITER wheel
         uses: actions/download-artifact@v4
@@ -301,11 +397,10 @@ jobs:
             echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
-            echo "- MODEL_NAME: \`${MODEL_NAME}\`"
-            echo "- TOPOLOGY: \`${TOPOLOGY}\` (xP=\`${XP}\`, yD=\`${YD}\`, nodes=\`${NODES}\`)"
+            echo "- Upstream case: \`${CASE_NAME}\`"
+            echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
             echo "- IMAGE: \`${BASE_IMAGE}\`"
             echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
-            echo "- SLURM_TIME_LIMIT: \`${SLURM_TIME_LIMIT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Run upstream vLLM disagg case
@@ -332,21 +427,16 @@ jobs:
           log_root="${DISAGG_SCRIPTS_STAGE%/}"
           mkdir -p "${log_root}"
 
-          echo "Running upstream vLLM disagg case from PR #${VLLM_DI_PR_NUMBER}"
+          cd "${GITHUB_WORKSPACE}/vllm"
+          echo "Running upstream vLLM case from PR #${VLLM_DI_PR_NUMBER}: ${CASE_NAME}"
+          echo "${UPSTREAM_CASE_COMMAND}"
           set +e
           env \
-            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${MODEL_NAME}-${TOPOLOGY}" \
-            MODEL_NAME="${MODEL_NAME}" \
+            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
             IMAGE="${BASE_IMAGE}" \
-            NODES="${NODES}" \
-            xP="${XP}" \
-            yD="${YD}" \
-            GPUS_PER_NODE=8 \
-            WAIT=1 \
-            SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
-            bash "${script}" 2>&1 | tee "${submit_log}"
+            bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
           set -e
 
@@ -405,7 +495,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-disagg-${{ matrix.model_name }}-${{ matrix.topology }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vllm-disagg-${{ matrix.case_slug }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
