@@ -221,7 +221,42 @@ jobs:
           ${{ env.BUILD_DOCKER_IMAGE }} \
           sleep infinity
 
-      - name: Install Dependencies (legacy rocm/pytorch image)
+      - name: Resolve container Python (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
+        run: |
+          set -euo pipefail
+          PYTHON_BIN=$(docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          sh -lc '
+            for candidate in /opt/venv/bin/python python3 python; do
+              if [ -x "$candidate" ]; then
+                py="$candidate"
+              elif command -v "$candidate" >/dev/null 2>&1; then
+                py="$(command -v "$candidate")"
+              else
+                continue
+              fi
+              if "$py" -m pip --version >/dev/null 2>&1; then
+                echo "$py"
+                exit 0
+              fi
+            done
+            echo "No python with pip found in container" >&2
+            exit 1
+          ')
+          echo "CONTAINER_PYTHON=${PYTHON_BIN}" >> "$GITHUB_ENV"
+          echo "Using container Python: ${PYTHON_BIN}"
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          "${PYTHON_BIN}" --version
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          "${PYTHON_BIN}" -m pip --version
+
+      - name: Install Dependencies (legacy container)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
           set -e
@@ -229,7 +264,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 -r requirements.txt
+          "${CONTAINER_PYTHON}" -m pip install --timeout=60 --retries=10 -r requirements.txt
 
       - name: Pin setuptools_scm (legacy)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
@@ -238,7 +273,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+          "${CONTAINER_PYTHON}" -m pip install --timeout=60 --retries=10 "setuptools_scm<10"
 
       - name: Install ninja (legacy)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
@@ -248,7 +283,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 ninja
+          "${CONTAINER_PYTHON}" -m pip install --timeout=60 --retries=10 ninja
 
       - name: Pin setuptools-scm (legacy)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
@@ -257,7 +292,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 'setuptools-scm<10'
+          "${CONTAINER_PYTHON}" -m pip install --timeout=60 --retries=10 'setuptools-scm<10'
 
       - name: Build Aiter (legacy)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
@@ -271,16 +306,18 @@ jobs:
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e CONTAINER_PYTHON="${CONTAINER_PYTHON}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
-            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+            sh -lc '"${CONTAINER_PYTHON}" setup.py bdist_wheel && ls dist/*.whl'
           else
             docker exec \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e CONTAINER_PYTHON="${CONTAINER_PYTHON}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
-            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+            sh -lc '"${CONTAINER_PYTHON}" setup.py bdist_wheel && ls dist/*.whl'
           fi
 
       # ============================================================
