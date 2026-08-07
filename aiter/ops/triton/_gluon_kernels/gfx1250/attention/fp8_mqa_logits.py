@@ -1,13 +1,14 @@
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
+from triton.language.core import _aggregate as aggregate
 
 # same reduction technique, arch agnostic
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
 )
+from aiter.ops.triton.utils.common_utils import strip_annotate
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
@@ -85,6 +86,7 @@ def _store_logits_block(
 
 
 @aggregate
+@strip_annotate
 class MQATDMKVLoaderConfig:
     BLOCK_KV: gl.constexpr
     HEAD_SIZE: gl.constexpr
@@ -103,6 +105,7 @@ class MQATDMKVLoaderConfig:
 
 
 @aggregate
+@strip_annotate
 class MQATDMKVLoader:
     kv_cfg: MQATDMKVLoaderConfig
     kv_desc: gl.amd.gfx1250.tdm.tensor_descriptor

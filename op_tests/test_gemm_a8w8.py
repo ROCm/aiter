@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import random
+
 import torch
 import torch.nn.functional as F
-import random
-import os
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, hipb_create_extension, hipb_findallsols, hipb_mm
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import hipb_mm, hipb_create_extension
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -19,9 +21,10 @@ except ModuleNotFoundError as e:
     if e.name != "tuned_op_bench_utils":
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
-import pandas as pd
 import argparse
 from functools import lru_cache
+
+import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
@@ -53,7 +56,7 @@ def is_shape_tuned(
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
                     df[mask][["M", "N", "K", "q_dtype_w"]].apply(tuple, axis=1)
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Warning: Could not load tuned shapes: {e}")
                 _TUNED_SHAPES_CACHE[tuned_file] = set()
         else:
@@ -73,19 +76,38 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+def run_aiter_hip_bpreshuffle(
+    inp,
+    weights,
+    scaleA,
+    scaleB,
+    dtype,
+    bias=None,
+    use_gelu=False,
+    solution_index=-1,
+):
     if scaleB is not None:
         scaleB = scaleB.t()
     return hipb_mm(
         inp,
         weights.t(),
-        solution_index=-1,
-        bias=None,
+        solution_index=solution_index,
+        bias=bias,
         out_dtype=dtype,
         scaleA=scaleA,
         scaleB=scaleB,
         scaleOut=None,
         bpreshuffle=True,
+        use_gelu=use_gelu,
+    )
+
+
+def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+    return (
+        quantDtype == dtypes.fp8
+        and get_gfx() == "gfx942"
+        and dtype == dtypes.bf16
+        and (m, n, k) in {(32, 3072, 768), (4096, 3072, 768), (8192, 3072, 768)}
     )
 
 
@@ -148,7 +170,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    a, _avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only; run_gemm_ck_bpreshuffle is unaffected (gated by quantDtype below)
     if skip_ck:
         avg_b = err_b = None
@@ -198,6 +220,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         else:
             avg_d = None
 
+    avg_gelu = None
+    err_gelu = None
+    avg_gelu_sol = None
+    err_gelu_sol = None
     if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
@@ -211,6 +237,104 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
             atol=1e-2,
             catastrophic_check=True,
         )
+
+        if should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+            hipb_bias = torch.rand([n], dtype=dtype, device="cuda") * 10
+            base, _ = run_aiter_hip_bpreshuffle(
+                x, weightshuffle, x_scale, w_scale, dtype, bias=hipb_bias
+            )
+            ref = F.gelu(base.float()).to(dtype)
+            gelu, avg_gelu = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+            )
+            err_gelu = checkAllclose(
+                ref,
+                gelu,
+                msg="hipmm gelu_bias: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            scale_b = w_scale.t()
+            sols = hipb_findallsols(
+                x,
+                weightshuffle.t(),
+                bias=hipb_bias,
+                out_dtype=dtype,
+                scaleA=x_scale,
+                scaleB=scale_b,
+                scaleC=None,
+                bpreshuffle=True,
+                use_gelu=True,
+            )
+            if len(sols) == 0:
+                raise RuntimeError(
+                    "hipb_findallsols(use_gelu=True) returned no solutions"
+                )
+            gelu_sol, avg_gelu_sol = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+                solution_index=sols[0],
+            )
+            err_gelu_sol = checkAllclose(
+                ref,
+                gelu_sol,
+                msg="hipmm gelu_bias selected sol: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            try:
+                hipb_mm(
+                    x,
+                    weightshuffle.t(),
+                    solution_index=-1,
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleOut=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("hipb_mm(use_gelu=True) should require bias")
+
+            try:
+                hipb_findallsols(
+                    x,
+                    weightshuffle.t(),
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleC=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(
+                    "hipb_findallsols(use_gelu=True) should require bias"
+                )
     else:
         avg_e = None
         err_e = None
@@ -223,6 +347,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         "asm err": err_d,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
+        "hipmm gelu_bias us": avg_gelu,
+        "hipmm gelu_bias err": err_gelu,
+        "hipmm gelu_bias selected sol us": avg_gelu_sol,
+        "hipmm gelu_bias selected sol err": err_gelu_sol,
     }
 
 
@@ -240,7 +368,7 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )
@@ -452,15 +580,15 @@ def _iter_flydsl_csv_cases():
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
         yield (
-            dict(
-                dtype=dtypes.bf16,
-                m=int(row["M"]),
-                n=int(row["N"]),
-                k=int(row["K"]),
-                quantDtype=q_dtype,
-                pad_a=128,
-                skip_ck=True,
-            ),
+            {
+                "dtype": dtypes.bf16,
+                "m": int(row["M"]),
+                "n": int(row["N"]),
+                "k": int(row["K"]),
+                "quantDtype": q_dtype,
+                "pad_a": 128,
+                "skip_ck": True,
+            },
             {
                 "source": "flydsl_csv",
                 "libtype": str(row.get("libtype", "")),
@@ -535,6 +663,10 @@ parser.add_argument(
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        # hipmm gelu_bias
+        (32, 3072, 768),
+        (4096, 3072, 768),
+        (8192, 3072, 768),
         # hipmm preshuffle
         (16, 7424, 8192),
         (32, 7424, 8192),

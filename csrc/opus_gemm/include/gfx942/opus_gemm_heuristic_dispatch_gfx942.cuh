@@ -27,12 +27,16 @@ OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_512x128x128x64_2x4_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_p1_256x64x64x64_2x2_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_p1_256x64x64x64_2x2_16x16x16_0x0x0);
+OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_p1_bk128_256x64x64x128_2x2_16x16x16_0x0x0);
+OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_p1_bk128_bf16ws_256x64x64x128_2x2_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_em3en4_lds1_pgr2_256x128x96x128_2x2_16x16x16_0x0x0);
+OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_legacy_512x64x128x64_2x4_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_splitk_legacy_bf16ws_512x128x128x64_2x4_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_wkc_512x16x32x32_1x1_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_wkc_512x32x16x64_1x1_16x16x16_0x0x0);
 OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_wkc_256x32x32x64_1x1_16x16x16_0x0x0);
+OPUS_GFX942_A16W16_DECL(opus_gemm_gfx942_wkc_512x16x32x64_1x1_16x16x16_0x0x0);
 
 #undef OPUS_GFX942_A16W16_DECL
 
@@ -56,15 +60,39 @@ inline OpusA16W16NoscaleKernel dispatch_bf16(int M, int N, int K)
 {
   const bool k64_ok = K % 64 == 0;
   const bool k32_ok = K % 32 == 0;
+  const bool wkc_bk64_ok = K >= 4096 && K % 512 == 0;
   const bool p1_ok = K % 128 == 0;
   const bool sb_ok = split_barrier_ok(N, K);
+
+  // DSV4 bf16 fallback misses that are not present in the generated CSV lookup.
+  // Keep this exact to K=4096; adjacent K=7168 bands have separate tuning data.
+  if (K == 4096)
+  {
+    if (p1_ok && ((M == 48 || M == 64) && N == 1024))
+      return opus_gemm_gfx942_splitk_p1_bk128_bf16ws_256x64x64x128_2x2_16x16x16_0x0x0<fp32_t>;
+    if (p1_ok && ((M == 128 && N == 512) || (M == 256 && N == 256)))
+      return opus_gemm_gfx942_splitk_p1_bk128_bf16ws_256x64x64x128_2x2_16x16x16_0x0x0<fp32_t>;
+    if (p1_ok && M == 512 && N == 256)
+      return opus_gemm_gfx942_splitk_p1_bk128_256x64x64x128_2x2_16x16x16_0x0x0<fp32_t>;
+    if ((M == 48 || M == 64) && N >= 1536 && N <= 2048)
+      return opus_gemm_gfx942_splitk_legacy_512x64x128x64_2x4_16x16x16_0x0x0<fp32_t>;
+    if ((M == 128 && N == 1024) || (M == 256 && N == 512))
+      return opus_gemm_gfx942_splitk_legacy_512x64x128x64_2x4_16x16x16_0x0x0<fp32_t>;
+    if ((M == 128 && N >= 1536 && N <= 2048) ||
+        (M == 256 && N == 1024) || (M == 512 && N == 512))
+      return opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0<fp32_t>;
+  }
 
   if (K >= 1024 && k32_ok && N >= 1536 && M <= 32)
   {
     if (M <= 4 && N >= 4096)
       return opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0<CDataType>;
-    return M <= 16
-        ? opus_gemm_gfx942_wkc_512x16x32x32_1x1_16x16x16_0x0x0<CDataType>
+    if (M <= 16)
+      return wkc_bk64_ok
+          ? opus_gemm_gfx942_wkc_512x16x32x64_1x1_16x16x16_0x0x0<CDataType>
+          : opus_gemm_gfx942_wkc_512x16x32x32_1x1_16x16x16_0x0x0<CDataType>;
+    return (M == 32 && K == 4096 && wkc_bk64_ok)
+        ? opus_gemm_gfx942_wkc_512x16x32x64_1x1_16x16x16_0x0x0<CDataType>
         : opus_gemm_gfx942_wkc_256x32x32x64_1x1_16x16x16_0x0x0<CDataType>;
   }
 

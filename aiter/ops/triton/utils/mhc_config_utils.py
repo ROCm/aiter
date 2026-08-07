@@ -9,7 +9,7 @@ import re
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.gemm_config_utils import _load_config_file, USE_LRU_CACHE
+from aiter.ops.triton.utils.gemm_config_utils import USE_LRU_CACHE, _load_config_file
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -149,7 +149,7 @@ def get_mhc_config(
 
     # Extract M_LEQ_x keys and their thresholds, sorted ascending
     m_leq_keys = []
-    for key in config_dict.keys():
+    for key in config_dict:
         if key.startswith("M_LEQ_"):
             try:
                 threshold = int(key[6:])  # Extract number after "M_LEQ_"

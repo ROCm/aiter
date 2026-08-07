@@ -3,7 +3,7 @@
 FlyDSL-native implementation of the FMHA prologue with compiler-managed
 VGPR bank allocation via @llvm.amdgcn.set.vgpr.bank intrinsic.
 
-Target: gfx1250 (MI450), wave32, 4 waves per thread-group, 128 threads.
+Target: gfx1250, wave32, 4 waves per thread-group, 128 threads.
 All phases use FlyDSL — zero inline ASM. 128×128 compute (TDM loads 256).
 
 Reference: BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s
@@ -14,13 +14,16 @@ from __future__ import annotations
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, rocdl, vector
+from flydsl.expr import arith, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
+
 from .fmha_core_loop import (
     QK_HDIM,
-    _rocdl_permlanex16,
     _rocdl_exp2,
+    _rocdl_permlanex16,
     set_vgpr_bank,
 )
 

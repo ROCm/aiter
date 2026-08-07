@@ -14,6 +14,7 @@ import functools
 import os
 import sys
 from functools import lru_cache
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -52,22 +53,37 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
     if _opus_csrc not in sys.path:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import kernels_list as _opus_kernels_list
+    from opus_gemm_common import (
+        SPLITK_KIDS as _opus_splitk_kids,
+    )
+    from opus_gemm_common import (
+        kernels_list as _opus_kernels_list,
+    )
     from opus_gemm_tune import (
-        candidate_kids_for_shape as _opus_candidate_kids_for_shape,
-        candidate_splitK as _opus_candidate_splitK,
-        kid_rejects_shape as _opus_kid_rejects_shape,
-        kid_rejects_bias as _opus_kid_rejects_bias,
         _ensure_kids_compiled as _opus_ensure_kids_compiled,
     )
+    from opus_gemm_tune import (
+        candidate_kids_for_shape as _opus_candidate_kids_for_shape,
+    )
+    from opus_gemm_tune import (
+        candidate_splitK as _opus_candidate_splitK,
+    )
+    from opus_gemm_tune import (
+        kid_rejects_bias as _opus_kid_rejects_bias,
+    )
+    from opus_gemm_tune import (
+        kid_rejects_shape as _opus_kid_rejects_shape,
+    )
+
     from aiter.ops.opus.gemm_op_a16w16 import (
         opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
     )
 
     _opus_all_kernels = dict(_opus_kernels_list)
-except Exception as _opus_exc:
+except Exception as _opus_exc:  # noqa: BLE001
     _opus_gemm_a16w16_tune = None
     _opus_all_kernels = None
+    _opus_splitk_kids = frozenset()
     _opus_candidate_kids_for_shape = None
     _opus_kid_rejects_shape = None
     _opus_kid_rejects_bias = None
@@ -81,7 +97,7 @@ try:
     if _gradlib_path not in sys.path:
         sys.path.insert(0, os.path.abspath(_gradlib_path))
     from GemmTuner import Gemm as HipblasltGemm
-except Exception as _hipb_exc:
+except Exception as _hipb_exc:  # noqa: BLE001
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
 
@@ -382,7 +398,7 @@ def libtype_list(string):
 
 
 class GemmA16W16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
@@ -447,7 +463,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         )
 
     def _clear_op_caches(self):
-        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+        from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
 
         get_GEMM_A16W16_config_.cache_clear()
         get_GEMM_A16W16_config.cache_clear()
@@ -459,8 +475,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return super().calculate(results, bpes=(2, 2, 2))
 
     def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
         from aiter.tuned_gemm import gemm_a16w16
-        from aiter.test_common import run_perftest, checkAllclose
 
         untunedf = self.untunedf
         results = []
@@ -526,7 +542,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
@@ -595,8 +611,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
         rtol, atol = _default_tol(outdtype)
         tasks = []
         solidx = 0
-        for key in asm_kernels.keys():
-            tile_m, tile_n, pf, splitK_flag, subK, bias_flag, bPreshuffle = key
+        for key in asm_kernels:
+            tile_m, tile_n, _pf, splitK_flag, subK, bias_flag, bPreshuffle = key
             kernelName = asm_kernels[key][0]
             start = 1
             if splitK_flag:
@@ -672,7 +688,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
-            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+            if kid in _opus_splitk_kids:
                 splitK_range = _opus_candidate_splitK(M, N, K, 1, cu_num, k_inst)
             else:
                 splitK_range = [0]
@@ -1000,7 +1016,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 if libtype == "hipblaslt":
                     try:
                         kernelName = aiter.getHipblasltKernelName(int(kernelId))
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         kernelName = "None"
                 else:
                     kernelName = "None"

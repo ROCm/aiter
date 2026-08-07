@@ -2,24 +2,36 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
 import torch
-import aiter
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    sage_fwd,
     map_dims,
+    sage_fwd,
 )
-
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
-
 from aiter.ops.triton.utils._triton import arch_info
 
 
-def get_sage_fwd_configs():
+def get_sage_fwd_configs(
+    block_m: int | None = None,
+    block_n: int | None = None,
+    *,
+    a3_tuned: bool = False,
+):
+    """Return Triton launch config for fav3_sage ``sage_fwd``.
+
+    Default behaviour is unchanged from upstream aiter (gfx942: num_warps=8, etc.).
+
+    Set ``a3_tuned=True`` to opt into MI308/gfx942 perf tuning for 128/64 tiles
+    (num_warps=4, waves_per_eu=2). Numerics match the default launch params;
+    use this when long sequences (e.g. Qwen edit ~8400 tokens) are register-bound.
+    """
     arch = arch_info.get_arch()
     if arch == "gfx950":
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
@@ -28,7 +40,7 @@ def get_sage_fwd_configs():
             "num_warps": 8,
         }
     elif arch == "gfx942":
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
@@ -37,8 +49,7 @@ def get_sage_fwd_configs():
             "num_warps": 8,
         }
     else:
-        # return tuned config for MI300X by default
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
@@ -46,6 +57,16 @@ def get_sage_fwd_configs():
             "num_stages": 2,
             "num_warps": 8,
         }
+    if block_m is not None:
+        base["BLOCK_M"] = block_m
+    if block_n is not None:
+        base["BLOCK_N"] = block_n
+
+    # Optional MI308/gfx942 perf preset; off by default so callers keep upstream behaviour.
+    if a3_tuned:
+        base["num_warps"] = 4
+        base["waves_per_eu"] = 2
+    return base
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
@@ -68,16 +89,20 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: float | None,
         causal: bool,
-        window_size: Tuple[int, int],
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         deterministic: bool,
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
-        config: Optional[dict] = None,
-        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        config: dict | None = None,
+        block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         smooth_k: bool = True,
+        q_smooth: bool = False,
+        hadamard_rotation: bool = False,
+        R: torch.Tensor | None = None,
+        BLOCK_R: int | None = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -134,15 +159,21 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             BLKK=BLKK,
             layout=layout,
             smooth_k=smooth_k,
+            q_smoothing=q_smooth,
             return_lse=return_lse,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_R=BLOCK_R,
         )
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result[:6]
+        rest = sq_result[6:]
+        delta_s = None
+        sage_lse_delta = None
+        if q_smooth:
+            delta_s = rest[0]
+            rest = rest[1:]
         if return_lse:
-            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, sage_lse_delta = (
-                sq_result
-            )
-        else:
-            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result
-            sage_lse_delta = None
+            sage_lse_delta = rest[0] if rest else None
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -166,6 +197,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            delta_s,
             softmax_scale,
             causal,
             window_size,
@@ -210,6 +242,10 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # config
             None,  # block_lut
             None,  # smooth_k
+            None,  # q_smooth
+            None,  # hadamard_rotation
+            None,  # R
+            None,  # BLOCK_R
         )
 
 
@@ -217,18 +253,22 @@ def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    config: dict | None = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     smooth_k: bool = True,
+    q_smooth: bool = False,
+    hadamard_rotation: bool = False,
+    R: torch.Tensor | None = None,
+    BLOCK_R: int | None = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -259,7 +299,11 @@ def fav3_sage_wrapper_func(
         block_lut: Optional ragged LUT for block-sparse attention,
                 (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
                 When None, dense attention is used.
-        smooth_k: Whether to apply k-smoothing to the K tensor
+        smooth_k: Whether to apply k-smoothing to the K tensor (default: True)
+        q_smooth: Apply per-block Q centering with delta_s bias correction (default: False)
+        hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
+        R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
+        BLOCK_R: Hadamard tile size when hadamard_rotation=True and R is None
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -307,6 +351,10 @@ def fav3_sage_wrapper_func(
         config,
         block_lut,
         smooth_k,
+        q_smooth,
+        hadamard_rotation,
+        R,
+        BLOCK_R,
     )
 
 
@@ -317,18 +365,19 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    bias: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
-    kv_block_indices: Optional[torch.Tensor] = None,
-    lut_start: Optional[torch.Tensor] = None,
-    lut_count: Optional[torch.Tensor] = None,
+    config: dict | None = None,
+    kv_block_indices: torch.Tensor | None = None,
+    lut_start: torch.Tensor | None = None,
+    lut_count: torch.Tensor | None = None,
     use_block_sparse: bool = False,
 ):
     """
@@ -427,6 +476,13 @@ def fav3_sage_func(
     stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
+    if bias is not None:
+        USE_BIAS = True
+        stride_bz, stride_bh, stride_bm, stride_bn = bias.stride()
+    else:
+        USE_BIAS = False
+        stride_bz, stride_bh, stride_bm, stride_bn = 0, 0, 0, 0
+
     # --- 6. Padding & Metadata ---
     padded_d_model_qk = max(16, 1 << (head_size_qk - 1).bit_length())
     padded_d_model_v = max(16, 1 << (head_size_v - 1).bit_length())
@@ -459,7 +515,7 @@ def fav3_sage_func(
         q,
         k,
         v,
-        None,
+        bias,
         q_descale,
         k_descale,
         v_descale,
@@ -491,10 +547,10 @@ def fav3_sage_func(
         stride_oh,
         stride_om,
         stride_od,
-        0,
-        0,
-        0,
-        0,  # stride_bz, stride_bh, stride_bm, stride_bn
+        stride_bz,
+        stride_bh,
+        stride_bm,
+        stride_bn,
         0,
         0,  # stride_az, stride_ah
         0,
@@ -529,7 +585,7 @@ def fav3_sage_func(
         IS_VARLEN=False,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False,
+        USE_BIAS=USE_BIAS,
         USE_ALIBI=False,
         ENABLE_DROPOUT=False,
         USE_EXP2=True,

@@ -85,10 +85,10 @@ static_assert(sizeof(KernelArgs) == 0x84,
 
 // ---- helpers ---------------------------------------------------------------
 
-// Kernel selection: only (dtype, hdim_q, hdim_v, mask) — we always use the
-// _brd (border) kernel variants which are a strict superset (handle aligned
-// + unaligned q_seq_len/kv_seq_len uniformly).  The csv schema therefore has
-// no `border` column.
+// Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
+// registers both mask=0 (non-causal, _rxy_pfnr source) and mask=1 (causal,
+// _rxy_pfnr_cas_brd source -> *_mask.co) variants, so is_causal picks the
+// matching .co at launch time.
 static std::string get_heuristic_kernel_fmha_fwd_bf16(const std::string& dtype,
                                                      int hdim_q,
                                                      int hdim_v,
