@@ -1019,28 +1019,18 @@ def _run_moe_reduction(
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         return
 
-    reduce_out_dtype_str = None
-    X = target
+    from .kernels.moe_reduce import compile_moe_reduction
+
+    # fp8 route-out: X is a flat uint8 [rows, model_dim + model_dim/8] buffer,
+    # reduced (fp8 * e8m0) -> out.dtype. Dense dtypes reduce the contiguous
+    # X[tokens, topk, model_dim]. out_dtype_str is only used by the fp8 path.
+    out_dtype_str = _reduce_dtype_str
     if is_fp8:
         _reduce_dtype_str = "fp8"
-        reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
-        # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer.
+        out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+        X = target
     else:
         X = target.view(token_num, topk, model_dim)
-
-    from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-    reduce_kwargs = {
-        "topk": topk,
-        "model_dim": model_dim,
-        "dtype_str": _reduce_dtype_str,
-        "use_mask": use_mask,
-        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-        "num_experts": int(expert_mask.numel()) if use_mask else 0,
-    }
-    if is_fp8:
-        reduce_kwargs["out_dtype_str"] = reduce_out_dtype_str
-    reduce_exe = compile_moe_reduction(**reduce_kwargs)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
         tk = topk_ids.to(torch.int32).contiguous()
@@ -1050,16 +1040,19 @@ def _run_moe_reduction(
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
     if stream is None:
         stream = torch.cuda.current_stream()
+    # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
+    num_experts = int(expert_mask.numel()) if use_mask else 0
+    reduce_exe = compile_moe_reduction(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=_reduce_dtype_str,
+        use_mask=use_mask,
+        num_experts=num_experts,
+        out_dtype_str=out_dtype_str,
+    )
     _run_compiled(
         reduce_exe,
-        (
-            ptr_arg(X),
-            ptr_arg(out),
-            ptr_arg(em),
-            ptr_arg(tk),
-            token_num,
-            stream,
-        ),
+        (ptr_arg(X), ptr_arg(out), ptr_arg(em), ptr_arg(tk), token_num, stream),
     )
 
 

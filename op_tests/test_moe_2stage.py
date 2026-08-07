@@ -98,7 +98,6 @@ def test_fmoe(
     linear_beta=None,
     kernel_bench=False,
     disable_stage2_bias=False,
-    reference_intermediate_pad=0,
     ref_dtype="bf16",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -446,27 +445,15 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    ref_a2_qt = a2_qt
-    ref_w2_qt = w2_qt
-    ref_w2_scale = w2_scale
-    if reference_intermediate_pad:
-        effective_inter_dim = inter_dim - int(reference_intermediate_pad)
-        ref_a2_qt = a2_qt[..., :effective_inter_dim].contiguous()
-        if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
-            ref_w2_qt = w2_qt[..., : effective_inter_dim // 2].contiguous()
-            ref_w2_scale = w2_scale[..., : effective_inter_dim // 32].contiguous()
-        else:
-            ref_w2_qt = w2_qt[..., :effective_inter_dim].contiguous()
-
     out2_ref = torch_moe_stage2(
-        ref_a2_qt,
+        a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
-        ref_w2_qt,  # E, model_dim, inter_dim
+        w2_qt,  # E, model_dim, inter_dim
         topk_weights,
         topk_ids,
         dtype=dtype,
         quant_type=qType,
-        w2_scale=ref_w2_scale,
+        w2_scale=w2_scale,
         a2_scale=a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
@@ -725,7 +712,7 @@ parser.add_argument(
 parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
-    help="Skip validating flydsl shapes from tuned fmoe CSVs.",
+    help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
     "--csv-filter",
@@ -829,21 +816,6 @@ def _row_to_kwargs(row):
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
     inter_dim = int(row["inter_dim"])
-    reference_intermediate_pad = 0
-    kernel_name2 = str(row.get("kernelName2", "") or "")
-    if kernel_name2.startswith("opus_"):
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            opus_a8w4_shape_family_for_shape,
-        )
-
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=int(row["model_dim"]),
-            inter_dim=inter_dim,
-            expert=int(row["expert"]),
-            topk=int(row["topk"]),
-        )
-        if shape_family is not None:
-            reference_intermediate_pad = int(shape_family.inter_dim_pad)
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
@@ -864,7 +836,6 @@ def _row_to_kwargs(row):
         "hidden_pad": 0,
         "intermediate_pad": 0,
         "preshuffle": True,
-        "reference_intermediate_pad": reference_intermediate_pad,
         "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
@@ -872,7 +843,7 @@ def _row_to_kwargs(row):
 
 
 def _iter_csv_cases():
-    """Yield (kwargs, extras) for every row of every selected model csv."""
+    """Yield FlyDSL/Opus cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
@@ -883,7 +854,11 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+        if (
+            "flydsl_" not in kernel_name1
+            and "flydsl_" not in kernel_name2
+            and not kernel_name1.startswith("opus_moe1_")
+        ):
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -900,6 +875,11 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
+            kwargs["linear_beta"] = (
+                25.0 if args.linear_beta is None else float(args.linear_beta)
+            )
         # The reference path below uses the CSV q_dtype_a directly, while
         # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
         # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).

@@ -851,6 +851,8 @@ def _fused_moe_impl(
         gate_mode,
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
     )
 
     if _metadata_transform is not None:
@@ -1321,6 +1323,7 @@ def _opus_a8w4_stage1_wrapper(
     num_valid_ids,
     out,
     topk,
+    activation,
     kernelName="",
     block_m: int = 0,
     w1_scale=None,
@@ -1328,6 +1331,8 @@ def _opus_a8w4_stage1_wrapper(
     sorted_weights=None,
     bias1=None,
     swiglu_limit: float | None = None,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     inter_dim_pad: int = 0,
     **_kwargs,
 ):
@@ -1351,7 +1356,10 @@ def _opus_a8w4_stage1_wrapper(
         out=out,
         block_m=int(block_m),
         kernelName=str(kernelName),
+        activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -2060,6 +2068,7 @@ def get_2stage_cfgs(
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
     has_stage2_bias=False,
+    opus_weights_shuffled=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2230,6 +2239,30 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    if cfg is not None:
+        kn1 = str(cfg.get("kernelName1", "") or "").strip()
+        kn2 = str(cfg.get("kernelName2", "") or "").strip()
+        has_opus = kn1.startswith("opus_") or kn2.startswith("opus_")
+        if opus_weights_shuffled is None:
+            opus_weights_shuffled = is_shuffled
+        if has_opus and not opus_weights_shuffled:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding Opus tuned config for {keys}: "
+                "both w1 and w2 must be marked is_shuffled=True; using default "
+                "heuristics"
+            )
+        elif kn1.startswith("opus_") and activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding Opus tuned config for unsupported "
+                f"activation {activation}; using default heuristics"
+            )
+
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
         if kn2.startswith("opus_"):
@@ -2402,6 +2435,7 @@ def get_2stage_cfgs(
             stage1_func = functools.partial(
                 _opus_a8w4_stage1_wrapper,
                 kernelName=kernelName1,
+                activation=activation,
                 block_m=block_m,
                 inter_dim_pad=intermediate_pad,
             )
@@ -2919,6 +2953,8 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
@@ -3043,6 +3079,11 @@ def fused_moe_2stages(
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
+        )
+    elif stage1_func is _opus_a8w4_stage1_wrapper:
+        extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
+        extra_stage1_args["situ_linear_beta"] = (
+            25.0 if linear_beta is None else float(linear_beta)
         )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
@@ -3364,8 +3405,8 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float | None = 7.0):
 def situv2(
     gate: torch.Tensor,
     up: torch.Tensor,
-    beta: float = 2.0,
-    linear_beta: float = 1.5,
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
 ) -> torch.Tensor:
     situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
     up_scaled = linear_beta * torch.tanh(up / linear_beta)
@@ -3387,8 +3428,8 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
     swiglu_limit=None,
-    situ_beta: float = 2.0,
-    situ_linear_beta: float = 1.5,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
