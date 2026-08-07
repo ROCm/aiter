@@ -367,7 +367,7 @@ jobs:
               local overlay="${AITER_OVERLAY_DIR:-/tmp/aiter_overlay}"
               rm -rf "${overlay}"
               mkdir -p "${overlay}"
-              python3 -m pip install --disable-pip-version-check --no-deps \
+              python3 -m pip install --disable-pip-version-check \
                   --target "${overlay}" "${wheels[0]}"
               export PYTHONPATH="${overlay}${PYTHONPATH:+:${PYTHONPATH}}"
               python3 -c 'import pathlib, sys, aiter; root = pathlib.Path(sys.argv[1]).resolve(); loaded = pathlib.Path(aiter.__file__).resolve(); print(f"[aiter-overlay] loaded {loaded}"); raise SystemExit(0 if root in loaded.parents else 1)' "${overlay}"
