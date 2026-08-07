@@ -1054,7 +1054,7 @@ def _gfx950_unified_attention(
         if ALL_DECODE:
             waves_per_eu = 1
         elif SLIDING_WINDOW > 0:
-            waves_per_eu = 2
+            waves_per_eu = 0
         else:
             waves_per_eu = 3
     elif HEAD_SIZE >= 256:
