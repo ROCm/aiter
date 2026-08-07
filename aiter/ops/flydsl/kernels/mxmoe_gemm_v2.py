@@ -230,8 +230,8 @@ def gemm2_body_v2(
     # g2_diag: PERF-ATTRIBUTION ONLY (wrong results); each bit drops one phase.
     diag_no_barrier = bool(g2_diag & 1)
     diag_no_epilog = bool(g2_diag & 2)
-    diag_no_ads = bool(g2_diag & 4)   # kunroll path only: skip the A ds-reads
-    diag_no_bld = bool(g2_diag & 8)   # kunroll path only: skip the B global loads
+    diag_no_ads = bool(g2_diag & 4)  # kunroll path only: skip the A ds-reads
+    diag_no_bld = bool(g2_diag & 8)  # kunroll path only: skip the B global loads
     diag_no_mfma = bool(g2_diag & 16)  # kunroll path only: skip the MFMA cluster
     # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     if g2_kstages not in (1, 2):
@@ -578,9 +578,7 @@ def gemm2_body_v2(
             cur_b, nxt_b = kt_ct % nB, (kt_ct + 1) % nB
             if const_expr(kt_ct + 1 < KT):
                 if const_expr(not diag_no_bld):
-                    issue_b_load_into(
-                        bqfs[nxt_b], bsfs[nxt_b], fx.Int32(kt_ct + 1)
-                    )
+                    issue_b_load_into(bqfs[nxt_b], bsfs[nxt_b], fx.Int32(kt_ct + 1))
                 load_a_scale_into(safs[nxt_b], kt_ct + 1)
             if const_expr(not diag_no_ads):
                 issue_a_ds_read(kt_ct, frags=a_sets[kt_ct % nA])
@@ -911,9 +909,7 @@ def atomic_bf16_epilog(
         # the readback keeps the bank spread the 8-col mapping had (a 4 x C_SLICE_ROWS/4
         # transpose; bijective on [0, C_SLICE_ROWS)).
         w_m4 = w_mlane * fx.Int32(4)
-        w_row_local = (w_m4 % fx.Int32(C_SLICE_ROWS)) + (
-            w_m4 // fx.Int32(C_SLICE_ROWS)
-        )
+        w_row_local = (w_m4 % fx.Int32(C_SLICE_ROWS)) + (w_m4 // fx.Int32(C_SLICE_ROWS))
         w_col_base = w_nlane * fx.Int32(W_CPL)
 
     def flat_buffer(arg, elem_ty, align):
@@ -957,7 +953,9 @@ def atomic_bf16_epilog(
     weight = []
     _pf = []
     # WIDE needs one (token_id, weight) pair per C slice, not one per M_REPS row.
-    _meta_reps = range_constexpr(CSPLIT) if const_expr(WIDE) else range_constexpr(M_REPS)
+    _meta_reps = (
+        range_constexpr(CSPLIT) if const_expr(WIDE) else range_constexpr(M_REPS)
+    )
     # NOTE: these loads are invariant across the n-tiles of an MXFP4_G2_NLOOP group,
     # but caching them across tiles measures slower -- the extra values live across
     # the next n-tile's whole K loop, and the K loop is more sensitive to register
@@ -1094,9 +1092,7 @@ def atomic_bf16_epilog(
             row_e = w_row_local * BN
             vals = []
             for h in range_constexpr(2):
-                base_e = row_e + cswz(
-                    w_col_base + fx.Int32(g * 8 + h * 4), row_grp4
-                )
+                base_e = row_e + cswz(w_col_base + fx.Int32(g * 8 + h * 4), row_grp4)
                 v4 = Vec(
                     lds_vec_load(
                         lds_acc_base,
@@ -1135,14 +1131,11 @@ def atomic_bf16_epilog(
                 f2,
                 out_i8[
                     None,
-                    row_base_addr
-                    + fx.Int64(col_g0_base + fx.Int32((_nw // 4) * 16)),
+                    row_base_addr + fx.Int64(col_g0_base + fx.Int32((_nw // 4) * 16)),
                 ],
             )
         scale_off = (
-            row_base_addr
-            + fx.Int64(N_OUT)
-            + fx.Int64(col_g0_base // fx.Int32(8))
+            row_base_addr + fx.Int64(N_OUT) + fx.Int64(col_g0_base // fx.Int32(8))
         )
         acc = scales[0] & fx.Int32(0xFF)
         for q in range_constexpr(1, W_NS):
@@ -1153,9 +1146,7 @@ def atomic_bf16_epilog(
             # quad_perm broadcasts: [i,i,i,i] for a 4-lane merge, [0,0,2,2]/[1,1,3,3]
             # for a 2-lane one.  Every lane ends up with the full dword; only the
             # group leader stores it, at its own (lowest) scale offset.
-            ctrls = (
-                (0x00, 0x55, 0xAA, 0xFF) if W_NPACK == 4 else (0xA0, 0xF5)
-            )
+            ctrls = (0x00, 0x55, 0xAA, 0xFF) if W_NPACK == 4 else (0xA0, 0xF5)
             merged = None
             for j in range_constexpr(W_NPACK):
                 part = fx.Int32(
@@ -1191,9 +1182,7 @@ def atomic_bf16_epilog(
         # Global row within the BM tile drives the swizzle selector (it must match the
         # write side, which indexes by the global chunk); the LDS row is slice-relative.
         row_in_block = fx.Int32((mr - sp * C_MREPS) * 8) + m_lane
-        row_grp4 = (
-            (fx.Int32(mr * 8) + m_lane) >> fx.Int32(2)
-        ) & fx.Int32(3)
+        row_grp4 = ((fx.Int32(mr * 8) + m_lane) >> fx.Int32(2)) & fx.Int32(3)
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if const_expr(use_reduce):
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
@@ -1381,9 +1370,8 @@ def atomic_bf16_epilog(
             def store_wide_if_valid(token_id, sp, tx_i32):
                 # tx >= W_ACTIVE only when g2_wcpl widened the lane slice past the
                 # thread count; those lanes have no row and must not store.
-                if token_id < i32_M:
-                    if tx_i32 < fx.Int32(W_ACTIVE):
-                        store_wide(sp)
+                if token_id < i32_M and tx_i32 < fx.Int32(W_ACTIVE):
+                    store_wide(sp)
 
             store_wide_if_valid(token_id, sp, tx_i32)
             continue

@@ -5,10 +5,9 @@
 import contextlib
 import os
 
-from flydsl.compiler.kernel_function import CompilationContext
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
@@ -386,9 +385,7 @@ def compile_gemm2_a4w4_port(
                 n_block0 = n_group_idx * fx.Int32(g2_nloop)
                 for _j in range_constexpr(g2_nloop):
                     run_unit(
-                        m_block_idx * fx.Int32(num_n_blocks)
-                        + n_block0
-                        + fx.Int32(_j)
+                        m_block_idx * fx.Int32(num_n_blocks) + n_block0 + fx.Int32(_j)
                     )
         elif const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
