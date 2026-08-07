@@ -39,7 +39,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
-    "test_tdm_gfx1250.cu",
+    "test_tdm_feature_gfx1250.cu",
     "test_finfo.cu",
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",
@@ -61,6 +61,20 @@ def _detect_arch():
                 name = line.split()[-1].strip()
                 if name.startswith("gfx"):
                     return name
+    except Exception:
+        pass
+    # rocminfo is not always installed, and falling straight through to "native" costs
+    # more than an unresolved arch string: the per-arch skip lists below are keyed by
+    # gfx name, so an undetected arch silently stops applying them. torch is already a
+    # hard requirement of the harness that loads the .so, and reports the same name.
+    try:
+        import torch
+
+        name = getattr(
+            torch.cuda.get_device_properties(0), "gcnArchName", ""
+        ).split(":")[0]
+        if name.startswith("gfx"):
+            return name
     except Exception:
         pass
     return "native"
@@ -123,15 +137,28 @@ def build(verbose=False, jobs=None):
     # target arch. Skipped at .so build time so the rest of the suite
     # still links; the Python harness sees the missing extern "C" launcher
     # and reports SKIP for those tests.
-    #
-    # gfx1201 / gfx1200 (Navi 44/48, RDNA4): opus _async_load uses
-    # __builtin_amdgcn_raw_ptr_buffer_load_lds which needs the
-    # Per-arch build-time skip list. Empty today; add entries here if a
-    # future kernel needs an arch-specific feature unavailable elsewhere.
-    _ARCH_SKIP_SOURCES = {}
-    skip = _ARCH_SKIP_SOURCES.get(arch, set())
+    _ARCH_SKIP_SOURCES = {
+        "gfx1250": {
+            # gfx1201 wave64 WMMA builtins; no gfx1250 spelling.
+            "test_wmma_gfx1201_w64.cu",
+            # opus.hpp's wmma<i8, i8, f32, 16, 16, 128> dispatch does not accept the
+            # scale operands the kernel passes.
+            "test_wmma_scale.cu",
+        },
+    }
+
+    # The inverse list: sources that build for one arch and no other. Stated positively
+    # because the alternative is naming every arch a kernel does NOT support, which is a
+    # list that silently goes wrong every time a new one appears.
+    _ARCH_ONLY_SOURCES = {
+        # The tensor DMA opcodes are gfx1250-only.
+        "test_tdm_feature_gfx1250.cu": {"gfx1250"},
+    }
+
+    skip = set(_ARCH_SKIP_SOURCES.get(arch, set()))
+    skip |= {s for s, archs in _ARCH_ONLY_SOURCES.items() if arch not in archs}
     sources = [s for s in _CU_SOURCES if s not in skip]
-    if verbose and skip:
+    if verbose:
         for s in sorted(skip):
             print(f"[setup]   skip {s} (incompatible with arch={arch})")
 

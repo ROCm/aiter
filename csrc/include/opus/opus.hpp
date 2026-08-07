@@ -1713,7 +1713,7 @@ OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, 
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
-    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15;
 
 OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, u32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
 OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
@@ -2584,8 +2584,12 @@ using tdm_sgpr4 = i32_t __attribute__((ext_vector_type(4)));
 using tdm_sgpr8 = i32_t __attribute__((ext_vector_type(8)));
 
 // Out of line because an explicit specialization cannot be written inside tdm_desc; the empty form is what makes [[no_unique_address]] free.
-template<bool En> struct tdm_groups23 {};
-template<>        struct tdm_groups23<true> { tdm_sgpr4 group2{0,0,0,0}; tdm_sgpr4 group3{0,0,0,0}; };
+// The two compile-time dwords come in as template arguments rather than being written by tdm_desc's initializer, which is the only way this can be an aggregate the empty case optimises away; they carry tile_dim3 and tile_dim4, so leaving them zero collapses a rank-4 or rank-5 tile onto its dim3/dim4 = 0 slice.
+template<bool En, u32_t G2Dword3 = 0, u32_t G3Dword2 = 0> struct tdm_groups23 {};
+template<u32_t G2Dword3, u32_t G3Dword2> struct tdm_groups23<true, G2Dword3, G3Dword2> {
+    tdm_sgpr4 group2{0, 0, 0, i32_t(G2Dword3)};
+    tdm_sgpr4 group3{0, 0, i32_t(G3Dword2), 0};
+};
 
 template<typename Traits>
 struct tdm_desc {
@@ -2618,7 +2622,10 @@ struct tdm_desc {
 
     // Compile-time dword inits; trailing comments list each dword's fields, "(rt)" marking setter-patched ones.
     // The two literals are ISA-fixed: count has only NULL/Valid and type no legal value but 2. scope/th stay 0, the cache policy riding as asm modifiers.
-    static constexpr u32_t group0_dword0_const = 1u | (u32_t((T::gather_tag::enabled ? 1 : 0) & 0x1) << 30) | (u32_t(T::gather_tag::index_size & 0x1) << 31);                                          // count[1:0]=1 (Valid Tensor) | gather_mode[30] | index_size[31] -- the two are easy to transpose and only gather<32> sets both, so gather<16> is the case that catches it
+    // count[1:0]=1 (Valid Tensor) | index_size[30] | gather_mode[31].
+    // MEASURED on gfx1250, and it contradicts MLIR: AMDGPUToROCDL's make_dma_base emits gather_mode at 30 and index_size at 31 (the offsets its lit test names), which does not gather. Issuing the same descriptor twice with only this dword changed, 0x80000001 fetches the listed rows and 0x40000001 returns consecutive rows from the origin -- see gcnasm/opus_tdm_test, which is what the probe exists for.
+    // Only gather<16> can tell the two orderings apart: gather<32> is 0xC0000001 either way, so a 32-bit-only workload will never notice a transposition.
+    static constexpr u32_t group0_dword0_const = 1u | (u32_t(T::gather_tag::index_size & 0x1) << 30) | (u32_t((T::gather_tag::enabled ? 1 : 0) & 0x1) << 31);
     static constexpr u32_t group0_dword3_const = 2u << 30;                                                                                                                                    // global_addr_hi(rt) | type[127:126]=2 (image)
     static constexpr u32_t group1_dword0_const = u32_t(wg_mask & 0xFFFF) | (u32_t(data_size & 0x3) << 16) | (u32_t(tdm_traits::atomic_barrier_enable) << 18) | (u32_t(tdm_traits::iterate_enable) << 19) | (u32_t(lds_pad_enable & 0x1) << 20) | (u32_t(tdm_traits::multicast_early_timeout) << 21) | (u32_t(pad_interval & 0x7) << 22) | (u32_t(pad_amount & 0x7F) << 25);   // wg_mask | data_size | build-wide bits | pad
     static constexpr u32_t group1_dword3_const = u32_t(tile_dim0 & 0xFFFF) << 16;                                                                                                               // tensor_dim1_lo(rt) | tile_dim0
@@ -2634,7 +2641,7 @@ struct tdm_desc {
     // Stored as the operand groups the instruction takes, so nothing is transcribed at issue; every subscript is constant, so this stays SSA scalars rather than a live vector.
     tdm_sgpr4 group0{ i32_t(group0_dword0_const), 0, 0, i32_t(group0_dword3_const) };
     tdm_sgpr8 group1{ i32_t(group1_dword0_const), 0, 0, i32_t(group1_dword3_const), i32_t(group1_dword4_const), 0, 0, 0 };
-    [[no_unique_address]] tdm_groups23<needs_groups23> groups23{};
+    [[no_unique_address]] tdm_groups23<needs_groups23, group2_dword3_const, group3_dword2_const> groups23{};
 
     // Runtime setters, bit positions in the trailing comments. g() reads one dword unsigned: the vectors hold i32_t, but every field below is bit arithmetic.
     OPUS_H_D static u32_t g(i32_t x) { return u32_t(x); }
