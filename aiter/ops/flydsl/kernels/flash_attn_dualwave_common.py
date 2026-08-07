@@ -885,13 +885,22 @@ def _make_dualwave_swp_fp8_traits(
         # So the ring cannot be shallowed without also shortening the prefetch
         # distance in the body, which is the pipeline's whole point.
         #
-        # That closes off 2 workgroups/CU entirely for this pipeline: at npf=6
-        # the ring (48.8 KB) plus the bf16 V staging (48.2 KB) is 97.0 KB before
-        # a single Q row, already over the 80 KB half-budget. Shrinking block_m
-        # 256 -> 16 saves 30 KB and lands at 99.0 KB, still 1 workgroup/CU. So
-        # the M-dimension refactor must be justified by issue rate and grid
-        # shape, NOT by occupancy -- there is no second workgroup to be had
-        # without restructuring the V staging too.
+        # That closes off 2 workgroups/CU entirely for this pipeline. MEASURED
+        # 2026-08-07 via rocprofv3 kernel trace (LDS_Block_Size): this kernel
+        # takes 140288 B = 137.0 KB per workgroup, against 160 KB per CU. Two
+        # workgroups needs <= 80 KB, i.e. a 41% cut. Zeroing the Q tile outright
+        # still leaves 105 KB.
+        #
+        # Do not go looking for that space in the V staging: the `vt` array is
+        # typed bf16 but under BN128 it is sized `num_prefetch_k *
+        # (fp8_v_tile_bytes // 2)`, so it already holds RAW FP8 at exactly the
+        # theoretical minimum (6 x 8 KB = 48 KB for 6 tiles of BLOCK_N x
+        # HEAD_DIM fp8). There is no bf16 inflation to reclaim -- an earlier
+        # reading of this as "48.2 KB of bf16 staging for fp8 V" was a
+        # misreading of the element type.
+        #
+        # So the M-dimension refactor is justified by issue rate and grid shape,
+        # NOT by occupancy: 1 workgroup/CU is a fixed property of this pipeline.
         num_prefetch_k = int(num_prefetch_k_override)
         assert 2 <= num_prefetch_k <= 6, (
             f"num_prefetch_k must be in [2, 6], got {num_prefetch_k}")
