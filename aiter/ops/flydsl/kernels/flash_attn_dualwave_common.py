@@ -470,9 +470,15 @@ def _init_dualwave_thread_mapping(ctx):
     # so output is bit-identical; split-K's third grid axis would not survive it.
     # Non-causal only: under a causal mask q-block i does work proportional to i, so
     # making q_block the fast axis clusters unequal work and costs 7% (measured).
-    if const_expr(not traits.SPLITK and not traits.CAUSAL and traits.NUM_HEADS_Q % NUM_XCD_GFX950 == 0):
+    # grid.x is NUM_HEADS_KV under GQA packing (the group rides in M) and
+    # NUM_HEADS_Q otherwise. The swizzle below linearises (x, y), so it must use
+    # the ACTUAL x extent -- using NUM_HEADS_Q while the grid launched
+    # NUM_HEADS_KV makes the mapping non-bijective and silently drops every head
+    # above num_kv_heads (found 2026-08-07: heads 0-3 correct, 4-7 at cos 0.00).
+    _grid_x_extent = traits.NUM_HEADS_KV if traits.GQA_PACK_M else traits.NUM_HEADS_Q
+    if const_expr(not traits.SPLITK and not traits.CAUSAL and _grid_x_extent % NUM_XCD_GFX950 == 0):
         num_q_blocks = fx.Index(gpu.grid_dim.y)
-        linear_wg = fx.Index(gpu.block_idx.x) + fx.Index(gpu.block_idx.y) * fx.Index(traits.NUM_HEADS_Q)
+        linear_wg = fx.Index(gpu.block_idx.x) + fx.Index(gpu.block_idx.y) * fx.Index(_grid_x_extent)
         ctx.h_idx = linear_wg // num_q_blocks
         ctx.q_block_idx = linear_wg % num_q_blocks
     else:
@@ -501,19 +507,56 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE
-    ctx.q_start = ctx.q_block_idx * traits.BLOCK_M
+    ctx.q_start = ctx.q_block_idx * traits.BLOCK_Q
 
-    ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
-    ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
-    ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
-    ctx.kv_head_idx = ctx.h_kv_idx
+    if const_expr(traits.GQA_PACK_M):
+        # grid.x is num_kv_heads: the whole GQA group rides in M, so the q-head
+        # is a function of the M row, not of the workgroup. q_head_idx is left
+        # unset -- every consumer must use q_head_of_row(), and a stale scalar
+        # read would silently address one head for all 16.
+        ctx.kv_head_idx = ctx.h_idx
+        ctx.h_kv_idx = ctx.h_idx
+        ctx.group_id = None
+        ctx.q_head_base = ctx.h_idx * traits.GQA_GROUP_SIZE
+        ctx.q_head_idx = None
+    else:
+        ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
+        ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
+        ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
+        ctx.kv_head_idx = ctx.h_kv_idx
+        ctx.q_head_base = None
 
 def _init_dualwave_q_row(ctx):
-    """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context."""
+    """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context.
+
+    ``q_row_in_block`` is the M row. Under GQA_PACK_M that row decomposes into
+    a query position and a head within the group, exactly as Triton does at
+    unified_attention.py:139:
+
+        query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    so ``q_row`` (the TOKEN index) advances only once per GQA_GROUP_SIZE rows,
+    and the head advances within them. Without packing the two coincide and
+    ``q_row_in_block`` is itself the token offset.
+    """
     traits = ctx.traits
     ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
-    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
-    ctx.q_row = ctx.q_start + ctx.q_row_in_block
+    if const_expr(traits.GQA_PACK_M):
+        g = fx.Index(traits.GQA_GROUP_SIZE)
+        ctx.q_pos_in_block = ctx.q_row_in_block // g
+        ctx.q_head_in_group = ctx.q_row_in_block % g
+        ctx.q_head_row = ctx.q_head_base + ctx.q_head_in_group
+        # Causal bounds are per query POSITION; all heads of a position share a
+        # row of the score matrix, so the wave's start position divides too.
+        ctx.q_start_pos_i32 = fx.Int32(
+            ctx.q_start + (ctx.wave_id_uni * traits.ROWS_PER_WAVE) // g)
+    else:
+        ctx.q_pos_in_block = ctx.q_row_in_block
+        ctx.q_head_in_group = None
+        ctx.q_head_row = ctx.q_head_idx
+        ctx.q_start_pos_i32 = fx.Int32(
+            ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
+    ctx.q_row = ctx.q_start + ctx.q_pos_in_block
     ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 @dataclass(frozen=True)
@@ -538,6 +581,16 @@ class DualwaveSwpFp8Traits:
     NUM_HEADS_Q: int
     NUM_HEADS_KV: int
     GQA_GROUP_SIZE: int
+    # GQA_PACK_M factors the M dimension as BLOCK_Q query POSITIONS x
+    # GQA_GROUP_SIZE heads, instead of BLOCK_M positions x 1 head. That is what
+    # lets one kernel serve prefill and decode in a single launch: at Sq=1 a
+    # single token fills the tile because the tile's width is heads, and at
+    # Sq=4023 the same tile holds BLOCK_Q positions. Mirrors Triton's
+    # `query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv`
+    # (aiter/ops/triton/_triton_kernels/attention/unified_attention.py:139).
+    # Off: the legacy one-head-per-workgroup shape, BLOCK_Q == BLOCK_M.
+    GQA_PACK_M: bool
+    BLOCK_Q: int
     CAUSAL: bool
     DTYPE_STR: str
     WAVES_PER_EU: int
@@ -637,6 +690,16 @@ class DualwaveSwpFp8Traits:
             self.FP8_PV,
             self.FP8_PV_DIRECT,
             self.NUM_PREFETCH_K,
+            # BLOCK_M/NUM_WAVES became parameters 2026-08-07. They change the
+            # tile shape and the CTA width, so they must key the cache -- two
+            # block_m values would otherwise hash alike and the builder would
+            # hand back whichever compiled first. Same class of bug the PAGED
+            # note above records.
+            self.BLOCK_M,
+            self.NUM_WAVES,
+            self.BLOCK_SIZE,
+            self.GQA_PACK_M,
+            self.BLOCK_Q,
             self.BN128,
             self.BN128_PF,
             self.QREG,
@@ -661,6 +724,9 @@ def _make_dualwave_swp_fp8_traits(
     paged=False,
     prefetch_bound="none",
     pv_spread=False,
+    num_waves=8,
+    num_prefetch_k_override=None,
+    gqa_pack_m=None,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
@@ -680,22 +746,54 @@ def _make_dualwave_swp_fp8_traits(
     off so the dense path stays bit-identical to upstream, and it is not a perf
     win (see its use site).
 
-    Two things deliberately absent, both investigated and rejected 2026-08-06.
-    ``block_m`` is not a parameter: it is bound by ``block_m = num_waves * 32``
-    (rows_per_wave is pinned by the MFMA tile), so lowering it halves wave
-    occupancy without reaching a second workgroup per CU -- the KV ring alone
-    is 96.8 KB against an 80 KB half-budget, at any block_m. And there is no
-    short-KV prologue variant: the prologue stages exactly the 4 tiles the
-    minimum two loop iterations consume, so there is nothing to trim.
+    ``num_waves`` sets the CTA width and, with it, ``block_m = num_waves * 32``
+    (``rows_per_wave`` is pinned by the MFMA tile, so this is the only way to
+    move ``block_m``). Default 8 -> block_m 256, the shape every prefill number
+    in this issue was measured at.
+
+    A 2026-08-06 note here claimed block_m could not usefully be lowered
+    because "the KV ring alone is 96.8 KB against an 80 KB half-budget, at any
+    block_m". Re-derived 2026-08-07: that figure is npf=4, but the fp8 path
+    runs npf=6, and the ring does not depend on block_m at all
+    (``smem_k_tile_elems`` is a function of ``block_n`` and ``head_dim`` only).
+    The real numbers per CU, against 160 KB of LDS on gfx950:
+
+    | npf | block_m=256 | block_m=32 |
+    |-----|-------------|------------|
+    |   6 |    129.0 KB |    101.0 KB |
+    |   4 |     96.8 KB |     68.8 KB |
+    |   3 |     80.6 KB |     52.6 KB |
+
+    So the old conclusion (block_m alone cannot reach 2 workgroups/CU) holds,
+    but the reason is the Q tile, not the ring: at block_m=256 the 32 KB of Q
+    swamps any ring saving, and at npf=6 no block_m fits twice. Lowering both
+    together does fit. Ring depth is ``num_prefetch_k``, still derived from
+    ``bn128`` -- shallowing it for fp8 is unmeasured, which is what the
+    block_m/npf sweep is for.
+
+    Still absent: there is no short-KV prologue variant: the prologue stages
+    exactly the 4 tiles the minimum two loop iterations consume, so there is
+    nothing to trim.
     """
-    # Tile shape and wave geometry follow the gfx950 dual-wave 8-wave CTA.
-    block_m = 256
+    # Tile shape and wave geometry follow the gfx950 dual-wave CTA.
     block_n = 64
     k_sub_n = 32
     warp_size = 64
-    num_waves = 8
-    block_size = num_waves * warp_size
     rows_per_wave = 32
+    num_waves = int(num_waves)
+    assert num_waves in (1, 2, 4, 8), f"num_waves must be a power of two <= 8, got {num_waves}"
+    # The fp8 V staging path distributes BLOCK_N rows over waves as
+    # `n = wave_id * 8 + ...` (_stage_v_fp8_block / _stage_v_fp8_block_dma), a
+    # literal 8 rather than a BLOCK_N // NUM_WAVES. At num_waves < 8 that
+    # covers only part of the tile and the rest is silently stale -- wrong
+    # output, not a crash. K staging is fine (it uses NUM_WAVES). Lift this by
+    # deriving the V stride from BLOCK_N // num_waves in both stagers.
+    assert not (num_waves != 8), (
+        f"fp8 V staging is hardcoded to 8 waves; num_waves={num_waves} would "
+        "stage a partial V tile. See _stage_v_fp8_block."
+    )
+    block_size = num_waves * warp_size
+    block_m = num_waves * rows_per_wave
 
     d_chunk = 32
     d_chunks = head_dim // d_chunk
@@ -703,6 +801,32 @@ def _make_dualwave_swp_fp8_traits(
     pv_k_steps = k_sub_n // pv_k_step
 
     gqa_group_size = num_heads // num_kv_heads
+    if gqa_pack_m is None:
+        # Default on wherever it is valid. Measured 2026-08-07 against the
+        # legacy factorisation, fp8 paged+varlen causal on MI355X: mixed batch
+        # 1.15-1.81x, decode 2.1-11.8x, prefill 0.99x (unchanged). It also wins
+        # or ties against Triton unified_attention everywhere, where the legacy
+        # shape lost the mixed batch at 0.60-0.97x.
+        #
+        # Two exclusions. GQA 1:1 is MHA -- packing is the identity there, so it
+        # only costs a distinct cache entry. Split-K is refused below.
+        gqa_pack_m = (gqa_group_size > 1) and (num_kv_splits <= 1)
+    gqa_pack_m = bool(gqa_pack_m)
+    if gqa_pack_m:
+        assert block_m % gqa_group_size == 0, (
+            f"block_m={block_m} must be divisible by gqa_group_size="
+            f"{gqa_group_size} to pack the group into M")
+        # The split-K partial store and its combine index the workspace by a
+        # SCALAR q_head_idx (store_splitk_partial_o and the combine kernel),
+        # which does not exist under packing -- the head varies per M row. That
+        # is a real but separate change; refuse rather than write every head of
+        # the group into one head's workspace rows.
+        assert num_kv_splits <= 1, (
+            "gqa_pack_m with num_kv_splits > 1 is not implemented: the split-K "
+            "workspace is indexed by a scalar q_head_idx per workgroup")
+        block_q = block_m // gqa_group_size
+    else:
+        block_q = block_m
     default_stride_q_n = num_heads * head_dim
     default_stride_kv_n = num_kv_heads * head_dim
 
@@ -743,6 +867,40 @@ def _make_dualwave_swp_fp8_traits(
     vdma = bn128_pf
     deep_ring = bn128
     num_prefetch_k = (6 if bn128_pf else 4) if deep_ring else 2
+    if num_prefetch_k_override is not None:
+        # Ring depth independent of the BN128 shape. BN128 selects four things
+        # at once (ring depth, Q in registers, V DMA staging, direct PV) and
+        # only the first is an LDS-budget knob; the fp8 body needs the other
+        # three.
+        #
+        # Measured 2026-08-07, and the floor is 6, not 2. This knob resizes the
+        # LDS ring, but the BN128 body's prefetch distance is hardcoded: the
+        # prologue stages tiles t0..t0+3 (flash_attn_fp8_gfx950.py:306-323) and
+        # the main loop prefetches at +4/+5 (`_ring_wrap(a_buf + 4/5)`, :398-399),
+        # so six buffers must be live simultaneously. Below that the modulo
+        # aliases a buffer being prefetched onto one still being read:
+        #   npf=5 -> bit-identical but 2.3% slower (aliasing not yet fatal)
+        #   npf=4 -> WRONG OUTPUT, maxerr 4.2e-02 against npf=6
+        #   npf=3 -> memory fault
+        # So the ring cannot be shallowed without also shortening the prefetch
+        # distance in the body, which is the pipeline's whole point.
+        #
+        # That closes off 2 workgroups/CU entirely for this pipeline: at npf=6
+        # the ring (48.8 KB) plus the bf16 V staging (48.2 KB) is 97.0 KB before
+        # a single Q row, already over the 80 KB half-budget. Shrinking block_m
+        # 256 -> 16 saves 30 KB and lands at 99.0 KB, still 1 workgroup/CU. So
+        # the M-dimension refactor must be justified by issue rate and grid
+        # shape, NOT by occupancy -- there is no second workgroup to be had
+        # without restructuring the V staging too.
+        num_prefetch_k = int(num_prefetch_k_override)
+        assert 2 <= num_prefetch_k <= 6, (
+            f"num_prefetch_k must be in [2, 6], got {num_prefetch_k}")
+        if num_prefetch_k < 6:
+            import warnings
+            warnings.warn(
+                f"num_prefetch_k={num_prefetch_k} < 6 aliases live ring buffers "
+                "in the BN128 body (wrong output at 4, faults at 3). Probe only.",
+                stacklevel=2)
     if bn128_pf:
         dualwave_swp_kv_per_buffer = smem_k_tile_elems
     else:
@@ -789,6 +947,8 @@ def _make_dualwave_swp_fp8_traits(
         NUM_HEADS_Q=num_heads,
         NUM_HEADS_KV=num_kv_heads,
         GQA_GROUP_SIZE=gqa_group_size,
+        GQA_PACK_M=gqa_pack_m,
+        BLOCK_Q=block_q,
         CAUSAL=causal,
         DTYPE_STR="fp8",
         WAVES_PER_EU=waves_per_eu,
@@ -941,9 +1101,16 @@ class DualwaveFp8KernelContext:
         init_sequence_lengths / init_tile_bounds / init_q_row read q_start.
         """
         traits = self.traits
-        num_q_blocks = (self.seq_len_v + traits.BLOCK_M - 1) // traits.BLOCK_M
+        # BLOCK_Q, not BLOCK_M: blocks are counted and started in query
+        # POSITIONS. These coincide unless GQA packing is on, where a BLOCK_M-row
+        # tile covers BLOCK_M // group positions -- using BLOCK_M here computes
+        # too few blocks and strides q_start by the group size, so only
+        # q_block_idx 0 lands correctly (found 2026-08-07: exactly the first 16
+        # of 256 positions right at GQA 16:1). Must stay in sync with the same
+        # expression in _init_dualwave_thread_mapping and the launcher's grid.y.
+        num_q_blocks = (self.seq_len_v + traits.BLOCK_Q - 1) // traits.BLOCK_Q
         self.q_block_idx = num_q_blocks - fx.Index(1) - self.q_block_idx
-        self.q_start = self.q_block_idx * traits.BLOCK_M
+        self.q_start = self.q_block_idx * traits.BLOCK_Q
 
     def init_lds(self, shared_storage):
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
@@ -996,9 +1163,15 @@ class DualwaveFp8KernelContext:
             self.seqlen_kv_v = self.seq_len_kv_v
             self.seqlen_kv_i32 = self.seq_len_kv
         self.delta_i32 = fx.Int32(self.seqlen_kv_i32 - fx.Int32(self.seqlen_q_v))
+        if const_expr(traits.GQA_PACK_M):
+            # Head is per M row here (stage_q_to_lds adds it), so the base
+            # carries only the group's first head.
+            _q_head_term = self.q_head_base * traits.HEAD_DIM
+        else:
+            _q_head_term = self.q_head_idx * traits.HEAD_DIM
         self.q_gmem_elem_offset = (
             self.q_tok_base + self.q_start
-        ) * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
+        ) * self.stride_q_n_v + _q_head_term
         # Dense fp8 carries the batch token base in the voffset, because its K/V
         # descriptors span the whole tensor. Under paging the descriptor is rebased
         # per page, so the token base is meaningless there -- keeping it would push
@@ -1140,7 +1313,11 @@ class DualwaveFp8KernelContext:
         # real tile count so out-of-range page ids are 0 rather than garbage.
         self.num_kv_tiles = num_kv_tiles
         if const_expr(traits.CAUSAL):
-            causal_end_i32 = fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
+            # BLOCK_Q, not BLOCK_M: this is how far the block reaches in query
+            # POSITIONS, which is what bounds the causal KV extent. Under GQA
+            # packing a BLOCK_M-row tile spans only BLOCK_M // group positions,
+            # and using BLOCK_M here over-runs the tile count by the group size.
+            causal_end_i32 = fx.Int32(self.q_start + traits.BLOCK_Q) + self.delta_i32
             causal_end_i32 = fx.Int32((causal_end_i32 > fx.Int32(0)).select(causal_end_i32, fx.Int32(0)))
             causal_num_tiles = (fx.Index(causal_end_i32) + kv_tile_size - 1) // kv_tile_size
             max_num_tiles = fx.Index((causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles))
@@ -1249,7 +1426,19 @@ class DualwaveFp8KernelContext:
         _buffer_store_128(pack_i32_vec, elem_index, self.o_store_reg_128, self.store_atom_128, self.o_div)
 
     def global_idx_q(self, token_idx, col):
-        return (self.q_tok_base + token_idx) * self.stride_q_n_v + self.q_head_idx * self.traits.HEAD_DIM + col
+        # q_head_row is the per-M-row head under GQA_PACK_M and the scalar
+        # workgroup head otherwise; q_head_idx is None in the packed mode
+        # precisely so a missed call site faults here instead of silently
+        # writing every head of the group to one head's rows.
+        return (
+            (self.q_tok_base + token_idx) * self.stride_q_n_v
+            + self.ctx_head_row() * self.traits.HEAD_DIM
+            + col
+        )
+
+    def ctx_head_row(self):
+        ref = getattr(self, "ctx_ref", self)
+        return ref.q_head_row
 
     def read_i32x8_lds(self, base_ptr, byte_row):
         halves = []
@@ -1270,7 +1459,20 @@ class DualwaveFp8QLoader(DualwaveFp8KernelContext):
             c = self.tid + fx.Index(p * traits.BLOCK_SIZE)
             row = c // fx.Index(chunks_per_row)
             dchunk = c % fx.Index(chunks_per_row)
-            src_elem = self.q_gmem_elem_offset + row * self.stride_q_n_v + dchunk * fx.Index(16)
+            if const_expr(traits.GQA_PACK_M):
+                # M row -> (query position, head in group). Consecutive rows are
+                # consecutive HEADS of one token, so they are HEAD_DIM apart in
+                # gmem, not stride_q_n apart -- staging them as if contiguous
+                # would load one token's data into all 16 head rows.
+                g = fx.Index(traits.GQA_GROUP_SIZE)
+                src_elem = (
+                    self.q_gmem_elem_offset
+                    + (row // g) * self.stride_q_n_v
+                    + (row % g) * fx.Index(traits.HEAD_DIM)
+                    + dchunk * fx.Index(16)
+                )
+            else:
+                src_elem = self.q_gmem_elem_offset + row * self.stride_q_n_v + dchunk * fx.Index(16)
             lds_addr = self.lds_q_base_idx + c * fx.Index(16)
             self.buffer_load_lds_128(self.q_div, lds_addr, src_elem, 0)
 

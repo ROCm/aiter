@@ -63,6 +63,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
     paged=False,
     prefetch_bound="none",
     pv_spread=False,
+    num_waves=8,
+    num_prefetch_k_override=None,
+    gqa_pack_m=None,
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
@@ -127,6 +130,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         paged=paged,
         prefetch_bound=prefetch_bound,
         pv_spread=pv_spread,
+        num_waves=num_waves,
+        num_prefetch_k_override=num_prefetch_k_override,
+        gqa_pack_m=gqa_pack_m,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -134,6 +140,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
     BLOCK_SIZE = traits.BLOCK_SIZE
     HEAD_DIM = traits.HEAD_DIM
     NUM_HEADS_Q = traits.NUM_HEADS_Q
+    BLOCK_Q = traits.BLOCK_Q
+    GQA_PACK_M = traits.GQA_PACK_M
+    # Under GQA packing the whole group rides in M, so one workgroup serves a
+    # kv-head rather than a q-head: grid.x drops from 64 to 4 at GQA 16:1.
+    GRID_X = traits.NUM_HEADS_KV if GQA_PACK_M else traits.NUM_HEADS_Q
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
     PAGED = traits.PAGED
@@ -575,7 +586,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         _ = _dualwave_swp_fp8_cache_tag
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
-        num_q_blocks = (sl_idx + BLOCK_M - 1) // BLOCK_M
+        # Blocks span BLOCK_Q query POSITIONS (== BLOCK_M when not packing).
+        num_q_blocks = (sl_idx + BLOCK_Q - 1) // BLOCK_Q
         if const_expr(SPLITK):
             grid_z = bs_idx * NUM_KV_SPLITS
         else:
@@ -614,7 +626,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 "passthrough": passthrough_entries,
             },
         ).launch(
-            grid=(NUM_HEADS_Q, num_q_blocks, grid_z),
+            grid=(GRID_X, num_q_blocks, grid_z),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
