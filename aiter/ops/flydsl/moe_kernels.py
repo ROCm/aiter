@@ -1312,8 +1312,8 @@ def flydsl_swiglu_and_mul_interleaved(
     _run_compiled(
         _swiglu_fn,
         (
-            input,
-            out,
+            ptr_arg(input),
+            ptr_arg(out),
             num_rows,
             torch.cuda.current_stream(),
         ),
