@@ -9,10 +9,6 @@ import triton
 from torch import Tensor
 
 from aiter import dtypes
-from aiter.ops.quant import (
-    rotate_activation_mxfp4_quant,
-    rotate_activation_mxfp6_quant,
-)
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rot_k_only_kernel,
     sage_quant_v_amax_finalize_kernel,
@@ -30,6 +26,26 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
+
+
+@compile_ops("module_fmha_v4_fwd")
+def rotate_activation_mxfp6_quant(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    multiplier: float,
+) -> None:
+    """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
+
+
+@compile_ops("module_fmha_v4_fwd")
+def rotate_activation_mxfp4_quant(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    multiplier: float,
+) -> None:
+    """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP4 E2M1."""
 
 
 class AttentionFormat(IntEnum):

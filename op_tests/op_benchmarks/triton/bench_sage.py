@@ -25,11 +25,9 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_packed,
     native_fp8_format,
-    scale_modes_for_formats,
-)
-from aiter.ops.quant import (
     rotate_activation_mxfp4_quant,
     rotate_activation_mxfp6_quant,
+    scale_modes_for_formats,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
