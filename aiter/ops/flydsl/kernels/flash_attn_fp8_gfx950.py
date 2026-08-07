@@ -36,6 +36,7 @@ from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
     _sched_barrier_exp_pairs,
     _sched_barrier_pairs,
     dualwave_splitk_workspace_elems,  # noqa: F401
+    waitcnt_vm_n,
 )
 from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import dtype_to_elem_type
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -280,7 +281,18 @@ def build_flash_attn_dualwave_swp_fp8_module(
             kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
             kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
             kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-            rocdl.s_waitcnt(0)
+            # The first loop iteration reads only K1, V0, V1 -- the first three
+            # of the seven staged above, and vmcnt retires in issue order, so
+            # vmcnt(4) covers exactly them. K2/K3/V2/V3 stay in flight; they are
+            # not read until later iterations, each preceded by the full drain
+            # at the end of the loop body. SMEM_D_RPT is 1 for fp8 d=128, so
+            # every load_k/load_v above is exactly one DMA.
+            #
+            # The lgkm wait is separate and not optional: with VDMA off, V is
+            # staged global->VGPR->LDS and only lgkmcnt covers that LDS store,
+            # which the barrier below must see. Same pairing as the bf16 kernel.
+            rocdl.s_waitcnt(traits.LGKMCNT_0_ONLY)
+            waitcnt_vm_n(4 * ctx.NUM_DMA_K)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)

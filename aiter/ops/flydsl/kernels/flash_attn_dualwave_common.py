@@ -81,6 +81,25 @@ _LOG2E = host_math.log2(host_math.e)
 
 NUM_XCD_GFX950 = 8
 
+# s_waitcnt bitfield encoding. Byte-identical to upstream
+# kernels/attention/flash_attn_utils.py:37-40 at v0.3.0; vendored because the
+# fp8 kernel called only the full-drain form, so the AST closure never pulled
+# these in.
+_VMCNT_LO_MASK = 0xF
+_LGKMCNT_EXPCNT_BASE = 0x3F70
+_VMCNT_HI_SHIFT = 14
+_VMCNT_HI_MASK = 0x3
+
+
+def waitcnt_vm_n(n):
+    """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7).
+
+    vmcnt retires in issue order, so `n` means "at most n loads outstanding",
+    i.e. everything but the last n has landed.
+    """
+    val = (n & _VMCNT_LO_MASK) | _LGKMCNT_EXPCNT_BASE | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
+    rocdl.s_waitcnt(val)
+
 def _read_exec_i64():
     """Read the current wave exec mask, matching Clang's builtin lowering."""
     true_i1 = fx.Boolean(True).ir_value()
