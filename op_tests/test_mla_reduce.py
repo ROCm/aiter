@@ -352,7 +352,9 @@ def main():
         [33],  # massive, single large tile
         [300],  # massive, exercises the >4*wave_size LDS-spill bucket
         [2, 4, 16, 64],  # mixed: simple + massive tiles
-    ] + [[6] * 40]  # many tiles -> exercises persistent-grid path
+    ] + [
+        [6] * 40
+    ]  # many tiles -> exercises persistent-grid path
 
     all_ok = True
     df = []
