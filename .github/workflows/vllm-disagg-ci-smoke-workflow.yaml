@@ -9,24 +9,21 @@ on:
     - cron: '30 18 * * *'
   workflow_dispatch:
     inputs:
-      model_name:
-        description: "DeepSeek model passed to the upstream vLLM disagg case"
-        required: false
-        type: choice
-        default: "DeepSeek-V3"
-        options:
-          - "DeepSeek-V3"
-          - "DeepSeek-R1-MXFP4"
       disagg_scripts_stage:
         description: "Shared path visible to Spur login and compute nodes"
         required: false
         type: string
         default: "/data/xinhuang/vllm-disagg-logs/"
-      spur_nodelist:
+      spur_nodelist_2:
         description: "Optional comma-separated Spur nodes for the 2-node smoke job"
         required: false
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+      spur_nodelist_4:
+        description: "Optional comma-separated Spur nodes for the 4-node smoke job"
+        required: false
+        type: string
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
         description: "Official vLLM ROCm image used to build and run current AITER"
         required: false
@@ -51,9 +48,9 @@ env:
   # TODO: Remove the temporary fetch/cherry-pick after vLLM PR #47030 merges.
   VLLM_DI_PR_NUMBER: "47030"
   BASE_IMAGE: ${{ inputs.image || 'rocm/vllm-dev:nightly' }}
-  MODEL_NAME: ${{ inputs.model_name || 'DeepSeek-V3' }}
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
-  SPUR_NODELIST: ${{ inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
+  SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
+  SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   SLURM_TIME_LIMIT: ${{ inputs.slurm_time_limit || '08:30:00' }}
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-whl-${{ github.run_id }}
 
@@ -130,6 +127,7 @@ jobs:
           retention-days: 14
 
   vllm-disagg-smoke:
+    name: ${{ matrix.model_name }} ${{ matrix.topology }}
     needs: build_aiter_wheel
     if: >-
       github.event_name != 'pull_request' ||
@@ -138,9 +136,53 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
     timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model_name: DeepSeek-V3
+            topology: 1P1D-TP8
+            nodes: 2
+            xp: 1
+            yd: 1
+          - model_name: DeepSeek-R1-MXFP4
+            topology: 1P1D-TP8
+            nodes: 2
+            xp: 1
+            yd: 1
+          - model_name: DeepSeek-V3
+            topology: 2P2D-TP8
+            nodes: 4
+            xp: 2
+            yd: 2
+          - model_name: DeepSeek-R1-MXFP4
+            topology: 2P2D-TP8
+            nodes: 4
+            xp: 2
+            yd: 2
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+      MODEL_NAME: ${{ matrix.model_name }}
+      TOPOLOGY: ${{ matrix.topology }}
+      NODES: ${{ matrix.nodes }}
+      XP: ${{ matrix.xp }}
+      YD: ${{ matrix.yd }}
     steps:
+      - name: Select Spur nodes for topology
+        run: |
+          set -euo pipefail
+          if [[ "${NODES}" == "2" ]]; then
+            nodelist="${SPUR_NODELIST_2}"
+          elif [[ "${NODES}" == "4" ]]; then
+            nodelist="${SPUR_NODELIST_4}"
+          else
+            echo "Unsupported node count: ${NODES}" >&2
+            exit 1
+          fi
+          echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
+          echo "Selected ${TOPOLOGY}: xP=${XP}, yD=${YD}, nodes=${NODES}, nodelist=${nodelist}"
+
       - name: Download current AITER wheel
         uses: actions/download-artifact@v4
         with:
@@ -260,6 +302,7 @@ jobs:
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- MODEL_NAME: \`${MODEL_NAME}\`"
+            echo "- TOPOLOGY: \`${TOPOLOGY}\` (xP=\`${XP}\`, yD=\`${YD}\`, nodes=\`${NODES}\`)"
             echo "- IMAGE: \`${BASE_IMAGE}\`"
             echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
             echo "- SLURM_TIME_LIMIT: \`${SLURM_TIME_LIMIT}\`"
@@ -292,10 +335,12 @@ jobs:
           echo "Running upstream vLLM disagg case from PR #${VLLM_DI_PR_NUMBER}"
           set +e
           env \
-            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${MODEL_NAME}-${TOPOLOGY}" \
             MODEL_NAME="${MODEL_NAME}" \
             IMAGE="${BASE_IMAGE}" \
-            NODES=2 \
+            NODES="${NODES}" \
+            xP="${XP}" \
+            yD="${YD}" \
             GPUS_PER_NODE=8 \
             WAIT=1 \
             SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT}" \
@@ -328,6 +373,7 @@ jobs:
             echo "### vLLM disagg smoke result"
             echo
             echo "- Model: \`${MODEL_NAME:-unknown}\`"
+            echo "- Topology: \`${TOPOLOGY:-unknown}\`"
             echo "- Image: \`${BASE_IMAGE:-unknown}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
@@ -359,7 +405,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-disagg-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vllm-disagg-${{ matrix.model_name }}-${{ matrix.topology }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
