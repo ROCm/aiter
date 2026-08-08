@@ -157,7 +157,7 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
-**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
+**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False, has_pe=True, attn_sink=None, num_kv_splits=None)`
 
 **Description:** Multi-head Latent Attention (DeepSeek MLA) kernel with split-KV. For MLA Decode, Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). For DSv4 Sparse Prefill, Q packs compressed latent and positional encoding into one contiguous row (448 NoPE + 64 RoPE, `q_nope` with shape `[nquery, nhead, 512]`), KV cache has aligned `head_dim=512`, `q_pe` and `k_pe` can be left as placeholders. Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
@@ -165,9 +165,13 @@ The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time reg
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
-- **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
+- **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)`. The wrapper launches a graph-stable maximum split count from the original workgroup budget (up to 256 for batch 1). A device-side policy kernel reads the runtime sequence metadata once and computes `max(1, min(workgroup_budget, cdiv(seq_len, BLOCK_N)))`, shared by stage-1 and stage-2. This preserves the original automatic split policy while preventing CUDA Graph capture from freezing a caller's default `min_kv_seq_len=1` into a one-workgroup decode. `NHEAD < BLOCK_H` masks OOB heads on Q load and O store.
 
 All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+
+`num_kv_splits` is an optional benchmark/tuning override for the low-head
+regimes. It must be in `[1, min_kv_seq_len]`; normal callers should leave it
+unset and use the regime's automatic policy.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
