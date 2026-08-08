@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""aiter op-test for ``flydsl_pa_mqa_logits_fp4_prefill`` and
-``flydsl_pa_mqa_logits_fp4_varqlen``.
+"""Op-tests for FP4 paged MQA canonical decode and ragged prefill APIs.
 
 Validates the ragged-prefill FP4 paged MQA logits kernel (gfx950) against a
 pure-torch reference. Each query row owns a seq-local window
 ``[local_start, local_end)`` into its sequence's paged FP4 KV cache, read
 straight from ``block_tables`` (no cp_gather staging).
 
-The variable-qlen path (``flydsl_pa_mqa_logits_fp4_varqlen``) is the same kernel
-driven by a ``cu_seq_q`` (per-batch qlen prefix-sum) adapter with MTP tail-causal
-windows ``[0, ctx_b - qlen_b + n]``; those cases also report TFLOPS / GB/s.
+Variable-qlen decode calls ``flydsl_pa_mqa_logits_fp4_decode`` directly with a
+``cu_seq_q`` per-batch qlen prefix-sum and MTP tail-causal windows
+``[0, ctx_b - qlen_b + n]``. Compatibility row-info and prefill routes remain
+covered separately; these cases also report TFLOPS / GB/s.
 
 Accuracy (torch ref):
   - vs exact FP4-dequant ref  -> kernel correctness (cos ~ 1.0)
@@ -26,16 +26,19 @@ Performance (vs the ATOM FP8 path, if importable):
 
 Usage:
     python op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py
-    python op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py --bench --bs 4 --ctx 2048 --n_q 64
+    python op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py --prefill-bs 4 --ctx 2048 --n-q 64
 """
 
 import argparse
+import itertools
 
+import pandas as pd
 import torch
 
+import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import is_flydsl_available
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.test_common import run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 dev = "cuda"
 SCALE_BLOCK = 32
@@ -61,6 +64,8 @@ _FP4_GRID_VALUES = [
 _E2M1_LUT = [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7]
 _E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
 KVS_NTPW = 4
+_ITERS = 50
+_WARMUP = 10
 
 
 # ── FP4 quant / dequant ──────────────────────────────────────────────
@@ -186,9 +191,9 @@ def run_case(
     iters=50,
     warmup=10,
 ):
-    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
-        compute_prefill_schedule,
+    from aiter.ops.flydsl import (
+        flydsl_pa_mqa_logits_fp4_prefill,
+        pack_prefill_row_info,
     )
 
     torch.manual_seed(seed)
@@ -238,14 +243,12 @@ def run_case(
             ls.append(s)
             le.append(e)
     total_tokens = len(rb)
-    # The persistent-grid schedule maps each (row, chunk-split) work item to a
-    # fixed CTA slot in [0, parallel_unit_num). If there are more rows than
-    # slots, the surplus rows are silently dropped (their out stays -inf -> NaN
-    # cosine). Grow the grid so every row gets at least one slot.
+    # Bounded split targets at least one CTA per query row.
     parallel_unit_num = max(parallel_unit_num, total_tokens)
     row_to_batch = torch.tensor(rb, dtype=torch.int32, device=dev)
     local_starts = torch.tensor(ls, dtype=torch.int32, device=dev)
     local_ends = torch.tensor(le, dtype=torch.int32, device=dev)
+    row_info = pack_prefill_row_info(row_to_batch, local_starts, local_ends)
 
     q_bf16 = torch.randn(
         total_tokens, heads, head_dim, dtype=torch.bfloat16, device=dev
@@ -269,11 +272,6 @@ def run_case(
         q_bf16, kv_bf16, weights, row_to_batch, ls, le, max_seq_len, weight_scale
     )
 
-    # Precompute the persistent-grid schedule once (so the bench times only the
-    # kernel launch, mirroring the standalone FlyDSL test).
-    _, cta_info, n_ctas = compute_prefill_schedule(
-        row_to_batch, local_starts, local_ends, block_k, parallel_unit_num, max_seq_len
-    )
     out = torch.full(
         (total_tokens, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
@@ -286,18 +284,15 @@ def run_case(
             kv_scale,
             block_tables,
             weights,
-            row_to_batch,
-            local_starts,
-            local_ends,
+            row_info,
             max_seq_len,
             weight_scale=weight_scale,
             block_k=block_k,
             kv_block_size=kv_block_size,
             parallel_unit_num=parallel_unit_num,
             out=out,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
         )
+        return out
 
     run_fp4()
     torch.cuda.synchronize()
@@ -317,26 +312,54 @@ def run_case(
     if not bench:
         return
 
-    _, us_fp4 = run_perftest(run_fp4, num_iters=iters, num_warmup=warmup)
-    _bench_vs_atom(
-        kv_bf16,
-        slot_mapping,
-        block_tables,
-        q_bf16,
-        weights,
-        row_to_batch,
-        local_ends,
-        ls,
-        le,
-        ref_bf16,
-        heads,
-        head_dim,
-        kv_block_size,
-        t_max,
+    pairs = sum(e - s for s, e in zip(ls, le))
+    kv_tokens = sum(
+        max((e for b_row, e in zip(rb, le) if b_row == b), default=0) for b in range(bs)
+    )
+    flops = pairs * heads * (2 * head_dim + 3)
+    bytes_total = (
+        total_tokens * heads * (head_dim // 2 + head_dim // 32)
+        + kv_tokens * (head_dim // 2 + head_dim // 32)
+        + total_tokens * heads * weights.element_size()
+        + block_tables.numel() * block_tables.element_size()
+        + pairs * out.element_size()
+    )
+    candidates = {"packed": run_fp4}
+    ret = {"gfx": get_gfx(), "pairs": pairs}
+    for name, fn in candidates.items():
+        candidate_out, us = run_perftest(
+            fn,
+            num_iters=iters,
+            num_warmup=warmup,
+            use_cuda_event=False,
+        )
+        err = checkAllclose(
+            ref_fp4[m].to(torch.float32),
+            candidate_out[m].to(torch.float32),
+            rtol=0.05,
+            atol=0.05,
+            msg=f"{name}: FP4 prefill",
+            printLog=False,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = bytes_total / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_prefill(bs, n_q, ctx, heads, head_dim):
+    ctx = max(64, (ctx // 64) * 64)
+    windows = [[ctx] * n_q for _ in range(bs)]
+    return run_case(
         bs,
-        us_fp4,
-        iters,
-        warmup,
+        windows,
+        heads=heads,
+        head_dim=head_dim,
+        bench=True,
+        iters=_ITERS,
+        warmup=_WARMUP,
     )
 
 
@@ -463,8 +486,6 @@ def _bench_vs_atom(
 
 # ── Variable-qlen (per-batch MTP) via cu_seq_q ───────────────────────
 
-_VARQLEN_PERF_SUMMARY = []
-
 
 def _mtp_windows_ref(qlens, ctxs):
     """Independent (python) construction of the MTP tail-causal windows, used
@@ -489,20 +510,25 @@ def run_varqlen_case(
     bench=True,
     iters=50,
     warmup=10,
+    padded_total_q=None,
+    check_graph=False,
 ):
     from aiter.ops.flydsl import (
+        compute_varqlen_row_info,
+        flydsl_pa_mqa_logits_fp4_decode,
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
-        compute_prefill_schedule,
         compute_varqlen_windows,
     )
 
     torch.manual_seed(seed)
     bs = len(qlens)
     assert len(ctxs) == bs
-    total_q = int(sum(qlens))
+    real_total_q = int(sum(qlens))
+    total_q = real_total_q if padded_total_q is None else int(padded_total_q)
+    assert total_q >= real_total_q
 
     max_end = max(ctxs)
     max_blocks_per_seq = max(
@@ -563,9 +589,19 @@ def run_varqlen_case(
     # ---- unit-check the device builder against the independent python windows ----
     rb_ref, ls_ref, le_ref = _mtp_windows_ref(qlens, ctxs)
     rb_k, ls_k, le_k = compute_varqlen_windows(cu_seq_q, context_lens, total_q)
-    assert rb_k.tolist() == rb_ref, f"row_to_batch: {rb_k.tolist()} != {rb_ref}"
-    assert ls_k.tolist() == ls_ref, "local_starts mismatch"
-    assert le_k.tolist() == le_ref, f"local_ends: {le_k.tolist()} != {le_ref}"
+    row_info_k = compute_varqlen_row_info(cu_seq_q, context_lens, total_q)
+    assert rb_k[:real_total_q].tolist() == rb_ref
+    assert ls_k[:real_total_q].tolist() == ls_ref
+    assert le_k[:real_total_q].tolist() == le_ref
+    assert not torch.any(le_k[real_total_q:]), "padded rows must have empty windows"
+    assert row_info_k[:real_total_q, 0].tolist() == rb_ref
+    assert row_info_k[:real_total_q, 1].tolist() == ls_ref
+    assert row_info_k[:real_total_q, 2].tolist() == le_ref
+    assert not torch.any(row_info_k[real_total_q:, 2])
+    assert not torch.any(row_info_k[:, 3]), "reserved row-info field must be zero"
+    rb_ref += [0] * (total_q - real_total_q)
+    ls_ref += [0] * (total_q - real_total_q)
+    le_ref += [0] * (total_q - real_total_q)
 
     ref_fp4 = ref_prefill_logits(
         q_dq, kv_dq, weights, rb_ref, ls_ref, le_ref, max_seq_len, weight_scale
@@ -574,25 +610,38 @@ def run_varqlen_case(
         q_bf16, kv_bf16, weights, rb_ref, ls_ref, le_ref, max_seq_len, weight_scale
     )
 
-    out = flydsl_pa_mqa_logits_fp4_varqlen(
+    out = flydsl_pa_mqa_logits_fp4_decode(
         q_fp4,
         q_scale,
         kv_cache,
         kv_scale,
         block_tables,
         weights,
+        context_lens,
         max_seq_len,
+        next_n_max=max(max(qlens), 1),
         cu_seq_q=cu_seq_q,
-        context_lens=context_lens,
         weight_scale=weight_scale,
         block_k=block_k,
         kv_block_size=kv_block_size,
     )
     torch.cuda.synchronize()
-
-    # "build once, reuse" path: passing prebuilt windows must match the
-    # cu_seq_q path bit-for-bit (windows are built once, kernel called many).
-    out_reuse = flydsl_pa_mqa_logits_fp4_varqlen(
+    out_packed = flydsl_pa_mqa_logits_fp4_prefill(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_info_k,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        parallel_unit_num=1024,
+    )
+    torch.cuda.synchronize()
+    out_row_info_route = flydsl_pa_mqa_logits_fp4_varqlen(
         q_fp4,
         q_scale,
         kv_cache,
@@ -600,64 +649,143 @@ def run_varqlen_case(
         block_tables,
         weights,
         max_seq_len,
-        windows=(rb_k, ls_k, le_k),
+        row_info=row_info_k,
         weight_scale=weight_scale,
         block_k=block_k,
         kv_block_size=kv_block_size,
+        parallel_unit_num=1024,
     )
     torch.cuda.synchronize()
-    assert torch.equal(out, out_reuse), "windows= reuse path differs from cu_seq_q path"
+    assert torch.equal(
+        out_packed, out_row_info_route
+    ), "row_info varqlen route differs from packed prefill"
 
     m = ~torch.isneginf(ref_fp4)
     cos_exact = _cos(out[m], ref_fp4[m]).item()
     cos_bf16 = _cos(out[m], ref_bf16[m]).item()
+    cos_packed = _cos(out_packed[m], ref_fp4[m]).item()
     oob_ok = bool(torch.isneginf(out[~m]).all().item()) if (~m).any() else True
+    packed_oob_ok = (
+        bool(torch.isneginf(out_packed[~m]).all().item()) if (~m).any() else True
+    )
     print(
-        f"  qlens={qlens} ctxs={ctxs} heads={heads} total_q={total_q} "
-        f"cos_exact={cos_exact:.6f} cos_bf16={cos_bf16:.6f} oob_neginf={oob_ok}"
+        f"  qlens={qlens} ctxs={ctxs} heads={heads} "
+        f"real_q={real_total_q} allocated_q={total_q} "
+        f"cos_exact={cos_exact:.6f} cos_packed={cos_packed:.6f} "
+        f"cos_bf16={cos_bf16:.6f} oob_neginf={oob_ok and packed_oob_ok}"
     )
     assert cos_exact > 0.99, f"kernel vs FP4-dequant ref cos {cos_exact:.4f} < 0.99"
+    assert cos_packed > 0.99, f"packed prefill cos {cos_packed:.4f} < 0.99"
     assert cos_bf16 > 0.95, f"kernel vs bf16 ref cos {cos_bf16:.4f} < 0.95"
     assert oob_ok, "OOB cells were not left at -inf"
+    assert packed_oob_ok, "packed prefill wrote OOB cells"
+
+    if check_graph:
+        graph_out = torch.full_like(out, float("-inf"))
+
+        def graph_launch():
+            graph_out.fill_(float("-inf"))
+            flydsl_pa_mqa_logits_fp4_decode(
+                q_fp4,
+                q_scale,
+                kv_cache,
+                kv_scale,
+                block_tables,
+                weights,
+                context_lens,
+                max_seq_len,
+                next_n_max=max(max(qlens), 1),
+                cu_seq_q=cu_seq_q,
+                weight_scale=weight_scale,
+                block_k=block_k,
+                kv_block_size=kv_block_size,
+                out=graph_out,
+            )
+
+        graph_launch()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_launch()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, graph_out), "CUDAGraph replay differs from eager decode"
+
+        row_info_graph = torch.empty_like(row_info_k)
+        compute_varqlen_row_info(
+            cu_seq_q,
+            context_lens,
+            total_q,
+            out=row_info_graph,
+        )
+        packed_graph_out = torch.full_like(out_packed, float("-inf"))
+
+        def packed_graph_launch():
+            packed_graph_out.fill_(float("-inf"))
+            flydsl_pa_mqa_logits_fp4_prefill(
+                q_fp4,
+                q_scale,
+                kv_cache,
+                kv_scale,
+                block_tables,
+                weights,
+                row_info_graph,
+                max_seq_len,
+                weight_scale=weight_scale,
+                block_k=block_k,
+                kv_block_size=kv_block_size,
+                parallel_unit_num=1024,
+                out=packed_graph_out,
+            )
+
+        packed_graph_launch()
+        torch.cuda.synchronize()
+        packed_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(packed_graph):
+            packed_graph_launch()
+        compute_varqlen_row_info(
+            cu_seq_q,
+            context_lens,
+            total_q,
+            out=row_info_graph,
+        )
+        packed_graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            out_packed, packed_graph_out
+        ), "packed row-info CUDAGraph replay differs"
 
     if not bench:
         return
 
-    # ---- Perf: isolate the kernel launch (precompute the schedule once) ----
-    pun = total_q * max(1, (max_seq_len + block_k - 1) // block_k)
-    _, cta_info, n_ctas = compute_prefill_schedule(
-        rb_k, ls_k, le_k, block_k, pun, max_seq_len
-    )
+    # Isolate the bounded-split kernel launch.
+    target_ctas = 1024
     out_buf = torch.full(
         (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
 
     def run_fp4():
-        flydsl_pa_mqa_logits_fp4_prefill(
+        flydsl_pa_mqa_logits_fp4_decode(
             q_fp4,
             q_scale,
             kv_cache,
             kv_scale,
             block_tables,
             weights,
-            rb_k,
-            ls_k,
-            le_k,
+            context_lens,
             max_seq_len,
+            next_n_max=max(max(qlens), 1),
+            cu_seq_q=cu_seq_q,
             weight_scale=weight_scale,
             block_k=block_k,
             kv_block_size=kv_block_size,
-            parallel_unit_num=pun,
+            parallel_unit_num=target_ctas,
             out=out_buf,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
         )
+        return out_buf
 
-    _, us = run_perftest(run_fp4, num_iters=iters, num_warmup=warmup)
-
-    # USEFUL work (exact ragged): (row, token) pairs = sum of window lengths.
-    # Bytes: Q/weights/out counted once; KV as the per-batch unique footprint
-    # (max window over the batch's rows), i.e. assuming cross-row KV reuse (L2).
+    # Useful work: exact ragged (row, token) pairs; KV uses the per-batch
+    # unique footprint, assuming cross-row L2 reuse.
     head_dim_packed, head_dim_scales = head_dim // 2, head_dim // 32
     win = [int(e - s) for s, e in zip(ls_ref, le_ref)]
     pairs = sum(win)
@@ -669,102 +797,124 @@ def run_varqlen_case(
     bytes_total = (
         total_q * heads * (head_dim_packed + head_dim_scales)  # Q fp4 + scale
         + kv_tokens * (head_dim_packed + head_dim_scales)  # KV fp4 + scale
-        + total_q * heads * 2  # weights bf16
-        + bs * max_blocks_per_seq * 4  # block_tables i32
-        + pairs * 4  # out fp32 (written window)
+        + total_q * heads * weights.element_size()
+        + block_tables.numel() * block_tables.element_size()
+        + pairs * out_buf.element_size()
     )
-    sec = us * 1e-6
-    tflops = flops / sec / 1e12
-    gbps = bytes_total / sec / 1e9
-    _VARQLEN_PERF_SUMMARY.append((total_q, heads, pairs, kv_tokens, us, tflops, gbps))
-
-
-def _print_varqlen_perf_summary():
-    print("\n" + "=" * 80)
-    print("Perf summary (flydsl varqlen FP4; kernel-only, useful FLOPs/bytes)")
-    print("=" * 80)
-    print(
-        f"  {'total_q':>7} | {'heads':>5} | {'pairs':>8} | {'kv_tok':>7} | "
-        f"{'us':>9} | {'TFLOPS':>7} | {'GB/s':>7}"
-    )
-    print("  " + "-" * 68)
-    for total_q, heads, pairs, kv_tokens, us, tflops, gbps in _VARQLEN_PERF_SUMMARY:
-        print(
-            f"  {total_q:>7} | {heads:>5} | {pairs:>8} | {kv_tokens:>7} | "
-            f"{us:>9.2f} | {tflops:>7.2f} | {gbps:>7.1f}"
+    candidates = {"bounded": run_fp4}
+    ret = {"gfx": get_gfx(), "real_q": real_total_q, "pairs": pairs}
+    for name, fn in candidates.items():
+        candidate_out, us = run_perftest(
+            fn,
+            num_iters=iters,
+            num_warmup=warmup,
+            use_cuda_event=False,
         )
-    print()
+        err = checkAllclose(
+            ref_fp4[m].to(torch.float32),
+            candidate_out[m].to(torch.float32),
+            rtol=0.05,
+            atol=0.05,
+            msg=f"{name}: ragged FP4 decode",
+            printLog=False,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = bytes_total / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_varqlen(qlens, ctxs, heads, padded_total_q):
+    return run_varqlen_case(
+        list(qlens),
+        list(ctxs),
+        heads=heads,
+        bench=True,
+        iters=_ITERS,
+        warmup=_WARMUP,
+        padded_total_q=padded_total_q or None,
+        check_graph=bool(padded_total_q),
+    )
+
+
+def _parse_ragged_shape(value):
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        raise argparse.ArgumentTypeError("expected q0,q1,...:ctx0,ctx1,...[:padded_q]")
+    qlens = tuple(int(x) for x in parts[0].split(","))
+    ctxs = tuple(int(x) for x in parts[1].split(","))
+    if len(qlens) != len(ctxs):
+        raise argparse.ArgumentTypeError(
+            "qlens and context_lens must have equal length"
+        )
+    padded = int(parts[2]) if len(parts) == 3 else 0
+    return qlens, ctxs, padded
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bench", action="store_true")
-    ap.add_argument("--bs", type=int, default=4)
-    ap.add_argument("--ctx", type=int, default=2048)
-    ap.add_argument("--n_q", type=int, default=64)
-    ap.add_argument("--heads", type=int, default=64)
-    ap.add_argument("--head_dim", type=int, default=128)
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "flydsl FP4 paged MQA logits unsupported on %s; skipping", get_gfx()
+        )
+        return
+    if not is_flydsl_available():
+        aiter.logger.warning("flydsl is unavailable; skipping FP4 paged MQA logits")
+        return
+
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    ap.add_argument("--prefill-bs", type=int, nargs="*", default=[2])
+    ap.add_argument("--ctx", type=int, nargs="*", default=[512])
+    ap.add_argument("--n-q", type=int, nargs="*", default=[8])
+    ap.add_argument("--heads", type=int, nargs="*", default=[64])
+    ap.add_argument("--head-dim", type=int, nargs="*", default=[128])
+    ap.add_argument(
+        "--ragged",
+        type=_parse_ragged_shape,
+        nargs="*",
+        default=[
+            ((4, 1, 3), (512, 0, 257), 12),
+            ((2, 0, 3), (384, 256, 640), 0),
+        ],
+        help="qlens:context_lens[:padded_total_q]",
+    )
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     args = ap.parse_args()
 
-    if get_arch() != "gfx950":
-        print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
-        return
+    global _ITERS, _WARMUP
+    _ITERS, _WARMUP = args.iters, args.warmup
 
-    if not is_flydsl_available():
-        print("[skip] flydsl is not available in this environment.")
-        return
-
-    print("=" * 80)
-    print("[test] FP4 paged prefill MQA logits")
-    print("=" * 80)
-    # Correctness sweep (small, ragged windows incl. non-zero lower bounds).
-    run_case(2, [[50, 120, 200], [40, 100]], seed=0)
-    run_case(3, [[30], [200], [100, 150]], seed=2)
-    run_case(2, [[16, 200], [64, 128]], heads=128, seed=3)
+    # Non-zero lower bounds are prefill-specific corner coverage.
     run_case(2, [[(10, 50), (64, 200)], [(0, 100), (130, 256)]], seed=4)
 
-    if args.bench:
-        kvb = 64
-        ctx_round = max(kvb, (args.ctx // kvb) * kvb)
-        windows = [[ctx_round] * args.n_q for _ in range(args.bs)]
-        run_case(
-            args.bs,
-            windows,
-            heads=args.heads,
-            head_dim=args.head_dim,
-            seed=7,
-            bench=True,
-            iters=args.iters,
-            warmup=args.warmup,
+    prefill_rows = [
+        test_prefill(bs, n_q, ctx, heads, head_dim)
+        for bs, n_q, ctx, heads, head_dim in itertools.product(
+            args.prefill_bs,
+            args.n_q,
+            args.ctx,
+            args.heads,
+            args.head_dim,
         )
-
-    # ── Variable-qlen (per-batch MTP via cu_seq_q) sweep + TFLOPS/bandwidth ──
-    print("=" * 80)
-    print("[test] FP4 paged variable-qlen (per-batch MTP) MQA logits")
-    print("=" * 80)
-    varqlen_cfgs = [
-        ([3, 1, 2], [512, 320, 768], 64, 0),
-        ([10, 1, 5, 2], [1024, 256, 2048, 512], 64, 1),  # incl a qlen=10 batch
-        ([2, 0, 3], [384, 256, 640], 64, 2),  # empty batch (qlen=0)
-        ([4, 3], [512, 768], 128, 3),
-        ([16, 8, 24, 4], [4096, 2048, 4096, 1024], 64, 4),  # larger (repr. perf)
     ]
-    for qlens, ctxs, vheads, seed in varqlen_cfgs:
-        run_varqlen_case(
-            qlens,
-            ctxs,
-            heads=vheads,
-            seed=seed,
-            bench=args.bench,
-            iters=args.iters,
-            warmup=args.warmup,
-        )
-    if _VARQLEN_PERF_SUMMARY:
-        _print_varqlen_perf_summary()
+    aiter.logger.info(
+        "flydsl FP4 prefill summary (markdown):\n%s",
+        pd.DataFrame(prefill_rows).to_markdown(index=False),
+    )
 
-    print("  PASS")
+    varqlen_rows = [
+        test_varqlen(qlens, ctxs, heads, padded)
+        for (qlens, ctxs, padded), heads in itertools.product(args.ragged, args.heads)
+    ]
+    aiter.logger.info(
+        "flydsl FP4 varqlen decode summary (markdown):\n%s",
+        pd.DataFrame(varqlen_rows).to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":
