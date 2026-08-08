@@ -97,6 +97,16 @@ on:
         type: boolean
         required: false
         default: false
+      commit:
+        description: 'Git ref, tag, or commit hash to build'
+        type: string
+        required: false
+        default: ''
+      artifact_suffix:
+        description: 'Optional suffix for uploaded wheel artifact names'
+        type: string
+        required: false
+        default: ''
       torch_pin:
         description: 'Optional torch version pin for the manylinux build (e.g. 2.10.0+rocm7.1). Empty = latest.'
         type: string
@@ -143,6 +153,8 @@ jobs:
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
       TORCH_PIN: ${{ inputs.torch_pin || '' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
+      BUILD_REF: ${{ inputs.commit || github.event.inputs.commit || '' }}
+      ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix || '' }}
       DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && 'DOCKER_PASSWORD' || '' }}
       DOCKER_USERNAME: ${{ github.event_name == 'workflow_dispatch' && 'rocmshared' || '' }}
 
@@ -157,10 +169,10 @@ jobs:
         if: ${{ matrix.build_enabled }}
         run: |
           set -ex
-          if [ -n "${{ github.event.inputs.commit }}" ]; then
-            echo "Checking out to commit: ${{ github.event.inputs.commit }}"
-            git fetch --all
-            git checkout ${{ github.event.inputs.commit }}
+          if [ -n "${BUILD_REF}" ]; then
+            echo "Checking out to ref: ${BUILD_REF}"
+            git fetch --all --tags
+            git checkout "${BUILD_REF}"
             git submodule update --init --recursive --depth 1 --jobs 4
           else
             echo "No commit input provided, using current commit: $(git rev-parse HEAD)"
@@ -505,7 +517,7 @@ jobs:
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: aiter-whl-packages-py${{ matrix.python_version }}${{ env.ARTIFACT_SUFFIX != '' && format('-{0}', env.ARTIFACT_SUFFIX) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
           retention-days: 14
 

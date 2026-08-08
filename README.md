@@ -92,6 +92,14 @@ python3 op_tests/test_rmsnorm2d.py
 ls op_tests/test_*.py
 ```
 
+## Release Plan
+
+AITER publishes a scheduled release every two weeks. For each scheduled release, maintainers create a release branch named after the target version, such as `release/v0.1.19`, and publish a matching release tag, such as `v0.1.19`. The normal version progression moves from one release tag to the next, for example `v0.1.18` to `v0.1.19`.
+
+If a hot fix is required after a release, the fix is cherry-picked onto the corresponding release branch and published as a post release tag. Post releases use the `.postN` suffix, for example `v0.1.16.post1` and `v0.1.16.post2`.
+
+Release automation validates that the release tag belongs to the matching release branch, builds manylinux_2_28 wheels for ROCm 7.0, 7.1, and 7.2 with Python 3.10 and 3.12, and uploads those wheels to the matching GitHub Release. The same automation runs for scheduled releases and for hot fix tags.
+
 ## Installation
 
 ```bash
