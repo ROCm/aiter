@@ -150,6 +150,7 @@ def flydsl_runner(inp, config):
     nbpv, nw, wtk = config
     state = inp["pool"]
     out = torch.zeros(inp["B"], 1, H, V, dtype=DTYPE, device=state.device)
+    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
     exe = create_vk_gdr_decode_kernel(
         get_dtype_str(DTYPE),
         get_dtype_str(inp["A_log"].dtype),
@@ -160,6 +161,9 @@ def flydsl_runner(inp, config):
         H,
         K,
         V,
+        q.stride(),
+        k.stride(),
+        v.stride(),
         state.stride(),
         inp["a"].stride(),
         inp["b"].stride(),
@@ -169,7 +173,6 @@ def flydsl_runner(inp, config):
         NUM_WARPS=nw,
         WARP_THREADS_K=wtk,
     )
-    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
     a, b = inp["a"], inp["b"]
     A_log, dt_bias = inp["A_log"], inp["dt_bias"]
     indices = inp["indices"]
@@ -177,7 +180,20 @@ def flydsl_runner(inp, config):
 
     def run():
         _run_compiled(
-            exe, q, k, v, a, b, dt_bias, A_log, indices, state, out, inp["B"], stream
+            exe,
+            q,
+            k,
+            v,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            indices,  # read slots
+            indices,  # write slots -- decode updates the slot it read
+            state,
+            out,
+            inp["B"],
+            stream,
         )
 
     return run, out
