@@ -9,6 +9,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+os.environ.setdefault("MORI_EP_LAUNCH_CONFIG_MODE", "AUTO")
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
 import mori
@@ -29,6 +30,13 @@ INTER_DIM = 3072
 EXPERTS = 384
 TOPK = 6
 SWIGLU_LIMIT = 10.0
+
+PERF_GUARD_MIN_SPEEDUP = {
+    (512, "uniform"): 140.0,
+    (512, "rank-mixed-skew"): 110.0,
+    (8192, "uniform"): 50.0,
+    (8192, "rank-mixed-skew"): 40.0,
+}
 
 
 def setup_dist():
@@ -206,6 +214,7 @@ def main():
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
+    parser.add_argument("--perf-guard", action="store_true")
     args = parser.parse_args()
 
     rank, world, device = setup_dist()
@@ -426,8 +435,27 @@ def main():
         if mori_graph is not None:
             profile_graph(mori_graph, f"mori_{args.route}", rank, args.profile_dir)
         profile_graph(mega_graph, f"mega_{args.route}", rank, args.profile_dir)
+    speedup = (mori_ms[1] / mega_ms[1] - 1.0) * 100.0
+    guard_floor = None
+    if args.perf_guard:
+        if args.mega_only or rank_tokens or args.mtpr != 8192:
+            raise ValueError(
+                "--perf-guard requires Mori, equal rank tokens, and mtpr=8192"
+            )
+        if (args.model_dim, args.inter_dim, args.experts, args.topk) != (
+            MODEL_DIM,
+            INTER_DIM,
+            EXPERTS,
+            TOPK,
+        ):
+            raise ValueError("--perf-guard requires the v4_pro shape")
+        guard_floor = PERF_GUARD_MIN_SPEEDUP.get((args.tokens, args.route))
+        if guard_floor is None:
+            raise ValueError(
+                f"no performance guard for tokens={args.tokens}, route={args.route}"
+            )
+    guard_pass = guard_floor is None or speedup >= guard_floor
     if rank == 0:
-        speedup = (mori_ms[1] / mega_ms[1] - 1.0) * 100.0
         print(f"[ROUTES] per-destination-rank={route_counts.tolist()}", flush=True)
         print(
             f"[EXPERTS] active={(expert_counts > 0).sum().item()} max_routes={expert_counts.max().item()} "
@@ -448,8 +476,16 @@ def main():
             f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms rank-mean/max",
             flush=True,
         )
+        if guard_floor is not None:
+            status = "PASS" if guard_pass else "FAIL"
+            print(
+                f"[PERF-GUARD] {status} speedup={speedup:.2f}% minimum={guard_floor:.2f}%",
+                flush=True,
+            )
     ms.shmem_finalize()
     dist.destroy_process_group()
+    if not guard_pass:
+        raise AssertionError(f"speedup {speedup:.2f}% is below {guard_floor:.2f}%")
 
 
 if __name__ == "__main__":
