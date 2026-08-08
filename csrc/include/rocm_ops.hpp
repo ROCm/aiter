@@ -665,6 +665,7 @@ namespace py = pybind11;
           py::arg("handle_ptrs"),                                                    \
           py::arg("offset_ptrs"));                                                   \
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));    \
+    m.def("allocate_data_buffer", &aiter::allocate_data_buffer, py::arg("size"));    \
     m.def("free_meta_buffer", &aiter::free_meta_buffer, py::arg("ptr"));             \
     m.def("get_meta_buffer_ipc_handle",                                              \
           &aiter::get_meta_buffer_ipc_handle,                                        \
