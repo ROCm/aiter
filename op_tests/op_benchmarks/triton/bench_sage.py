@@ -25,7 +25,9 @@ from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
     mha_v4,
     mha_v4_packed,
+    mxfp4_k_view,
     native_fp8_format,
+    quantize_mxfp4_k,
     rotate_activation_mxfp4_quant,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
@@ -149,9 +151,14 @@ def _production_quantize_mxfp4_qk(query, key, softmax_scale):
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale, k_fp4, k_scale = _production_quantize_mxfp4_qk(
-        query, key, softmax_scale
+    b, seq_len, heads, head_dim = query.shape
+    q_fp4 = query.new_empty((b, seq_len, heads, head_dim // 2), dtype=torch.uint8)
+    q_scale = query.new_empty((b, seq_len, heads, head_dim // 32), dtype=torch.uint8)
+    rotate_activation_mxfp4_quant(
+        q_fp4, q_scale, query, softmax_scale * MHA_V4_LOG2E
     )
+    k_raw, k_scale = quantize_mxfp4_k(key)
+    k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_fp8, v_scale = _production_quantize_v(value)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
 
@@ -1027,68 +1034,6 @@ def _build_fp6_k_coalesced_packer(device):
     return _packer
 
 
-# ===========================================================================
-# OPTIONAL / EXPERIMENTAL -- MXFP4 K-coalesced packer  (NOT part of the fp6 path)
-# ===========================================================================
-# Opt-in A/B lever, OFF by default; enable with AITER_KCOAL_FP4=1 (see the
-# aiter_mxfp4 runner). The fp4 DEFAULT bench path uses the stock token-strided K
-# from sage_quant_mxfp4 -- this packer exists only to A/B the mxfp4
-# _K_COALESCED_LOAD kernel (~+0.7%). Re-arranges AITER's already-packed fp4 K
-# [b,sk,h,64] into the kernel's chunk-major LDS order so the cooperative load is a
-# contiguous coalesced copy. AITER's sage_quant_mxfp4 is NOT touched -- this is a
-# pure on-device GATHER on its output. fp4 K is a single 16B b128 operand, so the
-# LDS tile is exactly 8192B and the permutation is a clean bijection (no dup /
-# padding bytes). Per-tile LDS position P (0..8191) -> token-major byte:
-#   idx8k[P] = ((P>>4)&127)*64 + ((P>>4)>>7)*16 + (P&15)   (token*64 + chunk*16 + byte).
-# ===========================================================================
-def _build_fp4_k_coalesced_packer(device):
-    """AITER fp4 K [b,sk,h,64] uint8 -> LDS-order uint8 view [b,sk,h,64] over a [b,h,n_tiles*8192]
-    buffer. seq stride = 64 (8192/128) so the kernel's _s_k_Seqs=64 -> tile base = token*64 =
-    tile*8192. On-device gather; memoized per fixed do_bench tensor."""
-    P = torch.arange(8192, device=device, dtype=torch.long)
-    idx8k = ((P >> 4) & 127) * 64 + ((P >> 4) >> 7) * 16 + (P & 15)  # [8192] bijection
-    _cache: dict = {}
-    _gidx: dict = {}
-
-    def _packer(k_fp4: torch.Tensor):
-        key = (k_fp4.data_ptr(), tuple(k_fp4.shape))
-        hit = _cache.get(key)
-        if hit is not None:
-            return hit
-        b, sk, h, d = k_fp4.shape
-        assert d == 64, (d, sk)
-        nt = (
-            sk + 127
-        ) // 128  # whole-tile count (ceil); the base kernel supports S % 128 != 0
-        sk_pad = nt * 128
-        # token-major flat per (b,h): [b, h, sk*64]. A partial tail tile (S % 128 != 0) is zero-
-        # padded up to a whole 128-token tile; the kernel masks tokens >= sk in softmax, so the
-        # padding fp4 zeros are loaded but never reach the output.
-        km = k_fp4.permute(0, 2, 1, 3).reshape(b, h, sk * 64)
-        if sk_pad != sk:
-            km = torch.nn.functional.pad(km, (0, (sk_pad - sk) * 64))
-        km = km.contiguous()
-        g = _gidx.get(nt)
-        if g is None:
-            g = (torch.arange(nt, device=device, dtype=torch.long) * 8192).unsqueeze(
-                1
-            ) + idx8k.unsqueeze(0)
-            g = g.reshape(-1)  # [nt*8192], per-tile bijection (no clamp/OOB)
-            _gidx[nt] = g
-        out = km[:, :, g]  # [b, h, nt*8192] on-device gather
-        k_hs = nt * 8192
-        k_bs = h * k_hs
-        data = out.reshape(-1)
-        buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=device)
-        buf[: data.numel()] = data
-        # seq stride 64 -> kernel _s_k_Seqs=64 -> tile base = token*64 (=tile*8192).
-        k_view = buf.as_strided((b, sk, h, 64), (k_bs, 64, k_hs, 1))
-        _cache[key] = k_view
-        return k_view
-
-    return _packer
-
-
 def make_kernel_runner(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -1414,21 +1359,8 @@ def make_kernel_runner(
                 q_smoothing=args.qsmooth,
             )
 
-        # OPTIONAL fp4 K-coalesced A/B lever (OFF by default). With AITER_KCOAL_FP4=1
-        # the packed fp4 K is re-arranged into the kernel's chunk-major LDS order so
-        # the cooperative load coalesces (~+0.7%); pair with the _K_COALESCED_LOAD=True
-        # mxfp4 .co. Feeding a coalesced K to the stock token-strided .co is garbage, so
-        # this stays opt-in -- unlike fp6, the fp4 default path is the stock K layout.
-        _fp4_kcoal_packer = (
-            _build_fp4_k_coalesced_packer(q_bshd.device)
-            if os.environ.get("AITER_KCOAL_FP4", "0") != "0"
-            else None
-        )
-
         # f4f4: sage_quant_f4f4 emits per-channel fp4 V in the kernel's col-major LDS layout.
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
-            if _fp4_kcoal_packer is not None:
-                k_fp4 = _fp4_kcoal_packer(k_fp4)
             return mha_v4_packed(
                 q_fp4,
                 k_fp4,

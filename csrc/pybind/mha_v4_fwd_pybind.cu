@@ -34,4 +34,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scale"),
           py::arg("input"),
           py::arg("multiplier"));
+    m.def("rotate_activation_mxfp4_quant_k",
+          &aiter::torch_itfs::rotate_activation_mxfp4_quant_k,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"));
 }

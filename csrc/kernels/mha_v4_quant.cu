@@ -134,14 +134,17 @@ __global__ void hadamard_rotate_activation_mxfp6_quant_kernel(
     }
 }
 
-template <typename DTYPE_I, int vec_size = 16>
+template <typename DTYPE_I, int vec_size = 16, bool KCoalesced = false>
 __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
     uint8_t* __restrict__ out,
     uint8_t* __restrict__ scale,
     DTYPE_I const* __restrict__ input,
     const int32_t m,
     const int32_t stride,
-    const float multiplier)
+    const float multiplier,
+    const int32_t sequence = 0,
+    const int32_t heads    = 0,
+    const int32_t tiles    = 0)
 {
     constexpr int dim         = 128;
     constexpr int warp_size   = opus::get_warp_size();
@@ -215,7 +218,25 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
 #endif
     if(row < m)
     {
-        *reinterpret_cast<packed_t*>(out + static_cast<int64_t>(row) * 64 + lane * 8) = packed;
+        if constexpr(KCoalesced)
+        {
+            const int32_t head       = row % heads;
+            const int32_t token_flat = row / heads;
+            const int32_t token      = token_flat % sequence;
+            const int32_t batch      = token_flat / sequence;
+            const int32_t tile       = token / 128;
+            const int32_t tile_token = token % 128;
+            const int32_t chunk      = lane / 2;
+            const int32_t chunk_byte = (lane % 2) * 8;
+            const int64_t head_tile  = (static_cast<int64_t>(batch) * heads + head) * tiles + tile;
+            const int64_t offset =
+                head_tile * 8192 + chunk * 2048 + tile_token * 16 + chunk_byte;
+            *reinterpret_cast<packed_t*>(out + offset) = packed;
+        }
+        else
+        {
+            *reinterpret_cast<packed_t*>(out + static_cast<int64_t>(row) * 64 + lane * 8) = packed;
+        }
         if((lane & 1) == 0)
             scale[static_cast<int64_t>(row) * 4 + lane / 2] = scale_exp;
     }
@@ -309,6 +330,41 @@ void rotate_activation_mxfp4_quant(at::Tensor& out,
                 128,
                 factor);
         });
+    });
+}
+
+void rotate_activation_mxfp4_quant_k(at::Tensor& out,
+                                     at::Tensor& scale,
+                                     const at::Tensor& input)
+{
+    constexpr int64_t tile = 128;
+    TORCH_CHECK(input.dim() == 4, "input must be BSHD");
+    const int64_t batch    = input.size(0);
+    const int64_t sequence = input.size(1);
+    const int64_t heads    = input.size(2);
+    const int64_t tiles    = (sequence + tile - 1) / tile;
+    TORCH_CHECK(out.numel() == batch * heads * tiles * tile * 64,
+                "out must have one padded 8192-byte tile per batch and head");
+    auto logical_out = out.as_strided({input.numel() / 2}, {1});
+    check_inputs<64>(logical_out, scale, input);
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "rotate_activation_mxfp4_quant_k", [&] {
+        using DTYPE_I = typename aiter::t2opus<scalar_t>::type;
+        constexpr int32_t block_size = WARP_SIZE;
+        constexpr int32_t m_block    = 16 * WARP_SIZE / 128;
+        const int32_t m              = input.numel() / 128;
+        const dim3 grid((m + m_block - 1) / m_block);
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        hadamard_rotate_activation_mxfp4_quant_kernel<DTYPE_I, 16, true>
+            <<<grid, dim3(block_size), 0, stream>>>(out.data_ptr<uint8_t>(),
+                                                    scale.data_ptr<uint8_t>(),
+                                                    reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
+                                                    m,
+                                                    128,
+                                                    1.0f,
+                                                    sequence,
+                                                    heads,
+                                                    tiles);
     });
 }
 
