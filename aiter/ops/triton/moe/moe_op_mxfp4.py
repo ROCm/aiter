@@ -37,6 +37,8 @@ def fused_moe_mxfp4(
     swizzle_mx_b: bool,
     config: dict[str, Any],
     compute_type: tl.dtype,
+    sorted_token_ids_are_packed: bool = False,
+    sorted_top_k: int | None = None,
 ) -> None:
     """
     Fused MoE computation with MXFP4 (microscale FP4) quantization.
@@ -61,6 +63,10 @@ def fused_moe_mxfp4(
         config (Dict[str, Any]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M).
         compute_type (tl.dtype): Computation dtype for accumulation.
+        sorted_token_ids_are_packed (bool): Decode AITER's packed
+            ``(topk_slot << 24) | token`` sorting format when true.
+        sorted_top_k (int | None): Original routing top-k used by the packed
+            format. Defaults to ``top_k`` for backward compatibility.
 
     Returns:
         None. Results written in-place to C.
@@ -100,10 +106,14 @@ def fused_moe_mxfp4(
     B_tl_dtype = torch_to_triton_dtype[B.dtype]
     B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
 
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(EM, meta["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], meta["BLOCK_SIZE_N"]),
+        )
+
+    if sorted_top_k is None:
+        sorted_top_k = top_k
     _fused_moe_kernel_mxfp4[grid](
         A,
         B,
@@ -135,6 +145,8 @@ def fused_moe_mxfp4(
         B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
+        SORTED_IDS_PACKED=sorted_token_ids_are_packed,
+        SORTED_TOP_K=sorted_top_k,
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
