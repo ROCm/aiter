@@ -247,7 +247,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
-def get_kernel_config_gluon(m, n, k, routing_data):
+def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
@@ -260,7 +260,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if k <= 768:
+        # The persistent decode kernel has no MXFP8 emit path (HAS_MX_OUT);
+        # route out_mx_quant to the non-persistent decode kernel.
+        if k <= 768 and not out_mx_quant:
             use_persistent = True
             persistent_iters = 3
             block_n = 128
@@ -390,7 +392,7 @@ def moe_gemm_a8w4(
         w_scales = w_scales.transpose(1, 2)
     # compute optimization flags
     if use_gluon:
-        config = get_kernel_config_gluon(M, N, K, routing_data)
+        config = get_kernel_config_gluon(M, N, K, routing_data, out_mx_quant)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
@@ -448,7 +450,7 @@ def moe_gemm_a8w4(
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
-        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
+        n_out = padded_N // reduction_n_matmul  # post-swiglu width
         assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
         m_out = y.shape[-2]
         y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
@@ -579,6 +581,10 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon:
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
