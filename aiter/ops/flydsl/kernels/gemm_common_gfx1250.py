@@ -3,9 +3,9 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, rocdl, tdm_ops
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
+from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
 
@@ -22,8 +22,7 @@ def make_lds_copy_ops(bits):
     )
 
     def _view(lds_base_idx, byte_offset):
-        byte_offset = fx.index_cast(T.index, byte_offset)
-        addr_i32 = fx.index_cast(T.i32, lds_base_idx + byte_offset)
+        addr_i32 = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
         ptr = fx.inttoptr(ptr_ty, addr_i32)
         return fx.Tensor(fx.make_view(ptr, layout))
 
