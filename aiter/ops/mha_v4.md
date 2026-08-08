@@ -5,10 +5,10 @@
 
 ## Status
 
-- Last updated: 2026-08-07.
+- Last updated: 2026-08-08.
 - Development branch: `mha_v4`, forked from `mxfp6_fmha_gfx950` at `8ccca033`.
 - Preserve `mxfp6_fmha_gfx950` as the validated integration baseline; do not add MHA v4 work to it.
-- Phase: dense BF16-output extraction implemented and validated on gfx950; xDiT migration remains.
+- Phase: dense BF16-output extraction and xDiT migration implemented and validated on gfx950.
 - `mha_v4` and `mha_v4_packed` support the six initial gfx950 combinations.
 - A gfx942/CDNA3 signed INT8/FP8 manifest row and code object are also preserved under v4.
 - Keep upstream `aiter/ops/mha.py` annotation style unchanged. New MHA v4 entrypoints deliberately
@@ -69,8 +69,8 @@
 - [x] Implement `mha_v4(...) -> torch.Tensor` for the six dense combinations.
 - [x] Expose `mha_v4_packed` for kernel-only benchmarks and integrations with packed operands.
 - [x] Migrate `bench_sage.py` kernel-only and `--e2e` paths.
-- [ ] Migrate xDiT callers to `aiter.ops.mha_v4` in the xDiT repository after this AITER branch is
-    available there; do not mix cross-repository changes into the AITER PR.
+- [x] Migrate xDiT callers to `aiter.ops.mha_v4` in the xDiT repository without mixing
+    cross-repository changes into the AITER PR.
 - [x] Remove branch-added mixed-format wrappers and automatic I8FP8 routing from `aiter.ops.mha`.
 - [x] Restore mixed-format ownership out of the v3 host, manifest, and code-object slots.
 
@@ -87,7 +87,7 @@
     head-count requests.
 - [x] Run the requested long-context command:
     `python op_tests/op_benchmarks/triton/bench_sage.py --b 1 --hq 5 --sq 8192 --d 128 --kernel all`.
-- [x] `python -m pytest -q op_tests/test_mha_v4.py`: 19 passed.
+- [x] `python -m pytest -q op_tests/test_mha_v4.py`: 23 passed.
 - [ ] Run the balanced real target-shape benchmark and record GPU count plus code-object hashes.
 
 ### Deferred Phases
