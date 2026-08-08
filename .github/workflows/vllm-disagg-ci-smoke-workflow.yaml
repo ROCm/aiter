@@ -4,23 +4,28 @@ on:
   schedule:
     # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
     - cron: '30 18 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - ".github/workflows/vllm-disagg-ci-smoke-workflow.yaml"
   workflow_dispatch:
     inputs:
       vllm_repository:
         description: "vLLM repository to clone"
         required: false
         type: string
-        default: "itej89/vllm"
+        default: "lcskrishna/vllm"
       vllm_ref:
-        description: "vLLM branch/ref with lcskrishna/vllm PR #5 changes"
+        description: "vLLM branch/ref with Kimi K2.6 disagg model config"
         required: false
         type: string
-        default: "fix/moriio-ep8-dp8-read-rdma-session-routing"
+        default: "3e90fd20a48f6b42c395224f10a7793117bf65a6"
       model_name:
         description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
         required: false
         type: string
-        default: "DeepSeek-V3"
+        default: "Kimi-K2.6-MXFP4"
       disagg_scripts_stage:
         description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
         required: false
@@ -30,7 +35,7 @@ on:
         description: "Optional comma-separated Spur nodes for the 2-node smoke job"
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15"
       image:
         description: "Docker image passed to run_xPyD disagg Slurm script"
         required: false
@@ -59,9 +64,9 @@ jobs:
     runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
     timeout-minutes: 480
     env:
-      VLLM_REPOSITORY_DEFAULT: itej89/vllm
-      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
-      MODEL_NAME_DEFAULT: DeepSeek-V3
+      VLLM_REPOSITORY_DEFAULT: lcskrishna/vllm
+      VLLM_REF_DEFAULT: 3e90fd20a48f6b42c395224f10a7793117bf65a6
+      MODEL_NAME_DEFAULT: Kimi-K2.6-MXFP4
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
       SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
@@ -160,6 +165,19 @@ jobs:
           cd "${workdir}"
 
           script="${SLURM_SCRIPT}"
+          if [[ -f models.yaml ]]; then
+            echo "models.yaml entries matching MODEL_NAME=${MODEL_NAME}:"
+            if ! grep -nF "${MODEL_NAME}" models.yaml; then
+              echo "MODEL_NAME=${MODEL_NAME} was not found in models.yaml" >&2
+              echo "Known model-like models.yaml lines:" >&2
+              grep -nE '(^[[:space:]]{0,2}[A-Za-z0-9_.-]+:|name:)' models.yaml \
+                | head -120 >&2 || true
+              exit 1
+            fi
+          else
+            echo "No models.yaml found under ${PWD}; continuing with ${script}"
+          fi
+
           if [[ ! -f "${script}" ]]; then
             for candidate in run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
               if [[ -f "${candidate}" ]]; then
