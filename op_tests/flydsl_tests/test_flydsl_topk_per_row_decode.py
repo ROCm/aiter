@@ -1,0 +1,586 @@
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+import contextlib
+
+import pytest
+import torch
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
+
+if torch is None or not torch.cuda.is_available():
+    pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
+
+if not is_flydsl_available():
+    pytest.skip("FlyDSL is not available on this device.", allow_module_level=True)
+
+from aiter.ops.flydsl import flydsl_top_k_per_row_decode
+
+SUPPORTED_KS = (256, 512, 1024, 2048)
+DISTRIBUTIONS = ("random", "ties", "10LSBits")
+
+# Lengths chosen to cross every tier of the K=2048 kernel
+# (short <= 16384, mid <= 65536, long > 65536) and to include the ``+1``/``+3``
+# unaligned lengths that exercise the vectorized-load tail masking. L == 2048
+# hits the direct-fill boundary at k == 2048.
+TIER_LENGTHS = (2048, 2049, 8192, 16384, 32768, 32769, 65536, 120000, 120003)
+
+# Physical width for padded (poison-tail) runs. Wide enough that a whole-row
+# over-scan is caught, small enough to keep per-case allocation cheap.
+_PAD_WIDTH = 200_000
+_POISON = 1e30
+_SEED = 1234
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _decode_row_ends(
+    seq_lens: torch.Tensor,
+    next_n: int,
+    num_rows: int,
+) -> torch.Tensor:
+    row_ids = torch.arange(num_rows, device=seq_lens.device, dtype=torch.int32)
+    seq_rows = row_ids // next_n
+    slots = row_ids % next_n
+    return (seq_lens[seq_rows] - next_n + slots + 1).clamp(min=0)
+
+
+def _fill_distribution(shape, dist: str, device) -> torch.Tensor:
+    if dist == "random":
+        return torch.randn(shape, dtype=torch.float32, device=device)
+
+    if dist == "ties":
+        # Small integer range -> many exactly-equal keys.
+        return torch.randint(-16, 16, shape, dtype=torch.int32, device=device).to(
+            torch.float32
+        )
+
+    if dist == "10LSBits":
+        # Identical top 22 bits, random low 10 bits: radix worst case
+        low = torch.randint(0, 2**10, shape, dtype=torch.int32, device=device)
+        bits = (0x3F900000 & 0xFFFFFC00) | (low & 0x000003FF)
+        return bits.view(torch.float32)
+
+    if dist == "constant":
+        # Every value identical -> the whole row is one tie group -> the boundary
+        # bucket holds all elements and the back-fill must pick exactly k.
+        return torch.full(shape, 3.5, dtype=torch.float32, device=device)
+
+    raise ValueError(f"unknown distribution: {dist}")
+
+
+def _build_case(num_rows, width, next_n, seq_len, dist, poison, stride_pad=0):
+    """Return (logits, seq_lens, row_ends) for one shape."""
+    device = torch.device("cuda")
+    torch.manual_seed(_SEED)
+
+    n_seqs = num_rows // next_n
+    seq_vals = (
+        list(seq_len) if isinstance(seq_len, (list, tuple)) else [seq_len] * n_seqs
+    )
+    seq_lens = torch.tensor(seq_vals, dtype=torch.int32, device=device)
+    row_ends = _decode_row_ends(seq_lens, next_n, num_rows)
+    phys = _fill_distribution((num_rows, width + stride_pad), dist, device)
+
+    logits = phys[:, :width] if stride_pad else phys
+    if poison is not None:
+        for row, end in enumerate(row_ends.tolist()):
+            if end < width:
+                logits[row, end:] = poison
+
+    return logits, seq_lens, row_ends
+
+
+def _run(logits, seq_lens, num_rows, next_n, k, workspace=None):
+    indices = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
+    flydsl_top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        k=k,
+        ordered=False,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    return indices
+
+
+def _assert_row_topk_set(logits_row, actual_row, k, row_len):
+    """Assert ``actual_row`` is a Top-K *set* of ``logits_row[:row_len]``"""
+    valid = min(k, row_len)
+    a = actual_row[:valid]
+    bad = (a < 0) | (a >= row_len)
+    assert not bad.any(), f"invalid/poison indices: {a[bad][:8].tolist()}"
+    assert len(set(a.tolist())) == len(a.tolist()), "duplicate indices"
+
+    if row_len < k:
+        pad = actual_row[row_len:k]
+        assert (
+            pad == -1
+        ).all(), f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
+
+    expected = torch.topk(logits_row[:row_len], valid).indices
+    a_set, e_set = set(a.tolist()), set(expected.tolist())
+    if a_set == e_set:
+        return
+
+    a_only = sorted(a_set - e_set)
+    e_only = sorted(e_set - a_set)
+    assert len(a_only) == len(
+        e_only
+    ), f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
+
+    av = torch.tensor([logits_row[i].item() for i in a_only]).sort().values
+    ev = torch.tensor([logits_row[i].item() for i in e_only]).sort().values
+    torch.testing.assert_close(av, ev, rtol=0, atol=0)
+
+
+def _assert_batch(logits, indices, row_ends, k):
+    """Assert Top-K set-equivalence for every row of a launch."""
+    logits_cpu = logits.detach().cpu()
+    actual = indices.detach().cpu()
+    for row, end in enumerate(row_ends.tolist()):
+        _assert_row_topk_set(logits_cpu[row], actual[row], k, int(end))
+
+
+def _check_set_equivalence(k, num_rows, next_n, seq_len, dist, padded):
+    """Build one shape, run the kernel, assert Top-K set-equivalence per row."""
+    width = max(_PAD_WIDTH, seq_len) if padded else seq_len
+    poison = _POISON if padded else None
+    logits, seq_lens, row_ends = _build_case(
+        num_rows, width, next_n, seq_len, dist, poison
+    )
+    indices = _run(logits, seq_lens, num_rows, next_n, k)
+    _assert_batch(logits, indices, row_ends, k)
+
+
+# --------------------------------------------------------------------------- #
+# Top-K set-equivalence vs torch.topk across every
+# tier/boundary (L) and radix worst case (dist), at single-row and batched
+# (num_rows 1, 8) cooperation. Every row carries a poison tail past row_len, so
+# any over-scan pulls a huge value into the result and fails.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("dist", DISTRIBUTIONS)
+@pytest.mark.parametrize("L", TIER_LENGTHS)
+@pytest.mark.parametrize("num_rows", [1, 8])
+def test_k2048_poison_tail_matrix(num_rows, L, dist):
+    _check_set_equivalence(2048, num_rows, 1, L, dist, padded=True)
+
+
+# --------------------------------------------------------------------------- #
+# Curated set-equivalence scenarios: the coverage the K=2048 padded matrix does
+# not reach -- unpadded (contiguous) shapes, K != 2048 across tiers, and
+# next_n > 1 (MTP) with per-slot differing row lengths.
+# --------------------------------------------------------------------------- #
+# id -> (k, num_rows, next_n, seq_len, dist, padded)
+_EQUIVALENCE_SCENARIOS = {
+    # unpadded (width == L): contiguous full-width path, unaligned lengths
+    "unpadded-k2048-short-random-rows1": (2048, 1, 1, 8192, "random", False),
+    "unpadded-k2048-short+1-random-rows8": (2048, 8, 1, 2049, "random", False),
+    "unpadded-k2048-mid-ties-rows8": (2048, 8, 1, 32769, "ties", False),
+    "unpadded-k2048-long-10lsb-rows1": (2048, 1, 1, 120003, "10LSBits", False),
+    # every supported K != 2048 across short / mid / long tiers
+    "k256-short-random": (256, 1, 1, 4096, "random", True),
+    "k256-mid-ties": (256, 1, 1, 32769, "ties", True),
+    "k256-long-10lsb": (256, 1, 1, 120003, "10LSBits", True),
+    "k512-short-ties": (512, 1, 1, 4096, "ties", True),
+    "k512-mid-10lsb": (512, 1, 1, 32769, "10LSBits", True),
+    "k512-long-random": (512, 1, 1, 120003, "random", True),
+    "k1024-short-10lsb": (1024, 1, 1, 4096, "10LSBits", True),
+    "k1024-mid-random": (1024, 1, 1, 32769, "random", True),
+    "k1024-long-ties": (1024, 1, 1, 120003, "ties", True),
+    # next_n > 1 (MTP): rows of differing length within one launch
+    "nextn4-k512-short-rows8": (512, 8, 4, 4096, "random", True),
+    "nextn4-k2048-mid-rows8": (2048, 8, 4, 32769, "random", True),
+    "nextn2-k1024-long-rows4": (1024, 4, 2, 120003, "ties", True),
+    # arbitrary (non-power-of-2) K -- the kernel is k-independent; tiny / odd /
+    # >2048 K across short, long, and direct-fill (L <= k) tiers.
+    "arbitrary-k1-long": (1, 1, 1, 120003, "random", True),
+    "arbitrary-k7-short": (7, 1, 1, 8192, "random", True),
+    "arbitrary-k777-long": (777, 1, 1, 120003, "random", True),
+    "arbitrary-k3000-long": (3000, 1, 1, 120003, "random", True),
+    "arbitrary-k3000-directfill": (3000, 1, 1, 2000, "random", True),
+}
+
+
+@pytest.mark.parametrize(
+    ("k", "num_rows", "next_n", "seq_len", "dist", "padded"),
+    list(_EQUIVALENCE_SCENARIOS.values()),
+    ids=list(_EQUIVALENCE_SCENARIOS.keys()),
+)
+def test_set_equivalence_scenarios(k, num_rows, next_n, seq_len, dist, padded):
+    _check_set_equivalence(k, num_rows, next_n, seq_len, dist, padded)
+
+
+# --------------------------------------------------------------------------- #
+# Ragged batches, edge shapes, and workspace reuse -- the tiered kernel's core
+# job (rows of different length -> different tiers -> in one launch) plus edges
+# the uniform-length matrix never reaches.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("k", [512, 2048])
+def test_ragged_batch_mixed_tiers(k):
+    """One launch whose sequences span direct-fill / short / mid / long tiers."""
+    seq_lens = [1024, 4096, 20001, 70000, 150003]
+    width = max(_PAD_WIDTH, max(seq_lens))
+    n = len(seq_lens)
+    logits, sl, row_ends = _build_case(n, width, 1, seq_lens, "random", _POISON)
+    indices = _run(logits, sl, n, 1, k)
+    _assert_batch(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+def test_empty_row_in_batch(k):
+    """seq_len 0 -> row_len 0 -> all -1, alongside a normal selection row."""
+    logits, sl, row_ends = _build_case(
+        2, max(_PAD_WIDTH, 4096), 1, [0, 4096], "random", _POISON
+    )
+    indices = _run(logits, sl, 2, 1, k)
+    actual = indices.cpu()
+    assert (actual[0] == -1).all(), "empty row (row_len 0) must be all -1"
+    _assert_row_topk_set(logits.cpu()[1], actual[1], k, int(row_ends[1]))
+
+
+@pytest.mark.parametrize("k", SUPPORTED_KS)
+def test_all_identical_values(k):
+    """Every value equal: whole row is one tie group, back-fill must pick k."""
+    L = 8192
+    logits, sl, row_ends = _build_case(1, max(_PAD_WIDTH, L), 1, L, "constant", _POISON)
+    indices = _run(logits, sl, 1, 1, k)
+    _assert_batch(logits, indices, row_ends, k)
+
+
+def _non_finite_row(L, device):
+    """A row with +inf / NaN scattered through it, plus one -inf.
+
+    Returns (logits, seq_lens, top_positions, bottom_positions).
+    """
+    torch.manual_seed(_SEED)
+    logits = torch.randn((1, L), dtype=torch.float32, device=device)
+    top = {10: float("inf"), 100: float("nan"), L // 3: float("inf")}
+    top[L - 5] = float("nan")
+    bottom = {L // 2: float("-inf")}
+    for pos, val in {**top, **bottom}.items():
+        logits[0, pos] = val
+    sl = torch.tensor([L], dtype=torch.int32, device=device)
+    return logits, sl, set(top), set(bottom)
+
+
+@pytest.mark.parametrize("L", [8192, 120003], ids=["short", "long"])
+@pytest.mark.parametrize("k", [256, 2048])
+def test_non_finite_ranks_like_torch(k, L):
+    """+inf and NaN rank at the very top and -inf below every finite value, which
+    is what torch.topk does and what the HIP kernel a gated call can fall back to
+    does. Clamping them instead would make the answer depend on which kernel the
+    gate happened to pick for that batch."""
+    device = torch.device("cuda")
+    logits, sl, top, bottom = _non_finite_row(L, device)
+
+    got = set(_run(logits, sl, 1, 1, k)[0].tolist())
+    assert top <= got, f"non-finite positions not selected: {sorted(top - got)}"
+    assert not (bottom & got), "-inf must never be selected"
+
+    # The remaining slots are the plain top-(k - len(top)) of the finite values.
+    finite = logits[0].clone()
+    for pos in top | bottom:
+        finite[pos] = float("-inf")
+    expected = torch.topk(finite, k - len(top)).values.sort().values
+    rest = torch.tensor(sorted(got - top), device=device)
+    torch.testing.assert_close(finite[rest].sort().values, expected, rtol=0, atol=0)
+
+
+def test_non_finite_mask_override_excludes_them():
+    """FLYDSL_TOPK_TIERED_MASK_NONFINITE=1 restores the clamp-to--inf behaviour
+    for a caller that would rather drop them than propagate them."""
+    k, L = 256, 8192
+    device = torch.device("cuda")
+    logits, sl, top, bottom = _non_finite_row(L, device)
+
+    with _env_override(FLYDSL_TOPK_TIERED_MASK_NONFINITE="1") as m:
+        assert m._kernel_config(1, L)["mask_non_finite"]
+        got = set(_run(logits, sl, 1, 1, k)[0].tolist())
+
+    assert not (
+        got & (top | bottom)
+    ), f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
+
+
+@contextlib.contextmanager
+def _env_override(**overrides):
+    """Set FLYDSL_TOPK_* vars and clear the config/launcher caches so the override
+    actually takes effect (both are cached and otherwise ignore env)."""
+    import os
+
+    import aiter.ops.flydsl.topk_per_row_decode as m
+
+    prev = {name: os.environ.get(name) for name in overrides}
+
+    def _apply(values):
+        for name, value in values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        m._environ_kernel_config.cache_clear()
+        m._build_launcher.cache_clear()
+
+    _apply(overrides)
+    try:
+        yield m
+    finally:
+        _apply(prev)
+
+
+def _tier_override(mode):
+    return _env_override(FLYDSL_TOPK_TIERED_OVERRIDE=mode)
+
+
+@pytest.mark.parametrize("mode", ["short", "mid", "long"])
+def test_tier_mode_override(mode):
+    """FLYDSL_TOPK_TIERED_OVERRIDE forces every row to a single tier. Assert the
+    override reaches the resolved config (all modes give correct output, so output
+    alone wouldn't prove the mode was applied), then check correctness. L > k so all
+    three run real radix-select; single row so the deadlock guard is a no-op."""
+    k, L = 2048, 120003
+    with _tier_override(mode) as m:
+        assert m._kernel_config(1, L)["tier_mode"] == mode
+        _check_set_equivalence(k, 1, 1, L, "random", padded=True)
+
+
+def test_tier_mode_invalid_rejected():
+    """An unknown FLYDSL_TOPK_TIERED_OVERRIDE value is rejected."""
+    with _tier_override("bogus"):
+        logits = torch.randn((1, 8192), device="cuda", dtype=torch.float32)
+        sl = torch.tensor([8192], device="cuda", dtype=torch.int32)
+        idx = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError):
+            flydsl_top_k_per_row_decode(
+                logits,
+                1,
+                sl,
+                idx,
+                1,
+                logits.stride(0),
+                logits.stride(1),
+                k=2048,
+                ordered=False,
+            )
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+def test_row_strided_logits(k):
+    """logits.stride(0) > width (row-slice of a wider buffer): exercises the
+    row_base = row * stride0 addressing across multiple distinct rows."""
+    L = 32769
+    width = max(_PAD_WIDTH, L)
+    logits, sl, row_ends = _build_case(
+        4, width, 1, L, "random", _POISON, stride_pad=257
+    )
+    assert logits.stride(0) == width + 257  # sanity: rows are non-contiguous
+    indices = _run(logits, sl, 4, 1, k)
+    _assert_batch(logits, indices, row_ends, k)
+
+
+def test_repeated_calls_reuse_workspace():
+    """A single caller-provided workspace reused across back-to-back calls must
+    stay correct -- guards the on-stream conditional-zero (a stale workspace only
+    surfaces on the 2nd+ call). Long length so the multi-block zero is in play."""
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    k, L = 2048, 120003
+    logits, sl, row_ends = _build_case(1, max(_PAD_WIDTH, L), 1, L, "random", _POISON)
+    size = flydsl_top_k_per_row_decode_workspace_size(1, logits.shape[1])
+    ws = torch.empty(size, dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        indices = torch.empty((1, k), device="cuda", dtype=torch.int32)
+        flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            sl,
+            indices,
+            1,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            ordered=False,
+            workspace=ws,
+        )
+        torch.cuda.synchronize()
+        _assert_batch(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("dist", DISTRIBUTIONS)
+@pytest.mark.parametrize("k", [256, 512])
+def test_bpp10_short_row_zeroes_workspace(k, dist):
+    """The LDS-only short tier is compiled in only at bits_per_pass 11. At 10 a row
+    short enough for that tier still runs the persistent path, so it hands out
+    output slots from the workspace counters and the host has to zero them. Width
+    <= short_max here, which is exactly the case a length-only test reads as
+    "short tier, no zero needed". The workspace is poisoned rather than merely
+    reused so the stale counters do not depend on what the allocator recycles."""
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    L = 16384
+    with _env_override(FLYDSL_TOPK_TIERED_BPP="10") as m:
+        cfg = m._kernel_config(1, L)
+        assert cfg["bits_per_pass"] == 10
+        assert L <= max(cfg["tiered_short_max"], k), "L must be short-tier sized"
+
+        logits, sl, row_ends = _build_case(1, L, 1, L, dist, None)
+        size = flydsl_top_k_per_row_decode_workspace_size(1, L)
+        ws = torch.full((size,), 0x7F000000, dtype=torch.int32, device="cuda")
+        indices = _run(logits, sl, 1, 1, k, workspace=ws)
+        _assert_batch(logits, indices, row_ends, k)
+
+
+def test_undersized_workspace_rejected():
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    k, L = 2048, 120003
+    logits, sl, _ = _build_case(1, max(_PAD_WIDTH, L), 1, L, "random", _POISON)
+    size = flydsl_top_k_per_row_decode_workspace_size(1, logits.shape[1])
+    ws = torch.empty(size - 1, dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, k), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError):
+        flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            sl,
+            indices,
+            1,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            ordered=False,
+            workspace=ws,
+        )
+
+
+def test_num_rows_subset_leaves_extra_untouched():
+    """numRows < physical rows: only the first numRows rows are processed; the
+    trailing output rows must be left untouched."""
+    k, L = 512, 8192
+    n_phys, n_proc = 4, 2
+    width = max(_PAD_WIDTH, L)
+    logits, sl, row_ends = _build_case(n_phys, width, 1, L, "random", _POISON)
+    indices = torch.full((n_phys, k), -7, device="cuda", dtype=torch.int32)
+    flydsl_top_k_per_row_decode(
+        logits,
+        1,
+        sl,
+        indices,
+        n_proc,
+        logits.stride(0),
+        logits.stride(1),
+        k=k,
+        ordered=False,
+    )
+    torch.cuda.synchronize()
+    actual = indices.cpu()
+    for row in range(n_proc):
+        _assert_row_topk_set(logits.cpu()[row], actual[row], k, int(row_ends[row]))
+    assert (actual[n_proc:] == -7).all(), "rows beyond numRows must be untouched"
+
+
+# --------------------------------------------------------------------------- #
+# API contract
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("logits_dtype", "call_kwargs", "exc"),
+    [
+        (torch.float32, {"k": 512, "ordered": True}, ValueError),
+        (torch.float32, {"k": 0}, ValueError),
+        (torch.float16, {"k": 512}, TypeError),
+    ],
+    ids=["ordered-true", "nonpositive-k", "fp16-logits"],
+)
+def test_invalid_args_rejected(logits_dtype, call_kwargs, exc):
+    k = call_kwargs["k"]
+    seq_lens = torch.tensor([4096], device="cuda", dtype=torch.int32)
+    logits = torch.randn((1, 4096), device="cuda", dtype=logits_dtype)
+    indices = torch.empty((1, k), device="cuda", dtype=torch.int32)
+    with pytest.raises(exc):
+        flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            1,
+            logits.stride(0),
+            logits.stride(1),
+            **call_kwargs,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Layout contract. Only logits carries its pitch into the kernel (as stride0);
+# indices, seqLens and workspace are addressed with a pitch the kernel assumes
+# -- row * k, element i, and linearly from the base pointer. Each case below is
+# a layout that satisfies the size checks and would then be mis-addressed, so
+# the assert on the older condition is part of the test: it pins that the size
+# check alone lets the layout through.
+# --------------------------------------------------------------------------- #
+def _layout_case(k, rows=2, L=4096):
+    logits = torch.randn((rows, L), device="cuda", dtype=torch.float32)
+    seq_lens = torch.full((rows,), L, device="cuda", dtype=torch.int32)
+    indices = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    return logits, seq_lens, indices
+
+
+def _launch(logits, seq_lens, indices, rows, k, workspace=None):
+    flydsl_top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k,
+        ordered=False,
+        workspace=workspace,
+    )
+
+
+def test_indices_wider_than_k_rejected():
+    """A contiguous (rows, k + pad) output has room for k and adjacent columns,
+    but its rows sit pad elements too far apart for the kernel's row * k."""
+    k, rows = 512, 2
+    logits, seq_lens, _ = _layout_case(k, rows)
+    indices = torch.empty((rows, k + 16), device="cuda", dtype=torch.int32)
+    assert indices.shape[1] >= k and indices.stride(1) == 1
+    with pytest.raises(ValueError, match="packed k apart"):
+        _launch(logits, seq_lens, indices, rows, k)
+
+
+def test_strided_seq_lens_rejected():
+    """seqLens[::2] reports the right numel(), but the kernel reads element i
+    and would pick up the interleaved neighbours instead."""
+    k, rows, L = 512, 2, 4096
+    logits, _, indices = _layout_case(k, rows, L)
+    backing = torch.tensor([L, 64] * rows, device="cuda", dtype=torch.int32)
+    seq_lens = backing[::2]
+    assert seq_lens.numel() == rows
+    with pytest.raises(ValueError, match="seqLens must be packed"):
+        _launch(logits, seq_lens, indices, rows, k)
+
+
+def test_strided_workspace_rejected():
+    """workspace[::2] holds enough slots, but zero_() follows the view while the
+    kernel addresses the region linearly, so the two cover different memory."""
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    k, rows, L = 512, 2, 4096
+    logits, seq_lens, indices = _layout_case(k, rows, L)
+    slots = flydsl_top_k_per_row_decode_workspace_size(rows, L)
+    ws = torch.zeros(2 * slots, device="cuda", dtype=torch.int32)[::2]
+    assert ws.numel() >= slots
+    with pytest.raises(ValueError, match="workspace must be packed"):
+        _launch(logits, seq_lens, indices, rows, k, workspace=ws)
