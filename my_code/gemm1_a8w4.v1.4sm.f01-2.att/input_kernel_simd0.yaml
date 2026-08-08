@@ -1,0 +1,16 @@
+jobs:
+ -
+  kernel_include_regex: '^moe_gemm1_a8w4$'
+  kernel_exclude_regex:
+  kernel_iteration_range: "[1]"
+  output_file: out
+  output_directory: my_code/.get_isa_runner_att_gemm1_a8w4.v1.4sm.f01-2.att_2094/thread_trace/simd0/kernel/rpf_v3
+  output_format: [csv]
+  truncate_kernels: false
+  sys_trace: false
+  advanced_thread_trace: true
+  att_target_cu: 1
+  att_shader_engine_mask: "0xf"
+  att_simd_select: "0"
+  att_buffer_size: "0x10000000"
+  att_library_path: ["/data/yanguahe/code/wk_sp1/decoder_new"]
