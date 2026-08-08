@@ -694,8 +694,14 @@ unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt)
                  max_resident_blocks);
     for(int num_waves = 1;; ++num_waves)
     {
-        IdxT num_blocks = std::min(
+        // items_per_thread below rounds up, so the recomputed block count is
+        // <= the one asked for here. Once max_resident_blocks is the binding
+        // bound the two stop agreeing, and the loop's only unconditional exit
+        // (below) compares the recomputed count against max_num_blocks — a test
+        // that then never fires. Keep the requested count to end the search on.
+        const IdxT requested_blocks = std::min(
             max_num_blocks, static_cast<IdxT>(std::max(num_waves * active_blocks / batch_size, 1)));
+        IdxT num_blocks        = requested_blocks;
         IdxT items_per_thread  = ceildiv<IdxT>(len, num_blocks * BlockSize);
         items_per_thread       = alignTo<IdxT>(items_per_thread, VECTORIZED_READ_SIZE / sizeof(T));
         num_blocks             = ceildiv<IdxT>(len, items_per_thread * BlockSize);
@@ -714,7 +720,7 @@ unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt)
             best_tail_wave_penalty = tail_wave_penalty;
         }
 
-        if(num_blocks == max_num_blocks)
+        if(requested_blocks == max_num_blocks)
         {
             break;
         }
