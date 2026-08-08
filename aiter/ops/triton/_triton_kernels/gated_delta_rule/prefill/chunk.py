@@ -302,6 +302,14 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         _is_gfx12_runtime(q.device) or (num_decodes > 0 and prefill_metadata is None)
     ):
         use_chunk_hip = False
+    if use_chunk_flydsl:
+        if _is_gfx12_runtime(q.device):
+            use_chunk_flydsl = False
+        elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError(
+                "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
+                f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
+            )
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
@@ -348,15 +356,17 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             num_decode_tokens=num_decode_tokens,
         )
     elif use_chunk_flydsl:
-        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
-        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
-        # head-major, so pass it through directly. The wrapper accepts
-        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
+        # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
+        # mirrors the HIP g-layout contract (default token-major), so pass
+        # g_head_major=True explicitly to select the head-major layout. The
+        # wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
+        # internally.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl,
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k=k,
             w=w,
             u=u,
@@ -368,6 +378,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            g_head_major=True,
             prefill_metadata=prefill_metadata,
         )
     else:
