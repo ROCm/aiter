@@ -1,0 +1,1247 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+"""Host MXFP6-E2M3 packers for the fp6 FMHA (Sage-attention) gfx950 kernel.
+
+Self-contained host-side numpy packers that cast Q/K/V to the exact MXFP6-E2M3
+byte layout the ``fwd_hd128_mxfp6`` kernel consumes (no in-kernel re-quant). This
+module is the canonical, production home of the fp6 FMHA encoding logic; it is
+INDEPENDENT of the mxfp4 path and shares no state with it.
+
+Only the PROVEN layouts are kept here (cos >= 0.99 @ b1 hq5 sq256 seed0, == the
+in-kernel "both"-mode reference). The experimental layout zoo used during bring-up
+lives in the research repo and is reachable from the benchmark via the
+``AITER_MXFP6_PACK`` path override.
+
+Layout facts (all measured / proven on gfx950):
+
+  * E2M3 6-bit code = OCP MXFP6 "S EE MMM": bit5=sign, bits4:3=exp(bias 1),
+    bits2:0=mantissa, subnormals at exp==0. Full 32-level grid (max 7.5).
+  * Per 32-element MX block: E8M0 scale exponent E = frexp_exp(amax) - 3
+    (== floor(log2(amax)) - emax, emax(E2M3)=2). Scale byte = E + 127. Each
+    value v is stored as code(v / 2^E).
+  * 24-byte (6-dword) block, 6-bit fields LSB-first at bit f*6. The MFMA reads
+    field 2i = blk[i], field 2i+1 = blk[16+i] (interleaved).
+"""
+
+import os
+
+import numpy as np
+
+try:
+    import torch
+    import triton
+    import triton.language as tl
+
+    _HAVE_TRITON = True
+except ImportError:  # numpy-only host packing still works without triton/torch
+    _HAVE_TRITON = False
+
+
+FP6_K_TILE_TOKENS = 128
+FP6_K_PACKED_ROW_BYTES = 96
+FP6_K_BUFFER_SLACK_BYTES = 256
+FP6_K_SCALE_VALUES_PER_TOKEN = 4
+FP6_K_SCALE_BUFFER_SLACK_BYTES = 64
+
+_K_TILE_TOKENS = FP6_K_TILE_TOKENS
+_K_PACKED_ROW_BYTES = FP6_K_PACKED_ROW_BYTES
+_K_COMPACT_DATA_BYTES = _K_TILE_TOKENS * _K_PACKED_ROW_BYTES
+_K_RESERVED_BYTES = 4096
+_K_SCALE_TAIL_BYTES = 1024
+_K_SCALE_TAIL_OFFSET = _K_COMPACT_DATA_BYTES + _K_RESERVED_BYTES
+FP6_K_TILE_BYTES = _K_SCALE_TAIL_OFFSET + _K_SCALE_TAIL_BYTES
+_K_TILE_BYTES = FP6_K_TILE_BYTES
+_K_SEQ_STRIDE_BYTES = _K_TILE_BYTES // _K_TILE_TOKENS
+
+
+def fp6_k_raw_buffer_sizes(batch, sequence, heads, tile=FP6_K_TILE_TOKENS):
+    """Return contiguous data/scale buffer sizes for the gfx950 FP6 K ABI.
+
+    Each head stores one 17,408-byte record per 128-token tile. The data buffer's
+    256-byte tail covers the final shifted scale-tail read; the separate scale ABI
+    buffer retains four E8M0 bytes per token plus 64 bytes of view slack.
+    """
+    tiles = (sequence + tile - 1) // tile
+    data_size = (
+        batch * heads * tiles * FP6_K_TILE_BYTES + FP6_K_BUFFER_SLACK_BYTES
+    )
+    scale_size = (
+        batch * sequence * heads * FP6_K_SCALE_VALUES_PER_TOKEN
+        + FP6_K_SCALE_BUFFER_SLACK_BYTES
+    )
+    return data_size, scale_size
+
+
+# ---------------------------------------------------------------------------
+# E2M3 grid + scalar encode
+# ---------------------------------------------------------------------------
+def _build_e2m3_grid() -> np.ndarray:
+    """OCP MXFP6 E2M3 magnitude table: code (0..31) -> magnitude (ascending)."""
+    g = np.empty(32, dtype=np.float64)
+    for code in range(32):
+        exp = code >> 3
+        m = code & 7
+        g[code] = (m / 8.0) if exp == 0 else (2.0 ** (exp - 1)) * (1.0 + m / 8.0)
+    return g
+
+
+_E2M3_MAG = _build_e2m3_grid()  # index == 6-bit code (sans sign); ascending
+_FP6_ROUND = os.environ.get("MXFP4_FP6_ROUND", "rne")  # rne|rtz|rhu
+
+
+def e2m3_encode(x: np.ndarray) -> np.ndarray:
+    """Round-encode f32 -> 6-bit E2M3 code (uint8, 0..63). Mode via MXFP4_FP6_ROUND
+    (rne=round-half-even default, rtz=truncate toward zero, rhu=round-half-up)."""
+    x = np.asarray(x, dtype=np.float64)
+    sign = (x < 0) | ((x == 0) & (np.signbit(x)))
+    mag = np.abs(x)
+    grid = _E2M3_MAG  # ascending, code == index
+    mag = np.minimum(mag, grid[-1])  # clamp to max 7.5
+    idx = np.searchsorted(grid, mag, side="left")
+    idx = np.clip(idx, 0, len(grid) - 1)
+    lo = np.clip(idx - 1, 0, len(grid) - 1)
+    dlo = mag - grid[lo]
+    dhi = grid[idx] - mag
+    if _FP6_ROUND == "rtz":
+        chosen = lo  # truncate toward zero (lo is always <= mag)
+    elif _FP6_ROUND == "rhu":
+        chosen = np.where(dhi <= dlo, idx, lo)  # round-half-up (toward +inf mag)
+    else:  # rne
+        pick_hi = dhi < dlo
+        tie = dhi == dlo
+        pick_hi = pick_hi | (tie & ((lo % 2) == 1))
+        chosen = np.where(pick_hi, idx, lo)
+    code = chosen.astype(np.uint8)
+    code = np.where(sign, code | 0x20, code).astype(np.uint8)
+    return code
+
+
+def e2m3_decode(code: np.ndarray) -> np.ndarray:
+    """Decode 6-bit E2M3 code -> f32 magnitude*sign (verification helper)."""
+    code = np.asarray(code, dtype=np.uint8)
+    sign = (code & 0x20) != 0
+    mag = _E2M3_MAG[(code & 0x1F)]
+    return np.where(sign, -mag, mag).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Fast 6-bit field packing
+# ---------------------------------------------------------------------------
+def _pack_fields_24b(fields: np.ndarray) -> np.ndarray:
+    """Pack [..., 32] of 6-bit codes LSB-first into [..., 24] bytes (vectorized).
+
+    32 fp6 fields = 192 bits = 24 bytes. Each group of 4 consecutive fields spans
+    exactly 24 bits = 3 byte-aligned bytes, so pack 4 codes into a uint32 (field i
+    at bit 6i) and emit the low 3 little-endian bytes. Byte-identical to the naive
+    per-bit loop, ~13x faster (no 192-iteration python loop)."""
+    f = fields.reshape(-1, 8, 4).astype(np.uint32)
+    v = f[..., 0] | (f[..., 1] << 6) | (f[..., 2] << 12) | (f[..., 3] << 18)  # [N,8]
+    b = np.stack([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF], axis=-1).astype(
+        np.uint8
+    )  # [N,8,3]
+    return b.reshape(*fields.shape[:-1], 24)
+
+
+# ---------------------------------------------------------------------------
+# QK packer (and the V operand building block)
+# ---------------------------------------------------------------------------
+def quantize_fp6_lastdim(x: np.ndarray):
+    """Vectorized MXFP6-E2M3 quantize along the last dim (multiple of 32).
+
+    x: f32 array [..., D], D % 32 == 0.
+    Returns:
+      packed: uint8 [..., (D//32)*24]  (24 bytes per 32-block, interleaved fields)
+      scale:  uint8 [..., D//32]       (E8M0 = E+127 per block)
+    Mirrors the kernel/HW fp6 pack: E = frexp_exp(amax)-3, value -> code(v/2^E),
+    field[2i]=code(blk[i]/2^E), field[2i+1]=code(blk[16+i]/2^E)."""
+    x = np.asarray(x, dtype=np.float64)
+    *lead, D = x.shape
+    assert D % 32 == 0, D
+    nb = D // 32
+    blk = x.reshape(*lead, nb, 32)
+    amax = np.max(np.abs(blk), axis=-1)  # [..., nb]
+    _m, e = np.frexp(np.maximum(amax, np.float64(0)))
+    E = np.where(amax == 0, 0, e - 3).astype(np.int64)  # [..., nb]
+    scale = (2.0**E)[..., None]  # [..., nb, 1]
+    codes = e2m3_encode(blk / scale)  # [..., nb, 32] uint8
+    # interleave -> field order: field[2i]=blk[i], field[2i+1]=blk[16+i]
+    fields = np.empty_like(codes)
+    fields[..., 0::2] = codes[..., 0:16]
+    fields[..., 1::2] = codes[..., 16:32]
+    packed = _pack_fields_24b(fields).reshape(*lead, nb * 24)
+    scale_b = ((E + 127) & 0xFF).astype(np.uint8)
+    return packed, scale_b
+
+
+# ---------------------------------------------------------------------------
+# K LDS-ORDER packer for the COALESCED cooperative load
+# ---------------------------------------------------------------------------
+# The default kernel cooperative K load reads token-strided (lane v0 -> token
+# (v0&31) at the 96B token stride), so each lane's 16B falls in its own cache
+# line (~25% L1 coalescing) -> the vL1D address-gen serializes under fp6's load
+# volume (the long vmcnt(0) wait). This packer PRE-ARRANGES K so the cooperative
+# load is a CONTIGUOUS, coalesced copy that lands byte-identically in the kernel's
+# chunk-major LDS image -- so the kernel's _K_COALESCED_LOAD path uses a plain
+# contiguous load and lds_read_K_data / the MFMA are unchanged. The transpose
+# becomes this one-time host op. (Stalled-on-Address 18.5%->0.7%, L1-L2 txns
+# 332M->241M, +1.3% end-to-end vs the token-strided load.)
+#
+# Permutation derived from the kernel's default chunk-major load addressing. C0 retains its
+# original 16B/lane layout; C1 keeps only its 8 useful bytes/lane, compacting 16KB to 12KB:
+#   original position P = w*1024 + i*4096 + v0*16 + byte  <-  the
+#   token-major byte v_K_base(v0)+C_i(w,i)+byte, with
+#   v_K_base = (v0&31)*96 + ((v0>>5)&1)*24  and  C_i: blk=w+(i&1)*4; half=blk&1;
+#   n=blk>>1; chunk=i>>1; C_i = n*32*96 + half*48 + chunk*16.
+def _k_lds_order_gather_index():
+    """Per-tile [12288] token-major byte index for the compact LDS-order image."""
+    c0 = np.arange(8192)
+    block = np.arange(8)[:, None, None, None]
+    parity = np.arange(2)[None, :, None, None]
+    lane = np.arange(32)[None, None, :, None]
+    byte = np.arange(8)[None, None, None, :]
+    c1 = 8192 + block * 1024 + parity * 512 + lane * 16 + byte
+    P = np.concatenate((c0, c1.reshape(-1)))
+    byte = P & 15
+    r = P >> 4
+    v0 = r & 63
+    r2 = r >> 6
+    wv = r2 & 3
+    iv = r2 >> 2
+    v_k_base = (v0 & 31) * 96 + ((v0 >> 5) & 1) * 24
+    blk = wv + (iv & 1) * 4
+    half = blk & 1
+    n = blk >> 1
+    chunk = iv >> 1
+    c_i = n * 32 * 96 + half * 48 + chunk * 16
+    return (v_k_base + c_i + byte).astype(np.int64)
+
+
+def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
+    """Pack K -> LDS-order fp6 (for the kernel's _K_COALESCED_LOAD contiguous load) + per-(tok,32)
+    E8M0 scale. Numerically identical to quantize_fp6_lastdim; LAYOUT change only.
+
+    Input : k_thd f32 [b, sk, h, 128].
+    Output:
+    data  uint8 [b, h, n_tiles*12288]  (each tile = the compact 12288B chunk-major LDS image; the kernel's
+            contiguous coalesced load lands it byte-identically to the token-strided chunk-major load).
+            tile = 12288B over 128 tokens.
+      scale uint8 [b, sk, h, 4]
+    """
+    k = np.asarray(k_thd)
+    b, sk, h, d = k.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile  # ceil; the valid=(g<total) mask zeroes a partial tail tile
+    packed, scale = quantize_fp6_lastdim(k.astype(np.float64))  # [b,sk,h,96], [b,sk,h,4]
+    # token-major flat per (b,h): [b, h, sk*96]
+    km = np.ascontiguousarray(np.transpose(packed, (0, 2, 1, 3))).reshape(b, h, sk * 96)
+    idx = _k_lds_order_gather_index()  # [12288]
+    total = sk * 96
+    out = np.zeros((b, h, nt * _K_COMPACT_DATA_BYTES), np.uint8)
+    for t in range(nt):
+        g = t * _K_COMPACT_DATA_BYTES + idx
+        valid = g < total
+        start = t * _K_COMPACT_DATA_BYTES
+        out[:, :, start:start + _K_COMPACT_DATA_BYTES] = np.where(
+            valid, km[:, :, np.where(valid, g, 0)], 0
+        )
+    return np.ascontiguousarray(out).astype(np.uint8), scale.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# V operand packer (proven "clean" / "operand" layout)
+# ---------------------------------------------------------------------------
+# tr8 within-32-block kv scramble (4-element chunk / 16-stride interleave). This
+# MEASURED permutation makes the host V operand agree with the in-kernel P operand
+# (fp8 K-distribution + cvt interleave); without it the layout caps at cos 0.59.
+_TR8_SIGMA32 = np.array(
+    [
+        0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23,
+        8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31,
+    ],
+    dtype=np.int64,
+)
+
+
+def quantize_fp6_v_clean(v_dmajor: np.ndarray, tile: int = 128):
+    """Pack V into the per-lane fp6 MFMA operand bytes (PROVEN, cos 0.99682498).
+
+    There is a single proven V layout: V is packed to match the kernel's NATURAL
+    (pre-swap) P operand, so the PV MFMA needs no cross-lane permlane32 swap on P
+    (the contraction sum_kv P[kv] V[kv] is permutation-invariant over K). The
+    field->kv map is the closed form
+        kv = t*128 + 64*(bn%2) + kvtab[L, f],
+    where kvtab[L,f] = 32*(srcL//32) + fperm[srcF] (see _v_noswap_kvtab); the head
+    dim is swap-invariant, d = (bn//2)*32 + (L%32). Per-block E8M0 is computed over
+    the gathered 32 kv and written at 12288 + n*128 + (L%32)*4 + (L//32) + 2*k.
+
+    Input : v_dmajor f32 [..., D=128, S] (head dim D on axis -2, kv seq S on -1;
+            RAW fp8 magnitudes -- per-channel v_descale is applied in the kernel
+            epilogue, so this is numerically a layout change only).
+    Output: uint8 [..., n_tiles*(tile*96 + D*4)]. Per 128-kv tile (12800B):
+              data  12288B = 8 blocks (n*2+k) x 64 lanes x 24B at (n*2+k)*1536+L*24
+              scale   512B = E8M0 at 12288 + n*128 + (L%32)*4 + (L//32) + 2*k.
+    """
+    v = np.asarray(v_dmajor, dtype=np.float64)
+    *lead, D, S = v.shape
+    assert D == 128 and S % tile == 0 and tile == 128, (D, S, tile)
+    nT = S // tile
+    kSubN1, kSubK1 = 4, 2
+    nblk = kSubN1 * kSubK1  # 8
+    B = int(np.prod(lead)) if lead else 1
+    vflat = v.reshape(B, D, S)
+
+    # closed-form pre-swap field->(d,kv) gather (verified == the empirical clean
+    # map composed with the kernel's field-level permlane32 swap).
+    kvtab = _v_noswap_kvtab()  # [64,32] = 32*(srcL//32) + fperm[srcF]
+    bn = np.arange(nblk)
+    k_bn = (bn % kSubK1)[:, None, None]  # bn%2
+    n_of = (bn // kSubK1)[:, None, None]
+    kv_in = 64 * k_bn + kvtab[None]  # [8,64,32] kv-in-tile (pre-swap)
+    Lg = np.arange(64)[None, :, None]
+    d_in = np.broadcast_to(n_of * 32 + (Lg % 32), (nblk, 64, 32))  # swap-invariant
+
+    # scale byte index (within the 512B region): n*128 + (L%32)*4 + (L//32) + 2*k.
+    nn = (bn // kSubK1)[:, None]
+    kk = (bn % kSubK1)[:, None]
+    LL = np.arange(64)[None, :]
+    sidx = (nn * 128 + (LL % 32) * 4 + (LL // 32) + 2 * kk).reshape(-1)  # (512,)
+
+    tile_bytes = tile * 96 + D * 4  # 12800
+    out = np.zeros((B, nT * tile_bytes), np.uint8)
+    for t in range(nT):
+        kvt = t * tile + kv_in  # [8,64,32] absolute kv
+        vals = vflat[:, d_in, kvt]  # (B,8,64,32)
+        amax = np.max(np.abs(vals), axis=-1)  # (B,8,64)
+        _m, e = np.frexp(np.maximum(amax, np.float64(0)))
+        E = np.where(amax == 0, 0, e - 3).astype(np.int64)  # (B,8,64)
+        codes = e2m3_encode(vals / (2.0**E)[..., None])  # (B,8,64,32)
+        data = _pack_fields_24b(codes.reshape(B * nblk * 64, 32))  # (B*8*64,24)
+        base = t * tile_bytes
+        out[:, base : base + nblk * 64 * 24] = data.reshape(B, nblk * 64 * 24)
+        E8 = ((E + 127) & 0xFF).astype(np.uint8).reshape(B, -1)  # (B,512) (bn,L)
+        out[:, base + 12288 + sidx] = E8
+    return np.ascontiguousarray(out).astype(np.uint8)
+
+
+# Single proven V layout (the kernel skips the cross-lane P swap), so the historic
+# "noswap" / "operand" names all denote this one packer.
+quantize_fp6_v_noswap = quantize_fp6_v_clean
+quantize_fp6_v_operand_tileflat = quantize_fp6_v_clean
+
+
+# ---------------------------------------------------------------------------
+# Triton GPU V packer (eliminates the one-time host pack)
+# ---------------------------------------------------------------------------
+# E2M3 magnitude grid as python literals (code 0..31 -> ascending magnitude); the
+# Triton kernel reconstructs searchsorted/RNE against these compile-time constants.
+_E2M3_GRID = tuple(float(x) for x in _E2M3_MAG)
+
+
+def _v_field_perm() -> np.ndarray:
+    """Per-output-field source index into a 32-kv MX block.
+
+    Combines (a) the cvt field interleave field[2i]=blk[i], field[2i+1]=blk[16+i]
+    and (b) the tr8 within-block kv scramble, so loading the 32 values in this
+    order yields the fp6 fields already in their final packed positions (groups of
+    4 contiguous fields = 3 contiguous bytes, no further permutation)."""
+    inv32 = np.empty(32, dtype=np.int64)
+    inv32[_TR8_SIGMA32] = np.arange(32)
+    c = np.where(np.arange(32) % 2 == 0, np.arange(32) // 2, 16 + np.arange(32) // 2)
+    return inv32[c].astype(np.int32)  # fieldperm[f] = inv32[c(f)]
+
+
+def quantize_fp6_v_clean_triton(v_fp8: "torch.Tensor", tile: int = 128):
+    """GPU (Triton) equivalent of quantize_fp6_v_clean (byte-identical).
+
+    v_fp8 : torch fp8 tensor [b, sk, h_kv, d=128] (RAW fp8 V magnitudes; the kernel
+            epilogue applies the per-channel descale, so this is a layout cast).
+    Returns: torch uint8 [b, h_kv, nT*12800] on the V device, byte-identical to the
+    numpy quantize_fp6_v_clean output (all intermediate quantities are exact dyadic
+    rationals representable in fp32, so fp32 GPU == fp64 host)."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h_kv, d = v_fp8.shape
+    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
+    nT = sk // tile
+    n_blocks = b * h_kv * nT * 128 * 4
+    out = torch.empty(b * h_kv * nT * 12800, dtype=torch.uint8, device=v_fp8.device)
+    kvtab = torch.from_numpy(_v_noswap_kvtab().reshape(-1)).to(v_fp8.device)
+    BLOCK_N = 128
+    grid = (triton.cdiv(n_blocks, BLOCK_N),)
+    _pack_v_fp6_kernel[grid](
+        v_fp8,
+        out,
+        kvtab,
+        v_fp8.stride(0),
+        v_fp8.stride(1),
+        v_fp8.stride(2),
+        v_fp8.stride(3),
+        h_kv,
+        nT,
+        n_blocks,
+        GRID=_E2M3_GRID,
+        BLOCK_N=BLOCK_N,
+    )
+    return out.view(b, h_kv, nT * 12800)
+
+
+# ---------------------------------------------------------------------------
+# Triton V packer kv-gather table (pre-swap P operand layout)
+# ---------------------------------------------------------------------------
+_NOSWAP_KVTAB_CACHE = None
+
+
+def _v_noswap_kvtab() -> np.ndarray:
+    """Per-(lane,field) kv-in-64-chunk offset for the noswap V operand: kv =
+    t*128 + 64*k + kvtab[L,f]. Derived from the empirical clean map composed with
+    the kernel's field-level permlane32 swap (see quantize_fp6_v_noswap). The
+    clean map has the closed form kv = 64*(bn%2) + 32*(L//32) + fperm[f], so
+    kvtab[L,f] = 32*(srcL[L,f]//32) + fperm[srcF[L,f]]. Memoized int32 [64,32]."""
+    global _NOSWAP_KVTAB_CACHE
+    if _NOSWAP_KVTAB_CACHE is not None:
+        return _NOSWAP_KVTAB_CACHE
+    fperm = _v_field_perm()
+    srcL = np.zeros((64, 32), np.int64)
+    srcF = np.zeros((64, 32), np.int64)
+    for L in range(64):
+        hi = L >= 32
+        base = L - 32 if hi else L
+        for f in range(32):
+            even = (f % 2) == 0
+            if not hi:
+                srcL[L, f], srcF[L, f] = (L, f) if even else (L + 32, f - 1)
+            else:
+                srcL[L, f], srcF[L, f] = (base, f + 1) if even else (L, f)
+    kvtab = 32 * (srcL // 32) + fperm[srcF]
+    _NOSWAP_KVTAB_CACHE = kvtab.astype(np.int32)
+    return _NOSWAP_KVTAB_CACHE
+
+
+if _HAVE_TRITON:
+
+    @triton.jit
+    def _pack_v_fp6_kernel(
+        v_ptr,  # fp8 V [b, sk, h_kv, d] (any strides)
+        out_ptr,  # uint8 [b*h_kv*nT*12800]
+        kvtab_ptr,  # int32 [64*32] (L*32 + f) -> kv-in-64-chunk offset
+        stride_vb,
+        stride_vs,
+        stride_vh,
+        stride_vd,
+        h_kv,
+        nT,
+        n_blocks,  # total 32-kv MX blocks
+        GRID: tl.constexpr,  # 32 e2m3 magnitudes (ascending)
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        blk = pid * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+        m = blk < n_blocks
+        # decode block id: blk = ((bh*nT + t)*128 + d_row)*4 + kvblk
+        kvblk = blk % 4
+        d_row = (blk // 4) % 128
+        t = (blk // 512) % nT
+        bh = blk // (512 * nT)
+        bb = bh // h_kv
+        hh = bh % h_kv
+        n = d_row // 32
+        k = kvblk // 2
+        bn = n * 2 + k
+        L = (kvblk % 2) * 32 + (d_row % 32)
+
+        f = tl.arange(0, 32)
+        kt = tl.load(kvtab_ptr + L[:, None] * 32 + f[None, :])  # [BN,32]
+        kv = (t * 128 + k * 64)[:, None] + kt  # [BN,32] kv-in-tile
+        voff = (
+            bb[:, None] * stride_vb
+            + kv * stride_vs
+            + hh[:, None] * stride_vh
+            + d_row[:, None] * stride_vd
+        )
+        vals = tl.load(v_ptr + voff, mask=m[:, None], other=0.0).to(tl.float32)
+
+        amax = tl.max(tl.abs(vals), axis=1)  # [BN]
+        bits = amax.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        E = tl.where(amax == 0.0, 0, exp - 129)  # frexp_exp-3 = (exp-126)-3
+        inv_scale = tl.exp2((-E).to(tl.float32))  # 2^-E (exact dyadic)
+        y = vals * inv_scale[:, None]  # scaled (exact in fp32 for fp8 input)
+        mag = tl.abs(y)
+        mag = tl.minimum(mag, 7.5)  # clamp to grid max
+
+        idx = tl.zeros([BLOCK_N, 32], tl.int32)
+        glo = tl.full([BLOCK_N, 32], -1.0e30, tl.float32)
+        ghi = tl.full([BLOCK_N, 32], 1.0e30, tl.float32)
+        for j in tl.static_range(32):
+            gj = GRID[j]
+            lt = mag > gj  # grid[j] < mag
+            idx += lt.to(tl.int32)
+            glo = tl.where(lt, tl.maximum(glo, gj), glo)
+            ge = mag <= gj  # grid[j] >= mag
+            ghi = tl.where(ge, tl.minimum(ghi, gj), ghi)
+        lo = tl.maximum(idx - 1, 0)
+        dlo = mag - glo
+        dhi = ghi - mag
+        pick_hi = (dhi < dlo) | ((dhi == dlo) & ((lo & 1) == 1))
+        chosen = tl.where(pick_hi, idx, lo)
+        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
+        ybits = y.to(tl.int32, bitcast=True)
+        sign = (ybits < 0).to(tl.int32) * 32
+        codes = chosen | sign  # [BN,32] field-order 6-bit codes
+
+        cf = codes.reshape(BLOCK_N, 8, 4)
+        w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)  # [1,6,12,18] shifts
+        u = tl.sum(cf * w[None, None, :], axis=2)  # [BN,8] 24-bit packed words
+        b0 = (u & 0xFF).to(tl.uint8)
+        b1 = ((u >> 8) & 0xFF).to(tl.uint8)
+        b2 = ((u >> 16) & 0xFF).to(tl.uint8)
+
+        base = (bh * nT + t) * 12800  # tile byte base
+        data_off = base + bn * 1536 + L * 24  # [BN]
+        g = tl.arange(0, 8)
+        off0 = data_off[:, None] + g[None, :] * 3
+        tl.store(out_ptr + off0 + 0, b0, mask=m[:, None])
+        tl.store(out_ptr + off0 + 1, b1, mask=m[:, None])
+        tl.store(out_ptr + off0 + 2, b2, mask=m[:, None])
+        # scale byte (d-major: 12288 + d_row*4 + kvblk)
+        scale_off = base + 12288 + d_row * 4 + kvblk
+        sb = ((E + 127) & 0xFF).to(tl.uint8)
+        tl.store(out_ptr + scale_off, sb, mask=m)
+
+
+# Single proven V layout: the historic "noswap" Triton name is kept as an alias.
+quantize_fp6_v_noswap_triton = quantize_fp6_v_clean_triton
+
+
+# ---------------------------------------------------------------------------
+# Triton GPU QK packer (lastdim MXFP6-E2M3, eliminates the host QK pack)
+# ---------------------------------------------------------------------------
+def _qk_field_perm() -> np.ndarray:
+    """Per-output-field source index within a 32-block for the lastdim pack.
+
+    Matches quantize_fp6_lastdim's interleave field[2i]=blk[i], field[2i+1]=
+    blk[16+i] (no kv scramble), so loading in this order yields fields already in
+    packed position."""
+    f = np.arange(32)
+    return np.where(f % 2 == 0, f // 2, 16 + f // 2).astype(np.int32)
+
+
+if _HAVE_TRITON:
+
+    @triton.jit
+    def _pack_qk_fp6_kernel(
+        x_ptr,  # float [N, D] row-major (D % 32 == 0)
+        packed_ptr,  # uint8 [N, NB*24]
+        scale_ptr,  # uint8 [N, NB]
+        cperm_ptr,  # int32 [32] field->source-element permutation
+        D,
+        NB,  # D // 32
+        n_blocks,  # N * NB
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        blk = pid * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+        m = blk < n_blocks
+        row = blk // NB
+        bj = blk % NB  # which 32-block within the last dim
+
+        f = tl.arange(0, 32)
+        cp = tl.load(cperm_ptr + f)  # [32]
+        elem = bj[:, None] * 32 + cp[None, :]  # [BN,32] source element index
+        xoff = row[:, None] * D + elem
+        vals = tl.load(x_ptr + xoff, mask=m[:, None], other=0.0).to(tl.float32)
+
+        amax = tl.max(tl.abs(vals), axis=1)  # [BN]
+        bits = amax.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        E = tl.where(amax == 0.0, 0, exp - 129)  # frexp_exp-3
+        inv_scale = tl.exp2((-E).to(tl.float32))
+        y = vals * inv_scale[:, None]
+        mag = tl.minimum(tl.abs(y), 7.5)
+
+        # Branchless round-half-even E2M3 encode. The magnitude grid IS a minifloat
+        # (2 exp bits, 3 mantissa bits, bias 1): normals mag>=1 are 2^(exp2-1)*(1+m/8),
+        # subnormals mag<1 are m/8 (uniform step 1/8). So the 32-way linear search is
+        # replaced by (a) fp32 RNE-round-to-3-mantissa-bits for the normal range and
+        # (b) round(mag*8) for the subnormal range -- bit-identical, ~2.9x faster.
+        magbits = mag.to(tl.int32, bitcast=True)
+        # (a) NORMAL: add the RNE rounding bias for dropping the low 20 mantissa bits
+        # ((1<<19)-1 + kept-LSB for ties-to-even); the carry propagates into the exp.
+        bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
+        exp2 = ((bits_r >> 23) & 0xFF) - 126  # (ef-127)+1 = E2M3 exp field for mag in [1,8)
+        m3n = (bits_r >> 20) & 7
+        code_norm = (exp2 << 3) | m3n
+        # (b) SUBNORMAL: round-half-even of mag*8 (0..8; 8 == first normal code, exact).
+        t8 = mag * 8.0
+        fl = tl.floor(t8)
+        fli = fl.to(tl.int32)
+        frac = t8 - fl
+        up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
+        code_sub = fli + up.to(tl.int32)
+        chosen = tl.where(mag >= 1.0, code_norm, code_sub)
+        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
+        ybits = y.to(tl.int32, bitcast=True)
+        sign = (ybits < 0).to(tl.int32) * 32
+        codes = chosen | sign  # [BN,32] field-order codes
+
+        cf = codes.reshape(BLOCK_N, 8, 4)
+        w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)
+        u = tl.sum(cf * w[None, None, :], axis=2)  # [BN,8]
+        b0 = (u & 0xFF).to(tl.uint8)
+        b1 = ((u >> 8) & 0xFF).to(tl.uint8)
+        b2 = ((u >> 16) & 0xFF).to(tl.uint8)
+
+        base = row * (NB * 24) + bj * 24  # [BN] byte base in packed
+        g = tl.arange(0, 8)
+        off0 = base[:, None] + g[None, :] * 3
+        tl.store(packed_ptr + off0 + 0, b0, mask=m[:, None])
+        tl.store(packed_ptr + off0 + 1, b1, mask=m[:, None])
+        tl.store(packed_ptr + off0 + 2, b2, mask=m[:, None])
+        scale_off = row * NB + bj
+        sb = ((E + 127) & 0xFF).to(tl.uint8)
+        tl.store(scale_ptr + scale_off, sb, mask=m)
+
+    @triton.jit
+    def _pack_k_fp6_lds_direct_kernel(
+        x_ptr,  # float K [b, sk, h, 128]
+        buf_ptr,  # uint8 final K backing buffer [b, h, nt, 17408]
+        scale_ptr,  # uint8 dense scale [b, sk, h, 4]
+        cperm_ptr,  # int32 [32] field->source-element permutation
+        scatter_ptr,  # int32 [12288] token-major source byte->compact destination byte
+        SK,
+        H,
+        NT,
+        n_blocks,
+        TILE_BYTES: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        blk = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        m = blk < n_blocks
+        block_in_row = blk & 3
+        padded_row = blk >> 2
+        token = padded_row % (NT * 128)
+        bh = padded_row // (NT * 128)
+        hidx = bh % H
+        bidx = bh // H
+        valid_token = token < SK
+
+        f = tl.arange(0, 32)
+        cp = tl.load(cperm_ptr + f)
+        elem = block_in_row[:, None] * 32 + cp[None, :]
+        xoff = ((bidx[:, None] * SK + token[:, None]) * H + hidx[:, None]) * 128 + elem
+        vals = tl.load(x_ptr + xoff, mask=m[:, None] & valid_token[:, None], other=0.0).to(tl.float32)
+
+        amax = tl.max(tl.abs(vals), axis=1)
+        bits = amax.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        E = tl.where(amax == 0.0, 0, exp - 129)
+        y = vals * tl.exp2((-E).to(tl.float32))[:, None]
+        mag = tl.minimum(tl.abs(y), 7.5)
+        magbits = mag.to(tl.int32, bitcast=True)
+        bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
+        exp2 = ((bits_r >> 23) & 0xFF) - 126
+        code_norm = (exp2 << 3) | ((bits_r >> 20) & 7)
+        t8 = mag * 8.0
+        fl = tl.floor(t8)
+        fli = fl.to(tl.int32)
+        frac = t8 - fl
+        up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
+        code_sub = fli + up.to(tl.int32)
+        chosen = tl.where(mag >= 1.0, code_norm, code_sub)
+        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
+        sign = (y.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
+        codes = chosen | sign
+
+        cf = codes.reshape(BLOCK_N, 8, 4)
+        w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)
+        u = tl.sum(cf * w[None, None, :], axis=2)
+        bytes0 = (u & 0xFF).to(tl.uint8)
+        bytes1 = ((u >> 8) & 0xFF).to(tl.uint8)
+        bytes2 = ((u >> 16) & 0xFF).to(tl.uint8)
+
+        byte_group = tl.arange(0, 8)
+        source_base = (token % 128) * 96 + block_in_row * 24
+        source0 = source_base[:, None] + byte_group[None, :] * 3
+        tile = token // 128
+        dest_base = bh * (NT * TILE_BYTES) + tile * TILE_BYTES
+        dest0 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 0)
+        dest1 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 1)
+        dest2 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 2)
+        tl.store(buf_ptr + dest0, bytes0, mask=m[:, None])
+        tl.store(buf_ptr + dest1, bytes1, mask=m[:, None])
+        tl.store(buf_ptr + dest2, bytes2, mask=m[:, None])
+
+        scale_off = ((bidx * SK + token) * H + hidx) * 4 + block_in_row
+        scale_byte = ((E + 127) & 0xFF).to(tl.uint8)
+        tl.store(scale_ptr + scale_off, scale_byte, mask=m & valid_token)
+
+    @triton.jit
+    def _gather_k_lds_kernel(
+        packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
+        buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
+        srcw_ptr,  # int32 [k_hs] within-(b,h) source byte offset = (gc//96)*(h*96)+(gc%96)
+        valid_ptr,  # int8 [k_hs] 1=keep, 0=zero (fp6 dup/overflow + partial-seq tail)
+        DATA_HS,  # nt*12288 data bytes per (b,h)
+        TILE_BYTES,
+        SKH96,  # sk*h*96 = packed bytes per batch
+        H,  # heads
+        DATA_TILE_BYTES: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # One fused pass replacing the torch permute+contiguous / advanced-index gather /
+        # masked_fill / buffer-copy chain (~4 full-size passes -> 1 gathered read + 1 write).
+        pid = tl.program_id(0)
+        nchunk = DATA_HS // BLOCK
+        bh = pid // nchunk
+        chunk = pid % nchunk
+        bIdx = bh // H
+        hIdx = bh % H
+        p = chunk * BLOCK + tl.arange(0, BLOCK)
+        srcw = tl.load(srcw_ptr + p)
+        valid = tl.load(valid_ptr + p)
+        src_addr = bIdx * SKH96 + hIdx * 96 + srcw
+        byte = tl.load(packed_ptr + src_addr).to(tl.int32)
+        byte = tl.where(valid != 0, byte, 0).to(tl.uint8)
+        tile = p // DATA_TILE_BYTES
+        in_tile = p - tile * DATA_TILE_BYTES
+        dst_addr = bh * (DATA_HS // DATA_TILE_BYTES) * TILE_BYTES + tile * TILE_BYTES + in_tile
+        tl.store(buf_ptr + dst_addr, byte)
+
+    @triton.jit
+    def _fill_k_scale_tail_kernel(
+        scale_ptr,  # uint8 scale [b, sk, h, 4] flattened
+        buf_ptr,  # uint8 packed K buffer [b,h,nt*17408] flattened
+        SK,
+        H,
+        NT,
+        TILE_BYTES: tl.constexpr,
+        SCALE_TAIL_OFFSET: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        bh = pid // NT
+        t = pid % NT
+        bidx = bh // H
+        hidx = bh % H
+        offs = tl.arange(0, BLOCK)
+        region_b = offs >= 512
+        region_off = offs - region_b.to(tl.int32) * 512
+        inst = region_off >> 8
+        lane = (region_off & 255) >> 2
+        byte_in_dword = region_off & 3
+        src_shift = byte_in_dword + region_b.to(tl.int32)
+        src_token = t * 128 + ((lane & 3) << 5) + (lane >> 2) + inst * 16 + (src_shift >> 2)
+        src_byte = src_shift & 3
+        dst = bh * (NT * TILE_BYTES) + t * TILE_BYTES + SCALE_TAIL_OFFSET + offs
+        src = ((bidx * SK + src_token) * H + hidx) * 4 + src_byte
+        valid = src_token < SK
+        val = tl.load(scale_ptr + src, mask=valid, other=0).to(tl.uint8)
+        tl.store(buf_ptr + dst, val)
+
+
+_QK_FIELD_PERM_CACHE: dict = {}
+
+
+def _qk_field_perm_dev(device):
+    """Cached per-device int32 field permutation for the lastdim fp6 pack. _qk_field_perm() is a
+    compile-time constant, but rebuilding it + a PAGEABLE host->device copy on EVERY Q and K pack
+    (quantize_fp6_k_lds_order_triton also calls the lastdim packer) was a per-attention sync that
+    serialized the quant. Build once per device and reuse."""
+    cperm = _QK_FIELD_PERM_CACHE.get(device)
+    if cperm is None:
+        cperm = torch.from_numpy(_qk_field_perm()).to(device)
+        _QK_FIELD_PERM_CACHE[device] = cperm
+    return cperm
+
+
+_K_LDS_SCATTER_CACHE: dict = {}
+
+
+def _k_lds_scatter_index(device):
+    """Cached inverse of the compact K gather: token-major source byte -> final data byte."""
+    scatter = _K_LDS_SCATTER_CACHE.get(device)
+    if scatter is None:
+        gather = _k_lds_order_gather_index()
+        inverse = np.empty_like(gather, dtype=np.int32)
+        inverse[gather] = np.arange(gather.size, dtype=np.int32)
+        scatter = torch.from_numpy(inverse).to(device)
+        _K_LDS_SCATTER_CACHE[device] = scatter
+    return scatter
+
+
+def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
+    """GPU (Triton) equivalent of quantize_fp6_lastdim.
+
+    x : torch float tensor [..., D] (D % 32 == 0) on GPU.
+    Returns (packed uint8 [..., (D//32)*24], scale uint8 [..., D//32]) on the same
+    device. Byte-identical to the numpy packer for inputs whose scaled values are
+    exactly representable (e.g. bf16/fp16 Q/K, where v/2^E is an exponent shift);
+    arbitrary fp32 inputs may differ by at most one code on measure-zero ties,
+    which is within fp6 quantization noise."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    *lead, D = x.shape
+    assert D % 32 == 0, D
+    NB = D // 32
+    xc = x.contiguous()
+    xflat = xc.reshape(-1, D)
+    N = xflat.shape[0]
+    packed = torch.empty(N, NB * 24, dtype=torch.uint8, device=x.device)
+    scale = torch.empty(N, NB, dtype=torch.uint8, device=x.device)
+    cperm = _qk_field_perm_dev(x.device)
+    n_blocks = N * NB
+    # The hd128 FMHA workloads consistently select 16/1. Pin it to avoid paying and logging
+    # the five-config autotune in every fresh benchmark process.
+    grid = (triton.cdiv(n_blocks, 16),)
+    _pack_qk_fp6_kernel[grid](
+        xflat,
+        packed,
+        scale,
+        cperm,
+        D,
+        NB,
+        n_blocks,
+        BLOCK_N=16,
+        num_warps=1,
+    )
+    return (
+        packed.reshape(*lead, NB * 24),
+        scale.reshape(*lead, NB),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel-ready packed views (GPU): bench / integration entry points
+# ---------------------------------------------------------------------------
+# These return tensors in the EXACT shape+stride the fwd_hd128_mxfp6 kernel
+# consumes, so a consumer hands them to mha_v4_packed. They own the
+# kernel-ABI knowledge -- the coalesced LDS-order K gather and the d-major
+# tile-flat V byte strides -- that used to live in the benchmark. Both support
+# S % 128 != 0 (the kernel masks the partial tail tile in softmax).
+
+_K_LDS_GIDX_CACHE: dict = {}
+
+
+def _k_lds_gather_index(nt: int, total: int, device):
+    """Cached [(nt*12288)] compact LDS-order gather index + valid mask. valid = (g < total)
+    zeroes BOTH the fp6 dup/overflow LDS tail AND a partial seq tail. Keyed by
+    (nt, total, device): with a partial tail the same nt pairs with different total."""
+    key = (nt, total, device)
+    g = _K_LDS_GIDX_CACHE.get(key)
+    if g is None:
+        idx16k = torch.as_tensor(
+            _k_lds_order_gather_index(), dtype=torch.long, device=device
+        )
+        full = (
+            torch.arange(nt, device=device, dtype=torch.long) * _K_COMPACT_DATA_BYTES
+        ).unsqueeze(1) + idx16k.unsqueeze(0)
+        full = full.reshape(-1)
+        valid = full < total
+        gc = torch.where(valid, full, torch.zeros_like(full))
+        g = (gc, valid)
+        _K_LDS_GIDX_CACHE[key] = g
+    return g
+
+
+_K_LDS_SRCW_CACHE: dict = {}
+
+
+def _k_lds_src_within(nt: int, total: int, h: int, device):
+    """Cached (srcw int32 [k_hs], valid int8 [k_hs]) for the fused LDS gather kernel.
+    srcw = (gc//96)*(h*96) + (gc%96) folds the [b,sk,h,96]->[b,h,token-major] permute
+    into the source address so the kernel reads `packed` directly (no permute+contiguous
+    copy). h-dependent (the h*96 token stride) so h is part of the key."""
+    key = (nt, total, h, device)
+    g = _K_LDS_SRCW_CACHE.get(key)
+    if g is None:
+        gc, valid = _k_lds_gather_index(nt, total, device)
+        srcw = ((gc // 96) * (h * 96) + (gc % 96)).to(torch.int32)
+        g = (srcw, valid.to(torch.int8))
+        _K_LDS_SRCW_CACHE[key] = g
+    return g
+
+
+def reorder_fp6_k_lds_order_triton(
+    packed: "torch.Tensor",
+    scale: "torch.Tensor",
+    tile: int = 128,
+    return_raw: bool = False,
+):
+    """Reorder dense packed K into the kernel-ready LDS-order view WITH E8M0 scales in the
+    per-tile tail. Each 128-token tile retains its 17408B global ABI: 12288B compact chunk-major
+    fp6 K data + a 4096B unused hole + a 1024B lane-major K-scale image. The kernel loads the
+    scale straight from the K buffer tail (coalesced buffer_load lds:1), so there is no separate
+    K-scale global-load stream. Supports S % tile != 0 (the gather's valid mask zeroes the partial
+    tail tile, which the kernel masks in softmax).
+
+    packed : dense uint8 fp6 K [b, sk, h, 96] on GPU.
+    scale : dense uint8 E8M0 K scales [b, sk, h, 4] on GPU.
+    Returns (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a [b,h,n_tiles*17408]
+             buffer, scale uint8 [b, sk, h, 4]). `scale` only satisfies the k_descale ABI arg --
+             the kernel reads scales from the K tail, not this tensor.
+    If return_raw: returns (buf, sbuf) -- the FULL contiguous backing buffers (uint8 1D) instead of
+    the strided/padded views. A torch.library.custom_op caller MUST take this path: returning the
+    strided k_view as a custom-op output lets AOTAutograd clone it to a contiguous numel-sized
+    tensor (dropping the seq-stride-136 LDS layout -> garbage). The caller rebuilds
+    k_view = buf.as_strided((b, sk, h, 96), (h*nt*17408, 136, nt*17408, 1)) OUTSIDE the op."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, packed_d = packed.shape
+    assert packed_d == _K_PACKED_ROW_BYTES and tile == 128, (packed_d, sk, tile)
+    assert scale.shape == (b, sk, h, 4), scale.shape
+    assert packed.dtype == torch.uint8 and scale.dtype == torch.uint8, (packed.dtype, scale.dtype)
+    assert packed.device == scale.device, (packed.device, scale.device)
+    packed = packed.contiguous()
+    scale = scale.contiguous()
+    nt = (sk + tile - 1) // tile  # ceil; partial tail handled by the valid mask
+    total = sk * 96
+    # Fused on-device LDS reorder: a single Triton gather (read `packed` via the cached
+    # source offset, apply the valid mask, write the buffer) replaces the torch chain of
+    # permute+contiguous / advanced-index gather / masked_fill / buffer-copy (~4 full-size
+    # passes -> 1 gathered read + 1 write; ~1.35x faster on the K reorder at long seq).
+    srcw, valid8 = _k_lds_src_within(nt, total, h, packed.device)
+    # Each 128-token tile remains 17408B: 12288B compact fp6 K data, a 4096B unused hole, then the
+    # 1024B lane-major E8M0 K-scale tail.
+    # The kernel loads that scale image with a coalesced buffer_load lds:1 straight from the K
+    # buffer (no separate scale pointer / global_load) -- this removes the stalling K-scale global
+    # loads. seq stride = 136 (17408/128) -> the kernel's _s_k_Seqs=136 -> tile base = token*136.
+    k_tile_bytes = _K_TILE_BYTES
+    k_hs = nt * k_tile_bytes
+    k_bs = h * k_hs
+    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=packed.device)
+    BLOCK = 1024
+    data_hs = nt * _K_COMPACT_DATA_BYTES
+    assert data_hs % BLOCK == 0, (data_hs, BLOCK)
+    grid = (b * h * (data_hs // BLOCK),)
+    _gather_k_lds_kernel[grid](
+        packed.reshape(-1),
+        buf,
+        srcw,
+        valid8,
+        data_hs,
+        k_tile_bytes,
+        sk * h * 96,
+        h,
+        DATA_TILE_BYTES=_K_COMPACT_DATA_BYTES,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
+    # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
+    # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.reshape(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    # `scale` is still returned to satisfy the k_descale ABI arg, but the kernel reads scales from
+    # the K tail, not this tensor. Re-home into a +64 slack buffer (harmless; keeps callers happy).
+    sflat = scale.reshape(-1)
+    sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=scale.device)
+    sbuf[: sflat.numel()] = sflat
+    if return_raw:
+        return buf, sbuf
+    scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
+    return k_view, scale
+
+
+def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
+    """Quantize float K and reorder it into the kernel-ready LDS-order fp6 view.
+
+    Use ``quantize_fp6_lastdim_triton`` followed by ``reorder_fp6_k_lds_order_triton`` when dense
+    quantization should be scheduled independently from the kernel-specific LDS layout conversion.
+    """
+    _b, sk, _h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    packed, scale = quantize_fp6_lastdim_triton(k_thd)
+    return reorder_fp6_k_lds_order_triton(packed, scale, tile=tile, return_raw=return_raw)
+
+
+def quantize_fp6_k_lds_order_direct_triton(
+    k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False
+):
+    """Quantize K directly into the kernel-ready compact LDS-order backing buffer.
+
+    This removes the dense ``[b, sk, h, 96]`` packed intermediate and the subsequent full-size
+    gather. The proven scale-tail fill remains separate because its shifted duplicate crosses tile
+    boundaries.
+    """
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    k = k_thd.contiguous()
+    nt = (sk + tile - 1) // tile
+    k_hs = nt * _K_TILE_BYTES
+    k_bs = h * k_hs
+    data_size, scale_size = fp6_k_raw_buffer_sizes(b, sk, h, tile)
+    buf = torch.empty(data_size, dtype=torch.uint8, device=k.device)
+    scale = torch.empty((b, sk, h, 4), dtype=torch.uint8, device=k.device)
+    cperm = _qk_field_perm_dev(k.device)
+    scatter = _k_lds_scatter_index(k.device)
+    n_blocks = b * h * nt * tile * 4
+    grid = (triton.cdiv(n_blocks, 32),)
+    _pack_k_fp6_lds_direct_kernel[grid](
+        k,
+        buf,
+        scale,
+        cperm,
+        scatter,
+        sk,
+        h,
+        nt,
+        n_blocks,
+        TILE_BYTES=_K_TILE_BYTES,
+        BLOCK_N=32,
+        num_warps=1,
+    )
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.reshape(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    sflat = scale.reshape(-1)
+    sbuf = torch.empty(scale_size, dtype=torch.uint8, device=k.device)
+    sbuf[: sflat.numel()] = sflat
+    if return_raw:
+        return buf, sbuf
+    return k_view, sbuf[: sflat.numel()].view_as(scale)
+
+
+def fp6_k_lds_order_views_from_raw(
+    buf: "torch.Tensor",
+    sbuf: "torch.Tensor",
+    b: int,
+    sk: int,
+    h: int,
+    tile: int = 128,
+):
+    """Rebuild the mxfp6 kernel ABI views from contiguous direct-packer buffers."""
+    assert tile == 128, tile
+    nt = (sk + tile - 1) // tile
+    k_hs = nt * _K_TILE_BYTES
+    k_bs = h * k_hs
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    scale = sbuf[: b * sk * h * 4].view(b, sk, h, 4)
+    return k_view, scale
+
+
+# ---------------------------------------------------------------------------
+# Torch (graph-friendly) Q/K packers -- inductor-schedulable counterparts of the
+# Triton packers above. Pure torch (pointwise / index_select / reshape / cat, no
+# host sync, no numpy, no data-dependent shapes), so under torch.compile they lower
+# to schedulable nodes and can overlap the Ulysses all-to-all. Byte-identical to the
+# Triton/numpy packers for bf16/fp16 Q/K (the scaled value v/2^E is an exact fp32
+# exponent shift); they reuse the exact same LDS gather / scale-tail index tables.
+# ---------------------------------------------------------------------------
+_QK_FIELD_PERM_PT_CACHE: dict = {}
+
+
+def _qk_field_perm_pt(device):
+    """Cached int64 field permutation [32] for the torch lastdim fp6 pack (same perm as the
+    Triton _qk_field_perm). Built once per device so it is not rebuilt in a capture region."""
+    p = _QK_FIELD_PERM_PT_CACHE.get(device)
+    if p is None:
+        p = torch.as_tensor(_qk_field_perm().astype(np.int64), device=device)
+        _QK_FIELD_PERM_PT_CACHE[device] = p
+    return p
+
+
+def _e2m3_encode_torch(y: "torch.Tensor") -> "torch.Tensor":
+    """Branchless round-half-even E2M3 encode (torch port of the _pack_qk_fp6_kernel encode).
+    y float32 [...] -> uint8 codes [...] (0..63; bit5 = sign). Same normal (fp32 RNE round to 3
+    mantissa bits) / subnormal (round(mag*8)) split + tie-to-even as the Triton kernel."""
+    mag = y.abs().clamp(max=7.5)
+    magbits = mag.contiguous().view(torch.int32)
+    bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
+    exp2 = ((bits_r >> 23) & 0xFF) - 126
+    m3n = (bits_r >> 20) & 7
+    code_norm = (exp2 << 3) | m3n
+    t8 = mag * 8.0
+    fl = torch.floor(t8)
+    fli = fl.to(torch.int32)
+    frac = t8 - fl
+    up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
+    code_sub = fli + up.to(torch.int32)
+    chosen = torch.where(mag >= 1.0, code_norm, code_sub).clamp(0, 31)
+    sign = (y.contiguous().view(torch.int32) < 0).to(torch.int32) * 32
+    return (chosen | sign).to(torch.uint8)
+
+
+def quantize_fp6_lastdim_torch(x: "torch.Tensor"):
+    """Graph-friendly (pure-torch, no host sync / numpy) port of quantize_fp6_lastdim_triton.
+
+    x float [..., D] (D % 32 == 0) -> (packed uint8 [..., (D//32)*24], scale uint8 [..., D//32]).
+    Traceable by Inductor (only pointwise / index_select / reshape ops) so it can be scheduled to
+    overlap the Ulysses all-to-all. Byte-identical to the Triton/numpy packers for bf16/fp16 Q/K."""
+    assert _HAVE_TRITON, "torch unavailable"
+    lead = list(x.shape[:-1])
+    D = x.shape[-1]
+    assert D % 32 == 0, D
+    NB = D // 32
+    xf = x.to(torch.float32).reshape(*lead, NB, 32)
+    amax = xf.abs().amax(dim=-1)  # [..., NB]
+    bits = amax.contiguous().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    E = torch.where(amax == 0, torch.zeros_like(exp), exp - 129)  # frexp_exp - 3
+    inv_scale = torch.exp2((-E).to(torch.float32))  # 2^-E (exact dyadic)
+    cperm = _qk_field_perm_pt(x.device)
+    y = xf.index_select(-1, cperm) * inv_scale.unsqueeze(-1)  # field-order, scaled
+    codes = _e2m3_encode_torch(y)  # [..., NB, 32] uint8
+    # pack 32 six-bit fields -> 24 bytes (groups of 4 fields = 24 bits = 3 bytes).
+    c = codes.to(torch.int32).reshape(*lead, NB, 8, 4)
+    u = c[..., 0] | (c[..., 1] << 6) | (c[..., 2] << 12) | (c[..., 3] << 18)  # [..., NB, 8]
+    packed = (
+        torch.stack([u & 0xFF, (u >> 8) & 0xFF, (u >> 16) & 0xFF], dim=-1)
+        .to(torch.uint8)
+        .reshape(*lead, NB * 24)
+    )
+    scale = ((E + 127) & 0xFF).to(torch.uint8)
+    return packed, scale
+
+
+_K_SCALE_TAIL_IDX_CACHE: dict = {}
+
+
+def _k_scale_tail_index(nt: int, sk: int, h: int, device):
+    """Cached (sidx int64 [h, nt, 1024], valid bool [nt, 1024]) for the per-tile K-scale TAIL image
+    (torch port of _fill_k_scale_tail_kernel: Region A unshifted + Region B pre-shifted +1 byte).
+    sidx indexes the flat [sk*h*4] E8M0 scale (per batch) = tok*(h*4) + head*4 + byte; invalid
+    (pre-shift tail past sk) -> clamped to 0 and masked out."""
+    key = (nt, sk, h, device)
+    g = _K_SCALE_TAIL_IDX_CACHE.get(key)
+    if g is None:
+        offs = torch.arange(1024, device=device, dtype=torch.int64)
+        region_b = (offs >= 512).to(torch.int64)
+        region_off = offs - region_b * 512
+        inst = region_off >> 8
+        lane = (region_off & 255) >> 2
+        byte_in_dword = region_off & 3
+        src_shift = byte_in_dword + region_b
+        tok_local = ((lane & 3) << 5) + (lane >> 2) + inst * 16 + (src_shift >> 2)  # [1024]
+        src_byte = src_shift & 3  # [1024]
+        t = torch.arange(nt, device=device, dtype=torch.int64)
+        src_token = t[:, None] * 128 + tok_local[None, :]  # [nt, 1024]
+        valid = src_token < sk
+        hidx = torch.arange(h, device=device, dtype=torch.int64)
+        sidx = src_token[None] * (h * 4) + hidx[:, None, None] * 4 + src_byte[None, None, :]
+        sidx = torch.where(valid[None], sidx, torch.zeros_like(sidx))  # [h, nt, 1024]
+        g = (sidx, valid)
+        _K_SCALE_TAIL_IDX_CACHE[key] = g
+    return g
+
+
+def quantize_fp6_k_lds_order_torch(
+    k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False
+):
+    """Graph-friendly (pure-torch) port of quantize_fp6_k_lds_order_triton (identical 17408B/tile
+    ABI: 12288B compact fp6 K data + 4096B unused + 1024B lane-major E8M0 K-scale tail). Traceable by
+    Inductor (torch pack + index-gathers + cat) so the K pack can overlap the Ulysses all-to-all.
+    Byte-identical to the Triton packer (reuses the exact LDS gather / scale-tail index tables).
+
+    k_thd float K [b, sk, h, 128] -> (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a
+    [b, h, nt*17408] buffer, scale uint8 [b, sk, h, 4] (ABI only; the kernel reads scales from the
+    K tail)). If return_raw: (buf, sbuf) contiguous backing buffers (for a torch.library.custom_op
+    caller that must rebuild the strided view outside the op)."""
+    assert _HAVE_TRITON, "torch unavailable"
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile  # ceil; the valid mask zeroes a partial tail tile
+    packed, scale = quantize_fp6_lastdim_torch(k_thd)  # [b,sk,h,96], [b,sk,h,4]
+    total = sk * 96
+
+    # DATA region: token-major per head, then the LDS-order gather (shared across heads), invalid->0.
+    km = packed.permute(0, 2, 1, 3).reshape(b, h, sk * 96).contiguous()
+    gc, dvalid = _k_lds_gather_index(nt, total, k_thd.device)  # compact data indices
+    data = km[:, :, gc]
+    data = torch.where(dvalid[None, None, :], data, torch.zeros_like(data)).reshape(
+        b, h, nt, _K_COMPACT_DATA_BYTES
+    )
+
+    # SCALE-TAIL region (1024B/tile): gather the E8M0 scale into the lane-major tail image, invalid->0.
+    sidx, svalid = _k_scale_tail_index(nt, sk, h, k_thd.device)
+    sf = scale.reshape(b, sk * h * 4)
+    stail = sf[:, sidx.reshape(-1)].reshape(b, h, nt, 1024)
+    stail = torch.where(svalid[None, None], stail, torch.zeros_like(stail))
+
+    # Preserve the 17408B global tile ABI: compact data + unused staging hole + scale tail.
+    padding = data.new_zeros(b, h, nt, _K_RESERVED_BYTES)
+    buf_full = torch.cat([data, padding, stail], dim=-1)  # [b, h, nt, 17408]
+    k_tile_bytes = _K_TILE_BYTES
+    k_hs = nt * k_tile_bytes
+    k_bs = h * k_hs
+    buf = torch.cat([buf_full.reshape(-1), buf_full.new_zeros(256)])
+    sflat = scale.reshape(-1)
+    sbuf = torch.cat([sflat, sflat.new_zeros(64)])
+    if return_raw:
+        return buf, sbuf
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    scale_out = sbuf[: sflat.numel()].view(b, sk, h, 4)
+    return k_view, scale_out
+
+
+def pack_fp6_v_kernel_view(
+    v_fp8: "torch.Tensor", tile: int = 128, use_triton: bool = True, out_device=None
+):
+    """Pack raw fp8 V into the kernel's native fp6 d-major tile-flat HBM layout and
+    return it as a [b, sk, h_kv, d] view with the kernel's byte strides
+    (v_Seqs=100, v_Hs=n_tiles*12800, v_Bs=h_kv*v_Hs). The per-channel v_descale is
+    applied in the kernel epilogue, so this is a layout cast only. Supports
+    S % tile != 0 by EDGE-padding the partial tail tile (replicate the last token so
+    every E8M0 32-block keeps a finite magnitude -- a zero block could dequant
+    0*inf -> NaN; the kernel masks tokens >= sk, so the padding never reaches out).
+
+    v_fp8 : torch fp8 V [b, sk, h_kv, d=128]. use_triton=False forces the numpy
+    host pack. out_device: move the final buffer here (the numpy pack lands on CPU).
+    Returns uint8 view [b, sk, h_kv, d]."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h_kv, d = v_fp8.shape
+    n_tiles = (sk + tile - 1) // tile
+    sk_pad = n_tiles * tile
+    if sk_pad != sk:
+        tail = v_fp8[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
+        v_in = torch.cat([v_fp8, tail], dim=1)
+    else:
+        v_in = v_fp8
+    if use_triton and _HAVE_TRITON:
+        packed_flat = quantize_fp6_v_clean_triton(v_in, tile=tile).reshape(-1)
+    else:
+        v_f = v_in.detach().to(torch.float32).cpu().numpy()  # [b, sk_pad, h_kv, d]
+        v_dmajor = np.transpose(v_f, (0, 2, 3, 1))  # [b, h_kv, d, sk_pad]
+        packed = quantize_fp6_v_clean(v_dmajor, tile=tile)
+        packed_flat = torch.from_numpy(np.ascontiguousarray(packed).reshape(-1))
+    tile_bytes = d * 96 + d * 4  # 12800 for d=128
+    v_hs = n_tiles * tile_bytes
+    v_bs = h_kv * v_hs
+    # as_strided can read up to (sk-1)*100 + (h_kv-1)*v_hs + (d-1), slightly past
+    # b*v_bs; the +256 tail keeps the view in-bounds.
+    buf = torch.empty(b * v_bs + 256, dtype=torch.uint8, device=packed_flat.device)
+    buf[: packed_flat.numel()] = packed_flat
+    if out_device is not None:
+        buf = buf.to(out_device)
+    return buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
+
+
