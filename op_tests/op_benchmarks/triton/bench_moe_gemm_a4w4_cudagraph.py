@@ -164,7 +164,7 @@ def check_and_shuffle_scales(scale, N, K):
 
 def preshuffle_weight(w):
     """gfx1250 WMMA weight preshuffle.
-    
+
     `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
     [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLED=True.
     shuffle_weight_gfx1250() asserts K // 2 % 32 and N % 16.
