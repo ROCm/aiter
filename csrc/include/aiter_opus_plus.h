@@ -111,12 +111,13 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x4(const S& s, float inverted_scale)
 }
 
 // fp32x2 -> i8x2 with scale
-// ISA: v_pk_mul_f32 + v_cvt_i32_f32 x2
+// ISA: v_pk_mul_f32 + round-to-nearest-even conversion x2
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_i8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
-    return i8x2_t{static_cast<i8_t>(tmp[0]), static_cast<i8_t>(tmp[1])};
+    return i8x2_t{static_cast<i8_t>(__builtin_rintf(tmp[0])),
+                  static_cast<i8_t>(__builtin_rintf(tmp[1]))};
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -124,10 +125,10 @@ OPUS_D decltype(auto) fp32_to_i8_scaled_x4(const S& s, float inverted_scale)
 {
     fp32x2_t tmp0 = pk_mul_f32(fp32x2_t{s[0], s[1]}, fp32x2_t{inverted_scale, inverted_scale});
     fp32x2_t tmp1 = pk_mul_f32(fp32x2_t{s[2], s[3]}, fp32x2_t{inverted_scale, inverted_scale});
-    return i8x4_t{static_cast<i8_t>(tmp0[0]),
-                  static_cast<i8_t>(tmp0[1]),
-                  static_cast<i8_t>(tmp1[0]),
-                  static_cast<i8_t>(tmp1[1])};
+    return i8x4_t{static_cast<i8_t>(__builtin_rintf(tmp0[0])),
+                  static_cast<i8_t>(__builtin_rintf(tmp0[1])),
+                  static_cast<i8_t>(__builtin_rintf(tmp1[0])),
+                  static_cast<i8_t>(__builtin_rintf(tmp1[1]))};
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
