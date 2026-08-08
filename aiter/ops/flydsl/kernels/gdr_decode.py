@@ -34,6 +34,9 @@ def create_vk_gdr_decode_kernel(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    q_strides: tuple,
+    k_strides: tuple,
+    v_strides: tuple,
     state_strides: tuple,
     a_strides: tuple,
     b_strides: tuple,
@@ -104,7 +107,8 @@ def create_vk_gdr_decode_kernel(
         b: fx.Tensor,
         dt_bias: fx.Tensor,
         A_log: fx.Tensor,
-        indices: fx.Tensor,
+        read_indices: fx.Tensor,
+        write_indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
@@ -140,17 +144,28 @@ def create_vk_gdr_decode_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
-        indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
-        pool_idx = fx.Int32(indices_tensor[b_i])
+        read_indices_tensor = GTensor(read_indices, dtype=T.i32, shape=(-1,))
+        write_indices_tensor = GTensor(write_indices, dtype=T.i32, shape=(-1,))
+        read_pool_idx = fx.Int32(read_indices_tensor[b_i])
+        write_pool_idx = fx.Int32(write_indices_tensor[b_i])
 
         q_tensor = GTensor(
-            query, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            query,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
+            stride=q_strides,
         )
         k_tensor = GTensor(
-            key, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            key,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
+            stride=k_strides,
         )
         v_tensor = GTensor(
-            value, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+            value,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_v_heads, head_v_dim),
+            stride=v_strides,
         )
         if const_expr(PER_CHANNEL):
             a_tensor = GTensor(
@@ -184,12 +199,21 @@ def create_vk_gdr_decode_kernel(
         out_tensor = GTensor(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
         )
-        state_tensor = GTensor(
+        read_state_tensor = GTensor(
             state,
             dtype=state_dtype_,
             shape=(num_v_heads, head_v_dim, head_k_dim),
             stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Int64(pool_idx)
+            static_bytes_offset_i64=fx.Int64(read_pool_idx)
+            * fx.Int64(state_strides[0])
+            * get_dtype_bytes(state_dtype),
+        )
+        write_state_tensor = GTensor(
+            state,
+            dtype=state_dtype_,
+            shape=(num_v_heads, head_v_dim, head_k_dim),
+            stride=(state_strides[1], state_strides[2], state_strides[3]),
+            static_bytes_offset_i64=fx.Int64(write_pool_idx)
             * fx.Int64(state_strides[0])
             * get_dtype_bytes(state_dtype),
         )
@@ -238,8 +262,10 @@ def create_vk_gdr_decode_kernel(
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_tensor.vec_load(
-                        (hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = (
+                        read_state_tensor.vec_load(
+                            (hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                        )
                     )
                     if const_expr("f32" in state_dtype):
                         pass
@@ -445,11 +471,11 @@ def create_vk_gdr_decode_kernel(
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                     else:
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
-                    state_tensor.vec_store(
+                    write_state_tensor.vec_store(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
 
-        if pool_idx >= 0:
+        if (read_pool_idx >= 0) & (write_pool_idx >= 0):
             _do_decode()
 
     @flyc.jit
@@ -461,7 +487,8 @@ def create_vk_gdr_decode_kernel(
         b: fx.Tensor,
         dt_bias: fx.Tensor,
         A_log: fx.Tensor,
-        indices: fx.Tensor,
+        read_indices: fx.Tensor,
+        write_indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
@@ -477,7 +504,8 @@ def create_vk_gdr_decode_kernel(
             b,
             dt_bias,
             A_log,
-            indices,
+            read_indices,
+            write_indices,
             state,
             out,
             batch_size,
