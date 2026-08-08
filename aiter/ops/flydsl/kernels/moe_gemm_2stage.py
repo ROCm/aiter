@@ -88,6 +88,19 @@ def _if_else(if_op):
                 scf.YieldOp([])
 
 
+def _stage1_activation_module_tag(
+    act: str, situ_beta: float, situ_linear_beta: float
+) -> str:
+    """Return a filesystem-safe cache-key suffix for stage1 activation code."""
+    if act == "silu":
+        return "_silu"
+
+    def float_tag(value: float) -> str:
+        return float(value).hex().replace("-", "m").replace("+", "p").replace(".", "d")
+
+    return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -106,6 +119,9 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
+    act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -141,6 +157,13 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16_or_bf16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+    if act not in ("silu", "situv2"):
+        raise ValueError(f"act must be 'silu' or 'situv2', got {act!r}")
+    if act == "situv2":
+        if situ_beta <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+        if situ_linear_beta <= 0.0:
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
@@ -187,6 +210,10 @@ def compile_moe_gemm1(
     # Split-K validation
     _is_splitk = k_batch > 1
     if _is_splitk:
+        if act != "silu":
+            raise NotImplementedError(
+                "split-K stage1 activation supports only 'silu', got " f"{act!r}"
+            )
         _k_per_batch = model_dim // k_batch
         assert (
             model_dim % k_batch == 0
@@ -303,11 +330,12 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    (
+    _act_tag = _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}{_split_k_tag}"
-        f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"{_gs_tag}{scale_tag}{_split_k_tag}{_act_tag}"
+        f"_abi4"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -335,7 +363,7 @@ def compile_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm1(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
@@ -386,19 +414,32 @@ def compile_moe_gemm1(
                     addr_i64, num_records_bytes=num_records_bytes
                 )
 
-            def silu(x):
+            def sigmoid(x):
                 # device fast path:
                 #   emu = exp(-x)  ~= exp2(log2e * (-x))  -> v_exp_f32
-                #   sig = rcp(1 + emu)                   -> v_rcp_f32
-                #   y = x * sig
+                #   sig = rcp(1 + emu)                   -> v_rcp_f32.
                 #
                 # Using llvm.amdgcn intrinsics prevents lowering to the div_scale/div_fixup
                 # sequences that introduce extra compares/cndmasks.
                 t = x * (-1.4426950408889634)  # -log2(e)
                 emu = rocdl.exp2(T.f32, t)
                 den = 1.0 + emu
-                sig = rocdl.rcp(T.f32, den)
-                return x * sig
+                return rocdl.rcp(T.f32, den)
+
+            def silu(x):
+                return x * sigmoid(x)
+
+            def situv2(gate, up):
+                gate_tanh = 2.0 * sigmoid(2.0 * (gate / situ_beta)) - 1.0
+                up_tanh = 2.0 * sigmoid(2.0 * (up / situ_linear_beta)) - 1.0
+                situ_gate = situ_beta * gate_tanh * sigmoid(gate)
+                situ_up = situ_linear_beta * up_tanh
+                return situ_gate * situ_up
+
+            def apply_activation(gate, up):
+                if const_expr(act == "silu"):
+                    return silu(gate) * up
+                return situv2(gate, up)
 
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
@@ -1801,7 +1842,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = apply_activation(vg, vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16, y)
@@ -1936,7 +1977,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = apply_activation(vg, vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)
