@@ -595,12 +595,12 @@ def _yarn_find_correction_range(
 
 
 def _yarn_linear_ramp_mask(
-    low: float, high: float, dim: int, dtype: torch.dtype
+    low: float, high: float, dim: int, dtype: torch.dtype, device=None
 ) -> torch.Tensor:
     if low == high:
         high += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
+    linear_func = (torch.arange(dim, dtype=dtype, device=device) - low) / (high - low)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -660,7 +660,13 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=dtypes.fp32)
+            - _yarn_linear_ramp_mask(
+                low,
+                high,
+                self.rotary_dim // 2,
+                dtype=dtypes.fp32,
+                device=pos_freqs.device,
+            )
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
@@ -876,7 +882,13 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=dtypes.fp32)
+            - _yarn_linear_ramp_mask(
+                low,
+                high,
+                self.rotary_dim // 2,
+                dtype=dtypes.fp32,
+                device=pos_freqs.device,
+            )
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
