@@ -23,6 +23,7 @@ from .tensor_shim import (
 def create_vk_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
+    dt_bias_dtype: str,
     state_dtype: str,
     seq_length: int,
     num_k_heads: int,
@@ -36,12 +37,20 @@ def create_vk_gdr_decode_kernel(
     a_strides: tuple,
     b_strides: tuple,
     use_qk_l2norm: bool,
+    gate_mode: str = "gdr",
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    g_min: float = -5.0,
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
 ):
+    # "gdr": per-head decay, -exp(A_log) * softplus(a + dt_bias).
+    # "kda": per-channel decay, g_min * sigmoid(exp(A_log) * (a + dt_bias)).
+    # Separate binaries, so "gdr" stays bit-identical to pre-847.
+    assert gate_mode in ("gdr", "kda"), gate_mode
+    PER_CHANNEL = gate_mode == "kda"
+
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
 
@@ -82,6 +91,8 @@ def create_vk_gdr_decode_kernel(
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
     KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
+    if gate_mode != "gdr":
+        KERNEL_NAME += f"_{gate_mode}"
 
     @flyc.kernel
     def gdr_decode_kernel(
@@ -105,6 +116,7 @@ def create_vk_gdr_decode_kernel(
         dtype_ = get_dtype_in_kernel(dtype)
         fx_dtype_ = fx.BFloat16 if dtype == "bf16" else fx.Float16
         A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
+        dt_bias_dtype_ = get_dtype_in_kernel(dt_bias_dtype)
         state_dtype_ = get_dtype_in_kernel(state_dtype)
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
@@ -150,19 +162,34 @@ def create_vk_gdr_decode_kernel(
             shape=(-1, seq_length, num_v_heads, head_v_dim),
             stride=v_strides,
         )
-        a_tensor = GTensor(
-            a,
-            dtype=dtype_,
-            stride=(a_strides[0], a_strides[1], a_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
-        )
+        if const_expr(PER_CHANNEL):
+            a_tensor = GTensor(
+                a,
+                dtype=dtype_,
+                stride=(a_strides[0], a_strides[1], a_strides[2], a_strides[3]),
+                shape=(-1, seq_length, num_v_heads, head_k_dim),
+            )
+        else:
+            a_tensor = GTensor(
+                a,
+                dtype=dtype_,
+                stride=(a_strides[0], a_strides[1], a_strides[2]),
+                shape=(-1, seq_length, num_v_heads),
+            )
         b_tensor = GTensor(
             b,
             dtype=dtype_,
             stride=(b_strides[0], b_strides[1], b_strides[2]),
             shape=(-1, seq_length, num_v_heads),
         )
-        dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
+        if const_expr(PER_CHANNEL):
+            dt_bias_tensor = GTensor(
+                dt_bias, dtype=dt_bias_dtype_, shape=(num_v_heads, head_k_dim)
+            )
+        else:
+            dt_bias_tensor = GTensor(
+                dt_bias, dtype=dt_bias_dtype_, shape=(num_v_heads,)
+            )
         A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
         out_tensor = GTensor(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
@@ -195,6 +222,22 @@ def create_vk_gdr_decode_kernel(
         def fast_log1p(x):
             return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
 
+        def fast_exp_vec(x_vec, mult=1.0):
+            """exp(x * mult) per lane, mult folded into the log2(e) factor.
+
+            rocdl.exp2 is scalar-only; the per-lane map still emits v_exp_f32.
+            """
+            scaled = x_vec * fx.Vector.filled(
+                VALUES_PER_THREAD_K, mult * 1.4426950408889634, fx.Float32
+            )
+            return fx.Vector.from_elements(
+                [
+                    fx.Float32(rocdl.exp2(T.f32, _to_raw(scaled[i])))
+                    for i in range_constexpr(VALUES_PER_THREAD_K)
+                ],
+                fx.Float32,
+            )
+
         # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
         # closure so the runtime `if` sees an opaque call (no GTensor "state"
         # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
@@ -203,7 +246,11 @@ def create_vk_gdr_decode_kernel(
                 r_A_log = A_log_tensor[hv_i]
             else:
                 r_A_log = A_log_tensor[hv_i].extf(T.f32)
-            r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+            if const_expr(not PER_CHANNEL):
+                if const_expr("f32" in dt_bias_dtype):
+                    r_dt_bias = dt_bias_tensor[hv_i]
+                else:
+                    r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
@@ -223,26 +270,58 @@ def create_vk_gdr_decode_kernel(
                         ].extf(acc_vec_t)
 
             for sq_i in range_constexpr(seq_length):
-                r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
-                r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta_ * x
+                if const_expr(PER_CHANNEL):
+                    r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                    r_A_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K,
+                        fx.Float32(fast_exp(r_A_log)),
+                        fx.Float32,
+                    )
+                    g_min_vec = fx.Vector.filled(VALUES_PER_THREAD_K, g_min, fx.Float32)
+                    one_vec = fx.Vector.filled(VALUES_PER_THREAD_K, f32_1, fx.Float32)
 
-                # softplus with the large-x identity: for beta_x > threshold,
-                # softplus(x) == x. select computes both arms (the overflow arm
-                # is discarded) -> bit-identical to the old branch.
-                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
-                softplus_x = (
-                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
-                ).select(softplus_big, x)
+                    # Decay varies along K, not V, so hoist it above the v loop:
+                    # one vector per ki, reused for every vi.
+                    r_g_vecs = [0] * WARP_TILE_K_ITERS
+                    for ki in range_constexpr(WARP_TILE_K_ITERS):
+                        warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                        a_vec = a_tensor.vec_load(
+                            (b_i, sq_i, hv_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                        ).extf(acc_vec_t)
+                        dt_bias_vec = dt_bias_tensor.vec_load(
+                            (hv_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                        )
+                        if const_expr("f32" not in dt_bias_dtype):
+                            dt_bias_vec = dt_bias_vec.extf(acc_vec_t)
+                        # g = g_min * sigmoid(exp(A_log) * (a + dt_bias)), stored
+                        # as exp(g) -- the decay factor, like r_g on the scalar path.
+                        y_vec = r_A_vec * (a_vec + dt_bias_vec)
+                        sigmoid_vec = one_vec / (one_vec + fast_exp_vec(y_vec, -1.0))
+                        r_g_vecs[ki] = fast_exp_vec(g_min_vec * sigmoid_vec)
 
-                r_g_value = -fast_exp(r_A_log) * softplus_x
-                r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
-                r_g = fast_exp(r_g_value)
+                    r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
+                else:
+                    r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                    r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                    x = r_a + r_dt_bias
+                    beta_x = softplus_beta_ * x
 
-                r_g_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
-                )
+                    # softplus with the large-x identity: for beta_x > threshold,
+                    # softplus(x) == x. select computes both arms (the overflow arm
+                    # is discarded) -> bit-identical to the old branch.
+                    softplus_big = (f32_1 / softplus_beta_) * fast_log1p(
+                        fast_exp(beta_x)
+                    )
+                    softplus_x = (
+                        fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                    ).select(softplus_big, x)
+
+                    r_g_value = -fast_exp(r_A_log) * softplus_x
+                    r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
+                    r_g = fast_exp(r_g_value)
+                    r_g_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
+                    )
 
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
@@ -341,7 +420,10 @@ def create_vk_gdr_decode_kernel(
                     )
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
+                        if const_expr(PER_CHANNEL):
+                            state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vecs[ki]
+                        else:
+                            state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
                         h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                         sum_hk = fx.math.fma(h_cur, sk_vecs[ki], sum_hk)
                         sum_hq_old = fx.math.fma(h_cur, sq_vecs[ki], sum_hq_old)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -99,10 +100,16 @@ def flydsl_gdr_decode(
     read_indices: torch.Tensor | None = None,
     write_indices: torch.Tensor | None = None,
 ):
-    if stream is None:
-        stream = torch.cuda.current_stream()
     device = query.device
     dtype = query.dtype
+    # Set only for a foreign launch stream, the one case needing reordering.
+    producer_stream = None
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+    else:
+        current_stream = torch.cuda.current_stream(device)
+        if stream != current_stream:
+            producer_stream = current_stream
     read_indices = indices if read_indices is None else read_indices
     write_indices = indices if write_indices is None else write_indices
     for input in [
@@ -119,10 +126,12 @@ def flydsl_gdr_decode(
     ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
-    for input in [key, value, a, b, dt_bias, out]:
+    for input in [key, value, a, b, out]:
         assert input.dtype == dtype
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert dt_bias.dtype in [torch.float, torch.bfloat16, torch.half]
+    assert indices.dtype == torch.int32
     assert read_indices.dtype == torch.int32
     assert write_indices.dtype == torch.int32
     if query.stride(-1) != 1:
@@ -136,42 +145,101 @@ def flydsl_gdr_decode(
             f"got stride {key.stride()}."
         )
 
-    if need_shuffle_state:
-        state_ = state.permute(0, 1, 3, 2).contiguous()
-    else:
-        state_ = state
+    # `a`'s rank selects the gate; the shapes below follow from it.
+    gate_mode = "kda" if a.dim() == 4 else "gdr"
+
+    for name, tensor in (("query", query), ("value", value), ("state", state)):
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"`{name}` must be 4D, got {tensor.dim()}D {tuple(tensor.shape)}."
+            )
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
-    num_v_heads = value.shape[-2]
-    head_v_dim = value.shape[-1]
-    kwargs_ = get_default_kwargs(
-        str(dtype),
-        str(state_.dtype),
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
+    num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
+
+    # Offsets come from `query`'s (B, Sq, H, D), so a tensor matching only the
+    # last dim is read row-shifted, not rejected. Shape only: views are valid.
+    qk = (batch_size, seq_length, num_k_heads, head_k_dim)
+    v = (batch_size, seq_length, num_v_heads, head_v_dim)
+    per_head = (batch_size, seq_length, num_v_heads)
+    slot = (
+        (num_v_heads, head_k_dim, head_v_dim)
+        if need_shuffle_state
+        else (num_v_heads, head_v_dim, head_k_dim)
     )
-    exe = create_vk_gdr_decode_kernel(
-        get_dtype_str(query.dtype),
-        get_dtype_str(A_log.dtype),
-        get_dtype_str(state_.dtype),
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        query.stride(),
-        key.stride(),
-        value.stride(),
-        state_.stride(),
-        a.stride(),
-        b.stride(),
-        use_qk_l2norm,
-        **kwargs_,
-    )
-    with torch.cuda.device(query.device.index):
+    expected = [
+        ("key", key, qk),
+        ("value", value, v),
+        ("out", out, v),
+        ("b", b, per_head),
+        ("A_log", A_log, (num_v_heads,)),
+        ("read_indices", read_indices, (batch_size,)),
+        ("write_indices", write_indices, (batch_size,)),
+        ("state", state, (state.shape[0], *slot)),
+        ("a", a, (*per_head, head_k_dim) if gate_mode == "kda" else per_head),
+        (
+            "dt_bias",
+            dt_bias,
+            (num_v_heads, head_k_dim) if gate_mode == "kda" else (num_v_heads,),
+        ),
+    ]
+    for name, tensor, shape in expected:
+        if tensor.shape != shape:
+            raise ValueError(
+                f"`{name}` must have shape {shape} for a {gate_mode} decode with "
+                f"query {qk} and value {v}; got {tuple(tensor.shape)}."
+            )
+
+    if gate_mode == "kda":
+        # `a` keeps its strides and is vector-loaded along D_k, so that axis
+        # must be dense. dt_bias is copied contiguous below, so it is free.
+        assert (
+            a.stride(-1) == 1
+        ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
+    # The transpose, `.contiguous()` staging and write-back are GPU copies that
+    # would race a launch on a foreign `stream`; run them there, after one wait.
+    # The caller orders the results. Entering the context costs ~5us against a
+    # ~7us kernel, so it is skipped when the stream is already the caller's.
+    with torch.cuda.device(device.index), (
+        nullcontext() if producer_stream is None else torch.cuda.stream(stream)
+    ):
+        if producer_stream is not None:
+            stream.wait_stream(producer_stream)
+
+        if need_shuffle_state:
+            state_ = state.permute(0, 1, 3, 2).contiguous()
+        else:
+            state_ = state
+
+        kwargs_ = get_default_kwargs(
+            str(dtype),
+            str(state_.dtype),
+            batch_size,
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        exe = create_vk_gdr_decode_kernel(
+            get_dtype_str(query.dtype),
+            get_dtype_str(A_log.dtype),
+            get_dtype_str(dt_bias.dtype),
+            get_dtype_str(state_.dtype),
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            query.stride(),
+            key.stride(),
+            value.stride(),
+            state_.stride(),
+            a.stride(),
+            b.stride(),
+            use_qk_l2norm,
+            gate_mode,
+            **kwargs_,
+        )
         _run_compiled(
             exe,
             query,
@@ -188,6 +256,6 @@ def flydsl_gdr_decode(
             batch_size,
             stream,
         )
-    if need_shuffle_state:
-        state_ = state_.permute(0, 1, 3, 2).contiguous()
-        state.copy_(state_)
+        if need_shuffle_state:
+            state_ = state_.permute(0, 1, 3, 2).contiguous()
+            state.copy_(state_)
