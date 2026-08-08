@@ -882,9 +882,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Sink backward tests (mha_bwd with sink / d_sink)
 #
-# Reference formula (derived from kernel block_fmha_bwd_dot_do_o.hpp):
+# `sink` is a learnable per-head softmax offset: a virtual extra logit column
+# that enters the softmax denominator but contributes nothing to the output
+# (its V row is zero).  It therefore has shape [H] -- one scalar per Q head,
+# shared by every batch entry -- and its gradient d_sink has the same shape.
+#
+# Reference formula:
 #   D[b, h, q]      = sum_j(dout[b, q, h, j] * out[b, q, h, j]) * p_undrop
-#   P_sink[b, h, q] = exp(sink[b, h] - lse_fwd[b, h, q])
+#   P_sink[b, h, q] = exp(sink[h] - lse[b, h, q])
 #   d_sink[h]       = sum_{b, q} (-P_sink[b, h, q] * D[b, h, q])
 # ---------------------------------------------------------------------------
 
@@ -906,8 +911,15 @@ def _sink_make_qkvo(
     return q, k, v, dout
 
 
-def _sink_run_fwd(q, k, v, softmax_scale, causal):
-    """Run mha_fwd and return (out, lse)."""
+def _sink_run_fwd(q, k, v, softmax_scale, causal, sink=None):
+    """
+    Run mha_fwd and return (out, lse).
+    When `sink` is given it is forwarded as `sink_ptr`, so the returned LSE is
+    log(exp(lse_without_sink) + exp(sink)) and `out` is normalised by that same
+    denominator.  Feeding a sink-free LSE to the backward instead would make
+    P_sink = exp(sink - lse) unbounded, i.e. a softmax state no forward pass can
+    produce; the pair (out, lse) produced here is the physically reachable one.
+    """
     out, lse, _, _ = aiter.mha_fwd(
         q,
         k,
@@ -920,6 +932,7 @@ def _sink_run_fwd(q, k, v, softmax_scale, causal):
         sink_size=0,
         return_softmax_lse=True,
         return_dropout_randval=False,
+        sink_ptr=sink,
     )
     return out, lse
 
@@ -930,13 +943,13 @@ def _sink_reference_d_sink(dout, out, lse, sink, p_undrop=1.0):
 
     dout : [B, Sq, H, Dv]
     out  : [B, Sq, H, Dv]
-    lse  : [B, H, Sq]       (forward LSE without sink)
-    sink : [B, H]
+    lse  : [B, H, Sq]       (forward LSE, sink included in the denominator)
+    sink : [H]
     returns d_sink : [H]
     """
     D_bsh = (dout.float() * out.float()).sum(dim=-1) * p_undrop  # [B, Sq, H]
     D_bhs = D_bsh.permute(0, 2, 1)  # [B, H, Sq]
-    sink_bhs = sink.unsqueeze(-1)  # [B, H, 1]
+    sink_bhs = sink.view(1, -1, 1)  # [1, H, 1], shared across the batch
     p_sink = torch.exp(sink_bhs.float() - lse.float())  # [B, H, Sq]
     d_sink = (-p_sink * D_bhs).sum(dim=(0, 2))  # [H]
     return d_sink.float()
@@ -948,6 +961,7 @@ _SINK_CONFIGS = [
     # (batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim)
     (2, 128, 128, 4, 4, 64),
     (1, 64, 64, 6, 2, 128),
+    (5, 512, 512, 8, 8, 64),
 ]
 
 
@@ -965,11 +979,12 @@ def test_mha_bwd_sink_dsink(
     q, k, v, dout = _sink_make_qkvo(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
     )
-    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
-
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
-        30.0, 60.0
-    )
+    sink = torch.empty(nhead, device=device, dtype=torch.float32).uniform_(
+            -1.0, 1.0
+            #3.0, 6.0
+            #30.0,60.0
+        )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink)
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     _dq, _dk, _dv, _softmax_d = aiter.mha_bwd(
@@ -990,13 +1005,14 @@ def test_mha_bwd_sink_dsink(
     )
 
     assert d_sink.abs().max() > 0, "d_sink was not updated by mha_bwd"
-
+    #print(f"sink: {sink}")
+    #print(f"d_sink: {d_sink}")
     d_sink_ref = _sink_reference_d_sink(dout, out, lse, sink)
     torch.testing.assert_close(
         d_sink,
         d_sink_ref,
-        rtol=0.02,
-        atol=0.5,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"d_sink mismatch for dtype={dtype}, causal={causal}, B={batch}, Sq={seqlen_q}, H={nhead}",
     )
 
@@ -1015,7 +1031,9 @@ def test_mha_bwd_with_sink_dq_dk_dv(
     q, k, v, dout = _sink_make_qkvo(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
     )
-    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
+    sink_small = torch.full((nhead,), -1000.0, device=device, dtype=torch.float32)
+    
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink_small)
 
     common_bwd_args = {
         "dropout_p": 0.0,
@@ -1030,7 +1048,6 @@ def test_mha_bwd_with_sink_dq_dk_dv(
         dout, q.detach(), k.detach(), v.detach(), out, lse, **common_bwd_args
     )
 
-    sink_small = torch.full((batch, nhead), -1000.0, device=device, dtype=torch.float32)
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq_sink, dk_sink, dv_sink, _ = aiter.mha_bwd(
