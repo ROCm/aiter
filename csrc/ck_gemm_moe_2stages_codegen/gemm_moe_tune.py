@@ -3648,7 +3648,11 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                ("a2_a16w_sorted" if a_dtype_str == "bf16" else "a2_qt"),
+                                (
+                                    "a2_a16w_sorted"
+                                    if a_dtype_str == "bf16"
+                                    else "a2_qt"
+                                ),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -4280,7 +4284,11 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                ("a2_a16w_sorted" if a_dtype_str == "bf16" else "a2_qt"),
+                                (
+                                    "a2_a16w_sorted"
+                                    if a_dtype_str == "bf16"
+                                    else "a2_qt"
+                                ),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
