@@ -9,6 +9,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     _quantize_mxfp4,
+    _quantize_v_mxfp4_raw,
     mha_v4,
     mha_v4_packed,
     mxfp4_k_view,
@@ -18,6 +19,7 @@ from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
+    sage_quant_v_f4f4,
 )
 
 
@@ -51,6 +53,45 @@ def test_mha_v4_raw_buffer_sizes_are_stable():
     assert fp4_v_padded_sequence(128) == 128
     assert fp4_v_padded_sequence(129) == 256
     assert fp4_v_raw_buffer_size(2, 129, 3) == 2 * 256 * 3 * 64 + 64
+
+
+@pytest.mark.parametrize(
+    "batch,sequence,heads", [(1, 128, 5), (1, 129, 2), (2, 257, 3)]
+)
+def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, heads):
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    payload_size = batch * heads * padded_sequence * 64
+    raw_size = fp4_v_raw_buffer_size(batch, sequence, heads)
+    max_logical_offset = (
+        (batch - 1) * heads * padded_sequence * 64
+        + (sequence - 1) * 64
+        + (heads - 1) * padded_sequence * 64
+        + 127
+    )
+
+    assert raw_size == payload_size + 64
+    assert max_logical_offset < raw_size
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@pytest.mark.parametrize("sequence", [1, 127, 129, 257])
+def test_mha_v4_mxfp4_v_ragged_pack_matches_explicit_padding(sequence):
+    torch.manual_seed(sequence)
+    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
+    raw, scale = _quantize_v_mxfp4_raw(value)
+
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    padded = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, padded_sequence - sequence))
+    padded_view, padded_scale = sage_quant_v_f4f4(padded, layout="bshd")
+    padded_raw = torch.as_strided(
+        padded_view,
+        (fp4_v_raw_buffer_size(2, sequence, 3),),
+        (1,),
+    )
+
+    assert torch.equal(raw, padded_raw)
+    assert torch.equal(scale, padded_scale)
+    assert torch.count_nonzero(raw[-64:]) == 0
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")

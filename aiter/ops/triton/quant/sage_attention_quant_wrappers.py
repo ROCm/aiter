@@ -346,7 +346,7 @@ def fp4_v_raw_buffer_size(batch, sequence, heads):
 
 
 def sage_quant_v_f4f4(v, layout="bshd"):
-    """Pack per-channel FP4 V into the F4F4 kernel's col-major LDS layout."""
+    """Pack per-channel FP4 V into a padded, slack-backed col-major LDS layout."""
     if layout == "bshd":
         b, kv_len, h_kv, head_dim = v.shape
         v_tok = v.permute(0, 2, 1, 3)
@@ -358,17 +358,18 @@ def sage_quant_v_f4f4(v, layout="bshd"):
 
     tile = FP4_V_TILE_TOKENS
     assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
-    assert kv_len % tile == 0, (
-        f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
-    )
-    nT = kv_len // tile
+    padded_kv_len = fp4_v_padded_sequence(kv_len)
+    nT = padded_kv_len // tile
     amax = v_tok.abs().amax(dim=-2).to(torch.float32)
     v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
     kperm = _f4f4_v_kperm(v.device)
-    packed = torch.empty(
-        (b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN),
+    buf = torch.empty(
+        fp4_v_raw_buffer_size(b, kv_len, h_kv),
         dtype=torch.uint8,
         device=v.device,
+    )
+    packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
+        b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
     )
     sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
         v_tok,
@@ -387,16 +388,13 @@ def sage_quant_v_f4f4(v, layout="bshd"):
         nT,
         kv_len,
     )
-    buf = torch.cat(
-        [packed.reshape(-1), packed.new_zeros(FP4_V_BUFFER_SLACK_BYTES)]
-    )
     v_fp4_view = torch.as_strided(
         buf,
         (b, kv_len, h_kv, 128),
         (
-            h_kv * kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
             FP4_V_PACKED_BYTES_PER_TOKEN,
-            kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
             1,
         ),
     )

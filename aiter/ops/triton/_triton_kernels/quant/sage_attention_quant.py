@@ -291,8 +291,17 @@ def sage_quant_v_fp4_colmajor_kernel(
     dbase = desc_ptr + bb * stride_db + hh * stride_dh
     row = token[:, None] * stride_vs  # [64,1]
 
-    v_lo = tl.load(vbase + row + chan_lo[None, :] * stride_vd).to(tl.float32)
-    v_hi = tl.load(vbase + row + chan_hi[None, :] * stride_vd).to(tl.float32)
+    token_mask = token[:, None] < S
+    v_lo = tl.load(
+        vbase + row + chan_lo[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    v_hi = tl.load(
+        vbase + row + chan_hi[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
     d_lo = tl.load(dbase + chan_lo)  # [16]
     d_hi = tl.load(dbase + chan_hi)
 
@@ -303,9 +312,17 @@ def sage_quant_v_fp4_colmajor_kernel(
     code_hi = _e2m1_code(y_hi)
     byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
 
-    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * 1024
+    block_bytes: tl.constexpr = 1024
+    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * block_bytes
     ooff = kk[:, None] * 16 + jj[None, :]
     tl.store(obase + ooff, byte)
+
+    slack = tl.arange(0, 64)
+    tl.store(
+        out_ptr + tl.num_programs(0) * block_bytes + slack,
+        0,
+        mask=(pid == 0) & (slack < 64),
+    )
 
 
 @triton.jit

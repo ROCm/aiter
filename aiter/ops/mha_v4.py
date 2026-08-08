@@ -590,11 +590,6 @@ def _quantize_v_mxfp4_raw(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("MXFP4 V quantization requires contiguous hd128 BSHD input")
-    padded_sequence = fp4_v_padded_sequence(sequence)
-    if padded_sequence != sequence:
-        input = torch.nn.functional.pad(
-            input, (0, 0, 0, 0, 0, padded_sequence - sequence)
-        )
     quantized, scale = sage_quant_v_f4f4(input, layout="bshd")
     raw = torch.as_strided(
         quantized, (fp4_v_raw_buffer_size(batch, sequence, heads),), (1,)
