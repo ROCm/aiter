@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Compare Mori EP and MegaMoEV2 with the same v4_pro A8W4 CUDA Graph workload."""
@@ -24,7 +23,6 @@ from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-
 
 MODEL_DIM = 7168
 INTER_DIM = 3072

@@ -4,7 +4,7 @@
 
 from bisect import bisect_left
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 TOKEN_BUCKETS = (
     1,
@@ -323,7 +323,7 @@ def _select_large_stage2(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _select_bucket_config(
     bucket: int, mtpr_class: int, experts_per_rank: int, model_dim: int, inter_dim: int
 ) -> MegaMoEConfig:
