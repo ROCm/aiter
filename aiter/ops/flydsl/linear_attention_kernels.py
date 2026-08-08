@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -99,10 +100,16 @@ def flydsl_gdr_decode(
     read_indices: torch.Tensor | None = None,
     write_indices: torch.Tensor | None = None,
 ):
-    if stream is None:
-        stream = torch.cuda.current_stream()
     device = query.device
     dtype = query.dtype
+    # Set only for a foreign launch stream, the one case needing reordering.
+    producer_stream = None
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+    else:
+        current_stream = torch.cuda.current_stream(device)
+        if stream != current_stream:
+            producer_stream = current_stream
     read_indices = indices if read_indices is None else read_indices
     write_indices = indices if write_indices is None else write_indices
     for input in [
@@ -138,70 +145,101 @@ def flydsl_gdr_decode(
             f"got stride {key.stride()}."
         )
 
-    # `a`'s rank selects the gate; dt_bias must match it, or the kernel would
-    # index a layout the caller did not pass.
+    # `a`'s rank selects the gate; the shapes below follow from it.
     gate_mode = "kda" if a.dim() == 4 else "gdr"
+
+    for name, tensor in (("query", query), ("value", value), ("state", state)):
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"`{name}` must be 4D, got {tensor.dim()}D {tuple(tensor.shape)}."
+            )
+    batch_size, seq_length, num_k_heads, head_k_dim = query.shape
+    num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
+
+    # Offsets come from `query`'s (B, Sq, H, D), so a tensor matching only the
+    # last dim is read row-shifted, not rejected. Shape only: views are valid.
+    qk = (batch_size, seq_length, num_k_heads, head_k_dim)
+    v = (batch_size, seq_length, num_v_heads, head_v_dim)
+    per_head = (batch_size, seq_length, num_v_heads)
+    slot = (
+        (num_v_heads, head_k_dim, head_v_dim)
+        if need_shuffle_state
+        else (num_v_heads, head_v_dim, head_k_dim)
+    )
+    expected = [
+        ("key", key, qk),
+        ("value", value, v),
+        ("out", out, v),
+        ("b", b, per_head),
+        ("A_log", A_log, (num_v_heads,)),
+        ("read_indices", read_indices, (batch_size,)),
+        ("write_indices", write_indices, (batch_size,)),
+        ("state", state, (state.shape[0], *slot)),
+        ("a", a, (*per_head, head_k_dim) if gate_mode == "kda" else per_head),
+        (
+            "dt_bias",
+            dt_bias,
+            (num_v_heads, head_k_dim) if gate_mode == "kda" else (num_v_heads,),
+        ),
+    ]
+    for name, tensor, shape in expected:
+        if tensor.shape != shape:
+            raise ValueError(
+                f"`{name}` must have shape {shape} for a {gate_mode} decode with "
+                f"query {qk} and value {v}; got {tuple(tensor.shape)}."
+            )
+
     if gate_mode == "kda":
-        assert (
-            dt_bias.dim() == 2
-        ), f"per-channel `a` needs a 2D (H_v, D_k) dt_bias, got {tuple(dt_bias.shape)}"
-        assert (
-            a.shape[-1] == query.shape[-1]
-        ), f"`a` last dim must be D_k={query.shape[-1]}, got {a.shape[-1]}"
-        assert dt_bias.shape == (a.shape[2], a.shape[3]), (
-            f"dt_bias {tuple(dt_bias.shape)} does not match `a` heads/channels "
-            f"{(a.shape[2], a.shape[3])}"
-        )
-        # `a` reaches the kernel with its own strides and is read as vectors
-        # along D_k, so that axis has to be dense -- a strided one would be
-        # misread, not rejected. dt_bias needs no such check: it is copied
-        # contiguous below.
+        # `a` keeps its strides and is vector-loaded along D_k, so that axis
+        # must be dense. dt_bias is copied contiguous below, so it is free.
         assert (
             a.stride(-1) == 1
         ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
-    else:
-        assert (
-            dt_bias.dim() == 1
-        ), f"per-head `a` needs a 1D (H_v,) dt_bias, got {tuple(dt_bias.shape)}"
+    # The transpose, `.contiguous()` staging and write-back are GPU copies that
+    # would race a launch on a foreign `stream`; run them there, after one wait.
+    # The caller orders the results. Entering the context costs ~5us against a
+    # ~7us kernel, so it is skipped when the stream is already the caller's.
+    with torch.cuda.device(device.index), (
+        nullcontext() if producer_stream is None else torch.cuda.stream(stream)
+    ):
+        if producer_stream is not None:
+            stream.wait_stream(producer_stream)
 
-    if need_shuffle_state:
-        state_ = state.permute(0, 1, 3, 2).contiguous()
-    else:
-        state_ = state
-    batch_size, seq_length, num_k_heads, head_k_dim = query.shape
-    num_v_heads = value.shape[-2]
-    head_v_dim = value.shape[-1]
-    kwargs_ = get_default_kwargs(
-        str(dtype),
-        str(state_.dtype),
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-    )
-    exe = create_vk_gdr_decode_kernel(
-        get_dtype_str(query.dtype),
-        get_dtype_str(A_log.dtype),
-        get_dtype_str(dt_bias.dtype),
-        get_dtype_str(state_.dtype),
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        query.stride(),
-        key.stride(),
-        value.stride(),
-        state_.stride(),
-        a.stride(),
-        b.stride(),
-        use_qk_l2norm,
-        gate_mode,
-        **kwargs_,
-    )
-    with torch.cuda.device(query.device.index):
+        if need_shuffle_state:
+            state_ = state.permute(0, 1, 3, 2).contiguous()
+        else:
+            state_ = state
+
+        kwargs_ = get_default_kwargs(
+            str(dtype),
+            str(state_.dtype),
+            batch_size,
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        exe = create_vk_gdr_decode_kernel(
+            get_dtype_str(query.dtype),
+            get_dtype_str(A_log.dtype),
+            get_dtype_str(dt_bias.dtype),
+            get_dtype_str(state_.dtype),
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            query.stride(),
+            key.stride(),
+            value.stride(),
+            state_.stride(),
+            a.stride(),
+            b.stride(),
+            use_qk_l2norm,
+            gate_mode,
+            **kwargs_,
+        )
         _run_compiled(
             exe,
             query,
@@ -218,6 +256,6 @@ def flydsl_gdr_decode(
             batch_size,
             stream,
         )
-    if need_shuffle_state:
-        state_ = state_.permute(0, 1, 3, 2).contiguous()
-        state.copy_(state_)
+        if need_shuffle_state:
+            state_ = state_.permute(0, 1, 3, 2).contiguous()
+            state.copy_(state_)

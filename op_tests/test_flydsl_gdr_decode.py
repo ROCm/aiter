@@ -297,6 +297,83 @@ def test_channel_strided_a_is_rejected():
         )
 
 
+def test_consumer_native_a_layout_is_rejected():
+    """`a` held as (1, B, H_v, D_k) must be rejected, not read row-shifted.
+
+    Consumers hold the gate that way and are expected to pass a (B, Sq, H_v, D_k)
+    view. The un-transposed buffer clears every dtype and stride check, so
+    without a full shape check it reaches the kernel and reads the Sq axis as
+    batch: wrong for B > 1, out of bounds once B exceeds H_v.
+    """
+    B, H, dt = 2, 12, torch.bfloat16
+    args, pool, indices = _kda_inputs(
+        B, H, dt, first_index=0, padded=False, shuffle=True
+    )
+
+    consumer_native = args["a"].transpose(0, 1)
+    assert consumer_native.shape == (1, B, H, K)
+    assert consumer_native.stride(-1) == 1  # passes the D_k density check
+
+    with pytest.raises(ValueError, match=r"`a` must have shape"):
+        flydsl_ops.flydsl_gdr_decode(
+            args["q"],
+            args["k"],
+            args["v"],
+            consumer_native,
+            args["b"],
+            args["dt_bias"],
+            args["A_log"],
+            indices,
+            pool,
+            args["out"],
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+
+
+def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
+    """A staged `.contiguous()` copy must land before the kernel reads it, even
+    when the launch is on another stream.
+
+    The sleep makes the failure deterministic: it holds the current stream, so a
+    copy left there cannot finish before a launch on ``side`` would start.
+    """
+    B, H, dt = 2, 12, torch.bfloat16
+    args, pool, indices = _kda_inputs(
+        B, H, dt, first_index=0, padded=False, shuffle=True
+    )
+
+    wide_bias = torch.randn(H, 2 * K, dtype=torch.float32, device="cuda") * 0.1
+    args["dt_bias"] = wide_bias[:, ::2]
+    assert not args["dt_bias"].is_contiguous()
+
+    initial_state = pool[indices.long()].clone()
+    kernel_pool = pool.clone()
+
+    side = torch.cuda.Stream()
+    torch.cuda._sleep(100_000_000)
+    flydsl_ops.flydsl_gdr_decode(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["a"],
+        args["b"],
+        args["dt_bias"],
+        args["A_log"],
+        indices,
+        kernel_pool,
+        args["out"],
+        use_qk_l2norm=True,
+        need_shuffle_state=True,
+        stream=side,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_state = _kda_reference(args, initial_state)
+    assert_close_rmse("o", ref_out, args["out"])
+    assert_close_rmse("ht", ref_state, kernel_pool[indices.long()])
+
+
 def test_non_contiguous_dt_bias_is_copied_not_rejected():
     """The counterpart: dt_bias is copied contiguous, so its strides are free.
 
