@@ -406,7 +406,6 @@ def _fwd_kernel_stage2(
 def _get_config():
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
-        _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
         with open(fpath, "r") as file:
             config = json.load(file)
