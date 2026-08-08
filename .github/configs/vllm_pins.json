@@ -1,0 +1,4 @@
+{
+  "base_image": "vllm/vllm-openai-rocm:v0.19.1",
+  "vllm_commit": "b31621279ff71666c13393e51a7d4ac8df1a70e9"
+}
