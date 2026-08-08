@@ -106,8 +106,15 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
+    act: str = "silu",
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    act:
+      - "silu":   out = silu(gate) * up
+      - "swiglu": out = gate * sigmoid(1.702 * gate) * (clamp(up, -lim, lim) + 1)
+                  with gate clamped to [-inf, lim] and up to [-lim, lim] (lim=7.0).
+                  Same formula as mixed_moe_gemm_2stage_common.swiglu_mul_vec4.
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -131,6 +138,10 @@ def compile_moe_gemm1(
     _valid_dtypes = ("fp8", "fp16", "bf16", "int8", "int8smooth", "int4", "int4_bf16")
     if in_dtype not in _valid_dtypes:
         raise ValueError(f"in_dtype must be one of {_valid_dtypes}, got {in_dtype!r}")
+    _valid_acts = ("silu", "swiglu")
+    if act not in _valid_acts:
+        raise ValueError(f"act must be one of {_valid_acts}, got {act!r}")
+    is_swiglu = act == "swiglu"
     is_int4_bf16 = (
         in_dtype == "int4_bf16"
     )  # W4A16: bf16 activations, packed int4 weights
@@ -303,11 +314,12 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
+    _act_tag = "" if act == "silu" else f"_{act}"
     (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}{_split_k_tag}"
-        f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"{_gs_tag}{scale_tag}{_split_k_tag}{_act_tag}"
+        f"_abi3"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -387,18 +399,32 @@ def compile_moe_gemm1(
                 )
 
             def silu(x):
-                # device fast path:
-                #   emu = exp(-x)  ~= exp2(log2e * (-x))  -> v_exp_f32
-                #   sig = rcp(1 + emu)                   -> v_rcp_f32
-                #   y = x * sig
-                #
-                # Using llvm.amdgcn intrinsics prevents lowering to the div_scale/div_fixup
-                # sequences that introduce extra compares/cndmasks.
+                # exp2 + rcp avoids the div_scale/div_fixup ISA lowering
+                # that a naive exp+div would produce.
                 t = x * (-1.4426950408889634)  # -log2(e)
                 emu = rocdl.exp2(T.f32, t)
                 den = 1.0 + emu
                 sig = rocdl.rcp(T.f32, den)
                 return x * sig
+
+            def swiglu(g, u):
+                alpha = arith.constant(1.702)
+                one = arith.constant(1.0)
+                neg_log2e = arith.constant(-1.4426950408889634)
+                lim = arith.constant(7.0)
+                neg_lim = arith.constant(-7.0)
+                g = arith.minimumf(g, lim)
+                u = arith.minimumf(u, lim)
+                u = arith.maximumf(u, neg_lim)
+                t = g * alpha * neg_log2e
+                emu = rocdl.exp2(T.f32, t)
+                sig = rocdl.rcp(T.f32, one + emu)
+                return g * sig * (u + one)
+
+            def gated_act(g, u):
+                if const_expr(is_swiglu):
+                    return swiglu(g, u)
+                return silu(g) * u
 
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
@@ -1801,7 +1827,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = gated_act(vg, vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16, y)
@@ -1936,7 +1962,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = gated_act(vg, vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)
