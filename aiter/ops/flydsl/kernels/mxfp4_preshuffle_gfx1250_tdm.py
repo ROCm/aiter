@@ -19,6 +19,7 @@ from .gemm_common_gfx1250 import (
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
+    lds_addr_keepalive,
     make_lds_copy_ops,
     pipeline_fence,
     situv2_consts,
@@ -518,45 +519,57 @@ def launch_gemm_a8w4_tdm(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        def load_a(buf, wm, ksl):
-            row = wmb + wm * 16 + lane16
-            b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
+        # Each region's LDS byte offset splits into a lane-varying part, hoisted
+        # into one base register per buffer by ``bases_of``, and a compile-time
+        # part the backend folds into the ds_load immediate field. The split is
+        # what gives ``lds_addr_keepalive`` a handle to pin -- with the address
+        # formed inline there is no base value to name. Constant spans stay well
+        # inside the 16-bit ds offset (A <= 30688 B, B <= 15872 B at t256x256x256).
+        a_lane = (wmb + lane16) * A_LDS_ROW + kgrp * 16
+        b_lane = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+        sa_lane = SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + kgrp * 4
+        # col_rel = wnb + wn*16 + lane16 with wnb 32-aligned and lane16 < 16, so
+        # col_rel//32 == wnb//32 + wn//2 and col_rel%32 == (wn%2)*16 + lane16 --
+        # exactly separable into a lane part and a compile-time wn/ksl part.
+        assert warp_tile_n % 32 == 0, "load_sb split requires wnb 32-aligned"
+        sb_lane = SB_OFF + ((wnb // 32) * SC_INNER + lane16) * 4
+
+        def bases_of(buf):
+            # ``buf`` is index-typed; the lane parts are i32, so cast before the
+            # add (the copy-op path used to do this inside its own view helper).
+            return tuple(
+                buf + fx.index_cast(T.index, o)
+                for o in (a_lane, b_lane, sa_lane, sb_lane)
+            )
+
+        def load_a(base, wm, ksl):
+            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128(buf, b0)).shuffle(
-                    Vec(lds_load_b128(buf, b0 + 32)), list(range(8))
+                return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
+                    Vec(lds_load_b128(base, fx.Int32(off + 32))), list(range(8))
                 )
-            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [
+                Vec(lds_load_b128(base, fx.Int32(off + 32 * j)))
+                for j in range_constexpr(4)
+            ]
             return (
                 v[0]
                 .shuffle(v[1], list(range(8)))
                 .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
             )
 
-        def load_b(buf, wn, ksl):
-            b0 = (
-                STAGE_A
-                + (wnb // 16 + wn) * B_LDS_ROW
-                + ksl * 1024
-                + kgrp * 256
-                + lane16 * 16
-            )
-            return Vec(lds_load_b128(buf, b0)).shuffle(
-                Vec(lds_load_b128(buf, b0 + 512)), list(range(8))
+        def load_b(base, wn, ksl):
+            off = wn * B_LDS_ROW + ksl * 1024
+            return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
+                Vec(lds_load_b128(base, fx.Int32(off + 512))), list(range(8))
             )
 
-        def load_sa(buf, wm, ksl):
-            warp_lds_row = wmb // wmma_m_rep + lane16
-            byte = (
-                warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
-            )
-            return lds_load_b32(buf, SA_OFF + byte)[0]
+        def load_sa(base, wm, ksl):
+            return lds_load_b32(base, fx.Int32((ksl * wmma_m_rep + wm) * 4))[0]
 
-        def load_sb(buf, wn, ksl):
-            col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32(
-                buf,
-                SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4,
-            )[0]
+        def load_sb(base, wn, ksl):
+            off = ((wn // 2) * SC_INNER + ksl * 32 + (wn % 2) * 16) * 4
+            return lds_load_b32(base, fx.Int32(off))[0]
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMAScale(
@@ -598,15 +611,23 @@ def launch_gemm_a8w4_tdm(
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         def load_state(buf, ksl):
+            bases = bases_of(buf)
+            ba, bb, bsa, bsb = bases
             act = [
-                to_rmem(ACT_NDW, load_a(buf, wm, ksl))
+                to_rmem(ACT_NDW, load_a(ba, wm, ksl))
                 for wm in range_constexpr(wmma_m_rep)
             ]
             wt = [
-                to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)
+                to_rmem(8, load_b(bb, wn, ksl)) for wn in range_constexpr(wmma_n_rep)
             ]
-            sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
-            sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_k = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            sa_k = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            # Pin all four bases past the scale loads. Otherwise the allocator
+            # reuses a base register as a scale destination once that address is
+            # dead, while A/B loads off it are still in flight, and the backend
+            # gates the overwrite with s_wait_alu depctr_vm_vsrc. Pinning only
+            # A/B leaves the scale bases reusable and does not remove the gates.
+            lds_addr_keepalive(*bases)
             return act, wt, sb_k, sa_k
 
         # Cross-tile carry for one k128 of A/B/scales. The k-tile loop is a runtime
@@ -625,13 +646,19 @@ def launch_gemm_a8w4_tdm(
 
         def xt_store(buf):
             """Load subtile 0 of ``buf`` into the carry slots."""
-            sa_v = [load_sa(buf, wm, 0) for wm in range_constexpr(wmma_m_rep)]
-            sb_v = [load_sb(buf, wn, 0) for wn in range_constexpr(wmma_n_rep)]
+            bases = bases_of(buf)
+            ba, bb, bsa, bsb = bases
+            sa_v = [load_sa(bsa, wm, 0) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(bsb, wn, 0) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
-                xt_act[wm].store(load_a(buf, wm, 0))
+                xt_act[wm].store(load_a(ba, wm, 0))
             for wn in range_constexpr(wmma_n_rep):
-                xt_wt[wn].store(load_b(buf, wn, 0))
+                xt_wt[wn].store(load_b(bb, wn, 0))
             xt_sc.store(Vec.from_elements(sa_v + sb_v))
+            # Keep this pin even though xt_store runs once in the prologue: it
+            # shapes allocation for the whole function, and dropping it puts the
+            # loop's vm_vsrc gates back and costs ~3.5% (4107 -> 4253 us total).
+            lds_addr_keepalive(*bases)
 
         def xt_read():
             sc = xt_sc.load()
@@ -756,7 +783,17 @@ def launch_gemm_a8w4_tdm(
                 mma_total = front_mma + back_mma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = 4 if KWS > 1 else 1
+                # Every group boundary is also a point where a base/ds dependency
+                # can meet the WMMA stream, and such a fence must be va_vdst(0) --
+                # a full matrix-pipe drain -- so coarser groups cut drains too,
+                # until the ds_reads burst long enough to expose lgkmcnt again.
+                # Swept on t256x256x256 (us, --ep-mode fake --const-init 0):
+                #   group      2       4       8      16
+                #   act (g1) 2131.6  2070.4  2093.9  2153.9
+                #   no  (g2) 1446.0  1406.5  1336.2  1353.8
+                # The activation GEMM peaks at 4 and the plain one at 8, so key
+                # the choice on stage1_act rather than taking one compromise.
+                mma_group = min(4 if stage1_act else 8, mma_total) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
                 future_schedule = spread(
                     STATE_DS if has_next else 0, schedule_slots

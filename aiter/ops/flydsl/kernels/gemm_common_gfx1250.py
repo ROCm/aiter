@@ -3,6 +3,7 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
@@ -38,6 +39,36 @@ def make_lds_copy_ops(bits):
         fx.copy_atom_call(atom, rmem, _view(lds_base_idx, byte_offset))
 
     return load, store
+
+
+def lds_addr_keepalive(*bases_idx):
+    """Pin the given LDS base-address registers live to this program point.
+
+    Under max VGPR pressure the allocator reuses a ds_load's base-address
+    register as the *destination* of a later ds_load once that address is dead.
+    When earlier loads off the base are still in flight, the overwrite is a WAR
+    hazard and the backend gates it with ``s_wait_alu depctr_vm_vsrc(N)``.
+    Emitting a side-effecting no-op that reads the bases extends their live
+    ranges past those later loads, so the allocator must place the later
+    destinations in fresh registers and the WAR wait disappears. Relies on
+    there being VGPR headroom (occupancy already at the floor, no spills).
+
+    Costs zero instructions: the asm body is empty, only the "v" constraints
+    and the side-effect marker reach the allocator.
+    """
+    from flydsl.expr.arith import ArithValue as _AV
+
+    ops = [_raw(arith.index_cast(T.i32, _AV(b))) for b in bases_idx]
+    if not ops:
+        return
+    llvm_dialect.InlineAsmOp(
+        res=None,
+        operands_=ops,
+        asm_string="; lds addr keepalive",
+        constraints=",".join(["v"] * len(ops)),
+        has_side_effects=True,
+        is_align_stack=False,
+    )
 
 
 def workgroup_barrier(use_cluster=False):
