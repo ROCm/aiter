@@ -189,7 +189,9 @@ def _batched_gemm_a16wfp4_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs,
+                    mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
+                    other=0,
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
