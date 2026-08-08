@@ -588,6 +588,32 @@ def launch_gemm_a8w4_tdm(
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
         BACK = list(range(front_wm, wmma_m_rep))
+        # wmma reserved as the closing group of the k128 before the tail REUSE
+        # fence, so that fence's s_wait_dscnt(0) is not preceded directly by
+        # load_state's ds_reads. That fence waits on EVERY outstanding ds op, so
+        # one read adjacent to it costs the full LDS latency (~100 cycles) once
+        # per k-tile; the fix is to put enough wmma between the last read and the
+        # fence, which needs all three of:
+        #   1. one scheduling region per k128 (see the sched_barrier in the
+        #      compute_ktile loop) -- without it there is a single region per
+        #      tile and no hint can describe the segment abutting the fence;
+        #   2. FENCE_READ_FRONT: pack the prefetch reads into the leading slots
+        #      so the last one is early, leaving the trailing slots pure MFMA;
+        #   3. FENCE_COVER_MMA: reserve a closing MFMA group out of mma_total.
+        # Swept on t256x256x256 (us, 3-rep means where noted):
+        #   FENCE_READ_FRONT (cover=16): 0.25 -> 3964.8, 0.5 -> 3841.5, 0.75 -> 3877.0
+        #   FENCE_COVER_MMA (front=0.5): 8 -> 3892.5, 16 -> 3841.5, 24 -> 3903.6, 32 -> 3907.5
+        # At 0.5/16 the ISA shows 40 wmma between the last ds_read and the fence
+        # (was 0), 3841.5 vs 3992.2 baseline (-3.8%), and spills drop 4 -> 0.
+        FENCE_READ_FRONT = 0.5
+        FENCE_COVER_MMA = 16
+        # NOTE: reordering wmma above the fence in the *source* does not work --
+        # tried 8 and 16 wmma, with and without explicit sched hints; the
+        # backend put them back every time (0 wmma in front of the fence) and
+        # perf regressed 3-17% (4125 / 4173 / 4655 us) with spills up to 12.
+        # Pinning the reads early with a sched_barrier after load_state is worse
+        # still (4395.9) -- it destroys the ds/MFMA interleave. Only the region
+        # split plus the two knobs above moves it.
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -624,8 +650,8 @@ def launch_gemm_a8w4_tdm(
             # Pin all four bases past the scale loads. Otherwise the allocator
             # reuses a base register as a scale destination once that address is
             # dead, while A/B loads off it are still in flight, and the backend
-            # gates the overwrite with s_wait_alu depctr_vm_vsrc. Pinning only
-            # A/B leaves the scale bases reusable and does not remove the gates.
+            # gates the overwrite with s_wait_alu depctr_vm_vsrc. Not redundant
+            # with the tile-top pin: dropping it puts vm_vsrc(0) back at 4.
             lds_addr_keepalive(*bases)
             return act, wt, sb_k, sa_k
 
@@ -653,9 +679,6 @@ def launch_gemm_a8w4_tdm(
             for wn in range_constexpr(wmma_n_rep):
                 xt_wt[wn].store(load_b(bb, wn, 0))
             xt_sc.store(Vec.from_elements(sa_v + sb_v))
-            # Keep this pin even though xt_store runs once in the prologue: it
-            # shapes allocation for the whole function, and dropping it puts the
-            # loop's vm_vsrc gates back and costs ~3.5% (4107 -> 4253 us total).
             lds_addr_keepalive(*bases)
 
         def xt_read():
@@ -759,24 +782,11 @@ def launch_gemm_a8w4_tdm(
             # rematerializes each base at its use, putting the v_add back in the
             # middle of the WMMA stream. Pinning here forces them to be formed at
             # this point and stay live, so the whole tile pays one va_vdst(0).
+            # xt_bases must be pinned too: without it the tail's bases get
+            # rematerialized mid-stream and va_vdst(0) goes 1 -> 3 (+3.4% us).
             lds_addr_keepalive(*bases)
             if const_expr(xt_bases is not None):
                 lds_addr_keepalive(*xt_bases)
-            prev = xt_read() if const_expr(from_xt) else load_state(bases, 0)
-            for ksl in range_constexpr(KWS):
-                nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                xt_b = xt_bases if const_expr(ksl + 1 == KWS) else None
-                prev = k_step(
-                    bases,
-                    prev[0],
-                    prev[1],
-                    prev[2],
-                    prev[3],
-                    nxt_ksl,
-                    xt_b,
-                    nxt_wait if const_expr(xt_b is not None) else None,
-                    do_issue if const_expr(tail_issue and xt_b is not None) else None,
-                )
             front_mma = front_wm * wmma_n_rep
             back_mma = len(BACK) * wmma_n_rep
 
@@ -789,13 +799,13 @@ def launch_gemm_a8w4_tdm(
                     previous = current
                 return counts
 
-            for ksl in range_constexpr(KWS):
+            def emit_hints(ksl, tail_mfma=0):
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and nxt_buf is not None
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not from_xt else 0)
-                mma_total = front_mma + back_mma
+                mma_total = front_mma + back_mma - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 # Every group boundary is also a point where a base/ds dependency
@@ -810,9 +820,20 @@ def launch_gemm_a8w4_tdm(
                 # the choice on stage1_act rather than taking one compromise.
                 mma_group = min(4 if stage1_act else 8, mma_total) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
-                future_schedule = spread(
-                    STATE_DS if has_next else 0, schedule_slots
+                # Front-load the prefetch reads into the leading slots of the
+                # k128 that precedes the tile-tail REUSE fence, leaving the
+                # trailing slots pure MFMA. Spreading them evenly puts the last
+                # read a couple of instructions from that fence by construction,
+                # and s_wait_dscnt(0) waits on every outstanding read -- so one
+                # late read costs the full LDS latency (~100 cycles) per k-tile.
+                ds_slots = (
+                    max(1, int(schedule_slots * FENCE_READ_FRONT))
+                    if (tail_mfma > 0)
+                    else schedule_slots
                 )
+                future_schedule = spread(
+                    STATE_DS if has_next else 0, ds_slots
+                ) + [0] * (schedule_slots - ds_slots)
                 # The tail issue lands in this k128, so its TDMs are spread over
                 # the WMMA groups rather than left as one burst in front of them:
                 # a burst blocks the MFMA pipe for its whole descriptor setup,
@@ -829,7 +850,53 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_mfma(mma_group)
                     if const_expr(future_schedule[i] > 0):
                         rocdl.sched_dsrd(future_schedule[i])
-            rocdl.sched_barrier(0)
+                # Reserved tail: closing the region on an MFMA group is what puts
+                # latency cover in front of the next k128's REUSE fence. It has
+                # to be reserved out of mma_total above -- simply flipping the
+                # slot order leaves the spread's leftover ds_reads last anyway.
+                if const_expr(tail_mfma > 0):
+                    rocdl.sched_mfma(tail_mfma)
+
+            # Hints are emitted per k128, immediately after that k128's code,
+            # instead of as one flat run after both. The REUSE fence inside
+            # k_step's tail sits between the two k128s, and a barrier cuts the
+            # scheduling region -- so a single trailing run only ever described
+            # the post-fence region, leaving the pre-fence one unscheduled and
+            # ending on load_state's ds_reads right in front of s_wait_dscnt(0).
+            prev = xt_read() if const_expr(from_xt) else load_state(bases, 0)
+            for ksl in range_constexpr(KWS):
+                nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
+                xt_b = xt_bases if const_expr(ksl + 1 == KWS) else None
+                prev = k_step(
+                    bases,
+                    prev[0],
+                    prev[1],
+                    prev[2],
+                    prev[3],
+                    nxt_ksl,
+                    xt_b,
+                    nxt_wait if const_expr(xt_b is not None) else None,
+                    do_issue if const_expr(tail_issue and xt_b is not None) else None,
+                )
+                # The k128 that precedes the tail fence closes on an MFMA group so
+                # load_state's ds_reads are not the last thing before its
+                # s_wait_dscnt(0).
+                emit_hints(
+                    ksl,
+                    FENCE_COVER_MMA
+                    if (ksl + 1 < KWS and xt_bases is not None)
+                    else 0,
+                )
+                # One scheduling region per k128 rather than one per tile.
+                # sched_group_barrier only partitions groups *within* a region,
+                # and the region is delimited by sched_barrier alone -- with a
+                # single barrier at the tile end, both k128s' hint runs were
+                # concatenated over one region and neither the trailing MFMA
+                # reservation nor the read distribution could describe the
+                # segment that actually abuts the tail fence. Cutting here makes
+                # the k128 before the fence its own region, so its run ends where
+                # the fence begins.
+                rocdl.sched_barrier(0)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
