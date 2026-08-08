@@ -2565,6 +2565,45 @@ def get_2stage_cfgs(
             _ksplit,
             False,
         )
+    if (
+        q_type == QuantType.per_Token
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and activation == ActivationType.Swiglu
+        and is_flydsl_available()
+    ):
+        _out_str = "bf16"
+        _tile_m = (
+            16 if token < 256 else 32 if token < 1024 else 64 if token < 2048 else 96
+        )
+        _tile_n = 128
+        _tile_k = 256
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(
+            1, "fp8", "fp8_w8a8", _out_str, _tile_m, _tile_n, _tile_k
+        )
+        kn2 = flydsl_kernel_name(
+            2, "fp8", "fp8_w8a8", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            0,
+            False,
+        )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
     use_mxfp4_flydsl = (
