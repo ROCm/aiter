@@ -668,14 +668,14 @@ def test_mla(
             ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
-    # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # Example: -c 10000000 -b 1 3 4 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == dtypes.fp8
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size == 1
+        and 1 <= batch_size <= 256
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
