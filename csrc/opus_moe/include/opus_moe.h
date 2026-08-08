@@ -40,4 +40,7 @@ void opus_moe_stage1_a8w4_fwd(
     int block_m,
     const std::string& kernelName,
     int inter_dim_pad,
-    float swiglu_limit);
+    int activation,
+    float swiglu_limit,
+    float situ_beta,
+    float situ_linear_beta);

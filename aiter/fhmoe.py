@@ -184,6 +184,7 @@ def _flydsl_fhmoe_stage1_wrapper(
     shared_w1=None,
     shared_w1_scale=None,
     shared_expert_id: int = -1,
+    v2_output_layout: bool = False,
     **_kwargs,
 ):
     from aiter.ops.flydsl import moe_kernels
@@ -226,6 +227,7 @@ def _flydsl_fhmoe_stage1_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
+        v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
     )
 
