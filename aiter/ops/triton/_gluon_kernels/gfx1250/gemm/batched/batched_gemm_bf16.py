@@ -197,7 +197,15 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
             b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
         )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        # The wait argument counts TDM *tiles* that may stay in flight, not TDM
+        # ops.  A and B are issued from two different descriptors and retire on
+        # two independent in-order streams sharing one counter, so "at most N ops
+        # outstanding" does not imply the oldest pair has landed: with T tiles in
+        # flight, one stream can still hold all T of its own ops while the other
+        # has drained.  Only N <= T-1 forces both streams below their own depth.
+        # Here the load just issued brings T to NUM_BUFFERS, so the wait is
+        # NUM_BUFFERS-1 -- not doubled.
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
 
         if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
@@ -270,7 +278,8 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    # Tiles, not ops -- see the interior loop for why this count is not doubled.
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
 
     load_idx += 1
 
@@ -298,9 +307,10 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
 
     compute_idx += 1
 
-    # Epilogue: no more loads
+    # Epilogue: no more loads.  NUM_BUFFERS-1-i tiles are still in flight on entry
+    # to iteration i, so the wait is one less than that -- tiles, not ops.
     for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2 - i)
 
         if LAYOUT[0] == "T":
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -345,14 +355,24 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
 
-    offs_c = (
-        pid_k * stride_ck
-        + batch_id * stride_cb
-        + stride_cm * offs_cm[:, None]
-        + stride_cn * offs_cn[None, :]
-    )
-
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # buffer_store addresses through a 32-bit byte offset, so a C tile starting
+    # past 2 GiB is dropped by the bounds check with nothing raised.  Fold the
+    # origin into the base pointer in 64-bit and keep only tile-local offsets,
+    # which the block shape bounds, so the fast path holds at every size.
+    c_ptr += (
+        pid_k.to(gl.int64) * stride_ck
+        + batch_id.to(gl.int64) * stride_cb
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
+    offs_c = (
+        stride_cm
+        * gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))[:, None]
+        + stride_cn
+        * gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))[None, :]
+    )
 
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
@@ -494,7 +514,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
     num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
     # TDM prologue: fill the pipeline
-    for _ in gl.static_range(NUM_BUFFERS):
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
@@ -522,8 +542,16 @@ def _batched_gemm_bf16_compute_bound_kernel(
 
         load_idx += 1
 
-    # Register pre-load prologue
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    # Register pre-load prologue.
+    #
+    # The wait argument counts TDM *tiles* that may stay in flight, not TDM ops.
+    # A and B are issued from two different descriptors and retire on two
+    # independent in-order streams sharing one counter, so "at most N ops
+    # outstanding" does not imply the oldest pair has landed: with T tiles in
+    # flight, one stream can still hold all T of its own ops while the other has
+    # drained. Only N <= T-1 forces both streams below their own depth. Here
+    # T = NUM_BUFFERS-1, so the wait is NUM_BUFFERS-2 -- not doubled.
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -573,7 +601,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
             b_desc, add_offsets=[0, BLOCK_K]
         )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     load_idx += 1
 
@@ -602,7 +630,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
     compute_idx += 1
 
     # Remaining main-loop iterations
-    for _ in range(num_k_tiles - NUM_BUFFERS - 2):
+    for _ in range(num_k_tiles - NUM_BUFFERS - 1):
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
         gl.amd.gfx1250.tdm.async_load(
@@ -630,7 +658,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
         load_idx += 1
 
@@ -687,7 +715,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     load_idx += 1
 
@@ -716,8 +744,8 @@ def _batched_gemm_bf16_compute_bound_kernel(
     compute_idx += 1
 
     # Epilogue: drain remaining tiles
-    for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+    for i in gl.static_range(NUM_BUFFERS - 2):
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 3 - i)
 
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -767,14 +795,24 @@ def _batched_gemm_bf16_compute_bound_kernel(
         0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
 
-    offs_c = (
-        pid_k * stride_ck
-        + batch_id * stride_cb
-        + stride_cm * offs_cm[:, None]
-        + stride_cn * offs_cn[None, :]
-    )
-
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # buffer_store addresses through a 32-bit byte offset, so a C tile starting
+    # past 2 GiB is dropped by the bounds check with nothing raised.  Fold the
+    # origin into the base pointer in 64-bit and keep only tile-local offsets,
+    # which the block shape bounds, so the fast path holds at every size.
+    c_ptr += (
+        pid_k.to(gl.int64) * stride_ck
+        + batch_id.to(gl.int64) * stride_cb
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
+    offs_c = (
+        stride_cm
+        * gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))[:, None]
+        + stride_cn
+        * gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))[None, :]
+    )
 
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
