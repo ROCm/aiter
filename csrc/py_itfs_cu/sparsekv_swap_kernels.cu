@@ -15,12 +15,16 @@
 
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace {
 
 constexpr int WARP_SIZE = 64;  // wavefront64 on gfx950
 constexpr int BLOCK     = 256;
+// Block target for the planned gather: gfx950 has 256 CUs, so a few thousand
+// blocks keeps every CU fed even when the decode batch is small.
+constexpr int GATHER_TARGET_BLOCKS = 2048;
 constexpr int EMPTY     = -1;
 
 // Word-wise warp copy of one item between two mapped addresses (host<->device).
@@ -61,6 +65,21 @@ __device__ unsigned long long g_sparsekv_oob_rows = 0ULL;
 // host pool (host_cache_locs != nullptr) the row is read from the per-request
 // translation table (req_to_host_pool[r][tok]); otherwise the dense layout maps
 // logical token tok of request r to row r*cold_depth + tok.
+__device__ __forceinline__ int64_t cold_row_bounded(const int32_t* __restrict__ locs,
+                                                    int stride, int r, int cold_depth,
+                                                    int tok, int64_t max_rows)
+{
+    if (locs) {
+        const int64_t row = (int64_t)locs[(int64_t)r * stride + tok];
+        if (row >= max_rows) {
+            atomicAdd(&g_sparsekv_oob_rows, 1ULL);
+            return (int64_t)-1;
+        }
+        return row;
+    }
+    return (int64_t)r * cold_depth + tok;
+}
+
 __device__ __forceinline__ int64_t cold_row_of(const int32_t* __restrict__ host_cache_locs,
                                                int host_stride, int r, int cold_depth,
                                                int tok)
@@ -451,6 +470,62 @@ __global__ void sparsekv_copy_planned_kernel(
 // device-mapped host cold pool as base, or gpu req_to_gpu_pool with the GPU cold
 // pool as base). The coordinator issues two calls per layer (host then gpu) so a
 // mixed-home top-k lands entirely in the hot buffer. One block per query token.
+// Both homes in one pass. The per-home kernel below walks the whole miss list
+// and copies only the entries matching its target, so running it twice scans the
+// list twice and leaves roughly half the warps in each launch idle on a skip.
+// Here every warp copies, and each picks its source from the home the plan
+// already recorded for that miss. Destinations are per-miss hot slots, so the
+// two homes never write the same row and merging them is safe.
+__global__ void sparsekv_gather_planned_dual_kernel(
+    const char* __restrict__ host_base,         // pinned host cold pool, this layer
+    const char* __restrict__ gpu_base,          // GPU cold tier, this layer (or null)
+    char* __restrict__ hot_buffer,              // GPU hot buffer, this layer
+    const int32_t* __restrict__ req_slots,      // [n]
+    const int32_t* __restrict__ plan_miss_tok,  // [n, topk]
+    const int32_t* __restrict__ plan_miss_slot, // [n, topk]
+    const int32_t* __restrict__ plan_miss_count,// [n]
+    const int32_t* __restrict__ plan_miss_home, // [n, topk] (0=host, 1=gpu)
+    const int32_t* __restrict__ host_locs,      // [R, host_stride] or nullptr
+    int host_stride,
+    const int32_t* __restrict__ gpu_locs,       // [R, gpu_stride] or nullptr
+    int gpu_stride,
+    int64_t item_size_bytes, int hot_slots, int cold_depth, int topk)
+{
+    const int q = blockIdx.x;
+    const int m = plan_miss_count[q];
+    if (m <= 0) return;
+    const int r = req_slots[q];
+    const int32_t* tok_q  = plan_miss_tok + (int64_t)q * topk;
+    const int32_t* slot_q = plan_miss_slot + (int64_t)q * topk;
+    const int32_t* home_q = plan_miss_home + (int64_t)q * topk;
+
+    // gridDim.y spreads one query's miss list across many blocks. With one
+    // block per query the whole gather ran on `n` blocks — 16 of 256 CUs at a
+    // decode batch of 16, each warp walking a hundred rows in series — so the
+    // kernel was parallelism-bound, not bandwidth-bound.
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int stride_i = gridDim.y * warps_per_block;
+    for (int i = blockIdx.y * warps_per_block + warp_id; i < m; i += stride_i) {
+        const int tok = tok_q[i];
+        const int v   = slot_q[i];
+        if (tok < 0 || tok >= cold_depth || v < 0 || v >= hot_slots) continue;
+        const bool gpu_home = (home_q[i] != 0);
+        const char* base = gpu_home ? gpu_base : host_base;
+        if (!base) continue;
+        const int64_t cold_row =
+            gpu_home ? cold_row_bounded(gpu_locs, gpu_stride, r, cold_depth, tok,
+                                        g_sparsekv_gpu_cold_rows)
+                     : cold_row_bounded(host_locs, host_stride, r, cold_depth, tok,
+                                        g_sparsekv_cold_rows);
+        if (cold_row < 0) continue;  // unbacked in its home: nothing to gather
+        const int64_t src = cold_row * item_size_bytes;
+        const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
+        transfer_item_warp(lane_id, base + src, hot_buffer + dst, item_size_bytes);
+    }
+}
+
 __global__ void sparsekv_gather_planned_kernel(
     const char* __restrict__ base_ptr,          // this home's cold pool base, layer
     char* __restrict__ hot_buffer,              // GPU hot buffer, this layer
@@ -759,6 +834,49 @@ void sparsekv_copy_planned(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
         cold, hot, req_slots.data_ptr<int32_t>(),
         plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
         plan_miss_count.data_ptr<int32_t>(), hcl, (int)host_stride,
+        item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
+}
+
+void sparsekv_gather_planned_dual(int64_t host_base_ptr, int64_t gpu_base_ptr,
+                                  at::Tensor hot_buffer, at::Tensor req_slots,
+                                  at::Tensor plan_miss_tok, at::Tensor plan_miss_slot,
+                                  at::Tensor plan_miss_count, at::Tensor plan_miss_home,
+                                  at::Tensor host_cache_locs, int64_t host_stride,
+                                  at::Tensor gpu_cache_locs, int64_t gpu_stride,
+                                  int64_t item_size_bytes, int64_t hot_slots,
+                                  int64_t cold_depth, int64_t topk)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && req_slots.is_cuda() &&
+                    plan_miss_tok.is_cuda() && plan_miss_slot.is_cuda() &&
+                    plan_miss_count.is_cuda() && plan_miss_home.is_cuda(),
+                "all sparsekv_gather_planned_dual tensors must be CUDA");
+    TORCH_CHECK(req_slots.scalar_type() == at::kInt &&
+                    plan_miss_tok.scalar_type() == at::kInt &&
+                    plan_miss_slot.scalar_type() == at::kInt &&
+                    plan_miss_count.scalar_type() == at::kInt &&
+                    plan_miss_home.scalar_type() == at::kInt,
+                "sparsekv_gather_planned_dual req_slots/plan tensors must be int32");
+
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* host_base = reinterpret_cast<const char*>(host_base_ptr);
+    const char* gpu_base  = reinterpret_cast<const char*>(gpu_base_ptr);
+    const int32_t* hl = sparsekv_host_cache_locs_ptr(host_cache_locs, host_stride);
+    const int32_t* gl = sparsekv_host_cache_locs_ptr(gpu_cache_locs, gpu_stride);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    // Enough blocks to keep the device busy; capped by the miss list so a small
+    // top-k does not launch blocks that can only exit.
+    constexpr int WPB = BLOCK / WARP_SIZE;
+    const int max_chunks = (int)((topk + WPB - 1) / WPB);
+    const int gy = std::max(1, std::min(max_chunks, (GATHER_TARGET_BLOCKS + n - 1) / n));
+    sparsekv_gather_planned_dual_kernel<<<dim3(n, gy), dim3(BLOCK), 0, stream>>>(
+        host_base, gpu_base, hot, req_slots.data_ptr<int32_t>(),
+        plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
+        plan_miss_count.data_ptr<int32_t>(), plan_miss_home.data_ptr<int32_t>(),
+        hl, (int)host_stride, gl, (int)gpu_stride,
         item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
 }
 

@@ -89,6 +89,21 @@ void sparsekv_swap_and_translate_record(int64_t cold_pool_dev_ptr,
                                         int64_t cold_depth,
                                         int64_t topk);
 
+// Replay a recorded miss plan into a layer's hot buffer for BOTH homes in one
+// pass. Each miss is copied from the cold pool the plan recorded for it, so the
+// list is walked once and every warp does a copy — the per-home entry point
+// below has to be run twice, and each run skips roughly half the entries it
+// scans. Destinations are per-miss hot slots, so the homes never collide.
+// gpu_base_ptr may be 0 when the GPU cold tier is off.
+void sparsekv_gather_planned_dual(int64_t host_base_ptr, int64_t gpu_base_ptr,
+                                  at::Tensor hot_buffer, at::Tensor req_slots,
+                                  at::Tensor plan_miss_tok, at::Tensor plan_miss_slot,
+                                  at::Tensor plan_miss_count, at::Tensor plan_miss_home,
+                                  at::Tensor host_cache_locs, int64_t host_stride,
+                                  at::Tensor gpu_cache_locs, int64_t gpu_stride,
+                                  int64_t item_size_bytes, int64_t hot_slots,
+                                  int64_t cold_depth, int64_t topk);
+
 // Replay one home's share of a recorded miss plan into a layer's hot buffer
 // (Design Y dual-source swap). Gathers only misses whose recorded home matches
 // target_home (0=host, 1=gpu), indirecting through that home's translation table

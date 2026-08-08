@@ -1479,6 +1479,24 @@ namespace py = pybind11;
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
           py::arg("topk"));                              \
+    m.def("sparsekv_gather_planned_dual",                \
+          &sparsekv_gather_planned_dual,                 \
+          py::arg("host_base_ptr"),                      \
+          py::arg("gpu_base_ptr"),                       \
+          py::arg("hot_buffer"),                         \
+          py::arg("req_slots"),                          \
+          py::arg("plan_miss_tok"),                      \
+          py::arg("plan_miss_slot"),                     \
+          py::arg("plan_miss_count"),                    \
+          py::arg("plan_miss_home"),                     \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
+          py::arg("gpu_cache_locs"),                     \
+          py::arg("gpu_stride"),                         \
+          py::arg("item_size_bytes"),                    \
+          py::arg("hot_slots"),                          \
+          py::arg("cold_depth"),                         \
+          py::arg("topk"));                              \
     m.def("sparsekv_gather_planned",                     \
           &sparsekv_gather_planned,                      \
           py::arg("base_dev_ptr"),                       \

@@ -129,6 +129,33 @@ def sparsekv_copy_planned(
 
 
 @compile_ops("module_sparsekv_swap")
+def sparsekv_gather_planned_dual(
+    host_base_ptr: int,
+    gpu_base_ptr: int,
+    hot_buffer: torch.Tensor,
+    req_slots: torch.Tensor,
+    plan_miss_tok: torch.Tensor,
+    plan_miss_slot: torch.Tensor,
+    plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+    topk: int,
+) -> None:
+    """Replay a recorded miss plan for both homes in a single pass.
+
+    Each miss reads the cold pool its plan entry recorded, so the list is walked
+    once and every warp copies — running the per-home op twice scans the list
+    twice and idles roughly half the warps of each launch on a skip.
+    """
+
+
+@compile_ops("module_sparsekv_swap")
 def sparsekv_gather_planned(
     base_dev_ptr: int,
     hot_buffer: torch.Tensor,
@@ -195,6 +222,7 @@ __all__ = [
     "sparsekv_backup_new_token",
     "sparsekv_copy_planned",
     "sparsekv_gather_planned",
+    "sparsekv_gather_planned_dual",
     "sparsekv_host_get_device_pointer",
     "sparsekv_set_pool_rows",
     "sparsekv_take_oob_row_count",
