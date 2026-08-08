@@ -7,13 +7,12 @@ CONTAINER_NAME="${CONTAINER_NAME:-hyg_fyd1}"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_RELATIVE_PATH="${SCRIPT_RELATIVE_PATH:-my_code/${SCRIPT_NAME}}"
 TRACE_ROOT="${TRACE_ROOT:-my_code}"
-# Override TEST_CMD in the environment to trace another isa_runner replay command.
-TEST_CMD="${TEST_CMD:-python my_code/isa_runner/tdm_adapter.py replay --which gemm1 --iters 100 --isa ./my_code/moe_gemm1_a8w4.v0.s}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 
 usage() {
-    echo "Usage: ${SCRIPT_NAME} <KERNEL_NAME> <output-dir-name> [--git] [--am]" >&2
-    echo "Example: bash my_code/${SCRIPT_NAME} moe_gemm1_a8w4 isa_runner_att" >&2
+    echo "Usage: ${SCRIPT_NAME} <KERNEL_NAME> <output-dir-name> <TEST_CMD> [--all-simd] [--git] [--am]" >&2
+    echo "Example: bash my_code/${SCRIPT_NAME} moe_gemm1_a8w4 isa_runner_att 'python my_code/isa_runner/tdm_adapter.py replay --which gemm1 --iters 100 --isa ./my_code/moe_gemm1_a8w4.v0.s'" >&2
+    echo "  --all-simd  run four ATT captures for SIMD0, SIMD1, SIMD2, and SIMD3" >&2
     echo "  --git  only add/commit/push an existing trace directory; skip trace collection" >&2
     echo "  --am   amend the current commit; requires --git" >&2
 }
@@ -59,6 +58,7 @@ validate_test_cmd() {
 container_main() {
     local kernel_name="$1"
     local output_dir_name="$2"
+    local all_simd="$3"
     local output_dir="${TRACE_ROOT}/${output_dir_name}"
     local output_archive="${TRACE_ROOT}/${output_dir_name}.tar.gz"
     local work_dir="${TRACE_ROOT}/.get_isa_runner_att_${output_dir_name}_$$"
@@ -96,6 +96,7 @@ container_main() {
         echo "host_git_commit: ${HOST_GIT_COMMIT:-unknown}"
         echo "HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-unset}"
         echo "requested kernel: ${kernel_name}"
+        echo "capture all SIMDs: ${all_simd}"
         echo "output directory name: ${output_dir_name}"
         echo "output directory: ${output_dir}"
         echo "output archive: ${output_archive}"
@@ -191,11 +192,20 @@ container_main() {
     run_att_for_kernel() {
         local kernel_name="$1"
         local kernel_regex="$2"
-        local log_file="$3"
-        local input_yaml="${work_dir}/input_kernel.yaml"
-        local att_output_dir="${thread_trace_root}/kernel/rpf_v3"
+        local simd_id="$3"
+        local log_file="$4"
+        local input_yaml
+        local att_output_dir
         local status
         local att_file
+
+        if [[ "${all_simd}" -eq 1 ]]; then
+            input_yaml="${work_dir}/input_kernel_simd${simd_id}.yaml"
+            att_output_dir="${thread_trace_root}/simd${simd_id}/kernel/rpf_v3"
+        else
+            input_yaml="${work_dir}/input_kernel.yaml"
+            att_output_dir="${thread_trace_root}/kernel/rpf_v3"
+        fi
 
         cat > "${input_yaml}" <<YAML
 jobs:
@@ -211,7 +221,7 @@ jobs:
   advanced_thread_trace: true
   att_target_cu: 1
   att_shader_engine_mask: "0xf"
-  att_simd_select: "0xf"
+  att_simd_select: "${simd_id}"
   att_buffer_size: "0x10000000"
   att_library_path: ["${ROCPROF_ATT_LIBRARY_PATH}"]
 YAML
@@ -219,7 +229,7 @@ YAML
         rm -rf "${att_output_dir}"
         mkdir -p "$(dirname "${att_output_dir}")"
         run_and_log \
-            "advanced-thread-trace-${kernel_name}" \
+            "advanced-thread-trace-${kernel_name}-simd${simd_id}" \
             "${log_file}" \
             rocprofv3 -i "${input_yaml}" -- \
                 "${test_env[@]}" \
@@ -266,21 +276,46 @@ YAML
 
     local kernel_regex
     kernel_regex="$(escape_kernel_regex "${kernel_name}")"
+    local -a simd_ids=(3)
+    if [[ "${all_simd}" -eq 1 ]]; then
+        simd_ids=(0 1 2 3)
+    fi
+
     local att_status=99
+    local simd_id
+    local simd_status
+    local simd_log
+    local simd_status_log="${log_dir}/att_simd_status.log"
     if [[ "${kernel_trace_status}" -eq 0 ]]; then
-        set +e
-        run_att_for_kernel \
-            "${kernel_name}" \
-            "${kernel_regex}" \
-            "${log_dir}/02_thread_trace_kernel.log"
-        att_status=$?
-        set -e
+        att_status=0
+        : > "${simd_status_log}"
+        for simd_id in "${simd_ids[@]}"; do
+            if [[ "${all_simd}" -eq 1 ]]; then
+                simd_log="${log_dir}/02_thread_trace_kernel_simd${simd_id}.log"
+            else
+                simd_log="${log_dir}/02_thread_trace_kernel.log"
+            fi
+            set +e
+            run_att_for_kernel \
+                "${kernel_name}" \
+                "${kernel_regex}" \
+                "${simd_id}" \
+                "${simd_log}"
+            simd_status=$?
+            set -e
+            echo "simd${simd_id}_att_status=${simd_status}" | tee -a "${simd_status_log}"
+            if [[ "${simd_status}" -ne 0 ]]; then
+                att_status="${simd_status}"
+            fi
+        done
     fi
 
     {
         echo "requested_kernel=${kernel_name}"
         echo "kernel_regex=${kernel_regex}"
         echo "kernel_name_validation=trusted_without_database_lookup"
+        echo "all_simd=${all_simd}"
+        echo "simd_ids=${simd_ids[*]}"
         echo "output_dir_name=${output_dir_name}"
         echo "test_command=${TEST_CMD}"
         echo "kernel_trace_status=${kernel_trace_status}"
@@ -297,6 +332,9 @@ YAML
         else
             echo "att_state=failed"
         fi
+        if [[ -f "${simd_status_log}" ]]; then
+            cat "${simd_status_log}"
+        fi
         echo "final_output_dir=${output_dir}"
         echo "final_archive=${output_archive}"
     } 2>&1 | tee "${summary_log}"
@@ -312,15 +350,21 @@ YAML
 if [[ "${1:-}" == "--inside-container" ]]; then
     kernel_name="${2:-}"
     output_dir_name="${3:-}"
-    if [[ "$#" -ne 3 ]]; then
+    TEST_CMD="${4:-}"
+    all_simd="${5:-0}"
+    if [[ "$#" -ne 5 ]]; then
         usage
-        echo "--inside-container requires KERNEL_NAME and output-dir-name" >&2
+        echo "--inside-container requires KERNEL_NAME, output-dir-name, TEST_CMD, and ALL_SIMD" >&2
+        exit 1
+    fi
+    if [[ "${all_simd}" != "0" && "${all_simd}" != "1" ]]; then
+        echo "ALL_SIMD must be 0 or 1" >&2
         exit 1
     fi
     validate_kernel_name "${kernel_name}"
     validate_output_dir_name "${output_dir_name}"
     validate_test_cmd
-    container_main "${kernel_name}" "${output_dir_name}"
+    container_main "${kernel_name}" "${output_dir_name}" "${all_simd}"
     exit $?
 fi
 
@@ -329,23 +373,29 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
-if [[ "$#" -lt 2 ]]; then
+if [[ "$#" -lt 3 ]]; then
     usage
     exit 1
 fi
 
 kernel_name="$1"
 output_dir_name="$2"
+TEST_CMD="$3"
 validate_kernel_name "${kernel_name}"
 validate_output_dir_name "${output_dir_name}"
 output_dir="${TRACE_ROOT}/${output_dir_name}"
 output_archive="${TRACE_ROOT}/${output_dir_name}.tar.gz"
-shift 2
+shift 3
 
 git_mode=0
 am_mode=0
+all_simd=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --all-simd)
+            all_simd=1
+            shift
+            ;;
         --git)
             git_mode=1
             shift
@@ -409,6 +459,7 @@ docker_env=(
     -e KERNEL_NAME="${kernel_name}"
     -e OUTPUT_DIR_NAME="${output_dir_name}"
     -e TEST_CMD="${TEST_CMD}"
+    -e ALL_SIMD="${all_simd}"
     -e HOST_GIT_BRANCH="${host_git_branch}"
     -e HOST_GIT_COMMIT="${host_git_commit}"
     -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
@@ -416,11 +467,11 @@ docker_env=(
 
 set +e
 docker exec -i "${docker_env[@]}" "${CONTAINER_NAME}" \
-    bash -lc 'cd "$REPO_ROOT" && bash "./$SCRIPT_RELATIVE_PATH" --inside-container "$KERNEL_NAME" "$OUTPUT_DIR_NAME"'
+    bash -lc 'cd "$REPO_ROOT" && bash "./$SCRIPT_RELATIVE_PATH" --inside-container "$KERNEL_NAME" "$OUTPUT_DIR_NAME" "$TEST_CMD" "$ALL_SIMD"'
 run_status=$?
 set -e
 
 echo "Trace collection complete; Git operations were not requested."
-echo "Run '${SCRIPT_RELATIVE_PATH} ${kernel_name} ${output_dir_name} --git' separately to commit the trace directory."
+echo "Run the same command with --git appended to commit the trace directory."
 
 exit "${run_status}"
