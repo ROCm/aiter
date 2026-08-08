@@ -327,8 +327,16 @@ def mha_v4_packed(
             )
             if k.stride() != expected_k_stride:
                 raise ValueError("MXFP4/FP8 K must use the coalesced MHA v4 tile layout")
-        elif not k.is_contiguous():
-            raise ValueError("F4F4 K currently requires contiguous token-strided storage")
+        else:
+            tiles = (k.shape[1] + 127) // 128
+            expected_k_stride = (
+                k.shape[2] * tiles * 8192,
+                64,
+                tiles * 8192,
+                1,
+            )
+            if k.stride() != expected_k_stride:
+                raise ValueError("F4F4 K must use the coalesced MHA v4 tile layout")
 
     if softmax_scale is None:
         softmax_scale = logical_head_dim**-0.5
@@ -664,53 +672,6 @@ def _launch_mxfp4_coalesced_fake(
     del out
 
 
-@torch.library.custom_op("aiter::mha_v4_launch_mxfp4", mutates_args=("out",))
-def _launch_mxfp4(
-    q: Tensor,
-    q_descale: Tensor,
-    k: Tensor,
-    k_descale: Tensor,
-    v_data: Tensor,
-    v_descale: Tensor,
-    out: Tensor,
-    v_format: int,
-    softmax_scale: float,
-) -> None:
-    v = _v_mxfp4_view(v_data, v_descale, k.shape[1])
-    mha_v4_packed(
-        q,
-        k,
-        v,
-        q_descale,
-        k_descale,
-        v_descale,
-        AttentionFormat.MXFP4,
-        AttentionFormat.MXFP4,
-        AttentionFormat(v_format),
-        AttentionScaleMode.E8M0_PER_1X32,
-        AttentionScaleMode.E8M0_PER_1X32,
-        AttentionScaleMode.F32_PER_CHANNEL,
-        softmax_scale=softmax_scale,
-        out=out,
-    )
-
-
-@_launch_mxfp4.register_fake
-def _launch_mxfp4_fake(
-    q: Tensor,
-    q_descale: Tensor,
-    k: Tensor,
-    k_descale: Tensor,
-    v_data: Tensor,
-    v_descale: Tensor,
-    out: Tensor,
-    v_format: int,
-    softmax_scale: float,
-) -> None:
-    del q, q_descale, k, k_descale, v_data, v_descale, v_format, softmax_scale
-    del out
-
-
 @torch.library.custom_op("aiter::mha_v4_launch_mxfp6", mutates_args=("out",))
 def _launch_mxfp6(
     q: Tensor,
@@ -819,34 +780,22 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = _quantize_mxfp4(q, softmax_scale * MHA_V4_LOG2E)
+        k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
-            k_quantized, k_descale = quantize_mxfp4_k(k)
             v_quantized, v_descale = _quantize_v_fp8(v)
-            _launch_mxfp4_coalesced(
-                q_quantized,
-                q_descale,
-                k_quantized,
-                k_descale,
-                v_quantized,
-                v_descale,
-                out,
-                int(v_format),
-                softmax_scale,
-            )
         else:
-            k_quantized, k_descale = _quantize_mxfp4(k, 1.0)
             v_quantized, v_descale = _quantize_v_mxfp4_raw(v)
-            _launch_mxfp4(
-                q_quantized,
-                q_descale,
-                k_quantized,
-                k_descale,
-                v_quantized,
-                v_descale,
-                out,
-                int(v_format),
-                softmax_scale,
-            )
+        _launch_mxfp4_coalesced(
+            q_quantized,
+            q_descale,
+            k_quantized,
+            k_descale,
+            v_quantized,
+            v_descale,
+            out,
+            int(v_format),
+            softmax_scale,
+        )
         return out
     elif q_format == AttentionFormat.MXFP6 and v_format in (
         *_FP8_FORMATS,

@@ -182,41 +182,31 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     v_fp8 = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     v_scale = torch.ones((1, 2, 128), device="cuda", dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="coalesced MHA v4 tile layout"):
-        mha_v4_packed(
-            q,
-            q,
-            v_fp8,
-            scale,
-            scale,
-            v_scale,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.FP8,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.F32_PER_CHANNEL,
-        )
+    for v_format, value in (
+        (AttentionFormat.FP8, v_fp8),
+        (AttentionFormat.MXFP4, q.new_zeros((1, 128, 2, 128))),
+    ):
+        with pytest.raises(ValueError, match="coalesced MHA v4 tile layout"):
+            mha_v4_packed(
+                q,
+                q,
+                value,
+                scale,
+                scale,
+                v_scale,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                v_format,
+                AttentionScaleMode.E8M0_PER_1X32,
+                AttentionScaleMode.E8M0_PER_1X32,
+                AttentionScaleMode.F32_PER_CHANNEL,
+            )
 
     raw, k_scale = quantize_mxfp4_k(
         torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
     )
     coalesced_k = mxfp4_k_view(raw, k_scale)
-    with pytest.raises(ValueError, match="contiguous token-strided storage"):
-        mha_v4_packed(
-            q,
-            coalesced_k,
-            q.new_zeros((1, 128, 2, 128)),
-            scale,
-            k_scale,
-            v_scale,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.F32_PER_CHANNEL,
-        )
+    assert coalesced_k.stride() == (16384, 64, 8192, 1)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")

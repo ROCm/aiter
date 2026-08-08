@@ -164,9 +164,14 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
 
 
 def _production_quantize_f4f4(query, key, value, softmax_scale):
-    q_fp4, q_scale, k_fp4, k_scale = _production_quantize_mxfp4_qk(
-        query, key, softmax_scale
+    b, seq_len, heads, head_dim = query.shape
+    q_fp4 = query.new_empty((b, seq_len, heads, head_dim // 2), dtype=torch.uint8)
+    q_scale = query.new_empty((b, seq_len, heads, head_dim // 32), dtype=torch.uint8)
+    rotate_activation_mxfp4_quant(
+        q_fp4, q_scale, query, softmax_scale * MHA_V4_LOG2E
     )
+    k_raw, k_scale = quantize_mxfp4_k(key)
+    k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_fp4, v_scale = sage_quant_v_f4f4(value, layout="bshd")
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 

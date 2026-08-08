@@ -271,8 +271,11 @@ void fmha_v4_fwd(const at::Tensor& q,
         }
         else
         {
-            TORCH_CHECK(k.is_contiguous(),
-                        "F4F4 K currently requires contiguous token-strided storage");
+            const int64_t tiles       = (seqlen_k + 127) / 128;
+            const int64_t head_stride = tiles * 8192;
+            TORCH_CHECK(k.stride(0) == nhead_k * head_stride && k.stride(1) == 64 &&
+                            k.stride(2) == head_stride,
+                        "F4F4 K must use the coalesced MHA v4 tile layout");
         }
     }
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,

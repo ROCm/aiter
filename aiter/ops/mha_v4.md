@@ -276,10 +276,8 @@ output = mha_v4_packed(
 The packed API takes each operand's data tensor, scale tensor, value format, and scale mode
 explicitly. The launcher validates this complete key against one manifest row.
 
-Packed layout is also part of that explicit contract. The MXFP4-QK/FP8-V row uses the
-chunk-major coalesced K layout produced by `quantize_mxfp4_k`; the initial F4F4 row still uses
-contiguous token-strided K until its binary is migrated separately. Passing one layout to the
-other row is rejected.
+Packed layout is also part of that explicit contract. MXFP4 Q/K rows use the chunk-major
+coalesced K layout produced by `quantize_mxfp4_k`; incompatible token-strided storage is rejected.
 
 Exotic LDS-order tensors are represented by contiguous backing buffers plus metadata. An
 `as_strided` view never crosses a custom-op boundary; the final launch op reconstructs it while
