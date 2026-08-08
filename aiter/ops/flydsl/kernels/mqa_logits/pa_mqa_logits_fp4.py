@@ -14,6 +14,7 @@ import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
+
 from .pa_mqa_logits_fp4_common import (
     _i32_buffer,
     _load_vec4_i32,
