@@ -37,26 +37,19 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     )
 
 
-_I32_MAX_RECORDS = fx.Int64(0xFFFFFFFF)
-
-
 def _i32_buffer(ptr, width=1):
     """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).
 
     ``width`` shapes it as ``(N, width)`` so a per-``width`` row can be sliced and
     vector-copied; ``width=1`` gives a flat tensor for scalar ``[idx]`` loads.
     """
-    p = fx.inttoptr(
-        fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4),
-        fx.Int64(fx.ptrtoint(fx.get_iter(ptr))),
-    )
+    src = fx.get_iter(ptr)
+    it = fx.recast_iter(fx.PointerType.get(T.i32, src.memspace, 4), src)
     if width == 1:
         lay = fx.make_layout((1 << 30,), (1,))
     else:
         lay = fx.make_layout((1 << 28, width), (width, 1))
-    return fx.rocdl.make_buffer_tensor(
-        fx.make_view(p, lay), num_records_bytes=_I32_MAX_RECORDS
-    )
+    return fx.rocdl.make_buffer_tensor(fx.make_view(it, lay))
 
 
 def _load_vec4_i32(bt2d, elem_off):
@@ -66,7 +59,7 @@ def _load_vec4_i32(bt2d, elem_off):
     row_div = fx.logical_divide(row, fx.make_layout(4, 1))
     reg_ty = fx.MemRefType.get(T.i32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
     r = fx.memref_alloca(reg_ty, fx.make_layout(4, 1))
-    fx.copy_atom_call(
+    fx.copy(
         fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 4),
         fx.slice(row_div, (None, fx.Int32(0))),
         r,
@@ -333,7 +326,7 @@ def build_pa_mqa_logits_fp4_module(
                 q_row_div = fx.logical_divide(q_row_bytes, fx.make_layout(16, 1))
                 col_idx = fx.Int32(k_tile * 4) + lane_div_16
                 r = fx.memref_alloca(q_reg_ty, q_reg_lay)
-                fx.copy_atom_call(q_atom, fx.slice(q_row_div, (None, col_idx)), r)
+                fx.copy(q_atom, fx.slice(q_row_div, (None, col_idx)), r)
                 q_4xi32 = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
                 q_i64_0 = _pack_i32_pair_to_i64(q_4xi32[0], q_4xi32[1])
                 q_i64_1 = _pack_i32_pair_to_i64(q_4xi32[2], q_4xi32[3])
@@ -356,7 +349,7 @@ def build_pa_mqa_logits_fp4_module(
                 (pid_b, pid_next_n, fx.Int32(k_tile), lane_div_16, lane_mod_16, None),
             )
             r = fx.memref_alloca(qs_reg_ty, qs_reg_lay)
-            fx.copy_atom_call(qs_atom, row, r)
+            fx.copy(qs_atom, row, r)
             qs_dws_vec = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
             qs_dws = [qs_dws_vec[i] for i in range(QS_DW)]
             q_scale_ops.append(
@@ -377,7 +370,7 @@ def build_pa_mqa_logits_fp4_module(
             tile = fx.slice(w_tiled_mi, (None, fx.Int32(mi_idx)))
             tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
             r = fx.memref_alloca(w_reg_ty, w_reg_lay)
-            fx.copy_atom_call(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
+            fx.copy(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
             w_per_lane.append(fx.memref_load_vec(r).to(fx.Float32))
 
         # ── Step 3: prologue + N-1 prefetch loop + epilogue ──
