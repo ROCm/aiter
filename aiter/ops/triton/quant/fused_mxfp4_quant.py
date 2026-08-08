@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel,
+)
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
@@ -14,6 +17,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -382,6 +386,7 @@ def fused_reduce_rms_mxfp4_quant(
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,
+    args: str = "auto",
 ):
     """
     This op contains several steps:
@@ -506,7 +511,21 @@ def fused_reduce_rms_mxfp4_quant(
     elif x2 is not None:
         r = 2
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
-    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+
+    # check if args is gluon and arch is not gfx1250
+    if args == "gluon" and get_arch() != "gfx1250":
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
+
+    # select kernel based on args and arch
+    kernel = (
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        else _fused_reduce_rms_mxfp4_quant_kernel
+    )
+
+    kernel[grid](
         x1,
         x1_weight,
         x2,
