@@ -49,8 +49,6 @@ def topk_gating(
                             "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
         correction_bias: optional bias tensor, pass None for no bias.
-
-    Note: softmax is already normalized, so renorm is forced off.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
@@ -61,8 +59,6 @@ def topk_gating(
         correction_bias = torch.empty(
             0, dtype=gating_output.dtype, device=gating_output.device
         )
-    if score_func == "softmax":
-        need_renorm = False
     topk_softplus(
         topk_weights,
         topk_indices,
@@ -411,7 +407,7 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel — the C++
+    """Per-row top-k (decode). Always uses the one-block kernel -- the C++
     side ignores the workspace argument for decode."""
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
     # The original mb dispatch is commented out below for reference:
