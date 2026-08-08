@@ -2530,6 +2530,20 @@ namespace py = pybind11;
           py::arg("use_qk_l2norm_in_kernel"),                         \
           py::arg("output"));
 
+#define GDR_DECODE_PACKED_BF16_PYBIND                  \
+    m.def("gdr_decode_packed_bf16",                    \
+          &aiter::gdr_decode_packed_bf16,               \
+          "gfx950 packed BF16 GDR decode (HIP).",      \
+          py::arg("mixed_qkv"),                        \
+          py::arg("a"),                                \
+          py::arg("b"),                                \
+          py::arg("dt_bias"),                          \
+          py::arg("A_log"),                            \
+          py::arg("indices"),                          \
+          py::arg("state"),                            \
+          py::arg("out"),                              \
+          py::arg("scale"));
+
 #define MXFP4_MOE_AUX_PYBIND                  \
     m.def("mxfp4_moe_sort_quant",             \
           &mxfp4_moe_sort_quant_kernel,       \
