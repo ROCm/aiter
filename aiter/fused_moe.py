@@ -3044,7 +3044,20 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
-    if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
+    # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
+    # skip the throwaway (token_num, topk, inter_dim) alloc (up to ~tens of MB at
+    # prefill). Gate matches the a16w4 branch of _flydsl_moe_stage1_impl.
+    _is_a16w4_port = (
+        quant_type == QuantType.per_1x32
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and getattr(w1, "dtype", None) == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
+    )
+    if _is_a16w4_port:
+        a2 = None
+    elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),

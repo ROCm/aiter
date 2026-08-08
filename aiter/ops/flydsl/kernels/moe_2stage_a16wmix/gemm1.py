@@ -785,6 +785,12 @@ def compile_gemm1_a16w4_port(
     assert (
         _INTER % TILE_N == 0
     ), f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
+    # 4 waves repartition into (4//k_wave) N-waves; each owns TILE_N//(4//k_wave)
+    # columns -> num_acc_n = that // 16. num_acc_n==0 makes every accumulate/store
+    # loop empty -> silent all-zero output that times fast (e.g. TILE_N=32,k_wave=1).
+    assert (
+        TILE_N // (4 // k_wave)
+    ) >= 16, f"TILE_N//(4//k_wave) must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}, k_wave={k_wave}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N
 

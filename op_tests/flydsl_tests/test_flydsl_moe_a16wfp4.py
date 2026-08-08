@@ -46,7 +46,13 @@ def _cos_diff(x, y):
 @_SKIP
 @pytest.mark.parametrize("model_dim,inter_dim", [(3584, 512), (3584, 384)])
 @pytest.mark.parametrize("token", [1, 16, 128])
-def test_flydsl_a16wfp4_situv2_e2e(model_dim, inter_dim, token):
+# (1,1) = plain tanh; (4,25) = kimi-k3 production betas, which exercise the
+# runtime situ_beta/situ_linear_beta f32 args (beta is NOT a compile key, so this
+# adds no extra kernel compiles).
+@pytest.mark.parametrize("situ_beta,situ_linear_beta", [(1.0, 1.0), (4.0, 25.0)])
+def test_flydsl_a16wfp4_situv2_e2e(
+    model_dim, inter_dim, token, situ_beta, situ_linear_beta
+):
     """a16w4 SiTUv2 SEPARATED end-to-end through fused_moe vs a bf16 SiTUv2 ref."""
     E, topk = 896, 16
     dtype = dtypes.bf16
@@ -80,8 +86,8 @@ def test_flydsl_a16wfp4_situv2_e2e(model_dim, inter_dim, token):
         a1_scale=None,
         w1_scale=w1_scale_e,
         doweight=False,
-        situ_beta=1.0,
-        situ_linear_beta=1.0,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     ref = torch_moe_stage2(
         o1.view(token, topk, inter_dim),
@@ -114,6 +120,8 @@ def test_flydsl_a16wfp4_situv2_e2e(model_dim, inter_dim, token):
         activation=ActivationType.Situv2,
         doweight_stage1=False,
         gate_mode=GateMode.SEPARATED.value,
+        beta=situ_beta,
+        linear_beta=situ_linear_beta,
     )
 
     assert not out.isnan().any().item(), "a16w4 SiTUv2 output contains NaN"

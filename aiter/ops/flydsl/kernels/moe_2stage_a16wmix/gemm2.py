@@ -612,6 +612,12 @@ def compile_gemm2_a16w4_port(
     assert (
         N_OUT % TILE_N == 0
     ), f"model_dim (N_OUT) must be a multiple of {TILE_N}, got {N_OUT}"
+    # 4 waves split TILE_N (TILE_N//4 cols each) -> num_acc_n = (TILE_N//4)//16.
+    # num_acc_n==0 makes every accumulate/store loop empty -> silent all-zero
+    # output that times fast (e.g. TILE_N=32). Require TILE_N >= 64.
+    assert (
+        TILE_N // 4
+    ) >= 16, f"TILE_N//4 must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
