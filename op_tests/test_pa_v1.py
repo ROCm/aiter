@@ -590,6 +590,139 @@ def test_paged_attention(
     #     f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
 
 
+def _valid_pa_v1_args(
+    num_seqs=2,
+    num_heads=8,
+    num_kv_heads=1,
+    head_size=128,
+    ctx_lens=512,
+    block_size=16,
+    partition_size=256,
+    seed=0,
+):
+    """A launch that paged_attention_v1 accepts, as a dict the caller can perturb.
+
+    Seeded, so that the same arguments produce the same inputs on every call.
+    """
+    torch.manual_seed(seed)
+    num_blocks_per_seq = (ctx_lens + block_size - 1) // block_size
+    num_blocks = num_seqs * num_blocks_per_seq
+    max_num_partitions = (ctx_lens + partition_size - 1) // partition_size
+    query = torch.randn(num_seqs, num_heads, head_size, dtype=dtypes.bf16)
+    kv_shape = (num_blocks, block_size, num_kv_heads, head_size)
+    scale = torch.tensor([1.0], dtype=dtypes.fp32)
+    return {
+        "out": torch.empty_like(query),
+        "workspace_buffer": torch.empty(
+            num_seqs * num_heads * max_num_partitions * head_size * query.element_size()
+            + 2 * num_seqs * num_heads * max_num_partitions * 4,
+            dtype=torch.uint8,
+        ),
+        "query": query,
+        "key_cache": torch.randn(kv_shape, dtype=dtypes.bf16),
+        "value_cache": torch.randn(kv_shape, dtype=dtypes.bf16),
+        "scale": head_size**-0.5,
+        "block_tables": torch.arange(num_blocks, dtype=dtypes.i32).reshape(
+            num_seqs, num_blocks_per_seq
+        ),
+        "cu_query_lens": None,
+        "context_lens": torch.full((num_seqs,), ctx_lens, dtype=dtypes.i32),
+        "max_context_len": ctx_lens,
+        "alibi_slopes": None,
+        "kv_cache_dtype": "auto",
+        "kv_cache_layout": "NHD",
+        "logits_soft_cap": 0.0,
+        "k_scale": scale,
+        "v_scale": scale,
+        "fp8_out_scale": None,
+        "partition_size": partition_size,
+    }
+
+
+def _call_pa_v1(kwargs):
+    torch.ops.aiter.paged_attention_v1(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "perturb, match",
+    [
+        # The workspace check is the only one that depends on a per-call value
+        # rather than the launch shape, so it must survive plan caching.
+        (
+            lambda a: a.update(workspace_buffer=a["workspace_buffer"][:16]),
+            "workspace_buffer is too small",
+        ),
+        (
+            lambda a: a.update(block_tables=a["block_tables"].flatten()),
+            "block_tables must be 2D",
+        ),
+        (
+            lambda a: a.update(block_tables=a["block_tables"][:, :1]),
+            "is too small for max_context_len",
+        ),
+        (
+            lambda a: a.update(context_lens=a["context_lens"][:1]),
+            "must match block_tables",
+        ),
+        (
+            lambda a: a.update(kv_cache_dtype="not_a_dtype"),
+            "unsupported kv_cache_dtype",
+        ),
+    ],
+)
+def test_paged_attention_rejects_bad_args(perturb, match):
+    torch.set_default_device("cuda:0")
+    args = _valid_pa_v1_args()
+    _call_pa_v1(args)  # the unperturbed launch must succeed
+    perturb(args)
+    with pytest.raises(ValueError, match=match):
+        _call_pa_v1(args)
+
+
+def test_paged_attention_plan_cache_tracks_shape_changes():
+    """Consecutive launches of differing shapes must not reuse a stale kernel plan.
+
+    Every field the launch depends on is varied while the process (and therefore
+    the plan cache) is shared, and each result is checked against the reference.
+    """
+    torch.set_default_device("cuda:0")
+    shapes = [
+        (2, 8, 1, 512),
+        (5, 32, 4, 512),
+        (2, 8, 1, 1024),  # more partitions, same heads
+        (2, 32, 4, 512),  # different gqa_ratio, context back to 512
+        (2, 8, 1, 512),  # the very first shape again
+    ]
+    for num_seqs, num_heads, num_kv_heads, ctx_lens in shapes:
+        args = _valid_pa_v1_args(num_seqs, num_heads, num_kv_heads, ctx_lens=ctx_lens)
+        _call_pa_v1(args)
+        golden, _ = run_torch(
+            args["query"],
+            args["key_cache"].permute(0, 2, 1, 3),
+            args["value_cache"].permute(0, 2, 1, 3),
+            args["block_tables"],
+            args["context_lens"],
+            ctx_lens,
+            "auto",
+            num_kv_heads,
+            args["scale"],
+            None,
+            0.0,
+            args["k_scale"],
+            args["v_scale"],
+            num_heads // num_kv_heads,
+            0,
+        )
+        assert (
+            checkAllclose(
+                golden,
+                args["out"],
+                msg=f"{num_seqs=} {num_heads=} {num_kv_heads=} {ctx_lens=}",
+            )
+            < 0.01
+        )
+
+
 @pytest.mark.parametrize("ctx_lens", [1, 26, 128, 4097])
 @pytest.mark.parametrize("num_seqs", [1, 3, 31, 128])
 @pytest.mark.parametrize("num_heads", [(8, 1), (32, 4)])
