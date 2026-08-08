@@ -5,20 +5,7 @@
 from __future__ import annotations
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
-
-
-def _pack_i32_pair_to_i64(a_i32, b_i32):
-    return fx.Vector.from_elements([a_i32, b_i32], dtype=fx.Int32).bitcast(fx.Int64)[0]
-
-
-def _pack_lo_i64x2_to_i32x8(x0, x1):
-    undef0 = _llvm.mlir_undef(T.i64)
-    undef1 = _llvm.mlir_undef(T.i64)
-    return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
-        fx.Int32
-    )
 
 
 def _i32_buffer(ptr, width=1):

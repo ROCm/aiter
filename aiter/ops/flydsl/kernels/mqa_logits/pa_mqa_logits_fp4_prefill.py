@@ -13,12 +13,10 @@ import triton
 import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
-from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Float4E2M1FN, Int32, T
 from .pa_mqa_logits_fp4_common import (
     _i32_buffer,
     _load_vec4_i32,
-    _pack_i32_pair_to_i64,
-    _pack_lo_i64x2_to_i32x8,
 )
 
 DEFAULT_HEADS = 64
@@ -311,6 +309,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
+        # Scaled FP4 16x16x128 MMA; opsel_b selects the per-nt scale byte, so one
+        # atom per nt (opsel_a stays 0 — Q scale is one byte per (k_tile, mi)).
+        mfma_atoms = [
+            fx.make_mma_atom(
+                fx.rocdl.cdna4.MFMA_Scale(
+                    16, 16, 128, Float4E2M1FN, Float4E2M1FN, opsel_a=0, opsel_b=nt
+                )
+            )
+            for nt in range(N_TILES_PER_WARP)
+        ]
+
         Q_buf = fx.rocdl.make_buffer_tensor(q_ptr)
         q_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 8)
         q_reg_ty = fx.MemRefType.get(
@@ -328,9 +337,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 r = fx.memref_alloca(q_reg_ty, q_reg_lay)
                 fx.copy(q_atom, fx.slice(q_row_div, (None, col_idx)), r)
                 q_4xi32 = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
-                q_i64_0 = _pack_i32_pair_to_i64(q_4xi32[0], q_4xi32[1])
-                q_i64_1 = _pack_i32_pair_to_i64(q_4xi32[2], q_4xi32[3])
-                q_a_ops_kt.append(_pack_lo_i64x2_to_i32x8(q_i64_0, q_i64_1))
+                a_frag = fx.make_rmem_tensor(4, fx.Int32)
+                a_frag.store(q_4xi32)
+                q_a_ops_kt.append(a_frag)
             q_a_ops.append(q_a_ops_kt)
 
         # Q scale: host-preshuffled [total_tokens, K_TILES, 4, 16, QS_PAD].
@@ -431,27 +440,25 @@ def build_pa_mqa_logits_fp4_prefill_module(
         def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
+            # opsel_b=nt is baked into the atom; scale_b is the packed 4-nt word.
+            atom = mfma_atoms[nt]
             for k_tile in range_constexpr(k_tiles):
-                kv_4xi32 = fx.Vector(kv_list_in[nt * k_tiles + k_tile])
-                kv_i64_0 = _pack_i32_pair_to_i64(kv_4xi32[0], kv_4xi32[1])
-                kv_i64_1 = _pack_i32_pair_to_i64(kv_4xi32[2], kv_4xi32[3])
-                kv_b = _pack_lo_i64x2_to_i32x8(kv_i64_0, kv_i64_1)
+                b_frag = fx.make_rmem_tensor(4, fx.Int32)
+                b_frag.store(fx.Vector(kv_list_in[nt * k_tiles + k_tile]))
                 kv_scale_packed = kvs_packed_per_kt[k_tile]
                 for mi_idx in range_constexpr(m_tiles):
-                    accs[mi_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        T.f32x4,
-                        [
-                            q_a_ops[k_tile][mi_idx],
-                            kv_b,
-                            accs[mi_idx],
-                            4,
-                            4,
-                            0,
-                            q_scale_ops[k_tile][mi_idx],
-                            nt,  # opselB: hardware byte-select byte `nt` of scaleB
-                            kv_scale_packed,
-                        ],
+                    c_frag = fx.make_rmem_tensor(4, fx.Float32)
+                    c_frag.store(fx.Vector(accs[mi_idx]))
+                    fx.gemm(
+                        atom,
+                        c_frag,
+                        q_a_ops[k_tile][mi_idx],
+                        b_frag,
+                        c_frag,
+                        scale_a=q_scale_ops[k_tile][mi_idx],
+                        scale_b=kv_scale_packed,
                     )
+                    accs[mi_idx] = c_frag.load()
             return accs
 
         def _post_process_nt(accs, nt, c_i32_arg):
