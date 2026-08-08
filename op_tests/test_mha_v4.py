@@ -255,3 +255,21 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@pytest.mark.parametrize("q_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
+    torch.manual_seed(37)
+    q = torch.randn((1, 129, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    eager = mha_v4(q, k, v, q_format, q_format, AttentionFormat.MXFP4)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, q_format, q_format, AttentionFormat.MXFP4
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+    assert torch.isfinite(compiled).all()
