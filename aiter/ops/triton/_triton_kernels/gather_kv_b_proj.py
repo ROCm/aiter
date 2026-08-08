@@ -414,7 +414,10 @@ def _triton_gather_kv_b_proj_impl(
     # ===---------------------------------------------------
     # Workload Partition
     # ===---------------------------------------------------
-    pid = tl.program_id(0)
+    flat_pid = tl.program_id(0)
+    num_batch_heads = batch_size * TpNumHeads
+    pid = flat_pid % num_batch_heads
+    chunk_id = flat_pid // num_batch_heads
     pid_batch = pid // TpNumHeads
     pid_head = pid % TpNumHeads
 
@@ -608,7 +611,7 @@ def _triton_gather_kv_b_proj_impl(
     else:
         CHUNK_STRIDE: tl.constexpr = ScaleKGranularity
 
-    for chunk_id in range((total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK):
+    if chunk_id < (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK:
         block_lane_valid = (
             chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
             < total_kv_block
