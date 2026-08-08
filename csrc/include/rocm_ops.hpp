@@ -164,9 +164,11 @@ namespace py = pybind11;
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
     m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
-#define AITER_UNARY_PYBIND                                  \
-    m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
-    m.def("tanh", &aiter_tanh, "apply for tanh.");
+#define AITER_UNARY_PYBIND                                                        \
+    AITER_SET_STREAM_PYBIND;                                                      \
+    m.def(                                                                        \
+        "sigmoid", &aiter_sigmoid, "apply for sigmoid.", py::arg("out"), py::arg("input")); \
+    m.def("tanh", &aiter_tanh, "apply for tanh.", py::arg("out"), py::arg("input"));
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
