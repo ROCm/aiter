@@ -371,6 +371,119 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     )
 
 
+def _pack_qkv(args, query, key, value):
+    """Re-materialize q/k/v as views into one packed ``mixed_qkv`` tensor.
+
+    This is the layout a GDN linear-attention layer actually produces: the qkv
+    projection writes a single ``[b, sq, 2*num_k_heads*head_k_dim +
+    num_v_heads*head_v_dim]`` tensor and q/k/v are last-dim slices of it. Each
+    slice is non-contiguous (its row stride spans the whole packed width), so
+    ``qkv_contiguous=True`` has to copy all three.
+    """
+    kd = args.num_k_heads * args.head_k_dim
+    vd = args.num_v_heads * args.head_v_dim
+    mixed = torch.empty((args.b, args.sq, 2 * kd + vd), dtype=args.dtype, device="cuda")
+    mixed[..., :kd] = query.reshape(args.b, args.sq, kd)
+    mixed[..., kd : 2 * kd] = key.reshape(args.b, args.sq, kd)
+    mixed[..., 2 * kd :] = value.reshape(args.b, args.sq, vd)
+    q = mixed[..., :kd].view(args.b, args.sq, args.num_k_heads, args.head_k_dim)
+    k = mixed[..., kd : 2 * kd].view(args.b, args.sq, args.num_k_heads, args.head_k_dim)
+    v = mixed[..., 2 * kd :].view(args.b, args.sq, args.num_v_heads, args.head_v_dim)
+    # Every slice keeps the packed row stride somewhere in its strides, so none
+    # is a dense [b, sq, heads, dim] tensor. (b == sq == 1 is degenerate: there
+    # is only one row, so the slices really are dense -- the explicit-stride path
+    # is still exercised, just with contiguous strides.)
+    if args.b * args.sq > 1:
+        packed = 2 * kd + vd
+        assert packed in q.stride() and packed in k.stride()
+        assert packed in v.stride()
+    return q, k, v
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        Args(
+            dtype=torch.bfloat16,
+            b=1,
+            sq=1,
+            num_k_heads=2,
+            num_v_heads=8,
+            head_k_dim=128,
+            head_v_dim=128,
+        ),
+        Args(
+            dtype=torch.bfloat16,
+            b=128,
+            sq=1,
+            num_k_heads=2,
+            num_v_heads=8,
+            head_k_dim=128,
+            head_v_dim=128,
+        ),
+        Args(
+            dtype=torch.float16,
+            b=2,
+            sq=2,
+            num_k_heads=16,
+            num_v_heads=32,
+            head_k_dim=128,
+            head_v_dim=128,
+        ),
+    ],
+)
+def test_flydsl_gdr_decode_strided(args):
+    """``qkv_contiguous=False`` on packed q/k/v must be bit-identical to copying.
+
+    Reading the strided views directly is a pure layout change -- the kernel does
+    the same arithmetic in the same order -- so this asserts byte equality of both
+    outputs, not ``allclose``. A stride miscomputation would read the wrong
+    elements and produce plausible garbage with no error.
+    """
+    _, query, key, value, a, b, dt_bias, A_log, indices, state = create_inputs(args)
+    q, k, v = _pack_qkv(args, query, key, value)
+
+    out_copy, out_view = create_outputs(args)[0], create_outputs(args)[0]
+    state_copy, state_view = state.clone(), state.clone()
+
+    common = {"use_qk_l2norm": args.use_qk_l2norm, "need_shuffle_state": True}
+    flydsl_gdr_decode(
+        q,
+        k,
+        v,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state_copy,
+        out_copy,
+        qkv_contiguous=True,
+        **common,
+    )
+    flydsl_gdr_decode(
+        q,
+        k,
+        v,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state_view,
+        out_view,
+        qkv_contiguous=False,
+        **common,
+    )
+
+    assert torch.equal(
+        out_view, out_copy
+    ), f"strided out differs at {(out_view != out_copy).sum().item()} elements"
+    assert torch.equal(
+        state_view, state_copy
+    ), f"strided state differs at {(state_view != state_copy).sum().item()} elements"
+
+
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     run_triton_kernel(
         out,
