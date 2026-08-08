@@ -1,0 +1,55 @@
+diff --git a/.buildkite/amd-disagg/vllm_disagg.sh b/.buildkite/amd-disagg/vllm_disagg.sh
+index 0974862..9fb948e 100644
+--- a/.buildkite/amd-disagg/vllm_disagg.sh
++++ b/.buildkite/amd-disagg/vllm_disagg.sh
+@@ -176 +176 @@ run_bench() {
+-run_accuracy() {
++ensure_lm_eval() {
+@@ -182,0 +183,33 @@ run_accuracy() {
++}
++
++run_v3_2p2d_warmup() {
++    if [[ "${MODEL_NAME}" != "DeepSeek-V3" || "${WIDE_EP_MODE}" != "0" \
++          || "${xP}" != "2" || "${yD}" != "2" \
++          || "${RUN_AFTER_HEALTH}" != "accuracy" ]]; then
++        return 0
++    fi
++
++    ensure_lm_eval || return $?
++    local base_url="http://127.0.0.1:${GATEWAY_PORT:-${PROXY_PORT}}/v1/completions"
++    local ts; ts="$(date +%Y%m%d_%H%M%S)"
++    local logf="${LOG_PATH}/warmup_${MODEL_NAME}_${PARALLEL_MODE}_${ts}.log"
++    log "DeepSeek-V3 2P2D warmup start: requests=64 concurrency=64 -> ${base_url}"
++
++    local warmup_rc=0
++    ( set -o pipefail
++      export HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0
++      python3 -m lm_eval --model local-completions \
++        --tasks gsm8k \
++        --limit 64 \
++        --model_args "model=${MODEL_PATH},base_url=${base_url},num_concurrent=64,max_retries=1,tokenized_requests=False,trust_remote_code=True,timeout=1200" \
++        2>&1 | tee "${logf}"
++    ) || warmup_rc=$?
++    if (( warmup_rc != 0 )); then
++        log "FAIL: DeepSeek-V3 2P2D warmup exited rc=${warmup_rc} — Log: ${logf}"
++        return "${warmup_rc}"
++    fi
++    log "DeepSeek-V3 2P2D warmup complete: requests=64 concurrency=64"
++}
++
++run_accuracy() {
++    ensure_lm_eval || return $?
+@@ -396,0 +430,5 @@ build_server_cmd() {
++    if [[ "${MODEL_NAME}" == "DeepSeek-V3" && "${WIDE_EP_MODE}" == "0" \
++          && "${xP}" == "2" && "${yD}" == "2" ]]; then
++        export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}"
++        log "DeepSeek-V3 2P2D execute-model timeout: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS}s"
++    fi
+@@ -488 +526 @@ orchestrate_master() {
+-            run_workload
++            run_v3_2p2d_warmup
+@@ -489,0 +528,4 @@ orchestrate_master() {
++            if (( rc == 0 )); then
++                run_workload
++                rc=$?
++            fi

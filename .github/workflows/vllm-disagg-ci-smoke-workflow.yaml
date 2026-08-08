@@ -270,6 +270,12 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
+      - name: Checkout AITER CI patch
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/patches/vllm-47030-v3-2p2d-warmup.patch
+          sparse-checkout-cone-mode: false
+
       - name: Select Spur nodes for topology
         run: |
           set -euo pipefail
@@ -303,7 +309,7 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM main and apply full PR 47030 patch series
+      - name: Checkout vLLM main, PR 47030, and V3 2P2D warmup
         run: |
           set -euo pipefail
           rm -rf vllm
@@ -321,6 +327,15 @@ jobs:
           curl --fail --location --silent --show-error --retry 3 \
             "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
             git am -3
+
+          # Temporary experiment for the reproducible V3 2P2D inference-time JIT
+          # timeout. Keep this on top of PR #47030 so it is easy to drop or move
+          # upstream after the result is known.
+          warmup_patch="${GITHUB_WORKSPACE}/.github/patches/vllm-47030-v3-2p2d-warmup.patch"
+          git apply --check --unidiff-zero "${warmup_patch}"
+          git apply --unidiff-zero "${warmup_patch}"
+          git add .buildkite/amd-disagg/vllm_disagg.sh
+          git commit -m "CI: warm DeepSeek-V3 2P2D before accuracy"
 
           echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
           echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
@@ -395,6 +410,7 @@ jobs:
             echo "- vLLM branch: \`${VLLM_BRANCH}\`"
             echo "- vLLM base SHA: \`${VLLM_BASE_SHA}\`"
             echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
+            echo "- Temporary V3 2P2D warmup patch: \`enabled\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
