@@ -197,6 +197,13 @@ def _kda_reference(args, initial_state):
         (4, 12, torch.bfloat16, False, False, 1, 1),
         (4, 12, torch.bfloat16, True, True, 1, 1),
         (4, 12, torch.bfloat16, True, False, 1, 8),
+        # The batch sizes with 12x12 rows in gdr_decode_tuned.csv; before
+        # these, only B=4's geometry was reachable from a test.
+        (1, 12, torch.bfloat16, True, False, 1, 1),
+        (64, 12, torch.bfloat16, True, False, 1, 1),
+        (256, 12, torch.bfloat16, True, False, 1, 1),
+        # Past K3's head count: no tuned row, so the fallback geometry.
+        (2, 64, torch.bfloat16, True, False, 1, 1),
     ],
     ids=[
         "b1_h8_bf16",
@@ -206,6 +213,10 @@ def _kda_reference(args, initial_state):
         "no_shuffle",
         "padded_state",
         "strided_indices",
+        "b1_h12_tuned",
+        "b64_h12_tuned",
+        "b256_h12_tuned",
+        "b2_h64",
     ],
 )
 def test_kda_per_channel_gate_matches_torch_reference(
