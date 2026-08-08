@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -26,8 +27,6 @@ from .utils import (
     _raw,
     _udiv,
     _umod,
-    kmchunks_for,
-    lds_acc_bytes_for,
 )
 
 # gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
@@ -54,7 +53,7 @@ def _atomic_bf16_epilog(
     N_OUT,
     BN,
 ):
-    _kMChunks = kmchunks_for(BM)
+    _kMChunks = BM // 16
     M_REPS = BM // 8
     # 4 waves split the BN(=TILE_N) tile (generic over BN, e.g. int4 tile_n=128).
     _n_per_wave = BN // 4
@@ -428,7 +427,7 @@ def _gemm2_body_a16w4(
             scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
         return scales
 
-    vec2_bf16 = ir.Type.parse("vector<2xbf16>")
+    vec2_bf16 = T.vec(2, T.bf16)
 
     def upconvert_b(raw, ku, scale_f32):
         if const_expr(_is_bf16):
@@ -576,6 +575,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
     return total_work
 
 
+@functools.cache
 def compile_gemm2_a16w4_port(
     BM=32,
     *,
@@ -624,7 +624,7 @@ def compile_gemm2_a16w4_port(
 
     # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N f32).
     _a_bytes = BM * KH_TILE_BYTES
-    _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
+    _acc_bytes = BM * TILE_N * 4  # f32 accumulator region
     _lds_bytes = _a_bytes + _acc_bytes
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"

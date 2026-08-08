@@ -580,7 +580,6 @@ def compile_flydsl_moe_stage1(
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
-        from .kernels.moe_2stage_a16wmix.utils import a16wmix_use_k16
 
         return compile_gemm1_a16w4_port(
             BM=tile_m,
@@ -597,7 +596,8 @@ def compile_flydsl_moe_stage1(
             w_dtype="fp4",
             w_layout="standard",
             k_wave=k_wave,
-            use_k16=a16wmix_use_k16(get_rocm_arch()),
+            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
+            use_k16="gfx95" not in str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -691,7 +691,6 @@ def compile_flydsl_moe_stage2(
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
-        from .kernels.moe_2stage_a16wmix.utils import a16wmix_use_k16
 
         return compile_gemm2_a16w4_port(
             BM=tile_m,
@@ -704,7 +703,8 @@ def compile_flydsl_moe_stage2(
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype="fp4",
-            use_k16=a16wmix_use_k16(get_rocm_arch()),
+            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
+            use_k16="gfx95" not in str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2

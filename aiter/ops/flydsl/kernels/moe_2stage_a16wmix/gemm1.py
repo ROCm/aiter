@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -424,7 +425,7 @@ def _gemm1_body_a16w4(
             scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
         return scales
 
-    vec2_bf16 = ir.Type.parse("vector<2xbf16>")
+    vec2_bf16 = T.vec(2, T.bf16)
 
     def upconvert_b(raw, ku, scale_f32):
         if const_expr(_is_bf16):
@@ -722,6 +723,7 @@ def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
     return int(max_m_blocks) * num_n_blocks
 
 
+@functools.cache
 def compile_gemm1_a16w4_port(
     BM=32,
     *,

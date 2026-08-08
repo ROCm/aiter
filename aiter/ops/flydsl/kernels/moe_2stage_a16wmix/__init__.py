@@ -19,8 +19,6 @@ Launch args are raw device pointers (``fx.Int64``); tensors passed as
 ``.data_ptr()``.
 """
 
-import functools
-
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
@@ -28,7 +26,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
-from .utils import a16wmix_use_k16
 
 __all__ = [
     "compile_gemm1_a16w4_port",
@@ -40,73 +37,10 @@ __all__ = [
 ]
 
 
-@functools.cache
-def _get_compiled_gemm1_a16w4(
-    BM,
-    D_HIDDEN,
-    D_INTER,
-    NE,
-    topk,
-    TILE_N,
-    TILE_K,
-    act,
-    b_cache_mod,
-    xcd_swizzle,
-    waves_per_eu,
-    w_dtype="fp4",
-    w_layout="standard",
-    k_wave=1,
-):
-    # _get_compiled_* is @functools.cache'd, so this builder runs once; the
-    # returned @flyc.jit launcher is then dispatched via _run_compiled.
-    return compile_gemm1_a16w4_port(
-        BM=BM,
-        D_HIDDEN=D_HIDDEN,
-        D_INTER=D_INTER,
-        NE=NE,
-        TOPK=topk,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        act=act,
-        b_cache_mod=b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        w_layout=w_layout,
-        k_wave=k_wave,
-        use_k16=a16wmix_use_k16(get_rocm_arch()),
-    )
-
-
-@functools.cache
-def _get_compiled_gemm2_a16w4(
-    BM,
-    NE,
-    N_OUT,
-    D_INTER,
-    TILE_N,
-    TILE_K,
-    b_cache_mod=2,
-    xcd_swizzle=1,
-    waves_per_eu=None,
-    w_dtype="fp4",
-    persist=False,
-    topk=1,
-):
-    return compile_gemm2_a16w4_port(
-        BM=BM,
-        NE=NE,
-        N_OUT=N_OUT,
-        D_INTER=D_INTER,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        b_cache_mod=b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        persist=persist,
-        use_k16=a16wmix_use_k16(get_rocm_arch()),
-    )
+# gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
+# scalar dequant fallback; gfx950 (CDNA4) uses the K=32 path. compile_gemm{1,2}_a16w4_port
+# are @functools.cache'd, so building through them directly (all-keyword) shares one
+# compile with moe_kernels.py's AOT/runtime direct calls.
 
 
 def flydsl_a16w4_gemm1(
@@ -189,21 +123,22 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
-    launch = _get_compiled_gemm1_a16w4(
-        BM,
-        D_HIDDEN,
-        D_INTER,
-        NE,
-        topk,
-        TILE_N,
-        TILE_K,
-        act,
-        b_cache_mod,
-        xcd_swizzle,
-        waves_per_eu,
-        w_dtype,
-        w_layout,
-        k_wave,
+    launch = compile_gemm1_a16w4_port(
+        BM=BM,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        NE=NE,
+        TOPK=topk,
+        TILE_N=TILE_N,
+        TILE_K=TILE_K,
+        act=act,
+        b_cache_mod=b_cache_mod,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        w_dtype=w_dtype,
+        w_layout=w_layout,
+        k_wave=k_wave,
+        use_k16="gfx95" not in str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -297,19 +232,19 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
-    launch = _get_compiled_gemm2_a16w4(
-        BM,
-        NE,
-        D_HIDDEN,
-        D_INTER,
-        TILE_N,
-        TILE_K,
-        _b_cache_mod,
-        xcd_swizzle,
-        waves_per_eu,
-        w_dtype,
-        _persist,
-        topk,
+    launch = compile_gemm2_a16w4_port(
+        BM=BM,
+        NE=NE,
+        N_OUT=D_HIDDEN,
+        D_INTER=D_INTER,
+        TILE_N=TILE_N,
+        TILE_K=TILE_K,
+        b_cache_mod=_b_cache_mod,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        w_dtype=w_dtype,
+        persist=_persist,
+        use_k16="gfx95" not in str(get_rocm_arch()),
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

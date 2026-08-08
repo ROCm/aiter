@@ -9,7 +9,6 @@ upconvert, index math) used by both stage1 (:mod:`gemm1`) and stage2
 """
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -20,16 +19,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
 # K-group). Scale packed bf16 pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
 A16WI4_GROUP_SIZE = 32
-
-
-def a16wmix_use_k16(arch):
-    """True for the gfx942 (CDNA3) codepath: K=16 MFMA + scalar int4 dequant.
-
-    Arch-gate: gfx950 (CDNA4) has K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32;
-    gfx942 has neither and falls back to K=16 MFMA + scalar-trunc dequant. The caller
-    passes the target arch (e.g. ``get_rocm_arch()``).
-    """
-    return "gfx95" not in str(arch)
 
 
 def _udiv(a, c):
@@ -109,7 +98,7 @@ def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
     # the stateless rocdl.cvt_pk_bf16_f32 gets CSE-merged/reordered across K steps in
     # the a16wi4 gemm1 hot loop (garbage output); side_effects pins each call.
     return llvm.inline_asm(
-        ir.IntegerType.get_signless(32),
+        T.i32,
         [_raw(src_a_f32), _raw(src_b_f32)],
         "v_cvt_pk_bf16_f32 $0, $1, $2",
         "=v,v,v",
@@ -163,11 +152,3 @@ def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
         return col_bytes
     rem = row & fx.Int32(k_blocks16 - 1)
     return col_bytes ^ (rem * fx.Int32(16))
-
-
-def kmchunks_for(BM):
-    return BM // 16
-
-
-def lds_acc_bytes_for(rows, BN):
-    return rows * BN * 4
