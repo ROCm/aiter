@@ -554,6 +554,7 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    is_causal=0,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -690,6 +691,7 @@ def mla_decode_fwd(
             cp_rank,
             valid_split_count,
             use_valid_split_count_reduce,
+            int(is_causal),
         )
 
         if num_kv_splits == 1 and (
@@ -914,6 +916,7 @@ def mla_decode_fwd(
                 cp_rank,
                 None,
                 0,
+                int(is_causal),
             )
 
         _mla_decode_reduce_v1_dispatch(
