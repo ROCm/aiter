@@ -14,14 +14,15 @@
 // the shared arch-router template instantiation and are never invoked for
 // gfx1250 (opus_gemm.cu forces <fp32_t> for split-K kids).
 //
-// Included exactly once, by opus_gemm.cu, AFTER gfx950's arch header so the
-// shared flat-array helpers in opus_gfx950_detail are visible (reused here).
+// Included exactly once, by opus_gemm.cu. Self-contained: the shared flat-array
+// dispatch types live in opus_gfx1250_detail (opus_gemm_heuristic_dispatch_
+// gfx1250.cuh), so this header does NOT depend on any gfx950 header and a
+// gfx1250-only build compiles without OPUS_BUILD_HAS_GFX950.
 #pragma once
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
-#include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"   // OpusA16W16NoscaleKernel + opus_gfx950_detail::*
-#include "opus_gemm_heuristic_dispatch_gfx1250.cuh"          // opus_a16w16_heuristic_kid_gfx1250
+#include "opus_gemm_heuristic_dispatch_gfx1250.cuh"          // OpusA16W16NoscaleKernel + opus_gfx1250_detail::* + opus_a16w16_heuristic_kid_gfx1250
 #include "opus_gemm_lookup.h"                                // GENERATE_OPUS_LOOKUP_TABLE_FP32
 #include "opus_gemm_a16w16_tune_lookup.h"                    // GENERATE_A16W16_TUNE_LOOKUP_FP32
 #include "opus_gemm_manifest.h"                              // launcher symbols
@@ -36,14 +37,14 @@
 // would be an empty array in a gfx1250-only build) and is never called.
 
 template <typename CDataType>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250(int id);
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16TuneEntry kTune[] = {
         GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)
     };
@@ -57,7 +58,7 @@ opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
 }
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
 {
     // gfx1250 split-K kids are emitted <fp32_t> only; the reduce kernel handles
@@ -92,14 +93,14 @@ inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
 }  // namespace opus_gfx1250_detail
 
 template <typename CDataType>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
         GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
     };
@@ -115,10 +116,10 @@ opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bi
 }
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bias)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
         GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
     };

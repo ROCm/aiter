@@ -448,16 +448,23 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     if (wave_split == 0) run(opus::true_type{});
     else                 run(opus::false_type{});
 
-    // ---- Plain store the fp32 partial into ws[split_idx][padded_m][padded_n]. ----
+    // ---- Store the partial into ws[split_idx][padded_m][padded_n]. ----
     // bias is folded once by the reduce kernel (not here).
-    constexpr int kCVec = T::kCVec;   // 4 (fp32 dwordx4)
-    DataAcc* ws_ptr = reinterpret_cast<DataAcc*>(kargs.ws_handle->ptr);
+    // OPUS_WS_BF16 (default 1): downcast the fp32 accumulator to bf16 (DataA) so
+    // the split-K-dominated reduce READ moves half the bytes (reduce re-accumulates
+    // in fp32). The reduce kernel is instantiated with the matching D_WS.
+#ifndef OPUS_WS_BF16
+#define OPUS_WS_BF16 1
+#endif
+    using DataWs          = typename std::conditional<(OPUS_WS_BF16 != 0), DataA, DataAcc>::type;
+    constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
+    DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);
     const size_t ws_split = (size_t)split_idx * (size_t)kargs.stride_ws_batch;
     const size_t ws_base  = ws_split + (size_t)tile_row * (size_t)kargs.stride_ws + (size_t)tile_col;
-    const unsigned int ws_bytes =
-        (unsigned int)(((size_t)kargs.stride_ws_batch
-                        - ((size_t)tile_row * kargs.stride_ws + tile_col)) * sizeof(DataAcc));
-    auto g_ws = make_gmem<DataAcc>(ws_ptr + ws_base, ws_bytes);
+    const unsigned int ws_bytes = (unsigned int)(((size_t)kargs.stride_ws_batch -
+                                                  ((size_t)tile_row * kargs.stride_ws + tile_col)) *
+                                                 sizeof(DataWs));
+    auto g_ws                   = make_gmem<DataWs>(ws_ptr + ws_base, ws_bytes);
     auto u_gc = partition_layout_c<kCVec>(mma, opus::make_tuple((int)kargs.stride_ws, 1_I),
                     opus::make_tuple(wave_m, lane_id % mma.grpn_c, wave_n, lane_id / mma.grpn_c));
     // Consumer epilogue: rendezvous with the producers (all 4 waves) BEFORE the
@@ -470,7 +477,8 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     const int padded_n = kargs.stride_ws;
     const int padded_m = (kargs.stride_ws != 0) ? (int)(kargs.stride_ws_batch / kargs.stride_ws) : 0;
     if (tile_row < padded_m && tile_col < padded_n) {
-        store<kCVec>(g_ws, reg_c, u_gc, 0);
+        auto reg_c_ws = opus::cast<DataWs>(reg_c);
+        store<kCVec>(g_ws, reg_c_ws, u_gc, 0);
     }
 
     // Consumer epilogue: rendezvous with the producers (matches the producer's
