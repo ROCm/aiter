@@ -872,9 +872,10 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert (
-        not metadata.flat or get_gfx() == "gfx950"
-    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
+    assert not metadata.flat or get_gfx() in (
+        "gfx942",
+        "gfx950",
+    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1039,6 +1040,7 @@ def fused_moe_1stage(
     M: int | None = None,
     device=None,
     doweight_stage1: bool | None = None,
+    flat: int = 0,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -1130,6 +1132,7 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
+                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -2288,7 +2291,7 @@ def get_2stage_cfgs(
         run_1stage = False
         run_1stage_xbf16 = False
         # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = False
+        cfg_flat = 0
         if (
             activation,
             q_type,
@@ -2353,9 +2356,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
-            cfg_flat = False
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2410,6 +2413,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
+                flat=cfg_flat,
             ),
             None,
             block_m,

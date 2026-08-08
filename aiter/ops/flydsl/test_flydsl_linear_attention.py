@@ -452,3 +452,105 @@ def test_flydsl_gdr_decode(args):
         maxdiff_state = (inouts[-2] - ref_inouts[-2]).abs().max()
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
         assert is_allclose
+
+
+@pytest.mark.parametrize("input_index,input_name", [(1, "query"), (2, "key")])
+def test_flydsl_gdr_decode_rejects_noncontiguous_vector_dimension(
+    input_index, input_name
+):
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    inouts = list(create_inputs(args) + create_outputs(args))
+    tensor = inouts[input_index]
+    strided_storage = torch.randn(
+        *tensor.shape[:-1],
+        tensor.shape[-1] * 2,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    inouts[input_index] = strided_storage[..., ::2]
+    assert inouts[input_index].shape == tensor.shape
+    assert inouts[input_index].stride(-1) == 2
+
+    with pytest.raises(
+        ValueError,
+        match=rf"`{input_name}` must have a contiguous last dimension",
+    ):
+        func(*inouts)
+
+
+@pytest.mark.parametrize(
+    "num_k_heads,num_v_heads",
+    [(2, 8), (4, 8), (4, 16), (8, 16), (8, 32), (16, 32), (16, 64)],
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_flydsl_gdr_decode_strided_inputs_and_split_state_indices(
+    num_k_heads, num_v_heads, state_dtype
+):
+    batch, seq_length, dim = 2, 1, 128
+    mixed_qkv = torch.randn(
+        batch,
+        seq_length,
+        num_k_heads * 2 + num_v_heads,
+        dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    query, key, value = torch.split(
+        mixed_qkv, [num_k_heads, num_k_heads, num_v_heads], dim=2
+    )
+    mixed_ba = torch.randn(batch, num_v_heads * 2, dtype=torch.bfloat16, device="cuda")
+    a, b = (
+        tensor.reshape(batch, seq_length, num_v_heads)
+        for tensor in torch.split(mixed_ba, num_v_heads, dim=-1)
+    )
+    dt_bias = torch.randn(num_v_heads, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device="cuda")
+    read_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    write_indices = torch.tensor([2, 4], dtype=torch.int32, device="cuda")
+    state = torch.randn(5, num_v_heads, dim, dim, dtype=state_dtype, device="cuda")
+    reference_state = state.clone()
+    reference_state[write_indices.long()] = reference_state[read_indices.long()]
+    output = torch.empty_like(value)
+    reference_output = torch.empty_like(value)
+
+    common_kwargs = {
+        "dt_bias": dt_bias,
+        "A_log": A_log,
+        "indices": write_indices,
+        "use_qk_l2norm": True,
+        "need_shuffle_state": False,
+    }
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        state=state,
+        out=output,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        **common_kwargs,
+    )
+    flydsl_gdr_decode(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        a.contiguous(),
+        b.contiguous(),
+        state=reference_state,
+        out=reference_output,
+        **common_kwargs,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, reference_state, rtol=0, atol=0)
