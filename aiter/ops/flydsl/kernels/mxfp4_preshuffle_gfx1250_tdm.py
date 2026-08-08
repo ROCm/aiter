@@ -610,8 +610,7 @@ def launch_gemm_a8w4_tdm(
         BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
-        def load_state(buf, ksl):
-            bases = bases_of(buf)
+        def load_state(bases, ksl):
             ba, bb, bsa, bsb = bases
             act = [
                 to_rmem(ACT_NDW, load_a(ba, wm, ksl))
@@ -644,9 +643,8 @@ def launch_gemm_a8w4_tdm(
         xt_wt = [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
         xt_sc = fx.make_rmem_tensor(wmma_m_rep + wmma_n_rep, fx.Int32)
 
-        def xt_store(buf):
-            """Load subtile 0 of ``buf`` into the carry slots."""
-            bases = bases_of(buf)
+        def xt_store(bases):
+            """Load subtile 0 of the buffer ``bases`` points at into the carry."""
             ba, bb, bsa, bsb = bases
             sa_v = [load_sa(bsa, wm, 0) for wm in range_constexpr(wmma_m_rep)]
             sb_v = [load_sb(bsb, wn, 0) for wn in range_constexpr(wmma_n_rep)]
@@ -678,22 +676,22 @@ def launch_gemm_a8w4_tdm(
         # ``nxt_ksl`` is the next subtile inside this tile, ``xt_buf`` the next
         # tile's buffer. Both paths prefetch a complete A/B/scale state.
         def k_step(
-            buf,
+            bases,
             act,
             wt,
             sb_k,
             sa_k,
             nxt_ksl,
-            xt_buf=None,
+            xt_bases=None,
             xt_wait=None,
             issue_fn=None,
         ):
             if const_expr(nxt_ksl is not None):
-                prefetch = load_state(buf, nxt_ksl)
+                prefetch = load_state(bases, nxt_ksl)
             else:
                 prefetch = None
-            if const_expr(xt_buf is not None):
-                # ``xt_buf`` is read only here, at the tail of this tile, so its
+            if const_expr(xt_bases is not None):
+                # ``xt_bases`` is read only here, at the tail of this tile, so its
                 # READY fence belongs here and not at the tile top: the TDM gets
                 # this tile's whole compute to land. The barrier is not optional --
                 # under WAVE_SPEC a wave's tensorcnt covers only the TDMs it issued
@@ -707,7 +705,7 @@ def launch_gemm_a8w4_tdm(
                 # a whole tile-tail earlier than issuing at the next tile's top.
                 if const_expr(issue_fn is not None):
                     issue_fn()
-                xt_store(xt_buf)
+                xt_store(xt_bases)
             mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, act[front_wm:], wt, sa_k, sb_k)
@@ -747,20 +745,37 @@ def launch_gemm_a8w4_tdm(
                 rocdl.sched_barrier(0)
                 do_issue()
                 rocdl.sched_barrier(0)
-            prev = xt_read() if const_expr(from_xt) else load_state(buf, 0)
+            # Form every LDS base for this tile here, before any of its WMMA is
+            # issued. Each address v_add costs exactly one va_vdst(0) -- at the
+            # first ds_load that reads it; every later ds_load off the same
+            # register is free (112 ds_loads in the loop, only 6 guarded). So
+            # scattering the bases through the WMMA stream buys one full
+            # matrix-pipe drain per site, while clustering them here collapses
+            # them into a single drain, placed where the pipe is already
+            # quiesced by the caller's barrier/fence.
+            bases = bases_of(buf)
+            xt_bases = bases_of(nxt_buf) if const_expr(nxt_buf is not None) else None
+            # Hoisting in the source alone is not enough -- the backend happily
+            # rematerializes each base at its use, putting the v_add back in the
+            # middle of the WMMA stream. Pinning here forces them to be formed at
+            # this point and stay live, so the whole tile pays one va_vdst(0).
+            lds_addr_keepalive(*bases)
+            if const_expr(xt_bases is not None):
+                lds_addr_keepalive(*xt_bases)
+            prev = xt_read() if const_expr(from_xt) else load_state(bases, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                xt_buf = nxt_buf if const_expr(ksl + 1 == KWS) else None
+                xt_b = xt_bases if const_expr(ksl + 1 == KWS) else None
                 prev = k_step(
-                    buf,
+                    bases,
                     prev[0],
                     prev[1],
                     prev[2],
                     prev[3],
                     nxt_ksl,
-                    xt_buf,
-                    nxt_wait if const_expr(xt_buf is not None) else None,
-                    do_issue if const_expr(tail_issue and xt_buf is not None) else None,
+                    xt_b,
+                    nxt_wait if const_expr(xt_b is not None) else None,
+                    do_issue if const_expr(tail_issue and xt_b is not None) else None,
                 )
             front_mma = front_wm * wmma_n_rep
             back_mma = len(BACK) * wmma_n_rep
@@ -841,7 +856,7 @@ def launch_gemm_a8w4_tdm(
                     # it, unlike the per-owner-list loop below.
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    xt_store(ptr_to_idx(buf_ptr(0)))
+                    xt_store(bases_of(ptr_to_idx(buf_ptr(0))))
 
                 def steady_post(my_jobs):
                     for kt in range(n_steady):
@@ -889,7 +904,7 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - PRE
                 if const_expr(XT):
                     pipeline_fence(outstanding=TDM_PER * (PRE - 1))
-                    xt_store(ptr_to_idx(buf_ptr(0)))
+                    xt_store(bases_of(ptr_to_idx(buf_ptr(0))))
 
                 # With XT the tile's only fence lives at its last k128, next to the
                 # xt_store and the issue that need it (see k_step), and the tile top
