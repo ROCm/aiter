@@ -38,6 +38,30 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _expandable_segments_enabled() -> bool:
+    """Return the active PyTorch expandable-segments allocator setting."""
+    try:
+        snapshot = torch.cuda.memory._snapshot()
+        return bool(snapshot["allocator_settings"]["expandable_segments"])
+    except (AttributeError, KeyError, RuntimeError):
+        pass
+
+    for name in (
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "PYTORCH_HIP_ALLOC_CONF",
+        "PYTORCH_ALLOC_CONF",
+    ):
+        if name not in os.environ:
+            continue
+        enabled = False
+        for setting in os.environ[name].split(","):
+            key, separator, value = setting.partition(":")
+            if separator and key.strip() == "expandable_segments":
+                enabled = value.strip().lower() == "true"
+        return enabled
+    return False
+
+
 def _detect_gfx1250() -> bool:
     # Escape hatch for validating the old-arch (IPC + old kernel) path on gfx1250
     # hardware: forces the non-gfx1250 code path end to end.
@@ -721,6 +745,14 @@ class CustomAllreduce:
         if not custom_ar:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
+            return
+
+        if not self._use_vmm and _expandable_segments_enabled():
+            logger.warning(
+                "Custom allreduce is disabled because PyTorch expandable-segment "
+                "allocations cannot be exported with hipIpcGetMemHandle; falling "
+                "back to RCCL."
+            )
             return
 
         self.group = group
