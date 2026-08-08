@@ -320,7 +320,8 @@
     "module_deepgemm_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/opus_gemm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'"
+            "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/opus_bmm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
