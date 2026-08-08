@@ -50,6 +50,16 @@ class DispatchSlot(IntEnum):
     P2P_RUNNING = 30
     LAUNCH_READY = 31
     P2P_LAUNCH_READY = 32
+    MAX_EXPERT_TILES = 33
+    PAYLOAD_CHUNK_DONE = 34
+    TILE_READY = 35
+    P2P_TILE_READY = 36
+    TILE_EXPECTED = 37
+    ACTIVE_PAYLOAD_BLOCKS = 38
+    PAYLOAD_READY_ROWS = 39
+    P2P_PAYLOAD_READY_ROWS = 40
+    PAYLOAD_BLOCKS_PER_DESTINATION = 41
+    PAYLOAD_CHUNKS_PER_DESTINATION = 42
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -69,6 +79,18 @@ def _wave_inclusive_scan_i32(value, lane):
     source32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
     remote32 = fx.rocdl.ds_bpermute(T.i32, source32 * fx.Int32(4), value)
     return (lane >= fx.Int32(32)).select(value + fx.Int32(remote32), value)
+
+
+@flyc.jit
+def _wave_reduce_max_i32(value, lane):
+    for distance in (1, 2, 4, 8, 16, 32):
+        peer = fx.Int32(
+            fx.rocdl.ds_bpermute(
+                T.i32, (lane ^ fx.Int32(distance)) * fx.Int32(4), value
+            )
+        )
+        value = (peer > value).select(peer, value)
+    return value
 
 
 # fmt: off
@@ -203,6 +225,7 @@ def emit_direct_fixed_slot_finalize(
     p_plan_ready = dp(DispatchSlot.P2P_PLAN_READY)
     a_work_tail = dp(DispatchSlot.WORK_TAIL)
     a_expert_tile_end = dp(DispatchSlot.EXPERT_TILE_END)
+    a_max_expert_tiles = dp(DispatchSlot.MAX_EXPERT_TILES)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -223,6 +246,7 @@ def emit_direct_fixed_slot_finalize(
         no_overflow = overflow_count == fx.Int32(0)
         safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
         num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+        max_expert_tiles = _wave_reduce_max_i32(num_expert_tiles, lane)
         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
         metadata_base = inclusive_tiles - num_expert_tiles
         total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
@@ -250,6 +274,7 @@ def emit_direct_fixed_slot_finalize(
             # num_valid[1] is a device-visible overflow status.
             buffer_ops.buffer_store(overflow_count, crfa(a_nv), fx.Int32(1))
             buffer_ops.buffer_store(ready_work, crfa(a_work_tail), fx.Int32(0))
+            buffer_ops.buffer_store(max_expert_tiles, crfa(a_max_expert_tiles), fx.Int32(0))
 
         fx.rocdl.s_waitcnt(0)
         comm_ops.fence_system_release()
@@ -265,7 +290,7 @@ def emit_direct_fixed_slot_finalize(
 def emit_dispatch_plan(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
     i32_cur_tok, addr_in_idx, parity, expected, external_grouping, external_counting,
-    dispatch_blocks,
+    dispatch_blocks, payload_chunk_rows=0, payload_tile_ready=False,
 ):
 # fmt: on
     """Build a destination-owned compact plan in one producer-only CTA."""
@@ -293,6 +318,12 @@ def emit_dispatch_plan(
     a_pair_order_ready = dp(DispatchSlot.PAIR_ORDER_READY)
     a_expert_tile_end = dp(DispatchSlot.EXPERT_TILE_END)
     a_group_done = dp(DispatchSlot.GROUP_DONE)
+    a_max_expert_tiles = dp(DispatchSlot.MAX_EXPERT_TILES)
+    a_tile_ready = dp(DispatchSlot.TILE_READY)
+    a_tile_expected = dp(DispatchSlot.TILE_EXPECTED)
+    a_active_payload_blocks = dp(DispatchSlot.ACTIVE_PAYLOAD_BLOCKS)
+    a_payload_blocks_per_destination = dp(DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION)
+    a_payload_chunks_per_destination = dp(DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -339,6 +370,53 @@ def emit_dispatch_plan(
     fx.barrier()
     comm_ops.fence_agent_acquire()
 
+    if const_expr(payload_tile_ready and dispatch_blocks > 32):
+        if warp == fx.Int32(0):
+            active_payload_blocks = fx.Int32(0)
+            for destination in range_constexpr(fz_npes):
+                max_source_count = fx.Int32(0)
+                for local_expert in range(lane, fz_epr, 64):
+                    ge = fx.Int32(destination * fz_epr) + local_expert
+                    source_count = buffer_ops.buffer_load(r_lh, ge, vec_width=1, dtype=fx.Int32)
+                    max_source_count = (source_count > max_source_count).select(
+                        source_count, max_source_count
+                    )
+                max_source_count = _wave_reduce_max_i32(max_source_count, lane)
+                if lane == fx.Int32(0):
+                    chunks_per_destination = (
+                        max_source_count + fx.Int32(payload_chunk_rows - 1)
+                    ) // fx.Int32(payload_chunk_rows)
+                    chunks_per_destination = (chunks_per_destination > fx.Int32(0)).select(
+                        chunks_per_destination, fx.Int32(1)
+                    )
+                    chunks_per_destination = (chunks_per_destination > fx.Int32(4)).select(
+                        chunks_per_destination, fx.Int32(4)
+                    )
+                    buffer_ops.buffer_store(
+                        chunks_per_destination, crfa(a_payload_chunks_per_destination),
+                        fx.Int32(destination),
+                    )
+                    active_per_destination = chunks_per_destination
+                    active_per_destination = (active_per_destination > fx.Int32(4)).select(
+                        active_per_destination, fx.Int32(4)
+                    )
+                    max_per_destination = fx.Int32(dispatch_blocks // fz_npes)
+                    active_per_destination = (active_per_destination < max_per_destination).select(
+                        active_per_destination, max_per_destination
+                    )
+                    buffer_ops.buffer_store(
+                        active_per_destination, crfa(a_payload_blocks_per_destination),
+                        fx.Int32(destination),
+                    )
+                    active_payload_blocks = active_payload_blocks + active_per_destination
+            if lane == fx.Int32(0):
+                buffer_ops.buffer_store(
+                    active_payload_blocks, crfa(a_active_payload_blocks), fx.Int32(0)
+                )
+        fx.rocdl.s_waitcnt(0)
+        fx.barrier()
+        comm_ops.fence_agent_release()
+
     # Transpose the source histogram into each destination's count matrix.
     for ge in range(gtid, fz_total_experts, gnt):
         destination = ge // fx.Int32(fz_epr)
@@ -366,6 +444,7 @@ def emit_dispatch_plan(
         r_nv = crfa(a_nv)
         r_sm = crfa(a_sm)
         row_carry = fx.Int32(0)
+        max_expert_tiles = fx.Int32(0)
         for expert_chunk in range_constexpr((fz_epr + 63) // 64):
             local_expert = fx.Int32(expert_chunk * 64) + lane
             valid_expert = local_expert < fx.Int32(fz_epr)
@@ -381,6 +460,10 @@ def emit_dispatch_plan(
                 source_counts.append(source_count)
                 total_count = total_count + source_count
             num_tiles = (total_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+            chunk_max = _wave_reduce_max_i32(num_tiles, lane)
+            max_expert_tiles = (chunk_max > max_expert_tiles).select(
+                chunk_max, max_expert_tiles
+            )
             padded_rows = num_tiles * fx.Int32(fz_tile_m)
             inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
             local_row_base = row_carry + inclusive_rows - padded_rows
@@ -393,6 +476,38 @@ def emit_dispatch_plan(
                 sender_prefix = sender_prefix + source_counts[source]
 
             if valid_expert:
+                if const_expr(payload_tile_ready):
+                    base_tile = local_row_base // fx.Int32(fz_tile_m)
+                    for tile in range(fx.Int32(0), num_tiles, 1):
+                        tile_index = base_tile + tile
+                        buffer_ops.buffer_store(fx.Int32(0), crfa(a_tile_ready), tile_index)
+                        buffer_ops.buffer_store(fx.Int32(1), crfa(a_tile_expected), tile_index)
+                    sender_prefix = fx.Int32(0)
+                    for source in range_constexpr(fz_npes):
+                        source_count = source_counts[source]
+                        source_active = source_count > fx.Int32(0)
+                        source_boundary = source_active & (sender_prefix > fx.Int32(0))
+                        source_boundary = source_boundary & (
+                            sender_prefix % fx.Int32(fz_tile_m) != fx.Int32(0)
+                        )
+                        if source_boundary:
+                            tile_index = base_tile + sender_prefix // fx.Int32(fz_tile_m)
+                            value = buffer_ops.buffer_load(
+                                crfa(a_tile_expected), tile_index, vec_width=1, dtype=fx.Int32
+                            )
+                            buffer_ops.buffer_store(value + fx.Int32(1), crfa(a_tile_expected), tile_index)
+                        for chunk_offset in range(
+                            fx.Int32(payload_chunk_rows), source_count, payload_chunk_rows
+                        ):
+                            boundary = sender_prefix + chunk_offset
+                            boundary_unaligned = boundary % fx.Int32(fz_tile_m) != fx.Int32(0)
+                            if boundary_unaligned:
+                                tile_index = base_tile + boundary // fx.Int32(fz_tile_m)
+                                value = buffer_ops.buffer_load(
+                                    crfa(a_tile_expected), tile_index, vec_width=1, dtype=fx.Int32
+                                )
+                                buffer_ops.buffer_store(value + fx.Int32(1), crfa(a_tile_expected), tile_index)
+                        sender_prefix = sender_prefix + source_count
                 buffer_ops.buffer_store(
                     (local_row_base + padded_rows) // fx.Int32(fz_tile_m), crfa(a_expert_tile_end), local_expert
                 )
@@ -409,6 +524,7 @@ def emit_dispatch_plan(
 
         if lane == fx.Int32(0):
             buffer_ops.buffer_store(row_carry, r_nv, fx.Int32(0))
+            buffer_ops.buffer_store(max_expert_tiles, crfa(a_max_expert_tiles), fx.Int32(0))
         fx.rocdl.s_waitcnt(0)
         comm_ops.fence_system_release()
         for source in range(lane, fz_npes, 64):
@@ -466,7 +582,12 @@ def emit_dispatch_plan(
     fx.barrier()
     if tid == fx.Int32(0):
         if const_expr(external_grouping):
-            mori_shmem.int32_wait_until_equals(a_group_done, fx.Int32(dispatch_blocks))
+            active_group_blocks = fx.Int32(dispatch_blocks)
+            if const_expr(payload_tile_ready and dispatch_blocks > 32):
+                active_group_blocks = buffer_ops.buffer_load(
+                    crfa(a_active_payload_blocks), fx.Int32(0), vec_width=1, dtype=fx.Int32
+                )
+            mori_shmem.int32_wait_until_equals(a_group_done, active_group_blocks)
             comm_ops.fence_agent_acquire()
         comm_ops.fence_agent_release()
         comm_ops.store_i32_system(a_pair_order_ready, parity, expected)
@@ -476,7 +597,7 @@ def emit_dispatch_plan(
 @flyc.jit
 def emit_dispatch_group(
     *, num_waves, fz_k, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx, dispatch_blocks,
-    producer_slot, parity, expected, external_counting,
+    producer_slot, parity, expected, external_counting, adaptive_grouping=False,
 ):
 # fmt: on
     """Count and group disjoint route spans across payload producer CTAs."""
@@ -492,6 +613,7 @@ def emit_dispatch_group(
     a_local_cursor = dp(DispatchSlot.LOCAL_CURSOR)
     a_pair_order = dp(DispatchSlot.PAIR_ORDER)
     a_group_done = dp(DispatchSlot.GROUP_DONE)
+    a_active_payload_blocks = dp(DispatchSlot.ACTIVE_PAYLOAD_BLOCKS)
     r_idx = crfa(addr_in_idx)
     r_pair = crfa(a_pair_order)
     tid = fx.thread_idx.x
@@ -516,21 +638,30 @@ def emit_dispatch_group(
         comm_ops.fence_agent_acquire()
     fx.barrier()
 
-    for route in range(group_tid, route_limit, group_threads):
-        expert = buffer_ops.buffer_load(r_idx, route, vec_width=1, dtype=fx.Int32)
-        valid = (expert >= fx.Int32(0)) & (expert < fx.Int32(fz_total_experts))
-        if valid:
-            position = fx.Int32(
-                comm_ops.atomic_add_agent(a_local_cursor + fx.Int64(expert) * fx.Int64(4), fx.Int32(1))
-            )
-            buffer_ops.buffer_store(route, r_pair, position)
-    fx.rocdl.s_waitcnt(0)
-    fx.barrier()
-    if tid == fx.Int32(0):
-        comm_ops.fence_agent_release()
-        comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
-        mori_shmem.int32_wait_until_equals(a_pair_order_ready + fx.Int64(parity) * fx.Int64(4), expected)
-        comm_ops.fence_agent_acquire()
+    active_group_blocks = fx.Int32(dispatch_blocks)
+    if const_expr(adaptive_grouping and dispatch_blocks > 32):
+        active_group_blocks = buffer_ops.buffer_load(
+            crfa(a_active_payload_blocks), fx.Int32(0), vec_width=1, dtype=fx.Int32
+        )
+    group_active = producer_slot < active_group_blocks
+    if group_active:
+        active_group_tid = producer_slot * block_threads + tid
+        active_group_threads = active_group_blocks * block_threads
+        for route in range(active_group_tid, route_limit, active_group_threads):
+            expert = buffer_ops.buffer_load(r_idx, route, vec_width=1, dtype=fx.Int32)
+            valid = (expert >= fx.Int32(0)) & (expert < fx.Int32(fz_total_experts))
+            if valid:
+                position = fx.Int32(
+                    comm_ops.atomic_add_agent(a_local_cursor + fx.Int64(expert) * fx.Int64(4), fx.Int32(1))
+                )
+                buffer_ops.buffer_store(route, r_pair, position)
+        fx.rocdl.s_waitcnt(0)
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_agent_release()
+            comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
+            mori_shmem.int32_wait_until_equals(a_pair_order_ready + fx.Int64(parity) * fx.Int64(4), expected)
+            comm_ops.fence_agent_acquire()
     fx.barrier()
 
 
@@ -539,7 +670,9 @@ def emit_dispatch_group(
 def emit_dispatch_payload(
     *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32, fz_safe_end_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_wts, addr_in_sc, dispatch_blocks,
-    producer_slot, parity, expected,
+    producer_slot, parity, expected, producers_per_destination, chunks_per_destination,
+    payload_chunk_rows=0,
+    payload_tile_ready=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
@@ -559,6 +692,9 @@ def emit_dispatch_payload(
     p_payload_ready = dp(DispatchSlot.P2P_PAYLOAD_READY)
     a_pair_order = dp(DispatchSlot.PAIR_ORDER)
     a_plan_ready = dp(DispatchSlot.PLAN_READY)
+    a_chunk_done = dp(DispatchSlot.PAYLOAD_CHUNK_DONE)
+    p_tile_ready = dp(DispatchSlot.P2P_TILE_READY)
+    p_payload_ready_rows = dp(DispatchSlot.P2P_PAYLOAD_READY_ROWS)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -568,9 +704,7 @@ def emit_dispatch_payload(
     r_mb = crfa(a_mb)
     r_pair = crfa(a_pair_order)
     r_wts = crfa(addr_in_wts)
-    task_limit = fx.Int32(fz_total_experts)
-    task0 = producer_slot
-    task_stride = fx.Int32(dispatch_blocks)
+    r_chunk_done = crfa(a_chunk_done)
     row0 = warp
     row_stride = fx.Int32(num_waves)
 
@@ -581,16 +715,54 @@ def emit_dispatch_payload(
         comm_ops.atomic_add_system(ready_remote + fx.Int64(ready_index) * fx.Int64(4), fx.Int32(1))
         buffer_ops.buffer_store(fx.Int32(0), r_lh, ge)
 
+    def _finish_task(destination, local_expert, ge, num_chunks):
+        if const_expr(payload_chunk_rows > 0):
+            comm_ops.fence_system_release()
+            completed = fx.Int32(
+                comm_ops.atomic_add_agent(a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1))
+            )
+            if completed == num_chunks - fx.Int32(1):
+                comm_ops.fence_agent_acquire()
+                buffer_ops.buffer_store(fx.Int32(0), r_chunk_done, ge)
+                _publish_task(destination, local_expert, ge)
+        else:
+            _publish_task(destination, local_expert, ge)
+
     num_destinations = fz_total_experts // fz_epr
+    if const_expr(payload_chunk_rows > 0):
+        assert dispatch_blocks % num_destinations == 0
+        task_limit = fx.Int32(fz_epr) * chunks_per_destination
+        task0 = producer_slot // fx.Int32(num_destinations)
+        task_stride = fx.Int32(producers_per_destination)
+    else:
+        task_limit = fx.Int32(fz_total_experts)
+        task0 = producer_slot
+        task_stride = fx.Int32(dispatch_blocks)
     hoist_remote_resources = fz_mtpr >= 1024
     producer_destination = producer_slot % fx.Int32(num_destinations)
     ready_index = parity * fx.Int32(num_destinations) + producer_destination
     if tid == fx.Int32(0):
         mori_shmem.int32_wait_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
+    destination_ready_rows = fx.Int32(0)
+    if const_expr(payload_tile_ready):
+        if tid == fx.Int32(0):
+            remote_ready_rows = buffer_ops.buffer_load(
+                crfa(p_payload_ready_rows), producer_destination, vec_width=1, dtype=fx.Int64
+            )
+            destination_ready_rows = buffer_ops.buffer_load(
+                crfa(remote_ready_rows), fx.Int32(0), vec_width=1, dtype=fx.Int32
+            )
     fx.barrier()
     for task_index in range(task0, task_limit, task_stride):
-        local_expert = task_index // fx.Int32(num_destinations)
+        if const_expr(payload_chunk_rows > 0):
+            chunk_id = task_index // fx.Int32(fz_epr)
+            rotated_expert = task_index - chunk_id * fx.Int32(fz_epr)
+            rotation = (chunk_id * fx.Int32(17)) % fx.Int32(fz_epr)
+            local_expert = (rotated_expert + fx.Int32(fz_epr) - rotation) % fx.Int32(fz_epr)
+        else:
+            chunk_id = fx.Int32(0)
+            local_expert = task_index // fx.Int32(num_destinations)
         destination = producer_destination
         ge = destination * fx.Int32(fz_epr) + local_expert
         source_count_lane = fx.Int32(0)
@@ -603,13 +775,29 @@ def emit_dispatch_payload(
         source_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_count_lane))
         source_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_base_lane))
         destination_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, destination_base_lane))
+        if const_expr(payload_chunk_rows > 0):
+            num_chunks = (source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
+                payload_chunk_rows
+            )
+            num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
+            chunk_active = chunk_id < num_chunks
+            chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
+            chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
+            chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
+            row_begin = chunk_active.select(chunk_begin, fx.Int32(0))
+            row_end = chunk_active.select(chunk_end, fx.Int32(0))
+        else:
+            num_chunks = fx.Int32(1)
+            chunk_active = fx.Int32(0) == fx.Int32(0)
+            row_begin = fx.Int32(0)
+            row_end = source_count
         if const_expr(hoist_remote_resources):
             wts_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_wts), destination, vec_width=1, dtype=fx.Int64))
             srcmap_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_sm), destination, vec_width=1, dtype=fx.Int64))
             token_remote = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
             if const_expr(fz_enable_scales):
                 scale_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_sc), destination, vec_width=1, dtype=fx.Int64))
-        for row in range(row0, source_count, row_stride):
+        for row in range(row_begin + row0, row_end, row_stride):
             wk_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 wk_lane = buffer_ops.buffer_load(r_pair, source_base + row, vec_width=1, dtype=fx.Int32)
@@ -690,8 +878,21 @@ def emit_dispatch_payload(
                     value = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
                     buffer_ops.buffer_store(value, destination_rsrc, column)
 
-        fx.rocdl.s_waitcnt(0)
-        fx.barrier()
-        if tid == fx.Int32(0):
-            _publish_task(destination, local_expert, ge)
-        fx.barrier()
+        if chunk_active:
+            fx.rocdl.s_waitcnt(0)
+            fx.barrier()
+            if tid == fx.Int32(0):
+                if const_expr(payload_tile_ready):
+                    if row_end > row_begin:
+                        comm_ops.fence_system_release()
+                        remote_tile_ready = buffer_ops.buffer_load(
+                            crfa(p_tile_ready), destination, vec_width=1, dtype=fx.Int64
+                        )
+                        first_tile = (destination_base + row_begin) // destination_ready_rows
+                        last_tile = (destination_base + row_end - fx.Int32(1)) // destination_ready_rows
+                        for tile in range(first_tile, last_tile + fx.Int32(1), 1):
+                            comm_ops.atomic_add_system(
+                                remote_tile_ready + fx.Int64(tile) * fx.Int64(4), fx.Int32(1)
+                            )
+                _finish_task(destination, local_expert, ge, num_chunks)
+            fx.barrier()

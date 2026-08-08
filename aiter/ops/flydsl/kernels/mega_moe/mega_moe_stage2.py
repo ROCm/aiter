@@ -273,7 +273,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     arch = str(get_rocm_arch() or "")
@@ -295,6 +295,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if persist and cu_num <= 0:
         raise AssertionError(f"persist=True requires cu_num>0, got {cu_num}")
+    if skew_cu and (not persist or not 0 < skew_cu < cu_num):
+        raise AssertionError(f"skew_cu={skew_cu} requires persist=True and 0<skew_cu<cu_num={cu_num}")
     log2_max_tok = max_tok.bit_length() - 1
     mask_max_tok = max_tok - 1
     N_OUT = model_dim
@@ -326,6 +328,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"megamoe_stage2_{dispatch_path}_t{BM}x{BN}x{BK}"
         f"_sbm{SBM}_{a_dtype}_nt{int(use_nt)}"
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
+        f"_sk{skew_cu}"
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
     )
@@ -333,8 +336,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # fmt: off
     @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
     def kernel_epilog_v2(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
-        arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64,
-        arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
+        arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64, arg_stids: fx.Int64,
+        arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32):
     # fmt: on
         tx_i32 = fx.thread_idx.x
@@ -436,6 +439,38 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 issue_all_a_loads(m_block_idx * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 run_unit(unit_bx, m_block_idx)
+        elif const_expr(skew_cu > 0):
+            m_slot = bx_i32 // fx.Int32(num_n_blocks)
+            n_block = bx_i32 - m_slot * fx.Int32(num_n_blocks)
+            total_stage1_tiles = (cumsum0 + fx.Int32(SBM - 1)) // fx.Int32(SBM)
+            max_expert_tiles = global_typed_ptr(arg_max_expert_tiles, T.i32)[0]
+            skewed = max_expert_tiles * fx.Int32(4) > total_stage1_tiles
+            active_cu = skewed.select(fx.Int32(skew_cu), fx.Int32(cu_num))
+            strided_diff = total_m_blocks - m_slot
+            strided_rem = (strided_diff > fx.Int32(0)).select(strided_diff, fx.Int32(0))
+            strided_iters = (strided_rem + active_cu - fx.Int32(1)) // active_cu
+            tiles_per_slot = (total_m_blocks + active_cu - fx.Int32(1)) // active_cu
+            m_tile0 = m_slot * tiles_per_slot
+            contiguous_diff = total_m_blocks - m_tile0
+            contiguous_rem = (contiguous_diff > fx.Int32(0)).select(
+                contiguous_diff, fx.Int32(0)
+            )
+            contiguous_iters = (contiguous_rem < tiles_per_slot).select(
+                contiguous_rem, tiles_per_slot
+            )
+            n_iters = skewed.select(strided_iters, contiguous_iters)
+            active = m_slot < active_cu
+            for _it in range(fx.Int32(0), n_iters, fx.Int32(1)):
+                strided_m = m_slot + fx.Int32(_it) * active_cu
+                contiguous_m = m_tile0 + fx.Int32(_it)
+                m_block = skewed.select(strided_m, contiguous_m)
+                if active:
+                    unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
+                    fx.barrier()
+                    issue_all_a_loads(m_block * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    if fx.Int32(m_block) < total_m_blocks:
+                        run_unit(unit_bx, m_block)
         else:
             m_slot = bx_i32 // fx.Int32(num_n_blocks)
             n_block = bx_i32 - m_slot * fx.Int32(num_n_blocks)
@@ -466,16 +501,17 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # fmt: off
     @flyc.jit
     def launch(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
-        arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64,
-        arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
+        arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64, arg_stids: fx.Int64,
+        arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_grid_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
         i32_npad: fx.Int32, stream: fx.Stream):
     # fmt: on
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         grid_x = i32_grid_blocks * num_n_blocks
         kernel_epilog_v2(
-            arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids, arg_sweights,
-            arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad,
+            arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles,
+            arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
+            i32_hidden, i32_kpad, i32_npad,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch
@@ -495,12 +531,12 @@ def _get_g2_launch(**compile_kw):
 
 
 # fmt: off
-def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids,
-    arg_sweights, arg_trb, arg_p2p, row_capacity, i32_inter, i32_hidden, stream, *,
+def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+    arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p, row_capacity, i32_inter, i32_hidden, stream, *,
     model_dim, inter_dim, experts, topk, rank, npes, max_tok, recv_cap, comb_inp_nbytes, BM, SBM,
     HIDDEN_MAX, INTER_MAX, cu_num, BN=256, BK=256, use_nt=True, g2_bhoist=True,
     g2_ascale_pf=True, g2_spart=402, persist=False, persist_cu=0, persist_strided=False,
-    g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False):
+    g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False, skew_cu=0):
     # fmt: on
     """Compile or reuse one fused Stage2 configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -510,12 +546,12 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         use_nt=use_nt, HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX, SBM=SBM, persist=persist,
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
-        p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch,
+        p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch, skew_cu=skew_cu,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
     _run_compiled(
-        launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids, arg_sweights,
-        arg_trb, arg_p2p, fx.Int32(max_m_blocks), fx.Int32(grid_blocks), fx.Int32(i32_inter),
-        fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
+        launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+        arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p, fx.Int32(max_m_blocks),
+        fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
     )
