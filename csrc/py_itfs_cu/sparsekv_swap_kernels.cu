@@ -43,6 +43,20 @@ __device__ __forceinline__ void transfer_item_warp(int lane_id,
     }
 }
 
+// Row counts of the two cold pools, published once by the coordinator. The
+// translation tables are the only thing that says where a token lives, so a
+// stale or corrupt entry is indistinguishable from a real row — and because the
+// pools are exact-sized, dereferencing one past the end reaches memory the agent
+// has no mapping for and kills the whole process with a memory access fault.
+// Bounding here turns that into a skipped token. Defaults are permissive so a
+// caller that never publishes them behaves as before.
+__device__ int64_t g_sparsekv_cold_rows     = INT64_MAX;
+__device__ int64_t g_sparsekv_gpu_cold_rows = INT64_MAX;
+// Out-of-range rows skipped so far. Skipping keeps the process alive but makes
+// the affected token read a stale hot slot, so the count has to be visible —
+// a silently wrong answer is worse to debug than the crash it replaced.
+__device__ unsigned long long g_sparsekv_oob_rows = 0ULL;
+
 // Resolve a request's logical token to its absolute cold-pool row. With a paged
 // host pool (host_cache_locs != nullptr) the row is read from the per-request
 // translation table (req_to_host_pool[r][tok]); otherwise the dense layout maps
@@ -52,7 +66,14 @@ __device__ __forceinline__ int64_t cold_row_of(const int32_t* __restrict__ host_
                                                int tok)
 {
     if (host_cache_locs) {
-        return (int64_t)host_cache_locs[(int64_t)r * host_stride + tok];
+        const int64_t row = (int64_t)host_cache_locs[(int64_t)r * host_stride + tok];
+        // Reports out-of-range as unbacked so every caller's existing `< 0`
+        // guard skips it; negatives pass through unchanged.
+        if (row >= g_sparsekv_cold_rows) {
+            atomicAdd(&g_sparsekv_oob_rows, 1ULL);
+            return (int64_t)-1;
+        }
+        return row;
     }
     return (int64_t)r * cold_depth + tok;
 }
@@ -86,7 +107,12 @@ __global__ void sparsekv_gather_kernel(const char* __restrict__ host_cache,
     const int num_warps = (gridDim.x * blockDim.x) / WARP_SIZE;
     for (int m = warp_id; m < num_misses; m += num_warps) {
         const int32_t src_row = src_locs[m];
-        if (src_row < 0) continue;  // unbacked cold row: no KV to gather
+        // Unbacked, or past the end of the pool (see g_sparsekv_cold_rows).
+        if (src_row < 0) continue;
+        if ((int64_t)src_row >= g_sparsekv_cold_rows) {
+            atomicAdd(&g_sparsekv_oob_rows, 1ULL);
+            continue;
+        }
         const int64_t src = (int64_t)src_row * item_size_bytes;
         const int64_t dst = (int64_t)dst_locs[m] * item_size_bytes;
         transfer_item_warp(lane_id, host_cache + src, device_buffer + dst,
@@ -258,9 +284,10 @@ __global__ void sparsekv_swap_and_translate_kernel(
             for (int i = warp_id; i < m; i += warps_per_block) {
                 int tok = miss_tok[i];
                 int v   = vic[i];
-                const int64_t src =
-                    cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok) *
-                    item_size_bytes;
+                const int64_t cold_row =
+                    cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok);
+                if (cold_row < 0) continue;  // unbacked / out of range
+                const int64_t src = cold_row * item_size_bytes;
                 const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
                 transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
                                    item_size_bytes);
@@ -352,6 +379,10 @@ __global__ void sparsekv_backup_kernel(
         int64_t gpu_row = -1;
         if (gpu_cold_pool && gpu_cache_locs) {
             gpu_row = (int64_t)gpu_cache_locs[(int64_t)r * gpu_stride + pos];
+            if (gpu_row >= g_sparsekv_gpu_cold_rows) {
+                atomicAdd(&g_sparsekv_oob_rows, 1ULL);
+                gpu_row = -1;  // fall back to the host tier
+            }
         }
         if (gpu_row >= 0) {
             const int64_t cold_off = gpu_row * item_size_bytes;
@@ -494,6 +525,10 @@ __global__ void sparsekv_backup_into_assigned_kernel(
         int64_t gpu_row = -1;
         if (gpu_cold_pool && gpu_cache_locs) {
             gpu_row = (int64_t)gpu_cache_locs[(int64_t)r * gpu_stride + pos];
+            if (gpu_row >= g_sparsekv_gpu_cold_rows) {
+                atomicAdd(&g_sparsekv_oob_rows, 1ULL);
+                gpu_row = -1;  // fall back to the host tier
+            }
         }
         if (gpu_row >= 0) {
             const int64_t cold_off = gpu_row * item_size_bytes;
@@ -532,6 +567,39 @@ static const int32_t* sparsekv_host_cache_locs_ptr(at::Tensor host_cache_locs,
     TORCH_CHECK(host_cache_locs.scalar_type() == at::kInt,
                 "host_cache_locs must be int32");
     return host_cache_locs.data_ptr<int32_t>();
+}
+
+void sparsekv_set_pool_rows(int64_t cold_rows, int64_t gpu_cold_rows)
+{
+    const int64_t host_rows = cold_rows > 0 ? cold_rows : INT64_MAX;
+    const int64_t gpu_rows  = gpu_cold_rows > 0 ? gpu_cold_rows : INT64_MAX;
+    hipError_t e = hipMemcpyToSymbol(HIP_SYMBOL(g_sparsekv_cold_rows), &host_rows,
+                                     sizeof(int64_t));
+    TORCH_CHECK(e == hipSuccess,
+                "sparsekv_set_pool_rows(cold_rows) failed: ", hipGetErrorString(e));
+    e = hipMemcpyToSymbol(HIP_SYMBOL(g_sparsekv_gpu_cold_rows), &gpu_rows,
+                          sizeof(int64_t));
+    TORCH_CHECK(e == hipSuccess,
+                "sparsekv_set_pool_rows(gpu_cold_rows) failed: ",
+                hipGetErrorString(e));
+}
+
+int64_t sparsekv_take_oob_row_count()
+{
+    unsigned long long count = 0ULL;
+    hipError_t e = hipMemcpyFromSymbol(&count, HIP_SYMBOL(g_sparsekv_oob_rows),
+                                       sizeof(unsigned long long));
+    TORCH_CHECK(e == hipSuccess,
+                "sparsekv_take_oob_row_count read failed: ", hipGetErrorString(e));
+    if (count != 0ULL) {
+        const unsigned long long zero = 0ULL;
+        e = hipMemcpyToSymbol(HIP_SYMBOL(g_sparsekv_oob_rows), &zero,
+                              sizeof(unsigned long long));
+        TORCH_CHECK(e == hipSuccess,
+                    "sparsekv_take_oob_row_count reset failed: ",
+                    hipGetErrorString(e));
+    }
+    return (int64_t)count;
 }
 
 int64_t sparsekv_host_get_device_pointer(at::Tensor pinned_host_tensor)

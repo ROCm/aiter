@@ -25,6 +25,27 @@ MD_NAME = "module_sparsekv_swap"
 
 
 @compile_ops("module_sparsekv_swap")
+def sparsekv_set_pool_rows(cold_rows: int, gpu_cold_rows: int) -> None:
+    """Publish both cold pools' row counts so the kernels can bound a row.
+
+    A translation-table entry is the only record of where a token lives; a stale
+    or corrupt one would otherwise dereference past an exact-sized pool and take
+    the process down with a memory access fault. With the bounds published such
+    a token is reported unbacked and skipped. 0 or negative means unbounded.
+    """
+
+
+@compile_ops("module_sparsekv_swap")
+def sparsekv_take_oob_row_count() -> int:
+    """Read and reset the count of rows skipped for being out of range.
+
+    Non-zero means a translation table held a row past the end of its pool. The
+    token was skipped rather than dereferenced, so the process survived, but it
+    read a stale hot slot — this is a correctness signal.
+    """
+
+
+@compile_ops("module_sparsekv_swap")
 def sparsekv_host_get_device_pointer(pinned_host_tensor: torch.Tensor) -> int: ...
 
 
@@ -175,6 +196,8 @@ __all__ = [
     "sparsekv_copy_planned",
     "sparsekv_gather_planned",
     "sparsekv_host_get_device_pointer",
+    "sparsekv_set_pool_rows",
+    "sparsekv_take_oob_row_count",
     "sparsekv_swap_and_translate",
     "sparsekv_swap_and_translate_record",
     "sparsekv_swap_in",

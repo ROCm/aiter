@@ -1403,6 +1403,12 @@ namespace py = pybind11;
           py::arg("softmax_scale"));
 
 #define SPARSEKV_SWAP_PYBIND                              \
+    m.def("sparsekv_set_pool_rows",                      \
+          &sparsekv_set_pool_rows,                       \
+          py::arg("cold_rows"),                          \
+          py::arg("gpu_cold_rows"));                     \
+    m.def("sparsekv_take_oob_row_count",                 \
+          &sparsekv_take_oob_row_count);                 \
     m.def("sparsekv_host_get_device_pointer",            \
           &sparsekv_host_get_device_pointer,             \
           py::arg("pinned_host_tensor"));                \

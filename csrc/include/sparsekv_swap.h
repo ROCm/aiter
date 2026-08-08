@@ -5,6 +5,19 @@
 #include <torch/extension.h>
 #include <cstdint>
 
+// Publish the row counts of the two cold pools to the kernels. The translation
+// tables are the only record of where a token lives, so a corrupt entry would
+// otherwise dereference past an exact-sized pool and fault the whole process;
+// with the bounds published, such a token is reported unbacked and skipped.
+// Call once per coordinator, before any swap. 0 or negative means "unbounded".
+void sparsekv_set_pool_rows(int64_t cold_rows, int64_t gpu_cold_rows);
+
+// Read and reset the count of rows skipped for being out of range. Non-zero
+// means a translation table held a row past the end of its pool: the token was
+// skipped (so the process survived) but read a stale hot slot, so it is a
+// correctness signal, not just a health one.
+int64_t sparsekv_take_oob_row_count();
+
 // Translate a pinned host allocation to a device-mapped pointer (int64 VA).
 // On an xnack- agent a GPU kernel faults on a raw host VA, so the swap kernels
 // must be fed the mapped pointer this returns instead of tensor.data_ptr().
