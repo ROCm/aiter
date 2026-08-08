@@ -30,6 +30,7 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 # cta_info packed fields per CTA.
 CTA_INFO_WIDTH = 6
 
+
 def compute_prefill_schedule(
     row_to_batch,
     local_starts,

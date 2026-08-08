@@ -461,7 +461,9 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
 
     # ---- Host schedule (precomputed once so the bench times only the launch) ----
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import compute_varctx_schedule
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
 
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped

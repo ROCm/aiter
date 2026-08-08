@@ -297,7 +297,7 @@ def create_vk_gdr_decode_kernel(
                 )
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     dot_kq_vec = fx.math.fma(sk_vecs[ki], sq_vecs[ki], dot_kq_vec)
-                dot_kq = fx.Vector(dot_kq_vec).reduce(fx.ReductionOp.ADD)
+                dot_kq = dot_kq_vec.reduce(fx.ReductionOp.ADD)
                 for offset in WARP_THREADS_K_SHFL_OFFSETS:
                     dot_kq = dot_kq + dot_kq.shuffle_xor(offset, WARP_SIZE)
 
@@ -320,8 +320,8 @@ def create_vk_gdr_decode_kernel(
                         sum_hk = fx.math.fma(h_cur, sk_vecs[ki], sum_hk)
                         sum_hq_old = fx.math.fma(h_cur, sq_vecs[ki], sum_hq_old)
 
-                    sum_hk = fx.Vector(sum_hk).reduce(fx.ReductionOp.ADD)
-                    sum_hq_old = fx.Vector(sum_hq_old).reduce(fx.ReductionOp.ADD)
+                    sum_hk = sum_hk.reduce(fx.ReductionOp.ADD)
+                    sum_hq_old = sum_hq_old.reduce(fx.ReductionOp.ADD)
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hk = sum_hk + sum_hk.shuffle_xor(offset, WARP_SIZE)

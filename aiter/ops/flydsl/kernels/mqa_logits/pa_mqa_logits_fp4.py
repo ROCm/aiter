@@ -27,6 +27,7 @@ MFMA_N = 16
 WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 
+
 @triton.jit
 def _varctx_cta_info_kernel(
     ctx_ptr,  # [B] int32
