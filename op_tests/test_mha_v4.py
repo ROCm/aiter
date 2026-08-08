@@ -8,8 +8,11 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
+    _quantize_mxfp4,
     mha_v4,
     mha_v4_packed,
+    mxfp4_k_view,
+    quantize_mxfp4_k,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -48,6 +51,38 @@ def test_mha_v4_raw_buffer_sizes_are_stable():
     assert fp4_v_padded_sequence(128) == 128
     assert fp4_v_padded_sequence(129) == 256
     assert fp4_v_raw_buffer_size(2, 129, 3) == 2 * 256 * 3 * 64 + 64
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
+@pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
+def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
+    torch.manual_seed(sequence)
+    value = torch.randn(
+        (2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16
+    )
+    dense, dense_scale = _quantize_mxfp4(value, 1.0)
+    raw, scale = quantize_mxfp4_k(value)
+    coalesced = mxfp4_k_view(raw, scale)
+
+    tiles = (sequence + 127) // 128
+    token = torch.arange(sequence, device="cuda")
+    chunk = torch.arange(4, device="cuda")
+    byte = torch.arange(16, device="cuda")
+    raw_offset = (
+        torch.arange(2, device="cuda")[:, None, None, None, None]
+        * (3 * tiles * 8192)
+        + torch.arange(3, device="cuda")[None, None, :, None, None]
+        * (tiles * 8192)
+        + (token // 128)[None, :, None, None, None] * 8192
+        + chunk[None, None, None, :, None] * 2048
+        + (token % 128)[None, :, None, None, None] * 16
+        + byte[None, None, None, None, :]
+    )
+    expected = dense.unflatten(-1, (4, 16))
+    assert torch.equal(raw[raw_offset], expected)
+
+    assert torch.equal(scale, dense_scale)
+    assert coalesced.stride() == (3 * tiles * 8192, 64, tiles * 8192, 1)
 
 
 def test_mha_v4_rejects_unsupported_contracts():
@@ -137,6 +172,50 @@ def test_mha_v4_packed_rejects_wrong_fp8_encoding():
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
+def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
+    q = torch.zeros((1, 128, 2, 64), device="cuda", dtype=torch.uint8)
+    scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    v_fp8 = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    v_scale = torch.ones((1, 2, 128), device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="coalesced MHA v4 tile layout"):
+        mha_v4_packed(
+            q,
+            q,
+            v_fp8,
+            scale,
+            scale,
+            v_scale,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.FP8,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_CHANNEL,
+        )
+
+    raw, k_scale = quantize_mxfp4_k(
+        torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    )
+    coalesced_k = mxfp4_k_view(raw, k_scale)
+    with pytest.raises(ValueError, match="contiguous token-strided storage"):
+        mha_v4_packed(
+            q,
+            coalesced_k,
+            q.new_zeros((1, 128, 2, 128)),
+            scale,
+            k_scale,
+            v_scale,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_CHANNEL,
         )
 
 

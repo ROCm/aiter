@@ -17,5 +17,9 @@ void rotate_activation_mxfp4_quant(at::Tensor& out,
                                    const at::Tensor& input,
                                    double multiplier);
 
+void rotate_activation_mxfp4_quant_k(at::Tensor& out,
+                                     at::Tensor& scale,
+                                     const at::Tensor& input);
+
 } // namespace torch_itfs
 } // namespace aiter
