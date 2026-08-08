@@ -15,7 +15,6 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     NUM_COL_POW2: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
 
     offs = pid * x_in_stride_r + tl.arange(0, NUM_COL_POW2)
@@ -40,14 +39,14 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
     DTYPE_MAX: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
 
     offs = pid * x_in_stride_r + tl.arange(0, NUM_COL_POW2)
     mask = tl.arange(0, NUM_COL_POW2) < cols
-    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    x = tl.load(x_in_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
 
-    m = tl.max(tl.abs(x))
+    m = tl.max(tl.abs(x)).to(tl.float32)
+    m = tl.maximum(m, 1e-10)
     tl.atomic_max(scale_out_ptr, m / DTYPE_MAX, sem="relaxed")
 
 
@@ -62,15 +61,15 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
     DTYPE_MAX: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
 
     offs = pid * x_in_stride_r + tl.arange(0, NUM_COL_POW2)
     mask = tl.arange(0, NUM_COL_POW2) < cols
-    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    x = tl.load(x_in_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
 
-    m = tl.max(tl.abs(x), axis=-1)
-    scale_out = m.to(tl.float32) / DTYPE_MAX
+    m = tl.max(tl.abs(x), axis=-1).to(tl.float32)
+    m = tl.maximum(m, 1e-10)
+    scale_out = m / DTYPE_MAX
     scale_recip = 1 / scale_out
 
     qx = x * scale_recip
