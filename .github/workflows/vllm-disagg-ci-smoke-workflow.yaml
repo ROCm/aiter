@@ -47,11 +47,12 @@ env:
   SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
   SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   AITER_GPU_ARCHS: gfx950
-  AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-whl-${{ github.run_id }}
+  AITER_PREBUILD_MAX_JOBS: "64"
+  AITER_OVERLAY_ARTIFACT_NAME: aiter-vllm-disagg-overlay-${{ github.run_id }}
 
 jobs:
   build_aiter_wheel:
-    name: Build Aiter wheel
+    name: Build precompiled Aiter overlay
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -86,7 +87,7 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
-      - name: Build AITER wheel in the vLLM nightly image
+      - name: Build precompiled AITER overlay in the vLLM nightly image
         run: |
           set -euo pipefail
           bash .github/scripts/docker_pull_with_retry.sh "${BASE_IMAGE}"
@@ -96,13 +97,26 @@ jobs:
             -w /workspace \
             -e AITER_USE_SYSTEM_TRITON=1 \
             -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
+            -e PREBUILD_KERNELS=1 \
+            -e MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" \
             --entrypoint /bin/bash \
             "${BASE_IMAGE}" \
             -lc '
               set -euo pipefail
               git config --global --add safe.directory /workspace
               shopt -s nullglob
-              rm -rf dist build aiter_meta ./*.egg-info
+              rm -rf dist build aiter_meta ./*.egg-info aiter_overlay aiter_artifacts
+              rm -f .aiter-prebuild.log
+              python3 - <<"PY"
+              from importlib.metadata import version
+              import flydsl
+
+              flydsl_version = version("flydsl")
+              print(
+                  f"Unmodified runtime dependency: flydsl={flydsl_version} "
+                  f"at {flydsl.__file__}"
+              )
+              PY
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
@@ -112,16 +126,59 @@ jobs:
               pip install --upgrade "ninja>=1.11.1"
               pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
               pip install tabulate
-              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}"
-              python setup.py bdist_wheel
+              echo "Prebuilding AITER for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
+              python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
               ls -lh dist/*.whl
+
+              # The runtime image must already provide AITER dependencies. Keep
+              # the overlay limited to AITER HEAD so compute nodes never resolve
+              # packages from PyPI or drift from the nightly image environment.
+              python3 - <<"PY"
+              from importlib.metadata import version
+              import flydsl
+
+              flydsl_version = version("flydsl")
+              print(f"Build environment flydsl={flydsl_version} at {flydsl.__file__}")
+              PY
+              wheels=(dist/*.whl)
+              if (( ${#wheels[@]} != 1 )); then
+                echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
+                exit 1
+              fi
+              mkdir -p aiter_overlay
+              PIP_NO_INDEX=1 python3 -m pip install --no-deps \
+                --target aiter_overlay "${wheels[0]}"
+              (cd /tmp && PYTHONPATH=/workspace/aiter_overlay python3 - <<"PY"
+              from pathlib import Path
+              import aiter
+
+              root = Path("/workspace/aiter_overlay").resolve()
+              loaded = Path(aiter.__file__).resolve()
+              kernels = sorted((root / "aiter" / "jit").glob("*.so"))
+              print(f"AITER overlay loaded from {loaded}")
+              print(f"Prebuilt AITER kernel modules: {len(kernels)}")
+              if root not in loaded.parents:
+                  raise SystemExit(f"AITER was not loaded from {root}")
+              if len(kernels) < 10:
+                  raise SystemExit(
+                      f"Expected at least 10 prebuilt kernel modules, found {len(kernels)}"
+                  )
+              PY
+              )
+              mkdir -p aiter_artifacts
+              tar -C aiter_overlay -czf \
+                aiter_artifacts/aiter-overlay-${GPU_ARCHS}.tar.gz .
+              ls -lh aiter_artifacts/*
             '
 
-      - name: Upload AITER wheel
+      - name: Upload precompiled AITER overlay
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: dist/*.whl
+          name: ${{ env.AITER_OVERLAY_ARTIFACT_NAME }}
+          path: |
+            aiter_artifacts/*.tar.gz
+            .aiter-prebuild.log
+          include-hidden-files: true
           retention-days: 14
 
   select_vllm_cases:
@@ -270,12 +327,6 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
-      - name: Checkout AITER CI patch
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/patches/vllm-47030-v3-2p2d-warmup.patch
-          sparse-checkout-cone-mode: false
-
       - name: Select Spur nodes for topology
         run: |
           set -euo pipefail
@@ -290,11 +341,11 @@ jobs:
           echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
           echo "Selected upstream case ${CASE_NAME}: nodes=${NODES}, nodelist=${nodelist}"
 
-      - name: Download current AITER wheel
+      - name: Download precompiled AITER overlay
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
+          name: ${{ env.AITER_OVERLAY_ARTIFACT_NAME }}
+          path: aiter_artifacts/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
 
       - name: Show runner and Slurm state
         run: |
@@ -309,7 +360,7 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM main, PR 47030, and V3 2P2D warmup
+      - name: Checkout vLLM main and apply full PR 47030 patch series
         run: |
           set -euo pipefail
           rm -rf vllm
@@ -328,77 +379,64 @@ jobs:
             "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
             git am -3
 
-          # Temporary experiment for the reproducible V3 2P2D inference-time JIT
-          # timeout. Keep this on top of PR #47030 so it is easy to drop or move
-          # upstream after the result is known.
-          warmup_patch="${GITHUB_WORKSPACE}/.github/patches/vllm-47030-v3-2p2d-warmup.patch"
-          git apply --check --unidiff-zero "${warmup_patch}"
-          git apply --unidiff-zero "${warmup_patch}"
-          git add .buildkite/amd-disagg/vllm_disagg.sh
-          git commit -m "CI: warm DeepSeek-V3 2P2D before accuracy"
-
           echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
           echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
           echo "VLLM_TEST_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
 
-      - name: Add current AITER wheel overlay to the upstream case
+      - name: Add precompiled AITER overlay to the upstream case
         run: |
           set -euo pipefail
           shopt -s nullglob
-          wheel_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
-          wheels=("${wheel_dir}"/*.whl)
-          if [[ "${#wheels[@]}" -ne 1 ]]; then
-            echo "Expected exactly one AITER wheel in ${wheel_dir}, found ${#wheels[@]}" >&2
-            find "${wheel_dir}" -maxdepth 1 -type f -printf '%f\n' >&2 || true
+          artifact_dir="${GITHUB_WORKSPACE}/aiter_artifacts/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}/aiter_artifacts"
+          archives=("${artifact_dir}"/aiter-overlay-*.tar.gz)
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one AITER overlay in ${artifact_dir}, found ${#archives[@]}" >&2
+            find "${artifact_dir}" -maxdepth 1 -type f -printf '%f\n' >&2 || true
             exit 1
           fi
 
           disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
           test -d "${disagg_dir}"
-          mkdir -p "${disagg_dir}/aiter_wheels"
-          cp -f "${wheels[0]}" "${disagg_dir}/aiter_wheels/"
+          rm -rf "${disagg_dir}/aiter_overlay"
+          mkdir -p "${disagg_dir}/aiter_overlay"
+          tar -xzf "${archives[0]}" -C "${disagg_dir}/aiter_overlay"
+          test -f "${disagg_dir}/aiter_overlay/aiter/__init__.py"
 
-          # The upstream case bind-mounts this directory into every compute-node
-          # container. Install the artifact into a writable overlay before vLLM
-          # starts, leaving the nightly image itself unchanged.
-          python3 - "${disagg_dir}/vllm_disagg.sh" <<'PY'
-          import sys
+          # PR #47030 supports overriding the cluster environment file. Use an
+          # AITER-owned wrapper to select the offline overlay without patching
+          # the upstream vLLM runtime script.
+          cat > "${disagg_dir}/aiter_cluster_env.sh" <<'SH'
+          #!/usr/bin/env bash
+          overlay_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aiter_overlay"
+          source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
+          export GPU_ARCHS=gfx950
+          export PYTHONPATH="${overlay_root}${PYTHONPATH:+:${PYTHONPATH}}"
+          python3 - "${overlay_root}" <<'PY'
+          from importlib.metadata import version
           from pathlib import Path
+          import sys
+          import aiter
+          import flydsl
 
-          path = Path(sys.argv[1])
-          content = path.read_text(encoding="utf-8")
-          anchor = 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-          hook = r'''
-
-          install_current_aiter() {
-              shopt -s nullglob
-              local wheels=("${SCRIPT_DIR}"/aiter_wheels/*.whl)
-              if (( ${#wheels[@]} != 1 )); then
-                  echo "[aiter-overlay] expected one wheel, found ${#wheels[@]}" >&2
-                  return 1
-              fi
-
-              local overlay="${AITER_OVERLAY_DIR:-/tmp/aiter_overlay}"
-              rm -rf "${overlay}"
-              mkdir -p "${overlay}"
-              export GPU_ARCHS="gfx950"
-              python3 -m pip install --disable-pip-version-check \
-                  --target "${overlay}" "${wheels[0]}"
-              export PYTHONPATH="${overlay}${PYTHONPATH:+:${PYTHONPATH}}"
-              python3 -c 'import pathlib, sys, aiter; root = pathlib.Path(sys.argv[1]).resolve(); loaded = pathlib.Path(aiter.__file__).resolve(); print(f"[aiter-overlay] loaded {loaded}"); raise SystemExit(0 if root in loaded.parents else 1)' "${overlay}"
-          }
-
-          install_current_aiter
-          '''
-          if anchor not in content:
-              raise SystemExit(f"Could not find SCRIPT_DIR anchor in {path}")
-          if "install_current_aiter" in content:
-              raise SystemExit(f"AITER overlay hook already exists in {path}")
-          path.write_text(content.replace(anchor, anchor + hook, 1), encoding="utf-8")
+          root = Path(sys.argv[1]).resolve()
+          loaded = Path(aiter.__file__).resolve()
+          print(
+              f"[aiter-overlay] loaded {loaded}; "
+              f"flydsl={version('flydsl')} at {flydsl.__file__}"
+          )
+          if root not in loaded.parents:
+              raise SystemExit(f"AITER was not loaded from {root}")
           PY
+          SH
+          chmod +x "${disagg_dir}/aiter_cluster_env.sh"
 
-          ls -lh "${disagg_dir}/aiter_wheels"
-          grep -n "aiter-overlay" "${disagg_dir}/vllm_disagg.sh"
+          du -sh "${disagg_dir}/aiter_overlay"
+          grep -n "aiter-overlay" "${disagg_dir}/aiter_cluster_env.sh"
+          grep -n 'CLUSTER_ENV_IN=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          grep -n 'export CLUSTER_ENV=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          git -C "${GITHUB_WORKSPACE}/vllm" diff --exit-code -- \
+            .buildkite/amd-disagg/vllm_disagg.sh \
+            .buildkite/amd-disagg/run_xPyD_disagg.slurm
 
       - name: Show vLLM disagg inputs
         run: |
@@ -410,7 +448,8 @@ jobs:
             echo "- vLLM branch: \`${VLLM_BRANCH}\`"
             echo "- vLLM base SHA: \`${VLLM_BASE_SHA}\`"
             echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
-            echo "- Temporary V3 2P2D warmup patch: \`enabled\`"
+            echo "- AITER gfx950 prebuilt overlay: \`enabled (offline, no runtime pip)\`"
+            echo "- Upstream request warmup patch: \`disabled\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
@@ -534,6 +573,7 @@ jobs:
             IMAGE="${BASE_IMAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
+            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
           touch "${stream_done}"
