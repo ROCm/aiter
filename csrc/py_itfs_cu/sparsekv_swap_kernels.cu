@@ -222,7 +222,9 @@ __global__ void sparsekv_swap_and_translate_kernel(
             lu_base[s] = tick;  // hit: most recent
         } else {
             int idx = atomicAdd(&s_miss_count, 1);
-            miss_tok[idx] = tok;
+            // miss_tok holds topk ints; runlen is not otherwise bounded by it,
+            // and overrunning it corrupts vic[] (the next shared array).
+            if (idx < topk) miss_tok[idx] = tok;
         }
     }
     __syncthreads();
@@ -232,6 +234,7 @@ __global__ void sparsekv_swap_and_translate_kernel(
     if (m > 0) {
         // Find tau* = min tick with count(last_used <= tau) >= m. Hits are at
         // `tick` (the max) so victims (all < tick) never include them.
+        //
         int64_t lo = -1, hi = tick;
         while (lo < hi) {
             int64_t mid = lo + (hi - lo) / 2;
@@ -248,7 +251,9 @@ __global__ void sparsekv_swap_and_translate_kernel(
         for (int s = threadIdx.x; s < hot_slots; s += blockDim.x) {
             if (lu_base[s] < tau) {
                 int idx = atomicAdd(&s_scratch, 1);
-                vic[idx] = s;
+                // Bounded by construction (count(< tau) < m <= topk) only while
+                // the tau search converges; don't let a bad tau scribble past.
+                if (idx < topk) vic[idx] = s;
             }
         }
         __syncthreads();
