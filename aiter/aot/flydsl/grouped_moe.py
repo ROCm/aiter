@@ -166,6 +166,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
+        build_moe_gather_reduce_wave_module,
     )
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_module,
@@ -366,6 +367,21 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
+    # The wave-per-row variant replaces both vec widths once token_num crosses
+    # AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS, and takes no vec parameter.
+    gather_reduce_wave = build_moe_gather_reduce_wave_module(
+        model_dim, topk, out_dtype, split_k
+    )
+    gather_reduce_wave(
+        ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+        ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+        ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+        ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+        token_num,
+        a2_out_e * a2_out_m * (model_dim // 2),
+        ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+        stream=0,
+    )
 
 
 def compile_one_config(**job):
