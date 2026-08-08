@@ -997,6 +997,7 @@ def _run_moe_reduction(
     topk_ids=None,
     stream=None,
     is_fp8=False,
+    topk_weights=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1043,6 +1044,13 @@ def _run_moe_reduction(
         # Placeholders; kernel ignores them when use_mask=False (and for fp8).
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    # Set when stage2 deferred the route-weight multiply to this reduction.
+    use_weight = topk_weights is not None
+    tw = (
+        topk_weights.to(torch.float32).contiguous()
+        if use_weight
+        else torch.empty(0, device=out.device, dtype=torch.float32)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
     # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
@@ -1054,10 +1062,19 @@ def _run_moe_reduction(
         use_mask=use_mask,
         num_experts=num_experts,
         out_dtype_str=out_dtype_str,
+        use_weight=use_weight,
     )
     _run_compiled(
         reduce_exe,
-        (ptr_arg(X), ptr_arg(out), ptr_arg(em), ptr_arg(tk), token_num, stream),
+        (
+            ptr_arg(X),
+            ptr_arg(out),
+            ptr_arg(em),
+            ptr_arg(tk),
+            ptr_arg(tw),
+            token_num,
+            stream,
+        ),
     )
 
 
@@ -2008,10 +2025,13 @@ def _flydsl_moe_stage2_impl(
         if return_per_slot:
             target = out.view(-1)
         else:
-            # fp8 route-out stores uint8 rows: N value bytes + N/8 e8m0 scale bytes.
+            # fp8 route-out stores uint8 rows: N value bytes + N/scale_blk e8m0
+            # scale bytes.
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
             target = torch.empty(
                 (
-                    (token_num * topk, model_dim + model_dim // 8)
+                    (token_num * topk, fp8out_row_bytes(model_dim))
                     if _s2_fp8_inter
                     else (token_num * topk * model_dim,)
                 ),

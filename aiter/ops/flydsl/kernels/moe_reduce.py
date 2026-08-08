@@ -34,6 +34,7 @@ def moe_reduction_kernel(
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
     topk_ids: fx.Pointer,
+    topk_weights: fx.Pointer,
     i32_m_tokens: fx.Int32,
     topk: fx.Constexpr[int],
     model_dim: fx.Constexpr[int],
@@ -41,6 +42,7 @@ def moe_reduction_kernel(
     use_mask: fx.Constexpr[bool],
     num_experts: fx.Constexpr[int],
     out_dtype_str: fx.Constexpr[str],
+    use_weight: fx.Constexpr[bool],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -110,6 +112,15 @@ def moe_reduction_kernel(
             i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
         )
         em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
+    if const_expr(use_weight):
+        # Route weights deferred from the stage2 epilogue: scale each expert's
+        # contribution here instead, so the GEMM stores unweighted rows.
+        f32pt = fx.PointerType.get(
+            T.f32, address_space=fx.AddressSpace.Global, alignment=4
+        )
+        tw_ptr = fx.inttoptr(
+            f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
+        )
 
     # Tiled copy: BLOCK threads across the tile, V contiguous elems per thread.
     tile_mn, tv_layout = fx.make_layout_tv(
@@ -163,6 +174,11 @@ def moe_reduction_kernel(
             else:
                 vk = fx.Vector(fx.memref_load_vec(frags[k]))
                 vk = vk.extf(vec_f32) if is_16b else vk
+            if const_expr(use_weight):
+                wk = tw_ptr[k]
+                vk = fx.Vector.from_elements(
+                    [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                )
             if const_expr(use_mask):
                 vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
                     vk, fx.Vector.filled(V, 0.0, fx.Float32)
@@ -192,12 +208,14 @@ def compile_moe_reduction(
     use_mask: bool = False,
     num_experts: int = 0,
     out_dtype_str: str | None = None,
+    use_weight: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
-    Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, i32_m_tokens,
-    stream)``; dispatch it through ``moe_kernels._run_compiled``. The launcher is a
-    distinct object per shape, so the shim's per-exe ``_cf`` cache stays correct.
+    Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
+    i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
+    launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
+    stays correct.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
@@ -209,6 +227,7 @@ def compile_moe_reduction(
         Y: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
+        topk_weights: fx.Pointer,
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -217,6 +236,7 @@ def compile_moe_reduction(
             Y,
             expert_mask,
             topk_ids,
+            topk_weights,
             i32_m_tokens,
             topk,
             model_dim,
@@ -224,6 +244,7 @@ def compile_moe_reduction(
             use_mask,
             num_experts,
             out_tag,
+            use_weight,
         ).launch(
             grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
         )

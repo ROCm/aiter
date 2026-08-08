@@ -1928,6 +1928,7 @@ def _flydsl_v2_stage2_wrapper(
     block_m=None,
     expert_mask=None,
     topk_ids=None,
+    topk_weights=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
@@ -1949,14 +1950,22 @@ def _flydsl_v2_stage2_wrapper(
     _s2_fp8_inter = (
         epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
+    _defer_w = (
+        _s2_fp8_inter
+        and sorted_weights is not None
+        and topk_weights is not None
+        and os.environ.get("MXFP4_G2_DEFER_WEIGHT", "1") == "1"
+    )
     if epilog == "reduce":
         if _s2_fp8_inter:
             if model_dim_runtime % 8 != 0:
                 raise ValueError(
                     "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
                 )
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
             target = torch.empty(
-                (token_num * topk, model_dim_runtime + model_dim_runtime // 8),
+                (token_num * topk, fp8out_row_bytes(model_dim_runtime)),
                 dtype=torch.uint8,
                 device=out.device,
             )
@@ -1997,6 +2006,10 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
+        g2_bf16_lds=cfg["bf16_lds"],
+        g2_spart=cfg["spart"],
+        g2_c_split=cfg["c_split"],
+        g2_defer_weight=_defer_w,
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if epilog == "reduce":
@@ -2011,6 +2024,7 @@ def _flydsl_v2_stage2_wrapper(
             expert_mask=expert_mask,
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
+            topk_weights=topk_weights if _defer_w else None,
         )
     return out
 
@@ -3067,6 +3081,8 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if stage2_func is _flydsl_v2_stage2_wrapper and not doweight_stage1:
+        extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
