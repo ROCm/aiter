@@ -1,3 +1,10 @@
-qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
-fp8,fp8,64,0,1,0,0,0,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
-fp8,fp8,16,0,4,0,0,0,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co
+// `sub_Q` (per-workgroup Q-row tile) is a property baked into each .co, so it
+// lives here as a column instead of being recomputed by the dispatcher. The
+// Python launcher (aiter/ops/asm/mla_decode_v4.py) reads it verbatim and uses it for
+// grid math (gdx = ceil(gqa*max_seqlen_q / sub_Q)). NOTE: the C++ dispatcher
+// (asm_mla_v4.cu) does NOT read this column (it computes sub_Q itself); the
+// column is only consumed by the Python gfx1250 path.
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,sub_Q,knl_name,co_name
+fp8,fp8,64,0,1,0,0,0,64,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,128,0,1,0,0,0,64,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,16,0,4,0,0,0,64,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co
