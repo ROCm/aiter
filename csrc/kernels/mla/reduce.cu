@@ -11,6 +11,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <sstream>
 #include <torch/python.h>
+#include <vector>
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>
 struct MlaReduceKernelV1Traits
@@ -106,6 +107,14 @@ struct MlaReduceKernelV1Params
     bool output_lse;
     bool use_reduce_final_map; // If true, qo len is uniform and implicitly set by
                                // reduce_partial_map[1] - reduce_partial_map[0].
+    bool fast_eligible;        // host sets this for the uniform-decode fast path
+                               // (max_seqlen_q==1, no LSE out, reduce_final_map present)
+    int32_t pool_size;         // partial-pool row count P (= partial_output.size(0)),
+                               // passed to the fast kernel for its buffer-rsrc extents
+    int32_t active_num_reduce_tile; // uniform-decode live tile count. In cudagraph
+                                    // paths reduce_indptr can be a static-capacity
+                                    // buffer, but final_output is sliced to the
+                                    // current decode token count.
 };
 
 // Launch-time configuration derived from the runtime device properties (kept
@@ -973,6 +982,159 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
             false, NAME " doesn't support output LSE type ", AiterDtype_to_str((LSE_TYPE)), "."); \
     }
 
+__device__ __forceinline__ uint16_t bf16_bits(float x) {
+    return __builtin_bit_cast(uint16_t, (opus::bf16_t)x);
+}
+__device__ __forceinline__ int buf_load_dword(__amdgpu_buffer_rsrc_t r, int voff) {
+    return __builtin_amdgcn_raw_buffer_load_b32(r, voff, 0, 0);
+}
+template <int VEC>
+__device__ __forceinline__ void buf_load_dwordx(int (&bits)[VEC], __amdgpu_buffer_rsrc_t r, int voff, int soff) {
+    if constexpr (VEC == 1) {
+        bits[0] = __builtin_amdgcn_raw_buffer_load_b32(r, voff, soff, 0);
+    } else if constexpr (VEC == 2) {
+        const opus::i32x2_t v = __builtin_bit_cast(opus::i32x2_t, __builtin_amdgcn_raw_buffer_load_b64(r, voff, soff, 0));
+        bits[0] = v[0]; bits[1] = v[1];
+    } else {
+        const opus::i32x4_t v = __builtin_bit_cast(opus::i32x4_t, __builtin_amdgcn_raw_buffer_load_b128(r, voff, soff, 0));
+        bits[0] = v[0]; bits[1] = v[1]; bits[2] = v[2]; bits[3] = v[3];
+    }
+}
+
+template <typename Traits, int MAX_SPLITS, int BATCH, typename out_t>
+__global__ void __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy)
+kn_mla_reduce_v1_fast(
+    const float* __restrict__ partial_output,
+    const float* __restrict__ partial_lse,
+    out_t*       __restrict__ reduced,
+    const int*   __restrict__ reduce_indptr,
+    int num_reduce_tiles, int P)
+{
+    constexpr int H       = Traits::kNumHeadQ;
+    constexpr int K       = Traits::kSizeDV;
+    constexpr int VEC     = Traits::kVecWidth;     // K / kNumThreads (4 for 16/512)
+    constexpr int THREADS = Traits::kNumThreads;
+    constexpr int BD      = THREADS * VEC;
+    constexpr int D_TILES = K / BD;                // 1 for VEC=4
+    static_assert(BATCH >= 1 && BATCH <= MAX_SPLITS, "BATCH must be in [1, MAX_SPLITS]");
+
+    const int pid         = blockIdx.x;
+    const int d_split     = pid % D_TILES;
+    const int p1          = pid / D_TILES;
+    const int h           = p1 % H;
+    const int reduce_tile = p1 / H;
+    if (reduce_tile >= num_reduce_tiles) return;
+    const int tid = threadIdx.x;
+    const int d   = d_split * BD + tid * VEC;
+
+    // per-tile split range [base,end) + pool size P, wave-uniform (SGPR).
+    const auto RI = opus::make_buffer_rsrc(
+        reduce_indptr, (uint32_t)((num_reduce_tiles + 1) * (int)sizeof(int)));
+    const int base    = __builtin_amdgcn_readfirstlane(buf_load_dword(RI, reduce_tile       * (int)sizeof(int)));
+    const int end     = __builtin_amdgcn_readfirstlane(buf_load_dword(RI, (reduce_tile + 1) * (int)sizeof(int)));
+    const int nsplits = end - base;
+    if (nsplits < 2) return;   // nosplit tiles already written to o by stage1
+
+    // Two invariants let the fast path drop both metadata indirections the
+    // general kernel performs (reduce_final_map for the output row,
+    // reduce_partial_map for each pool row). Both hold ONLY under uniform
+    // decode (max_seqlen_q==1), which is exactly what fast_eligible gates on;
+    // they are established by the decode metadata builder and are asserted
+    // host-side under ASM_DEBUG in mla_reduce_v1() below.
+    //
+    // (A) output row == tile index == reduce_final_map[tile].q_start.
+    //     Source: decode_update_mla_metadata_v1_kernel (aiter/ops/attention.py),
+    //     q_len==1 branch stores q_start = batch_id = tile_idx (and q_end = q_start+1).
+    // (B) the tile's pool rows are the contiguous identity range [base,end):
+    //     reduce_partial_map[base+k] == base+k for k in [0,nsplits).
+    //     Source: the decode planner allocates the partial pool as a contiguous
+    //     arange, so the map is identity and (base+k) indexes the pool directly.
+    const int out_row = reduce_tile;   // invariant (A)
+    const int pbase   = base;          // invariant (B): pool row == base + k
+
+    const auto LSE = opus::make_buffer_rsrc(
+        partial_lse, (uint32_t)((size_t)P * H * (int)sizeof(float)));
+    const auto A = opus::make_buffer_rsrc(
+        partial_output, (uint32_t)((size_t)P * H * K * (int)sizeof(float)));
+    const int v_voff_base = tid * VEC * (int)sizeof(float);
+
+    float run_m = -INFINITY, run_den = 0.0f;
+    float acc[VEC];
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) acc[e] = 0.0f;
+
+    for (int c0 = 0; c0 < nsplits; c0 += MAX_SPLITS) {
+        const int rem   = nsplits - c0;
+        const int cn    = (rem < MAX_SPLITS) ? rem : MAX_SPLITS;
+        const int cbase = pbase + c0;
+
+        float lse[MAX_SPLITS];
+        float chunk_m = -INFINITY;
+        #pragma unroll
+        for (int k = 0; k < MAX_SPLITS; k++) {
+            const int off = ((cbase + k) * H + h) * (int)sizeof(float);
+            const int oob = (k < cn) ? 0 : 0x40000000;
+            lse[k] = __int_as_float(buf_load_dword(LSE, off + oob));
+            if (k < cn) chunk_m = fmaxf(chunk_m, lse[k]);
+        }
+        float w[MAX_SPLITS];
+        float chunk_den = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < MAX_SPLITS; k++) {
+            w[k] = (k < cn) ? __expf(lse[k] - chunk_m) : 0.0f;
+            chunk_den += w[k];
+        }
+        float cacc[VEC];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++) cacc[e] = 0.0f;
+        #pragma unroll
+        for (int k0 = 0; k0 < MAX_SPLITS; k0 += BATCH) {
+            int bits[BATCH][VEC];
+            #pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                const int k = k0 + b;
+                if (k < MAX_SPLITS) {
+                    const int soff = ((cbase + k) * H * K + h * K + d_split * BD) * (int)sizeof(float);
+                    const int oob  = (k < cn) ? 0 : 0x40000000;
+                    buf_load_dwordx<VEC>(bits[b], A, v_voff_base + oob, soff);
+                }
+            }
+            #pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                const int k = k0 + b;
+                if (k < cn) {
+                    #pragma unroll
+                    for (int e = 0; e < VEC; e++)
+                        cacc[e] += w[k] * __int_as_float(bits[b][e]);
+                }
+            }
+        }
+        const float new_m = fmaxf(run_m, chunk_m);
+        const float a = __expf(run_m   - new_m);
+        const float b = __expf(chunk_m - new_m);
+        run_den = run_den * a + chunk_den * b;
+        #pragma unroll
+        for (int e = 0; e < VEC; e++) acc[e] = acc[e] * a + cacc[e] * b;
+        run_m = new_m;
+    }
+
+    const float inv = (run_den > 0.0f) ? (1.0f / run_den) : 0.0f;
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) acc[e] *= inv;
+
+    const size_t out_idx = (size_t)out_row * (H * K) + (size_t)h * K + d;
+    if constexpr (VEC == 1) {
+        *reinterpret_cast<uint16_t*>(&reduced[out_idx]) = bf16_bits(acc[0]);
+    } else if constexpr (VEC == 2) {
+        const opus::u16x2_t o = { bf16_bits(acc[0]), bf16_bits(acc[1]) };
+        *reinterpret_cast<opus::u16x2_t*>(&reduced[out_idx]) = o;
+    } else {
+        const opus::u16x4_t o = { bf16_bits(acc[0]), bf16_bits(acc[1]),
+                                    bf16_bits(acc[2]), bf16_bits(acc[3]) };
+        *reinterpret_cast<opus::u16x4_t*>(&reduced[out_idx]) = o;
+    }
+}
+
 // Fast reduction kernel for kSizeDV==64 && kNumHeadQ==64: each block handles
 // one (head, tile) pair with 64 threads (one per output element), avoiding
 // LDS entirely. From origin/main commit f7af2744e.
@@ -1072,6 +1234,40 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                             const int32_t num_cu,
                             const hipStream_t& stream)
 {
+    if constexpr(Traits::kNumHeadQ == 16 && Traits::kSizeDV == 512 &&
+                 std::is_same_v<out_t, opus::bf16_t>)
+    {
+        if(params.fast_eligible)
+        {
+            const int num_tiles = params.active_num_reduce_tile;
+            if(num_tiles <= 0) return;
+            int cap = (num_cu + num_tiles - 1) / num_tiles;   // ceil(num_cu / tiles)
+            if(cap > 16) cap = 16;
+            if(cap < 2)  cap = 2;
+            int ms = 2;
+            while(ms * 2 <= cap) ms *= 2;                     // chunk width in {2,4,8,16}
+            const dim3 grid = dim3(num_tiles * Traits::kNumHeadQ);  // D_TILES=1 (VEC=4)
+            auto go = [&](auto MS) {
+                constexpr int MS_V  = decltype(MS)::value;
+                constexpr int BATCH = (MS_V < 4) ? MS_V : 4;
+                kn_mla_reduce_v1_fast<Traits, MS_V, BATCH, out_t>
+                    <<<grid, Traits::kNumThreads, 0, stream>>>(
+                        reinterpret_cast<const float*>(params.p_partial_output),
+                        reinterpret_cast<const float*>(params.p_partial_lse),
+                        reinterpret_cast<out_t*>(params.p_final_output),
+                        params.p_reduce_indptr, num_tiles, params.pool_size);
+            };
+            switch(ms)
+            {
+            case 2:  go(std::integral_constant<int, 2>{});  break;
+            case 4:  go(std::integral_constant<int, 4>{});  break;
+            case 8:  go(std::integral_constant<int, 8>{});  break;
+            default: go(std::integral_constant<int, 16>{}); break;
+            }
+            return;
+        }
+    }
+
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -1253,6 +1449,53 @@ void mla_reduce_v1(
         params.num_reduce_tile      = num_reduce_tile;
         params.output_lse           = output_lse;
         params.use_reduce_final_map = !no_reduce_final_map;
+        params.fast_eligible        = (max_seqlen_q == 1 && !output_lse && !no_reduce_final_map);
+        params.pool_size            = (int32_t)partial_output.size(0);
+        params.active_num_reduce_tile =
+            params.fast_eligible ? min(num_reduce_tile, (int32_t)final_output.size(-3))
+                                 : num_reduce_tile;
+
+#ifdef ASM_DEBUG
+        // Host-side verification of the two uniform-decode
+        // invariants kn_mla_reduce_v1_fast relies on. Copies the metadata maps
+        // back to host and asserts them so a future change to the decode
+        // metadata builder that breaks either invariant will fail.
+        if(params.fast_eligible)
+        {
+            const int32_t n_tiles = params.active_num_reduce_tile;
+            std::vector<int32_t> indptr(num_reduce_tile + 1);
+            std::vector<MlaPartialTileInfo> final_map(num_reduce_tile);
+            std::vector<int32_t> partial_map(reduce_partial_map.numel());
+            HIP_CALL(hipStreamSynchronize(stream));
+            HIP_CALL(hipMemcpy(indptr.data(), params.p_reduce_indptr,
+                               indptr.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+            HIP_CALL(hipMemcpy(final_map.data(), params.p_reduce_final_map,
+                               final_map.size() * sizeof(MlaPartialTileInfo),
+                               hipMemcpyDeviceToHost));
+            HIP_CALL(hipMemcpy(partial_map.data(), params.p_reduce_partial_map,
+                               partial_map.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+            for(int32_t t = 0; t < n_tiles; ++t)
+            {
+                const int32_t base    = indptr[t];
+                const int32_t nsplits = indptr[t + 1] - base;
+                if(nsplits < 2)
+                    continue; // nosplit tile: fast kernel skips it (stage1 wrote o)
+                // invariant (A): output row == tile == reduce_final_map[tile].q_start
+                TORCH_CHECK(final_map[t].q_start == t && final_map[t].q_end == t + 1,
+                            "mla_reduce_v1 fast path invariant (A) violated at tile ", t,
+                            ": reduce_final_map=[", final_map[t].q_start, ",",
+                            final_map[t].q_end, "], expected [", t, ",", t + 1, "]");
+                // invariant (B): pool rows are the contiguous identity range [base,end)
+                for(int32_t k = 0; k < nsplits; ++k)
+                {
+                    TORCH_CHECK(partial_map[base + k] == base + k,
+                                "mla_reduce_v1 fast path invariant (B) violated at tile ", t,
+                                " split ", k, ": reduce_partial_map[", base + k, "]=",
+                                partial_map[base + k], ", expected ", base + k);
+                }
+            }
+        }
+#endif
 
         DISPATCH_MLA_REDUCE_KERNEL(output_lse ? final_lse.value().dtype() : AITER_DTYPE_fp32,
                                    final_output.dtype(),
