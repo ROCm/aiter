@@ -82,6 +82,9 @@ def pick_flydsl_stage2_tile_k(inter_dim: int) -> int:
     ``inter_dim % 256 != 0`` (e.g. DSV4 TP8 ``inter=640``) must use
     ``tile_k=128``; ``tile_k=256`` only tiles cleanly when K is 256-aligned.
     Matches ``fused_moe.get_2stage_cfgs`` FlyDSL fallback (``_s2_tk``).
+
+    A single-pass ``tile_k == inter_dim`` (e.g. 384) is registered but not
+    auto-picked; the tuner has to name it explicitly.
     """
     inter_dim = int(inter_dim)
     return 256 if (inter_dim % 256 == 0) else 128
@@ -291,7 +294,8 @@ def get_flydsl_stage2_kernels(
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
-    tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
+    # 384 covers the single-pass K case for inter_dim=384 (MiniMax/KimiK3 TP).
+    tile_ks = [128, 256, 384] if (is_fp4 or is_fp8) else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 

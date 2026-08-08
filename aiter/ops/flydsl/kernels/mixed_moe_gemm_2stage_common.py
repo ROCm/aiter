@@ -3559,7 +3559,17 @@ def compile_mixed_moe_gemm2_common(
         )
     bytes_per_thread_x = bytes_x_per_tile // total_threads
 
-    lds_stride = tile_k
+    # swizzle_xor16 only stays within a row when the LDS X row stride is a power
+    # of two, so pad it up and leave the tail of the row unused.
+    _lds_stride_raw = int(tile_k)
+    lds_stride = 1 << (_lds_stride_raw - 1).bit_length()
+    lds_stride_bytes = int(lds_stride) * int(a_elem_bytes)
+    if const_expr(lds_stride != _lds_stride_raw and bool(use_async_copy)):
+        # buffer_load_lds fills the destination linearly, so it cannot leave a
+        # gap at the end of each padded LDS row.
+        raise ValueError(
+            f"use_async_copy requires a power-of-2 tile_k, got tile_k={tile_k}"
+        )
 
     if const_expr(out_is_f32):
         _use_cshuffle_epilog = bool(use_cshuffle_epilog)
@@ -3612,7 +3622,10 @@ def compile_mixed_moe_gemm2_common(
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
     ).replace("-", "_")
-    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+    # A single K tile per batch never touches the ping buffer, so skip
+    # double-buffering X and save the LDS.
+    _x_buf_count = 1 if num_k_tiles_per_batch == 1 else 2
+    lds_x_bytes = _x_buf_count * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
@@ -3695,10 +3708,10 @@ def compile_mixed_moe_gemm2_common(
 
             if const_expr(use_async_copy and a_elem_vec_pack > 1):
                 eff_lds_stride = lds_stride // a_elem_vec_pack
-                eff_tile_k_bytes = tile_k_bytes // a_elem_vec_pack
+                eff_tile_k_bytes = lds_stride_bytes // a_elem_vec_pack
             else:
                 eff_lds_stride = lds_stride
-                eff_tile_k_bytes = tile_k_bytes
+                eff_tile_k_bytes = lds_stride_bytes
 
             shape_lds = fx.make_shape(tile_m, eff_lds_stride)
             stride_lds = fx.make_stride(eff_lds_stride, 1)
@@ -3765,7 +3778,7 @@ def compile_mixed_moe_gemm2_common(
                 else None
             )
 
-            lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+            lds_x_b = _x_buf_count * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
             lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
@@ -4191,7 +4204,10 @@ def compile_mixed_moe_gemm2_common(
                 m_repeat = tile_m // 16
                 k_unroll = tile_k_bytes // 128
 
-                k_unroll_packed = k_unroll // pack_K
+                # Round up: an odd k_unroll (e.g. tile_k=384 -> 3) still needs the
+                # packed-scale i32 holding its last 128-K block, and the host-side
+                # e8m0 shuffle pads K so the extra index stays in bounds.
+                k_unroll_packed = (k_unroll + pack_K - 1) // pack_K
                 m_repeat_packed = m_repeat // pack_M
                 num_acc_n_packed = body_num_acc_n // pack_N
 
@@ -5344,6 +5360,15 @@ def compile_mixed_moe_gemm2_common(
                         )
 
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                if const_expr(need_fp8_out and e_vec != 8):
+                    # With e_vec < 8 two fragments share one e8m0 scale byte and
+                    # race on it, so half the row dequantizes with the wrong
+                    # exponent.
+                    raise ValueError(
+                        "fp8 stage2 route-out (AITER_FLYDSL_STAGE2_FP8=1) needs "
+                        f"tile_n >= 256 to form whole 8-column MXFP8 groups, got "
+                        f"tile_n={body_tile_n} (e_vec={e_vec})"
+                    )
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
                     arith=arith,
