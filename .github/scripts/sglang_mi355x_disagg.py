@@ -1,0 +1,1098 @@
+#!/usr/bin/env python3
+"""Helpers for the SGLang MI355X disaggregation workflow.
+
+The workflow intentionally reuses SGLang's launcher from the upstream PR and
+keeps the aiter-side delta small. This helper patches the launcher for aiter's
+Spur/Slurm environment and narrows the recipe to the requested smoke surface.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+RECIPE_PATH = Path("scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml")
+LAUNCHER_PATH = Path("scripts/ci/slurm/launch_mi355x.sh")
+
+
+def replace_once(text: str, old: str, new: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"expected exactly one launcher match, got {count}: {old!r}")
+    return text.replace(old, new, 1)
+
+
+def replace_all(text: str, old: str, new: str, min_count: int = 1) -> str:
+    count = text.count(old)
+    if count < min_count:
+        raise SystemExit(
+            f"expected at least {min_count} launcher match(es), got {count}: {old!r}"
+        )
+    return text.replace(old, new)
+
+
+def patch_launcher(args: argparse.Namespace) -> None:
+    root = Path(args.sglang_workspace)
+    launcher = root / LAUNCHER_PATH
+    text = launcher.read_text(encoding="utf-8")
+
+    text = replace_once(
+        text,
+        'SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"',
+        'SLURM_PARTITION="${SLURM_PARTITION-}"',
+    )
+    text = replace_once(
+        text,
+        'WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"',
+        'WORKDIR="${SHARED_WORKDIR_ROOT:-$HOME/.mi355x_ci}/${MATRIX_CONFIG_NAME}"',
+    )
+    text = replace_once(
+        text,
+        """DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
+--security-opt seccomp=unconfined \\
+--device /dev/kfd --device /dev/dri --device /dev/infiniband \\
+-v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
+""",
+        """MODEL_MOUNT_ARGS=""
+MODEL_DOWNLOAD_MOUNT_ARGS=""
+for mount_root in ${MODEL_MOUNT_ROOTS:-/it-share /data /models}; do
+    if [[ -d "$mount_root" ]]; then
+        MODEL_MOUNT_ARGS+=" -v $mount_root:$mount_root:ro"
+        MODEL_DOWNLOAD_MOUNT_ARGS+=" -v $mount_root:$mount_root:rw"
+    fi
+done
+
+MODEL_CACHE_ARGS="-e HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+if [[ -d /data ]]; then
+    mkdir -p /data/models2/.hf-cache 2>/dev/null || true
+fi
+if [[ -d /data/models2/.hf-cache ]]; then
+    MODEL_CACHE_ARGS+=" -e HF_HOME=/root/.cache/huggingface -e HF_XET_CACHE=/root/.cache/huggingface/xet"
+    MODEL_CACHE_ARGS+=" -v /data/models2/.hf-cache:/root/.cache/huggingface:rw"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    MODEL_CACHE_ARGS+=" -e HF_TOKEN"
+fi
+
+AITER_MOUNT_ARGS=""
+if [[ -n "${AITER_SOURCE_DIR:-}" ]]; then
+    AITER_MOUNT_ARGS=" -v $AITER_SOURCE_DIR:/aiter-under-test:ro"
+fi
+
+HOST_IBVERBS_ARGS=""
+host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+if [[ -n "$host_ionic" && -e "$host_ionic" ]]; then
+    HOST_IBVERBS_ARGS+=" -v $host_ionic:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro"
+fi
+if [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]]; then
+    HOST_IBVERBS_ARGS+=" -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro"
+fi
+if [[ -e /etc/libibverbs.d/ionic.driver ]]; then
+    HOST_IBVERBS_ARGS+=" -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro"
+fi
+
+DOCKER_COMMON="--rm --network host --ipc host --shm-size 128g --privileged \\
+--cap-add IPC_LOCK --cap-add NET_ADMIN \\
+--ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \\
+--security-opt seccomp=unconfined \\
+--device /dev/kfd --device /dev/dri --device /dev/infiniband \\
+-v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $MODEL_CACHE_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
+DOCKER_DOWNLOAD_COMMON="--rm --network host --ipc host --shm-size 32g \\
+--security-opt seccomp=unconfined \\
+-v $WORKDIR:/ci_workdir $MODEL_DOWNLOAD_MOUNT_ARGS $MODEL_CACHE_ARGS"
+""",
+    )
+    text = replace_once(
+        text,
+        'CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"',
+        'SGLANG_RUNTIME_WORKSPACE="${SGLANG_RUNTIME_WORKSPACE:-$GITHUB_WORKSPACE}"\n'
+        'CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"',
+    )
+    text = replace_once(
+        text,
+        'CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"',
+        'CHECKOUT_SHA="$(git -C "$SGLANG_RUNTIME_WORKSPACE" rev-parse HEAD)"',
+    )
+    text = replace_once(
+        text,
+        'MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1',
+        """MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || MODEL_PATH="${MODEL:-}"
+if [[ -n "${MODEL:-}" && "$MODEL_PATH" == /* && ! -e "$MODEL_PATH" ]]; then
+    echo "WARN: MODEL_PATH is not visible on the submit node; compute containers will try it before falling back to model id: $MODEL_PATH -> $MODEL" >&2
+fi""",
+    )
+    text = replace_once(
+        text,
+        '-C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+        '-C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+    )
+    text = replace_once(
+        text,
+        'echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"',
+        '''if [[ -n "${SGLANG_SPUR_IB_DEVICES:-}" ]]; then
+    echo "overriding disaggregation IB devices for SPUR: $IB -> $SGLANG_SPUR_IB_DEVICES"
+    IB="$SGLANG_SPUR_IB_DEVICES"
+fi
+echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"''',
+    )
+    text = replace_once(
+        text,
+        'MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"',
+        'MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=0 -e NCCL_NET_PLUGIN=none -e NCCL_SOCKET_IFNAME=eth1 -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7 -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=0 -e NCCL_PXN_DISABLE=0 -e NCCL_NET_DISABLE_INTRA=1 -e NCCL_IB_TC=104 -e NCCL_IB_FIFO_TC=192 -e NCCL_IB_QPS_PER_CONNECTION=1 -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=12 -e NCCL_DEBUG=WARN"',
+    )
+    text = replace_once(
+        text,
+        'cat > "$WORKDIR/prefill_entry.sh" <<EOF',
+        r"""cat > "$WORKDIR/install_checkout_aiter.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ ! -d /aiter-under-test ]]; then
+  echo "[checkout-aiter] /aiter-under-test not mounted; using image-baked aiter"
+  exit 0
+fi
+
+RUNTIME_AITER="${RUNTIME_AITER:-/tmp/aiter-under-test-runtime}"
+echo "[checkout-aiter] reinstalling aiter from /aiter-under-test"
+rm -rf "$RUNTIME_AITER"
+mkdir -p "$RUNTIME_AITER"
+tar --exclude='__pycache__' --exclude='*.pyc' \
+  -C /aiter-under-test -cf - . | tar -C "$RUNTIME_AITER" -xf -
+
+python3 -m pip uninstall -y amd-aiter aiter || true
+MAX_JOBS="${AITER_MAX_JOBS:-64}" PREBUILD_KERNELS="${AITER_PREBUILD_KERNELS:-0}" GPU_ARCHS="${GPU_ARCHS:-gfx950}" \
+  python3 -m pip install --no-build-isolation -e "$RUNTIME_AITER"
+python3 -m pip show amd-aiter || python3 -m pip show aiter || true
+export PYTHONPATH="$RUNTIME_AITER:${PYTHONPATH:-}"
+python3 - <<'PY'
+import importlib.metadata
+import sys
+import traceback
+
+required = (
+    "dynamic_per_tensor_quant",
+    "dynamic_per_token_scaled_quant",
+    "static_per_tensor_quant",
+)
+
+try:
+    import aiter
+    print(f"[checkout-aiter] sys_path_head={sys.path[:5]}")
+    print(f"[checkout-aiter] aiter_file={aiter.__file__}")
+    try:
+        print(f"[checkout-aiter] amd-aiter_version={importlib.metadata.version('amd-aiter')}")
+    except Exception as exc:
+        print(f"[checkout-aiter] amd-aiter_version_error={exc}")
+    missing = [name for name in required if not hasattr(aiter, name)]
+    for name in required:
+        print(f"[checkout-aiter] has_{name}={hasattr(aiter, name)}")
+    if missing:
+        raise RuntimeError(f"aiter import succeeded but missing required symbols: {missing}")
+except Exception:
+    traceback.print_exc()
+    raise
+PY
+EOF
+
+cat > "$WORKDIR/model_path_helpers.sh" <<'EOF'
+#!/bin/bash
+
+model_has_complete_files() {
+  local p="$1"
+  [[ -f "$p/config.json" ]] || return 1
+  find "$p" -maxdepth 1 -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print -quit 2>/dev/null | grep -q .
+}
+
+resolve_local_model_path() {
+  local original="${1:-}"
+  local p="$original"
+  [[ -n "$p" && "$p" == /* && -e "$p" ]] || return 1
+
+  if model_has_complete_files "$p"; then
+    printf "%s\\n" "$p"
+    return 0
+  fi
+
+  if [[ -d "$p/models--sgl-project--DeepSeek-V4-Pro-FP8" ]]; then
+    p="$p/models--sgl-project--DeepSeek-V4-Pro-FP8"
+  fi
+  if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
+    local hash
+    hash="$(cat "$p/refs/main" 2>/dev/null || true)"
+    if [[ -n "$hash" && -d "$p/snapshots/$hash" ]]; then
+      p="$p/snapshots/$hash"
+    fi
+  fi
+  if model_has_complete_files "$p"; then
+    printf "%s\\n" "$p"
+    return 0
+  fi
+
+  local candidate="" dir
+  while IFS= read -r dir; do
+    if model_has_complete_files "$dir"; then
+      candidate="$dir"
+      break
+    fi
+  done < <(find "$original" -maxdepth 6 -type f -name config.json -printf "%h\\n" 2>/dev/null | sort -u)
+
+  [[ -n "$candidate" ]] || return 1
+  printf "%s\\n" "$candidate"
+}
+
+model_runtime_path() {
+  local original="${1:-}"
+  local fallback="${2:-}"
+  local resolved=""
+  local prepared_file="${MODEL_RUNTIME_PATH_FILE:-/ci_workdir/prepared_model_path}"
+
+  if [[ -f "$prepared_file" ]]; then
+    local prepared=""
+    prepared="$(head -n 1 "$prepared_file" 2>/dev/null || true)"
+    if resolved="$(resolve_local_model_path "$prepared")"; then
+      echo "[model] using prepared local model path: ${prepared} -> ${resolved}" >&2
+      printf "%s\\n" "$resolved"
+      return 0
+    fi
+    echo "WARN: prepared model path is not complete: ${prepared:-<empty>}" >&2
+  fi
+
+  if resolved="$(resolve_local_model_path "$original")"; then
+    echo "[model] resolved local model path: ${original} -> ${resolved}" >&2
+    find "$resolved" -maxdepth 1 -type f \( -name config.json -o -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print 2>/dev/null | head -20 >&2 || true
+    printf "%s\\n" "$resolved"
+    return 0
+  fi
+
+  echo "WARN: MODEL_PATH is missing or incomplete inside container: ${original:-<unset>}" >&2
+  if [[ -n "$original" && "$original" == /* ]]; then
+    find "$original" -maxdepth 4 \( -name config.json -o -name "*.safetensors" -o -name refs -o -name snapshots \) -print 2>/dev/null | head -80 >&2 || true
+  fi
+  if [[ -n "$fallback" ]]; then
+    echo "WARN: falling back to HuggingFace model id: $fallback" >&2
+    printf "%s\\n" "$fallback"
+    return 0
+  fi
+
+  echo "ERROR: no model fallback is set" >&2
+  return 1
+}
+EOF
+
+cat > "$WORKDIR/prepare_model_cache.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+MODEL_PATH="$MODEL_PATH"
+MODEL_ID="$MODEL"
+IMAGE="$IMAGE"
+WORKDIR="$WORKDIR"
+DOCKER_DOWNLOAD_COMMON="$DOCKER_DOWNLOAD_COMMON"
+PREPARED_MODEL_PATH_FILE="$WORKDIR/prepared_model_path"
+
+source "\$WORKDIR/model_path_helpers.sh"
+
+if [[ -z "\$MODEL_PATH" || "\$MODEL_PATH" != /* ]]; then
+  echo "[model] skip local predownload because MODEL_PATH is not an absolute path: \${MODEL_PATH:-<unset>}"
+  exit 1
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
+  echo "[model] local model already prepared: \$MODEL_PATH -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
+  exit 0
+fi
+
+MODEL_TARGET="\$MODEL_PATH"
+MODEL_TARGET_PARENT="\$(dirname "\$MODEL_TARGET")"
+if ! mkdir -p "\$MODEL_TARGET_PARENT" 2>/dev/null || ! touch "\$MODEL_TARGET_PARENT/.aiter-ci-write-test-\$\$" 2>/dev/null; then
+  FALLBACK_ROOT="\${MODEL_CACHE_FALLBACK_ROOT:-/data/\$(id -un)/models2}"
+  MODEL_TARGET="\$FALLBACK_ROOT/\$(basename "\$MODEL_PATH")"
+  MODEL_TARGET_PARENT="\$(dirname "\$MODEL_TARGET")"
+  echo "WARN: MODEL_PATH parent is not writable, using fallback cache: \$MODEL_PATH -> \$MODEL_TARGET"
+  mkdir -p "\$MODEL_TARGET_PARENT"
+else
+  rm -f "\$MODEL_TARGET_PARENT/.aiter-ci-write-test-\$\$" 2>/dev/null || true
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+  echo "[model] fallback/local model already prepared: \$MODEL_TARGET -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
+  exit 0
+fi
+
+LOCK="\${MODEL_TARGET}.download.lock"
+
+lock_is_stale() {
+  [[ -d "\$LOCK" ]] || return 1
+  local marker="\$LOCK/heartbeat"
+  [[ -e "\$marker" ]] || marker="\$LOCK"
+  python3 - "\$marker" "\${MODEL_DOWNLOAD_STALE_SECONDS:-900}" <<'PY'
+import os
+import sys
+import time
+
+path = sys.argv[1]
+limit = int(sys.argv[2])
+try:
+    age = time.time() - os.stat(path).st_mtime
+except FileNotFoundError:
+    sys.exit(1)
+sys.exit(0 if age > limit else 1)
+PY
+}
+
+remove_foreign_lock() {
+  [[ -d "\$LOCK" ]] || return 0
+  local owner=""
+  owner="\$(cat "\$LOCK/owner" 2>/dev/null || true)"
+  if [[ "\$owner" != *"workdir=\$WORKDIR"* ]]; then
+    echo "WARN: removing foreign model download lock: \$LOCK"
+    [[ -n "\$owner" ]] && echo "WARN: foreign lock owner: \$owner"
+    rm -rf "\$LOCK"
+  fi
+}
+
+remove_foreign_lock
+
+if lock_is_stale; then
+  echo "WARN: removing stale model download lock: \$LOCK"
+  rm -rf "\$LOCK"
+fi
+
+mkdir_error="\$(mktemp)"
+if mkdir "\$LOCK" 2>"\$mkdir_error"; then
+  rm -f "\$mkdir_error" 2>/dev/null || true
+  {
+    echo "host=\$(hostname)"
+    echo "pid=\$\$"
+    echo "workdir=\$WORKDIR"
+    echo "target=\$MODEL_TARGET"
+    date -u "+start=%Y-%m-%dT%H:%M:%SZ"
+  } > "\$LOCK/owner" 2>/dev/null || true
+  touch "\$LOCK/heartbeat" 2>/dev/null || true
+  (
+    while :; do
+      touch "\$LOCK/heartbeat" 2>/dev/null || true
+      sleep 60
+    done
+  ) &
+  HEARTBEAT_PID=\$!
+  trap 'kill "\$HEARTBEAT_PID" 2>/dev/null || true; rm -rf "\$LOCK" 2>/dev/null || true' EXIT
+  echo "[model] downloading \$MODEL_ID to \$MODEL_TARGET"
+  mkdir -p "\$MODEL_TARGET"
+  docker run \$DOCKER_DOWNLOAD_COMMON \
+    -e MODEL="\$MODEL_ID" \
+    -e MODEL_PATH="\$MODEL_TARGET" \
+    "\$IMAGE" bash -lc '
+      set -euo pipefail
+      python3 - <<'"'"'PY'"'"'
+import os
+from pathlib import Path
+import time
+from huggingface_hub import snapshot_download
+
+repo_id = os.environ["MODEL"]
+target = os.environ["MODEL_PATH"]
+Path(target).mkdir(parents=True, exist_ok=True)
+print(f"[model] snapshot_download repo={repo_id} local_dir={target}", flush=True)
+last_error = None
+for attempt in range(1, int(os.environ.get("HF_HUB_DOWNLOAD_ATTEMPTS", "4")) + 1):
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=target,
+            max_workers=int(os.environ.get("HF_HUB_DOWNLOAD_THREADS", "4")),
+        )
+        break
+    except Exception as exc:
+        last_error = exc
+        print(f"[model] snapshot_download attempt {attempt} failed: {exc}", flush=True)
+        time.sleep(min(60 * attempt, 180))
+else:
+    raise last_error
+PY
+    '
+else
+  mkdir_status="\$(cat "\$mkdir_error" 2>/dev/null || true)"
+  rm -f "\$mkdir_error" 2>/dev/null || true
+  if [[ ! -d "\$LOCK" ]]; then
+    echo "WARN: failed to create model lock and no active lock exists: \$LOCK"
+    [[ -n "\$mkdir_status" ]] && echo "WARN: mkdir error: \$mkdir_status"
+    exit 1
+  fi
+  echo "[model] another rank is preparing \$MODEL_TARGET; waiting for it"
+  lock_owner="\$(cat "\$LOCK/owner" 2>/dev/null || true)"
+  [[ -n "\$lock_owner" ]] && echo "[model] lock owner: \$lock_owner"
+  for i in \$(seq 1 \${MODEL_DOWNLOAD_WAIT_POLLS:-720}); do
+    if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+      echo "[model] local model prepared by another rank: \$MODEL_TARGET -> \$resolved"
+      printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
+      exit 0
+    fi
+    if lock_is_stale; then
+      echo "WARN: observed stale model download lock while waiting: \$LOCK"
+      rm -rf "\$LOCK"
+      exec "\$0"
+    fi
+    [[ -d "\$LOCK" ]] || exec "\$0"
+    if (( i % 15 == 0 )); then
+      echo "[model] still waiting for \$MODEL_TARGET after \$((i * 20))s"
+    fi
+    sleep 20
+  done
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+  echo "[model] local model prepared: \$MODEL_TARGET -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
+  exit 0
+fi
+
+echo "WARN: unable to prepare local model cache at \$MODEL_TARGET; runtime will fall back to \$MODEL_ID"
+exit 1
+EOF
+
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
+""",
+    )
+    text = replace_all(
+        text,
+        'bash "\\$CIDIR/install_checkout_sglang.sh"\n',
+        'bash "\\$CIDIR/install_checkout_sglang.sh"\n'
+        'bash "\\$CIDIR/install_checkout_aiter.sh"\n'
+        "export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
+        min_count=2,
+    )
+    text = replace_all(
+        text,
+        'source "\\$CIDIR/model_flags.sh"\n',
+        'source "\\$CIDIR/model_flags.sh"\n'
+        'MODEL_PATH_ORIGINAL="$MODEL_PATH"\n'
+        'source "\\$CIDIR/model_path_helpers.sh"\n'
+        'MODEL_PATH_RUNTIME="\\$(model_runtime_path "\\$MODEL_PATH_ORIGINAL" "$MODEL")"\n',
+        min_count=2,
+    )
+    text = replace_all(
+        text,
+        "--model-path $MODEL_PATH --host",
+        '--model-path "\\$MODEL_PATH_RUNTIME" --host',
+        min_count=2,
+    )
+    text = replace_once(
+        text,
+        "    bash \\$CIDIR/install_checkout_sglang.sh\n",
+        "    bash \\$CIDIR/install_checkout_sglang.sh\n"
+        "    bash \\$CIDIR/install_checkout_aiter.sh\n"
+        "    export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
+    )
+    text = replace_once(
+        text,
+        "    bash \\$CIDIR/install_checkout_router.sh\n",
+        "    bash \\$CIDIR/install_checkout_router.sh\n"
+        '    MODEL_PATH_ORIGINAL="$MODEL_PATH"\n'
+        '    source "\\$CIDIR/model_path_helpers.sh"\n'
+        '    MODEL_PATH_RUNTIME="\\$(model_runtime_path "\\$MODEL_PATH_ORIGINAL" "$MODEL")"\n',
+    )
+    text = replace_once(
+        text,
+        "--host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \\",
+        '--host 127.0.0.1 --port $LBPORT --model "\\$MODEL_PATH_RUNTIME" \\',
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/prefill.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+docker rm -f mi355x_prefill 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/prefill.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before prefill; runtime will fall back to model id"
+docker rm -f mi355x_prefill 2>/dev/null || true
+""",
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/decode.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+docker rm -f mi355x_decode 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/decode.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before decode; runtime will fall back to model id"
+docker rm -f mi355x_decode 2>/dev/null || true
+""",
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/bench.sh" <<EOF
+#!/bin/bash
+set -e
+PIP=\\$1; DIP=\\$2
+docker rm -f mi355x_bench 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/bench.sh" <<EOF
+#!/bin/bash
+set -e
+PIP=\\$1; DIP=\\$2
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before bench; runtime will fall back to model id"
+docker rm -f mi355x_bench 2>/dev/null || true
+""",
+    )
+    text = replace_once(
+        text,
+        """    echo "[wait] prefill"; for i in \\$(seq 1 600); do curl -sf http://\\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
+    echo "[wait] decode";  for i in \\$(seq 1 600); do curl -sf http://\\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
+""",
+        """    wait_health() {
+      NAME=\\$1
+      URL=\\$2
+      echo "[wait] \\$NAME \\$URL"
+      for i in \\$(seq 1 600); do
+        if curl -sf "\\$URL" >/dev/null; then
+          echo "[wait] \\$NAME ready after \\$i attempt(s)"
+          return 0
+        fi
+        if [ \\$((i % 12)) -eq 0 ]; then
+          echo "[wait] \\$NAME still not ready after \\$((i * 5))s"
+        fi
+        sleep 5
+      done
+      echo "[wait] ERROR: \\$NAME not ready after 3000s: \\$URL"
+      exit 1
+    }
+    wait_health prefill http://\\$PIP:$PPORT/health
+    wait_health decode http://\\$DIP:$DPORT/health
+""",
+    )
+    text = replace_all(
+        text,
+        "/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}",
+        "/ci_workdir",
+    )
+    text = replace_once(
+        text,
+        """NODELIST_ARG=()
+[[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
+""",
+        """NODELIST_ARG=()
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+    NODELIST_ARG=()
+elif [[ -n "${SLURM_NODELIST:-}" ]]; then
+    NODELIST_ARG=()
+fi
+
+RESERVATION_ARG=()
+[[ -n "${SLURM_RESERVATION:-}" ]] && RESERVATION_ARG=(--reservation "$SLURM_RESERVATION")
+
+PARTITION_ARG=()
+[[ -n "${SLURM_PARTITION:-}" ]] && PARTITION_ARG=(-p "$SLURM_PARTITION")
+""",
+    )
+    text = replace_once(
+        text,
+        """WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+PNODES=("${NODES[@]:0:PW}")
+DNODES=("${NODES[@]:PW:DW}")
+PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
+PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
+DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+""",
+        """WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+
+DRIVE_LOCK="$WORKDIR/drive.lock"
+if ! mkdir "$DRIVE_LOCK" 2>/dev/null; then
+  echo "[drive] another launcher instance already owns $DRIVE_LOCK; exiting duplicate task"
+  exit 0
+fi
+trap 'rmdir "$DRIVE_LOCK" 2>/dev/null || true' EXIT
+
+expand_nodelist() {
+  local raw="$1"
+  if command -v scontrol >/dev/null 2>&1; then
+    scontrol show hostnames "$raw" 2>/dev/null && return 0
+  fi
+  python3 - "$raw" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+
+def split_top(value: str) -> list[str]:
+    parts, buf, depth = [], [], 0
+    for ch in value:
+        if ch == "," and depth == 0:
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]" and depth:
+            depth -= 1
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+def expand_one(item: str) -> list[str]:
+    match = re.fullmatch(r"([^\\[]*)\\[([^\\]]+)\\](.*)", item)
+    if not match:
+        return [item] if item else []
+    prefix, body, suffix = match.groups()
+    expanded = []
+    for piece in body.split(","):
+        range_match = re.fullmatch(r"(\\d+)-(\\d+)", piece)
+        if range_match:
+            start_s, end_s = range_match.groups()
+            width = max(len(start_s), len(end_s))
+            start, end = int(start_s), int(end_s)
+            step = 1 if end >= start else -1
+            expanded.extend(
+                f"{prefix}{value:0{width}d}{suffix}"
+                for value in range(start, end + step, step)
+            )
+        else:
+            expanded.append(f"{prefix}{piece}{suffix}")
+    return expanded
+
+for part in split_top(raw):
+    for node in expand_one(part.strip()):
+        print(node)
+PY
+}
+
+RAW_NODELIST="${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-${SPUR_JOB_NODELIST:-${SPUR_NODELIST:-}}}}"
+if [[ -z "$RAW_NODELIST" ]]; then
+  echo "[drive] ERROR: no Slurm/SPUR nodelist env found" >&2
+  env | sort | grep -E '^(SLURM|SPUR)_' >&2 || true
+  exit 1
+fi
+mapfile -t NODES < <(expand_nodelist "$RAW_NODELIST")
+if (( ${#NODES[@]} < PW + DW )); then
+  echo "[drive] ERROR: need $((PW + DW)) nodes, got ${#NODES[@]} from $RAW_NODELIST: ${NODES[*]}" >&2
+  exit 1
+fi
+PNODES=("${NODES[@]:0:PW}")
+DNODES=("${NODES[@]:PW:DW}")
+PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
+PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
+DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+PIP="${PIP:-$PNODE}"
+DIP="${DIP:-$DNODE}"
+
+run_on_node() {
+  local node="$1"
+  shift
+  local self_full self_short
+  self_full="$(hostname)"
+  self_short="$(hostname -s 2>/dev/null || hostname)"
+  if [[ "$node" == "$self_full" || "$node" == "$self_short" ]]; then
+    "$@"
+  else
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=30 "$node" "$@"
+  fi
+}
+""",
+    )
+    text = replace_once(
+        text,
+        """for n in "${PNODES[@]}"; do
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+done
+for n in "${DNODES[@]}"; do
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+done
+sleep 5
+""",
+        """for n in "${PNODES[@]}"; do
+  ( run_on_node "$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+done
+for n in "${DNODES[@]}"; do
+  ( run_on_node "$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+done
+sleep 5
+""",
+    )
+    text = replace_once(
+        text,
+        """# Each server's srun runs here on the login node and returns exactly when its
+# compute-node container exits. Wrap it so the return code lands in a marker
+# file on shared NFS. The monitor then watches for markers instead of polling
+# PIDs -- unambiguous (no zombie/kill -0 guesswork) and it records which role
+# died and with what code. (A hung-but-alive server is NOT caught here; that is
+# bounded by bench.sh's health-wait timeout.)
+""",
+        """# SPUR does not fully match Slurm's nested srun/--overlap behavior, so dispatch
+# per-node work through SSH after the outer srun reserves the nodes. Wrap each
+# command so the return code lands in a marker file on shared NFS. The monitor
+# then watches for markers instead of polling PIDs and records which role died.
+""",
+    )
+    text = replace_once(
+        text,
+        """( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+  echo $? > "$WORKDIR/bench_exit" ) &
+""",
+        """( run_on_node "$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+  echo $? > "$WORKDIR/bench_exit" ) &
+""",
+    )
+    text = replace_once(
+        text,
+        """for n in "${PNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
+for n in "${DNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
+""",
+        """for n in "${PNODES[@]}"; do run_on_node "$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
+for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
+""",
+    )
+    text = replace_once(
+        text,
+        """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+    --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
+""",
+        """SBATCH_SCRIPT="$WORKDIR/submit.sh"
+BATCH_EXIT="$WORKDIR/batch_exit"
+rm -f "$BATCH_EXIT"
+
+SBATCH_PARTITION_LINE=""
+if [[ -n "${SLURM_PARTITION:-}" ]]; then
+    SBATCH_PARTITION_LINE="#SBATCH --partition=$SLURM_PARTITION"
+fi
+SBATCH_NODE_LINE=""
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+    SBATCH_NODE_LINE="#SBATCH --reservation=$SLURM_RESERVATION"
+elif [[ -n "${SLURM_NODELIST:-}" ]]; then
+    SBATCH_NODE_LINE="#SBATCH --nodelist=$SLURM_NODELIST"
+fi
+SBATCH_EXCLUSIVE_LINE=""
+if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]]; then
+    SBATCH_EXCLUSIVE_LINE="#SBATCH --exclusive"
+fi
+SBATCH_EXCLUDE_LINE=""
+if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
+    SBATCH_EXCLUDE_LINE="#SBATCH --exclude=$SLURM_EXCLUDE"
+fi
+
+cat > "$SBATCH_SCRIPT" <<EOF
+#!/bin/bash
+#SBATCH --job-name=$JOB_NAME
+#SBATCH --nodes=$TOTAL_NODES
+#SBATCH --ntasks=$TOTAL_NODES
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=$TIME_LIMIT
+#SBATCH --output=/tmp/spur-%j.out
+#SBATCH --error=/tmp/spur-%j.err
+#SBATCH --chdir=/tmp
+$SBATCH_PARTITION_LINE
+$SBATCH_NODE_LINE
+$SBATCH_EXCLUSIVE_LINE
+$SBATCH_EXCLUDE_LINE
+
+set -euo pipefail
+TOTAL_NODES="$TOTAL_NODES"
+REQUESTED_NODELIST_RAW="\\${SPUR_NODELIST:-${SLURM_NODELIST:-}}"
+REQUESTED_NODES=()
+if [[ -n "\\$REQUESTED_NODELIST_RAW" ]]; then
+    if command -v scontrol >/dev/null 2>&1; then
+        mapfile -t REQUESTED_NODES < <(scontrol show hostnames "\\$REQUESTED_NODELIST_RAW" 2>/dev/null || true)
+    fi
+    if [[ "\\${#REQUESTED_NODES[@]}" -eq 0 ]]; then
+        IFS=',' read -r -a REQUESTED_NODES <<< "\\$REQUESTED_NODELIST_RAW"
+    fi
+fi
+
+RAW_RANK="\\${SPUR_TASK_OFFSET:-\\${SLURM_PROCID:-0}}"
+if [[ ! "\\$RAW_RANK" =~ ^[0-9]+$ ]]; then
+    RAW_RANK=0
+fi
+RANK=-1
+CURRENT_HOST="\\$(hostname)"
+CURRENT_SHORT="\\$(hostname -s 2>/dev/null || hostname)"
+for idx in "\\${!REQUESTED_NODES[@]}"; do
+    node="\\${REQUESTED_NODES[\\$idx]}"
+    node_short="\\${node%%.*}"
+    if [[ "\\$CURRENT_HOST" == "\\$node" || "\\$CURRENT_SHORT" == "\\$node_short" ]]; then
+        RANK="\\$idx"
+        break
+    fi
+done
+if (( RANK < 0 )); then
+    if (( RAW_RANK >= TOTAL_NODES && RAW_RANK - 1 < TOTAL_NODES )); then
+        RANK=\\$((RAW_RANK - 1))
+    else
+        RANK="\\$RAW_RANK"
+    fi
+fi
+
+JOB_ID="\\${SLURM_JOB_ID:-\\${SPUR_JOB_ID:-batch}}"
+RANK_LOG="$WORKDIR/rank-\\${RANK}.log"
+LOCAL_LOG="/tmp/sglang-\\${JOB_ID}-rank\\${RANK}.log"
+STARTUP_LOG="$WORKDIR/startup.log"
+{
+    echo "startup job=\\$JOB_ID raw_rank=\\$RAW_RANK rank=\\$RANK host=\\$(hostname) local_log=\\$LOCAL_LOG shared_log=\\$RANK_LOG"
+    env | sort | grep -E '^(SLURM|SPUR)_' || true
+} >> "\\$STARTUP_LOG" 2>/dev/null || true
+if : >> "\\$RANK_LOG" 2>/dev/null; then
+    exec > >(tee -a "\\$LOCAL_LOG" "\\$RANK_LOG") 2>&1
+else
+    exec > "\\$LOCAL_LOG" 2>&1
+    echo "WARNING: cannot write shared rank log \\$RANK_LOG; using local log \\$LOCAL_LOG"
+fi
+
+echo "=== SGLang SPUR batch rank \\$RANK raw_rank=\\$RAW_RANK job=\\$JOB_ID host=\\$(hostname) ==="
+echo "local_log=\\$LOCAL_LOG"
+echo "shared_log=\\$RANK_LOG"
+env | sort | grep -E '^(SLURM|SPUR)_' || true
+
+IPS=()
+if [[ -n "\\${SPUR_PEER_NODES:-}" ]]; then
+    IFS=',' read -r -a PEERS <<< "\\$SPUR_PEER_NODES"
+    for peer in "\\${PEERS[@]}"; do
+        IPS+=("\\${peer%%:*}")
+    done
+elif (( \\${#REQUESTED_NODES[@]} >= TOTAL_NODES )); then
+    for node in "\\${REQUESTED_NODES[@]:0:$TOTAL_NODES}"; do
+        ip="\\$(getent ahostsv4 "\\$node" | awk '\\$1 !~ /^127[.]/ {print \\$1; exit}')"
+        IPS+=("\\${ip:-\\$node}")
+    done
+fi
+
+if (( \\${#IPS[@]} < TOTAL_NODES )); then
+    echo "ERROR: expected \\$TOTAL_NODES peer IPs, got \\${#IPS[@]}: \\${IPS[*]}" >&2
+    echo 1 > "$BATCH_EXIT"
+    exit 1
+fi
+
+PIP="\\${IPS[0]}"
+DIP="\\${IPS[$PW]}"
+echo "peer_ips=\\${IPS[*]}"
+echo "bench targets prefill=\\$PIP decode=\\$DIP"
+
+if (( RANK < $PW )); then
+    ROLE=prefill
+    CONTAINER=mi355x_prefill
+    ROLE_SCRIPT="$WORKDIR/prefill.sh"
+    ROLE_LOG="$WORKDIR/prefill_rank\\${RANK}.log"
+else
+    ROLE=decode
+    CONTAINER=mi355x_decode
+    ROLE_SCRIPT="$WORKDIR/decode.sh"
+    ROLE_LOG="$WORKDIR/decode_rank\\${RANK}.log"
+fi
+
+cleanup_role() {
+    docker kill "\\$CONTAINER" >/dev/null 2>&1 || true
+}
+trap cleanup_role EXIT
+
+echo "starting role=\\$ROLE script=\\$ROLE_SCRIPT log=\\$ROLE_LOG"
+bash "\\$ROLE_SCRIPT" > "\\$ROLE_LOG" 2>&1 &
+ROLE_PID=\\$!
+
+if [[ "\\$RANK" == "0" ]]; then
+    sleep 5
+    set +e
+    bash "$WORKDIR/bench.sh" "\\$PIP" "\\$DIP" > "$WORKDIR/bench.log" 2>&1
+    rc=\\$?
+    echo "\\$rc" > "$BATCH_EXIT"
+    cleanup_role
+    wait "\\$ROLE_PID" >/dev/null 2>&1 || true
+    exit "\\$rc"
+fi
+
+while [[ ! -f "$BATCH_EXIT" ]]; do
+    if ! kill -0 "\\$ROLE_PID" >/dev/null 2>&1; then
+        wait "\\$ROLE_PID"
+        rc=\\$?
+        echo "ERROR: role \\$ROLE exited before benchmark completed rc=\\$rc" >&2
+        echo "\\$rc" > "$BATCH_EXIT"
+        exit "\\$rc"
+    fi
+    sleep 5
+done
+rc="\\$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
+cleanup_role
+wait "\\$ROLE_PID" >/dev/null 2>&1 || true
+exit "\\$rc"
+EOF
+if ! grep -q 'set -euo pipefail' "$SBATCH_SCRIPT"; then
+    echo "ERROR: generated submit script is missing payload" >&2
+    sed -n '1,120p' "$SBATCH_SCRIPT" >&2 || true
+    exit 1
+fi
+chmod +x "$SBATCH_SCRIPT"
+
+parse_batch_job_id() {
+    local output="$1"
+    output="${output//$'\\r'/}"
+    if [[ "$output" =~ Submitted[[:space:]]+batch[[:space:]]+job[[:space:]]+([0-9]+) ]]; then
+        printf '%s\\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$output" =~ ^[[:space:]]*([0-9]+)(\\;.*)?[[:space:]]*$ ]]; then
+        printf '%s\\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+echo "=== submitting batch script ==="
+sed -n '1,80p' "$SBATCH_SCRIPT"
+SBATCH_OUTPUT="$(sbatch "$SBATCH_SCRIPT")"
+SALLOC_RC=$?
+echo "$SBATCH_OUTPUT"
+if [[ "$SALLOC_RC" -eq 0 ]]; then
+    if ! BATCH_JOB_ID="$(parse_batch_job_id "$SBATCH_OUTPUT")"; then
+        echo "ERROR: unable to parse batch job id from sbatch output: $SBATCH_OUTPUT" >&2
+        SALLOC_RC=1
+    else
+        echo "batch_job_id=$BATCH_JOB_ID"
+        SLURM_OUT="$WORKDIR/slurm-${BATCH_JOB_ID}.out"
+        SLURM_ERR="$WORKDIR/slurm-${BATCH_JOB_ID}.err"
+        declare -A LIVE_LOG_LINES=()
+        print_live_logs() {
+            shopt -s nullglob
+            local file current previous start skipped
+            local limit=80
+            local files=(
+                "$WORKDIR"/startup.log
+                "$WORKDIR"/rank-*.log
+                "$WORKDIR"/bench.log
+                "$WORKDIR"/prefill_rank*.log
+                "$WORKDIR"/decode_rank*.log
+            )
+            shopt -u nullglob
+            for file in "${files[@]}"; do
+                [[ -f "$file" ]] || continue
+                current="$(wc -l < "$file" 2>/dev/null || echo 0)"
+                [[ "$current" =~ ^[0-9]+$ ]] || current=0
+                previous="${LIVE_LOG_LINES[$file]:-0}"
+                if (( current <= previous )); then
+                    continue
+                fi
+                start=$((previous + 1))
+                if (( current - previous > limit )); then
+                    skipped=$((current - previous - limit))
+                    start=$((current - limit + 1))
+                    echo "--- live $(basename "$file") skipped ${skipped} older new line(s) ---"
+                fi
+                echo "--- live $(basename "$file") lines ${start}-${current} ---"
+                sed -n "${start},${current}p" "$file" | sed "s/^/[$(basename "$file")] /" || true
+                LIVE_LOG_LINES["$file"]="$current"
+            done
+        }
+        while [[ ! -f "$BATCH_EXIT" ]]; do
+            queue_line="$(squeue -j "$BATCH_JOB_ID" -h 2>/dev/null || true)"
+            if [[ -n "$queue_line" ]]; then
+                echo "[batch] $queue_line"
+                print_live_logs
+                sleep 30
+            else
+                sleep 5
+                [[ -f "$BATCH_EXIT" ]] || { echo "ERROR: batch job $BATCH_JOB_ID ended without $BATCH_EXIT" >&2; SALLOC_RC=1; break; }
+            fi
+        done
+        print_live_logs
+        if [[ -f "$BATCH_EXIT" ]]; then
+            SALLOC_RC="$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
+        fi
+        echo "--- slurm stdout ---"
+        cat "$SLURM_OUT" 2>/dev/null || true
+        echo "--- slurm stderr ---"
+        cat "$SLURM_ERR" 2>/dev/null || true
+    fi
+fi
+""",
+    )
+    text = replace_once(
+        text,
+        """    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+SALLOC_RC=$?
+""",
+        "",
+    )
+
+    launcher.write_text(text, encoding="utf-8")
+    print(f"patched {launcher}")
+
+
+def parse_concurrency_list(raw: str) -> list[int]:
+    values = [item for item in raw.replace(",", " ").split() if item]
+    if not values:
+        raise SystemExit("concurrency list cannot be empty")
+    try:
+        parsed = [int(item) for item in values]
+    except ValueError as exc:
+        raise SystemExit(f"invalid concurrency list {raw!r}: {exc}") from exc
+    if any(value <= 0 for value in parsed):
+        raise SystemExit(f"concurrency values must be positive: {parsed}")
+    return parsed
+
+
+def parse_bool(raw: str) -> bool:
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"invalid boolean value: {raw!r}")
+
+
+def configure_recipe(args: argparse.Namespace) -> None:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise SystemExit("PyYAML is required: python3 -m pip install pyyaml") from exc
+
+    root = Path(args.sglang_workspace)
+    recipe = root / RECIPE_PATH
+    payload = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+
+    payload["bench"]["concurrencies"] = parse_concurrency_list(args.concurrency_list)
+    payload["bench"].setdefault("accuracy", {})["enabled"] = parse_bool(
+        args.accuracy_enabled
+    )
+
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    print(f"configured {recipe}")
+    print(f"concurrencies={payload['bench']['concurrencies']}")
+    print(f"accuracy_enabled={payload['bench']['accuracy']['enabled']}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    patch = subparsers.add_parser("patch-launcher")
+    patch.add_argument("sglang_workspace")
+    patch.set_defaults(func=patch_launcher)
+
+    recipe = subparsers.add_parser("configure-recipe")
+    recipe.add_argument("sglang_workspace")
+    recipe.add_argument("--concurrency-list", required=True)
+    recipe.add_argument("--accuracy-enabled", required=True)
+    recipe.set_defaults(func=configure_recipe)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
