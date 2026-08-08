@@ -280,7 +280,14 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    # Same HIP interposition guard as aiter.jit.core._RTLD_DEEPBIND. Recomputed
+    # rather than imported so this module stays standalone.
+    deepbind = (
+        0
+        if os.getenv("AITER_DISABLE_DEEPBIND") == "1"
+        else getattr(os, "RTLD_DEEPBIND", 0)
+    )
+    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", mode=os.RTLD_LAZY | deepbind)
     return getattr(lib, func_name)
 
 
