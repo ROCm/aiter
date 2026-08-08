@@ -526,17 +526,20 @@ def _grouped_a8w4_tdm_moe(
         num_valid_routes=_ep_nvr,
     )
 
-    # Fuse gemm1 silu/swiglu + fp8 quantization + scale preshuffle into the
-    # kernel epilogue (a8w4 only), eliminating the standalone
-    # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = (not _is_fp4) and (_b1 is None)
+    # Fuse gemm1 activation + MX quantization + scale preshuffle into the
+    # kernel epilogue, eliminating the standalone quant pass between gemm1 and
+    # gemm2. The epilogue currently requires a bias-free stage1 (Kimi-K3) and
+    # four WN subtiles per MX block within each wave.
+    _wmma_n_rep = tile_n // (4 * 16)  # TDM launcher uses n_warp=4.
+    _fuse_quant = _b1 is None and _wmma_n_rep >= 4 and _wmma_n_rep % 4 == 0
+    _stage1_quant_out = 2 if _is_fp4 else 1
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
     if _fuse_quant:
-        # Pre-allocate fp8 payload + preshuffled e8m0 scale for gemm1 output.
+        # Pre-allocate MX payload + preshuffled E8M0 scale for gemm1 output.
         # These are written directly by the kernel's fused quant epilogue.
-        payload_bytes = inter_dim  # fp8: 1 byte per element
+        payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
         scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
         a2_payload = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
@@ -546,9 +549,8 @@ def _grouped_a8w4_tdm_moe(
             dtype=torch.uint8,
             device=device,
         )
-        # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
-        # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
-        # quant_scale / arg_quant_scale).
+        # The gemm1 kernel writes packed MX payload to `a2_payload` (passed as
+        # `out` / arg_c) and preshuffled E8M0 scale to `a2_scale`.
         flydsl_grouped_gemm_a8w4_masked(
             a2_payload.view(torch.uint8),
             a1_payload,
@@ -569,7 +571,7 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
-            stage1_quant_out=1,
+            stage1_quant_out=_stage1_quant_out,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             **_situ_kw,
@@ -659,7 +661,7 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
-                        stage1_quant_out=1,
+                        stage1_quant_out=_stage1_quant_out,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         **_situ_kw,
