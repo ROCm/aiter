@@ -737,6 +737,29 @@ def _fused_moe_impl(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    # RDNA3 has no executable CK per-1x32 path. Keep BF16 activations for the
+    # narrowly supported Triton A16W4 route instead of quantizing them to FP4.
+    if _is_gfx1100_triton_mxfp4_contract(
+        M,
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        q_dtype_w,
+        quant_type,
+        isG1U1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        isShuffled,
+        gate_mode,
+        expert_mask is not None,
+        bias2 is not None,
+    ):
+        q_dtype_a = dtypes.bf16
+
     if get_gfx() == "gfx1250":
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
@@ -1259,6 +1282,298 @@ class MOEMetadata:
 
 def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
+
+
+def _require_ck_2stage_quant_arch(quant_type):
+    """Reject MX quant dispatch that would reach an architecture-empty CK kernel.
+
+    The CK two-stage per-1x32 implementation uses gfx950-only MX matrix
+    instructions. Other backends are selected before this guard, so reaching
+    it means that no portable implementation was found for this dispatch.
+    """
+    gfx = get_gfx()
+    if quant_type == QuantType.per_1x32 and gfx != "gfx950":
+        raise RuntimeError(
+            "CK two-stage per_1x32 MoE is only executable on gfx950; "
+            f"refusing to launch its architecture-empty kernel on {gfx}. "
+            "Select a supported Triton, FlyDSL, Opus, or CK-Tile backend."
+        )
+
+
+# SGLang's DSV4 chunked-prefill contract is 4096 tokens. The same Triton
+# kernels and sorting ABI used for decode remain valid through that boundary;
+# only their launch grid grows with the padded route count.
+_GFX1100_TRITON_MXFP4_MAX_TOKENS = 4096
+_GFX1100_TRITON_MXFP4_SHAPES = {
+    (2048, 256, 0),  # unsharded/full-shape correctness gate
+    (256, 256, 0),  # DeepSeek-V4 TP8: global I2048 sharded to local I256
+}
+_GFX1100_TRITON_MXFP4_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "kpack": 1,
+}
+
+
+def _is_gfx1100_triton_mxfp4_contract(
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    dtype,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    doweight_stage1,
+    hidden_pad,
+    intermediate_pad,
+    is_shuffled,
+    gate_mode,
+    is_ep,
+    has_stage2_bias,
+):
+    return (
+        get_gfx() == "gfx1100"
+        and 0 < token <= _GFX1100_TRITON_MXFP4_MAX_TOKENS
+        and model_dim == 4096
+        and (inter_dim, expert, intermediate_pad) in _GFX1100_TRITON_MXFP4_SHAPES
+        and topk == 6
+        and dtype == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and use_g1u1
+        and activation == ActivationType.Silu
+        and not doweight_stage1
+        and hidden_pad == 0
+        and not is_shuffled
+        and gate_mode == GateMode.SEPARATED
+        and not is_ep
+        and not has_stage2_bias
+    )
+
+
+def _gfx1100_triton_mxfp4_metadata(
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    doweight_stage1,
+    hidden_pad,
+    intermediate_pad,
+    is_shuffled,
+    gate_mode,
+    is_ep,
+    has_stage2_bias,
+):
+    """Return the narrowly qualified gfx1100 Triton MXFP4 route, if any."""
+    if not (
+        q_dtype_a == dtypes.bf16
+        and _is_gfx1100_triton_mxfp4_contract(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            dtype,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+            is_ep,
+            has_stage2_bias,
+        )
+    ):
+        return None
+    return MOEMetadata(
+        stage1=functools.partial(
+            _triton_mxfp4_a16w4_stage1,
+            config=_GFX1100_TRITON_MXFP4_CONFIG,
+        ),
+        stage2=functools.partial(
+            _triton_mxfp4_a16w4_stage2,
+            config=_GFX1100_TRITON_MXFP4_CONFIG,
+        ),
+        block_m=_GFX1100_TRITON_MXFP4_CONFIG["BLOCK_SIZE_M"],
+        ksplit=1,
+        prequant=False,
+        skip_inter_quant=True,
+    )
+
+
+_TRITON_MXFP4_UNIT_SCALES: dict[
+    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _triton_mxfp4_unit_scales(tensor, num_experts):
+    """Reuse immutable unit scales instead of launching fills for every MoE stage."""
+    device = tensor.device
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (device, int(num_experts))
+    scales = _TRITON_MXFP4_UNIT_SCALES.get(key)
+    if scales is None:
+        scales = (
+            torch.ones((1,), dtype=dtypes.fp32, device=device),
+            torch.ones((num_experts,), dtype=dtypes.fp32, device=device),
+        )
+        _TRITON_MXFP4_UNIT_SCALES[key] = scales
+    return scales
+
+
+def _triton_mxfp4_a16w4_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
+    topk_weights=None,
+    topk_ids=None,
+    swiglu_limit=None,
+    *,
+    config,
+    **_kwargs,
+):
+    from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import (
+        fused_moe_mxfp4_silu,
+    )
+    from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
+    del w2, block_m, a1_scale
+    token_num = hidden_states.shape[0]
+    inter_dim = w1.shape[1] // 2
+    if out is None or tuple(out.shape) != (token_num, topk, inter_dim):
+        out = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+    if w1_scale is None:
+        raise ValueError("gfx1100 Triton MXFP4 stage1 requires E8M0 weight scales")
+    if getattr(w1, "is_shuffled", False):
+        raise ValueError("gfx1100 Triton MXFP4 stage1 requires unshuffled weights")
+    if topk_weights is None or topk_ids is None:
+        raise ValueError("gfx1100 Triton MXFP4 stage1 requires route-order metadata")
+
+    route_count = token_num * topk
+    a_scale, b_scale = _triton_mxfp4_unit_scales(w1, w1.shape[0])
+    fused_moe_mxfp4_silu(
+        hidden_states,
+        w1.view(torch.uint8),
+        out.view(route_count, inter_dim),
+        a_scale,
+        b_scale,
+        None,
+        w1_scale.view(torch.uint8),
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        False,
+        topk,
+        False,
+        False,
+        config,
+        torch_to_triton_dtype[out.dtype],
+        sorted_token_ids_are_packed=True,
+        sorted_top_k=topk,
+        swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+    )
+    return out
+
+
+def _triton_mxfp4_a16w4_stage2(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_out,
+    topk,
+    w2_scale=None,
+    a2_scale=None,
+    block_m=None,
+    sorted_weights=None,
+    topk_weights=None,
+    *,
+    config,
+    **_kwargs,
+):
+    from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
+    from aiter.ops.triton.moe.reduce import reduce_topk
+    from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
+    del w1, a2_scale, block_m, sorted_weights
+    if w2_scale is None:
+        raise ValueError("gfx1100 Triton MXFP4 stage2 requires E8M0 weight scales")
+    if topk_weights is None:
+        raise ValueError("gfx1100 Triton MXFP4 stage2 requires route-order weights")
+    if getattr(w2, "is_shuffled", False):
+        raise ValueError("gfx1100 Triton MXFP4 stage2 requires unshuffled weights")
+
+    token_num = moe_out.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = inter_states.shape[-1]
+    route_count = token_num * topk
+    route_weights = topk_weights.reshape(route_count, 1).contiguous()
+    route_ids_placeholder = sorted_token_ids[:route_count].view(route_count, 1)
+    route_out = torch.empty(
+        (route_count, 1, model_dim), dtype=moe_out.dtype, device=moe_out.device
+    )
+    a_scale, b_scale = _triton_mxfp4_unit_scales(w2, w2.shape[0])
+    fused_moe_mxfp4(
+        inter_states.view(route_count, inter_dim),
+        w2.view(torch.uint8),
+        route_out,
+        a_scale,
+        b_scale,
+        None,
+        w2_scale.view(torch.uint8),
+        route_weights,
+        route_ids_placeholder,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        True,
+        1,
+        False,
+        False,
+        config,
+        torch_to_triton_dtype[moe_out.dtype],
+        sorted_token_ids_are_packed=True,
+        sorted_top_k=topk,
+    )
+    reduce_topk(route_out.view(token_num, topk, model_dim), moe_out)
+    return moe_out
 
 
 def _normalize_bias_for_kernel(
@@ -1876,6 +2191,29 @@ def get_2stage_cfgs(
     has_stage2_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
+    gfx1100_triton_metadata = _gfx1100_triton_mxfp4_metadata(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        q_type,
+        use_g1u1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        is_shuffled,
+        gate_mode,
+        is_ep,
+        has_stage2_bias,
+    )
+    if gfx1100_triton_metadata is not None:
+        return gfx1100_triton_metadata
+
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
@@ -2551,6 +2889,7 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        _require_ck_2stage_quant_arch(q_type)
         if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
@@ -2820,6 +3159,12 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if stage1_func is _triton_mxfp4_a16w4_stage1:
+        extra_stage1_args["topk_weights"] = topk_weights
+        extra_stage1_args["topk_ids"] = topk_ids
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if stage2_func is _triton_mxfp4_a16w4_stage2:
+        extra_stage2_args["topk_weights"] = topk_weights
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -2879,6 +3224,8 @@ def fused_moe_2stages(
     a2 = _stage1_call()
     if m_indices is not None and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
+    elif metadata.skip_inter_quant:
+        a2_scale = None
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)

@@ -149,3 +149,50 @@ def reduce_grouped(
         num_warps=2,
     )
     return out
+
+
+def reduce_topk(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Sum contiguous ``[tokens, topk, hidden]`` route output in fp32."""
+    assert x.ndim == 3
+    assert out.ndim == 2
+    assert x.is_contiguous()
+    assert out.is_contiguous()
+    token_num, topk, hidden_dim = x.shape
+    assert out.shape == (token_num, hidden_dim)
+    assert out.dtype == x.dtype
+    assert out.device == x.device
+    if token_num == 0:
+        return out
+
+    flat = x.view(1, token_num * topk, hidden_dim)
+    block_n = 512
+    num_blocks = triton.cdiv(hidden_dim, block_n)
+    _reduce_grouped[(num_blocks * token_num,)](
+        flat,
+        flat.stride(0),
+        flat.stride(1),
+        flat.stride(2),
+        out,
+        out.stride(0),
+        out.stride(1),
+        None,
+        flat.shape[0],
+        flat.shape[1],
+        flat.shape[2],
+        num_blocks,
+        False,
+        1.0,
+        1.0,
+        1,
+        BLOCK_N=block_n,
+        EVEN_N=(hidden_dim % block_n == 0),
+        K=topk,
+        SWIGLU_ADD_RESIDUAL=True,
+        USE_TDM=False,
+        Residual=out,
+        stride_extres_m=0,
+        stride_extres_n=0,
+        HAS_EXT_RESIDUAL=False,
+        num_warps=2,
+    )
+    return out

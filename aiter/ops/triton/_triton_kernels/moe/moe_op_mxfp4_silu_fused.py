@@ -33,6 +33,9 @@ _fused_moe_kernel_mxfp4_silu_repr = make_kernel_repr(
         "EVEN_K",
         "MUL_ROUTED_WEIGHT",
         "top_k",
+        "SORTED_IDS_PACKED",
+        "SORTED_TOP_K",
+        "SWIGLU_LIMIT",
         "compute_type",
         "SWIZZLE_MX_A",
         "SWIZZLE_MX_B",
@@ -86,6 +89,9 @@ def _fused_moe_kernel_mxfp4_silu(
     EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    SORTED_IDS_PACKED: tl.constexpr,
+    SORTED_TOP_K: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
     compute_type: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
@@ -171,6 +177,10 @@ def _fused_moe_kernel_mxfp4_silu(
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    if SORTED_IDS_PACKED:
+        token_id = offs_token & 0xFFFFFF
+        topk_slot = offs_token >> 24
+        offs_token = token_id * SORTED_TOP_K + topk_slot
     token_mask = offs_token < num_valid_tokens
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
@@ -389,6 +399,9 @@ def _fused_moe_kernel_mxfp4_silu(
         accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
     )
 
+    if SWIGLU_LIMIT > 0.0:
+        silu_acc = tl.minimum(silu_acc, SWIGLU_LIMIT)
+        mul_acc = tl.maximum(tl.minimum(mul_acc, SWIGLU_LIMIT), -SWIGLU_LIMIT)
     silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
     # -----------------------------------------------------------
