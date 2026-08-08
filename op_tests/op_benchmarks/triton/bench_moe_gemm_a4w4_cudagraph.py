@@ -46,6 +46,7 @@ from pathlib import Path
 import torch
 import triton
 
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     is_gluon_supported,
@@ -55,7 +56,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe, shuffle_weight
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
@@ -162,18 +163,13 @@ def check_and_shuffle_scales(scale, N, K):
 
 
 def preshuffle_weight(w):
-    """gfx1250 WMMA weight preshuffle, as in run_moe_a4w4.py's build().
-
+    """gfx1250 WMMA weight preshuffle.
+    
     `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
-    [E, (K // 2) * 16, N // 16] the gluon kernel reads with
-    PRESHUFFLE_WEIGHTS=True. shuffle_weight() asserts K // 2 % 32 and N % 16.
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLED=True.
+    shuffle_weight_gfx1250() asserts K // 2 % 32 and N % 16.
     """
-    E, K_packed, N = w.shape
-    return (
-        shuffle_weight(w, arch="gfx1250")
-        .view(E, N // 16, K_packed * 16)
-        .transpose(-1, -2)
-    )
+    return shuffle_weight_gfx1250(w)
 
 
 def quantize(x, dtype):
