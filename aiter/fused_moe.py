@@ -168,6 +168,22 @@ def _adaptive_moe_sort(
     return std
 
 
+def _match_output_buffer(output, shape, dtype, device):
+    """The caller's buffer iff it can stand in for torch.empty(shape, dtype, device).
+
+    A mismatch is never an error -- the caller allocates privately and copies.
+    """
+    if (
+        output is not None
+        and output.shape == shape
+        and output.dtype == dtype
+        and output.device == device
+        and output.is_contiguous()
+    ):
+        return output
+    return None
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -182,6 +198,7 @@ def _moe_sorting_impl(
     return_local_topk_ids=False,
     accumulate=True,
     output_aux=False,
+    output=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -189,6 +206,7 @@ def _moe_sorting_impl(
     if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -214,8 +232,11 @@ def _moe_sorting_impl(
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
     #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
     #    [M, topk, model_dim] intermediate; allocate a placeholder here.
+    # A caller buffer can stand in: the sort kernel zeroes what it is handed.
     if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        moe_buf = _match_output_buffer(output, (M, model_dim), moebuf_dtype, device)
+        if moe_buf is None:
+            moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
@@ -294,6 +315,7 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
     accumulate=True,
+    output=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
@@ -313,8 +335,11 @@ def _flydsl_moe_sorting(
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        moe_buf = _match_output_buffer(output, (M, model_dim), moebuf_dtype, device)
+        if moe_buf is None:
+            moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
 
@@ -348,6 +373,7 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    output=None,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -368,8 +394,10 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             accumulate=accumulate,
+            output=output,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # `output` cannot be honored: FLAT needs extra bytes appended to moe_buf.
     if flat:
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
@@ -389,6 +417,7 @@ def moe_sorting(
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
+            output=output,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -478,6 +507,11 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    # Optional [M, model_dim] destination for the top-k sum, to save the caller
+    # a copy. Ignored unless shape/dtype/device match and it is contiguous, so
+    # it is never required for correctness. Taken -> the return value is this
+    # tensor; declined -> a fresh one, so compare identity.
+    output: torch.Tensor | None = None,
 ):
     if (
         any(
@@ -546,6 +580,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        output=output,
     )
 
 
@@ -574,13 +609,21 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    # Unused, but torch fills the fake positionally from fused_moe_'s schema, so
+    # the parameter lists must line up -- missing these was a TypeError.
+    beta: float | None = None,
+    linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
-    moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+    # Same predicate as the real path, so the traced aliasing matches runtime.
+    moe_buf = _match_output_buffer(output, (M, model_dim), dtype, device)
+    if moe_buf is None:
+        moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
     return moe_buf
 
 
@@ -613,6 +656,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -640,6 +684,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        output=output,
     )
 
 
@@ -669,6 +714,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    output: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -872,6 +918,7 @@ def _fused_moe_impl(
             block_size_M,
             accumulate=_atomic,
             output_aux=True,
+            output=output,
         )
         local_topk_ids = None
     else:
@@ -888,6 +935,7 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
+            output=output,
         )
         if need_local_topk_ids:
             (
@@ -974,6 +1022,7 @@ def _fused_moe_impl(
             _metadata_transform=_metadata_transform,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            output=output,
         )
 
 
@@ -2891,6 +2940,7 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    output=None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2900,7 +2950,11 @@ def fused_moe_2stages(
     device = hidden_states.device
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
-        moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        # Reduce mode: the real output is born here, so it can be the caller's
+        # buffer. Accumulate mode is handled in moe_sorting (zeroed there).
+        moe_out = _match_output_buffer(output, (token_num, model_dim), dtype, device)
+        if moe_out is None:
+            moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
