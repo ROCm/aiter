@@ -222,6 +222,122 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     )
 
 
+# ── MX-microscale preshuffle GEMM (gfx950, FlyDSL) ───────────────────────────
+# A separate quant scheme from a8w8_blockscale above (E8M0 microscale, not fp32
+# 1x128), so it gets its own entry rather than a libtype branch there.
+
+
+def gemm_a8w8_mxscale_preshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    *,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp8",
+    blockscale: bool = True,
+    config: dict | None = None,
+) -> Tensor:
+    """MX-microscale preshuffle GEMM on gfx950/gfx1250 (FlyDSL). a8w8 / a4w4 / a6w4.
+
+    Operands (the op does no repacking -- prepare them once, caller-side):
+        XQ       [M, K] codes, row-major, NOT preshuffled
+                 (fp8/fp6: 1 byte/code; fp4: 2 codes/byte, so last dim is K//2)
+        WQ       ``shuffle_weight(w_codes, layout=(16, 16))``
+        x_scale  blockscale=True : ``shuffle_scale_blockscale_a(a_1x128, K)``
+                 blockscale=False: ``shuffle_scale_a16w4(a_1x32, 1, False)``
+        w_scale  blockscale=True : ``shuffle_scale_blockscale_b(b_128x128, N, K)``
+                 blockscale=False: ``shuffle_scale_a16w4(b_1x32, 1, False)``
+    all from ``aiter.ops.shuffle``.
+
+    ``blockscale`` defaults to True (the tuned path). It is a8w8-only and needs
+    N%128==0; a4w4 / a6w4 callers must pass blockscale=False.
+
+    The launch config comes from the tuned CSV keyed on
+    (gfx, cu_num, M, N, K, a_dtype, b_dtype), or a heuristic tile when untuned;
+    pass ``config`` to override the lookup.
+    """
+    gfx = get_gfx()
+    if gfx not in ("gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"gemm_a8w8_mxscale_preshuffle_flydsl requires gfx950/gfx1250, got {gfx}"
+        )
+    if not is_flydsl_available():
+        raise RuntimeError("gemm_a8w8_mxscale_preshuffle_flydsl requires flydsl")
+    assert dtype in (
+        dtypes.bf16,
+        dtypes.fp16,
+    ), (
+        f"Output {dtype=} is currently not supported in "
+        "gemm_a8w8_mxscale_preshuffle_flydsl"
+    )
+
+    m, n = XQ.shape[0], WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if gfx == "gfx1250":
+        if not blockscale:
+            raise RuntimeError(
+                "[FlyDSL gfx1250 mxfp8_128] blockscale=False (MX per-1x32) has no "
+                "gfx1250 kernel; only the 1x128 blockscale path exists"
+            )
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 mxfp8_128] a8w8-only; got {a_dtype=} {b_dtype=}"
+            )
+        from .flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+            candidates_for,
+        )
+        from .flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+            parse_wmma_kernel_name,
+            run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
+        )
+        from .flydsl.mxscale_preshuffle_kernels import _lookup_tuned
+
+        k = XQ.shape[-1]
+        cfg = config or _lookup_tuned(m, n, k, a_dtype, b_dtype)
+        kernel_name = str(cfg["kernelName"]) if cfg and cfg.get("kernelName") else None
+        if kernel_name is not None and parse_wmma_kernel_name(kernel_name) is None:
+            logger.warning(
+                f"[gfx1250 mxfp8_128] tuned row M={m}, N={n}, K={k} has kernelName "
+                f"'{kernel_name}', which is not a gfx1250 wmma name; ignoring it."
+            )
+            kernel_name = None
+        if kernel_name is None:
+            fits = [ki for _, ki in candidates_for(a_dtype, b_dtype, m, n, k, gfx)]
+            if not fits:
+                raise RuntimeError(
+                    f"[FlyDSL gfx1250 mxfp8_128] no legal candidate for "
+                    f"M={m} N={n} K={k}"
+                )
+            want_tm = min(256, max(16, 1 << (max(m, 1) - 1).bit_length()))
+            ki = min(
+                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
+            )
+            kernel_name = ki.name
+            logger.warning(
+                f"[gfx1250] gemm_a8w8_mxscale_preshuffle untuned M={m}, N={n}, K={k}; "
+                f"falling back to flydsl kernel '{kernel_name}'."
+            )
+        return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+            XQ, WQ, x_scale, w_scale, Y, kernel_name
+        )
+
+    from .flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
+
+    return gemm_mxscale_preshuffle(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Y,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        blockscale=blockscale,
+        config=config,
+    )
+
+
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",
