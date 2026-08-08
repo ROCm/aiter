@@ -160,6 +160,16 @@ jobs:
               --reasoning-parser minimax_m3
               --moe-backend aiter
             extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
+          - model: MiniMax-M3-MXFP8
+            runner: linux-aiter-do-mi350x-8
+            kv_cache_dtype: default_kvcache
+            tp: 8
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:
       - name: Checkout Docker pull retry helper
