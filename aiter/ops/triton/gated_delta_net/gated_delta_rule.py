@@ -463,6 +463,7 @@ def chunk_gated_delta_rule_opt_vk(
     num_decode_tokens: int = 0,
     seq_lens_cpu: Sequence[int] | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -511,6 +512,8 @@ def chunk_gated_delta_rule_opt_vk(
         prefill_metadata: Reusable schedule created by
             ``build_gated_delta_rule_prefill_metadata``. Prefer this over
             ``seq_lens_cpu`` when several GDR layers process the same batch.
+        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
+            (`fp32` or `bf16`). Defaults to `k.dtype`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -556,6 +559,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,
         o=o,
         num_decodes=num_decodes,

@@ -233,6 +233,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     num_decode_tokens: int = 0,
     seq_lens_cpu: Sequence[int] | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -272,6 +273,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             shared K1--K6 schedule without device readback.
         prefill_metadata: Prebuilt reusable host/device schedule. This is the
             preferred path when multiple layers process the same batch.
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -341,6 +344,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
             prefill_metadata=prefill_metadata,
@@ -348,6 +352,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             num_decode_tokens=num_decode_tokens,
         )
     elif use_chunk_flydsl:
+        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
+            raise ValueError(
+                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
+                "omit it or pass `k.dtype`."
+            )
         # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
         # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
         # head-major, so pass it through directly. The wrapper accepts
@@ -381,6 +390,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             prefill_metadata=prefill_metadata,
