@@ -11,7 +11,6 @@
 #include "mx_quant_utils.h"
 #include <hip/hip_bf16.h>
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 using fp8_type = opus::fp8_t;
 
@@ -602,7 +601,7 @@ __global__ void act_and_mul_quant_kernel(
                        "v"(fabsf(result_float[i + 1 < VEC_SIZE_I ? i + 1 : i])));
     }
 
-    float max_val = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+    float max_val = multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
 
     float quant_scale = is_fp4
         ? aiter::fp4_f32_to_e8m0_scale(max_val)
