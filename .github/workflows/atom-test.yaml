@@ -87,6 +87,9 @@ jobs:
               # Kimi-K2.7 ATOM (in-tree) downstream gate. Config (model_path,
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
               {"model_name": "Kimi-K2.7-Code-MXFP4"},
+              # MiniMax-M3 ATOM downstream gate. Config is pulled from ATOM
+              # models_accuracy.json and mapped onto the AITER MI350X pool.
+              {"model_name": "MiniMax-M3-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
