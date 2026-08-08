@@ -950,7 +950,25 @@ void fused_qk_rmsnorm_group_quant(
                 n2);
     // Small token counts: GPU under-saturated, separate x2 blocks add useful parallelism.
     // Large token counts: GPU saturated, fusing x2 into same block halves block count.
-    const int grid_y = (has_second_input && m <= 1024) ? 2 : 1;
+    // --- grid_y strategy ---
+    // When n2 > n1 across different size tiers ("K dominates"), the fused path
+    // wastes threads on Q.  For small/medium m, separate Q/K blocks (grid_y=2)
+    // add parallelism on under-saturated CUs.  For large m the fused path wins
+    // through better cache locality within one block.
+    //
+    // size_tier() is a rough heuristic to detect gross n1-vs-n2 mismatch; it
+    // intentionally does NOT mirror the exact BlockSize dispatch below (which
+    // depends on grid_y itself, creating a circular dependency).
+    auto size_tier = [](int n) -> int {
+        if(n <= 1024) return 0;
+        if(n <= 2048) return 1;
+        if(n <= 4096) return 2;
+        return 3;
+    };
+    const bool k_dominates =
+        has_second_input && n2 > n1 && (size_tier(n1) != size_tier(n2));
+    const int grid_y =
+        (has_second_input && (m <= 1024 || (k_dominates && m <= 4096))) ? 2 : 1;
     const int max_n = n1 > n2 ? n1 : n2;
     // fp4x2 path reuses fp8 kernels but requires thread_data_size >= 8 for store packing.
     const int thread_data_size = per_token_quant
@@ -987,6 +1005,11 @@ void fused_qk_rmsnorm_group_quant(
     HipDeviceGuard device_guard(inp1.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
+
+    // gfx950 path: use a wider block / smaller thread_data_size combination
+    // for residual group-quant to improve occupancy.
+    const bool gfx950_wide_block =
+        get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8;
 
     if(per_token_quant)
     {
@@ -1038,7 +1061,7 @@ void fused_qk_rmsnorm_group_quant(
         }
         else if(max_n <= 2048)
         {
-            if(get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8)
+            if(gfx950_wide_block)
             {
                 DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 8);
             }
@@ -1049,7 +1072,14 @@ void fused_qk_rmsnorm_group_quant(
         }
         else if(max_n <= 4096)
         {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
+            if(gfx950_wide_block && grid_y == 1)
+            {
+                DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 512, 8);
+            }
+            else
+            {
+                DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
+            }
         }
         else
         {
