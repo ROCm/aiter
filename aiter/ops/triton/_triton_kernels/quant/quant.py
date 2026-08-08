@@ -83,6 +83,83 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def _cvt_scalef32_pk_fp4_bf16(a, b, scale, byte_sel: tl.constexpr):
+    """
+    Native gfx950 hardware instruction wrapper: v_cvt_scalef32_pk_fp4_bf16.
+
+    Computes e2m1(a / scale) and e2m1(b / scale) (RNE, saturating to
+    +/-6.0), packing them into one byte (a -> low nibble, b -> high nibble)
+    of a uint32 word, written into the byte selected by `byte_sel` (0-3).
+
+    bf16 is the instruction's native src format (packed v2bf16), so `a`/`b`
+    only need bit-packing, not numeric conversion. `scale` must be
+    bitcast(e8m0_biased_byte << 23, f32) -- the raw e8m0 exponent-only float.
+
+    The "old"/merge input is tied to the output register (constraint "0")
+    so the compiler emits the required read-before-write dependency itself;
+    manually pre-loading it is unsafe since the register allocator can then
+    alias the write-only output with a still-live input, silently corrupting
+    results for some byte_sel values.
+    """
+    op_sel2: tl.constexpr = byte_sel & 1
+    op_sel3: tl.constexpr = (byte_sel >> 1) & 1
+    a_bits = a.to(tl.uint16, bitcast=True).to(tl.uint32)
+    b_bits = b.to(tl.uint16, bitcast=True).to(tl.uint32)
+    src = a_bits | (b_bits << 16)
+    old = tl.zeros_like(src)
+    return tl.inline_asm_elementwise(
+        f"v_cvt_scalef32_pk_fp4_bf16 $0, $2, $3 op_sel:[0,0,{op_sel2},{op_sel3}]",
+        "=v,0,v,v",
+        [old, src, scale],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mxfp4_quant_op_hw(
+    x,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_M,
+    MXFP4_QUANT_BLOCK_SIZE,
+):
+    """
+    Converts given x (bf16) to mxfp4 format using the native gfx950
+    v_cvt_scalef32_pk_fp4_bf16 hardware conversion instruction.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], bf16
+
+    x stays bf16 throughout: `tl.max` already promotes the reduction to
+    fp32 internally, so no upfront upcast is needed.
+    """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True).to(tl.float32)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+    # blockscale_e8m0, in fp32, we have 2^(e - 127)
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
+
+    # scale_f32 is the e8m0 byte shifted into the fp32 exponent field, i.e.
+    # 2^(bs_e8m0-127) -- see `_cvt_scalef32_pk_fp4_bf16`.
+    scale_f32 = (bs_e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+
+    x = tl.reshape(x, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2])
+    evens, odds = tl.split(x)
+    scale_bcast = scale_f32 + tl.zeros_like(evens).to(tl.float32)
+    packed = _cvt_scalef32_pk_fp4_bf16(evens, odds, scale_bcast, 0)
+    x_fp4 = (packed & 0xFF).to(tl.uint8)
+    x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
+
+    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
@@ -90,8 +167,8 @@ def _mxfp4_quant_op(
     MXFP4_QUANT_BLOCK_SIZE,
 ):
     """
-    Converts given x (in fp32) to mxfp4 format.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
+    Converts given x (in its native load dtype, e.g. bf16) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
     """
     EXP_BIAS_FP32: tl.constexpr = 127
@@ -105,7 +182,7 @@ def _mxfp4_quant_op(
     min_normal: tl.constexpr = 1
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(tl.float32)
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     amax = amax.to(tl.int32, bitcast=True)
@@ -312,6 +389,7 @@ def _dynamic_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    USE_HW_CVT: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -331,16 +409,19 @@ def _dynamic_mxfp4_quant_kernel(
         x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
 
         if EVEN_M_N:
-            x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+            x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
         else:
             x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-            x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                tl.float32
-            )
+            x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg")
 
-        out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
+        if USE_HW_CVT:
+            out_tensor, bs_e8m0 = _mxfp4_quant_op_hw(
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+        else:
+            out_tensor, bs_e8m0 = _mxfp4_quant_op(
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
