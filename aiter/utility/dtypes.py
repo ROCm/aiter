@@ -163,5 +163,11 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
-    """Convert string to ActivationType."""
+    members = getattr(ActivationType, "__members__", None)
+    if members is not None:
+        s_lower = s.lower()
+        for name, member in members.items():
+            if name.lower() == s_lower:
+                return member
+        raise argparse.ArgumentTypeError(f"invalid activation type: {s}")
     return getattr(ActivationType, s.capitalize())
