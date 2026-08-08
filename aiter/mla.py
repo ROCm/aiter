@@ -173,7 +173,7 @@ def _mla_decode_reduce_v1_dispatch(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH_NUM"])
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
@@ -195,7 +195,7 @@ def _fwd_kernel_stage2_asm(
     MAYBE_FINAL_OUT: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_VALID_SPLIT_COUNT_REDUCE: tl.constexpr,
-    BATCH_NUM: tl.constexpr,
+    BATCH_NUM,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     mgc: tl.constexpr,
