@@ -27,8 +27,8 @@ This module provides:
   waves are partitioned into two groups (group A uses ``lds_out``, group B
   uses ``lds_out_split``), each handling half of the N dimension.
 
-These helpers are intentionally *dialect-agnostic*: callers pass the dialect
-modules (`arith`, `gpu`) and the `range_constexpr` iterator.
+Callers pass the `range_constexpr` iterator; the MLIR dialects are imported
+directly here rather than injected.
 """
 
 from __future__ import annotations
@@ -38,12 +38,14 @@ from contextlib import contextmanager
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
+from flydsl.expr import arith
 from flydsl.expr.typing import T
 
 
 @contextmanager
-def _if_then(if_op, scf):
+def _if_then(if_op):
     """Compat helper for SCF IfOp then-region across old/new Python APIs."""
     with ir.InsertionPoint(if_op.then_block):
         try:
@@ -56,7 +58,6 @@ def _if_then(if_op, scf):
 
 def default_epilog(
     *,
-    arith,
     range_constexpr,
     m_repeat: int,
     lane_div_16,
@@ -68,7 +69,6 @@ def default_epilog(
     The mapping matches the common MFMA fragment layout used across kernels in this repo.
 
     Args:
-      arith: flydsl arith ext module.
       range_constexpr: compile-time unrolled range helper.
       m_repeat: tile_m // 16 (python int).
       lane_div_16: index Value (0..3).
@@ -91,9 +91,6 @@ def default_epilog(
 
 def c_shuffle_epilog(
     *,
-    arith,
-    gpu,
-    scf=None,
     range_constexpr,
     # Tile params
     tile_m: int,
@@ -156,9 +153,6 @@ def c_shuffle_epilog(
     #   Group B (waves N/2..N-1) uses lds_out_split, columns [tile_n/2, tile_n)
     # Each group writes/reads independently; same barriers synchronise all waves.
     if lds_out_split is not None:
-        if scf is None:
-            raise ValueError("scf module is required for split-LDS cshuffle")
-
         _half_n = int(tile_n) // 2
         _half_threads = int(block_size) // 2
         EVec = int(e_vec)
@@ -215,16 +209,15 @@ def c_shuffle_epilog(
                 )
                 scf.YieldOp([])
 
-        gpu.barrier()
+        fx.barrier()
         default_epilog(
-            arith=arith,
             range_constexpr=range_constexpr,
             m_repeat=m_repeat,
             lane_div_16=lane_div_16,
             bx_m=bx_m,
             body_row=_write_row_split,
         )
-        gpu.barrier()
+        fx.barrier()
 
         # -- read phase (each group reads from its own LDS buffer) --
         tx_local = tx - arith.select(_is_group_b, _half_thr_idx, _zero_idx)
@@ -252,8 +245,7 @@ def c_shuffle_epilog(
             row_ctx = row_ctx_raw
             row_pred = None
             if (
-                scf is not None
-                and row_ctx_raw is not None
+                row_ctx_raw is not None
                 and isinstance(row_ctx_raw, tuple)
                 and len(row_ctx_raw) == 2
             ):
@@ -295,7 +287,7 @@ def c_shuffle_epilog(
 
             if row_pred is not None:
                 _if_row = scf.IfOp(row_pred)
-                with _if_then(_if_row, scf):
+                with _if_then(_if_row):
                     _do_store_row_split()
             else:
                 _do_store_row_split()
@@ -329,9 +321,8 @@ def c_shuffle_epilog(
         )
 
     # Ensure all LDS reads finished before the lds write.
-    gpu.barrier()
+    fx.barrier()
     default_epilog(
-        arith=arith,
         range_constexpr=range_constexpr,
         m_repeat=m_repeat,
         lane_div_16=lane_div_16,
@@ -340,7 +331,7 @@ def c_shuffle_epilog(
     )
 
     # Ensure all LDS writes are visible before the shuffle-read.
-    gpu.barrier()
+    fx.barrier()
 
     # ---------------- Step 2: shuffle mapping + half2 store/atomic ----------------
     CShuffleNLane = int(cshuffle_nlane)
@@ -381,8 +372,7 @@ def c_shuffle_epilog(
         row_ctx = row_ctx_raw
         row_pred = None
         if (
-            scf is not None
-            and row_ctx_raw is not None
+            row_ctx_raw is not None
             and isinstance(row_ctx_raw, tuple)
             and len(row_ctx_raw) == 2
         ):
@@ -416,7 +406,7 @@ def c_shuffle_epilog(
 
         if row_pred is not None:
             _if_row = scf.IfOp(row_pred)
-            with _if_then(_if_row, scf):
+            with _if_then(_if_row):
                 _do_store_row()
         else:
             _do_store_row()
@@ -426,7 +416,6 @@ def mfma_epilog(
     *,
     use_cshuffle: bool,
     # Common (always required)
-    arith,
     range_constexpr,
     m_repeat: int,
     lane_div_16,
@@ -434,8 +423,6 @@ def mfma_epilog(
     # Default epilog (required when use_cshuffle=False)
     body_row: Callable | None = None,
     # CShuffle epilog (required when use_cshuffle=True)
-    gpu=None,
-    scf=None,
     tile_m: int | None = None,
     tile_n: int | None = None,
     e_vec: int = 2,
@@ -456,7 +443,6 @@ def mfma_epilog(
         if body_row is None:
             raise ValueError("mfma_epilog(use_cshuffle=False) requires `body_row`.")
         return default_epilog(
-            arith=arith,
             range_constexpr=range_constexpr,
             m_repeat=m_repeat,
             lane_div_16=lane_div_16,
@@ -465,9 +451,6 @@ def mfma_epilog(
         )
 
     return c_shuffle_epilog(
-        arith=arith,
-        gpu=gpu,
-        scf=scf,
         range_constexpr=range_constexpr,
         tile_m=int(tile_m),
         tile_n=int(tile_n),

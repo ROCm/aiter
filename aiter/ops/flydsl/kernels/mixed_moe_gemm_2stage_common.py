@@ -1929,7 +1929,7 @@ def compile_mixed_moe_gemm1_common(
                 gate_w0, up_w0 = load_b_tile(k0_b)
                 if const_expr(use_async_copy):
                     rocdl.s_waitcnt(0)
-                gpu.barrier()
+                fx.barrier()
                 rocdl.sched_barrier(0)
                 a_tile_pong = prefetch_full_a_from_lds(body_lds_x_pong)
 
@@ -2266,13 +2266,13 @@ def compile_mixed_moe_gemm1_common(
                     c4 = arith.constant(4, index=True)
                     c64 = arith.constant(64, index=True)
                     my_base = wave_id * c_gs + lane_id
-                    gpu.barrier()
+                    fx.barrier()
                     for ai in range_constexpr(nm):
                         sidx = (my_base + arith.constant(ai, index=True) * c64) * c4
                         fx.Vector(acc_gate[ai]).store(scr_g, [sidx], alignment=16)
                         if const_expr(has_up):
                             fx.Vector(acc_up[ai]).store(scr_u, [sidx], alignment=16)
-                    gpu.barrier()
+                    fx.barrier()
                     for ai in range_constexpr(nm):
                         ai_off = arith.constant(ai, index=True) * c64 + lane_id
                         gvs = []
@@ -2775,7 +2775,7 @@ def compile_mixed_moe_gemm1_common(
                     T.vec(1, f32)
                     vecev_f32 = T.vec(e_vec, f32)
 
-                    gpu.barrier()
+                    fx.barrier()
 
                     def fused_write(mi, ii, row_in_tile, row):
                         rb = row_in_tile * c_tn
@@ -2797,14 +2797,13 @@ def compile_mixed_moe_gemm1_common(
                             )
 
                     default_epilog(
-                        arith=arith,
                         range_constexpr=range_constexpr,
                         m_repeat=m_repeat,
                         lane_div_16=lane_div_16,
                         bx_m=bx_m,
                         body_row=fused_write,
                     )
-                    gpu.barrier()
+                    fx.barrier()
 
                     cn = int(cshuffle_nlane)
                     cm = int(total_threads) // cn
@@ -2868,9 +2867,6 @@ def compile_mixed_moe_gemm1_common(
                     gui_by_n = by_n // arith.constant(2, index=True)
                     gui_n_tile_base = n_tile_base // arith.constant(2, index=True)
                     c_shuffle_epilog(
-                        arith=arith,
-                        gpu=gpu,
-                        scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=gui_tile_n,
@@ -2895,9 +2891,6 @@ def compile_mixed_moe_gemm1_common(
                     eff_e_vec = e_vec_sk
                     acc = acc_gate
                     c_shuffle_epilog(
-                        arith=arith,
-                        gpu=gpu,
-                        scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
@@ -2925,9 +2918,6 @@ def compile_mixed_moe_gemm1_common(
                     acc = acc_gate
                     sk_n_offset[0] = 0
                     c_shuffle_epilog(
-                        arith=arith,
-                        gpu=gpu,
-                        scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
@@ -2950,14 +2940,11 @@ def compile_mixed_moe_gemm1_common(
                         lds_out_split=lds_out_B,
                     )
 
-                    gpu.barrier()
+                    fx.barrier()
 
                     acc = acc_up
                     sk_n_offset[0] = inter_dim
                     c_shuffle_epilog(
-                        arith=arith,
-                        gpu=gpu,
-                        scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
@@ -2981,9 +2968,6 @@ def compile_mixed_moe_gemm1_common(
                     )
                 else:
                     c_shuffle_epilog(
-                        arith=arith,
-                        gpu=gpu,
-                        scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
@@ -3023,7 +3007,7 @@ def compile_mixed_moe_gemm1_common(
                     scf.YieldOp([])
                 scf.YieldOp([])
 
-            gpu.barrier()
+            fx.barrier()
             scf.YieldOp([])
             for_ip.__exit__(None, None, None)
 
@@ -4814,7 +4798,7 @@ def compile_mixed_moe_gemm2_common(
                 if const_expr(r216_defer_tid):
                     emit_tid_lds_prologue()
                     rocdl.sched_barrier(0)
-                gpu.barrier()
+                fx.barrier()
 
                 acc = [acc_init] * body_num_acc_n * m_repeat
                 lds_base_pong = lds_base_cur
@@ -4890,7 +4874,7 @@ def compile_mixed_moe_gemm2_common(
                         )
                         if const_expr(not use_async_copy):
                             store_x_tile_to_lds(x_regs_ping, lds_base_ping)
-                        gpu.barrier()
+                        fx.barrier()
 
                         a0_prefetch_ping = lds_load_packs_k64(
                             row_a_lds, col_offset_base, lds_base_ping
@@ -4934,7 +4918,7 @@ def compile_mixed_moe_gemm2_common(
                         k0_pong_bk = next_k2_bk
                         if const_expr(not use_async_copy):
                             store_x_tile_to_lds(x_regs_pong, lds_base_pong)
-                        gpu.barrier()
+                        fx.barrier()
 
                         a0_prefetch_pong = lds_load_packs_k64(
                             row_a_lds, col_offset_base, lds_base_pong
@@ -4995,7 +4979,7 @@ def compile_mixed_moe_gemm2_common(
 
                     if const_expr(not use_async_copy):
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
-                    gpu.barrier()
+                    fx.barrier()
 
                     a0_prefetch_ping = lds_load_packs_k64(
                         row_a_lds, col_offset_base, lds_base_ping
@@ -5244,9 +5228,6 @@ def compile_mixed_moe_gemm2_common(
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
-                    arith=arith,
-                    gpu=gpu,
-                    scf=scf,
                     range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=body_tile_n,
@@ -5297,7 +5278,7 @@ def compile_mixed_moe_gemm2_common(
                     emit_moe_gemm2_body()
                     scf.YieldOp([])
 
-                gpu.barrier()
+                fx.barrier()
                 scf.YieldOp([cur_active])
             else:
                 if_valid = scf.IfOp(all_valid)
@@ -5305,7 +5286,7 @@ def compile_mixed_moe_gemm2_common(
                     emit_moe_gemm2_body()
                     scf.YieldOp([])
 
-                gpu.barrier()
+                fx.barrier()
                 scf.YieldOp([expert_i32, expert_b_base])
             for_ip.__exit__(None, None, None)
 
