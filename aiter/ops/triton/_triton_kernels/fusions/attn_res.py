@@ -84,7 +84,9 @@ def attnres_fwd_kernel(
         n_res = L - 1  # res_packed holds the first L-1 rows; prefix is candidate L-1
         ps = tl.load(prefix + i_n * D + o_d, mask=m_d, other=0.0).to(tl.float32)
         if DO_ADD:
-            ps += tl.load(add_hidden + i_n * D + o_d, mask=m_d, other=0.0).to(tl.float32)
+            ps += tl.load(add_hidden + i_n * D + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
         if WRITE_PREF:
             tl.store(
                 prefix_out + i_n * D + o_d,

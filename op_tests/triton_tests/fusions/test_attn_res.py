@@ -233,9 +233,7 @@ def test_attn_res_gate_matches_attn_res_fwd(B):
     # and a unit rms_weight, with the prefix materialized as the last candidate.
     packed = torch.cat([block_residual, prefix.unsqueeze(-2)], dim=-2).contiguous()
     ones = torch.ones(D, dtype=dtype, device=prefix.device)
-    y_fwd = attn_res_fwd(
-        score_weight, packed, ones, None, eps, scale, layout="packed"
-    )
+    y_fwd = attn_res_fwd(score_weight, packed, ones, None, eps, scale, layout="packed")
 
     torch.testing.assert_close(y_gate, y_fwd, atol=1e-5, rtol=1e-5)
 

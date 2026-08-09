@@ -14,11 +14,11 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
 )
 
 __all__ = [
-    "attnres_fwd_kernel",
     "_mhc_fused_kernel",
     "_mhc_fused_split_kernel",
     "_mhc_post_kernel",
     "_mhc_post_pre_reduce_apply_kernel",
     "_mhc_post_pre_split_kernel",
     "_mhc_reduce_apply_kernel",
+    "attnres_fwd_kernel",
 ]
