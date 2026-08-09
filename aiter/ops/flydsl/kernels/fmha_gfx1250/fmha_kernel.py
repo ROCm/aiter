@@ -173,35 +173,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         V_CFG_OOB = (1 << 16) | V_TDM_CONFIG
         m_start_raw = m_start
 
-        k_oob_dg1 = [
-            TDM.make_kv_dg1_with_oob(
-                K_CFG_OOB,
-                QK_HDIM,
-                8,
-                stride_k_elems_oob,
-                TDM.per_warp_oob_dim1(
-                    actual_kv_len - su * 32,
-                    wave_id,
-                    8,
-                ),
-                dim0_stride=200,
-            )
-            for su in range(CNT_SU)
-        ]
-        v_oob_dg1 = [
-            TDM.make_kv_dg1_with_oob(
-                V_CFG_OOB,
-                128,
-                8,
-                stride_v_elems_oob,
-                TDM.per_warp_oob_dim1(
-                    actual_kv_len - su * 32,
-                    wave_id,
-                    8,
-                ),
-            )
-            for su in range(CNT_SU)
-        ]
+        k_oob_dg1 = TDM.build_oob_dg1_list(
+            K_CFG_OOB, QK_HDIM, stride_k_elems_oob,
+            actual_kv_len, wave_id, dim0_stride=200,
+        )
+        v_oob_dg1 = TDM.build_oob_dg1_list(
+            V_CFG_OOB, 128, stride_v_elems_oob,
+            actual_kv_len, wave_id,
+        )
         # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len)
         # write nothing.
         q_remain_raw = actual_q_len - m_start_raw
@@ -428,21 +407,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # -- 2e: Softmax PART0+PART1 only (no PART2) --
             # Pin each MSB's scalar state to its own VGPR bank for the
             # "全-bankN" (0x00/0x55/0xAA/0xFF) MSB allocation pattern.
-            softmax_state_pro = {
-                "old_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                "local_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                "delta": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                "exp_delta": [None] * NUM_MSB,
-                "cur_max_log2e": [None] * NUM_MSB,
-                "cur_max_log2e_1": [None] * NUM_MSB,
-                "cur_max_log2e_scalar": [None] * NUM_MSB,
-                "cur_max_log2e_dup": [None] * NUM_MSB,
-                "vgpr_log2e_scl_pair": [None] * NUM_MSB,
-                "exp_delta_dup": [None] * NUM_MSB,
-                "row_sums": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                "p_bf16": [[], [], [], []],
-                "sp_pairs_prev": sp_pairs_all_pro,
-            }
+            softmax_state_pro = make_softmax_state(
+                [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                sp_pairs_prev=sp_pairs_all_pro,
+            )
             Softmax.part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
 
             # -- 2e': PART2 first half for tile 0 --
@@ -489,21 +460,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             k_tile1_stride = tile_n_const * stride_k_seq
             k_tile1_offset = k_offset + k_tile1_stride
             kv_remain_t1 = actual_kv_len - TILE_N
-            k_tile1_oob_dg1 = [
-                TDM.make_kv_dg1_with_oob(
-                    K_CFG_OOB,
-                    QK_HDIM,
-                    8,
-                    stride_k_elems_oob,
-                    TDM.per_warp_oob_dim1(
-                        kv_remain_t1 - su * 32,
-                        wave_id,
-                        8,
-                    ),
-                    dim0_stride=200,
-                )
-                for su in range(CNT_SU)
-            ]
+            k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
+                K_CFG_OOB, QK_HDIM, stride_k_elems_oob,
+                kv_remain_t1, wave_id, dim0_stride=200,
+            )
             TDM.load_k_only(
                 ptr_K,
                 k_tile1_offset,
@@ -813,27 +773,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     [set_vgpr_bank(zero_v8f32, m)]
                     for m in fx.range_constexpr(NUM_MSB)
                 ]
-                et_sfx = {
-                    "old_max": list(ep_old_max),
-                    "local_max": list(ep_local_max),
-                    "delta": list(ep_delta),
-                    "exp_delta": [None] * NUM_MSB,
-                    "cur_max_log2e": [None] * NUM_MSB,
-                    "cur_max_log2e_1": [None] * NUM_MSB,
-                    "cur_max_log2e_scalar": [None] * NUM_MSB,
-                    "cur_max_log2e_dup": [None] * NUM_MSB,
-                    "vgpr_log2e_scl_pair": [None] * NUM_MSB,
-                    "exp_delta_dup": [None] * NUM_MSB,
-                    "row_sums": list(ep_row_sums),
-                    "p_bf16": [[], [], [], []],
-                    "sp_pairs_prev": [
+                et_sfx = make_softmax_state(
+                    ep_old_max, ep_local_max, ep_delta, ep_row_sums,
+                    sp_pairs_prev=[
                         [
                             ep_partial_sp_pairs[m][i]
                             for i in fx.range_constexpr(N_SP_PAIRS)
                         ]
                         for m in fx.range_constexpr(NUM_MSB)
                     ],
-                }
+                )
                 # DBG: row_sums entering endtile core_loop (= ep_row_sums from
                 # loop_results)
 
@@ -857,20 +806,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 et_kv_remain = actual_kv_len - (num_tiles - 1) * tile_n_const
                 _et_V_CFG_OOB = (1 << 16) | V_TDM_CONFIG
                 _et_stride_v_elems = stride_v_seq >> 1
-                et_v_oob_dg1 = [
-                    TDM.make_kv_dg1_with_oob(
-                        _et_V_CFG_OOB,
-                        128,
-                        8,
-                        _et_stride_v_elems,
-                        TDM.per_warp_oob_dim1(
-                            et_kv_remain - su * 32,
-                            wave_id,
-                            8,
-                        ),
-                    )
-                    for su in range(CNT_SU)
-                ]
+                et_v_oob_dg1 = TDM.build_oob_dg1_list(
+                    _et_V_CFG_OOB, 128, _et_stride_v_elems,
+                    et_kv_remain, wave_id,
+                )
                 _, _, et_o, _, et_psp_lo, et_psp_hi, et_ped = fmha_pipeline_ctx(
                     ctx,
                     ty,
@@ -910,9 +849,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         for rpi in fx.range_constexpr(N_SP_PAIRS)
                     ]
                     et_psp.append(rpairs)
-                rocdl.s_wait_tensorcnt(0)
-                rocdl.s_barrier_signal(-1)
-                rocdl.s_barrier_wait(-1)
+                tdm_wait_and_barrier()
                 _ep_finish(
                     ctx,
                     et_o,

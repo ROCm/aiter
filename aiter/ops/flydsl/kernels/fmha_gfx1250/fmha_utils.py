@@ -717,6 +717,30 @@ class Atom:
 # Slot Scheduling Tables
 
 
+def tdm_wait_and_barrier():
+    rocdl.s_wait_tensorcnt(0)
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
+
+
+def make_softmax_state(old_max, local_max, delta, row_sums, sp_pairs_prev=None):
+    return {
+        "old_max": list(old_max),
+        "local_max": list(local_max),
+        "delta": list(delta),
+        "exp_delta": [None] * NUM_MSB,
+        "cur_max_log2e": [None] * NUM_MSB,
+        "cur_max_log2e_1": [None] * NUM_MSB,
+        "cur_max_log2e_scalar": [None] * NUM_MSB,
+        "cur_max_log2e_dup": [None] * NUM_MSB,
+        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+        "exp_delta_dup": [None] * NUM_MSB,
+        "row_sums": list(row_sums),
+        "p_bf16": [[] for _ in range(NUM_MSB)],
+        "sp_pairs_prev": sp_pairs_prev,
+    }
+
+
 class Softmax:
     """Softmax operation builders for the FMHA pipeline."""
 
@@ -2583,6 +2607,17 @@ class TDM:
         )
 
     @staticmethod
+    def build_oob_dg1_list(config, dim0_elems, stride_elems, remain, wave_id, dim0_stride=None):
+        return [
+            TDM.make_kv_dg1_with_oob(
+                config, dim0_elems, 8, stride_elems,
+                TDM.per_warp_oob_dim1(remain - su * 32, wave_id, 8),
+                dim0_stride=dim0_stride,
+            )
+            for su in range(CNT_SU)
+        ]
+
+    @staticmethod
     def load_kv_blk(kv_type, dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
         """Issue n_su TDM loads for one blk of K or V data.
 
@@ -2608,8 +2643,6 @@ class TDM:
         K_ROW_BYTES = 384 (= 192 * 2, flat, no padding).
         Per-warp: 4 warps x 8 rows = 32 rows per SU, 4 SUs total.
         """
-        i64 = ir.IntegerType.get_signless(64)
-
         _DIM0_VALID = QK_HDIM  # 192
         _DIM0_STRIDE = 200     # LDS row stride in elements
         _DIM1_ROWS = 8
@@ -2646,9 +2679,7 @@ class TDM:
             KV_K, k_dg1, k_addr, k_stride_adv, lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU
         )
 
-        rocdl.s_wait_tensorcnt(0)
-        rocdl.s_barrier_signal(-1)
-        rocdl.s_barrier_wait(-1)
+        tdm_wait_and_barrier()
 
     @staticmethod
     def load_v_only(
@@ -2665,8 +2696,6 @@ class TDM:
         4 TDM loads (SU 0-3). Per-warp distribution: 4 warps each load
         8 rows of the 32-row SU, writing to their own LDS sub-region.
         """
-        i64 = ir.IntegerType.get_signless(64)
-
         _V_CONFIG_BF16 = (1 << 16) | V_TDM_CONFIG
         _DIM0_ELEMS = 128
         _DIM1_ROWS = 8
@@ -2701,9 +2730,7 @@ class TDM:
             KV_V, v_dg1, v_addr, v_stride_adv, lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU
         )
 
-        rocdl.s_wait_tensorcnt(0)
-        rocdl.s_barrier_signal(-1)
-        rocdl.s_barrier_wait(-1)
+        tdm_wait_and_barrier()
 
 
 # ================================================================
@@ -2864,7 +2891,6 @@ def fmha_pipeline_ctx(
     has_tdm_v_g1 = gemm1_tdm_is_v and (tdm_v_offset is not None)
 
     if has_tdm_k_g1:
-        i64 = ir.IntegerType.get_signless(64)
         _K_CFG = (1 << 16) | K_TDM_CONFIG
         _stride_k_elems = stride_k_seq >> 1
         if const_expr(loop_k_oob_dg1 is not None):
@@ -2897,7 +2923,6 @@ def fmha_pipeline_ctx(
         tdm_state["k_desc_idx"] = 0
 
     if has_tdm_v_g1:
-        i64 = ir.IntegerType.get_signless(64)
         _V_CFG = (1 << 16) | V_TDM_CONFIG
         _stride_v_elems = stride_v_seq >> 1
         if const_expr(endtile_v_oob_dg1 is not None):
@@ -3060,7 +3085,6 @@ def fmha_pipeline_ctx(
     # Build V TDM descriptors for GEMM2 stages 0-1.
     has_tdm_v_g2 = (not gemm1_tdm_is_v) and (tdm_v_offset is not None)
     if has_tdm_v_g2:
-        i64 = ir.IntegerType.get_signless(64)
         _V_CFG = (1 << 16) | V_TDM_CONFIG
         _stride_v_elems = stride_v_seq >> 1
         if const_expr(loop_v_oob_dg1 is not None):
@@ -3294,21 +3318,10 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     for msb in fx.range_constexpr(NUM_MSB):
         sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
 
-    softmax_state = {
-        "old_max": list(ia_old_max),
-        "local_max": list(ia_local_max),
-        "delta": list(ia_delta),
-        "exp_delta": [None] * NUM_MSB,
-        "cur_max_log2e": [None] * NUM_MSB,
-        "cur_max_log2e_1": [None] * NUM_MSB,
-        "cur_max_log2e_scalar": [None] * NUM_MSB,
-        "cur_max_log2e_dup": [None] * NUM_MSB,
-        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
-        "exp_delta_dup": [None] * NUM_MSB,
-        "row_sums": list(ia_row_sums),
-        "p_bf16": [[], [], [], []],
-        "sp_pairs_prev": ia_partial_sp_pairs,
-    }
+    softmax_state = make_softmax_state(
+        ia_old_max, ia_local_max, ia_delta, ia_row_sums,
+        sp_pairs_prev=ia_partial_sp_pairs,
+    )
 
     # Build TDM state (zero placeholder for memload=False)
     tdm_state = {
@@ -3339,36 +3352,15 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     _loop_V_CFG_OOB = (1 << 16) | V_TDM_CONFIG
 
     loop_v_remain = actual_kv_len - tile_idx_i32 * tile_n_const
-    loop_v_oob_dg1 = [
-        TDM.make_kv_dg1_with_oob(
-            _loop_V_CFG_OOB,
-            128,
-            8,
-            _loop_stride_v_elems,
-            TDM.per_warp_oob_dim1(
-                loop_v_remain - su * 32,
-                wave_id,
-                8,
-            ),
-        )
-        for su in range(CNT_SU)
-    ]
+    loop_v_oob_dg1 = TDM.build_oob_dg1_list(
+        _loop_V_CFG_OOB, 128, _loop_stride_v_elems,
+        loop_v_remain, wave_id,
+    )
     loop_k_remain = actual_kv_len - next_tile * tile_n_const
-    loop_k_oob_dg1 = [
-        TDM.make_kv_dg1_with_oob(
-            _loop_K_CFG_OOB,
-            QK_HDIM,
-            8,
-            _loop_stride_k_elems,
-            TDM.per_warp_oob_dim1(
-                loop_k_remain - su * 32,
-                wave_id,
-                8,
-            ),
-            dim0_stride=200,
-        )
-        for su in range(CNT_SU)
-    ]
+    loop_k_oob_dg1 = TDM.build_oob_dg1_list(
+        _loop_K_CFG_OOB, QK_HDIM, _loop_stride_k_elems,
+        loop_k_remain, wave_id, dim0_stride=200,
+    )
 
     # Core fmha_pipeline call
     (
@@ -3493,21 +3485,10 @@ def _ep_finish(
     actual_kv_len = ctx["actual_kv_len"]
     stride_v_seq = ctx["stride_v_seq"]
 
-    sfx = {
-        "old_max": list(old_max_in),
-        "local_max": list(local_max_in),
-        "delta": list(delta_in),
-        "exp_delta": [None] * NUM_MSB,
-        "cur_max_log2e": [None] * NUM_MSB,
-        "cur_max_log2e_1": [None] * NUM_MSB,
-        "cur_max_log2e_scalar": [None] * NUM_MSB,
-        "cur_max_log2e_dup": [None] * NUM_MSB,
-        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
-        "exp_delta_dup": [None] * NUM_MSB,
-        "row_sums": list(row_sums_in),
-        "p_bf16": [[], [], [], []],
-        "sp_pairs_prev": sp_pairs_in,
-    }
+    sfx = make_softmax_state(
+        old_max_in, local_max_in, delta_in, row_sums_in,
+        sp_pairs_prev=sp_pairs_in,
+    )
 
     # PART2 second half: setup ops + pair_exp+cvt+sum.
     p2ops = Softmax.build_all_part2_ops(
