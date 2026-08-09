@@ -107,16 +107,7 @@ jobs:
               shopt -s nullglob
               rm -rf dist build aiter_meta ./*.egg-info aiter_overlay aiter_artifacts
               rm -f .aiter-prebuild.log
-              python3 - <<"PY"
-              from importlib.metadata import version
-              import flydsl
-
-              flydsl_version = version("flydsl")
-              print(
-                  f"Unmodified runtime dependency: flydsl={flydsl_version} "
-                  f"at {flydsl.__file__}"
-              )
-              PY
+              python3 -c "from importlib.metadata import version; import flydsl; flydsl_version = version(\"flydsl\"); print(f\"Unmodified runtime dependency: flydsl={flydsl_version} at {flydsl.__file__}\")"
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
@@ -133,13 +124,7 @@ jobs:
               # The runtime image must already provide AITER dependencies. Keep
               # the overlay limited to AITER HEAD so compute nodes never resolve
               # packages from PyPI or drift from the nightly image environment.
-              python3 - <<"PY"
-              from importlib.metadata import version
-              import flydsl
-
-              flydsl_version = version("flydsl")
-              print(f"Build environment flydsl={flydsl_version} at {flydsl.__file__}")
-              PY
+              python3 -c "from importlib.metadata import version; import flydsl; flydsl_version = version(\"flydsl\"); print(f\"Build environment flydsl={flydsl_version} at {flydsl.__file__}\")"
               wheels=(dist/*.whl)
               if (( ${#wheels[@]} != 1 )); then
                 echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
@@ -148,23 +133,7 @@ jobs:
               mkdir -p aiter_overlay
               PIP_NO_INDEX=1 python3 -m pip install --no-deps \
                 --target aiter_overlay "${wheels[0]}"
-              (cd /tmp && PYTHONPATH=/workspace/aiter_overlay python3 - <<"PY"
-              from pathlib import Path
-              import aiter
-
-              root = Path("/workspace/aiter_overlay").resolve()
-              loaded = Path(aiter.__file__).resolve()
-              kernels = sorted((root / "aiter" / "jit").glob("*.so"))
-              print(f"AITER overlay loaded from {loaded}")
-              print(f"Prebuilt AITER kernel modules: {len(kernels)}")
-              if root not in loaded.parents:
-                  raise SystemExit(f"AITER was not loaded from {root}")
-              if len(kernels) < 10:
-                  raise SystemExit(
-                      f"Expected at least 10 prebuilt kernel modules, found {len(kernels)}"
-                  )
-              PY
-              )
+              (cd /tmp && PYTHONPATH=/workspace/aiter_overlay python3 -c "from pathlib import Path; import aiter; root = Path(\"/workspace/aiter_overlay\").resolve(); loaded = Path(aiter.__file__).resolve(); kernels = sorted((root / \"aiter\" / \"jit\").glob(\"*.so\")); print(f\"AITER overlay loaded from {loaded}\"); print(f\"Prebuilt AITER kernel modules: {len(kernels)}\"); assert root in loaded.parents, f\"AITER was not loaded from {root}\"; assert len(kernels) >= 10, f\"Expected at least 10 prebuilt kernel modules, found {len(kernels)}\"")
               mkdir -p aiter_artifacts
               tar -C aiter_overlay -czf \
                 aiter_artifacts/aiter-overlay-${GPU_ARCHS}.tar.gz .
