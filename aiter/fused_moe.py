@@ -77,6 +77,29 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
+# FlyDSL v2 stage1 produces an intermediate consumed immediately by stage2.
+# Reuse it across layers and CUDA graphs on the same stream instead of retaining
+# one allocation per layer and captured shape. Separate stream keys preserve
+# correctness for overlapping launches, while exact shape keys keep graph-baked
+# pointers stable.
+_FLYDSL_STAGE1_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int]], torch.Tensor
+] = {}
+
+
+def _get_flydsl_stage1_out(
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape)
+    out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtypes.fp8, device=device)
+        _FLYDSL_STAGE1_OUT_CACHE[key] = out
+    return out
+
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -1412,6 +1435,22 @@ def _flydsl_stage1_wrapper(
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     if out_dtype is not None:
         parsed = {**parsed, "out_dtype": out_dtype}
+    if (
+        out is None
+        and v2_output_layout
+        and parsed["out_dtype"] == "fp8"
+        and parsed.get("k_batch", 1) == 1
+        # a16w4 allocates and returns its own sorted intermediate before it
+        # looks at `out`, so a buffer handed to it is silently dropped.
+        and not (parsed["a_dtype"] == "bf16" and parsed["b_dtype"] == "fp4")
+    ):
+        device = hidden_states.device
+        inter_dim = w1.shape[1] // 2
+        sorted_rows = max(
+            sorted_token_ids.shape[0],
+            sorted_expert_ids.shape[0] * parsed["tile_m"],
+        )
+        out = _get_flydsl_stage1_out((sorted_rows, inter_dim), device)
     if activation == ActivationType.Swiglu:
         act = "swiglu"
     elif activation == ActivationType.Situv2:
