@@ -17,6 +17,70 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr import arith as _arith
 from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import Vector as Vec
+
+
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim: callers now
+# hand in a typed buffer tensor (built once, hoisted out of the K loop) instead
+# of a raw rsrc + an injected buffer_ops module. The layout uses stride (1, 1)
+# so `group_index` counts ELEMENTS (matching the shim's element-offset calling
+# convention): fx.slice on the last coord reads `width` contiguous elements
+# starting at `group_index`. An i32-typed buffer therefore reproduces the shim's
+# `buffer_load(rsrc, idx, dtype=T.i32)` byte math (idx * 4) exactly.
+# ---------------------------------------------------------------------------
+def make_buffer_addr(addr_i64, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    """Build a typed layout-API buffer tensor from a computed i64 base address.
+
+    The view uses stride ``(1, 1)`` so a slice on the last coord counts ELEMENTS
+    of ``elem_ty`` (the shim's element-offset convention). An i32-typed buffer
+    (``width`` covering the widest load, e.g. 4 for dwordx4) reproduces the old
+    ``buffer_load(rsrc, idx, dtype=T.i32)`` byte math exactly. Public so GEMM
+    callers can build ``b_buffer`` once (hoisted where the old rsrc was built)
+    without inlining the construction or re-vending the buffer_ops shim.
+    """
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    """Build a typed layout-API buffer tensor from a kernel-arg pointer or tensor.
+
+    A tensor is dereferenced via ``get_iter`` before ``ptrtoint``; a raw
+    ``!fly.ptr`` argument (the GEMM kernels' pointer args) is passed straight to
+    ``ptrtoint`` (matching the old ``ptr_buffer_resource`` byte-address math).
+    """
+    try:
+        addr = fx.ptrtoint(fx.get_iter(tensor))
+    except Exception:
+        addr = fx.ptrtoint(tensor)
+    return make_buffer_addr(
+        fx.Int64(addr),
+        elem_ty,
+        width,
+        max_size=max_size,
+        num_records_bytes=num_records_bytes,
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    # Scalar loads return a raw ir.Value (matching the old buffer_ops.buffer_load,
+    # whose result feeds raw arith.* ops e.g. in extract_bf16_scale); width>1
+    # returns the vector for callers that index / bitcast it.
+    return as_ir_value(value[0]) if width == 1 else value
 
 
 def crd2idx(crd, layout):
@@ -43,8 +107,7 @@ def swizzle_xor16(row, col, k_blocks16):
 
 
 def _buffer_load_vec(
-    buffer_ops,
-    rsrc,
+    b_buffer,
     idx,
     *,
     elem_type,
@@ -53,7 +116,13 @@ def _buffer_load_vec(
     offset_in_bytes,
     cache_modifier=0,
 ):
-    """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
+    """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast.
+
+    ``b_buffer`` is an i32-typed layout-API buffer tensor (stride (1,1)); ``idx``
+    is the element/byte index in the shim's convention and is normalized to i32
+    (dword) units below, so the buffer's element-offset math reproduces the old
+    ``buffer_load(rsrc, idx_i32, dtype=T.i32)`` byte offset exactly.
+    """
     from flydsl.expr import arith as _ld_arith
 
     elem_size = int(elem_bytes)
@@ -67,17 +136,17 @@ def _buffer_load_vec(
     else:
         idx_i32 = idx
 
-    i32_val = buffer_ops.buffer_load(
-        rsrc,
+    i32_val = _buffer_load(
+        b_buffer,
         idx_i32,
-        vec_width=vec_width,
-        dtype=T.i32,
+        fx.Int32,
+        width=vec_width,
         cache_modifier=cache_modifier,
     )
     if vec_width == 1:
         i32_vec = fx.Vector.from_elements([i32_val], fx.Int32)
     else:
-        i32_vec = fx.Vector(i32_val)
+        i32_vec = i32_val
     return i32_vec.bitcast(fx.Numeric.from_ir_type(elem_type))
 
 
@@ -268,11 +337,10 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, scale_val=None):
 
 
 def load_b_raw_w4a16(
-    buffer_ops,
     arith,
     *,
     arg_b,
-    b_rsrc,
+    b_buffer,
     layout_b,
     base_k: ir.Value,
     ku: int,
@@ -310,8 +378,7 @@ def load_b_raw_w4a16(
     idx_bytes = idx_pack + k2_base
 
     b4 = _buffer_load_vec(
-        buffer_ops,
-        b_rsrc,
+        b_buffer,
         idx_bytes,
         elem_type=elem_type,
         vec_elems=4,
@@ -404,11 +471,10 @@ def unpack_b_w4a16(
 
 
 def load_b_pack_k32(
-    buffer_ops,
     arith,
     *,
     arg_b,
-    b_rsrc,
+    b_buffer,
     layout_b,
     base_k: ir.Value,
     ki_step: int,
@@ -445,8 +511,7 @@ def load_b_pack_k32(
     if unpack_int4:
         idx_bytes = idx_pack + k2_base
         b4 = _buffer_load_vec(
-            buffer_ops,
-            b_rsrc,
+            b_buffer,
             idx_bytes,
             elem_type=elem_type,
             vec_elems=4,
@@ -458,8 +523,7 @@ def load_b_pack_k32(
 
     vec_elems = kpack_bytes // int(elem_bytes)
     b16 = _buffer_load_vec(
-        buffer_ops,
-        b_rsrc,
+        b_buffer,
         idx_pack,
         elem_type=elem_type,
         vec_elems=vec_elems,
@@ -493,11 +557,10 @@ def tile_chunk_coord_i32(
 
 
 def buffer_copy_gmem16_dwordx4(
-    buffer_ops,
     *,
     elem_type,
     idx_i32: ir.Value,
-    rsrc,
+    b_buffer,
     vec_elems: int = 16,
     elem_bytes: int = 1,
 ):
@@ -505,8 +568,7 @@ def buffer_copy_gmem16_dwordx4(
     if int(vec_elems) <= 0:
         raise ValueError(f"vec_elems must be > 0, got {vec_elems!r}")
     return _buffer_load_vec(
-        buffer_ops,
-        rsrc,
+        b_buffer,
         idx_i32,
         elem_type=elem_type,
         vec_elems=vec_elems,
@@ -697,6 +759,8 @@ __all__ = [
     "load_b_raw_mxfp4_dwordx4",
     "load_b_raw_w4a16",
     "load_b_raw_w4a16_groupwise",
+    "make_buffer",
+    "make_buffer_addr",
     "make_preshuffle_b_layout",
     "make_preshuffle_scale_layout",
     "swizzle_xor16",
@@ -713,10 +777,9 @@ __all__ = [
 
 
 def _load_groupwise_scale(
-    buffer_ops,
     arith,
     *,
-    scale_rsrc,
+    scale_buffer,
     expert_offset,
     n_blk,
     n_intra,
@@ -753,18 +816,14 @@ def _load_groupwise_scale(
         dword_base = expert_offset * c_npm1 + n_global
         dword_elem = dword_base + pair_idx * c_npe
         dword_idx = arith.index_cast(T.i32, dword_elem)
-        scale_val = buffer_ops.buffer_load(
-            scale_rsrc, dword_idx, vec_width=1, dtype=T.i32
-        )
+        scale_val = _buffer_load(scale_buffer, dword_idx, fx.Int32, width=1)
     else:
         # (E, G, N) layout with f32 dtype
         c_gm1 = fx.Index(num_groups - 1)
         base_scale = expert_offset * c_gm1 + n_global
         elem_idx = base_scale + group_idx * c_npe
         scale_idx_i32 = arith.index_cast(T.i32, elem_idx)
-        scale_val = buffer_ops.buffer_load(
-            scale_rsrc, scale_idx_i32, vec_width=1, dtype=T.f32
-        )
+        scale_val = _buffer_load(scale_buffer, scale_idx_i32, fx.Float32, width=1)
     return scale_val
 
 
@@ -788,11 +847,10 @@ def extract_bf16_scale(arith, scale_raw_i32, ku: int):
 
 
 def load_b_raw_w4a16_groupwise(
-    buffer_ops,
     arith,
     *,
     arg_b,
-    b_rsrc,
+    b_buffer,
     layout_b,
     base_k,
     ku: int,
@@ -800,7 +858,7 @@ def load_b_raw_w4a16_groupwise(
     n_intra,
     lane_div_16,
     elem_type,
-    scale_rsrc,
+    scale_buffer,
     expert_offset,
     num_groups: int,
     group_size: int,
@@ -816,10 +874,9 @@ def load_b_raw_w4a16_groupwise(
     Returns ``(packed32, scale_val)``.
     """
     packed32 = load_b_raw_w4a16(
-        buffer_ops,
         arith,
         arg_b=arg_b,
-        b_rsrc=b_rsrc,
+        b_buffer=b_buffer,
         layout_b=layout_b,
         base_k=base_k,
         ku=ku,
@@ -831,9 +888,8 @@ def load_b_raw_w4a16_groupwise(
     )
     k_pos = base_k + fx.Index(ku * 32)
     scale_val = _load_groupwise_scale(
-        buffer_ops,
         arith,
-        scale_rsrc=scale_rsrc,
+        scale_buffer=scale_buffer,
         expert_offset=expert_offset,
         n_blk=n_blk,
         n_intra=n_intra,
@@ -937,11 +993,10 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, scale_f32=None):
 
 
 def load_b_raw_mxfp4_dwordx4(
-    buffer_ops,
     arith,
     *,
     arg_b,
-    b_rsrc,
+    b_buffer,
     layout_b,
     base_k: ir.Value,
     n_blk: ir.Value,
@@ -969,8 +1024,7 @@ def load_b_raw_mxfp4_dwordx4(
     idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
     b16 = _buffer_load_vec(
-        buffer_ops,
-        b_rsrc,
+        b_buffer,
         idx_pack,
         elem_type=elem_type,
         vec_elems=16,

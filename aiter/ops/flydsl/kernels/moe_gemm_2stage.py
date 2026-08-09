@@ -55,6 +55,7 @@ from .mfma_preshuffle_pipeline import (
     load_b_pack_k32,
     load_b_raw_w4a16,
     load_b_raw_w4a16_groupwise,
+    make_buffer,
     make_preshuffle_b_layout,
     swizzle_xor16,
     tile_chunk_coord_i32,
@@ -505,7 +506,14 @@ def compile_moe_gemm1(
                 x_nbytes_idx = x_rows * k_in * arith.index(int(elem_bytes))
                 x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_idx)
 
-                w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
+                # Layout-API i32 buffers (width 4 = widest dwordx4 load) for the
+                # migrated mfma_preshuffle_pipeline helpers, hoisted here beside
+                # the shim x_rsrc (still used by this file's own 8B/4B buffer_ops
+                # loads). W has no remaining shim rsrc, so only w_buffer is built.
+                x_buffer = make_buffer(
+                    arg_x, fx.Int32, 4, num_records_bytes=x_nbytes_idx
+                )
+                w_buffer = make_buffer(arg_w, fx.Int32, 4, num_records_bytes=w_nbytes)
 
                 # OUT: normal=[tokens, topk, inter] f16/bf16,
                 #      split-K=[tokens*topk, 2*inter] f32 (or bf16 for bf16 split-K)
@@ -530,8 +538,17 @@ def compile_moe_gemm1(
                 # scale_w: fp16/bf16 (non-int4) path ignores; int4_bf16 needs dequant scale.
                 if const_expr(not needs_scale_w):
                     sw_rsrc = None
+                    sw_buffer = None
                 else:
                     sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
+                    # Layout-API scale buffer for the groupwise pipeline helper
+                    # (bf16 packs two groups per i32 dword; f32 loads directly).
+                    sw_buffer = make_buffer(
+                        arg_scale_w,
+                        fx.Int32 if _scale_is_bf16 else fx.Float32,
+                        1,
+                        num_records_bytes=sw_nbytes,
+                    )
 
                 sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
                 sorted_rsrc = _ptr_buffer_resource(
@@ -647,10 +664,9 @@ def compile_moe_gemm1(
                             idx_i32 if elem_bytes == 1 else (idx_i32 * fx.Index(2))
                         )
                         return buffer_copy_gmem16_dwordx4(
-                            buffer_ops,
                             elem_type=x_elem,
                             idx_i32=idx_elem,
-                            rsrc=x_rsrc,
+                            b_buffer=x_buffer,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
                         )
@@ -741,10 +757,9 @@ def compile_moe_gemm1(
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                 def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
                     return load_b_pack_k32(
-                        buffer_ops,
                         arith,
                         arg_b=arg_w,
-                        b_rsrc=w_rsrc,
+                        b_buffer=w_buffer,
                         layout_b=layout_b,
                         base_k=base_k,
                         ki_step=ki_step,
@@ -772,10 +787,9 @@ def compile_moe_gemm1(
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
                                 packed32, scale_val = load_b_raw_w4a16_groupwise(
-                                    buffer_ops,
                                     arith,
                                     arg_b=arg_w,
-                                    b_rsrc=w_rsrc,
+                                    b_buffer=w_buffer,
                                     layout_b=layout_b,
                                     base_k=base_k,
                                     ku=ku,
@@ -783,7 +797,7 @@ def compile_moe_gemm1(
                                     n_intra=intra_list[ni],
                                     lane_div_16=lane_div_16,
                                     elem_type=w_elem,
-                                    scale_rsrc=sw_rsrc,
+                                    scale_buffer=sw_buffer,
                                     expert_offset=expert_off_idx,
                                     num_groups=num_groups,
                                     group_size=group_size,
@@ -801,10 +815,9 @@ def compile_moe_gemm1(
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
                                 raw = load_b_raw_w4a16(
-                                    buffer_ops,
                                     arith,
                                     arg_b=arg_w,
-                                    b_rsrc=w_rsrc,
+                                    b_buffer=w_buffer,
                                     layout_b=layout_b,
                                     base_k=base_k,
                                     ku=ku,
@@ -2344,7 +2357,12 @@ def compile_moe_gemm2(
             x_nbytes_idx = (tokens_in * c_topk) * k_in * arith.index(int(elem_bytes))
             x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_idx)
 
-            w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
+            # Layout-API i32 buffers (width 4 = widest dwordx4 load) for the
+            # migrated mfma_preshuffle_pipeline helpers, hoisted beside the shim
+            # x_rsrc (still used by this file's own 8B/4B buffer_ops loads). W has
+            # no remaining shim rsrc, so only w_buffer is built.
+            x_buffer = make_buffer(arg_x, fx.Int32, 4, num_records_bytes=x_nbytes_idx)
+            w_buffer = make_buffer(arg_w, fx.Int32, 4, num_records_bytes=w_nbytes)
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -2364,9 +2382,17 @@ def compile_moe_gemm2(
             # scale_w: fp16/bf16 (non-int4) path ignores; int4_bf16 needs dequant scale.
             if const_expr(not needs_scale_w):
                 sw_rsrc = None
+                sw_buffer = None
             else:
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
                 sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
+                # Layout-API scale buffer for the groupwise pipeline helper.
+                sw_buffer = make_buffer(
+                    arg_scale_w,
+                    fx.Int32 if _scale_is_bf16 else fx.Float32,
+                    1,
+                    num_records_bytes=sw_nbytes,
+                )
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
             sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
@@ -2452,10 +2478,9 @@ def compile_moe_gemm2(
                             idx_i32 if elem_bytes == 1 else (idx_i32 * fx.Index(2))
                         )
                         return buffer_copy_gmem16_dwordx4(
-                            buffer_ops,
                             elem_type=x_elem,
                             idx_i32=idx_elem,
-                            rsrc=x_rsrc,
+                            b_buffer=x_buffer,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
                         )
@@ -2553,10 +2578,9 @@ def compile_moe_gemm2(
                 # --- B Load Logic (K64) ---
                 def load_b_pack(base_k, ki_step, ni):
                     return load_b_pack_k32(
-                        buffer_ops,
                         arith,
                         arg_b=arg_w,
-                        b_rsrc=w_rsrc,
+                        b_buffer=w_buffer,
                         layout_b=layout_b,
                         base_k=base_k,
                         ki_step=ki_step,
@@ -2584,10 +2608,9 @@ def compile_moe_gemm2(
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
                                 packed32, scale_val = load_b_raw_w4a16_groupwise(
-                                    buffer_ops,
                                     arith,
                                     arg_b=arg_w,
-                                    b_rsrc=w_rsrc,
+                                    b_buffer=w_buffer,
                                     layout_b=layout_b,
                                     base_k=base_k,
                                     ku=ku,
@@ -2595,7 +2618,7 @@ def compile_moe_gemm2(
                                     n_intra=n_intra_list[ni],
                                     lane_div_16=lane_div_16,
                                     elem_type=w_elem,
-                                    scale_rsrc=sw_rsrc,
+                                    scale_buffer=sw_buffer,
                                     expert_offset=expert_off_idx,
                                     num_groups=num_groups,
                                     group_size=group_size,
@@ -2613,10 +2636,9 @@ def compile_moe_gemm2(
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
                                 raw = load_b_raw_w4a16(
-                                    buffer_ops,
                                     arith,
                                     arg_b=arg_w,
-                                    b_rsrc=w_rsrc,
+                                    b_buffer=w_buffer,
                                     layout_b=layout_b,
                                     base_k=base_k,
                                     ku=ku,
