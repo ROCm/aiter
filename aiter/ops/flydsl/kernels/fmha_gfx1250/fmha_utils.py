@@ -29,7 +29,7 @@ from flydsl.expr import arith, gpu, rocdl
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.typing import T, Float32, Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator
 
 from flydsl._mlir.dialects import fly as fly_d
@@ -541,12 +541,7 @@ def get_types():
 
 
 def make_v2f32(lo, hi, bank=0):
-    v2f32_ty = T.vec(2, T.f32)
-    idx_0 = arith.constant(0, type=T.i32)
-    idx_1 = arith.constant(1, type=T.i32)
-    undef = llvm_dialect.mlir_undef(v2f32_ty)
-    v = llvm_dialect.insertelement(undef, lo, idx_0)
-    v = llvm_dialect.insertelement(v, hi, idx_1)
+    v = Vec.from_elements([lo, hi], Float32)
     return set_vgpr_bank(v, bank)
 
 
@@ -631,16 +626,8 @@ class Atom:
     def tdm_load(ty, s_g0, s_g1):
         sched_barrier(0)
         zero_i32 = arith.constant(0, type=T.i32)
-        null_v4 = llvm_dialect.mlir_undef(ty["v4i32"])
-        for i in range_constexpr(4):
-            null_v4 = llvm_dialect.insertelement(
-                null_v4, zero_i32, arith.constant(i, type=T.i32)
-            )
-        null_v8 = llvm_dialect.mlir_undef(ty["v8i32"])
-        for i in range_constexpr(8):
-            null_v8 = llvm_dialect.insertelement(
-                null_v8, zero_i32, arith.constant(i, type=T.i32)
-            )
+        null_v4 = vector.broadcast(ty["v4i32"], zero_i32)
+        null_v8 = vector.broadcast(ty["v8i32"], zero_i32)
         rocdl.tensor_load_to_lds(s_g0, s_g1, null_v4, null_v4, null_v8, 0)
         sched_barrier(0)
 
@@ -812,13 +799,8 @@ class Softmax:
         def op_save_old_max(b=bank):
             ss["old_max"][b] = Atom.mov_b32(ss["local_max"][b], b)
             sched_barrier(0)
-            v2f32_ty = T.vec(2, T.f32)
-            idx_0 = arith.constant(0, type=T.i32)
-            idx_1 = arith.constant(1, type=T.i32)
-            undef = llvm_dialect.mlir_undef(v2f32_ty)
             _scl = sgpr["s_log2e_scl"]
-            v = llvm_dialect.insertelement(undef, _scl, idx_0)
-            v = llvm_dialect.insertelement(v, _scl, idx_1)
+            v = Vec.from_elements([_scl, _scl], Float32)
             if const_expr(b > 0):
                 ss["vgpr_log2e_scl_pair"][b] = set_vgpr_bank_offset(v, b, LOG2E_PAIR_OFFSET)
             else:
@@ -921,16 +903,10 @@ class Softmax:
 
                 def op_exp_lo(pidx=_pidx, b=bank, _clo=sp_lo_cache):
                     lo, hi = split_v2f32(sp_pairs[pidx])
-                    v2f32_ty = T.vec(2, T.f32)
                     sched_barrier(0)
                     exp_lo = rocdl_exp2(T.f32, lo)
                     sched_barrier(0)
-                    undef = llvm_dialect.mlir_undef(v2f32_ty)
-                    _idx0 = arith.constant(0, type=T.i32)
-                    _idx1 = arith.constant(1, type=T.i32)
-                    v = llvm_dialect.insertelement(undef, exp_lo, _idx0)
-                    v = llvm_dialect.insertelement(v, hi, _idx1)
-                    sp_pairs[pidx] = v
+                    sp_pairs[pidx] = Vec.from_elements([exp_lo, hi], Float32)
                     if const_expr(_clo is not None):
                         _clo[pidx] = exp_lo  # standalone f32 scalar for yield
 
@@ -939,16 +915,10 @@ class Softmax:
 
                 def op_exp_hi(pidx=_pidx, b=bank, _chi=sp_hi_cache):
                     lo, hi = split_v2f32(sp_pairs[pidx])
-                    v2f32_ty = T.vec(2, T.f32)
                     sched_barrier(0)
                     exp_hi = rocdl_exp2(T.f32, hi)
                     sched_barrier(0)
-                    undef = llvm_dialect.mlir_undef(v2f32_ty)
-                    _idx0 = arith.constant(0, type=T.i32)
-                    _idx1 = arith.constant(1, type=T.i32)
-                    v = llvm_dialect.insertelement(undef, lo, _idx0)
-                    v = llvm_dialect.insertelement(v, exp_hi, _idx1)
-                    sp_pairs[pidx] = v
+                    sp_pairs[pidx] = Vec.from_elements([lo, exp_hi], Float32)
                     if const_expr(_chi is not None):
                         _chi[pidx] = exp_hi  # standalone f32 scalar for yield
 
