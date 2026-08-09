@@ -47,7 +47,10 @@ env:
   SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
   SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   AITER_GPU_ARCHS: gfx950
-  AITER_PREBUILD_MAX_JOBS: "64"
+  # FlyDSL AOT launches one compiler process per worker. Sixty-four workers
+  # stalled the build-only runner after 3728/4676 gfx950 kernels; keep enough
+  # parallelism without exhausting the runner while the GPU-less build is used.
+  AITER_PREBUILD_MAX_JOBS: "16"
   AITER_OVERLAY_ARTIFACT_NAME: aiter-vllm-disagg-overlay-${{ github.run_id }}
 
 jobs:
