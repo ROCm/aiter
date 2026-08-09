@@ -43,10 +43,7 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
-# isort and black disagree here: isort wants two blank lines after this block,
-# black folds them back to one because the `# fmt: off` below starts a
-# formatting-disabled region. black is the one CI enforces, so it wins.
-import torch  # noqa: I001
+import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -54,6 +51,10 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
+MLA_GLUON_CAPABILITIES = frozenset(
+    {"fp8_kv_batched_decode", "fp8_kv_mtp_decode", "fp8_kv_scale"}
+)
 
 # fmt: off
 @gluon.jit

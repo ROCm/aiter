@@ -139,6 +139,7 @@ def test_mla(
     return_lse=False,
     is_causal=True,
     sequential_page_indices=False,
+    kv_scale_value=1.0,
 ):
     ret = {}
 
@@ -179,6 +180,13 @@ def test_mla(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=torch.bfloat16,
     )
+    kv_buffer_quantized = None
+    if kvtype == dtypes.fp8:
+        # Compare against values recovered from scaled FP8 storage.
+        kv_buffer_quantized = (kv_buffer / kv_scale_value).to(kvtype)
+        kv_buffer = (kv_buffer_quantized.to(torch.bfloat16) * kv_scale_value).to(
+            torch.bfloat16
+        )
 
     # for none absorb (mha)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -448,8 +456,9 @@ def test_mla(
             aiter.logger.info("don't support this case.")
             return None, 1e12
 
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        assert kv_buffer_quantized is not None
+        kv_buffer_fp8 = kv_buffer_quantized
+        kv_scale = torch.full([1], kv_scale_value, dtype=torch.float, device="cuda")
 
         (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -556,7 +565,8 @@ def test_mla(
 
         kv_c = kv_buffer.view(-1, qk_head_dim)
         if name == "bh16bn128":
-            kv_c = kv_c.to(dtypes.fp8)
+            assert kv_buffer_quantized is not None
+            kv_c = kv_buffer_quantized.view(-1, qk_head_dim)
 
         if not varlen:
             page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
@@ -577,7 +587,7 @@ def test_mla(
             seq_info,
             sm_scale,
             use_2d_view=use_2d_view,
-            kv_scale=1.0,
+            kv_scale=kv_scale_value,
             min_kv_seq_len=ctx_lens,
             return_lse=return_lse,
         )
@@ -667,14 +677,13 @@ def test_mla(
             # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
             ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
-    # Gluon MLA bh16bn128 decode test
-    # Example: -c 10000000 -b 1 3 4 -n 16,1 -d bf16 -kvd fp8
+    # Gluon MLA FP8 decode test
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == dtypes.fp8
         and nhead <= 16
-        and decode_qlen == 1
+        and 1 <= decode_qlen <= 4
         and 1 <= batch_size <= 256
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
@@ -855,14 +864,34 @@ parser.add_argument(
     help="""Enable/disable causal masking. Default: True.
     --causal / --no-causal""",
 )
+parser.add_argument(
+    "--kv-scale",
+    type=float,
+    nargs="*",
+    default=[1.0],
+    help="""FP8 KV dequantization scale(s).
+    e.g.: --kv-scale 1.0 0.375""",
+)
 
 
 args = parser.parse_args()
 
 for nhead, decode_qlen in args.nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+    for (
+        dtype,
+        kvtype,
+        ctx_len,
+        batch_size,
+        split_per_batch,
+        kv_scale,
+    ) in itertools.product(
+        args.dtype,
+        args.kv_dtype,
+        args.ctxLen,
+        args.batchSize,
+        args.split_per_batch,
+        args.kv_scale,
     ):
         if check_support(dtype, kvtype, nhead):
             ret = test_mla(
@@ -882,6 +911,7 @@ for nhead, decode_qlen in args.nhead:
                 return_lse=args.return_lse,
                 is_causal=args.causal,
                 sequential_page_indices=args.sequential_page_indices,
+                kv_scale_value=kv_scale,
             )
             df.append(ret)
     df = pd.DataFrame(df)
