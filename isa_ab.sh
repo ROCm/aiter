@@ -1,0 +1,33 @@
+#!/bin/bash
+# ISA A/B for a FlyDSL migration, with no GPU.
+#   ./isa_ab.sh <git-ref> <path...> -- <compile_gate case>...
+# Compiles the given cases with <path...> at <git-ref> (the "before"), then at
+# the working-tree state ("after"), and diffs the final ISA.
+set -u
+REF="$1"; shift
+PATHS=(); while [ "$1" != "--" ]; do PATHS+=("$1"); shift; done; shift
+CASES=("$@")
+
+run() {  # run <outdir>
+  rm -rf "$1" ~/.flydsl/cache; mkdir -p "$1"
+  PYTHONPATH=/tmp/envstub FLYDSL_GPU_ARCH=gfx950 COMPILE_ONLY=1 \
+  FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR="$1" \
+  timeout 1800 /opt/venv/bin/python compile_gate.py "${CASES[@]}" 2>/dev/null \
+    | grep -E '^\[|^[0-9a-f]{16} '
+}
+
+TMP=$(mktemp -d)
+for p in "${PATHS[@]}"; do mkdir -p "$TMP/$(dirname "$p")"; cp "$p" "$TMP/$p"; done
+for p in "${PATHS[@]}"; do git show "$REF:$p" > "$p" || exit 1; done
+echo "=== BEFORE ($REF) ==="; run /tmp/isa_before > /tmp/ab_before.txt; cat /tmp/ab_before.txt
+for p in "${PATHS[@]}"; do cp "$TMP/$p" "$p"; done
+echo "=== AFTER (working tree) ==="; run /tmp/isa_after > /tmp/ab_after.txt; cat /tmp/ab_after.txt
+rm -rf "$TMP"
+
+echo "=== VERDICT ==="
+if diff -q <(grep -E '^[0-9a-f]{16} ' /tmp/ab_before.txt) \
+           <(grep -E '^[0-9a-f]{16} ' /tmp/ab_after.txt) >/dev/null; then
+  echo "ISA IDENTICAL - migration is provably behaviour- and perf-neutral"
+else
+  echo "ISA DIFFERS:"; diff <(cat /tmp/ab_before.txt) <(cat /tmp/ab_after.txt)
+fi
