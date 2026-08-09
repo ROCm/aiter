@@ -237,15 +237,50 @@ def _e2m1_code(y):
     first-min): idx = #{grid midpoints strictly below |y|}; sign bit = 8. The grid is
     {0,.5,1,1.5,2,3,4,6} so the midpoints are {.25,.75,1.25,1.75,2.5,3.5,5.0}."""
     mag = tl.abs(y)
-    idx = (mag > 0.25).to(tl.int32)
-    idx += (mag > 0.75).to(tl.int32)
-    idx += (mag > 1.25).to(tl.int32)
-    idx += (mag > 1.75).to(tl.int32)
-    idx += (mag > 2.5).to(tl.int32)
-    idx += (mag > 3.5).to(tl.int32)
-    idx += (mag > 5.0).to(tl.int32)
+    uniform_idx = tl.maximum(tl.ceil(mag * 2.0 - 0.5), 0.0).to(tl.int32)
+    high_idx = 4
+    high_idx += (mag > 2.5).to(tl.int32)
+    high_idx += (mag > 3.5).to(tl.int32)
+    high_idx += (mag > 5.0).to(tl.int32)
+    idx = tl.where(mag <= 2.0, uniform_idx, high_idx)
     sign = (y < 0.0).to(tl.int32) * 8
     return idx | sign
+
+
+@triton.jit
+def _mxfp4_scale_from_amax(amax):
+    """Return E8M0 scale bytes and exact reciprocal powers."""
+    safe_amax = tl.maximum(amax, 1e-12)
+    bits = safe_amax.to(tl.uint32, bitcast=True)
+    fp32_exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    scale_e8m0 = fp32_exponent - 2 + (mantissa > 0x400000).to(tl.uint32)
+    scale_e8m0 = tl.minimum(tl.maximum(scale_e8m0, 0), 255)
+    reciprocal_bits = (254 - scale_e8m0) << 23
+    reciprocal = reciprocal_bits.to(tl.float32, bitcast=True)
+    return scale_e8m0.to(tl.uint8), reciprocal
+
+
+@triton.jit
+def _e2m1_pack_native(value_lo, value_hi):
+    lo_bits = value_lo.to(tl.uint32, bitcast=True)
+    hi_bits = value_hi.to(tl.uint32, bitcast=True)
+    lo_sign = lo_bits & 0x80000000
+    hi_sign = hi_bits & 0x80000000
+    lo_mag = lo_bits & 0x7FFFFFFF
+    hi_mag = hi_bits & 0x7FFFFFFF
+    lo_bits = lo_sign | (lo_mag - (lo_mag != 0).to(tl.uint32))
+    hi_bits = hi_sign | (hi_mag - (hi_mag != 0).to(tl.uint32))
+    value_lo = lo_bits.to(tl.float32, bitcast=True)
+    value_hi = hi_bits.to(tl.float32, bitcast=True)
+    return tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[value_lo, value_hi, 1.0],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
 
 
 @triton.jit
@@ -320,6 +355,82 @@ def sage_quant_v_fp4_colmajor_kernel(
     slack = tl.arange(0, 64)
     tl.store(
         out_ptr + tl.num_programs(0) * block_bytes + slack,
+        0,
+        mask=(pid == 0) & (slack < 64),
+    )
+
+
+@triton.jit
+def sage_quant_v_mxfp4_colmajor_kernel(
+    v_ptr,  # V [b, h_kv, S, D]
+    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major block-normalized fp4
+    scale_ptr,  # uint8 [b, h_kv, nT*512] E8M0 image in kernel gather order
+    kperm_ptr,  # int32 [64] kv-column permutation
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_sb,
+    stride_sh,
+    h_kv,
+    nT,
+    S,
+):
+    """Pack true MXFP4 V with per-(channel, 32-token-block) E8M0 scales."""
+    pid = tl.program_id(0)
+    unit = pid % 16
+    tile = (pid // 16) % nT
+    batch_head = pid // (16 * nT)
+    batch = batch_head // h_kv
+    head = batch_head % h_kv
+    channel_block = unit // 4
+    token_quarter = unit % 4
+    token_half = token_quarter // 2
+    token_block = token_quarter % 2
+
+    column = token_block * 32 + tl.arange(0, 32)
+    token_in_half = tl.load(kperm_ptr + column)
+    channel = channel_block * 32 + tl.arange(0, 32)
+    token = tile * 128 + token_half * 64 + token_in_half
+    row = token[:, None] * stride_vs
+    token_mask = token[:, None] < S
+    v_base = v_ptr + batch * stride_vb + head * stride_vh
+    payload_unit = 2 * channel_block + token_half
+    out_base = (
+        out_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + tile * 8192
+        + payload_unit * 1024
+    )
+    scale_base = scale_ptr + batch * stride_sb + head * stride_sh + tile * 512
+
+    values = tl.load(
+        v_base + row + channel[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    encoded, reciprocal = _mxfp4_scale_from_amax(tl.max(tl.abs(values), axis=0))
+    normalized = values * reciprocal[None, :]
+    normalized = tl.reshape(normalized, (32, 16, 2))
+    normalized_lo, normalized_hi = tl.split(normalized)
+    packed = _e2m1_pack_native(normalized_lo, normalized_hi)
+    channel_pair = tl.arange(0, 16)
+    output_offset = column[:, None] * 16 + channel_pair[None, :]
+    tl.store(out_base + output_offset, packed)
+
+    encoded = tl.reshape(encoded, (16, 2))
+    encoded_lo, encoded_hi = tl.split(encoded)
+    scale_half = scale_base + token_half * 256
+    scale_block = scale_half + token_block * 128
+    tl.store(scale_block + 8 * channel_pair + channel_block, encoded_lo)
+    tl.store(scale_block + 8 * channel_pair + 4 + channel_block, encoded_hi)
+
+    slack = tl.arange(0, 64)
+    tl.store(
+        out_ptr + (tl.num_programs(0) // 16) * 8192 + slack,
         0,
         mask=(pid == 0) & (slack < 64),
     )

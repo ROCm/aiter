@@ -59,7 +59,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_f4f4,
     sage_quant_mxfp4,
     sage_quant_mxfp6,
-    sage_quant_v_f4f4,
+    sage_quant_v_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -172,7 +172,7 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
     )
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_fp4, v_scale = sage_quant_v_f4f4(value, layout="bshd")
+    v_fp4, v_scale = sage_quant_v_mxfp4(value)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
@@ -1364,7 +1364,7 @@ def make_kernel_runner(
                 q_smoothing=args.qsmooth,
             )
 
-        # f4f4: sage_quant_f4f4 emits per-channel fp4 V in the kernel's col-major LDS layout.
+        # f4f4 emits true-MXFP4 V in the kernel's col-major LDS layout.
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
             return mha_v4_packed(
                 q_fp4,
@@ -1408,8 +1408,7 @@ def make_kernel_runner(
 
     if args.kernel in ("aiter_mxfp6", "aiter_f6f4"):
         # fp6 QK path. aiter_mxfp6 = f6f8 (fp6 QK, fp8 V, tail K-scale) -> the mainline upstream
-        # kernel. aiter_f6f4 = the ISOLATED v_fp4 kernel (fp6 QK, per-channel fp4 V via
-        # ds_read_b64_tr_b4).
+        # kernel. aiter_f6f4 = the isolated v_fp4 kernel (fp6 QK, true-MXFP4 V).
         _is_f6f4 = args.kernel == "aiter_f6f4"
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8

@@ -5,7 +5,7 @@
 
 ## Status
 
-- Last updated: 2026-08-08.
+- Last updated: 2026-08-09.
 - Development branch: `mha_v4`, forked from `mxfp6_fmha_gfx950` at `8ccca033`.
 - Preserve `mxfp6_fmha_gfx950` as the validated integration baseline; do not add MHA v4 work to it.
 - Phase: dense BF16-output extraction and xDiT migration implemented and validated on gfx950.
@@ -87,8 +87,8 @@
     head-count requests.
 - [x] Run the requested long-context command:
     `python op_tests/op_benchmarks/triton/bench_sage.py --b 1 --hq 5 --sq 8192 --d 128 --kernel all`.
-- [x] `python -m pytest -q op_tests/test_mha_v4.py`: 23 passed.
-- [ ] Run the balanced real target-shape benchmark and record GPU count plus code-object hashes.
+- [x] `python -m pytest -q op_tests/test_mha_v4.py`: 37 passed.
+- [x] Run the balanced real target-shape benchmark and record GPU count plus code-object hashes.
 
 ### Deferred Phases
 
@@ -282,6 +282,44 @@ coalesced K layout produced by `quantize_mxfp4_k`; incompatible token-strided st
 Exotic LDS-order tensors are represented by contiguous backing buffers plus metadata. An
 `as_strided` view never crosses a custom-op boundary; the final launch op reconstructs it while
 populating the kernarg.
+
+### MXFP4 V Contract
+
+The F4F4 and F6F4 rows use true MXFP4 V: E2M1 values with one E8M0 scale for every
+`(channel, 32-token)` block. `pack_v_mxfp4_colmajor_raw` fuses block-amax reduction,
+ceil-power-of-two scale generation, normalization, E2M1 encoding, and the final col-major ASM
+layout. One single-warp Triton program owns an exact `(32-token, 32-channel)` scale block, giving
+16 disjoint programs per `(batch, head, 128-token tile)`. It loads the contiguous `32x32` BF16
+block once, derives all 32 E8M0 scales with exponent-bit arithmetic, normalizes with exact
+power-of-two multiplies, and packs adjacent channels with gfx950 native FP4 conversion. It returns
+a contiguous FP4 raw buffer and a uint8 scale image with shape
+`[batch, heads, ceil(sequence / 128) * 512]`. Ragged-tail loads are masked and the raw buffer's
+64-byte launch slack is zeroed.
+
+The scale image is already in the ASM gather order; it is not a generic row-major scale tensor.
+The raw producer and final launch custom-op names must be versioned whenever its dtype, shape, or
+layout changes so existing Inductor guards cannot reuse an older per-channel-F32 contract. Packed
+launches select `E8M0_PER_1X32` only for MXFP4 V; MX Q/K with FP8 V retains
+`F32_PER_CHANNEL`.
+
+The active gfx950 implementations are the trailing-underscore F4F4/F6F4 PyISA sources. Both
+reclaim prologue-only workitem-decomposition registers: `v1:v2` hold the two current V-scale
+dwords and `v3` holds the E8M0 identity scale. Scale loads issue at QK exit so softmax hides their
+VMEM latency before the existing PV drain. Existing 4-aligned operand banks do not move, and the
+allocation remains 256 VGPR. F4F4 restores next-K0 prefetch under the penultimate PV MFMA; F6F4
+keeps its split-FP6 K0 prefetch at the PV tail because the earlier placement was flat in balanced
+eight-GPU testing.
+
+Promotion requires byte equality against an independent Torch payload/scale reference at sequence
+lengths `1, 127, 128, 129, 257`, deterministic repeated output, zero slack, eager/fullgraph parity,
+allocator churn, the full MHA v4 and xDiT mixed-attention suites, and repeated retained Wan
+captures. The validated underscore candidates preserve 95 SGPR and 256 VGPR usage; F4F4 uses
+66,048 bytes LDS and F6F4 uses 43,008 bytes LDS. At
+`b=1,hq=hk=5,sq=sk=65536,d=dv=128`, final eight-GPU e2e medians were
+`3574.8 TFLOP/s` for F4F4 versus `3459.0` for F4F8, and `3351.2 TFLOP/s` for F6F4 versus
+`3205.1` for F6F8. The deployed code-object SHA256 values are
+`212981592d1e4801f93db1cb8cc37db1ed7335e3fdadf53c0d01e7bd53917d72` (F4F4) and
+`a5046f1dcc0d51033122310efab70796e690086391285b9e5cdeaa5496d292a9` (F6F4).
 
 ### Future MXFP6 K Fusion
 

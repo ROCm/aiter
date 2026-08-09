@@ -19,8 +19,66 @@ from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
-    sage_quant_v_f4f4,
 )
+
+
+def _e2m1_code_ties_low(value):
+    magnitude = value.abs()
+    code = sum(
+        magnitude > midpoint for midpoint in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    ).to(torch.uint8)
+    return code | ((value < 0).to(torch.uint8) << 3)
+
+
+def _reference_mxfp4_v(value):
+    batch, sequence, heads, _ = value.shape
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    tiles = padded_sequence // 128
+    padded = torch.nn.functional.pad(value.float(), (0, 0, 0, 0, 0, padded_sequence - sequence))
+    padded = padded.permute(0, 2, 1, 3)
+
+    column = torch.arange(64, device=value.device)
+    lane = column % 32
+    permutation = 4 * (lane // 8) + 16 * ((lane // 4) % 2) + lane % 4
+    tau64 = 32 * (column // 32) + permutation
+    kperm = torch.empty(64, dtype=torch.long, device=value.device)
+    kperm[tau64] = column
+
+    raw = torch.zeros(
+        fp4_v_raw_buffer_size(batch, sequence, heads),
+        dtype=torch.uint8,
+        device=value.device,
+    )
+    payload = raw[:-64].view(batch, heads, tiles * 8192)
+    scale = torch.empty((batch, heads, tiles * 512), dtype=torch.uint8, device=value.device)
+    for tile in range(tiles):
+        for channel_block in range(4):
+            for token_half in range(2):
+                unit = 2 * channel_block + token_half
+                tokens = tile * 128 + token_half * 64 + kperm
+                channels = slice(channel_block * 32, (channel_block + 1) * 32)
+                block = padded[:, :, tokens, channels]
+                exponents = []
+                normalized = torch.empty_like(block)
+                for token_block in range(2):
+                    columns = slice(token_block * 32, (token_block + 1) * 32)
+                    amax = block[:, :, columns].abs().amax(dim=2)
+                    exponent = torch.ceil(torch.log2(torch.clamp_min(amax, 1e-12) / 6.0))
+                    exponents.append(exponent)
+                    normalized[:, :, columns] = block[:, :, columns] / torch.exp2(exponent[:, :, None])
+
+                code = _e2m1_code_ties_low(normalized)
+                packed = code[..., 0::2] | (code[..., 1::2] << 4)
+                payload[:, :, tile * 8192 + unit * 1024 : tile * 8192 + (unit + 1) * 1024] = packed.flatten(2)
+
+                scale_base = tile * 512 + token_half * 256
+                for token_block, exponent in enumerate(exponents):
+                    encoded = (exponent + 127).clamp(0, 255).to(torch.uint8)
+                    for pair in range(16):
+                        offset = scale_base + token_block * 128 + 8 * pair + channel_block
+                        scale[:, :, offset] = encoded[:, :, 2 * pair]
+                        scale[:, :, offset + 4] = encoded[:, :, 2 * pair + 1]
+    return raw, scale
 
 
 def test_attention_format_ids_are_stable():
@@ -74,23 +132,21 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [1, 127, 129, 257])
-def test_mha_v4_mxfp4_v_ragged_pack_matches_explicit_padding(sequence):
+@pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
+def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
     raw, scale = _quantize_v_mxfp4_raw(value)
+    raw_again, scale_again = _quantize_v_mxfp4_raw(value)
+    expected_raw, expected_scale = _reference_mxfp4_v(value)
 
-    padded_sequence = fp4_v_padded_sequence(sequence)
-    padded = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, padded_sequence - sequence))
-    padded_view, padded_scale = sage_quant_v_f4f4(padded, layout="bshd")
-    padded_raw = torch.as_strided(
-        padded_view,
-        (fp4_v_raw_buffer_size(2, sequence, 3),),
-        (1,),
-    )
-
-    assert torch.equal(raw, padded_raw)
-    assert torch.equal(scale, padded_scale)
+    assert raw.shape == (fp4_v_raw_buffer_size(2, sequence, 3),)
+    assert scale.shape == (2, 3, ((sequence + 127) // 128) * 512)
+    assert raw.dtype == scale.dtype == torch.uint8
+    assert torch.equal(raw, expected_raw)
+    assert torch.equal(scale, expected_scale)
+    assert torch.equal(raw, raw_again)
+    assert torch.equal(scale, scale_again)
     assert torch.count_nonzero(raw[-64:]) == 0
 
 
@@ -223,9 +279,14 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     v_fp8 = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     v_scale = torch.ones((1, 2, 128), device="cuda", dtype=torch.float32)
 
-    for v_format, value in (
-        (AttentionFormat.FP8, v_fp8),
-        (AttentionFormat.MXFP4, q.new_zeros((1, 128, 2, 128))),
+    for v_format, value, value_scale, v_scale_mode in (
+        (AttentionFormat.FP8, v_fp8, v_scale, AttentionScaleMode.F32_PER_CHANNEL),
+        (
+            AttentionFormat.MXFP4,
+            q.new_zeros((1, 128, 2, 128)),
+            q.new_zeros((1, 2, 512)),
+            AttentionScaleMode.E8M0_PER_1X32,
+        ),
     ):
         with pytest.raises(ValueError, match="coalesced MHA v4 tile layout"):
             mha_v4_packed(
@@ -234,13 +295,13 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
                 value,
                 scale,
                 scale,
-                v_scale,
+                value_scale,
                 AttentionFormat.MXFP4,
                 AttentionFormat.MXFP4,
                 v_format,
                 AttentionScaleMode.E8M0_PER_1X32,
                 AttentionScaleMode.E8M0_PER_1X32,
-                AttentionScaleMode.F32_PER_CHANNEL,
+                v_scale_mode,
             )
 
     raw, k_scale = quantize_mxfp4_k(

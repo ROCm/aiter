@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_q_kernel,
     sage_quant_kernel,
     sage_quant_v_fp4_colmajor_kernel,
+    sage_quant_v_mxfp4_colmajor_kernel,
     sage_quant_v_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -401,6 +402,78 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     return v_fp4_view, v_descale
 
 
+@torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
+def pack_v_mxfp4_colmajor_raw(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack V into contiguous payload and ASM-order E8M0 scale buffers.
+
+    Each 128-token tile contributes 512 scale bytes: four 32-token blocks times
+    128 channels, arranged in the gather order consumed by the F4F4/F6F4 kernels.
+    """
+    batch, sequence, heads, head_dim = value.shape
+    if head_dim != 128 or not value.is_contiguous():
+        raise ValueError("MXFP4 V packing requires contiguous hd128 BSHD input")
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    tiles = padded_sequence // FP4_V_TILE_TOKENS
+    raw = torch.empty(
+        fp4_v_raw_buffer_size(batch, sequence, heads),
+        dtype=torch.uint8,
+        device=value.device,
+    )
+    scale = torch.empty(
+        (batch, heads, tiles * 512), dtype=torch.uint8, device=value.device
+    )
+    value_bhsd = value.permute(0, 2, 1, 3)
+    payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
+    kperm = _f4f4_v_kperm(value.device)
+    sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
+        value_bhsd,
+        payload,
+        scale,
+        kperm,
+        value_bhsd.stride(0),
+        value_bhsd.stride(1),
+        value_bhsd.stride(2),
+        value_bhsd.stride(3),
+        payload.stride(0),
+        payload.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        heads,
+        tiles,
+        sequence,
+        num_warps=1,
+        num_stages=1,
+    )
+    return raw, scale
+
+
+@pack_v_mxfp4_colmajor_raw.register_fake
+def _pack_v_mxfp4_colmajor_raw_fake(value):
+    batch, sequence, heads, _ = value.shape
+    tiles = fp4_v_padded_sequence(sequence) // FP4_V_TILE_TOKENS
+    return (
+        value.new_empty(
+            (fp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+        ),
+        value.new_empty((batch, heads, tiles * 512), dtype=torch.uint8),
+    )
+
+
+def sage_quant_v_mxfp4(value):
+    """Return true-MXFP4 V data view and kernel-ready E8M0 block-scale image."""
+    batch, sequence, heads, _ = value.shape
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    raw, scale = pack_v_mxfp4_colmajor_raw(value)
+    view = torch.as_strided(
+        raw,
+        (batch, sequence, heads, 128),
+        (heads * padded_sequence * 64, 64, padded_sequence * 64, 1),
+    )
+    return view, scale
+
+
 def sage_quant_f4f4(
     q,
     k,
@@ -416,28 +489,12 @@ def sage_quant_f4f4(
     R=None,
     BLOCK_R=32,
 ):
-    """f4f4 quantizer: fp4 Q/K (mxfp4, hadamard-rotated) + per-channel fp4 (E2M1) V in
-    the kernel's col-major LDS operand layout. The Q/K path is identical to
-    ``sage_quant_mxfp4``; V is packed to fp4 (uint8, 8x1024 B col-major blocks per
-    128-kv tile) with an f32 per-channel descale instead of fp8. In-tree (no dependency
-    on the research host packer). FP8_TYPE/FP8_MAX are accepted for signature parity with
-    ``sage_quant_mxfp4`` but unused (V is fp4, not fp8).
-
-    Returns (q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s), where
-    v_fp4_view is a strided [b, sk, h_kv, 128] uint8 view over a [b, h_kv, nT*8192]+64 B
-    backing buffer (seq stride 64). mha_v4_packed consumes it directly -- do NOT
-    call .contiguous() on it (that would drop the col-major LDS layout -> garbage). The
-    kernel's V loads are bounds-checked (num_records = kv_len*64), so the last-token
-    strided window is safe; the +64 B slack only keeps the torch view in storage bounds.
-    """
-    if layout == "bshd":
-        _b, _qo_len, _h_qo, head_dim = q.shape
-        _, kv_len, _h_kv, _ = v.shape
-    elif layout == "bhsd":
-        _b, _h_qo, _qo_len, head_dim = q.shape
-        _, _h_kv, kv_len, _ = v.shape
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
+    """Quantize rotated MXFP4 Q/K plus true-MXFP4 V for the F4F4 ASM kernel."""
+    del FP8_TYPE, FP8_MAX, BLKK, USE_RNE
+    if layout != "bshd":
+        raise ValueError(f"f4f4 requires bshd layout, got {layout}")
+    _, _, _, head_dim = q.shape
+    _, kv_len, _, _ = v.shape
 
     tile = 128
     assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
@@ -462,7 +519,7 @@ def sage_quant_f4f4(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    v_fp4_view, v_descale = sage_quant_v_f4f4(v, layout=layout)
+    v_fp4_view, v_descale = sage_quant_v_mxfp4(v)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 
@@ -492,7 +549,7 @@ def sage_quant_mxfp6(
     k_packer callables to override (e.g. a bench that swaps the packer via AITER_MXFP6_PACK
     or forces the numpy path). The V operand is selected by f6f4:
       * f6f4=False (f6f8): raw fp8 V via sage_quant_v_kernel (per-channel descale).
-            * f6f4=True:          per-channel fp4 (E2M1) V via sage_quant_v_f4f4.
+            * f6f4=True: true-MXFP4 V with per-(channel, 32-token) E8M0 scales.
     Only the selected V operand is computed (no wasted fp8 quant on the f6f4 path).
     Returns (q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s). bshd only.
     """
@@ -534,9 +591,9 @@ def sage_quant_mxfp6(
         sm_scale=(sm_scale * 1.4426950408889634),
     )
 
-    # V operand: per-channel fp4 (f6f4) or raw fp8 (f6f8) -- only the selected one.
+    # V operand: true-MXFP4 (f6f4) or raw fp8 (f6f8) -- only the selected one.
     if f6f4:
-        v_quantized, v_scale = sage_quant_v_f4f4(v, layout=layout)
+        v_quantized, v_scale = sage_quant_v_mxfp4(v)
     else:
         v_quantized = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
         K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK

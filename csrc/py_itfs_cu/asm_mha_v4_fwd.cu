@@ -303,15 +303,26 @@ void fmha_v4_fwd(const at::Tensor& q,
         TORCH_CHECK(q_descale.numel() == 1 && k_descale.numel() == 1,
                     "INT8/FP8 Q/K descales must be scalar tensors");
     }
-    TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
-                "V descale must be a float32 tensor");
-    if(mx_qk)
+    const bool mxfp4_v = v_format == format_id(AttentionFormat::Fp4E2M1);
+    if(mx_qk && mxfp4_v)
     {
+        const int64_t tiles = (seqlen_k + 127) / 128;
+        TORCH_CHECK(v_scale_mode == 5 && v_descale.scalar_type() == at::ScalarType::Byte,
+                    "MXFP4 V descale must use uint8 E8M0 per-1x32 scales");
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({batch, nhead_k, tiles * 512}),
+                    "MXFP4 V descale must have shape [batch, key_heads, tiles * 512]");
+    }
+    else if(mx_qk)
+    {
+        TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
+                    "MX FP8 V descale must be a float32 tensor");
         TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({batch, nhead_k, kHeadDim}),
                     "MX V descale must have shape [batch, key_heads, 128]");
     }
     else
     {
+        TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
+                    "INT8/FP8 V descale must be a float32 tensor");
         TORCH_CHECK(v_descale.numel() == 1, "INT8/FP8 V descale must be a scalar tensor");
     }
 
