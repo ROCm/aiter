@@ -619,7 +619,8 @@ def launch_gemm_a8w4_tdm(
         # At 0.5/16 the ISA shows 40 wmma between the last ds_read and the fence
         # (was 0), 3841.5 vs 3992.2 baseline (-3.8%), and spills drop 4 -> 0.
         PRE_FENCE_WM = 0
-        FENCE_READ_FRONT = 0.5
+        MG_ACT = 4
+        FENCE_READ_FRONT = 0.75
         FENCE_COVER_MMA = 16
         # NOTE: reordering wmma above the fence in the *source* does not work --
         # tried 8 and 16 wmma, with and without explicit sched hints; the
@@ -875,7 +876,7 @@ def launch_gemm_a8w4_tdm(
                 #   no  (g2) 1446.0  1406.5  1336.2  1353.8
                 # The activation GEMM peaks at 4 and the plain one at 8, so key
                 # the choice on stage1_act rather than taking one compromise.
-                mma_group = min(4 if stage1_act else 8, mma_total) if KWS > 1 else 1
+                mma_group = min(MG_ACT if stage1_act else 8, mma_total) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
                 # Front-load the prefetch reads into the leading slots of the
                 # k128 that precedes the tile-tail REUSE fence, leaving the
