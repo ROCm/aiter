@@ -177,6 +177,18 @@ def _gemm2_body_a16w4(
         (N_OUT // 16, bl_k0, 4, 16, 16),
         (bl_stride_n0, bl_stride_k0, bl_stride_klane, 16, 1),
     )
+    # W2 (int4, a16wi4) OLD-kernel preshuffle: pack_int8_to_packed_int4(shuffle_weight(
+    #   w.i8, (16,16))) kpack=8 BYTES (K16/klane slot). See gemm1 counterpart: a port
+    #   MFMA-K32 block c=k0*4+klane = two adjacent klane slots (2*(c%2),+1) 128 B apart.
+    if const_expr(_is_int4):
+        i4l_k0 = K // 64
+        i4l_stride_klane = 128
+        i4l_stride_k0 = 512
+        i4l_stride_n0 = i4l_k0 * i4l_stride_k0
+        layout_b_int4 = fx.make_layout(
+            (N_OUT // 16, i4l_k0, 4, 16, 8),
+            (i4l_stride_n0, i4l_stride_k0, i4l_stride_klane, 8, 1),
+        )
     # W2 (raw bf16) preshuffle layout (N-major == shuffle_weight (16,16)), bf16-elem units:
     #   shape (N_OUT/16, K/32, 4, 16, 8). One kpack=8 bf16=one MFMA K32 fragment; K
     #   reindexed to the fp4 (klane_hw, ku)->K order (see load_b_raw_bf16).
@@ -223,6 +235,11 @@ def _gemm2_body_a16w4(
     # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
     w_reg_lay = fx.make_layout(4, 1)
+    if const_expr(_is_int4):
+        # OLD int4 layout: klane slot = 8 bytes = 2 i32 -> dwordx2 loads (see gemm1).
+        w_copy_atom64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(b_cache_mod), fx.Int32)
+        w_reg_lay2 = fx.make_layout(2, 1)
+        w_tiles8 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 2)
     if _is_int4:
         _sw_bytes = NE * N_OUT * _g_half * 4
     else:
@@ -359,6 +376,41 @@ def _gemm2_body_a16w4(
             raw.append([fx.Int32(v4[j]) for j in range(4)])
         return raw
 
+    def load_b_raw_int4(base_k, n_blk, n_intra):
+        # int4 OLD layout (kpack=8): port MFMA-K32 block c = k0*4 + lane_div_16 is the
+        # concat of two adjacent klane slots (2*(c%2), +1) 128 B apart -> two dwordx2
+        # loads. raw[k0i] = [slot_a i32#0, i32#1, slot_b i32#0, i32#1]; each i32 is one
+        # MFMA K-step, "interleaved-by-4" packed (upconvert_b old_pack=True). See gemm1.
+        raw = []
+        for k0i in range_constexpr(_k0_count):
+            k0 = (base_k + fx.Int32(k0i * 128)) // fx.Int32(128)
+            c = k0 * fx.Int32(4) + lane_div_16
+            old_k0 = c // fx.Int32(2)
+            old_klane_a = (c % fx.Int32(2)) * fx.Int32(2)
+            four = []
+            for slot in range_constexpr(2):
+                idx = fx.Int32(
+                    crd2idx(
+                        [
+                            fx.Int64(n_blk),
+                            fx.Int64(old_k0),
+                            fx.Int64(old_klane_a + fx.Int32(slot)),
+                            fx.Int64(n_intra),
+                            fx.Int64(0),
+                        ],
+                        layout_b_int4,
+                    )
+                )
+                r = fx.make_rmem_tensor(w_reg_lay2, fx.Int32)
+                fx.copy(
+                    w_copy_atom64, fx.slice(w_tiles8, (None, idx // fx.Int32(8))), r
+                )
+                v2 = fx.Vector(fx.memref_load_vec(r))
+                four.append(fx.Int32(v2[0]))
+                four.append(fx.Int32(v2[1]))
+            raw.append(four)
+        return raw
+
     def load_b_raw_bf16(base_k, n_blk, n_intra):
         # Raw bf16 W: one dwordx4 (8 bf16) per ku = one MFMA K32 fragment. Index to
         # match the fp4 (klane_hw=lane_div_16, ku)->K order (see gemm1 counterpart).
@@ -434,7 +486,9 @@ def _gemm2_body_a16w4(
             return raw[ku]  # already v8bf16 (no scale, no upconvert)
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
-            return _int4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32, use_k16=use_k16)
+            return _int4_nibble_to_bf16x8(
+                fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
+            )
         s_raw = _raw(scale_f32)
         i32s = []
         for sel in range_constexpr(4):
@@ -515,8 +569,9 @@ def _gemm2_body_a16w4(
             ]
             b_sc = None
         else:
+            _lbr = load_b_raw_int4 if const_expr(_is_int4) else load_b_raw
             b_raw = [
-                load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni])
+                _lbr(base_k, n_blk_list[ni], n_intra_list[ni])
                 for ni in range_constexpr(num_acc_n)
             ]
             if const_expr(_is_int4):

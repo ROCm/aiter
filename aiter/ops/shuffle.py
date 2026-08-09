@@ -216,34 +216,6 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     )
 
 
-def shuffle_weight_a16wi4(w_qt_i8: torch.Tensor) -> torch.Tensor:
-    """Preshuffle a signed-int4 weight for the FlyDSL a16wi4 (bf16 A x int4 W) kernel.
-
-    Input: ``w_qt_i8`` ``[..., N, K]`` int8 container holding signed int4 values in
-    ``[-7, 7]`` (the :func:`aiter.ops.quant.per_1x32_i4_quant` weight output).
-
-    Output: the FlyDSL a16wi4 kernel weight layout as ``float4_e2m1fn_x2`` (``[..., N,
-    K//2]``, 2 nibbles/byte): contiguous 2-nibble packing (``low = even K, high = odd
-    K``, matching the kernel's ``_int4_nibble_to_bf16x8`` upconvert) followed by
-    EXACTLY the a16w4 (mxfp4) weight shuffle. a16w4 and a16wi4 are the same kernel
-    (``moe_2stage_a16wmix``, ``w_layout="standard"``) differing only in ``w_dtype``, so
-    their weight layouts must stay in lockstep -- hence the delegation rather than a
-    duplicated ``shuffle_weight`` call. ``gate_up=False`` is the non-interleaved (GGUU,
-    N-major) form, which is what ``w_layout="standard"`` consumes; the ``gate_up=True``
-    GUGU form is the fp8 stage1 layout and is NOT used here.
-
-    Note: this is a FlyDSL-backend layout, NOT byte-identical to aiter's CK int4
-    packing (``pack_int8_to_packed_int4`` + ``shuffle_weight`` on the int8, which is
-    kpack=8 for the old int4_bf16 kernel). Prepare weights with this helper when
-    dispatching a16wi4 to the FlyDSL 2-stage MoE.
-    """
-    from aiter.utility.fp4_utils import pack_uint4
-
-    u = (w_qt_i8.to(torch.int16) & 0xF).to(torch.uint8).contiguous()
-    packed = pack_uint4(u)  # [..., N, K//2] uint8
-    return shuffle_weight_a16w4(packed.view(torch.float4_e2m1fn_x2), 16, False)
-
-
 def shuffle_weight_NK(
     x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False
 ) -> torch.Tensor:

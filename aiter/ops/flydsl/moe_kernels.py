@@ -612,7 +612,8 @@ def compile_flydsl_moe_stage1(
     # (moe_2stage_a16wmix), consuming the standard GGUU W1+scale layout
     # (w_layout="standard"), matching main. a16wi4 shares this compile entry so AOT
     # builds the same kernel the runtime early-return launches; its W1 is the
-    # FlyDSL-native int4 prep (shuffle_weight_a16wi4) + (E,N,G//2,2) bf16 scale.
+    # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
+    # (E,G//2,N,2) bf16 scale.
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         from flydsl.runtime.device import get_rocm_arch
 
@@ -701,7 +702,7 @@ def compile_flydsl_moe_stage2(
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
     # (moe_2stage_a16wmix); its gate_up=False W2+scale layout matches the standard
-    # shuffle_weight/e8m0 (a16wi4: shuffle_weight_a16wi4 + bf16 groupwise scale).
+    # shuffle_weight/e8m0 (a16wi4: pack_int8_to_packed_int4(shuffle_weight) + bf16 scale).
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         from flydsl.runtime.device import get_rocm_arch
 
@@ -1453,7 +1454,8 @@ def _flydsl_moe_stage1_impl(
     # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName;
     # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel). Both
     # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
-    # FlyDSL-native int4 prep (shuffle_weight_a16wi4) + (E,N,G//2,2) bf16 scale.
+    # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
+    # (E,G//2,N,2) bf16 scale.
     _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
@@ -1937,8 +1939,8 @@ def _flydsl_moe_stage2_impl(
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4): ported gemm2 atomic-scatters
         # into the caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like
-        # a4w4/a8w4). a16wi4 W2 uses the FlyDSL-native int4 layout (shuffle_weight_a16wi4)
-        # + (E,N,G//2,2) bf16 scale.
+        # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
+        # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
 
         E = w2.shape[0]

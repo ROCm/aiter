@@ -42,11 +42,11 @@ except ModuleNotFoundError as e:
 
 
 from aiter.ops.shuffle import (
+    pack_int8_to_packed_int4,
     shuffle_scale_a16w4,
     shuffle_scale_for_int4,
     shuffle_weight,
     shuffle_weight_a16w4,
-    shuffle_weight_a16wi4,
 )
 
 logger = logging.getLogger(__name__)
@@ -294,20 +294,24 @@ def test_fmoe(
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
-        # FlyDSL a16w-mix port layout: shuffle_weight_a16wi4 (kpack=16, shared with the
-        # mxfp4 a16w4 kernel) + (E,N,G//2,2) bf16 scale. NOT the CK int4 kpack=8 layout.
+        # a16wi4 consumes the OLD FlyDSL int4 kernel's preshuffle (the kernel this PR
+        # replaces): pack_int8_to_packed_int4(shuffle_weight(w.i8, (16,16))) kpack=8 +
+        # shuffle_scale_for_int4 (E,G//2,N,2). Caller contract is byte-identical to the
+        # replaced kernel -> drop-in, no model/serving change.
         w1_qt_aiter = (
-            shuffle_weight_a16wi4(w1_qt_aiter.view(dtypes.i8))
+            pack_int8_to_packed_int4(
+                shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
+            )
             .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             .view(dtypes.i4x2)
         )
         w2_qt_aiter = (
-            shuffle_weight_a16wi4(w2_qt_aiter.view(dtypes.i8))
+            pack_int8_to_packed_int4(
+                shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
+            )
             .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
             .view(dtypes.i4x2)
         )
-        # groupwise scale: [E, K//32, N] bf16 -> (E, G//2, N, 2) (OLD-kernel layout,
-        # coalesced N-major gather in the port kernel).
         w1_scale_aiter = (
             shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
         )
