@@ -466,12 +466,10 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     b_dtype = "int4"
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
-    # small tile_n (with k_wave) is the decode config: it maximizes N-tile grid
-    # workgroups to fight wave-starvation (the port's answer to the old kernel's
-    # grid split-K, which the port lacks). tile_n=16 needs kw4 (n_per_wave>=16).
+    # A narrow tile_n (paired with k_wave) is the decode config: it maximizes the
+    # N-tile grid, which is the port's answer to the wave starvation the old kernel
+    # solved with grid split-K.
     tile_ns = [16, 32, 64, 128]
-    k_batches = [1, 2, 4, 7, 14]
-    b_nts = [0, 2]
 
     def _emit(tm, tn, tk, *, kb=1, kw=1, bnt=2):
         name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
@@ -499,23 +497,26 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
-                # legacy split-K names (k_batch ignored by the port) -- CSV compat.
-                for kb in k_batches:
-                    _emit(tm, tn, tk, kb=kb)
-                # kw1 cached (b_nt=0) variant: large-M weight reuse wants L2-cached
-                # loads (matches main's use_nt: cached for token*topk//E >= 64), vs the
-                # default nt/streaming; the base kw1 name is nt (b_nt=2).
-                _emit(tm, tn, tk, bnt=0)
-                # k_wave (intra-block K-slice): the port's decode/wave-starvation
-                # lever. The kernel splits the 4 waves into (4/kw) N-waves x kw
-                # K-waves, so each N-wave covers tn/(4/kw) cols and needs >=16 for
-                # the 16x16 MMA; kw>1 also needs 4*tn <= tk (K-slice fits the tile).
-                for kw in (2, 4):
+                # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
+                # each N-wave covers tn/(4/kw) cols and needs >= 16 for the 16x16 MMA
+                # (kw=1 therefore requires tn >= 64); kw > 1 additionally needs
+                # 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W loads)
+                # is registered alongside the default nt/streaming b_nt=2: large-M
+                # weight reuse wants cached, decode wants streamed.
+                for kw in (1, 2, 4):
                     num_n_waves = 4 // kw
-                    if tn % num_n_waves or tn // num_n_waves < 16 or 4 * tn > tk:
+                    if tn % num_n_waves or tn // num_n_waves < 16:
                         continue
-                    for bnt in b_nts:
+                    if kw > 1 and 4 * tn > tk:
+                        continue
+                    for bnt in (0, 2):
                         _emit(tm, tn, tk, kw=kw, bnt=bnt)
+                # Legacy grid-split-K names: k_batch is parsed but IGNORED by the
+                # port (it runs k_wave=1), and they only ever existed for the tile_n
+                # the old kernel supported. Kept so pre-existing tuned CSVs parse.
+                if tn >= 64:
+                    for kb in (2, 4, 7, 14):
+                        _emit(tm, tn, tk, kb=kb)
     return kernels
 
 
