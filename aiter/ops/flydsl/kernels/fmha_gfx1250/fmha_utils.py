@@ -546,10 +546,8 @@ def make_v2f32(lo, hi, bank=0):
 
 
 def split_v2f32(pair):
-    idx_0 = arith.constant(0, type=T.i32)
-    idx_1 = arith.constant(1, type=T.i32)
-    lo = llvm_dialect.extractelement(pair, idx_0)
-    hi = llvm_dialect.extractelement(pair, idx_1)
+    lo = Vec(pair, dtype=Float32)[0].ir_value()
+    hi = Vec(pair, dtype=Float32)[1].ir_value()
     return lo, hi
 
 
@@ -582,7 +580,7 @@ class Atom:
     @staticmethod
     def wmma_init(ty, src_a, src_b, bank_dst):
         sched_barrier(0)
-        zero = vector.broadcast(ty["v8f32"], arith.constant(0.0, type=T.f32))
+        zero = fx.constant_vector(0.0, T.vec(8, T.f32))
         result = rocdl_dialect.wmma_f32_16x16x32_bf16(
             ty["v8f32"], src_a, src_b, zero,
             signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
@@ -605,8 +603,7 @@ class Atom:
     @staticmethod
     def ds_load_b128(ty, addr, offset_val, bank):
         sched_barrier(0)
-        off = arith.constant(offset_val, type=T.i32)
-        ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + off))
+        ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
         raw = llvm_dialect.load(ty["v4i32"], ptr)
         banked = set_vgpr_bank(raw, bank)
         sched_barrier(0)
@@ -615,8 +612,7 @@ class Atom:
     @staticmethod
     def ds_load_tr16_b128(ty, addr, offset_val, bank):
         sched_barrier(0)
-        off = arith.constant(offset_val, type=T.i32)
-        ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + off))
+        ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
         raw = rocdl.ds_load_tr16_b128(ty["v8bf16"], ptr)
         banked = set_vgpr_bank(raw, bank)
         sched_barrier(0)
@@ -625,9 +621,8 @@ class Atom:
     @staticmethod
     def tdm_load(ty, s_g0, s_g1):
         sched_barrier(0)
-        zero_i32 = arith.constant(0, type=T.i32)
-        null_v4 = vector.broadcast(ty["v4i32"], zero_i32)
-        null_v8 = vector.broadcast(ty["v8i32"], zero_i32)
+        null_v4 = fx.constant_vector(0, T.vec(4, T.i32))
+        null_v8 = fx.constant_vector(0, T.vec(8, T.i32))
         rocdl.tensor_load_to_lds(s_g0, s_g1, null_v4, null_v4, null_v8, 0)
         sched_barrier(0)
 
@@ -1037,10 +1032,7 @@ class Softmax:
 
         def _get_sp(offset):
             if const_expr(sp_f32[offset] is None):
-                sp_f32[offset] = llvm_dialect.extractelement(
-                    sp_pairs[offset // 2],
-                    arith.constant(offset % 2, type=T.i32),
-                )
+                sp_f32[offset] = Vec(sp_pairs[offset // 2], dtype=Float32)[offset % 2].ir_value()
             return sp_f32[offset]
 
         # Phase 1: initial max3 per valid group (4 ops)
@@ -1337,13 +1329,10 @@ class Softmax:
             pairs = [None] * N_SP_PAIRS
             for su in range_constexpr(CNT_SU):
                 v8 = su_sp_tiles_list[su][msb][0]
+                v8w = Vec(v8, dtype=Float32)
                 for i in range_constexpr(4):
-                    lo = llvm_dialect.extractelement(
-                        v8, arith.constant(i * 2, type=T.i32)
-                    )
-                    hi = llvm_dialect.extractelement(
-                        v8, arith.constant(i * 2 + 1, type=T.i32)
-                    )
+                    lo = v8w[i * 2].ir_value()
+                    hi = v8w[i * 2 + 1].ir_value()
                     pair_idx = su * 4 + i
                     v2 = make_v2f32(lo, hi, bank=msb)
                     if const_expr(msb > 0):

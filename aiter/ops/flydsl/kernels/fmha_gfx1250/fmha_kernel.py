@@ -155,7 +155,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         def load_cu_seqlen_scalar(ptr_tensor, idx_i32):
             """Load cu_seqlens[idx] → SGPR (uniform across wavefront)."""
             base_i64 = ptr_base_i64(ptr_tensor)
-            byte_off_64 = arith.extsi(i64_ty, (idx_i32 * 4).ir_value())
+            byte_off_64 = fx.Int64(idx_i32 * 4)
             addr_ptr = llvm_dialect.inttoptr(gptr_ty, base_i64 + byte_off_64)
             return rocdl.readfirstlane(T.i32, llvm_dialect.load(i32_ty, addr_ptr))
 
@@ -269,10 +269,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             if valid_z:
                 elem_off_z = by * stride_o_head + q_tok_z * stride_o_seq
                 byte_off_z = elem_off_z * 2
-                byte_off_z64 = arith.extsi(i64z, byte_off_z.ir_value())
+                byte_off_z64 = fx.Int64(byte_off_z)
                 o_addr_z = o_base_z + byte_off_z64
                 for chunk_z in fx.range_constexpr(V_HDIM // 8):
-                    chunk_addr = o_addr_z + arith.extsi(i64z, arith.constant(chunk_z * 16, type=T.i32))
+                    chunk_addr = o_addr_z + fx.Int64(chunk_z * 16)
                     ptr_z = llvm_dialect.inttoptr(glbpz, chunk_addr)
                     llvm_dialect.store(zero_v4, ptr_z)
                 # LSE = -inf for seqlen_k==0 rows
@@ -282,7 +282,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     # lse layout: (total_q, nheads), elem_off = tok * nheads + head
                     lse_elem_z = q_tok_z * gdz + by
                     lse_byte_z = lse_elem_z * 4
-                    lse_byte_z64 = arith.extsi(i64z, lse_byte_z)
+                    lse_byte_z64 = fx.Int64(lse_byte_z)
                     lse_addr_z = lse_base_z + lse_byte_z64
                     lse_ptr_z = llvm_dialect.inttoptr(glbpz, lse_addr_z)
                     llvm_dialect.store(neg_inf_zl, lse_ptr_z)
@@ -1670,7 +1670,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             # elem_off = tok * nheads + head
                             lse_elem_off = lse_tok * gdz + by
                             lse_byte_off = lse_elem_off * 4
-                            lse_byte_off_i64 = arith.extsi(i64_lse, lse_byte_off)
+                            lse_byte_off_i64 = fx.Int64(lse_byte_off)
                             lse_addr = lse_base_i64 + lse_byte_off_i64
                             lse_ptr = llvm_dialect.inttoptr(glbpt_lse, lse_addr)
                             llvm_dialect.store(lse_vals[msb_lse], lse_ptr)
@@ -1731,7 +1731,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 o_elem_off = by * stride_o_head + o_tok * stride_o_seq
                 o64 = ptr_base_i64(ptr_O)
                 boff32 = o_elem_off * 2
-                boff64 = arith.extsi(i64t, boff32.ir_value())
+                boff64 = fx.Int64(boff32)
                 oadr64 = o64 + boff64
 
                 alo, ahi = split_i64_to_lo_hi(oadr64)
