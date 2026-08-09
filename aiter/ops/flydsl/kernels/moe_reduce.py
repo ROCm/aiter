@@ -139,6 +139,7 @@ def _moe_reduction_kernel(
     )
     thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
+
     def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
         w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)
         words = (w[0], w[0], w[1], w[1])
@@ -202,7 +203,7 @@ def _moe_reduction_kernel(
         _reduce_tile()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _reduction_kernel(block_size: int):
     return flyc.kernel(
         _moe_reduction_kernel,

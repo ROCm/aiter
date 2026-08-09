@@ -1950,9 +1950,7 @@ def _flydsl_v2_stage2_wrapper(
     _s2_fp8_inter = (
         epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
-    _defer_w = (
-        _s2_fp8_inter and sorted_weights is not None and topk_weights is not None
-    )
+    _defer_w = _s2_fp8_inter and sorted_weights is not None and topk_weights is not None
     if epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (

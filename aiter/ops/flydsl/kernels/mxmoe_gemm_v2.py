@@ -18,7 +18,6 @@ from flydsl.expr.typing import (
 from flydsl.expr.typing import Vector as Vec
 
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
-from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import (
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
@@ -32,7 +31,7 @@ from .mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
-
+from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
 STORE_CACHE_MODIFIER = 2
 

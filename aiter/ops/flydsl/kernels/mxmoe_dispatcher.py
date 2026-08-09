@@ -8,7 +8,6 @@ from contextlib import nullcontext as _nullcontext
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
@@ -21,6 +20,7 @@ from .mxmoe_gemm_v2 import (
     kStages,
 )
 from .tensor_shim import _run_compiled as run_compiled
+
 
 def _g2_hints_ctx():
     return _nullcontext()
