@@ -465,23 +465,6 @@ def shuffle_scale_a16w4(
     )
 
 
-def shuffle_scale_a16wi4(scale: torch.Tensor) -> torch.Tensor:
-    """Preshuffle a groupwise int4 scale for the FlyDSL a16wi4 kernel.
-
-    Input: ``scale`` ``[E, G, N]`` bf16 (the :func:`per_1x32_i4_quant` scale output,
-    ``G = K // 32`` groups). Output: ``(E, N, G//2, 2)`` bf16 -- N-major, two adjacent
-    groups packed into one dword (even/odd group -> low/high bf16), matching the
-    kernel's ``load_b_scale_int4`` addressing (``dword = n*(G//2) + group//2``).
-
-    This differs from :func:`shuffle_scale_for_int4` (the CK int4 layout
-    ``(E, G//2, N, 2)``); use this one for the FlyDSL a16wi4 path.
-    """
-    if scale.dtype != torch.bfloat16:
-        raise ValueError(f"a16wi4 scale must be bf16, got {scale.dtype}")
-    E, G, N = scale.shape
-    return scale.permute(0, 2, 1).contiguous().view(E, N, G // 2, 2).contiguous()
-
-
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
     """Pack a preshuffled int8 tensor (values in [-8, 7]) into packed int4 bytes.
 
