@@ -25,9 +25,21 @@ echo "=== AFTER (working tree) ==="; run /tmp/isa_after > /tmp/ab_after.txt; cat
 rm -rf "$TMP"
 
 echo "=== VERDICT ==="
+# A case that failed to compile, or produced no ISA at all, must never read as a
+# pass: comparing two empty hash lists would otherwise report IDENTICAL.
+if grep -q '^\[FAIL\]' /tmp/ab_before.txt /tmp/ab_after.txt; then
+  echo "INVALID - a case failed to compile; fix the harness before trusting a verdict"
+  grep -h '^\[FAIL\]' /tmp/ab_before.txt /tmp/ab_after.txt
+  exit 2
+fi
+n_before=$(grep -cE '^[0-9a-f]{16} ' /tmp/ab_before.txt)
+n_after=$(grep -cE '^[0-9a-f]{16} ' /tmp/ab_after.txt)
+if [ "$n_before" -eq 0 ] || [ "$n_after" -eq 0 ]; then
+  echo "INVALID - no ISA produced (before=$n_before after=$n_after)"; exit 2
+fi
 if diff -q <(grep -E '^[0-9a-f]{16} ' /tmp/ab_before.txt) \
            <(grep -E '^[0-9a-f]{16} ' /tmp/ab_after.txt) >/dev/null; then
-  echo "ISA IDENTICAL - migration is provably behaviour- and perf-neutral"
+  echo "ISA IDENTICAL across $n_after kernel(s) - provably behaviour- and perf-neutral"
 else
-  echo "ISA DIFFERS:"; diff <(cat /tmp/ab_before.txt) <(cat /tmp/ab_after.txt)
+  echo "ISA DIFFERS:"; diff /tmp/ab_before.txt /tmp/ab_after.txt
 fi
