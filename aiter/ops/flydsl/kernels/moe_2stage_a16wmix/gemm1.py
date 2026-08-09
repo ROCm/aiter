@@ -5,10 +5,12 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_dsl_value, as_ir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import _silu_mul_batch, _situ_mul_batch
@@ -595,7 +597,13 @@ def _gemm1_body_a16w4(
             for mi in range_constexpr(m_repeat)
         ]
 
-    def compute_tile(b_tile, a_frags):
+    def compute_tile(b_tile, a_frags, accs_gate=None, accs_up=None):
+        # accs_gate/accs_up default to the module-level rmem accumulators (unrolled /
+        # epilogue path); the rolled loop passes fresh per-iteration rmem tensors.
+        if accs_gate is None:
+            accs_gate = acc_gate
+        if accs_up is None:
+            accs_up = acc_up
         g_raw, u_raw, g_sc, u_sc = b_tile
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
@@ -605,8 +613,62 @@ def _gemm1_body_a16w4(
                 ub = upconvert_b(u_raw[ni], ku, _usc)
                 for mi in range_constexpr(m_repeat):
                     a8 = a_frags[mi][ku]
-                    _mma(acc_gate[mi][ni], a8, gb)
-                    _mma(acc_up[mi][ni], a8, ub)
+                    _mma(accs_gate[mi][ni], a8, gb)
+                    _mma(accs_up[mi][ni], a8, ub)
+
+    # ---- flatten/unflatten of a B-tile for scf.for loop-carried state ---------
+    # load_b_tile returns (g_raw, u_raw, g_sc, u_sc), each a list over ni (num_acc_n).
+    #   fp4/int4: raw[ni] = list[_k0_count] of list[4] i32; sc[ni] = list[k_unroll] f32.
+    #   bf16:     raw[ni] = list[k_unroll] of v8bf16 Vector; sc = None.
+    # Flat order: [g_raw...][u_raw...][g_sc...][u_sc...] (raw before scales).
+    def _flatten_b_tile(b_tile):
+        g_raw, u_raw, g_sc, u_sc = b_tile
+        flat = []
+        for side_raw in (g_raw, u_raw):
+            for ni in range_constexpr(num_acc_n):
+                if const_expr(_is_bf16):
+                    flat.extend(side_raw[ni])  # k_unroll Vectors
+                else:
+                    for k0i in range_constexpr(_k0_count):
+                        flat.extend(side_raw[ni][k0i])  # 4 i32 each
+        if const_expr(not _is_bf16):
+            for side_sc in (g_sc, u_sc):
+                for ni in range_constexpr(num_acc_n):
+                    flat.extend(side_sc[ni])  # k_unroll f32
+        return flat
+
+    def _unflatten_b_tile(vals):
+        idx = [0]
+
+        def _take_raw():
+            side = []
+            for ni in range_constexpr(num_acc_n):
+                if const_expr(_is_bf16):
+                    side.append(list(vals[idx[0] : idx[0] + k_unroll]))
+                    idx[0] += k_unroll
+                else:
+                    k0_list = []
+                    for k0i in range_constexpr(_k0_count):
+                        k0_list.append(list(vals[idx[0] : idx[0] + 4]))
+                        idx[0] += 4
+                    side.append(k0_list)
+            return side
+
+        g_raw = _take_raw()
+        u_raw = _take_raw()
+        if const_expr(_is_bf16):
+            return (g_raw, u_raw, None, None)
+
+        def _take_sc():
+            side = []
+            for ni in range_constexpr(num_acc_n):
+                side.append(list(vals[idx[0] : idx[0] + k_unroll]))
+                idx[0] += k_unroll
+            return side
+
+        g_sc = _take_sc()
+        u_sc = _take_sc()
+        return (g_raw, u_raw, g_sc, u_sc)
 
     # ---- main K loop (ISA-aligned software pipeline) --------------------------
     # k-group global K base = wave_k_id * klen (0 at k_wave=1). Loop runs K_TILES_TOTAL.
@@ -623,25 +685,100 @@ def _gemm1_body_a16w4(
         compute_tile(b0, preload_a(0))
         gpu.barrier()
     else:
+        # ROLLED software pipeline (runtime scf.for). Same prefetch structure as the
+        # old unrolled body: B(kt+1) issued before compute(kt); A double-buffered LDS.
+        # Loop runs [0, K_TILES_TOTAL-1) carrying the prefetched B-tile and the
+        # accumulator VALUES (rmem tensor objects cannot cross an scf.for iteration);
+        # the final tile is computed as an epilogue after the loop.
         # prologue: tile-0 A DMA + B loads in flight.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
-        for kt in range_constexpr(K_TILES_TOTAL):
-            cur_slot = kt % A_LDS_STAGES
+
+        # flat loop-carried state: [acc_gate vecs][acc_up vecs][flattened b_cur]
+        _n_acc = m_repeat * num_acc_n
+
+        def _acc_to_vals(accs):
+            return [
+                fx.Vector(fx.memref_load_vec(accs[mi][ni]))
+                for mi in range_constexpr(m_repeat)
+                for ni in range_constexpr(num_acc_n)
+            ]
+
+        def _vals_to_acc(accs, vals):
+            i = 0
+            for mi in range_constexpr(m_repeat):
+                for ni in range_constexpr(num_acc_n):
+                    accs[mi][ni].store(vals[i])
+                    i += 1
+
+        def _fresh_accs(vals):
+            # Fresh per-iteration rmem tensors seeded from carried vectors. rmem objects
+            # cannot cross an scf.for boundary; the loop carries their VECTOR VALUES.
+            accs = [
+                [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(num_acc_n)]
+                for _ in range(m_repeat)
+            ]
+            _vals_to_acc(accs, vals)
+            return accs
+
+        init_state = (
+            _acc_to_vals(acc_gate) + _acc_to_vals(acc_up) + _flatten_b_tile(b_cur)
+        )
+
+        # Manual scf.for emission: this body function is NOT AST-transformed (only the
+        # @flyc.kernel entry is), so the range(..., init=) loop sugar is unavailable
+        # here -- emit the loop-carried scf.ForOp directly. iter_args carry the flat
+        # state as raw ir.Values; re-wrap to DSL values via init_state exemplars.
+        _lb = as_ir_value(fx.Index(0))
+        _ub = as_ir_value(fx.Index(K_TILES_TOTAL - 1))
+        _step = as_ir_value(fx.Index(1))
+        _init_ir = [as_ir_value(v) for v in init_state]
+        _for = scf.ForOp(_lb, _ub, _step, _init_ir)
+        with ir.InsertionPoint(_for.body):
+            iv = _for.induction_variable
+            state = [
+                as_dsl_value(a, ex)
+                for a, ex in zip(list(_for.inner_iter_args), init_state)
+            ]
+            _ag_vals = list(state[:_n_acc])
+            _au_vals = list(state[_n_acc : 2 * _n_acc])
+            _b_cur = _unflatten_b_tile(list(state[2 * _n_acc :]))
+
+            iv_i32 = fx.Int32(iv)
+            cur_slot = iv_i32 % fx.Int32(A_LDS_STAGES)
+            nxt_slot = (iv_i32 + fx.Int32(1)) % fx.Int32(A_LDS_STAGES)
             # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
             rocdl.s_waitcnt(lgkmcnt=0)
-            gpu.barrier()  # single barrier: A(kt) visible before ds_read
-            # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
-            # so they overlap the MFMA cluster.
+            gpu.barrier()  # single barrier: A(iv) visible before ds_read
             a_frags = preload_a(cur_slot)
-            if const_expr(kt + 1 < K_TILES_TOTAL):
-                dma_x_tile_to_lds(
-                    k_base + fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES
-                )
-                b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
-            compute_tile(b_cur, a_frags)
-            if const_expr(kt + 1 < K_TILES_TOTAL):
-                b_cur = b_nxt
+            # Prefetch NEXT tile's A-DMA + B/B-scale so they overlap the MFMA cluster.
+            nxt_k = k_base + (iv_i32 + fx.Int32(1)) * fx.Int32(TILE_K)
+            dma_x_tile_to_lds(nxt_k, slot=nxt_slot)
+            _b_nxt = load_b_tile(nxt_k)
+
+            _ag = _fresh_accs(_ag_vals)
+            _au = _fresh_accs(_au_vals)
+            compute_tile(_b_cur, a_frags, accs_gate=_ag, accs_up=_au)
+
+            _yield = _acc_to_vals(_ag) + _acc_to_vals(_au) + _flatten_b_tile(_b_nxt)
+            scf.YieldOp([as_ir_value(v) for v in _yield])
+
+        # After the loop: restore accs + the last prefetched B-tile from final results.
+        new_state = [
+            as_dsl_value(r, ex) for r, ex in zip(list(_for.results), init_state)
+        ]
+        _ag_final = list(new_state[:_n_acc])
+        _au_final = list(new_state[_n_acc : 2 * _n_acc])
+        b_cur = _unflatten_b_tile(list(new_state[2 * _n_acc :]))
+        _vals_to_acc(acc_gate, _ag_final)
+        _vals_to_acc(acc_up, _au_final)
+
+        # epilogue tile (kt == K_TILES_TOTAL-1): compute last B, no prefetch.
+        last_slot = fx.Int32(K_TILES_TOTAL - 1) % fx.Int32(A_LDS_STAGES)
+        rocdl.s_waitcnt(lgkmcnt=0)
+        gpu.barrier()
+        a_frags = preload_a(last_slot)
+        compute_tile(b_cur, a_frags)
 
     # ---- k_wave slice-K reduce (aiter mixed_moe LDS-reduce): each wave stores its
     # nm = num_acc_n*m_repeat vec4-f32 acc-slots to a per-wave LDS region, then sums its
