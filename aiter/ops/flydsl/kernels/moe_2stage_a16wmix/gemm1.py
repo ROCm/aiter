@@ -686,12 +686,37 @@ def _gemm1_body_a16w4(
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
+    elif const_expr(not _is_int4):
+        # mxfp4 (a16w4) / bf16 (a16w16): KEEP the fully-unrolled range_constexpr body
+        # BYTE-IDENTICAL to the shipped/tuned PR#4502 kernel. The rolled scf.for below
+        # is int4-ONLY (a16wi4 decode) -- rolling regresses the mxfp4 mainloop (+5% at
+        # tok16), so a16w4 must not take it. Two mainloop variants is the correct trade
+        # (least change to the already-tuned a16w4 path).
+        dma_x_tile_to_lds(k_base, slot=0)
+        b_cur = load_b_tile(k_base)
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()  # single barrier: A(kt) visible before ds_read
+            # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
+            # so they overlap the MFMA cluster.
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                dma_x_tile_to_lds(
+                    k_base + fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES
+                )
+                b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
+            compute_tile(b_cur, a_frags)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                b_cur = b_nxt
     else:
-        # ROLLED software pipeline (runtime scf.for). Same prefetch structure as the
-        # old unrolled body: B(kt+1) issued before compute(kt); A double-buffered LDS.
-        # Loop runs [0, K_TILES_TOTAL-1) carrying the prefetched B-tile and the
-        # accumulator VALUES (rmem tensor objects cannot cross an scf.for iteration);
-        # the final tile is computed as an epilogue after the loop.
+        # int4 (a16wi4): ROLLED software pipeline (runtime scf.for). Same prefetch
+        # structure as the unrolled body: B(kt+1) issued before compute(kt); A
+        # double-buffered LDS. Loop runs [0, K_TILES_TOTAL-1) carrying the prefetched
+        # B-tile and the accumulator VALUES (rmem tensor objects cannot cross an
+        # scf.for iteration); the final tile is an epilogue after the loop. Rolling the
+        # ~12.7K-line unrolled body to ~2.2K cuts small-M GRBM/SQ_BUSY ~2x (see commit).
         # prologue: tile-0 A DMA + B loads in flight.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
