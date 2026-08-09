@@ -579,6 +579,53 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp8_w8a8(out_dtype: str) -> dict[str, dict]:
+    """Return per-token activation / per-tensor weight FP8 stage1 configs."""
+    kernels = {}
+    for tm in (16, 32, 64, 96, 128):
+        for tn in (64, 128, 256):
+            for tk in (64, 128, 256, 512):
+                name = flydsl_kernel_name(1, "fp8", "fp8_w8a8", out_dtype, tm, tn, tk)
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": "fp8_w8a8",
+                    "b_dtype": "fp8_w8a8",
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "MPerBlock": tm,
+                    "in_dtype": "fp8",
+                    "k_batch": 1,
+                }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp8_w8a8(out_dtype: str) -> dict[str, dict]:
+    """Return per-token activation / per-tensor weight FP8 stage2 configs."""
+    kernels = {}
+    for tm in (16, 32, 64, 96, 128):
+        for tn in (64, 128, 256):
+            for tk in (64, 128, 256):
+                for mode in ("atomic",):
+                    name = flydsl_kernel_name(
+                        2, "fp8", "fp8_w8a8", out_dtype, tm, tn, tk, mode
+                    )
+                    kernels[name] = {
+                        "stage": 2,
+                        "a_dtype": "fp8_w8a8",
+                        "b_dtype": "fp8_w8a8",
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp8",
+                        "mode": mode,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -594,6 +641,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # fp8 w8a8 (per-tensor scale) configs
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp8_w8a8(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp8_w8a8(out))
 
 
 _register_all_configs()
@@ -690,6 +741,25 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
         )
+    if a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8":
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        # The direct epilogue supports bf16 output; CShuffle currently does not.
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=False,
+            k_batch=k_batch,
+            act=act,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -774,6 +844,22 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+        )
+    if a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8":
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
         )
     else:
         raise ValueError(
@@ -2126,8 +2212,7 @@ def _flydsl_moe_stage2_impl(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+    if a_dtype in ("fp8", "fp8_w8a8"):
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:

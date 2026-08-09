@@ -853,6 +853,7 @@ def _fused_moe_impl(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        swiglu_limit=swiglu_limit,
     )
 
     if _metadata_transform is not None:
@@ -2105,6 +2106,7 @@ def get_2stage_cfgs(
     is_ep=False,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
+    swiglu_limit=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2633,6 +2635,60 @@ def get_2stage_cfgs(
             0,
             False,
         )
+    # The heuristic below is validated only for the gfx942 MiniMax-M3 contract:
+    # bf16 output, separated preshuffled gate/up weights, no EP/bias, and the
+    # default SwiGLU clamp. Other layouts and architectures retain their
+    # existing fallback until they have dedicated correctness/performance data.
+    if (
+        gfx == "gfx942"
+        and dtype == dtypes.bf16
+        and q_type == QuantType.per_Token
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and activation == ActivationType.Swiglu
+        and use_g1u1
+        and opus_weights_shuffled
+        and gate_mode == GateMode.SEPARATED
+        and not doweight_stage1
+        and not is_ep
+        and not has_stage2_bias
+        and model_dim % 256 == 0
+        and inter_dim % 128 == 0
+        and (swiglu_limit is None or float(swiglu_limit) == 7.0)
+        and is_flydsl_available()
+    ):
+        _out_str = "bf16"
+        _tile_m = (
+            16 if token < 256 else 32 if token < 1024 else 64 if token < 2048 else 96
+        )
+        _tile_n = 128
+        _tile_k = 256
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(
+            1, "fp8", "fp8_w8a8", _out_str, _tile_m, _tile_n, _tile_k
+        )
+        kn2 = flydsl_kernel_name(
+            2, "fp8", "fp8_w8a8", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            0,
+            False,
+        )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
     # a16w4-SiTUv2 (bf16 A x mxfp4 W) -> ported 2-stage path; SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
@@ -2991,6 +3047,7 @@ def fused_moe_2stages(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        swiglu_limit=swiglu_limit,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
