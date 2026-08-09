@@ -283,6 +283,37 @@ Exotic LDS-order tensors are represented by contiguous backing buffers plus meta
 `as_strided` view never crosses a custom-op boundary; the final launch op reconstructs it while
 populating the kernarg.
 
+### Future MXFP6 K Fusion
+
+The production MXFP6 K path deliberately remains two stages:
+
+1. the native gfx950 kernel fuses normalized hd128 Hadamard rotation, E8M0 scale generation, and
+    dense E2M3 packing into 24-byte blocks;
+2. one Triton pass reorders those blocks into the compact 17,408-byte-per-tile K ABI and writes the
+    embedded scale tail.
+
+A future implementation may remove the dense intermediate and full reorder, but it must preserve
+the compact ABI exactly: 12,288 bytes of C0/C1 data, a 4,096-byte reserved region, and a 1,024-byte
+scale tail per 128-token tile. The promising design is a direct packer that owns one complete tile
+per program/workgroup, writes disjoint 16-byte C0 and 8-byte C1 segments, and emits each scale-tail
+dword from one owner. A Triton implementation that performs the normalized Hadamard in registers
+before the existing direct compact pack is the safest retry. An alternative is a native kernel that
+uses an intrinsic or store primitive capable of writing the six-dword FP6 result to two destinations
+without slicing a compiler vector.
+
+Do not retry (or be cautious) the rejected native implementation by splitting
+`__builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32` with element indexing, vector shuffles, temporary
+vectors, `memcpy`, or LDS reinterpret loads. Those variants could match the reference bytes on
+sampled tensors yet corrupted unrelated later allocations under allocator churn. Also do not write
+the shifted Region-B scale image with overlapping byte stores from multiple workgroups. Every
+formed source pointer must be in bounds; masking only the selected value is insufficient because
+the compiler may speculate an invalid padded-tail load.
+
+Promotion requires byte equality against `reorder_fp6_k_lds_order_triton` for compact data, scale
+tails, and valid scale bytes at sequence lengths `1, 127, 128, 129, 257`; guarded-allocation stress;
+the complete MHA v4 and xDiT mixed-attention suites in one process; compiled allocator churn; and
+repeated full Wan captures. Keep the contiguous raw-buffer custom-op ABI unchanged.
+
 Arbitrary code-object paths and symbols are not a production API. Kernel-development tools may
 retain a separate direct launcher.
 
