@@ -1951,18 +1951,20 @@ def _flydsl_v2_stage2_wrapper(
         epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
     _defer_w = (
-        _s2_fp8_inter
-        and sorted_weights is not None
-        and topk_weights is not None
-        and os.environ.get("MXFP4_G2_DEFER_WEIGHT", "1") == "1"
+        _s2_fp8_inter and sorted_weights is not None and topk_weights is not None
     )
     if epilog == "reduce":
         if _s2_fp8_inter:
-            if model_dim_runtime % 8 != 0:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+                FP8OUT_SCALE_BLK,
+                fp8out_row_bytes,
+            )
+
+            if model_dim_runtime % FP8OUT_SCALE_BLK != 0:
                 raise ValueError(
-                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
+                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
+                    f"by {FP8OUT_SCALE_BLK}"
                 )
-            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
 
             target = torch.empty(
                 (token_num * topk, fp8out_row_bytes(model_dim_runtime)),

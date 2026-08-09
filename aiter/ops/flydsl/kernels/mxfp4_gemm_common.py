@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-import os
-
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
@@ -217,44 +215,16 @@ def lds_acc_bytes_for(rows, BN):
     return rows * BN * 4
 
 
-def fp8out_pitch_align():
-    return int(os.environ.get("AITER_FP8OUT_PITCH_ALIGN", "0"))
+FP8OUT_SCALE_BLK = 32
+FP8OUT_PITCH_ALIGN = 64
 
 
-def fp8out_scale_blk():
-    v = int(os.environ.get("AITER_G2_SCALE_BLK", "32"))
-    if v not in (8, 32):
-        raise ValueError(f"AITER_G2_SCALE_BLK must be 8 or 32, got {v}")
-    return v
-
-
-def fp8out_elem_bits():
-    # fp6 route-out additionally needs an fp6-aware topk reduction.
-    v = int(os.environ.get("AITER_G2_ELEM_BITS", "8"))
-    if v != 8:
+def fp8out_row_bytes(model_dim):
+    model_dim = int(model_dim)
+    if model_dim % FP8OUT_SCALE_BLK:
         raise ValueError(
-            f"AITER_G2_ELEM_BITS must be 8 (moe_reduce.py assumes it), got {v}"
+            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK}"
         )
-    return v
-
-
-def fp8out_row_bytes(model_dim, align=None, scale_blk=None, elem_bits=None):
-    if scale_blk is None:
-        scale_blk = fp8out_scale_blk()
-    scale_blk = int(scale_blk)
-    if elem_bits is None:
-        elem_bits = fp8out_elem_bits()
-    elem_bits = int(elem_bits)
-    if (int(model_dim) * elem_bits) % 8 != 0:
-        raise ValueError(
-            f"model_dim {model_dim} x {elem_bits} bits is not byte-aligned"
-        )
-    pitch = int(model_dim) * elem_bits // 8 + int(model_dim) // scale_blk
-    if align is None:
-        align = fp8out_pitch_align()
-    align = int(align)
-    if align == 0 and scale_blk != 8:
-        align = 64
-    if align > 0:
-        pitch = ((pitch + align - 1) // align) * align
-    return pitch
+    pitch = model_dim + model_dim // FP8OUT_SCALE_BLK
+    align = FP8OUT_PITCH_ALIGN
+    return ((pitch + align - 1) // align) * align

@@ -18,27 +18,25 @@ contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
-from .mxfp4_gemm_common import fp8out_row_bytes, fp8out_scale_blk
+from .mxfp4_gemm_common import FP8OUT_SCALE_BLK, fp8out_row_bytes
 
 BLOCK = 256
+MAX_BLOCK = 1024  # AMDGPU workgroup limit
+WAVE = 64
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
 def _reduce_block(model_dim, V):
     exact = model_dim // V
-    default = (
-        exact
-        if (model_dim % V == 0 and exact % 64 == 0 and 0 < exact <= 1024)
-        else BLOCK
-    )
-    return int(os.environ.get("AITER_MOE_REDUCE_BLOCK", default))
+    if model_dim % V or exact % WAVE or not 0 < exact <= MAX_BLOCK:
+        return BLOCK
+    return exact
 
 
 def _moe_reduction_kernel(
@@ -237,13 +235,12 @@ def compile_moe_reduction(
     out_tag = out_dtype_str or dtype_str
     kern = _reduction_kernel(block)
     if dtype_str == "fp8":
-        scale_blk = fp8out_scale_blk()
-        if scale_blk % FP8_VEC:
+        if FP8OUT_SCALE_BLK % FP8_VEC:
             raise ValueError(
-                f"scale_blk {scale_blk} must be a multiple of {FP8_VEC} so one "
-                "reduction thread's values share a single e8m0 scale"
+                f"scale_blk {FP8OUT_SCALE_BLK} must be a multiple of {FP8_VEC}"
             )
-        fp8_row_stride = fp8out_row_bytes(model_dim, scale_blk=scale_blk)
+        scale_blk = FP8OUT_SCALE_BLK
+        fp8_row_stride = fp8out_row_bytes(model_dim)
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 

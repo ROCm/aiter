@@ -22,17 +22,8 @@ from .mxmoe_gemm_v2 import (
 )
 from .tensor_shim import _run_compiled as run_compiled
 
-_G2_WPE = int(os.environ.get("MXFP4_G2_WPE", "0"))
-
-_G2_PERSIST_N = os.environ.get("MXFP4_G2_PERSIST_N", "0") == "1"
-
-
 def _g2_hints_ctx():
-    if _G2_WPE <= 0:
-        return _nullcontext()
-    from flydsl.compiler.kernel_function import CompilationContext
-
-    return CompilationContext.compile_hints({"waves_per_eu": _G2_WPE})
+    return _nullcontext()
 
 
 __all__ = [
@@ -159,27 +150,18 @@ def compile_gemm2_a4w4_port(
     if out_dtype not in ("bf16", "fp8"):
         raise AssertionError(f"out_dtype must be 'bf16' or 'fp8', got {out_dtype!r}")
     route_out_fp8 = out_dtype == "fp8"
-    if g2_scale_blk is None:
-        from .mxfp4_gemm_common import fp8out_scale_blk
+    from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
-        g2_scale_blk = fp8out_scale_blk()
-    g2_scale_blk = int(g2_scale_blk)
-    if g2_out_pitch_align is None:
-        from .mxfp4_gemm_common import fp8out_pitch_align
-
-        g2_out_pitch_align = fp8out_pitch_align()
-    g2_out_pitch_align = int(g2_out_pitch_align)
-    if g2_out_pitch_align == 0 and g2_scale_blk != 8:
-        g2_out_pitch_align = 64
+    g2_scale_blk = int(FP8OUT_SCALE_BLK if g2_scale_blk is None else g2_scale_blk)
+    g2_out_pitch_align = int(
+        FP8OUT_PITCH_ALIGN if g2_out_pitch_align is None else g2_out_pitch_align
+    )
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
     if g2_kstages is None:
         g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     if g2_kstages not in (1, 2):
         raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
-    _nt_force = os.environ.get("AITER_G2_NT", "")
-    if _nt_force:
-        use_nt = _nt_force == "1"
     if g2_bhoist is None:
         g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_bhoist = bool(g2_bhoist)
@@ -188,9 +170,6 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf = bool(g2_ascale_pf)
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    _spart_force = os.environ.get("MXFP4_G2_SPART_FORCE", "")
-    if _spart_force:
-        g2_spart = int(_spart_force)
     g2_spart = int(g2_spart)
     g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
@@ -210,23 +189,23 @@ def compile_gemm2_a4w4_port(
     aStages = 2 if g2_bf16_lds else 3
     _k_tiles_max = INTER_MAX // BK
     if g2_c_pad is None:
-        g2_c_pad = int(os.environ.get("MXFP4_G2_CPAD", "0"))
+        g2_c_pad = 0
     g2_c_pad = int(g2_c_pad)
     if g2_c_pad < 0:
         raise AssertionError(f"g2_c_pad must be >= 0, got {g2_c_pad}")
     if g2_c_split is None:
-        g2_c_split = int(os.environ.get("MXFP4_G2_CSPLIT", "1"))
+        g2_c_split = 1
     g2_c_split = max(1, int(g2_c_split))
     if BM % g2_c_split or (BM // g2_c_split) % 16 or (BM // 8) % g2_c_split:
         g2_c_split = 1
     if g2_defer_weight is None:
-        g2_defer_weight = os.environ.get("MXFP4_G2_DEFER_WEIGHT", "0") == "1"
+        g2_defer_weight = False
     g2_defer_weight = bool(g2_defer_weight)
     if epilog != "reduce":
         g2_defer_weight = False
     c_lds_bytes = BM * (BN + g2_c_pad) * (2 if g2_bf16_lds else 4) // g2_c_split
     if g2_c_disjoint is None:
-        g2_c_disjoint = os.environ.get("MXFP4_G2_CDISJOINT", "0") == "1"
+        g2_c_disjoint = False
     g2_c_disjoint = bool(g2_c_disjoint)
     lds_bytes = (
         aStages * slot_bytes + c_lds_bytes
@@ -252,8 +231,6 @@ def compile_gemm2_a4w4_port(
             "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
         )
     persist_tag = "" if not persist else f"_persist_cu{cu_num}"
-    persist_n = bool(_G2_PERSIST_N)
-    pn_tag = "_pn" if persist_n else ""
     pad_tag = (
         "_pad" if has_pad else ""
     )  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
@@ -261,44 +238,13 @@ def compile_gemm2_a4w4_port(
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
-    g2_nmajor = os.environ.get("AITER_G2_NMAJOR", "0") == "1" and g2_m01 == 1
-    nmaj_tag = "_nmaj" if g2_nmajor else ""
-    g2_xcdsw = int(os.environ.get("AITER_G2_XCDSW", "0"))
-    xcdsw_tag = f"_xcdsw{g2_xcdsw}" if g2_xcdsw > 1 else ""
-    g2_mbhost = int(os.environ.get("AITER_G2_MBHOST", "0")) > 0 and g2_spart > 0
-    mbhost_tag = "_mbhost" if g2_mbhost else ""
-    g2_kapre = int(os.environ.get("AITER_G2_KAPRE", "0"))
-    kapre_tag = f"_kapre{g2_kapre}" if g2_kapre > 0 else ""
-    g2_nfuse = int(os.environ.get("MXFP4_G2_NFUSE", "1"))
-    if g2_nfuse > 1 and (persist or persist_n or g2_spart <= 0):
-        raise AssertionError("MXFP4_G2_NFUSE>1 requires the one-shot spart path")
-    nf_tag = f"_nf{g2_nfuse}" if g2_nfuse > 1 else ""
-
-    g2_mfuse = int(os.environ.get("MXFP4_G2_MFUSE", "1"))
-    if g2_mfuse > 1 and (persist or persist_n or g2_spart <= 0 or g2_nfuse > 1):
-        raise AssertionError(
-            "MXFP4_G2_MFUSE>1 requires the one-shot spart path and NFUSE=1"
-        )
-    mf_tag = f"_mf{g2_mfuse}" if g2_mfuse > 1 else ""
-
-    g2_pipe_a = os.environ.get("AITER_G2_PIPE_A", "0") == "1"
-    if g2_pipe_a and g2_nfuse <= 1 and g2_mfuse <= 1:
-        raise AssertionError(
-            "AITER_G2_PIPE_A=1 needs MXFP4_G2_NFUSE>1 or MXFP4_G2_MFUSE>1 (nothing to pipeline into)"
-        )
-    if g2_pipe_a and not g2_c_disjoint:
-        raise AssertionError(
-            "AITER_G2_PIPE_A=1 needs g2_c_disjoint (C would alias the A ring)"
-        )
-    pipea_tag = "_pipea" if g2_pipe_a else ""
-
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
     cdj_tag = "_cdj" if g2_c_disjoint else ""
     cpad_tag = f"_cpad{g2_c_pad}" if g2_c_pad else ""
     csplit_tag = f"_cs{g2_c_split}" if g2_c_split > 1 else ""
     dw_tag = "_dw" if g2_defer_weight else ""
     if g2_kstatic is None:
-        g2_kstatic = os.environ.get("AITER_G2_KSTATIC", "1") == "1"
+        g2_kstatic = True
     g2_kstatic = bool(g2_kstatic)
     kst_tag = "_kst" if g2_kstatic else ""
     g2_apreload = kStages
@@ -308,15 +254,9 @@ def compile_gemm2_a4w4_port(
         f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
     )
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
-    from .mxfp4_gemm_common import fp8out_elem_bits as _g2_elem_bits_fn
-
-    _g2_ebits = _g2_elem_bits_fn()
-    ebits_tag = f"_e{_g2_ebits}" if (route_out_fp8 and _g2_ebits != 8) else ""
-    if _g2_ebits != 8 and os.environ.get("AITER_G2_E6_ASM", "1") != "1":
-        ebits_tag += "_noasm"
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pn_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{nmaj_tag}{xcdsw_tag}{mbhost_tag}{kapre_tag}{nf_tag}{mf_tag}{pipea_tag}{bf16lds_tag}{cdj_tag}{cpad_tag}{csplit_tag}{dw_tag}{kst_tag}{apre_tag}{pitch_tag}{sblk_tag}{ebits_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{cdj_tag}{cpad_tag}{csplit_tag}{dw_tag}{kst_tag}{apre_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -419,33 +359,7 @@ def compile_gemm2_a4w4_port(
                 pipe_next=pipe_next,
             )
 
-        if const_expr(persist_n):
-            pn_m_block = bx_i32
-            issue_all_a_loads(pn_m_block * fx.Int32(BM))
-            rocdl.sched_barrier(0)
-
-            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
-
-            if fx.Int32(pn_m_block) < total_m_blocks:
-                eids_p = global_typed_ptr(arg_eids, T.i32)
-                if const_expr(SBM == BM):
-                    e_hoist = rocdl.readfirstlane(T.i32, _raw(eids_p[pn_m_block]))
-                else:
-                    e_hoist = rocdl.readfirstlane(
-                        T.i32,
-                        _raw(eids_p[_udiv(pn_m_block * fx.Int32(BM), fx.Int32(SBM))]),
-                    )
-                for _n in range(fx.Int32(0), fx.Int32(num_n_blocks), fx.Int32(1)):
-                    run_unit(
-                        fx.Int32(0),
-                        mn_idx=(pn_m_block, fx.Int32(_n)),
-                        e_idx=e_hoist,
-                    )
-                    gpu.barrier()
-                    issue_all_a_loads(pn_m_block * fx.Int32(BM))
-                    rocdl.sched_barrier(0)
-        elif const_expr(not persist and g2_spart <= 0):
+        if const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
             issue_all_a_loads(_udiv(bx_i32, num_n_blocks) * fx.Int32(BM))
             rocdl.sched_barrier(0)
@@ -456,113 +370,6 @@ def compile_gemm2_a4w4_port(
 
             if fx.Int32(bx_i32) < bound:
                 run_unit(bx_i32)
-        elif const_expr(not persist and g2_nfuse > 1):
-            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
-            n_groups = _udiv(num_n_blocks + fx.Int32(g2_nfuse - 1), g2_nfuse)
-
-            if fx.Int32(bx_i32) < total_m_blocks * n_groups:
-                m_block_idx, n_group = _spart_output_tile_index(
-                    bx_i32, total_m_blocks, n_groups, g2_group_num, g2_m01
-                )
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-                eids_p = global_typed_ptr(arg_eids, T.i32)
-                if const_expr(SBM == BM):
-                    e_hoist = rocdl.readfirstlane(T.i32, _raw(eids_p[m_block_idx]))
-                else:
-                    e_hoist = rocdl.readfirstlane(
-                        T.i32,
-                        _raw(eids_p[_udiv(m_block_idx * fx.Int32(BM), fx.Int32(SBM))]),
-                    )
-                n_base = n_group * fx.Int32(g2_nfuse)
-
-                def _reload_a():
-                    gpu.barrier()
-                    issue_all_a_loads(m_block_idx * fx.Int32(BM))
-                    rocdl.sched_barrier(0)
-
-                for _i in range_constexpr(g2_nfuse):
-                    n_block_idx = n_base + fx.Int32(_i)
-                    _has_next = const_expr(_i + 1 < g2_nfuse)
-                    if n_block_idx < num_n_blocks:
-                        run_unit(
-                            m_block_idx * fx.Int32(num_n_blocks) + n_block_idx,
-                            mn_idx=(m_block_idx, n_block_idx),
-                            e_idx=e_hoist,
-                            pipe_next=(
-                                _reload_a if (_has_next and g2_pipe_a) else None
-                            ),
-                        )
-                    if const_expr(_has_next and not g2_pipe_a):
-                        _reload_a()
-        elif const_expr(not persist and g2_mfuse > 1):
-            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
-            m_groups = _udiv(
-                total_m_blocks + fx.Int32(g2_mfuse - 1), fx.Int32(g2_mfuse)
-            )
-            mf_bound = m_groups * num_n_blocks
-
-            if fx.Int32(bx_i32) < mf_bound:
-                mf_bx = (
-                    _xcd_unswizzle(bx_i32, mf_bound, g2_xcdsw)
-                    if const_expr(g2_xcdsw > 1)
-                    else bx_i32
-                )
-                mf_group, mf_n_block = _spart_output_tile_index(
-                    mf_bx,
-                    m_groups,
-                    num_n_blocks,
-                    g2_group_num,
-                    g2_m01,
-                    nmajor=g2_nmajor,
-                )
-                mf_base = mf_group * fx.Int32(g2_mfuse)
-                issue_all_a_loads(mf_base * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-
-                _mf_next_m = mf_base
-                if const_expr(g2_pipe_a):
-
-                    def _mf_pipe():
-                        gpu.barrier()
-                        issue_all_a_loads(_mf_next_m * fx.Int32(BM))
-                        rocdl.sched_barrier(0)
-
-                for _j in range_constexpr(g2_mfuse):
-                    mf_m_block = mf_base + fx.Int32(_j)
-                    _mf_has_next = const_expr(_j + 1 < g2_mfuse)
-                    _mf_next_m = mf_base + fx.Int32(_j + 1)
-                    if mf_m_block < total_m_blocks:
-                        run_unit(
-                            mf_m_block * num_n_blocks + mf_n_block,
-                            mn_idx=(mf_m_block, mf_n_block),
-                            pipe_next=(
-                                _mf_pipe if (_mf_has_next and g2_pipe_a) else None
-                            ),
-                        )
-                    if const_expr(_mf_has_next and not g2_pipe_a):
-                        gpu.barrier()
-                        issue_all_a_loads((mf_base + fx.Int32(_j + 1)) * fx.Int32(BM))
-                        rocdl.sched_barrier(0)
-        elif const_expr(not persist and g2_mbhost):
-            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            mbh_m, mbh_n = _spart_output_tile_index(
-                bx_i32,
-                i32_grid_blocks,
-                num_n_blocks,
-                g2_group_num,
-                g2_m01,
-                nmajor=g2_nmajor,
-            )
-            issue_all_a_loads(mbh_m * fx.Int32(BM))
-            rocdl.sched_barrier(0)
-            if mbh_m < _udiv(cumsum0, BM):
-                run_unit(
-                    mbh_m * fx.Int32(num_n_blocks) + mbh_n,
-                    mn_idx=(mbh_m, mbh_n),
-                )
         elif const_expr(not persist):
             # One-shot with spatial-partitioner remap (g2_spart>0): needs M0=total_m_blocks so cumsum is read FIRST.
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
@@ -570,18 +377,12 @@ def compile_gemm2_a4w4_port(
             bound = total_m_blocks * fx.Int32(num_n_blocks)
 
             if fx.Int32(bx_i32) < bound:
-                spart_bx = (
-                    _xcd_unswizzle(bx_i32, bound, g2_xcdsw)
-                    if const_expr(g2_xcdsw > 1)
-                    else bx_i32
-                )
                 m_block_idx, n_block_idx = _spart_output_tile_index(
-                    spart_bx,
+                    bx_i32,
                     total_m_blocks,
                     num_n_blocks,
                     g2_group_num,
                     g2_m01,
-                    nmajor=g2_nmajor,
                 )
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
                 issue_all_a_loads(m_block_idx * fx.Int32(BM))
@@ -683,22 +484,7 @@ def compile_gemm2_a4w4_port(
     ):
         # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
         num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
-        if const_expr(persist_n):
-            grid_x = i32_grid_blocks
-        elif const_expr(g2_nfuse > 1):
-            grid_x = i32_grid_blocks * fx.Int32(
-                fx.Uint32(num_n_blocks + fx.Int32(g2_nfuse - 1)) // fx.Uint32(g2_nfuse)
-            )
-        elif const_expr(g2_mfuse > 1):
-            grid_x = (
-                fx.Int32(
-                    fx.Uint32(i32_grid_blocks + fx.Int32(g2_mfuse - 1))
-                    // fx.Uint32(g2_mfuse)
-                )
-                * num_n_blocks
-            )
-        else:
-            grid_x = i32_grid_blocks * num_n_blocks
+        grid_x = i32_grid_blocks * num_n_blocks
         gemm2_kernel(
             arg_aq,
             arg_ascale,
@@ -718,11 +504,6 @@ def compile_gemm2_a4w4_port(
             arg_out_scale,
             i32_grid_blocks,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
-
-    if g2_kapre > 0:
-        launch_gemm2.compile_hints["llvm_options"] = {
-            "amdgpu-kernarg-preload-count": g2_kapre,
-        }
 
     return launch_gemm2
 
@@ -759,43 +540,30 @@ def get_g2(
     topk_key = topk if epilog == "reduce" else 1
     cu_key = cu_num if persist else 0
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
-    _nt_force = os.environ.get("AITER_G2_NT", "")
-    if _nt_force:
-        use_nt = _nt_force == "1"
-    g2_nfuse = int(os.environ.get("MXFP4_G2_NFUSE", "1"))
-    g2_mfuse = int(os.environ.get("MXFP4_G2_MFUSE", "1"))
-    g2_xcdsw = int(os.environ.get("AITER_G2_XCDSW", "0"))
-    g2_mbhost = int(os.environ.get("AITER_G2_MBHOST", "0"))
-    g2_kapre = int(os.environ.get("AITER_G2_KAPRE", "0"))
     g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    _spart_force = os.environ.get("MXFP4_G2_SPART_FORCE", "")
-    if _spart_force:
-        g2_spart = int(_spart_force)
     g2_spart = int(g2_spart)
     if g2_bf16_lds is None:
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
-    g2_c_disjoint = os.environ.get("MXFP4_G2_CDISJOINT", "0") == "1"
-    g2_c_pad = int(os.environ.get("MXFP4_G2_CPAD", "0"))
+    g2_c_disjoint = False
+    g2_c_pad = 0
     if g2_c_split is None:
-        g2_c_split = int(os.environ.get("MXFP4_G2_CSPLIT", "1"))
+        g2_c_split = 1
     g2_c_split = int(g2_c_split)
     if g2_defer_weight is None:
-        g2_defer_weight = os.environ.get("MXFP4_G2_DEFER_WEIGHT", "0") == "1"
+        g2_defer_weight = False
     g2_defer_weight = bool(g2_defer_weight) and epilog == "reduce"
     if g2_kstatic is None:
-        g2_kstatic = os.environ.get("AITER_G2_KSTATIC", "1") == "1"
+        g2_kstatic = True
     g2_kstatic = bool(g2_kstatic)
-    from .mxfp4_gemm_common import fp8out_pitch_align
+    from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
-    from .mxfp4_gemm_common import fp8out_scale_blk
-
-    g2_out_pitch_align = fp8out_pitch_align()
-    g2_scale_blk = fp8out_scale_blk()
+    g2_out_pitch_align = FP8OUT_PITCH_ALIGN
+    g2_scale_blk = FP8OUT_SCALE_BLK
     key = (
         BM,
         BN,
@@ -814,11 +582,6 @@ def get_g2(
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
-        g2_xcdsw,
-        g2_mbhost,
-        g2_kapre,
-        g2_nfuse,
-        g2_mfuse,
         g2_bf16_lds,
         g2_c_disjoint,
         g2_c_pad,
@@ -929,7 +692,7 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
-    _kstatic = os.environ.get("AITER_G2_KSTATIC", "1") == "1" and D_INTER % BK == 0
+    _kstatic = D_INTER % BK == 0
     if _kstatic:
         INTER_MAX = D_INTER
     launch = get_g2(
