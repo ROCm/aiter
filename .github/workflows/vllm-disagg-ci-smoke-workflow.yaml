@@ -138,7 +138,11 @@ jobs:
               mkdir -p aiter_overlay
               PIP_NO_INDEX=1 python3 -m pip install --no-deps \
                 --target aiter_overlay "${wheels[0]}"
-              (cd /tmp && PYTHONPATH=/workspace/aiter_overlay python3 -c "from pathlib import Path; import aiter; root = Path(\"/workspace/aiter_overlay\").resolve(); loaded = Path(aiter.__file__).resolve(); kernels = sorted((root / \"aiter\" / \"jit\").glob(\"*.so\")); print(f\"AITER overlay loaded from {loaded}\"); print(f\"Prebuilt AITER kernel modules: {len(kernels)}\"); assert root in loaded.parents, f\"AITER was not loaded from {root}\"; assert len(kernels) >= 10, f\"Expected at least 10 prebuilt kernel modules, found {len(kernels)}\"")
+              # Importing AITER calls get_gfx_runtime(), which intentionally
+              # probes rocminfo instead of honoring GPU_ARCHS. This build runner
+              # has no GPU, so validate the offline overlay structurally here;
+              # every MI350 case validates the actual import before vLLM starts.
+              python3 -c "from pathlib import Path; root = Path(\"/workspace/aiter_overlay\").resolve(); init = root / \"aiter\" / \"__init__.py\"; kernels = sorted((root / \"aiter\" / \"jit\").glob(\"*.so\")); print(f\"AITER overlay root: {root}\"); print(f\"Prebuilt AITER kernel modules: {len(kernels)}\"); assert init.is_file(), f\"Missing {init}\"; assert len(kernels) >= 10, f\"Expected at least 10 prebuilt kernel modules, found {len(kernels)}\""
               mkdir -p aiter_artifacts
               tar -C aiter_overlay -czf \
                 aiter_artifacts/aiter-overlay-${GPU_ARCHS}.tar.gz .
