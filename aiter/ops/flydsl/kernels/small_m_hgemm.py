@@ -553,9 +553,7 @@ def compile_small_m_hgemm_kernel(
         signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-        _i64_type = T.i64
-        acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
+        acc_init = fx.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
         zero_a_vec = fx.Vector.filled(LDG_VEC_SIZE, 0.0, fx_dtype)
         zero_a_async_vec = fx.Vector.filled(LDG_ASYNC_VEC_SIZE, 0.0, fx_dtype)
 
@@ -570,6 +568,15 @@ def compile_small_m_hgemm_kernel(
         if const_expr(B_TO_LDS):
             b_lds_ptr = lds.b_lds.ptr
             b_lds_i64 = fx.Int64(fx.ptrtoint(b_lds_ptr))
+
+        _lds_i8_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, 16)
+
+        def _wave_uniform_lds_ptr(base_i64, byte_off):
+            # readfirstlane keeps the direct-to-LDS destination address uniform
+            # across the wave (it feeds an `s` operand of buffer_load_lds).
+            # BOUNDARY: the direct-to-LDS intrinsic needs a raw !llvm.ptr<3>.
+            addr = rocdl.readfirstlane(T.i64, base_i64 + fx.Int64(byte_off))
+            return fx.to_llvm_ptr(fx.inttoptr(_lds_i8_ptr_ty, fx.Int64(addr)))
 
         # LDS accessors: linear element offsets mirroring the old STensor shapes.
         # as_/bs_ = (stage, row, col) over (STAGES, BLOCK*, BLOCK_K); cs_ =
@@ -627,7 +634,7 @@ def compile_small_m_hgemm_kernel(
         block_m_idx = fx.block_idx.x
         block_n_group_idx = fx.Index(fx.block_idx.y)
         ks_idx = fx.Index(fx.block_idx.z)
-        ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+        ks_begin = fx.Int32(ks_idx * ks)
         block_n_tiles = n // BLOCK_N
         tile_group = PERSISTENT_N_TILES if const_expr(PERSISTENT_N) else N_TILE_REPEAT
 
@@ -649,8 +656,7 @@ def compile_small_m_hgemm_kernel(
             for tile_block_n_idx in tile_block_n_indices
         ]
         tile_signal_indices = [
-            fx.block_idx.x * fx.Int32(block_n_tiles)
-            + arith.index_cast(T.i32, tile_block_n_idx)
+            fx.block_idx.x * fx.Int32(block_n_tiles) + fx.Int32(tile_block_n_idx)
             for tile_block_n_idx in tile_block_n_indices
         ]
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
@@ -683,6 +689,8 @@ def compile_small_m_hgemm_kernel(
                     init_vec = bias_g.vec_load(
                         (tile_n_offset + n_local_idx,), LDG_VEC_SIZE
                     )
+                # BOUNDARY: predicated vec_store to the closure c_g TensorView; a
+                # runtime scf.if cannot yield the captured TensorView, so keep raw.
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                 )
@@ -693,18 +701,18 @@ def compile_small_m_hgemm_kernel(
                     )
                     scf.YieldOp([])
 
+        # i8-element addrspace(1) pointer so fx.add_offset counts bytes; the raw
+        # atomicrmw / inline-asm sinks below take the !llvm.ptr<1> at the boundary.
+        _g_i8_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 4)
+
         def get_llvm_ptr(ptr, offset, dtype_bytes):
-            base_ptr = arith.index_cast(_i64_type, fx.ptrtoint(ptr))
-            byte_offset = arith.index_cast(
-                T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
-            )
-            llvm_ptr = llvm.AddOp(
-                base_ptr, byte_offset, llvm.IntegerOverflowFlags(0)
-            ).result
-            llvm_ptr = llvm.IntToPtrOp(_ptr_type, llvm_ptr).result
-            return llvm_ptr._value if hasattr(llvm_ptr, "_value") else llvm_ptr
+            base = fx.inttoptr(_g_i8_ptr_ty, fx.Int64(fx.ptrtoint(ptr)))
+            byte_offset = fx.Int64(fx.Index(offset) * fx.Index(dtype_bytes))
+            return fx.to_llvm_ptr(fx.add_offset(base, byte_offset))
 
         def prepare_split_k_tile(c_g, bias_g, tile_n_offset, tile_signal_idx):
+            # BOUNDARY: predicated atomicrmw + inline-asm signal stores and a
+            # closure-store zero_c_tile; kept as raw scf.IfOp built via InsertionPoint.
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
             is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
             with ir.InsertionPoint(is_t0_cond_if.then_block):
@@ -749,6 +757,11 @@ def compile_small_m_hgemm_kernel(
                 scf.YieldOp([])
 
         def split_k_barrier(tile_signal_idx):
+            # BOUNDARY: unbounded spin-wait; scf.WhileOp has no fx control-flow
+            # surface. The is-thread-0 / last-departure guards below stay raw
+            # scf.IfOp because they nest the WhileOp, an atomicrmw whose result
+            # they branch on, and predicated stores to the closure semaphore_/
+            # signal_ TensorViews.
             init_cur = arith.constant(0, type=T.i32)
             w = scf.WhileOp([T.i32], [init_cur])
             before = ir.Block.create_at_start(w.before, [T.i32])
@@ -816,6 +829,8 @@ def compile_small_m_hgemm_kernel(
                 )
                 valid_row = arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m))
                 can_load = arith.andi(slot_valid, valid_row)
+                # BOUNDARY: must guard the OOB global load (a select would issue the
+                # masked-out vec_load unconditionally); kept as raw value-yielding scf.if.
                 load_if = scf.IfOp(
                     can_load,
                     results_=[T.vec(LDG_VEC_SIZE, dtype_)],
@@ -868,31 +883,24 @@ def compile_small_m_hgemm_kernel(
                     )
                     cond_if = scf.IfOp(valid_row, results_=[], has_else=True)
                     with ir.InsertionPoint(cond_if.then_block):
-                        global_offset = (
+                        global_offset = fx.Int32(
                             A_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                         )
-                        global_offset = arith.index_cast(T.i32, global_offset)
                         lds_elem_off = (
                             fx.Index(lds_stage) * (BLOCK_M * BLOCK_K)
                             + fx.Index(m_local_idx) * BLOCK_K
                             + fx.Index(k_local_idx)
                         )
-                        lds_byte_off = arith.index_cast(
-                            T.i64, lds_elem_off * fx.Index(DTYPE_BYTES)
-                        )
-                        lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                        lds_addr_ = rocdl.readfirstlane(
-                            T.i64, a_lds_i64 + fx.Int64(lds_byte_off)
-                        )
-                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                        lds_byte_off = fx.Int64(lds_elem_off * fx.Index(DTYPE_BYTES))
+                        lds_ptr = _wave_uniform_lds_ptr(a_lds_i64, lds_byte_off)
                         rocdl.raw_ptr_buffer_load_lds(
                             A_.rsrc,
                             lds_ptr,
-                            arith.constant(DMA_BYTES, type=T.i32),
+                            fx.Int32(DMA_BYTES),
                             global_offset,
-                            arith.constant(0, type=T.i32),
-                            arith.constant(0, type=T.i32),
-                            arith.constant(1, type=T.i32),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(1),
                         )
                         scf.YieldOp([])
                     with ir.InsertionPoint(cond_if.else_block):
@@ -963,42 +971,31 @@ def compile_small_m_hgemm_kernel(
             return c_frags_new
 
         def store_split_k_tile(c_tensor, c_g, tile_n_offset):
-            out_raw = c_tensor
-            out_base_int = arith.index_cast(_i64_type, fx.ptrtoint(out_raw))
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
                 n_global_idx = tile_n_offset + n_local_idx
+                # BOUNDARY: predicated atomicrmw writeback reading the closure c_g
+                # TensorView; a runtime scf.if cannot yield the captured TensorView,
+                # so keep raw scf.IfOp built via InsertionPoint.
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_load_vec(m_local_idx, n_local_idx, LDG_VEC_SIZE)
-                    linear_bytes_offset = (
-                        c_g.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
-                    )
+                    linear_offset_c = c_g.linear_offset((m_global_idx, n_global_idx))
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
                         pk_vec = fx.Vector(pk_val)
                         e0 = pk_vec[vec_idx * 2]
                         e1 = pk_vec[vec_idx * 2 + 1]
                         pair = fx.Vector.from_elements([e0, e1], fx_dtype)
-                        pair_byte_offset = arith.index_cast(
-                            T.i64,
-                            linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES),
-                        )
-                        pair_addr_i64 = llvm.AddOp(
-                            out_base_int,
-                            pair_byte_offset,
-                            llvm.IntegerOverflowFlags(0),
-                        ).result
-                        pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
-                        pair_ptr_v = (
-                            pair_ptr._value if hasattr(pair_ptr, "_value") else pair_ptr
-                        )
                         pair_v = pair._value if hasattr(pair, "_value") else pair
+                        pair_ptr_v = get_llvm_ptr(
+                            c_tensor, linear_offset_c + vec_idx * 2, DTYPE_BYTES
+                        )
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.fadd,
                             pair_ptr_v,
@@ -1015,6 +1012,8 @@ def compile_small_m_hgemm_kernel(
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
+                # BOUNDARY: predicated vec_store to the closure c_g TensorView;
+                # a runtime scf.if cannot yield the captured TensorView, so keep raw.
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
@@ -1078,33 +1077,27 @@ def compile_small_m_hgemm_kernel(
                     )
                     slot_if = scf.IfOp(slot_valid, results_=[], has_else=False)
                     with ir.InsertionPoint(slot_if.then_block):
-                        global_offset = B_.linear_offset(
-                            (tile_n_offset + fx.Index(n_local_idx), col_idx)
-                        )
-                        global_offset = arith.index_cast(
-                            T.i32, global_offset * DTYPE_BYTES
+                        global_offset = fx.Int32(
+                            B_.linear_offset(
+                                (tile_n_offset + fx.Index(n_local_idx), col_idx)
+                            )
+                            * DTYPE_BYTES
                         )
                         lds_elem_off = (
                             fx.Index(lds_stage) * (BLOCK_N * BLOCK_K)
                             + fx.Index(n_local_idx) * BLOCK_K
                             + fx.Index(k_local_idx)
                         )
-                        lds_byte_off = arith.index_cast(
-                            T.i64, lds_elem_off * fx.Index(DTYPE_BYTES)
-                        )
-                        lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                        lds_addr_ = rocdl.readfirstlane(
-                            T.i64, b_lds_i64 + fx.Int64(lds_byte_off)
-                        )
-                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                        lds_byte_off = fx.Int64(lds_elem_off * fx.Index(DTYPE_BYTES))
+                        lds_ptr = _wave_uniform_lds_ptr(b_lds_i64, lds_byte_off)
                         rocdl.raw_ptr_buffer_load_lds(
                             B_.rsrc,
                             lds_ptr,
-                            arith.constant(DMA_BYTES, type=T.i32),
+                            fx.Int32(DMA_BYTES),
                             global_offset,
-                            arith.constant(0, type=T.i32),
-                            arith.constant(0, type=T.i32),
-                            arith.constant(1, type=T.i32),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(1),
                         )
                         scf.YieldOp([])
 
@@ -1171,7 +1164,7 @@ def compile_small_m_hgemm_kernel(
                     rocdl.sched_barrier(0)
 
                 UNROLL = EFFECTIVE_B_TO_LDS_UNROLL
-                init_state = [ks_begin, arith.constant(0, index=True)] + c_frags_local
+                init_state = [ks_begin, fx.Index(0)] + c_frags_local
                 for bki, state in range(0, BLOCK_K_LOOPS - 1, UNROLL, init=init_state):
                     k_offset = state[0]
                     current_stage = fx.Index(state[1])
@@ -1276,7 +1269,7 @@ def compile_small_m_hgemm_kernel(
             TOTAL_C_FRAGS_LEN = C_FRAGS_LEN * N_TILE_REPEAT
             TOTAL_B_FRAGS_LEN = B_FRAGS_LEN * N_TILE_REPEAT
             init_state = (
-                [ks_begin, arith.constant(0, index=True)] + c_frags + a_frags + b_frags
+                [ks_begin, fx.Index(0)] + c_frags + a_frags + b_frags
             )
             for _, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]

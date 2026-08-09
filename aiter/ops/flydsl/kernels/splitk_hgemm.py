@@ -12,8 +12,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from .tensor_shim import GTensor, get_dtype_in_kernel
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
@@ -254,7 +252,7 @@ def compile_hgemm_kernel(
         signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
+        acc_init = fx.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
@@ -269,12 +267,14 @@ def compile_hgemm_kernel(
             b_lds_ptr = lds.pipeline.b_lds.peek().ptr
             b_lds_i64 = fx.Int64(fx.ptrtoint(b_lds_ptr))
 
+        # i8-element addrspace(3) pointer so fx.add_offset counts bytes, matching
+        # the byte-offset convention of the direct-to-LDS buffer_load intrinsic.
+        _lds_i8_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, 16)
+
         def _lds_a3_ptr(base_i64, elem_off):
-            off_i64 = arith.index_cast(
-                T.i64, fx.Index(elem_off) * fx.Index(DTYPE_BYTES)
-            )
-            return buffer_ops.create_llvm_ptr(
-                base_i64 + fx.Int64(off_i64), address_space=3
+            off_i64 = fx.Int64(fx.Index(elem_off) * fx.Index(DTYPE_BYTES))
+            return fx.add_offset(
+                fx.inttoptr(_lds_i8_ptr_ty, base_i64), off_i64
             )
 
         # LDS accessors: linear element offsets mirroring the old STensor shapes
@@ -355,7 +355,7 @@ def compile_hgemm_kernel(
 
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
-        ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+        ks_begin = fx.Int32(ks_idx * ks)
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -378,27 +378,21 @@ def compile_hgemm_kernel(
                 asm = f"s_waitcnt vmcnt({vmcnt})"
             llvm.InlineAsmOp(None, [], asm, "", has_side_effects=True)
 
-        def get_llvm_ptr(
-            ptr,
-            offset,
-            dtype_bytes,
-            ptr_type=ir.Type.parse("!llvm.ptr<1>"),  # noqa: B008
-        ):
-            base_ptr = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-            byte_offset = arith.index_cast(
-                T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
-            )
-            llvm_ptr = llvm.AddOp(
-                base_ptr, byte_offset, llvm.IntegerOverflowFlags(0)
-            ).result
-            llvm_ptr = llvm.IntToPtrOp(ptr_type, llvm_ptr).result
-            ptr_v = (
-                llvm_ptr._value if const_expr(hasattr(llvm_ptr, "_value")) else llvm_ptr
-            )
-            return ptr_v
+        # i8-element addrspace(1) pointer so fx.add_offset counts bytes; the raw
+        # atomicrmw / inline-asm sinks below take the !llvm.ptr<1> at the boundary.
+        _g_i8_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 4)
+
+        def get_llvm_ptr(ptr, offset, dtype_bytes):
+            base = fx.inttoptr(_g_i8_ptr_ty, fx.Int64(fx.ptrtoint(ptr)))
+            byte_offset = fx.Int64(fx.Index(offset) * fx.Index(dtype_bytes))
+            return fx.to_llvm_ptr(fx.add_offset(base, byte_offset))
 
         def zero_c():
-            # zero c if current block is the first block
+            # zero c if current block is the first block.
+            # BOUNDARY: this ks_idx==0 region nests predicated direct global stores
+            # (inline-asm side effects) and reads closure GTensors; a runtime scf.if
+            # here would try to yield the captured C_/BIAS_ tensors, so keep the
+            # guard as a raw scf.IfOp built via InsertionPoint.
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
@@ -424,8 +418,7 @@ def compile_hgemm_kernel(
                         bytes_offset = C_.linear_offset(
                             (row_idx, n_offset + n_local_idx)
                         )
-                        bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
-                        c_ptr = get_llvm_ptr(C, bytes_offset_i32, DTYPE_BYTES)
+                        c_ptr = get_llvm_ptr(C, fx.Int32(bytes_offset), DTYPE_BYTES)
                         llvm.InlineAsmOp(
                             None,
                             [c_ptr, init_vec],
@@ -453,6 +446,9 @@ def compile_hgemm_kernel(
         def split_k_barrier():
             # spin-wait until signal triggered
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            # BOUNDARY: unbounded spin-wait; scf.WhileOp has no fx control-flow
+            # surface. The enclosing is-thread-0 guard stays a raw scf.IfOp because
+            # it directly hosts the raw WhileOp.
             is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
             with ir.InsertionPoint(is_t0_cond_if.then_block):
                 init_cur = arith.constant(0, type=T.i32)
@@ -479,7 +475,11 @@ def compile_hgemm_kernel(
                 scf.YieldOp([])
             rocdl.sched_barrier(0)
             gpu.barrier()
-            # clean semaphore and signal if this is the last block within split-k group
+            # clean semaphore and signal if this is the last block within split-k
+            # group. BOUNDARY: predicated stores to the closure semaphore_/signal_
+            # TensorViews; a runtime scf.if would try to yield those captures, so
+            # keep these guards as raw scf.IfOp built via InsertionPoint.
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
             is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
             with ir.InsertionPoint(is_t0_cond_if.then_block):
                 semaphore_ptr = get_llvm_ptr(semaphore, signal_idx, 4)
@@ -509,11 +509,7 @@ def compile_hgemm_kernel(
                 m_local_idx = global_tid // LDG_A_X_THREADS
                 k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
                 row_idx = m_offset + fx.Index(m_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                    row_idx,
-                    fx.Index(0),
-                )
+                safe_row_idx = (row_idx < fx.Index(m)).select(row_idx, fx.Index(0))
                 col_idx = fx.Index(k_offset + k_local_idx)
                 vec = A_.vec_load((safe_row_idx, col_idx), LDG_VEC_SIZE)
                 vecs.append(vec)
@@ -531,10 +527,7 @@ def compile_hgemm_kernel(
         def get_dma_copy_warp_offset():
             warp_offset = rocdl.readfirstlane(
                 T.i64,
-                arith.index_cast(
-                    T.i64,
-                    fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True),
-                ),
+                fx.Int64(fx.Index(wid) * fx.Index(WARP_SIZE * DMA_BYTES)),
             )
             return warp_offset
 
@@ -547,9 +540,11 @@ def compile_hgemm_kernel(
                 asm = "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, 0 offen sc0 lds"
             else:
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
+            # BOUNDARY: direct-to-LDS buffer_load intrinsic; needs a raw !llvm.ptr<3>
+            # and raw ir.Value operands.
             llvm.InlineAsmOp(
                 None,
-                [lds_ptr, global_offset, rsrc],
+                [fx.to_llvm_ptr(lds_ptr), global_offset.ir_value(), rsrc],
                 asm,
                 "s,v,s",
                 has_side_effects=True,
@@ -562,23 +557,17 @@ def compile_hgemm_kernel(
             col_in_bytes = k_local_idx * DTYPE_BYTES
             col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
             row_idx = m_offset + fx.Index(m_local_idx)
-            safe_row_idx = arith.select(
-                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                row_idx,
-                fx.Index(0),
-            )
+            safe_row_idx = (row_idx < fx.Index(m)).select(row_idx, fx.Index(0))
             col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
             global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-            global_offset = arith.index_cast(T.i32, global_offset)
+            global_offset = fx.Int32(global_offset)
             if const_expr(lds_ptr is None):
                 lds_ptr_base = _lds_a3_ptr(
                     a_lds_i64, fx.Index(write_stage) * (BLOCK_M * BLOCK_K)
                 )
-                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
+                lds_ptr = fx.add_offset(lds_ptr_base, fx.Int64(warp_offset))
             else:
-                lds_ptr = buffer_ops.get_element_ptr(
-                    lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
-                )
+                lds_ptr = fx.add_offset(lds_ptr, fx.Int64(BLOCK_THREADS * DMA_BYTES))
             buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
             return lds_ptr
 
@@ -596,23 +585,17 @@ def compile_hgemm_kernel(
             col_in_bytes = k_local_idx * DTYPE_BYTES
             col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
             row_idx = n_offset + fx.Index(n_local_idx)
-            safe_row_idx = arith.select(
-                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
-                row_idx,
-                fx.Index(0),
-            )
+            safe_row_idx = (row_idx < fx.Index(n)).select(row_idx, fx.Index(0))
             col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
             global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-            global_offset = arith.index_cast(T.i32, global_offset)
+            global_offset = fx.Int32(global_offset)
             if const_expr(lds_ptr is None):
                 lds_ptr_base = _lds_a3_ptr(
                     b_lds_i64, fx.Index(write_stage) * (BLOCK_N * BLOCK_K)
                 )
-                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
+                lds_ptr = fx.add_offset(lds_ptr_base, fx.Int64(warp_offset))
             else:
-                lds_ptr = buffer_ops.get_element_ptr(
-                    lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
-                )
+                lds_ptr = fx.add_offset(lds_ptr, fx.Int64(BLOCK_THREADS * DMA_BYTES))
             buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
             return lds_ptr
 
@@ -902,7 +885,7 @@ def compile_hgemm_kernel(
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
 
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
+            init_state = [ks_begin, fx.Index(0)] + c_frags
             for bki, state in range(
                 0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state
             ):
@@ -960,7 +943,7 @@ def compile_hgemm_kernel(
                 rocdl.sched_barrier(0)
 
             init_state = (
-                [ks_begin, arith.constant(0, index=True)] + c_frags + b_frags_next
+                [ks_begin, fx.Index(0)] + c_frags + b_frags_next
             )
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]
@@ -1014,6 +997,9 @@ def compile_hgemm_kernel(
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
                 n_global_idx = n_offset + n_local_idx
+                # BOUNDARY: predicated atomicrmw writeback reading the closure C_
+                # TensorView; a runtime scf.if cannot yield the captured TensorView
+                # ("Cannot extract IR values from TensorView"), so keep raw scf.IfOp.
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
@@ -1025,8 +1011,6 @@ def compile_hgemm_kernel(
                             ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE
                         )
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
-                    # split to vec2s
-                    T.vec(2, dtype_)
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
                         e0 = fx.Vector(pk_val)[vec_idx * 2]
                         e1 = fx.Vector(pk_val)[vec_idx * 2 + 1]
@@ -1053,6 +1037,8 @@ def compile_hgemm_kernel(
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
+                # BOUNDARY: predicated vec_store to the closure C_ TensorView; a
+                # runtime scf.if cannot yield the captured TensorView, so keep raw.
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
