@@ -2572,13 +2572,21 @@ def get_2stage_cfgs(
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        # No grid split-K, so small-M uses intra-block k_wave. token<64: tile_n=64/kw2
-        # (32KB LDS) BEATS tile_n=32/kw4 (64KB LDS, occupancy-starved to ~1 wave/SIMD) by
-        # ~13-19% (needs 4*tile_n<=tile_k, D_HIDDEN%(kw*tk)==0). token>=64: grid is parallel
-        # enough that tile_n=64/kw1 wins; larger still -> tile_n=128.
-        if token < 64 and model_dim % 512 == 0 and inter_dim % 64 == 0:
+        # No grid split-K, so decode is workgroup-count-limited: the grid is
+        # m_blocks * (inter_dim / tile_n), and at token<4 only a narrow N-tile gets
+        # near the 256 CUs. Measured gemm1 (7168x512, E384/k8): at tok1 tile_n=64/kw2
+        # 41.6us -> tile_n=16/kw4 16.7us; at tok4-32 tile_n=32/kw2 wins; from tok64
+        # the grid is full and the wider tile amortizes A-LDS traffic instead.
+        # Constraints: 4*tile_n <= tile_k, D_HIDDEN % (k_wave*tile_k) == 0,
+        # inter_dim % tile_n == 0.
+        if token < 4 and model_dim % 1024 == 0 and inter_dim % 16 == 0:
             kn1 = (
-                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 64, 256)
+                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 16, 256)
+                + "_kw4"
+            )
+        elif token < 64 and model_dim % 512 == 0 and inter_dim % 32 == 0:
+            kn1 = (
+                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 32, 256)
                 + "_kw2"
             )
         elif token < 256 and inter_dim % 64 == 0:
