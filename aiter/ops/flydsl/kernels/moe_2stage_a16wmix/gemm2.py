@@ -411,17 +411,17 @@ def _gemm2_body_a16w4(
             scales.append((n_pack == fx.Int32(0)).select(se, so))
         return scales
 
-    def load_b_scale_int4(base_k, col_g):
-        # int4 groupwise (bf16-pair) scale, per-lane N = col_g. See gemm1 counterpart.
+    def load_b_scale_int4(base_k, n_full):
+        # int4 groupwise (bf16-pair) scale, per-lane within-expert N = n_full. OLD-kernel
+        # (E, G//2, N, 2) layout: dword = e*(G//2*N) + (adj_ku//2)*N + n_full (coalesced
+        # over 16 consecutive N-lanes). See gemm1 counterpart.
         scales = []
-        base_dword = col_g * fx.Int32(_g_half)
         for ku in range_constexpr(k_unroll):
             _k0_blk = ku // 4
             adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
             pair_idx = adj_ku // fx.Int32(2)
-            packed = _buffer_i32_scalar_read(
-                sw_tiles, base_dword + pair_idx, sw_read_atom
-            )
+            dword = _scale_expert_base + pair_idx * fx.Int32(N_OUT) + n_full
+            packed = _buffer_i32_scalar_read(sw_tiles, dword, sw_read_atom)
             lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
             hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)
             scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
@@ -458,11 +458,13 @@ def _gemm2_body_a16w4(
         ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)
         scale_mni_list.append(ng // fx.Int32(32))
         scale_np_list.append((ng // fx.Int32(16)) % fx.Int32(2))
-    # int4 groupwise scale: per-lane N = expert_off + col_g (row_w already computed).
+    # int4 groupwise scale (OLD-kernel (E, G//2, N, 2) layout): N = col_g is WITHIN-expert;
+    # the expert base is a separate G//2*N_OUT stride.
     if const_expr(_is_int4):
-        scale_n_list = [
-            expert_off + col_g_list[ni] for ni in range_constexpr(num_acc_n)
-        ]
+        _scale_expert_base = rocdl.readfirstlane(
+            T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
+        )
+        scale_n_list = [col_g_list[ni] for ni in range_constexpr(num_acc_n)]
 
     # ---- accumulators: accm[mi][ni] f32[4] (layout the atomic epilog expects) --
     acc_layout = fx.make_layout(4, 1)

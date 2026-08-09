@@ -408,19 +408,20 @@ def _gemm1_body_a16w4(
             scales.append((n_pack == fx.Int32(0)).select(se, so))
         return scales
 
-    def load_b_scale_int4(base_k, col_g):
-        # int4 groupwise (bf16-pair) scale, per-lane N = col_g. group_size=32 == one K32
-        # step, so adj_ku = base_k//32 + (ku//4)*4 + lane_div_16 (mxfp4 K->group map).
-        # Buffer (E, N, G//2, 2) bf16: dword = col_g*(G//2) + adj_ku//2, half by parity.
+    def load_b_scale_int4(base_k, n_full):
+        # int4 groupwise (bf16-pair) scale, per-lane N (within-expert) = n_full.
+        # group_size=32 == one K32 step, so adj_ku = base_k//32 + (ku//4)*4 + lane_div_16
+        # (mxfp4 K->group map). Buffer (E, G//2, N, 2) bf16 (shuffle_scale_for_int4, the
+        # OLD-kernel layout): dword = e*(G//2*N) + (adj_ku//2)*N + n_full, half by parity.
+        # N-major over lanes -> 16 consecutive lanes read 16 consecutive dwords (one 64B
+        # cache line) instead of a G//2-strided gather, which the (E,N,G//2,2) layout hit.
         scales = []
-        base_dword = col_g * fx.Int32(_g_half)
         for ku in range_constexpr(k_unroll):
             _k0_blk = ku // 4
             adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
             pair_idx = adj_ku // fx.Int32(2)
-            packed = _buffer_i32_scalar_read(
-                sw_tiles, base_dword + pair_idx, sw_read_atom
-            )
+            dword = _scale_expert_base + pair_idx * fx.Int32(N_OUT) + n_full
+            packed = _buffer_i32_scalar_read(sw_tiles, dword, sw_read_atom)
             # even adj_ku -> low bf16, odd -> high.
             lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
             hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)
@@ -531,14 +532,15 @@ def _gemm1_body_a16w4(
         else:
             fx.gemm(mma_atom, acc, _bf16_frag(a8), _bf16_frag(b8), acc)
 
-    # int4 groupwise scale N = expert_off + (col_g | col_g+inter); expert_off (N_OUT
-    # units) doubles as the scale-N expert base ((E, N_OUT, G//2, 2)).
+    # int4 groupwise scale is the OLD-kernel (E, G//2, N, 2) layout: N (col_g | col_g+
+    # inter) is WITHIN-expert; the expert base is a separate G//2*N_OUT stride.
     if const_expr(_is_int4):
-        scale_n_gate = [
-            expert_off + col_g_list[ni] for ni in range_constexpr(num_acc_n)
-        ]
+        _scale_expert_base = rocdl.readfirstlane(
+            T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
+        )
+        scale_n_gate = [col_g_list[ni] for ni in range_constexpr(num_acc_n)]
         scale_n_up = [
-            expert_off + col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)
+            col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)
         ]
 
     # ---- B tile load + compute helpers ----------------------------------------
