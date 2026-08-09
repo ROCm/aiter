@@ -1174,7 +1174,8 @@ def _iter_situv2_default_cases():
     The default cases hardcode the supported MXFP4 family instead of relying on
     the -a list:
       * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
+    beta / linear_beta come from --beta / --linear-beta. The default sweep uses
+    0.5 / 2.0 when the flags are omitted.
     Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
 
     Notes on cases intentionally kept out of this DEFAULT auto-run:
