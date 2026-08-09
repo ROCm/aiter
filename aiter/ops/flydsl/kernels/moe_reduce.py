@@ -33,10 +33,10 @@ FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
 def _reduce_block(model_dim, V):
-    exact = model_dim // V
-    if model_dim % V or exact % WAVE or not 0 < exact <= MAX_BLOCK:
+    exact_block = model_dim // V
+    if model_dim % V or exact_block % WAVE or not 0 < exact_block <= MAX_BLOCK:
         return BLOCK
-    return exact
+    return exact_block
 
 
 def _moe_reduction_kernel(
