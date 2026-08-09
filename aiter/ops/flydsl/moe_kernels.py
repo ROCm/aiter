@@ -453,36 +453,69 @@ def _register_production_variants_stage2(
 
 
 def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
-    """Return {kernelName: params} for all supported int4_bf16 stage1 configs."""
+    """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage1 configs.
+
+    a16wi4 is served by the shared FlyDSL a16w-mix port (moe_2stage_a16wmix,
+    w_dtype="int4"), which uses intra-block ``k_wave`` (not grid split-K). Legacy
+    ``_kb{n}`` names are still registered (k_batch is parsed but IGNORED by the port
+    -> runs k_wave=1) so pre-existing tuned CSVs keep parsing; new tuned rows should
+    use ``_kw{n}`` for the wave-starved decode regime.
+    """
     kernels = {}
     a_dtype = "bf16"
     b_dtype = "int4"
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
-    tile_ns = [64, 128]
+    # small tile_n (with k_wave) is the decode config: it maximizes N-tile grid
+    # workgroups to fight wave-starvation (the port's answer to the old kernel's
+    # grid split-K, which the port lacks). tile_n=16 needs kw4 (n_per_wave>=16).
+    tile_ns = [16, 32, 64, 128]
     k_batches = [1, 2, 4, 7, 14]
+    b_nts = [0, 2]
+
+    def _emit(tm, tn, tk, *, kb=1, kw=1, bnt=2):
+        name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+        if kb != 1:
+            name += f"_kb{kb}"
+        if bnt != 2:
+            name += f"_bnt{bnt}"
+        if kw != 1:
+            name += f"_kw{kw}"
+        kernels[name] = {
+            "stage": 1,
+            "a_dtype": a_dtype,
+            "b_dtype": b_dtype,
+            "out_dtype": out_dtype,
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "MPerBlock": tm,
+            "in_dtype": "int4_bf16",
+            "k_batch": kb,
+            "b_nt": bnt,
+            "k_wave": kw,
+        }
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
+                # legacy split-K names (k_batch ignored by the port) -- CSV compat.
                 for kb in k_batches:
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
-                    if kb != 1:
-                        name += f"_kb{kb}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": tm,
-                        "in_dtype": "int4_bf16",
-                        "k_batch": kb,
-                    }
+                    _emit(tm, tn, tk, kb=kb)
+                # kw1 cached (b_nt=0) variant: large-M weight reuse wants L2-cached
+                # loads (matches main's use_nt: cached for token*topk//E >= 64), vs the
+                # default nt/streaming; the base kw1 name is nt (b_nt=2).
+                _emit(tm, tn, tk, bnt=0)
+                # k_wave (intra-block K-slice): the port's decode/wave-starvation
+                # lever. The kernel splits the 4 waves into (4/kw) N-waves x kw
+                # K-waves, so each N-wave covers tn/(4/kw) cols and needs >=16 for
+                # the 16x16 MMA; kw>1 also needs 4*tn <= tk (K-slice fits the tile).
+                for kw in (2, 4):
+                    num_n_waves = 4 // kw
+                    if tn % num_n_waves or tn // num_n_waves < 16 or 4 * tn > tk:
+                        continue
+                    for bnt in b_nts:
+                        _emit(tm, tn, tk, kw=kw, bnt=bnt)
     return kernels
 
 
@@ -574,9 +607,12 @@ def compile_flydsl_moe_stage1(
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x fp4 W) SiTUv2: build the ported gemm1 (moe_2stage_a16wmix),
-    # consuming the standard GGUU W1+scale layout (w_layout="standard"), matching main.
-    if a_dtype == "bf16" and b_dtype == "fp4":
+    # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
+    # (moe_2stage_a16wmix), consuming the standard GGUU W1+scale layout
+    # (w_layout="standard"), matching main. a16wi4 shares this compile entry so AOT
+    # builds the same kernel the runtime early-return launches; its W1 is the
+    # FlyDSL-native int4 prep (shuffle_weight_a16wi4) + (E,N,G//2,2) bf16 scale.
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
@@ -593,7 +629,7 @@ def compile_flydsl_moe_stage1(
             b_cache_mod=b_nt,
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
-            w_dtype="fp4",
+            w_dtype=b_dtype,
             w_layout="standard",
             k_wave=k_wave,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
@@ -631,29 +667,6 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
         )
-    elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        from .kernels.moe_gemm_2stage import compile_moe_gemm1
-
-        # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
-        _use_cshuffle = None if k_batch > 1 else False
-
-        return compile_moe_gemm1(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage1=doweight_stage1,
-            in_dtype="int4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            use_cshuffle_epilog=_use_cshuffle,
-            scale_is_bf16=True,
-            k_batch=k_batch,
-        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -685,9 +698,10 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x fp4 W) down-proj: build the ported gemm2 (moe_2stage_a16wmix);
-    # its gate_up=False W2+scale layout matches the standard shuffle_weight/e8m0.
-    if a_dtype == "bf16" and b_dtype == "fp4":
+    # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
+    # (moe_2stage_a16wmix); its gate_up=False W2+scale layout matches the standard
+    # shuffle_weight/e8m0 (a16wi4: shuffle_weight_a16wi4 + bf16 groupwise scale).
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
@@ -702,7 +716,7 @@ def compile_flydsl_moe_stage2(
             xcd_swizzle=xcd_swizzle,
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
-            w_dtype="fp4",
+            w_dtype=b_dtype,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
         )
@@ -737,25 +751,6 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
-        )
-    elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        from .kernels.moe_gemm_2stage import compile_moe_gemm2
-
-        return compile_moe_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            in_dtype="int4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            accumulate=accumulate,
-            scale_is_bf16=True,
         )
     else:
         raise ValueError(
@@ -1453,11 +1448,13 @@ def _flydsl_moe_stage1_impl(
     _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
 
     dev = a.device
-    _is_a16w4 = a_dtype == "bf16" and b_dtype == "fp4"
-    if _is_a16w4:
-        # a16w4 (bf16 A x fp4 W): ported gemm1 -> bf16 sorted intermediate,
-        # threaded to stage2 unchanged. Tiles from the CSV kernelName;
-        # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel).
+    # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
+    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName;
+    # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel). Both
+    # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
+    # FlyDSL-native int4 prep (shuffle_weight_a16wi4) + (E,N,G//2,2) bf16 scale.
+    _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
+    if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
         _act = "situv2" if act in ("situv2", "situ") else act
@@ -1492,6 +1489,7 @@ def _flydsl_moe_stage1_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
+            w_dtype=b_dtype,
             w_layout="standard",
         )
         return inter_sorted
@@ -1935,9 +1933,11 @@ def _flydsl_moe_stage2_impl(
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
-    if a_dtype == "bf16" and b_dtype == "fp4":
-        # a16w4 (bf16 A x fp4 W) down-proj: ported gemm2 atomic-scatters into the
-        # caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like a4w4/a8w4).
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
+        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4): ported gemm2 atomic-scatters
+        # into the caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like
+        # a4w4/a8w4). a16wi4 W2 uses the FlyDSL-native int4 layout (shuffle_weight_a16wi4)
+        # + (E,N,G//2,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
 
         E = w2.shape[0]
@@ -1988,6 +1988,7 @@ def _flydsl_moe_stage2_impl(
             b_nt=b_nt,
             waves_per_eu=waves_per_eu,
             xcd_swizzle=xcd_swizzle,
+            w_dtype=b_dtype,
         )
         return out
 

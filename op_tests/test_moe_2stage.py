@@ -42,11 +42,11 @@ except ModuleNotFoundError as e:
 
 
 from aiter.ops.shuffle import (
-    pack_int8_to_packed_int4,
     shuffle_scale_a16w4,
-    shuffle_scale_for_int4,
+    shuffle_scale_a16wi4,
     shuffle_weight,
     shuffle_weight_a16w4,
+    shuffle_weight_a16wi4,
 )
 
 logger = logging.getLogger(__name__)
@@ -294,25 +294,21 @@ def test_fmoe(
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
-        w1_qt_aiter = pack_int8_to_packed_int4(
-            shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
+        # FlyDSL a16w-mix port layout: shuffle_weight_a16wi4 (kpack=16, shared with the
+        # mxfp4 a16w4 kernel) + (E,N,G//2,2) bf16 scale. NOT the CK int4 kpack=8 layout.
+        w1_qt_aiter = (
+            shuffle_weight_a16wi4(w1_qt_aiter.view(dtypes.i8))
+            .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+            .view(dtypes.i4x2)
         )
-        w1_qt_aiter = w1_qt_aiter.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(
-            dtypes.i4x2
+        w2_qt_aiter = (
+            shuffle_weight_a16wi4(w2_qt_aiter.view(dtypes.i8))
+            .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+            .view(dtypes.i4x2)
         )
-        w2_qt_aiter = pack_int8_to_packed_int4(
-            shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
-        )
-        w2_qt_aiter = w2_qt_aiter.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(
-            dtypes.i4x2
-        )
-        # groupwise scale: [E, K//32, N] bf16 -> shuffle and flatten for kernel
-        w1_scale_aiter = (
-            shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
-        )
-        w2_scale_aiter = (
-            shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
-        )
+        # groupwise scale: [E, K//32, N] bf16 -> (E, N, G//2, 2) for the port kernel.
+        w1_scale_aiter = shuffle_scale_a16wi4(w1_scale).view(-1).contiguous()
+        w2_scale_aiter = shuffle_scale_a16wi4(w2_scale).view(-1).contiguous()
     elif WQDType == torch.int4:  # int4 w quant (a8w4)
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(

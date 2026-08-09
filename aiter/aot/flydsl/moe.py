@@ -854,9 +854,10 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    b_dtype: str = "fp4",
     **kwargs,
 ):
-    """AOT for the folded a16w4 (bf16 A x fp4 W) port (moe_2stage_a16wmix).
+    """AOT for the folded a16w-mix port (moe_2stage_a16wmix): a16w4 / a16wi4.
 
     The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
@@ -904,6 +905,7 @@ def _precompile_a16w4_to_cache(
                 tile_k=tile_k,
                 k_wave=k_wave,
                 act=("situv2" if act in ("situv2", "situ") else act),
+                w_dtype=b_dtype,
                 w_layout="standard",
                 **common,
             )
@@ -931,7 +933,7 @@ def _precompile_a16w4_to_cache(
                 max_sorted=1,
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
-                w_dtype="fp4",
+                w_dtype=b_dtype,
                 **common,
             )
 
@@ -1037,19 +1039,19 @@ def compile_one_config(
 
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    # The folded a16w4 (bf16 A x fp4 W) port takes raw .data_ptr() device
+    # The folded a16w-mix port (a16w4 fp4 / a16wi4 int4) takes raw .data_ptr() device
     # pointers, which FakeTensors don't have; drive its dedicated precompile with
     # real (COMPILE_ONLY) tensors outside FakeTensorMode.
-    is_a16w4 = (
+    is_a16w_port = (
         not is_epilogue
         and kwargs.get("shared_expert_id", -1) < 0
         and kwargs.get("a_dtype") == "bf16"
-        and kwargs.get("b_dtype") == "fp4"
+        and kwargs.get("b_dtype") in ("fp4", "int4")
     )
 
     t0 = time.time()
     try:
-        if is_a16w4:
+        if is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(
                     model_dim=model_dim,
