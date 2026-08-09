@@ -222,14 +222,9 @@ def fp8out_pitch_align():
 
 
 def fp8out_scale_blk():
-    # 8 keeps the route-out row layout ([N values | N/8 e8m0]) that the shared
-    # topk reduction in kernels/moe_reduce.py decodes. Wider blocks need a
-    # reduction that tracks scale_blk separately from the load width.
-    v = int(os.environ.get("AITER_G2_SCALE_BLK", "8"))
-    if v != 8:
-        raise ValueError(
-            f"AITER_G2_SCALE_BLK must be 8 (moe_reduce.py assumes it), got {v}"
-        )
+    v = int(os.environ.get("AITER_G2_SCALE_BLK", "32"))
+    if v not in (8, 32):
+        raise ValueError(f"AITER_G2_SCALE_BLK must be 8 or 32, got {v}")
     return v
 
 
