@@ -72,24 +72,12 @@ Numbering convention:
 Synthetic balanced / round-robin and full-tile experiments were retired because
 they are not valid for general MoE routing.
 
-The source of truth for public ids, names, block shapes, output mode, and
-route-reduce tile width is
-`aiter/ops/opus/moe_stage2_a8w4_meta.py`. `-1` remains the direct-atomic auto
-selector.
+The source of truth for Stage1/Stage2 public ids, names, block shapes, output
+mode, and route-reduce tile width is `opus_moe_common.py`.
 
-In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
-`kernelName2` value from metadata. The generic wrapper name
-`opus_moe_stage2_a8w4_decode` is still accepted for rows that carry explicit
-numeric columns:
-
-- `stage2_kernel_id`: `-1` for direct-atomic auto, or one of the A8W4 kids
-  above.
-- `stage2_block_m`: the kernel tile M passed to Opus stage2.
-- `stage2_route_out`: `1` when stage2 returns per-slot route output that needs
-  route-output reduce, otherwise `0`.
-- `stage2_reduce_block_n`: optional route-output reduce tile width. Per-kid
-  kernel names can also carry this as an `_rbn<N>` suffix, for example
-  `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072`.
+Fused MoE tuned configs select A8W4 Stage2 with a complete per-kid
+`kernelName2` from metadata. The name fixes the decode shape, sorting block,
+output mode, and route-reduce tile width as one immutable launch plan.
 
 Optional tuned CSV metadata columns `route_bucket`, `expected_sorted_blocks`,
 `min_sorted_blocks`, and `max_sorted_blocks` are carried to runtime and checked
@@ -128,15 +116,13 @@ gfx950 code:
 
 Python/JIT code:
 
-- `aiter/ops/opus/moe_stage2_a8w4_meta.py`: torch-free A8W4 stage2 kid
-  metadata shared by runtime wrapper and csrc tuner/codegen helpers.
-- `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Python wrapper and route-output
-  reduce wrapper.
-- `aiter/ops/opus/moe_stage2_a8w4_fused_adapter.py`: fused MoE CSV parsing and
-  stage2 wrapper glue for A8W4.
+- `aiter/ops/opus/moe_stage1_a8w4.py`: A8W4 Stage1 runtime binding and fused
+  MoE adapter.
+- `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Stage2 runtime bindings, typed
+  tuned-config parsing, fused MoE adapter, and unified route-output reduction.
 - `gen_instances.py`: JIT-time private BF16 and A8W4 manifest/TU generator.
-- `opus_moe_common.py`: private BF16 metadata plus the A8W4 metadata bridge for
-  manifest codegen.
+- `opus_moe_common.py`: torch-free canonical Stage1/Stage2 contracts, kernel
+  instances, public names, and kid lookup shared by runtime, tuner, and codegen.
 
 ## Tuning and Dispatch
 
