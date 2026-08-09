@@ -2559,42 +2559,37 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    if (
-        q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.i4x2
-        and is_flydsl_available()
-    ):
-        # a16wi4 (bf16 A x int4 W): route to the shared a16w-mix port (moe_2stage_a16wmix,
-        # w_dtype="int4"). Tiles come from the tuned CSV kernelName when available, else this
-        # per-token heuristic. block_m (MOEMetadata arg 3) MUST equal tile_m -- it sizes
-        # moe_sorting AND gemm tile_m.
+    if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+        if not is_flydsl_available():
+            # a16wi4 is FlyDSL-only. Falling through would hand W1/W2 -- preshuffled
+            # for the FlyDSL port by shuffle_weight_a16wi4 (kpack=16) -- to a CK/ASM
+            # stage1 that expects the CK int4 layout (kpack=8), i.e. silently wrong
+            # numbers rather than a failure.
+            raise NotImplementedError(
+                "a16wi4 (per_1x32 int4 weights) requires FlyDSL; no CK/ASM kernel "
+                "consumes the FlyDSL a16wi4 weight layout."
+            )
+        # a16wi4 (bf16 A x int4 W) with no tuned CSV row: route to the shared a16w-mix
+        # port (moe_2stage_a16wmix, w_dtype="int4") on a single safe config, mirroring
+        # the mxfp4 fallback below. Tiles are NOT heuristically chosen here -- they are
+        # a tuning result and belong in the tuned CSV (kernelName1/2, which the
+        # CSV-driven branch above consumes). This config is shape-safe, not fast: it
+        # has no k_wave, so at decode it leaves the machine wave-starved (measured 2.5x
+        # off a tuned narrow-N tile at token=1). Tune the shape instead of widening
+        # this. block_m (MOEMetadata arg 3) MUST equal tile_m -- it sizes moe_sorting
+        # AND the gemm tile_m.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = _tile_k = 128
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        # No grid split-K, so decode is workgroup-count-limited: the grid is
-        # m_blocks * (inter_dim / tile_n), and at token<4 only a narrow N-tile gets
-        # near the 256 CUs. Measured gemm1 (7168x512, E384/k8): at tok1 tile_n=64/kw2
-        # 41.6us -> tile_n=16/kw4 16.7us; at tok4-32 tile_n=32/kw2 wins; from tok64
-        # the grid is full and the wider tile amortizes A-LDS traffic instead.
-        # Constraints: 4*tile_n <= tile_k, D_HIDDEN % (k_wave*tile_k) == 0,
-        # inter_dim % tile_n == 0.
-        if token < 4 and model_dim % 1024 == 0 and inter_dim % 16 == 0:
-            kn1 = (
-                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 16, 256)
-                + "_kw4"
-            )
-        elif token < 64 and model_dim % 512 == 0 and inter_dim % 32 == 0:
-            kn1 = (
-                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 32, 256)
-                + "_kw2"
-            )
-        elif token < 256 and inter_dim % 64 == 0:
-            kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 64, 128)
-        else:
-            kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 128, 128)
+        kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
         kn2 = flydsl_kernel_name(
-            2, "bf16", "int4", _out_str, _tile_m, 128, 128, "atomic"
+            2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using untuned a16wi4 fallback ({kn1=}, {kn2=})"
         )
         return MOEMetadata(
             functools.partial(
