@@ -1,0 +1,719 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from dataclasses import dataclass
+import math
+
+import pytest
+import torch
+
+from aiter import ActivationType, dtypes
+from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+    _mxfp4_a_scale_sorted_shuffled,
+    build_v2_inputs,
+    gen,
+    quant_a,
+    v2_stage1_compare,
+    v2_stage1_dequant_cosine_err,
+    v2_stage1_scale_reference,
+    v2_stage1_sorted_ref,
+)
+from aiter.ops.shuffle import shuffle_weight_a16w4
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
+from op_tests.mxmoe_v2_test_utils import (
+    load_baseline_limit,
+    logits_diff,
+    run_standalone_v2_a8w8,
+)
+
+
+def test_fp8_b_pair_layout_matches_runtime_shuffle():
+    E, N, K = 1, 128, 256
+    raw = (torch.arange(E * N * K, dtype=torch.int32) % 251).to(torch.uint8)
+    weight = raw.view(E, N, K).view(dtypes.fp8)
+    shuffled = shuffle_weight_a16w4(weight, 16, False).view(torch.uint8)
+    physical = shuffled.view(E, N // 16, K // 64, 4, 16, 16)
+    flat = shuffled.view(-1)
+    k_halves = 1
+    for n0, kt, pair, klane, nlane in (
+        (0, 0, 0, 0, 0),
+        (3, 0, 1, 2, 7),
+        (7, 1, 0, 3, 15),
+        (4, 1, 1, 1, 9),
+    ):
+        base = n0 * 16 * K
+        i32_offset = klane * 64 + nlane * 4 + kt * (k_halves * 2 * 256) + pair * 256
+        got = flat[base + i32_offset * 4 : base + i32_offset * 4 + 16]
+        expected = physical[0, n0, kt * 2 + pair, klane, nlane]
+        assert torch.equal(got, expected)
+    lo = 0
+    hi = 256 * 4
+    assert hi - lo == 1024
+
+
+def test_e8m0_shuffle_word_matches_opsel_mapping():
+    N, K = 128, 384
+    raw = (torch.arange(N * (K // 32), dtype=torch.int32) % 254).to(torch.uint8)
+    raw = raw.view(N, K // 32).view(dtypes.fp8_e8m0)
+    shuffled = fp4_utils.e8m0_shuffle(raw).view(torch.uint8)
+    physical = shuffled.view(8, 2, 4, 16, 2, 2)
+    for group, chunk, klane, nlane, kpack, npack in (
+        (0, 0, 0, 0, 0, 0),
+        (1, 0, 3, 7, 1, 1),
+        (2, 1, 1, 11, 0, 0),
+        (3, 1, 3, 15, 0, 1),
+    ):
+        opsel = 2 * kpack + npack
+        word = physical[group, chunk, klane, nlane].reshape(-1)
+        row = group * 32 + npack * 16 + nlane
+        k_group = chunk * 8 + kpack * 4 + klane
+        assert word[opsel] == raw.view(torch.uint8)[row, k_group]
+
+
+@pytest.mark.l2_device
+@pytest.mark.parametrize("BK", [128, 256])
+def test_v2_a8w8_value_scale_coupling(BK):
+    coupling_limit = 1e-4
+    result = run_standalone_v2_a8w8(BM=32, BN=128, BK=BK, K=256, limit=coupling_limit)
+    assert not result.out.isnan().any()
+    assert logits_diff(result.out, result.ref) <= coupling_limit
+
+
+@pytest.mark.l2_device
+def test_v2_a8w8_coupling_negative_control():
+    coupling_limit = 1e-4
+    bad = run_standalone_v2_a8w8(
+        BM=32,
+        BN=128,
+        BK=256,
+        K=256,
+        corrupt_b_scale_roll=1,
+        limit=coupling_limit,
+    )
+    diff = logits_diff(bad.out, bad.ref)
+    assert not math.isfinite(diff) or diff > 100 * coupling_limit
+
+
+@pytest.mark.l2_device
+def test_v2_a8w8_k384_does_not_consume_scale_padding():
+    limit = load_baseline_limit()
+    clean = run_standalone_v2_a8w8(BM=32, BN=128, BK=128, K=384, limit=limit)
+    poisoned = run_standalone_v2_a8w8(
+        BM=32,
+        BN=128,
+        BK=128,
+        K=384,
+        poison_scale_padding=True,
+        limit=limit,
+    )
+    assert not poisoned.out.isnan().any()
+    assert logits_diff(clean.out, clean.ref) <= limit
+    assert logits_diff(poisoned.out, poisoned.ref) <= limit
+    torch.testing.assert_close(poisoned.out, clean.out, rtol=0, atol=0)
+
+
+@pytest.mark.l2_device
+def test_v2_a8w8_scale_poison_negative_control():
+    limit = load_baseline_limit()
+    bad = run_standalone_v2_a8w8(
+        BM=32,
+        BN=128,
+        BK=128,
+        K=384,
+        poison_real_scale=True,
+        limit=limit,
+    )
+    assert bad.out.isnan().any() or logits_diff(bad.out, bad.ref) > 100 * limit
+
+
+@dataclass
+class Stage1ConsistencyCase:
+    data: dict
+    inputs: dict
+    BM: int
+    K: int
+
+    def synthetic_sorted_scale(self):
+        ref1 = self.data["ref1"].contiguous()
+        payload, scale = quant_a(ref1.view(-1, self.K), "fp8")
+        del payload
+        return _mxfp4_a_scale_sorted_shuffled(
+            scale.view(torch.uint8),
+            self.inputs["sti"],
+            self.inputs["cumsum"],
+            self.inputs["max_sorted"],
+            self.K,
+            BM=self.BM,
+            BK=256,
+            source_topk=self.data["topk_ids"].shape[1],
+        )
+
+    def synthetic_payload_and_scale(self):
+        payload, scale = quant_a(self.data["ref1"].contiguous().view(-1, self.K), "fp8")
+        payload = payload.view(torch.uint8).view(-1, self.K)
+        packed = self.inputs["sti"]
+        token = self.data["inp"].shape[0]
+        topk = self.data["topk_ids"].shape[1]
+        token_ids = packed & 0x00FFFFFF
+        slots = (packed >> 24) & 0xFF
+        valid = (token_ids < token) & (slots < topk)
+        source_rows = token_ids * topk + slots
+        sorted_payload = torch.zeros(
+            (self.inputs["max_sorted"], self.K),
+            dtype=torch.uint8,
+            device=payload.device,
+        )
+        sorted_payload[valid] = payload[source_rows[valid].long()]
+        sorted_scale = _mxfp4_a_scale_sorted_shuffled(
+            scale.view(torch.uint8),
+            packed,
+            self.inputs["cumsum"],
+            self.inputs["max_sorted"],
+            self.K,
+            BM=self.BM,
+            BK=256,
+            source_topk=topk,
+        )
+        return sorted_payload, sorted_scale
+
+    def run_real_v2_stage1(self):
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+        a1_scale_sort = moe_mxfp4_sort(
+            self.data["a1_scale"].view(self.data["inp"].shape[0], 1, -1),
+            sorted_ids=self.inputs["sti"],
+            num_valid_ids=self.inputs["cumsum"],
+            token_num=self.data["inp"].shape[0],
+            block_size=self.BM,
+        )
+        result = flydsl_moe_stage1(
+            a=self.data["a1_qt"],
+            w1=self.data["base"]["w1_qt_shuf"],
+            out=self.inputs["isq"],
+            sorted_token_ids=self.inputs["sti"],
+            sorted_expert_ids=self.inputs["sei"],
+            num_valid_ids=self.inputs["cumsum"],
+            topk=self.data["topk_ids"].shape[1],
+            tile_m=self.BM,
+            tile_n=128,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            out_dtype="fp8",
+            act="swiglu",
+            w1_scale=self.data["base"]["w1_scale_shuf"],
+            a1_scale=a1_scale_sort,
+            gate_mode="interleave",
+            a_scale_one=False,
+            v2_output_layout=True,
+        )
+        assert isinstance(result, tuple) and len(result) == 2, (
+            "v2 stage1 must return (out, out_scale_sorted); "
+            "check out_dtype='fp8' and v2_output_layout=True"
+        )
+        return result
+
+    def _valid_routes_and_offsets(self):
+        token = self.data["inp"].shape[0]
+        topk = self.data["topk_ids"].shape[1]
+        padded_cols = ((self.K // 32) + 7) // 8 * 8
+        routes = []
+        offsets = []
+        for row in range(self.inputs["max_sorted"]):
+            packed = int(self.inputs["sti"][row].item())
+            token_id = packed & 0x00FFFFFF
+            slot = (packed >> 24) & 0xFF
+            if token_id >= token or slot >= topk:
+                continue
+            source_row = token_id * topk + slot
+            for k_group in range(self.K // 32):
+                d0 = row // 32
+                d1 = (row // 16) & 1
+                d2 = row & 15
+                d3 = k_group // 8
+                d4 = (k_group // 4) & 1
+                d5 = k_group & 3
+                routes.append((source_row, k_group))
+                offsets.append(
+                    d0 * (padded_cols * 32) + d3 * 256 + d5 * 64 + d2 * 4 + d4 * 2 + d1
+                )
+        return routes, torch.tensor(
+            offsets, dtype=torch.long, device=self.inputs["sti"].device
+        )
+
+    def consumed_scale_bytes(self, scale):
+        _, offsets = self._valid_routes_and_offsets()
+        return scale.view(torch.uint8).view(-1)[offsets]
+
+    def reshuffle_runtime_scale(self, runtime_scale):
+        routes, offsets = self._valid_routes_and_offsets()
+        topk = self.data["topk_ids"].shape[1]
+        logical = torch.zeros(
+            self.data["inp"].shape[0] * topk,
+            self.K // 32,
+            dtype=torch.uint8,
+            device=runtime_scale.device,
+        )
+        physical = runtime_scale.view(torch.uint8).view(-1)
+        for (source_row, k_group), offset in zip(routes, offsets.tolist()):
+            logical[source_row, k_group] = physical[offset]
+        return _mxfp4_a_scale_sorted_shuffled(
+            logical,
+            self.inputs["sti"],
+            self.inputs["cumsum"],
+            self.inputs["max_sorted"],
+            self.K,
+            BM=self.BM,
+            BK=256,
+            source_topk=topk,
+        )
+
+    def required_consumed_bytes(self):
+        routes, _ = self._valid_routes_and_offsets()
+        return len(routes)
+
+    def poison_k_padding(self, scale):
+        poisoned = scale.view(torch.uint8).clone()
+        words = poisoned.view(-1, 4)
+        chunks = (self.K + 255) // 256
+        groups = int(self.inputs["n"]) // 32
+        for group in range(groups):
+            start = (group * chunks + chunks - 1) * 64
+            words[start : start + 64, 2:4] = 0xFF
+        return poisoned
+
+    def run_gemm2(self, payload, scale):
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+        token = self.data["inp"].shape[0]
+        model_dim = self.data["inp"].shape[1]
+        topk = self.data["topk_ids"].shape[1]
+        out = torch.zeros(
+            (token, model_dim), dtype=torch.bfloat16, device=payload.device
+        )
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=payload.view(torch.uint8),
+            inter_sorted_shuffled_scale=scale.view(torch.uint8),
+            w2_u8=self.inputs["w2u8"],
+            w2_scale_u8=self.inputs["w2sc"],
+            sorted_expert_ids=self.inputs["sei"],
+            cumsum_tensor=self.inputs["cumsum"],
+            sorted_token_ids=self.inputs["sti"],
+            sorted_weights=self.inputs["swt"],
+            out=out,
+            M_logical=token,
+            max_sorted=self.inputs["max_sorted"],
+            NE=self.data["w2_qt"].shape[0],
+            D_HIDDEN=model_dim,
+            D_INTER=self.K,
+            topk=topk,
+            BM=self.BM,
+            BN=128,
+            BK=128,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            epilog="atomic",
+            SBM=self.BM,
+            n_sorted_padded=self.inputs["n"],
+        )
+        torch.cuda.synchronize()
+        return out
+
+
+def build_stage1_consistency_case(BM, K):
+    with torch.device("cuda"):
+        data = gen(
+            16,
+            256,
+            K,
+            8,
+            2,
+            BM,
+            adtype="fp8",
+            b_dtype="fp8",
+            activation=ActivationType.Swiglu,
+        )
+        inputs = build_v2_inputs(data, 16, 256, K, 8, 2, BM)
+    return Stage1ConsistencyCase(data=data, inputs=inputs, BM=BM, K=K)
+
+
+@pytest.mark.l2_device
+def test_v2_a8w8_k384_tuner_and_stage1_scale_layout_match():
+    case = build_stage1_consistency_case(BM=32, K=384)
+    synthetic = case.synthetic_sorted_scale()
+    runtime_payload, runtime_scale = case.run_real_v2_stage1()
+    expected_cols = ((384 // 32) + 7) // 8 * 8
+    assert runtime_scale.shape[1] == expected_cols, (
+        "runtime v2 stage1 scale stride diverged from GEMM2's K/256 ABI; "
+        "do not relax this assertion"
+    )
+    assert synthetic.numel() >= case.required_consumed_bytes()
+    assert runtime_scale.numel() >= case.required_consumed_bytes()
+    runtime_roundtrip = case.reshuffle_runtime_scale(runtime_scale)
+    assert torch.equal(
+        case.consumed_scale_bytes(runtime_roundtrip),
+        case.consumed_scale_bytes(runtime_scale.view(torch.uint8)),
+    )
+    synthetic_bytes = case.consumed_scale_bytes(synthetic).to(torch.int16)
+    runtime_bytes = case.consumed_scale_bytes(runtime_scale).to(torch.int16)
+    assert (synthetic_bytes - runtime_bytes).abs().max() <= 1
+
+    ref = v2_stage1_sorted_ref(
+        case.data["ref1"],
+        case.data["topk_ids"],
+        case.inputs["sti"],
+        case.inputs["sei"],
+        case.inputs["n"],
+        token=case.data["inp"].shape[0],
+        inter_dim=case.K,
+        bm_s1=case.BM,
+        max_sorted=case.inputs["max_sorted"],
+    )
+    assert (
+        v2_stage1_dequant_cosine_err(
+            ref,
+            runtime_payload.view(torch.uint8).view(case.inputs["max_sorted"], case.K),
+            printLog=False,
+            inter_dim=case.K,
+            adtype="fp8",
+        )
+        <= 1e-3
+    )
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_scale_comparator_rejects_corruption():
+    case = build_stage1_consistency_case(BM=32, K=384)
+    _, runtime_scale = case.run_real_v2_stage1()
+    scale_ref = v2_stage1_scale_reference(
+        case.data["ref1"],
+        case.inputs["sti"],
+        case.inputs["cumsum"],
+        case.inputs["max_sorted"],
+        token=case.data["inp"].shape[0],
+        topk=case.data["topk_ids"].shape[1],
+        inter_dim=case.K,
+        block_m=case.BM,
+        adtype="fp8",
+    )
+    assert (
+        v2_stage1_compare(
+            scale_ref,
+            runtime_scale.view(torch.uint8),
+            printLog=False,
+            inter_dim=case.K,
+            adtype="fp8",
+        )
+        <= 0.05
+    )
+    corrupted = runtime_scale.view(torch.uint8).clone()
+    corrupted[scale_ref != 0xFF] = 0x7F
+    assert (
+        v2_stage1_compare(
+            scale_ref,
+            corrupted,
+            printLog=False,
+            inter_dim=case.K,
+            adtype="fp8",
+        )
+        > 0.05
+    )
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_scale_comparator_reports_sparse_corruption_fraction():
+    case = build_stage1_consistency_case(BM=32, K=384)
+    scale_ref = v2_stage1_scale_reference(
+        case.data["ref1"],
+        case.inputs["sti"],
+        case.inputs["cumsum"],
+        case.inputs["max_sorted"],
+        token=case.data["inp"].shape[0],
+        topk=case.data["topk_ids"].shape[1],
+        inter_dim=case.K,
+        block_m=case.BM,
+        adtype="fp8",
+    )
+    valid = scale_ref != 0xFF
+    assert 1 / valid.sum().item() < 0.05
+    corrupted = scale_ref.clone()
+    index = tuple(valid.nonzero()[0].tolist())
+    value = int(corrupted[index].item())
+    corrupted[index] = value + 3 if value <= 0xFC else value - 3
+    err = v2_stage1_compare(
+        scale_ref,
+        corrupted,
+        printLog=False,
+        inter_dim=case.K,
+        adtype="fp8",
+    )
+    assert err == pytest.approx(1 / valid.sum().item())
+    assert err < 0.05
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_joint_comparator_rejects_uniform_scale_shift():
+    from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+        v2_stage1_output_compare,
+        v2_stage1_route_mask,
+    )
+
+    case = build_stage1_consistency_case(BM=32, K=384)
+    runtime_payload, _ = case.run_real_v2_stage1()
+    ref = v2_stage1_sorted_ref(
+        case.data["ref1"],
+        case.data["topk_ids"],
+        case.inputs["sti"],
+        case.inputs["sei"],
+        case.inputs["n"],
+        token=case.data["inp"].shape[0],
+        inter_dim=case.K,
+        bm_s1=case.BM,
+        max_sorted=case.inputs["max_sorted"],
+    )
+    scale_ref = v2_stage1_scale_reference(
+        case.data["ref1"],
+        case.inputs["sti"],
+        case.inputs["cumsum"],
+        case.inputs["max_sorted"],
+        token=case.data["inp"].shape[0],
+        topk=case.data["topk_ids"].shape[1],
+        inter_dim=case.K,
+        block_m=case.BM,
+        adtype="fp8",
+    )
+    route_mask = v2_stage1_route_mask(
+        case.inputs["sti"],
+        case.inputs["n"],
+        token=case.data["inp"].shape[0],
+        topk=case.data["topk_ids"].shape[1],
+        max_sorted=case.inputs["max_sorted"],
+    )
+    clean = v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (runtime_payload.view(torch.uint8), scale_ref),
+        printLog=False,
+        inter_dim=case.K,
+        adtype="fp8",
+    )
+    assert clean <= 0.05
+
+    shifted = scale_ref.clone()
+    _, offsets = case._valid_routes_and_offsets()
+    valid_scale = shifted.view(-1)[offsets].to(torch.int16)
+    assert (valid_scale < 0xFF).all()
+    shifted.view(-1)[offsets] = (valid_scale + 1).to(torch.uint8)
+    assert (
+        v2_stage1_compare(
+            scale_ref,
+            shifted,
+            printLog=False,
+            inter_dim=case.K,
+            adtype="fp8",
+        )
+        == 0
+    )
+    corrupted = v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (runtime_payload.view(torch.uint8), shifted),
+        printLog=False,
+        inter_dim=case.K,
+        adtype="fp8",
+    )
+    assert corrupted > 0.05
+
+    sparse = scale_ref.clone()
+    offset = int(offsets[0].item())
+    ref_byte = int(scale_ref.view(-1)[offset].item())
+    sparse.view(-1)[offset] = ref_byte + 3 if ref_byte <= 0xFC else ref_byte - 3
+    sparse_corrupted = v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (runtime_payload.view(torch.uint8), sparse),
+        printLog=False,
+        inter_dim=case.K,
+        adtype="fp8",
+    )
+    assert sparse_corrupted > 0.05
+
+
+def _v2_stage1_explicit_route_case():
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils as tune_utils
+
+    rows = 4
+    inter_dim = 32
+    ref = torch.zeros((rows, inter_dim), dtype=torch.bfloat16)
+    ref[:2] = 1
+    payload = torch.zeros((rows, inter_dim), dtype=torch.float8_e4m3fn)
+    payload[:2] = 1
+    payload = payload.view(torch.uint8)
+    scale_ref = torch.full((256, 8), 0xFF, dtype=torch.uint8)
+    offsets = tune_utils._v2_stage1_scale_offsets(
+        None,
+        rows=torch.arange(rows, dtype=torch.long),
+        inter_dim=inter_dim,
+        max_sorted=rows,
+    ).view(rows, inter_dim // 32)
+    scale_ref.view(-1)[offsets] = 127
+    route_mask = torch.tensor([True, True, True, False])
+    return ref, payload, scale_ref, route_mask, offsets
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_route_mask_does_not_scan_sti_tail():
+    from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_route_mask
+
+    sti = torch.zeros(6, dtype=torch.int32)
+    sti[:3] = torch.arange(3, dtype=torch.int32)
+    route_mask = v2_stage1_route_mask(
+        sti,
+        3,
+        token=3,
+        topk=1,
+        max_sorted=6,
+    )
+
+    assert route_mask.tolist() == [True, True, True, False, False, False]
+    assert int(route_mask.sum()) == 3
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_joint_comparator_validates_zero_ref_route_payload():
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils as tune_utils
+
+    ref, payload, scale_ref, route_mask, _ = _v2_stage1_explicit_route_case()
+    payload[2] = torch.ones(32, dtype=torch.float8_e4m3fn).view(torch.uint8)
+    err = tune_utils.v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (payload, scale_ref),
+        printLog=False,
+        inter_dim=32,
+        adtype="fp8",
+    )
+
+    assert err > 0.05
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_joint_comparator_ignores_zero_ref_route_scale():
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils as tune_utils
+
+    ref, payload, scale_ref, route_mask, offsets = _v2_stage1_explicit_route_case()
+    candidate_scale = scale_ref.clone()
+    candidate_scale.view(-1)[offsets[2]] = 0
+    err = tune_utils.v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (payload, candidate_scale),
+        printLog=False,
+        inter_dim=32,
+        adtype="fp8",
+    )
+
+    assert err == 0
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_joint_comparator_ignores_route_mask_false_tail():
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils as tune_utils
+
+    ref, payload, scale_ref, route_mask, offsets = _v2_stage1_explicit_route_case()
+    payload[3] = torch.ones(32, dtype=torch.float8_e4m3fn).view(torch.uint8)
+    candidate_scale = scale_ref.clone()
+    candidate_scale.view(-1)[offsets[3]] = 0
+    err = tune_utils.v2_stage1_output_compare(
+        (ref, scale_ref, route_mask),
+        (payload, candidate_scale),
+        printLog=False,
+        inter_dim=32,
+        adtype="fp8",
+    )
+
+    assert err == 0
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_joint_comparator_chunks_large_fp8_result(monkeypatch):
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils as tune_utils
+
+    rows = 10_240
+    inter_dim = 32
+    ref = torch.ones((rows, inter_dim), dtype=torch.bfloat16)
+    payload = torch.ones((rows, inter_dim), dtype=torch.float8_e4m3fn).view(torch.uint8)
+    padded_rows = (rows + 255) // 256 * 256
+    scale_ref = torch.full((padded_rows, 8), 0xFF, dtype=torch.uint8)
+    valid_rows = torch.arange(rows, dtype=torch.long)
+    offsets = tune_utils._v2_stage1_scale_offsets(
+        None,
+        rows=valid_rows,
+        inter_dim=inter_dim,
+        max_sorted=rows,
+    )
+    scale_ref.view(-1)[offsets] = 127
+
+    batch_rows = []
+    torch_isclose = torch.isclose
+
+    def record_isclose(a, b, *args, **kwargs):
+        batch_rows.append(a.shape[0])
+        return torch_isclose(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "isclose", record_isclose)
+    err = tune_utils.v2_stage1_output_compare(
+        (ref, scale_ref, torch.ones(rows, dtype=torch.bool)),
+        (payload, scale_ref),
+        printLog=False,
+        inter_dim=inter_dim,
+        adtype="fp8",
+    )
+
+    assert err == 0
+    assert batch_rows == [4096, 4096, 2048]
+
+
+@pytest.mark.l2_device
+def test_v2_stage1_scale_producers_ignore_k_padding_in_chained_gemm2():
+    case = build_stage1_consistency_case(BM=32, K=384)
+    runtime_payload, runtime_scale = case.run_real_v2_stage1()
+    runtime_clean = case.run_gemm2(runtime_payload, runtime_scale)
+    runtime_poisoned = case.run_gemm2(
+        runtime_payload, case.poison_k_padding(runtime_scale)
+    )
+    torch.testing.assert_close(runtime_poisoned, runtime_clean, rtol=0, atol=0)
+
+    synthetic_payload, synthetic_scale = case.synthetic_payload_and_scale()
+    synthetic_clean = case.run_gemm2(synthetic_payload, synthetic_scale)
+    synthetic_poisoned = case.run_gemm2(
+        synthetic_payload, case.poison_k_padding(synthetic_scale)
+    )
+    torch.testing.assert_close(synthetic_poisoned, synthetic_clean, rtol=0, atol=0)
+
+
+@pytest.mark.l2_device
+def test_v2_a8w8_bm16_standalone_only():
+    result = run_standalone_v2_a8w8(
+        BM=16, BN=128, BK=128, K=384, limit=load_baseline_limit()
+    )
+    assert logits_diff(result.out, result.ref) <= result.limit
+
+
+@pytest.mark.l2_device
+@pytest.mark.parametrize(
+    "BM,BN,epilog",
+    [
+        pytest.param(64, 256, "atomic", id="bm64_bn256_atomic_nt"),
+        pytest.param(128, 256, "reduce", id="bm128_bn256_reduce_nt"),
+    ],
+)
+def test_v2_a8w8_large_tile_nt_branches(BM, BN, epilog):
+    limit = load_baseline_limit()
+    result = run_standalone_v2_a8w8(
+        BM=BM,
+        BN=BN,
+        BK=256,
+        K=512,
+        epilog=epilog,
+        use_nt=True,
+        limit=limit,
+    )
+    assert not result.out.isnan().any()
+    assert logits_diff(result.out, result.ref) <= limit

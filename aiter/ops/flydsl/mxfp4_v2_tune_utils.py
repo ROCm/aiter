@@ -1,4 +1,4 @@
-"""Shared v2 gemm1/gemm2 data-prep helpers for dsv4 a8w4 / a4w4 (fp8/fp4 a, fp4 w).
+"""Shared v2 gemm1/gemm2 data-prep helpers for MXFP4/MXFP8 MoE.
 
 Extracted verbatim from bench_gemm12_v2_vs_baseline.py so both the launch-comparison
 bench and the fmoe tuner (csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py) can build
@@ -64,6 +64,22 @@ def quant_a(x, adtype):
 
 def quant_w_fp4(w):
     return per_1x32_f4_quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def quant_w(w, b_dtype):
+    if b_dtype == "fp8":
+        return per_1x32_f8_scale_f8_quant(
+            w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+    return quant_w_fp4(w)
+
+
+def dequant_w(q, scale, b_dtype, rows, cols):
+    values = q.float() if b_dtype == "fp8" else fp4_utils.mxfp4_to_f32(q)
+    scale_f32 = fp4_utils.e8m0_to_f32(scale)
+    return (
+        values.view(rows, cols // 32, 32) * scale_f32.view(rows, cols // 32, 1)
+    ).view(rows, cols)
 
 
 def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
@@ -230,6 +246,7 @@ def gen(
     topk,
     block_m,
     adtype="fp8",
+    b_dtype="fp4",
     activation=ActivationType.Silu,
     situ_beta=DEFAULT_SITUV2_BETA,
     situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -241,25 +258,19 @@ def gen(
     score = balanced_score(token, E, topk, dtypes.bf16)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
-    w1_qt, w1_scale = quant_w_fp4(w1)  # fp4x2 weights + e8m0 scale
-    w2_qt, w2_scale = quant_w_fp4(w2)  # fp4x2 weights + e8m0 scale
+    w1_qt, w1_scale = quant_w(w1, b_dtype)
+    w2_qt, w2_scale = quant_w(w2, b_dtype)
     a1_qt, a1_scale = quant_a(inp, adtype)  # fp8 (a8w4) or fp4 (a4w4) activations
 
     # torch reference stage1 (dequant the SAME quantized operands the kernels read)
     a_deq = _a_deq(a1_qt, a1_scale, token, model_dim, adtype)
     w1_deq = (
-        (
-            fp4_utils.mxfp4_to_f32(w1_qt).view(E, inter_dim * 2, model_dim // 32, 32)
-            * fp4_utils.e8m0_to_f32(w1_scale).view(E, inter_dim * 2, model_dim // 32, 1)
-        )
+        dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim)
         .view(E, inter_dim * 2, model_dim)
         .to(dtypes.bf16)
     )
     w2_deq = (
-        (
-            fp4_utils.mxfp4_to_f32(w2_qt).view(E, model_dim, inter_dim // 32, 32)
-            * fp4_utils.e8m0_to_f32(w2_scale).view(E, model_dim, inter_dim // 32, 1)
-        )
+        dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim)
         .view(E, model_dim, inter_dim)
         .to(dtypes.bf16)
     )
@@ -286,6 +297,22 @@ def gen(
         quant_type=QuantType.No,
         doweight=True,
     )  # [token, hidden]
+    a2_ref_q, a2_ref_scale = quant_a(
+        ref1.contiguous().view(token * topk, inter_dim), adtype
+    )
+    a2_ref_deq = _a_deq(a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype).view(
+        token, topk, inter_dim
+    )
+    ref2_quantized = torch_moe_stage2(
+        a2_ref_deq,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.No,
+        doweight=True,
+    )
 
     # ---- baseline (aiter mixed_moe stage1) prep ----
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
@@ -293,14 +320,22 @@ def gen(
     )
     # w1/w1_scale preshuffle depends on the activation dtype (a8w4 vs a4w4);
     # see _baseline_w1_shuffle. w2 always uses the a16w4 down-proj layout.
-    w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
+    if b_dtype == "fp8":
+        w1_qt_shuf = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2_scale_shuf = e8m0_shuffle(w2_scale)
+    else:
+        w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
+        w2_qt_shuf = _mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False)
+        w2_scale_shuf = _mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False)
     base = {
         "a1_qt": a1_qt,
         "adtype": adtype,
         "w1_qt_shuf": w1_qt_shuf,
         "w1_scale_shuf": w1_scale_shuf,
-        "w2_qt_shuf": _mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False),
-        "w2_scale_shuf": _mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False),
+        "w2_qt_shuf": w2_qt_shuf,
+        "w2_scale_shuf": w2_scale_shuf,
         "a1_scale_sort": moe_mxfp4_sort(
             a1_scale[:token, :].view(token, 1, -1),
             sorted_ids=sorted_ids,
@@ -333,6 +368,7 @@ def gen(
     return {
         "ref1": ref1,
         "ref2": ref2,
+        "ref2_quantized": ref2_quantized,
         "topk_ids": topk_ids,
         "topk_weights": topk_weights,
         "w1_qt": w1_qt,
@@ -345,6 +381,7 @@ def gen(
         "base": base,
         "adtype": adtype,
         "stage2_adtype": adtype,
+        "b_dtype": b_dtype,
     }
 
 
@@ -353,10 +390,10 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     device = "cuda"
     H, INTER, NE, TOPK = model_dim, inter_dim, E, topk
     SBM = BM_S1
-    w1u8 = _u8v(_mxfp4_shuffle_weight_a16w4(d["w1_qt"], gate_up=True))
-    w1sc = _u8v(_mxfp4_shuffle_scale_a16w4(d["w1_scale"], NE, gate_up=True))
-    w2u8 = _u8v(_mxfp4_shuffle_weight_a16w4(d["w2_qt"], gate_up=False))
-    w2sc = _u8v(_mxfp4_shuffle_scale_a16w4(d["w2_scale"], NE, gate_up=False))
+    w1u8 = _u8v(d["base"]["w1_qt_shuf"])
+    w1sc = _u8v(d["base"]["w1_scale_shuf"])
+    w2u8 = _u8v(d["base"]["w2_qt_shuf"])
+    w2sc = _u8v(d["base"]["w2_scale_shuf"])
 
     topk_ids_i32 = d["topk_ids"].to(torch.int32)
     topk_w_f32 = d["topk_weights"].to(torch.float32)
@@ -502,6 +539,7 @@ def populate_baseline_v2_intermediate(
         block_size=BM_S1,
     )
     adtype = d["base"].get("adtype", "fp8")
+    b_dtype = d.get("b_dtype", "fp4")
     stage2_adtype = d["base"].get("a2_dtype", adtype)
     default_gate = "interleave" if adtype == "fp8" else "separated"
     gate_mode = params.get("gate_mode", default_gate)
@@ -509,7 +547,7 @@ def populate_baseline_v2_intermediate(
         _kn1 = flydsl_kernel_name(
             1,
             adtype,
-            "fp4",
+            b_dtype,
             stage2_adtype,
             params["tile_m"],
             params["tile_n"],
@@ -519,7 +557,7 @@ def populate_baseline_v2_intermediate(
         _bnt = params.get("b_nt", 2)
         print(
             f"[gemm1 producer] baseline flydsl_moe_stage1 (v2 layout)  "
-            f"kernel={_kn1}  a_dtype={adtype} b_dtype=fp4 out={stage2_adtype}  "
+            f"kernel={_kn1}  a_dtype={adtype} b_dtype={b_dtype} out={stage2_adtype}  "
             f"gate={gate_mode} k_wave={_kw} b_nt={_bnt}  "
             f"tile=({params['tile_m']}x{params['tile_n']}x{params['tile_k']})"
         )
@@ -535,7 +573,7 @@ def populate_baseline_v2_intermediate(
         tile_n=params["tile_n"],
         tile_k=params["tile_k"],
         a_dtype=adtype,
-        b_dtype="fp4",
+        b_dtype=b_dtype,
         out_dtype=stage2_adtype,
         act=get_flydsl_activation_name(activation),
         situ_beta=situ_beta,
@@ -594,3 +632,188 @@ def v2_stage1_dequant_cosine_err(ref, res, msg="", printLog=True, *, inter_dim, 
     if printLog:
         print(f"{msg}[v2_stage1 cos={cos:.4f} err={err:.4f}]")
     return max(err, 0.0)
+
+
+def _v2_stage1_scale_offsets(
+    sti, *, token=None, topk=None, inter_dim, max_sorted, rows=None
+):
+    if rows is None:
+        rows = torch.arange(max_sorted, dtype=torch.long, device=sti.device)
+        packed = sti[:max_sorted]
+        token_ids = packed & 0x00FFFFFF
+        slots = (packed >> 24) & 0xFF
+        rows = rows[(token_ids < token) & (slots < topk)]
+    k_groups = torch.arange(inter_dim // 32, dtype=torch.long, device=rows.device)
+    row = rows[:, None]
+    k_group = k_groups[None, :]
+    padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+    offsets = (
+        (row // 32) * (padded_cols * 32)
+        + (k_group // 8) * 256
+        + (k_group & 3) * 64
+        + (row & 15) * 4
+        + ((k_group // 4) & 1) * 2
+        + ((row // 16) & 1)
+    )
+    return offsets.reshape(-1)
+
+
+def v2_stage1_route_mask(sti, n, *, token, topk, max_sorted):
+    route_mask = torch.zeros(max_sorted, dtype=torch.bool, device=sti.device)
+    prefix = min(int(n), max_sorted, sti.shape[0])
+    packed = sti[:prefix]
+    token_ids = packed & 0x00FFFFFF
+    slots = (packed >> 24) & 0xFF
+    route_mask[:prefix] = (token_ids < token) & (slots < topk)
+    return route_mask
+
+
+def v2_stage1_scale_reference(
+    ref1,
+    sti,
+    cumsum,
+    max_sorted,
+    *,
+    token,
+    topk,
+    inter_dim,
+    block_m,
+    adtype,
+):
+    _, scale = quant_a(ref1.contiguous().view(token * topk, inter_dim), adtype)
+    sorted_scale = _mxfp4_a_scale_sorted_shuffled(
+        scale.view(torch.uint8),
+        sti,
+        cumsum,
+        max_sorted,
+        inter_dim,
+        BM=block_m,
+        BK=256,
+        source_topk=topk,
+    )
+    padded_rows = (max_sorted + 255) // 256 * 256
+    padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+    masked = torch.full(
+        (padded_rows, padded_cols),
+        0xFF,
+        dtype=torch.uint8,
+        device=ref1.device,
+    )
+    offsets = _v2_stage1_scale_offsets(
+        sti,
+        token=token,
+        topk=topk,
+        inter_dim=inter_dim,
+        max_sorted=max_sorted,
+    )
+    masked.view(-1)[offsets] = sorted_scale.view(torch.uint8).view(-1)[offsets]
+    return masked
+
+
+# Bound FP32 payload/reference temporaries while amortizing GPU dispatch overhead.
+_V2_STAGE1_COMPARE_CHUNK_ROWS = 4096
+
+
+def _v2_stage1_scale_delta(ref, res):
+    valid = ref != 0xFF
+    if not valid.any():
+        return None
+    return (
+        ref[valid].to(torch.int16) - res.view(torch.uint8)[valid].to(torch.int16)
+    ).abs()
+
+
+def v2_stage1_compare(ref, res, msg="", printLog=True, *, inter_dim, adtype):
+    if ref.dtype == torch.uint8:
+        delta = _v2_stage1_scale_delta(ref, res)
+        if delta is None:
+            return 1.0
+        err = float((delta > 1).float().mean())
+        if printLog:
+            print(
+                f"{msg}[v2_stage1 scale err={err:.4f} "
+                f"max_exp_delta={int(delta.max())}]"
+            )
+        return err
+    return v2_stage1_dequant_cosine_err(
+        ref,
+        res,
+        msg=msg,
+        printLog=printLog,
+        inter_dim=inter_dim,
+        adtype=adtype,
+    )
+
+
+def v2_stage1_output_compare(
+    refs,
+    results,
+    msg="",
+    printLog=True,
+    *,
+    inter_dim,
+    adtype,
+    rtol=0.1,
+    atol=0.1,
+):
+    ref, scale_ref, route_mask = refs
+    payload, scale = results
+    valid = route_mask.nonzero(as_tuple=True)[0]
+    if valid.numel() == 0:
+        return 1.0
+
+    k_groups = inter_dim // 32
+    payload_u8 = payload.view(torch.uint8).reshape(ref.shape[0], inter_dim)
+    scale_ref_u8 = scale_ref.view(torch.uint8).reshape(-1)
+    scale_u8 = scale.view(torch.uint8).reshape(-1)
+    mismatches = torch.zeros((), dtype=torch.long, device=ref.device)
+    max_scale_delta = torch.zeros((), dtype=torch.int16, device=ref.device)
+    compared = 0
+    for start in range(0, valid.numel(), _V2_STAGE1_COMPARE_CHUNK_ROWS):
+        rows = valid[start : start + _V2_STAGE1_COMPARE_CHUNK_ROWS]
+        offsets = _v2_stage1_scale_offsets(
+            None,
+            rows=rows,
+            inter_dim=inter_dim,
+            max_sorted=ref.shape[0],
+        )
+        logical_scale_ref = scale_ref_u8[offsets].view(rows.numel(), k_groups)
+        logical_scale = scale_u8[offsets].view(rows.numel(), k_groups)
+        ref_chunk = ref[rows].float()
+        scale_rows = ref_chunk.abs().sum(dim=1) > 0
+        scale_delta = (
+            logical_scale_ref.to(torch.int16) - logical_scale.to(torch.int16)
+        ).abs()
+        scale_delta = torch.where(scale_rows[:, None], scale_delta, 0)
+        max_scale_delta = torch.maximum(
+            max_scale_delta,
+            scale_delta.max(),
+        )
+        values = (
+            payload_u8[rows]
+            .view(torch.float8_e4m3fn)
+            .float()
+            .view(rows.numel(), k_groups, 32)
+        )
+        values.mul_(
+            fp4_utils.e8m0_to_f32(logical_scale).view(rows.numel(), k_groups, 1)
+        )
+        isclose = torch.isclose(
+            ref_chunk,
+            values.view(rows.numel(), inter_dim),
+            rtol=rtol,
+            atol=atol,
+        )
+        mismatches += (~isclose).sum()
+        compared += isclose.numel()
+    max_exp_delta = int(max_scale_delta)
+    if max_exp_delta > 1:
+        if printLog:
+            print(
+                f"{msg}[v2_stage1 scale err=1.0000 " f"max_exp_delta={max_exp_delta}]"
+            )
+        return 1.0
+    err = float(mismatches) / compared
+    if printLog:
+        print(f"{msg}[v2_stage1 joint err={err:.4f} {atol=} {rtol=}]")
+    return err

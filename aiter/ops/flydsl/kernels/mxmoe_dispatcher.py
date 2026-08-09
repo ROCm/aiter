@@ -39,6 +39,15 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
     return sort_blocks * (SBM // BM)
 
 
+def _validate_v2_gemm2_dtypes(a_dtype: str, b_dtype: str) -> None:
+    if (a_dtype, b_dtype) not in {
+        ("fp4", "fp4"),
+        ("fp8", "fp4"),
+        ("fp8", "fp8"),
+    }:
+        raise AssertionError(f"unsupported v2 GEMM2 dtype pair {(a_dtype, b_dtype)!r}")
+
+
 # ---- gemm2 (down-proj) compile ----
 def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     """ck_tile GemmSpatiallyLocalTilePartitioner::GetOutputTileIndex: 1D block id -> spatially-local (m_block_idx, n_block_idx). block_1d_id/M0 runtime; N0/group_num/m01 compile-time."""
@@ -94,6 +103,7 @@ def compile_gemm2_a4w4_port(
     epilog="atomic",
     INTER_MAX=8192,
     a_dtype="fp4",
+    b_dtype="fp4",
     topk=1,
     SBM=None,
     persist=False,
@@ -153,8 +163,7 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
-    if a_dtype not in ("fp4", "fp8"):
-        raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
@@ -181,6 +190,7 @@ def compile_gemm2_a4w4_port(
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
+    btag = "_w8" if b_dtype == "fp8" else ""
     etag = "atomic" if not use_reduce else f"reduce_tk{topk}"
     sbm_tag = "" if SBM == BM else f"_sbm{SBM}"
     if persist and cu_num <= 0:
@@ -207,7 +217,7 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -290,6 +300,7 @@ def compile_gemm2_a4w4_port(
                 aStages=aStages,
                 a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
+                b_dtype=b_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
                 has_pad=has_pad,
@@ -466,6 +477,7 @@ def get_g2(
     epilog,
     INTER_MAX,
     a_dtype,
+    b_dtype="fp4",
     topk=1,
     SBM=None,
     persist=False,
@@ -502,6 +514,7 @@ def get_g2(
         epilog,
         INTER_MAX,
         a_dtype,
+        b_dtype,
         topk_key,
         SBM,
         persist,
@@ -525,6 +538,7 @@ def get_g2(
             epilog=epilog,
             INTER_MAX=INTER_MAX,
             a_dtype=a_dtype,
+            b_dtype=b_dtype,
             topk=topk_key,
             SBM=SBM,
             persist=persist,
@@ -563,6 +577,7 @@ def mxfp4_moe_gemm2(
     BK=256,
     use_nt=False,
     a_dtype="fp4",
+    b_dtype="fp4",
     epilog="atomic",
     SBM=None,
     persist=False,
@@ -580,6 +595,7 @@ def mxfp4_moe_gemm2(
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
 
+    _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
@@ -618,6 +634,7 @@ def mxfp4_moe_gemm2(
         INTER_MAX,
         a_dtype,
         g2_kstatic=_kstatic,
+        b_dtype=b_dtype,
         topk=topk,
         SBM=SBM,
         persist=persist,
