@@ -20,6 +20,7 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     lds_addr_keepalive,
+    sgpr_opaque,
     make_lds_copy_ops,
     pipeline_fence,
     situv2_consts,
@@ -278,6 +279,18 @@ def launch_gemm_a8w4_tdm(
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
+
+        def buf_ptr_opaque(s):
+            """``buf_ptr`` with the stage base hidden from constant folding.
+
+            Only needed on the constexpr-unrolled drain tail; see sgpr_opaque.
+            """
+            return fx.index_cast(
+                T.index,
+                fx.Int32(
+                    sgpr_opaque(fx.index_cast(T.i32, ptr_to_idx(buf_ptr(s))))
+                ),
+            )
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -669,7 +682,30 @@ def launch_gemm_a8w4_tdm(
         ]
         xt_wt = [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
         xt_sc = fx.make_rmem_tensor(wmma_m_rep + wmma_n_rep, fx.Int32)
-
+        # Cross-tile carry for one k128 of A/B/scales. The k-tile loop is a runtime
+        # scf.for, so this cannot ride a Python value across iterations: it lives
+        # in fixed rmem that persists across the loop, exactly like c_frags. One
+        # set is enough -- a tile reads it for subtile 0 and overwrites it on its
+        # last subtile, so the read always precedes the write. Scales are packed
+        # into one tensor because rmem SSA promotion wants a vector store/load and
+        # a width-1 vector leaves a poison lane.
+        xt_act = [
+            fx.make_rmem_tensor(ACT_NDW, fx.Int32)
+            for _ in range_constexpr(wmma_m_rep)
+        ]
+        xt_wt = [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
+        xt_sc = fx.make_rmem_tensor(wmma_m_rep + wmma_n_rep, fx.Int32)
+        # NOTE: carrying the four LDS region bases across the k-tile back-edge
+        # was tried and reverted. The next tile's ``bases`` really is this tile's
+        # ``xt_bases`` (same four addresses), and handing them over via fixed
+        # rmem worked exactly as intended -- main loop 357 -> 346 instrs, address
+        # v_adds 6 -> 3, s_set_vgpr_msb 64 -> 49, depctr unchanged at 3. But it
+        # cost 3 epilogue spills that four attempts could not clear (dropping the
+        # xt pin, sweeping FENCE_COVER_MMA, chaining the unrolled drain tail),
+        # and an interleaved same-sitting A/B measured it 1.2% slower overall
+        # (3916.4 vs 3870.8 us; gemm1 alone 2.4%). Recomputing the base from its
+        # scalar stage base is simply cheaper here than keeping four VGPRs live
+        # across the back-edge at this occupancy.
         def xt_store(bases):
             """Load subtile 0 of the buffer ``bases`` points at into the carry."""
             ba, bb, bsa, bsb = bases
@@ -793,6 +829,10 @@ def launch_gemm_a8w4_tdm(
             # matrix-pipe drain per site, while clustering them here collapses
             # them into a single drain, placed where the pipe is already
             # quiesced by the caller's barrier/fence.
+            # In the rolled steady loop ``bases`` arrives from the previous
+            # iteration's xt_bases (identical addresses), so only the next
+            # tile's set is computed here. The unrolled drain tail has no
+            # predecessor to carry from and computes both.
             bases = bases_of(buf)
             xt_bases = bases_of(nxt_buf) if const_expr(nxt_buf is not None) else None
             # Hoisting in the source alone is not enough -- the backend happily
@@ -1036,14 +1076,14 @@ def launch_gemm_a8w4_tdm(
                 unswitch(steady_mid)
                 for j in range_constexpr(PRE):
                     kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                    buf = buf_ptr_opaque(kt % num_buffers)
                     has_next = XT and j + 1 < PRE
                     if const_expr(not XT):
                         pipeline_fence(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                         )
                     nxt_buf = (
-                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        buf_ptr_opaque((kt + 1) % num_buffers)
                         if const_expr(has_next)
                         else None
                     )
