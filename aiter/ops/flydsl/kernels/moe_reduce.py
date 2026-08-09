@@ -27,19 +27,11 @@ from flydsl.expr.typing import T
 from .mxfp4_gemm_common import FP8OUT_SCALE_BLK, fp8out_row_bytes
 
 BLOCK = 256
-MAX_BLOCK = 1024  # AMDGPU workgroup limit
-WAVE = 64
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
-def _reduce_block(model_dim, V):
-    exact_block = model_dim // V
-    if model_dim % V or exact_block % WAVE or not 0 < exact_block <= MAX_BLOCK:
-        return BLOCK
-    return exact_block
-
-
-def _moe_reduction_kernel(
+@flyc.kernel
+def moe_reduction_kernel(
     X: fx.Pointer,
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
@@ -53,7 +45,6 @@ def _moe_reduction_kernel(
     num_experts: fx.Constexpr[int],
     out_dtype_str: fx.Constexpr[str],
     use_weight: fx.Constexpr[bool],
-    block_size: fx.Constexpr[int],
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
 ):
@@ -80,7 +71,7 @@ def _moe_reduction_kernel(
         load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
     out_bytes = out_numeric.width // 8
     is_16b = out_numeric.width < 32
-    TILE = block_size * V
+    TILE = BLOCK * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
     token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
@@ -133,9 +124,9 @@ def _moe_reduction_kernel(
             f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
         )
 
-    # Tiled copy: block_size threads across the tile, V contiguous elems per thread.
+    # Tiled copy: BLOCK threads across the tile, V contiguous elems per thread.
     tile_mn, tv_layout = fx.make_layout_tv(
-        fx.make_layout((1, block_size), (1, 1)), fx.make_layout((1, V), (1, 1))
+        fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, V), (1, 1))
     )
     thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
@@ -203,15 +194,6 @@ def _moe_reduction_kernel(
         _reduce_tile()
 
 
-@functools.cache
-def _reduction_kernel(block_size: int):
-    return flyc.kernel(
-        _moe_reduction_kernel,
-        name=f"moe_reduction_kernel_b{block_size}",
-        known_block_size=[block_size, 1, 1],
-    )
-
-
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
     *,
@@ -231,10 +213,8 @@ def compile_moe_reduction(
     stays correct.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
-    block = _reduce_block(model_dim, V)
-    gy = (model_dim + block * V - 1) // (block * V)
+    gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
     out_tag = out_dtype_str or dtype_str
-    kern = _reduction_kernel(block)
     if dtype_str == "fp8":
         if FP8OUT_SCALE_BLK % FP8_VEC:
             raise ValueError(
@@ -255,7 +235,7 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        kern(
+        moe_reduction_kernel(
             X,
             Y,
             expert_mask,
@@ -269,11 +249,10 @@ def compile_moe_reduction(
             num_experts,
             out_tag,
             use_weight,
-            block,
             scale_blk,
             fp8_row_stride,
         ).launch(
-            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(block, 1, 1), stream=stream
+            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
     return launch
