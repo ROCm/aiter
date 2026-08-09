@@ -605,6 +605,7 @@ def launch_gemm_a8w4_tdm(
         #   FENCE_COVER_MMA (front=0.5): 8 -> 3892.5, 16 -> 3841.5, 24 -> 3903.6, 32 -> 3907.5
         # At 0.5/16 the ISA shows 40 wmma between the last ds_read and the fence
         # (was 0), 3841.5 vs 3992.2 baseline (-3.8%), and spills drop 4 -> 0.
+        PRE_FENCE_WM = 0
         FENCE_READ_FRONT = 0.5
         FENCE_COVER_MMA = 16
         # NOTE: reordering wmma above the fence in the *source* does not work --
@@ -714,6 +715,18 @@ def launch_gemm_a8w4_tdm(
             else:
                 prefetch = None
             if const_expr(xt_bases is not None):
+                # Push some of THIS subtile's mma ahead of the fence. They read
+                # act/wt that the previous k128 already prefetched into registers
+                # and touch no LDS, so they are independent of both the READY
+                # tensorcnt and the REUSE barrier -- pure cover for the global
+                # TDM wait. Only reachable now that each k128 is its own
+                # scheduling region; without that the backend hoisted them back.
+                if const_expr(PRE_FENCE_WM > 0):
+                    mma_rows(
+                        FRONT[:PRE_FENCE_WM], act[:PRE_FENCE_WM], wt, sa_k, sb_k
+                    )
+                    rocdl.sched_mfma(PRE_FENCE_WM * wmma_n_rep)
+                    rocdl.sched_barrier(0)
                 # ``xt_bases`` is read only here, at the tail of this tile, so its
                 # READY fence belongs here and not at the tile top: the TDM gets
                 # this tile's whole compute to land. The barrier is not optional --
@@ -729,7 +742,11 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(issue_fn is not None):
                     issue_fn()
                 xt_store(xt_bases)
-            mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
+                mma_rows(
+                    FRONT[PRE_FENCE_WM:], act[PRE_FENCE_WM:front_wm], wt, sa_k, sb_k
+                )
+            else:
+                mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, act[front_wm:], wt, sa_k, sb_k)
             return prefetch
@@ -799,13 +816,13 @@ def launch_gemm_a8w4_tdm(
                     previous = current
                 return counts
 
-            def emit_hints(ksl, tail_mfma=0):
+            def emit_hints(ksl, tail_mfma=0, pre_mfma=0):
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and nxt_buf is not None
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not from_xt else 0)
-                mma_total = front_mma + back_mma - tail_mfma
+                mma_total = front_mma + back_mma - tail_mfma - pre_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 # Every group boundary is also a point where a base/ds dependency
@@ -826,6 +843,19 @@ def launch_gemm_a8w4_tdm(
                 # read a couple of instructions from that fence by construction,
                 # and s_wait_dscnt(0) waits on every outstanding read -- so one
                 # late read costs the full LDS latency (~100 cycles) per k-tile.
+                # A wmma holds the matrix pipe 8 cycles and only 3 of those can
+                # issue anything else, so ideally no gap between mfma groups
+                # exceeds 3 non-mfma instructions. That is not reachable here:
+                # every mfma<->ds transition costs 2 s_set_vgpr_msb (the kernel
+                # runs at 966 VGPRs, so mfma and ds destinations live in
+                # different banks), leaving room for a single ds per gap. Capping
+                # ds per slot at 3 or 4 was tried and does not help -- it only
+                # splits the same reads into more gaps, each still over budget
+                # (68% of gaps vs 61%, 3871.6 / 3877.1 us vs 3841.5). Driving
+                # mma_group to 2 does reach 0% violations and maxDsRun 3, but
+                # doubles the msb count: loop 366 -> 408 instrs, spills 0 -> 4,
+                # 3944.1 us. Escaping this needs VGPRs under the banking
+                # threshold (w2x4 halves the accumulators), not a hint change.
                 ds_slots = (
                     max(1, int(schedule_slots * FENCE_READ_FRONT))
                     if (tail_mfma > 0)
@@ -885,6 +915,9 @@ def launch_gemm_a8w4_tdm(
                     ksl,
                     FENCE_COVER_MMA
                     if (ksl + 1 < KWS and xt_bases is not None)
+                    else 0,
+                    PRE_FENCE_WM * wmma_n_rep
+                    if (xt_b is not None and PRE_FENCE_WM > 0)
                     else 0,
                 )
                 # One scheduling region per k128 rather than one per tile.
