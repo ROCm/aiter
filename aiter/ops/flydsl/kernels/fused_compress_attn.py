@@ -81,7 +81,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtypeInt,
 )
@@ -99,6 +98,79 @@ from .tensor_shim import _run_compiled, _to_raw
 def _velem(vec, i):
     """Element *i* of *vec* as a raw ir.Value (this kernel feeds raw MLIR ops)."""
     return _to_raw(fx.Vector(vec)[i])
+
+
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored (rsrc, element_offset) buffer shim with a typed
+# buffer tensor built from the tensor's base pointer. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`. An i8-typed buffer therefore makes
+# `group_index` a byte offset, covering the old offset_is_bytes=True stores.
+#
+# A buffer bakes in (elem_ty, width); build one per (tensor, dtype, width) used.
+# Loads/stores return / accept raw ir.Values, matching the old shim contract so
+# the raw-MLIR call sites in this kernel need no rewrapping.
+# ---------------------------------------------------------------------------
+def _make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = fx.Vector(fragment.load())
+    return _to_raw(value[0]) if width == 1 else _to_raw(value)
+
+
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(
+        fx.Vector.from_elements([value], elem_ty)
+        if width == 1
+        else fx.Vector(value)
+    )
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
+
+
+def _make_rsrc(tensor, max_size=True):
+    """Raw AMD buffer descriptor (``!llvm.ptr<8>``) for a tensor, dtype-agnostic.
+
+    The shared nm-asm scatter emitter (byte-identical across CSA / HCA /
+    gfx1250) takes a bare rsrc and drives the ROCDL raw-buffer store itself, so
+    that path stays on the descriptor form rather than the fx.copy surface.
+    """
+    return fx.rocdl.get_buffer_rsrc(
+        fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size))
+    )
+
+
+def _store_dwords_at_byte(byte_buf, byte_off, dwords):
+    """Store the i32 values ``dwords`` (a single ir.Value or a list) at
+    ``byte_off`` (in BYTES) through an i8 buffer, reinterpreting the payload as an
+    i8 vector.
+
+    Replaces the old offset_is_bytes=True dword stores: the i8 buffer's element
+    index IS the byte offset (no scaling), while the BufferCopy width stays a
+    whole number of dwords (emits buffer_store_dword{,xN}).
+    """
+    dw_list = dwords if isinstance(dwords, (list, tuple)) else [dwords]
+    v_i8 = fx.Vector.from_elements(list(dw_list), fx.Int32).bitcast(fx.Int8)
+    _buffer_store(byte_buf, byte_off, v_i8, fx.Int8, 4 * len(dw_list))
 
 
 # --- shape constants --------------------------------------------------------
@@ -354,9 +426,9 @@ def _build_kernel(
         # Fuse the 4 scalar loads into one buffer_load_dwordx4 + 4 extracts --
         # saves 3 buffer-load instructions per program (visible at small N
         # where total program count is low).
-        plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
+        plan_buf = _make_buffer(plan, fx.Int32, 4)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
-        plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
+        plan_vec = _buffer_load(plan_buf, plan_base, fx.Int32, 4)
         ragged_id = _velem(plan_vec, 0)
         batch_id = _velem(plan_vec, 1)
         position = _velem(plan_vec, 2)
@@ -370,12 +442,8 @@ def _build_kernel(
         # thread) and lowers it to scf.if, guarding every store inside.
         def _body():
             # ---- Step 3: per-seq state slot ----
-            slot_map_rsrc = buffer_ops.create_buffer_resource(
-                state_slot_mapping, max_size=True
-            )
-            slot = buffer_ops.buffer_load(
-                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
-            )
+            slot_map_buf = _make_buffer(state_slot_mapping, fx.Int32)
+            slot = _buffer_load(slot_map_buf, batch_id, fx.Int32)
 
             # ---- Step 4: per-thread element-range bookkeeping ----
             # This thread owns columns [tid*VEC, tid*VEC+VEC) of BLOCK_D.
@@ -447,67 +515,63 @@ def _build_kernel(
                     )
                 return new_m, new_kv, new_w
 
-            def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
+            def _load_bf16_vec_then_f32(buf, off_elems_i32):
                 """Load VEC bf16 from byte-aligned dword stream -> fp32 VEC scalars.
 
-                Returns a list of VEC fp32 MLIR values.
+                ``buf`` is an i32 buffer over the bf16 tensor (built at width
+                BF16_DW). Returns a list of VEC fp32 MLIR values.
                 """
                 off_dw = ArithValue(off_elems_i32) >> arith.constant(1, type=i32)
                 # bf16 VEC = VEC * 2 bytes; for VEC ? {2, 4, 8} that's
                 # {4, 8, 16} bytes = {1, 2, 4} dwords.
                 dwords = (VEC + 1) // 2  # ceil(VEC*2 / 4)
                 if const_expr(dwords == 1):
-                    # buffer_load(vec_width=1) returns a scalar i32; wrap into
-                    # vec<1xi32> before bitcasting to vec<2xbf16>.
-                    raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
+                    # width-1 load returns a scalar i32; wrap into vec<1xi32>
+                    # before bitcasting to vec<2xbf16>.
+                    raw_s = _buffer_load(buf, off_dw, fx.Int32)
                     raw = fx.Vector.from_elements([raw_s], fx.Int32)
                 else:
-                    raw = buffer_ops.buffer_load(
-                        rsrc, off_dw, vec_width=dwords, dtype=i32
-                    )
+                    raw = _buffer_load(buf, off_dw, fx.Int32, dwords)
                 vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
                     out.append(arith.extf(f32, _to_raw(_velem(vec_bf16, i))))
                 return out
 
-            def _load_f32_vec(rsrc, off_elems_i32):
+            def _load_f32_vec(buf, off_elems_i32):
                 """Load VEC fp32 from byte-aligned stream -> list of VEC fp32 scalars.
 
-                For VEC=2 -> dwordx2; VEC=4 -> dwordx4; VEC=8 -> 2x dwordx4 (HW max).
+                ``buf`` is an f32 buffer built at width F32_VW. For VEC=2 ->
+                dwordx2; VEC=4 -> dwordx4; VEC=8 -> 2x dwordx4 (HW max).
                 """
                 if const_expr(VEC <= 4):
-                    vw = VEC
-                    raw = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=vw, dtype=f32
-                    )
+                    raw = _buffer_load(buf, off_elems_i32, fx.Float32, VEC)
                     return [_to_raw(_velem(raw, i)) for i in range(VEC)]
                 else:
                     # VEC == 8 -> 2x dwordx4
                     assert VEC == 8
                     half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=half, dtype=f32
-                    )
-                    r1 = buffer_ops.buffer_load(
-                        rsrc,
+                    r0 = _buffer_load(buf, off_elems_i32, fx.Float32, half)
+                    r1 = _buffer_load(
+                        buf,
                         ArithValue(off_elems_i32) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
+                        fx.Float32,
+                        half,
                     )
                     v0, v1 = fx.Vector(r0), fx.Vector(r1)
                     return [_to_raw(v0[i]) for i in range_constexpr(half)] + [
                         _to_raw(v1[i]) for i in range_constexpr(half)
                     ]
 
-            # Buffer resources reused across K iters.
-            kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
-            score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
-            score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
-            )
-            ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+            # Buffers reused across K iters. bf16 tensors are read as i32 dword
+            # streams (width BF16_DW); f32 tensors at width F32_VW.
+            F32_VW = VEC if VEC <= 4 else VEC // 2
+            BF16_DW = (VEC + 1) // 2
+            kv_in_buf = _make_buffer(kv_in, fx.Int32, BF16_DW)
+            score_in_buf = _make_buffer(score_in, fx.Int32, BF16_DW)
+            kv_state_buf = _make_buffer(kv_state, fx.Float32, F32_VW)
+            score_state_buf = _make_buffer(score_state, fx.Float32, F32_VW)
+            ape_buf = _make_buffer(ape, fx.Float32, F32_VW)
 
             def _col_off_for_k(k_static_val):
                 """Compute col_off ? {0, D} for OVERLAP (==head_dim when k >= RATIO),
@@ -565,8 +629,8 @@ def _build_kernel(
                     + tid_x_vec
                 )
 
-                kv_v_lane = _load_f32_vec(kv_state_rsrc, base_kv_off)
-                sc_v_lane = _load_f32_vec(score_state_rsrc, base_sc_off)
+                kv_v_lane = _load_f32_vec(kv_state_buf, base_kv_off)
+                sc_v_lane = _load_f32_vec(score_state_buf, base_sc_off)
 
                 sc_pad_lane = []
                 for i in range_constexpr(VEC):
@@ -626,9 +690,9 @@ def _build_kernel(
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
-                kv = _load_bf16_vec_then_f32(kv_in_rsrc, base_in_off)
-                sc = _load_bf16_vec_then_f32(score_in_rsrc, base_sc_off)
-                ape = _load_f32_vec(ape_rsrc, base_ape_off)
+                kv = _load_bf16_vec_then_f32(kv_in_buf, base_in_off)
+                sc = _load_bf16_vec_then_f32(score_in_buf, base_sc_off)
+                ape = _load_f32_vec(ape_buf, base_ape_off)
                 return kv, sc, ape
 
             if const_expr(not enable_prefetch_input):
@@ -780,11 +844,12 @@ def _build_kernel(
             # rms_weight: per-channel; this thread loads VEC values at tid*VEC.
             # Production atom passes bf16 (the param is cast at model load);
             # tests may pass fp32. Constexpr branch picks the right load.
-            rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
             if const_expr(rms_weight_is_bf16):
-                rmsw_lane = _load_bf16_vec_then_f32(rmsw_rsrc, tid_x_vec)
+                rmsw_buf = _make_buffer(rms_weight, fx.Int32, BF16_DW)
+                rmsw_lane = _load_bf16_vec_then_f32(rmsw_buf, tid_x_vec)
             else:
-                rmsw_lane = _load_f32_vec(rmsw_rsrc, tid_x_vec)
+                rmsw_buf = _make_buffer(rms_weight, fx.Float32, F32_VW)
+                rmsw_lane = _load_f32_vec(rmsw_buf, tid_x_vec)
 
             normed_lane = [
                 arith.MulFOp(
@@ -814,8 +879,8 @@ def _build_kernel(
             #
             # cos/sin loads for NOPE threads are safe because we clamp the
             # row-relative index to 0 (a valid in-bounds position).
-            cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-            sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+            cos_buf = _make_buffer(cos_cache, fx.BFloat16, PAIRS_PER_THREAD)
+            sin_buf = _make_buffer(sin_cache, fx.BFloat16, PAIRS_PER_THREAD)
             c_half_rd = arith.constant(RD // 2, type=i32)
             cos_row_base = ArithValue(comp_pos_i32) * c_half_rd
 
@@ -832,32 +897,16 @@ def _build_kernel(
             cs_lo = ArithValue(rope_rel) * arith.constant(PAIRS_PER_THREAD, type=i32)
 
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_b = buffer_ops.buffer_load(
-                    cos_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=1,
-                    dtype=T.bf16,
-                )
-                sin_b = buffer_ops.buffer_load(
-                    sin_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=1,
-                    dtype=T.bf16,
-                )
+                cos_b = _buffer_load(cos_buf, cos_row_base + cs_lo, fx.BFloat16)
+                sin_b = _buffer_load(sin_buf, cos_row_base + cs_lo, fx.BFloat16)
                 cos_vals = [arith.extf(f32, cos_b)]
                 sin_vals = [arith.extf(f32, sin_b)]
             else:
-                cos_vec = buffer_ops.buffer_load(
-                    cos_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=PAIRS_PER_THREAD,
-                    dtype=T.bf16,
+                cos_vec = _buffer_load(
+                    cos_buf, cos_row_base + cs_lo, fx.BFloat16, PAIRS_PER_THREAD
                 )
-                sin_vec = buffer_ops.buffer_load(
-                    sin_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=PAIRS_PER_THREAD,
-                    dtype=T.bf16,
+                sin_vec = _buffer_load(
+                    sin_buf, cos_row_base + cs_lo, fx.BFloat16, PAIRS_PER_THREAD
                 )
                 cos_vals = [
                     arith.extf(
@@ -907,13 +956,11 @@ def _build_kernel(
                 slot_in_block = arith.remui(ci, arith.constant(k_per_block, type=i32))
 
                 # physical_block = block_table[batch_id, block_in_seq]
-                bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
+                bt_buf = _make_buffer(block_table, fx.Int32)
                 bt_off = ArithValue(batch_id) * ArithValue(
                     block_table_seq_stride
                 ) + ArithValue(block_in_seq)
-                physical_block = buffer_ops.buffer_load(
-                    bt_rsrc, bt_off, vec_width=1, dtype=i32
-                )
+                physical_block = _buffer_load(bt_buf, bt_off, fx.Int32)
 
                 if const_expr(not quant):
                     # BF16 paged write. kv_cache layout: [NB, k_per_block, D].
@@ -929,9 +976,6 @@ def _build_kernel(
                     out_vec_t = T.vec(VEC, T.bf16)
                     raw_vec = fx.Vector.from_elements(out_lane, fx.Float32)
                     bf16_vec = raw_vec.truncf(out_vec_t)
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
                     # cache_off is in bf16 elements; convert to dword for the i32-vec store.
                     cache_off_dw = ArithValue(cache_off) >> arith.constant(1, type=i32)
                     dwords = (VEC + 1) // 2
@@ -939,9 +983,13 @@ def _build_kernel(
                     if const_expr(dwords == 1):
                         # vec<1xi32> -> scalar i32 store
                         scalar_i32 = _velem(bf16_as_i32, 0)
-                        buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
+                        out_buf = _make_buffer(kv_cache, fx.Int32)
+                        _buffer_store(out_buf, cache_off_dw, scalar_i32, fx.Int32)
                     else:
-                        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                        out_buf = _make_buffer(kv_cache, fx.Int32, dwords)
+                        _buffer_store(
+                            out_buf, cache_off_dw, bf16_as_i32, fx.Int32, dwords
+                        )
                 elif const_expr(nm_asm):
                     # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope bf16
                     # -> separate k_rope_buff. Shared emitter (byte-identical to HCA). --
@@ -957,13 +1005,9 @@ def _build_kernel(
                         lane=tid,
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
-                        out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache, max_size=True
-                        ),
+                        out_rsrc=_make_rsrc(kv_cache),
                         krope_base=_to_raw(_nm_krope_base),
-                        krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff, max_size=True
-                        ),
+                        krope_rsrc=_make_rsrc(k_rope_buff),
                         VEC=VEC,
                         NOPE=NOPE,
                         RTS=RTS,
@@ -1094,8 +1138,9 @@ def _build_kernel(
                     # Compute store address (in BYTES from kv_cache base).
                     # Both layouts use the same base (= phys * block_stride);
                     # the offset within the block differs.
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                    dwords_per_store = 1 if VEC != 8 else 2
+                    out_byte_buf = _make_buffer(
+                        kv_cache, fx.Int8, 4 * dwords_per_store
                     )
                     block_byte_base = ArithValue(physical_block) * ArithValue(
                         kv_cache_block_stride
@@ -1136,37 +1181,22 @@ def _build_kernel(
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
                         if (tid & 1) == 0:
-                            buffer_ops.buffer_store(
-                                dword,
-                                out_rsrc,
-                                byte_off,
-                                offset_is_bytes=True,
-                            )
+                            _store_dwords_at_byte(out_byte_buf, byte_off, dword)
                     elif const_expr(VEC == 4):
-                        buffer_ops.buffer_store(
-                            dword, out_rsrc, byte_off, offset_is_bytes=True
-                        )
+                        _store_dwords_at_byte(out_byte_buf, byte_off, dword)
                     else:
                         # VEC == 8: store 2 dwords (8 bytes) via vec<2xi32>
-                        store_vec = fx.Vector.from_elements(
-                            [dword[0], dword[1]], fx.Int32
-                        )
-                        buffer_ops.buffer_store(
-                            store_vec,
-                            out_rsrc,
-                            byte_off,
-                            offset_is_bytes=True,
+                        _store_dwords_at_byte(
+                            out_byte_buf, byte_off, [dword[0], dword[1]]
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
                     if tid == 0:
-                        cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
-                        )
+                        cs_buf = _make_buffer(cache_scale, fx.Float32)
                         cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
                         ) + fx.Int32(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        _buffer_store(cs_buf, cs_off, scale_v, fx.Float32)
                 else:
                     # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
@@ -1228,9 +1258,7 @@ def _build_kernel(
                         for i in range_constexpr(VEC)
                     ]
 
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
+                    out_byte_buf = _make_buffer(kv_cache, fx.Int8)
                     # packed byte index within the row = (tid*VEC) / 2.
                     packed_start = ArithValue(tid_x_vec) >> arith.constant(1, type=i32)
                     # flat paged slot (for the linear fallback).
@@ -1262,19 +1290,18 @@ def _build_kernel(
                             byte_off = ArithValue(flat_slot) * arith.constant(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
-                        buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(byte_val)),
-                            out_rsrc,
+                        # i8 nibble byte: element offset == byte offset.
+                        _buffer_store(
+                            out_byte_buf,
                             _to_raw(byte_off),
-                            offset_is_bytes=True,
+                            arith.trunci(T.i8, _to_raw(byte_val)),
+                            fx.Int8,
                         )
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(tid_x_vec, c32_i32)
                     if tid % NTG == 0:
-                        cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
-                        )
+                        cs_buf = _make_buffer(cache_scale, fx.Int8)
                         if const_expr(preshuffle):
                             # scale [NB, k_tiles, 4, kvbs] u8, with the slot axis
                             # INTERLEAVED so the mqa-logits reader's packed-dword
@@ -1302,10 +1329,11 @@ def _build_kernel(
                             cs_off = ArithValue(flat_slot) * arith.constant(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
-                        buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(e8m0)),
-                            cs_rsrc,
+                        _buffer_store(
+                            cs_buf,
                             _to_raw(cs_off),
+                            arith.trunci(T.i8, _to_raw(e8m0)),
+                            fx.Int8,
                         )  # e8m0 uint8
             # else: warmup — no scatter, just consume compute.
 
@@ -1584,9 +1612,9 @@ def _build_kernel_ksplit(
         lid = arith.remui(_to_raw(tid), c_64)  # ? [0, 64)
 
         # ---- plan row (single dwordx4) ----
-        plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
+        plan_buf = _make_buffer(plan, fx.Int32, 4)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
-        plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
+        plan_vec = _buffer_load(plan_buf, plan_base, fx.Int32, 4)
         ragged_id = _velem(plan_vec, 0)
         batch_id = _velem(plan_vec, 1)
         position = _velem(plan_vec, 2)
@@ -1595,23 +1623,21 @@ def _build_kernel_ksplit(
         # Sentinel-skip: whole body runs only for position >= 0, as a closure
         # under a runtime `if` (see the CSA kernel above for the rationale).
         def _body():
-            slot_map_rsrc = buffer_ops.create_buffer_resource(
-                state_slot_mapping, max_size=True
-            )
-            slot = buffer_ops.buffer_load(
-                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
-            )
+            slot_map_buf = _make_buffer(state_slot_mapping, fx.Int32)
+            slot = _buffer_load(slot_map_buf, batch_id, fx.Int32)
 
             # This lane owns columns [lid*VEC, lid*VEC+VEC) of head_dim.
             lid_x_vec = ArithValue(lid) * c_VEC
 
-            kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
-            score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
-            score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
-            )
-            ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+            # Buffers reused across K iters. bf16 tensors are read as i32 dword
+            # streams (width BF16_DW); f32 tensors at width F32_VW.
+            F32_VW = VEC if VEC <= 4 else VEC // 2
+            BF16_DW = (VEC + 1) // 2
+            kv_in_buf = _make_buffer(kv_in, fx.Int32, BF16_DW)
+            score_in_buf = _make_buffer(score_in, fx.Int32, BF16_DW)
+            kv_state_buf = _make_buffer(kv_state, fx.Float32, F32_VW)
+            score_state_buf = _make_buffer(score_state, fx.Float32, F32_VW)
+            ape_buf = _make_buffer(ape, fx.Float32, F32_VW)
 
             def _col_off_for_k(k_i32):
                 if const_expr(not overlap):
@@ -1621,39 +1647,33 @@ def _build_kernel_ksplit(
                 )
                 return arith.select(is_b, c_D, c_zero_i32)
 
-            def _load_f32_vec(rsrc, off_elems_i32):
+            def _load_f32_vec(buf, off_elems_i32):
                 if const_expr(VEC <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=VEC, dtype=f32
-                    )
+                    raw = _buffer_load(buf, off_elems_i32, fx.Float32, VEC)
                     return [_to_raw(_velem(raw, i)) for i in range(VEC)]
                 else:
                     assert VEC == 8
                     half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=half, dtype=f32
-                    )
-                    r1 = buffer_ops.buffer_load(
-                        rsrc,
+                    r0 = _buffer_load(buf, off_elems_i32, fx.Float32, half)
+                    r1 = _buffer_load(
+                        buf,
                         ArithValue(off_elems_i32) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
+                        fx.Float32,
+                        half,
                     )
                     v0, v1 = fx.Vector(r0), fx.Vector(r1)
                     return [_to_raw(v0[i]) for i in range_constexpr(half)] + [
                         _to_raw(v1[i]) for i in range_constexpr(half)
                     ]
 
-            def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
+            def _load_bf16_vec_then_f32(buf, off_elems_i32):
                 off_dw = ArithValue(off_elems_i32) >> c_one_i32
                 dwords = (VEC + 1) // 2
                 if const_expr(dwords == 1):
-                    raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
+                    raw_s = _buffer_load(buf, off_dw, fx.Int32)
                     raw = fx.Vector.from_elements([raw_s], fx.Int32)
                 else:
-                    raw = buffer_ops.buffer_load(
-                        rsrc, off_dw, vec_width=dwords, dtype=i32
-                    )
+                    raw = _buffer_load(buf, off_dw, fx.Int32, dwords)
                 vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
@@ -1710,8 +1730,8 @@ def _build_kernel_ksplit(
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
-                kv_v = _load_f32_vec(kv_state_rsrc, base_kv)
-                sc_v = _load_f32_vec(score_state_rsrc, base_sc)
+                kv_v = _load_f32_vec(kv_state_buf, base_kv)
+                sc_v = _load_f32_vec(score_state_buf, base_sc)
                 sc_pad = [arith.select(is_pad, c_neg_inf, sc_v[i]) for i in range(VEC)]
                 return kv_v, sc_pad
 
@@ -1735,9 +1755,9 @@ def _build_kernel_ksplit(
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
-                kv = _load_bf16_vec_then_f32(kv_in_rsrc, base_in)
-                sc = _load_bf16_vec_then_f32(score_in_rsrc, base_sc)
-                ape_v = _load_f32_vec(ape_rsrc, base_ape)
+                kv = _load_bf16_vec_then_f32(kv_in_buf, base_in)
+                sc = _load_bf16_vec_then_f32(score_in_buf, base_sc)
+                ape_v = _load_f32_vec(ape_buf, base_ape)
                 score = [
                     arith.AddFOp(sc[i], ape_v[i], fastmath=fm_fast).result
                     for i in range(VEC)
@@ -1846,11 +1866,12 @@ def _build_kernel_ksplit(
                     arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
                 )
 
-                rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
                 if const_expr(rms_weight_is_bf16):
-                    rmsw_lane = _load_bf16_vec_then_f32(rmsw_rsrc, lid_x_vec)
+                    rmsw_buf = _make_buffer(rms_weight, fx.Int32, BF16_DW)
+                    rmsw_lane = _load_bf16_vec_then_f32(rmsw_buf, lid_x_vec)
                 else:
-                    rmsw_lane = _load_f32_vec(rmsw_rsrc, lid_x_vec)
+                    rmsw_buf = _make_buffer(rms_weight, fx.Float32, F32_VW)
+                    rmsw_lane = _load_f32_vec(rmsw_buf, lid_x_vec)
 
                 normed_lane = [
                     arith.MulFOp(
@@ -1866,8 +1887,8 @@ def _build_kernel_ksplit(
                     arith.divsi(_to_raw(position), arith.constant(ratio, type=i32)),
                     arith.constant(ratio, type=i32),
                 )
-                cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-                sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+                cos_buf = _make_buffer(cos_cache, fx.BFloat16, PAIRS_PER_THREAD)
+                sin_buf = _make_buffer(sin_cache, fx.BFloat16, PAIRS_PER_THREAD)
                 c_half_rd = arith.constant(RD // 2, type=i32)
                 cos_row_base = ArithValue(comp_pos_i32) * c_half_rd
 
@@ -1885,26 +1906,16 @@ def _build_kernel_ksplit(
                 )
 
                 if const_expr(PAIRS_PER_THREAD == 1):
-                    cos_b = buffer_ops.buffer_load(
-                        cos_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
-                    )
-                    sin_b = buffer_ops.buffer_load(
-                        sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
-                    )
+                    cos_b = _buffer_load(cos_buf, cos_row_base + cs_lo, fx.BFloat16)
+                    sin_b = _buffer_load(sin_buf, cos_row_base + cs_lo, fx.BFloat16)
                     cos_vals = [arith.extf(f32, cos_b)]
                     sin_vals = [arith.extf(f32, sin_b)]
                 else:
-                    cos_vec = buffer_ops.buffer_load(
-                        cos_rsrc,
-                        cos_row_base + cs_lo,
-                        vec_width=PAIRS_PER_THREAD,
-                        dtype=T.bf16,
+                    cos_vec = _buffer_load(
+                        cos_buf, cos_row_base + cs_lo, fx.BFloat16, PAIRS_PER_THREAD
                     )
-                    sin_vec = buffer_ops.buffer_load(
-                        sin_rsrc,
-                        cos_row_base + cs_lo,
-                        vec_width=PAIRS_PER_THREAD,
-                        dtype=T.bf16,
+                    sin_vec = _buffer_load(
+                        sin_buf, cos_row_base + cs_lo, fx.BFloat16, PAIRS_PER_THREAD
                     )
                     cos_vals = [
                         arith.extf(
@@ -1949,13 +1960,11 @@ def _build_kernel_ksplit(
                 ci = arith.divsi(_to_raw(position), arith.constant(ratio, type=i32))
                 block_in_seq = arith.divsi(ci, arith.constant(k_per_block, type=i32))
                 slot_in_block = arith.remui(ci, arith.constant(k_per_block, type=i32))
-                bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
+                bt_buf = _make_buffer(block_table, fx.Int32)
                 bt_off = ArithValue(batch_id) * ArithValue(
                     block_table_seq_stride
                 ) + ArithValue(block_in_seq)
-                physical_block = buffer_ops.buffer_load(
-                    bt_rsrc, bt_off, vec_width=1, dtype=i32
-                )
+                physical_block = _buffer_load(bt_buf, bt_off, fx.Int32)
 
                 if const_expr(not quant):
                     cache_off = (
@@ -1966,17 +1975,18 @@ def _build_kernel_ksplit(
                     out_vec_t = T.vec(VEC, T.bf16)
                     raw_vec = fx.Vector.from_elements(out_lane, fx.Float32)
                     bf16_vec = raw_vec.truncf(out_vec_t)
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
                     cache_off_dw = ArithValue(cache_off) >> c_one_i32
                     dwords = (VEC + 1) // 2
                     bf16_as_i32 = fx.Vector(bf16_vec).bitcast(fx.Int32)
                     if const_expr(dwords == 1):
                         scalar_i32 = _velem(bf16_as_i32, 0)
-                        buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
+                        out_buf = _make_buffer(kv_cache, fx.Int32)
+                        _buffer_store(out_buf, cache_off_dw, scalar_i32, fx.Int32)
                     else:
-                        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                        out_buf = _make_buffer(kv_cache, fx.Int32, dwords)
+                        _buffer_store(
+                            out_buf, cache_off_dw, bf16_as_i32, fx.Int32, dwords
+                        )
                 elif const_expr(nm_asm):
                     # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope
                     # bf16 -> separate k_rope_buff. Shared emitter, byte-identical
@@ -1993,13 +2003,9 @@ def _build_kernel_ksplit(
                         lane=lid,
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
-                        out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache, max_size=True
-                        ),
+                        out_rsrc=_make_rsrc(kv_cache),
                         krope_base=_to_raw(_nm_krope_base),
-                        krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff, max_size=True
-                        ),
+                        krope_rsrc=_make_rsrc(k_rope_buff),
                         VEC=VEC,
                         NOPE=NOPE,
                         RTS=RTS,
@@ -2103,8 +2109,9 @@ def _build_kernel_ksplit(
                         )
                         dword = (p0, p1)
 
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                    dwords_per_store = 1 if VEC != 8 else 2
+                    out_byte_buf = _make_buffer(
+                        kv_cache, fx.Int8, 4 * dwords_per_store
                     )
                     block_byte_base = ArithValue(physical_block) * ArithValue(
                         kv_cache_block_stride
@@ -2136,30 +2143,21 @@ def _build_kernel_ksplit(
 
                     if const_expr(VEC == 2):
                         if (lid & 1) == 0:
-                            buffer_ops.buffer_store(
-                                dword, out_rsrc, byte_off, offset_is_bytes=True
-                            )
+                            _store_dwords_at_byte(out_byte_buf, byte_off, dword)
                     elif const_expr(VEC == 4):
-                        buffer_ops.buffer_store(
-                            dword, out_rsrc, byte_off, offset_is_bytes=True
-                        )
+                        _store_dwords_at_byte(out_byte_buf, byte_off, dword)
                     else:
-                        store_vec = fx.Vector.from_elements(
-                            [dword[0], dword[1]], fx.Int32
-                        )
-                        buffer_ops.buffer_store(
-                            store_vec, out_rsrc, byte_off, offset_is_bytes=True
+                        _store_dwords_at_byte(
+                            out_byte_buf, byte_off, [dword[0], dword[1]]
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
                     if lid == 0:
-                        cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
-                        )
+                        cs_buf = _make_buffer(cache_scale, fx.Float32)
                         cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
                         ) + fx.Int32(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        _buffer_store(cs_buf, cs_off, scale_v, fx.Float32)
                 else:
                     # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
@@ -2215,9 +2213,7 @@ def _build_kernel_ksplit(
                         for i in range_constexpr(VEC)
                     ]
 
-                    out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
+                    out_byte_buf = _make_buffer(kv_cache, fx.Int8)
                     packed_start = ArithValue(lid_x_vec_i) >> arith.constant(
                         1, type=i32
                     )
@@ -2248,19 +2244,18 @@ def _build_kernel_ksplit(
                             byte_off = ArithValue(flat_slot) * arith.constant(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
-                        buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(byte_val)),
-                            out_rsrc,
+                        # i8 nibble byte: element offset == byte offset.
+                        _buffer_store(
+                            out_byte_buf,
                             _to_raw(byte_off),
-                            offset_is_bytes=True,
+                            arith.trunci(T.i8, _to_raw(byte_val)),
+                            fx.Int8,
                         )
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(lid_x_vec_i, c32_i32)
                     if lid % NTG == 0:
-                        cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
-                        )
+                        cs_buf = _make_buffer(cache_scale, fx.Int8)
                         if const_expr(preshuffle):
                             # scale [NB, k_tiles, 4, kvbs] u8, slot axis
                             # INTERLEAVED: sflat = (slot%16)*4 + (slot//16)
@@ -2286,10 +2281,11 @@ def _build_kernel_ksplit(
                             cs_off = ArithValue(flat_slot) * arith.constant(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
-                        buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(e8m0)),
-                            cs_rsrc,
+                        _buffer_store(
+                            cs_buf,
                             _to_raw(cs_off),
+                            arith.trunci(T.i8, _to_raw(e8m0)),
+                            fx.Int8,
                         )  # e8m0 uint8
 
             if wid == 0:

@@ -38,18 +38,56 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith, ptrtoint, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
+
+
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
+# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`. The copy dtype (i32 for dword* ops, i8 for
+# the byte fallback) is baked into each buffer.
+# ---------------------------------------------------------------------------
+def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    return value[0] if width == 1 else value
+
+
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def build_moe_scatter_copy_token_module(row_bytes: int):
@@ -92,7 +130,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         num_dst: Int32,
     ):
         i32 = T.i32
-        cdt = T.i32 if use_dword else T.i8
+        cfx = fx.Int32 if use_dword else fx.Int8
 
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -104,15 +142,13 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
         _if_dst = scf.IfOp(dst_valid)
         with ir.InsertionPoint(_if_dst.then_block):
-            map_rsrc = ptr_rsrc(dst_src)
-            srow = ArithValue(
-                buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
-            )
+            map_buf = _make_buffer(dst_src, fx.Int32)
+            srow = ArithValue(_buffer_load(map_buf, bid_i32, fx.Int32))
             row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
             _if_row = scf.IfOp(row_ok)
             with ir.InsertionPoint(_if_row.then_block):
-                src_rsrc = ptr_rsrc(src)
-                dst_rsrc = ptr_rsrc(dst)
+                src_buf = _make_buffer(src, cfx, vec_width)
+                dst_buf = _make_buffer(dst, cfx, vec_width)
                 tid_i32 = ArithValue(tid)
                 # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
                 src_base = srow * row_stride_i32
@@ -134,13 +170,8 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
                             if vec_width == 1
                             else uidx * arith.constant(vec_width, type=i32)
                         )
-                        v = buffer_ops.buffer_load(
-                            src_rsrc,
-                            src_base + eidx,
-                            vec_width=vec_width,
-                            dtype=cdt,
-                        )
-                        buffer_ops.buffer_store(v, dst_rsrc, dst_base + eidx)
+                        v = _buffer_load(src_buf, src_base + eidx, cfx, vec_width)
+                        _buffer_store(dst_buf, dst_base + eidx, v, cfx, vec_width)
                         scf.YieldOp([])
                 scf.YieldOp([])
             scf.YieldOp([])

@@ -22,7 +22,6 @@ from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
 )
@@ -32,6 +31,26 @@ from aiter.utility.mx_types import (
 
 from .quant_utils import emit_mx_e8m0_scale
 from .tensor_shim import _to_raw
+
+
+def _raw_buffer_store(data, rsrc, byte_offset):
+    """Store ``data`` (scalar or vector ir.Value) through the AMD buffer resource
+    ``rsrc`` (``!llvm.ptr<8>``) at ``byte_offset`` (i32, in BYTES).
+
+    This is the hardware boundary: the emitter's ``rsrc`` is a raw buffer
+    descriptor handed in by callers (built from the fx layout API's
+    ``get_buffer_rsrc``), so the store goes straight to the ROCDL raw-buffer
+    intrinsic -- the tensor-oriented ``fx.copy`` surface can't take a bare rsrc.
+    Mirrors the old vendored byte-offset store path exactly (soffset 0, aux 0).
+    """
+    i32 = T.i32
+    off = _to_raw(byte_offset)
+    if not (isinstance(off.type, ir.IntegerType) and off.type.width == 32):
+        off = arith.index_cast(i32, off) if isinstance(
+            off.type, ir.IndexType
+        ) else arith.trunci(i32, off)
+    zero = arith.constant(0, type=i32)
+    rocdl.RawPtrBufferStoreOp(_to_raw(data), _to_raw(rsrc), off, zero, zero)
 
 
 @contextmanager
@@ -128,9 +147,8 @@ def emit_group_fp8_nm_asm_scatter(
             VEC, type=i32
         )
         store_vec = fx.Vector.from_elements(dwords, fx.Int32)
-        buffer_ops.buffer_store(
-            store_vec, out_rsrc, _to_raw(nope_off), offset_is_bytes=True
-        )
+        # nope_off is already a BYTE offset (fp8 entry, 1 byte/elem).
+        _raw_buffer_store(store_vec, out_rsrc, _to_raw(nope_off))
         group_id = ArithValue(lane) >> arith.constant(log2_rts, type=i32)
         lane_in_group = ArithValue(lane) & arith.constant(RTS - 1, type=i32)
         is_leader = arith.cmpi(CmpIPredicate.eq, _to_raw(lane_in_group), c_zero_i32)
@@ -142,8 +160,9 @@ def emit_group_fp8_nm_asm_scatter(
                 + arith.constant(NOPE, type=i32)
                 + ArithValue(group_id) * arith.constant(2, type=i32)
             )
-            buffer_ops.buffer_store(e8m0_i8, out_rsrc, _to_raw(sc_off))
-            buffer_ops.buffer_store(
+            # i8 scale byte: element offset == byte offset.
+            _raw_buffer_store(e8m0_i8, out_rsrc, _to_raw(sc_off))
+            _raw_buffer_store(
                 e8m0_i8, out_rsrc, _to_raw(ArithValue(sc_off) + c_one_i32)
             )
 
@@ -159,19 +178,21 @@ def emit_group_fp8_nm_asm_scatter(
         dwr = (VEC + 1) // 2
         rope_i32 = fx.Vector(rope_bf16).bitcast(fx.Int32)
         krope_off_dw = ArithValue(krope_off) >> c_one_i32
+        # i32 dword store: byte offset == dword index * 4.
+        krope_byte = ArithValue(krope_off_dw) * arith.constant(4, type=i32)
         if dwr <= 4:
             # VEC<=8 (wave64): single dwordx{dwr} store.
-            buffer_ops.buffer_store(rope_i32, krope_rsrc, _to_raw(krope_off_dw))
+            _raw_buffer_store(rope_i32, krope_rsrc, _to_raw(krope_byte))
         else:
             # VEC=16 (wave32) -> dwr=8: no dwordx8 store; split into 2x dwordx4.
-            c4_i32 = arith.constant(4, type=i32)
             lo = vector_dialect.extract_strided_slice(
                 T.vec(4, i32), rope_i32, offsets=[0], sizes=[4], strides=[1]
             )
             hi = vector_dialect.extract_strided_slice(
                 T.vec(4, i32), rope_i32, offsets=[4], sizes=[4], strides=[1]
             )
-            buffer_ops.buffer_store(lo, krope_rsrc, _to_raw(krope_off_dw))
-            buffer_ops.buffer_store(
-                hi, krope_rsrc, _to_raw(ArithValue(krope_off_dw) + c4_i32)
+            _raw_buffer_store(lo, krope_rsrc, _to_raw(krope_byte))
+            # +4 dwords == +16 bytes.
+            _raw_buffer_store(
+                hi, krope_rsrc, _to_raw(ArithValue(krope_byte) + arith.constant(16, type=i32))
             )

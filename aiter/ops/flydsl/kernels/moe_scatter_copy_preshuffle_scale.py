@@ -66,21 +66,58 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith, ptrtoint, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
 
 
-def _emit_preshuffle_dword(gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0):
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
+# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`.
+# ---------------------------------------------------------------------------
+def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    return value[0] if width == 1 else value
+
+
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
+
+
+def _emit_preshuffle_dword(gather, map_buf, src_buf, grow, sd, c_src_dwords, c0):
     """Emit the load of one preshuffled source dword (grouped row ``grow``, scale
     dword ``sd``).
 
@@ -90,18 +127,15 @@ def _emit_preshuffle_dword(gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c
     through ``rows_to_tokens`` (padding -> 0); ``gather=False`` reads the grouped
     row directly (identity, pure preshuffle).
     """
-    i32 = T.i32
     if gather:
-        srow = ArithValue(
-            buffer_ops.buffer_load(map_rsrc, grow, vec_width=1, dtype=i32)
-        )
+        srow = ArithValue(_buffer_load(map_buf, grow, fx.Int32))
         valid = arith.cmpi(CmpIPredicate.sge, srow, c0)
         # Clamp offset in-bounds when padding, then zero the result.
         src_off = arith.select(valid, srow * c_src_dwords + sd, c0)
-        v_raw = buffer_ops.buffer_load(src_rsrc, src_off, vec_width=1, dtype=i32)
+        v_raw = ArithValue(_buffer_load(src_buf, src_off, fx.Int32))
         return arith.select(valid, v_raw, c0)
     src_off = grow * c_src_dwords + sd
-    return buffer_ops.buffer_load(src_rsrc, src_off, vec_width=1, dtype=i32)
+    return ArithValue(_buffer_load(src_buf, src_off, fx.Int32))
 
 
 def build_moe_scatter_copy_preshuffle_scale_module(
@@ -190,9 +224,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
 
         # Created unconditionally (no in-body `if`): for gather=False the launcher
         # passes a placeholder for rows_to_tokens and the helper never reads it.
-        map_rsrc = ptr_rsrc(rows_to_tokens)
-        src_rsrc = ptr_rsrc(src)
-        dst_rsrc = ptr_rsrc(dst)
+        map_buf = _make_buffer(rows_to_tokens, fx.Int32)
+        src_buf = _make_buffer(src, fx.Int32)
+        dst_buf = _make_buffer(dst, fx.Int32, store_vw)
 
         for it in range_constexpr(
             (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -222,15 +256,15 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                     )
                     elems.append(
                         _emit_preshuffle_dword(
-                            gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0
+                            gather, map_buf, src_buf, grow, sd, c_src_dwords, c0
                         )
                     )
 
                 if store_vw == 1:
-                    buffer_ops.buffer_store(elems[0], dst_rsrc, dst_off)
+                    _buffer_store(dst_buf, dst_off, elems[0], fx.Int32, store_vw)
                 else:
                     vec = fx.Vector.from_elements(elems, fx.Int32)
-                    buffer_ops.buffer_store(vec, dst_rsrc, dst_off)
+                    _buffer_store(dst_buf, dst_off, vec, fx.Int32, store_vw)
                 scf.YieldOp([])
 
     if gather:

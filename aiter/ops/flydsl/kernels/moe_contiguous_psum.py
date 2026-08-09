@@ -17,15 +17,62 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
+
+
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
+# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`.
+# ---------------------------------------------------------------------------
+def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    return value[0] if width == 1 else value
+
+
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
+
+
+def _lds_slot_ptr(base_i64, elem_idx):
+    """Raw addrspace(3) !llvm.ptr to i32 element ``elem_idx`` of an LDS base.
+
+    The atomicrmw builder is a raw op and needs an ``!llvm.ptr<3>``; everything
+    up to that boundary stays on the fx pointer surface.
+    """
+    ptr_ty = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 4)
+    return fx.to_llvm_ptr(fx.add_offset(fx.inttoptr(ptr_ty, base_i64), elem_idx))
 
 
 @fx.struct
@@ -86,7 +133,6 @@ def build_moe_contiguous_psum_module():
         experts: Int32,
         tile_m: Int32,
     ):
-        i32 = T.i32
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui exactly like the arith.* calls they
         # replace.
@@ -99,10 +145,10 @@ def build_moe_contiguous_psum_module():
         lds1 = lds.lds1.ptr
         carry = lds.carry.ptr
 
-        m_rsrc = ptr_rsrc(masked_m)
-        s_rsrc = ptr_rsrc(starts)
-        p_rsrc = ptr_rsrc(psum)
-        c_rsrc = ptr_rsrc(contiguous_m)
+        m_buf = _make_buffer(masked_m, fx.Int32)
+        s_buf = _make_buffer(starts, fx.Int32)
+        p_buf = _make_buffer(psum, fx.Int32)
+        c_buf = _make_buffer(contiguous_m, fx.Int32)
 
         is_lane0 = tid == fx.Uint32(0)
         if is_lane0:
@@ -128,9 +174,7 @@ def build_moe_contiguous_psum_module():
             in_expert = e < fx.Uint32(experts)
             m_e = fx.Uint32(0)
             if in_expert:
-                m_e = fx.Uint32(
-                    buffer_ops.buffer_load(m_rsrc, e, vec_width=1, dtype=i32)
-                )
+                m_e = fx.Uint32(_buffer_load(m_buf, e, fx.Int32))
             _lds_store(lds0, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v), tid)
             gpu.barrier()
 
@@ -155,8 +199,8 @@ def build_moe_contiguous_psum_module():
                 if is_not_first:
                     excl = _lds_load(src, tid - 1)
                 start = excl + base_off
-                buffer_ops.buffer_store(start, s_rsrc, e)
-                buffer_ops.buffer_store(start + fx.Int32(m_e), p_rsrc, e)
+                _buffer_store(s_buf, e, start, fx.Int32)
+                _buffer_store(p_buf, e, start + fx.Int32(m_e), fx.Int32)
 
             # Fold this chunk's total in before the next one overwrites lds0.
             chunk_total = _lds_load(src, MAX_EXPERTS_PER_BLOCK - 1)
@@ -168,7 +212,7 @@ def build_moe_contiguous_psum_module():
         if is_lane0:
             total = _lds_load(carry, 0)
             gt = total > fx.Int32(tile_v)
-            buffer_ops.buffer_store(gt.select(total, tile_v), c_rsrc, 0)
+            _buffer_store(c_buf, fx.Uint32(0), gt.select(total, tile_v), fx.Int32)
 
     @flyc.jit
     def launch_psum(
@@ -215,7 +259,6 @@ def build_moe_contiguous_psum_remap_module():
         tile_m: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
     ):
-        i32 = T.i32
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui exactly like the arith.* calls they
         # replace.
@@ -228,11 +271,11 @@ def build_moe_contiguous_psum_remap_module():
         lds1 = lds.lds1.ptr
         carry = lds.carry.ptr
 
-        m_rsrc = ptr_rsrc(masked_m)
-        rows_rsrc = ptr_rsrc(topids_to_rows)
-        s_rsrc = ptr_rsrc(starts)
-        p_rsrc = ptr_rsrc(psum)
-        c_rsrc = ptr_rsrc(contiguous_m)
+        m_buf = _make_buffer(masked_m, fx.Int32)
+        rows_buf = _make_buffer(topids_to_rows, fx.Int32)
+        s_buf = _make_buffer(starts, fx.Int32)
+        p_buf = _make_buffer(psum, fx.Int32)
+        c_buf = _make_buffer(contiguous_m, fx.Int32)
 
         is_lane0 = tid == fx.Uint32(0)
         if is_lane0:
@@ -258,9 +301,7 @@ def build_moe_contiguous_psum_remap_module():
             in_expert = e < fx.Uint32(experts)
             m_e = fx.Uint32(0)
             if in_expert:
-                m_e = fx.Uint32(
-                    buffer_ops.buffer_load(m_rsrc, e, vec_width=1, dtype=i32)
-                )
+                m_e = fx.Uint32(_buffer_load(m_buf, e, fx.Int32))
             _lds_store(lds0, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v), tid)
             gpu.barrier()
 
@@ -285,8 +326,8 @@ def build_moe_contiguous_psum_remap_module():
                 if is_not_first:
                     excl = _lds_load(src, tid - 1)
                 start = excl + base_off
-                buffer_ops.buffer_store(start, s_rsrc, e)
-                buffer_ops.buffer_store(start + fx.Int32(m_e), p_rsrc, e)
+                _buffer_store(s_buf, e, start, fx.Int32)
+                _buffer_store(p_buf, e, start + fx.Int32(m_e), fx.Int32)
 
             # Fold this chunk's total in before the next one overwrites lds0.
             chunk_total = _lds_load(src, MAX_EXPERTS_PER_BLOCK - 1)
@@ -298,7 +339,7 @@ def build_moe_contiguous_psum_remap_module():
         if is_lane0:
             total = _lds_load(carry, 0)
             gt = total > fx.Int32(tile_v)
-            buffer_ops.buffer_store(gt.select(total, tile_v), c_rsrc, 0)
+            _buffer_store(c_buf, fx.Uint32(0), gt.select(total, tile_v), fx.Int32)
 
         gpu.barrier()
 
@@ -310,22 +351,15 @@ def build_moe_contiguous_psum_remap_module():
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
-            valid_route_count = fx.Uint32(
-                buffer_ops.buffer_load(
-                    ptr_rsrc(num_valid_routes), fx.Uint32(0), vec_width=1, dtype=i32
-                )
-            )
+            nvr_buf = _make_buffer(num_valid_routes, fx.Int32)
+            valid_route_count = fx.Uint32(_buffer_load(nvr_buf, fx.Uint32(0), fx.Int32))
         for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(
-                buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
-            )
+            row = fx.Uint32(_buffer_load(rows_buf, route_i32, fx.Int32))
             m = fx.Uint32(route_max_m)
             expert = row // m
             slot = row - expert * m
-            start = fx.Uint32(
-                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+            start = fx.Uint32(_buffer_load(s_buf, expert, fx.Int32))
+            _buffer_store(rows_buf, route_i32, start + slot, fx.Int32)
 
     @flyc.jit
     def launch_psum_remap(
@@ -409,11 +443,11 @@ def build_moe_route_psum_fused_module():
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
 
-        topk_rsrc = ptr_rsrc(topk_ids)
-        rows_rsrc = ptr_rsrc(topids_to_rows)
-        m_rsrc = ptr_rsrc(masked_m)
-        s_rsrc = ptr_rsrc(starts)
-        p_rsrc = ptr_rsrc(psum)
+        topk_buf = _make_buffer(topk_ids, fx.Int32)
+        rows_buf = _make_buffer(topids_to_rows, fx.Int32)
+        m_buf = _make_buffer(masked_m, fx.Int32)
+        s_buf = _make_buffer(starts, fx.Int32)
+        p_buf = _make_buffer(psum, fx.Int32)
 
         in_expert = tid < fx.Uint32(experts)
 
@@ -429,29 +463,24 @@ def build_moe_route_psum_fused_module():
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            off_i64 = fx.Int64(e) * 4
-            ptr = buffer_ops.create_llvm_ptr(
-                cnt_base_i64 + fx.Int64(off_i64), address_space=3
-            )
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            e = _buffer_load(topk_buf, route_i32, fx.Int32)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
-                ptr,
+                _lds_slot_ptr(cnt_base_i64, e),
                 arith.constant(1, type=i32),
                 llvm.AtomicOrdering.monotonic,
                 syncscope="workgroup",
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, rows_rsrc, route_i32)
+            _buffer_store(rows_buf, route_i32, row, fx.Int32)
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.
         if in_expert:
             m = fx.Uint32(_lds_load(lds_cnt, tid))
             _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
-            buffer_ops.buffer_store(m, m_rsrc, tid)
+            _buffer_store(m_buf, tid, m, fx.Int32)
         gpu.barrier()
 
         src = lds0
@@ -475,22 +504,18 @@ def build_moe_route_psum_fused_module():
             if is_not_first:
                 start = _lds_load(src, tid - 1)
             m_tid = _lds_load(lds_cnt, tid)
-            buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
+            _buffer_store(s_buf, tid, start, fx.Int32)
+            _buffer_store(p_buf, tid, start + m_tid, fx.Int32)
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(
-                buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
-            )
+            row = fx.Uint32(_buffer_load(rows_buf, route_i32, fx.Int32))
             m = fx.Uint32(max_m)
             expert = row // m
             slot = row - expert * m
-            start = fx.Uint32(
-                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+            start = fx.Uint32(_buffer_load(s_buf, expert, fx.Int32))
+            _buffer_store(rows_buf, route_i32, start + slot, fx.Int32)
 
     @flyc.jit
     def launch_route_psum_fused(

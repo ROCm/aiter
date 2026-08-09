@@ -20,47 +20,55 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith
+from flydsl.expr import arith, ptrtoint
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
 
 
-def _valid_tiles(masked_rsrc, expert, max_m, tile_m):
-    i32 = T.i32
-    c0 = arith.constant(0, type=i32)
-    valid_m = buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
-    valid_m = arith.maxsi(valid_m, c0)
-    valid_m = arith.minsi(valid_m, max_m)
-    return (valid_m + tile_m - arith.constant(1, type=i32)) // tile_m
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
+# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`.
+# ---------------------------------------------------------------------------
+def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
 
 
-def _emit_prefix_sum(masked_rsrc, expert, max_m, tile_m):
-    i32 = T.i32
-    c0 = arith.constant(0, index=True)
-    c1 = arith.constant(1, index=True)
-    expert_idx = arith.index_cast(T.index, expert)
-    init_acc = arith.constant(0, type=i32)
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    return value[0] if width == 1 else value
 
-    loop = scf.ForOp(c0, expert_idx, c1, [init_acc])
-    loop_ip = ir.InsertionPoint(loop.body)
-    loop_ip.__enter__()
 
-    cur = arith.index_cast(i32, loop.induction_variable)
-    acc = ArithValue(loop.inner_iter_args[0])
-    tiles = _valid_tiles(masked_rsrc, cur, max_m, tile_m)
-    scf.YieldOp([acc + tiles])
-
-    loop_ip.__exit__(None, None, None)
-    return ArithValue(loop.results[0])
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def build_moe_m_tile_prefix_map_module():
@@ -119,18 +127,17 @@ def build_moe_m_tile_map_module():
         i32 = T.i32
         expert = ArithValue(fx.block_idx.x)
         tid = ArithValue(fx.thread_idx.x)
-        prefix_rsrc = ptr_rsrc(m_tile_prefix)
-        map_rsrc = ptr_rsrc(m_tile_map)
+        prefix_buf = _make_buffer(m_tile_prefix, fx.Int32)
+        map_buf = _make_buffer(m_tile_map, fx.Int32)
 
         expert_valid = arith.cmpi(CmpIPredicate.ult, expert, ArithValue(experts))
         if_expert = scf.IfOp(expert_valid)
         with ir.InsertionPoint(if_expert.then_block):
-            prefix = buffer_ops.buffer_load(prefix_rsrc, expert, vec_width=1, dtype=i32)
-            next_prefix = buffer_ops.buffer_load(
-                prefix_rsrc,
-                expert + arith.constant(1, type=i32),
-                vec_width=1,
-                dtype=i32,
+            prefix = ArithValue(_buffer_load(prefix_buf, expert, fx.Int32))
+            next_prefix = ArithValue(
+                _buffer_load(
+                    prefix_buf, expert + arith.constant(1, type=i32), fx.Int32
+                )
             )
             tiles = next_prefix - prefix
             e_base = expert * ArithValue(max_m_tiles)
@@ -150,8 +157,8 @@ def build_moe_m_tile_map_module():
             tile_ok = arith.cmpi(CmpIPredicate.ult, local_tile, tiles)
             if_tile = scf.IfOp(tile_ok)
             with ir.InsertionPoint(if_tile.then_block):
-                buffer_ops.buffer_store(
-                    e_base + local_tile, map_rsrc, prefix + local_tile
+                _buffer_store(
+                    map_buf, prefix + local_tile, e_base + local_tile, fx.Int32
                 )
                 scf.YieldOp([])
             scf.YieldOp([])
