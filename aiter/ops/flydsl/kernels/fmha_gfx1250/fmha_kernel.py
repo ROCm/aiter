@@ -166,43 +166,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         actual_q_len = q_end_tok - q_start_tok
         actual_kv_len = k_end_tok - k_start_tok
 
-        def apply_causal_mask(su_sp_tiles, n_start_fx):
-            lane_lo = lane_id & 15
-            lane_hi_x8 = (lane_id >> 4) * 8
-            wave_x32 = wave_id * 32
-            base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
-            neg_inf_c = arith.constant(float("-inf"), type=T.f32)
-            for su in fx.range_constexpr(CNT_SU):
-                for msb in fx.range_constexpr(NUM_MSB):
-                    off = (msb // 2) * 16 - su * 32 - (msb % 2) * 16
-                    bnd_fx = base + off
-                    v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
-                    masked_elems = []
-                    for e in fx.range_constexpr(8):
-                        cmp_fx = bnd_fx < e
-                        elem_fx = v8w[e]
-                        mval_fx = cmp_fx.select(neg_inf_c, elem_fx)
-                        masked_elems.append(mval_fx)
-                    su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
-
-        def apply_kv_oob_mask(su_sp_tiles, kv_remain_raw):
-            lane_hi = lane_id >> 4
-            lane_hi_x8 = lane_hi * 8
-            base = (kv_remain_raw - 1) - lane_hi_x8
-            neg_inf = arith.constant(float("-inf"), type=T.f32)
-            for su in fx.range_constexpr(CNT_SU):
-                for msb in fx.range_constexpr(NUM_MSB):
-                    col_base_val = su * 32 + (msb % 2) * 16
-                    bnd = base - col_base_val
-                    v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
-                    masked_elems = []
-                    for e in fx.range_constexpr(8):
-                        cmp = bnd < e
-                        elem = v8w[e]
-                        mval = cmp.select(neg_inf, elem)
-                        masked_elems.append(mval)
-                    su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
-
         # ================================================================
         # OOB protection: pre-compute per-block dg1 lists for TDM loads
         # ================================================================
@@ -361,233 +324,48 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 "s_log2e_scl_pair": scale_pair,
             }
 
-            # ================================================================
-            # SECTION 2: Prologue — Tile 0 QK + Partial Softmax (no PV)
-            #
-            # 1. TDM load K(tile 0) → K_a LDS
-            # 2. QK_pure for all 4 SUs (no interleaving, first tile)
-            # 3. TDM load V(tile 0) → V_a LDS
-            # 4. Apply causal + KV OOB masks
-            # 5. sp_tiles → sp_pairs → Softmax PART0+PART1+PART2 (first half)
-            # 6. Prefetch K(tile 1) → K_b
-            # 7. Build initial iter_args for dynamic loop
-            # ================================================================
-            #
-            #   1. TDM K(tile 0, 4 SUs) → wait → QK_pure (64 WMMAs)
-            #   2. TDM V(tile 0, 4 SUs) — overlapped with softmax
-            #   3. sp_tiles → sp_pairs → softmax PART0+PART1 only (no PART2)
-            #   4. TDM K(tile 1) — prefetch K only, V(tile 0) stays in LDS
-            #   5. Wait K(tile 1) → LDS K(su=0) — preload for core_loop entry
-            #
-            # No PV in prologue. PART2 + PV run in core_loop iterations.
-
-            zero_f32 = arith.constant(0.0, type=T.f32)
-            neg_inf = arith.constant(float("-inf"), type=T.f32)
-            zero_v8f32 = fx.constant_vector(0.0, T.vec(8, T.f32))
-
-            # -- 2a: Load K(tile 0) → K_a (ping buffer) --
-            rocdl.sched_barrier(0)
-            TDM.load_k_only(
-                ptr_K,
-                k_offset,
-                stride_k_seq,
-                stride_k_32,
-                wave_id,
-                k_a_base_i32,
-                oob_dg1_list=k_oob_dg1,
-            )
-            rocdl.sched_barrier(0)
-
-            # -- 2b: QK_pure for all 4 SUs --
-            all_su_sp_tiles = []
-            for su in fx.range_constexpr(CNT_SU):
-                kv_tiles_su = Fragment.load_k_su(ty, kv_lds_addrs_a, 0, su)
-                fresh_sp = []
-                for msb in fx.range_constexpr(NUM_MSB):
-                    fresh_sp.append([zero_v8f32])
-                fresh_sp = qk_gemm_pure(ty, 0, su, q_frags, kv_tiles_su, fresh_sp)
-                all_su_sp_tiles.append(fresh_sp)
-
-            # -- 2c: Load V(tile 0) → V_a (ping buffer) --
-            TDM.load_v_only(
-                ptr_V,
-                v_offset,
-                stride_v_seq,
-                stride_v_32,
-                wave_id,
-                v_a_base_i32,
-                oob_dg1_list=v_oob_dg1,
-            )
-
-            # -- 2d': causal mask on prologue tile (n_start=0) --
-            # Bottom-right aligned: shift n_start by -(sk - sq) so the diagonal
-            # is anchored at the bottom-right corner of the QK matrix.
-            causal_offset = actual_kv_len - actual_q_len
-            if const_expr(IS_CAUSAL):
-                pro_causal_n = -causal_offset
-                apply_causal_mask(all_su_sp_tiles, pro_causal_n)
-
-            # -- 2d'': KV OOB mask on prologue tile --
-            apply_kv_oob_mask(all_su_sp_tiles, actual_kv_len)
-
-            # -- 2d: sp_tiles → sp_pairs --
-            sp_pairs_all_pro = Softmax.tiles_to_pairs(all_su_sp_tiles)
-
-            # -- 2e: Softmax PART0+PART1 only (no PART2) --
-            # Pin each MSB's scalar state to its own VGPR bank for the
-            # "全-bankN" (0x00/0x55/0xAA/0xFF) MSB allocation pattern.
-            softmax_state_pro = {
-                "old_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                "local_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                "delta": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                "exp_delta": [None] * NUM_MSB,
-                "cur_max_log2e": [None] * NUM_MSB,
-                "cur_max_log2e_1": [None] * NUM_MSB,
-                "cur_max_log2e_scalar": [None] * NUM_MSB,
-                "cur_max_log2e_dup": [None] * NUM_MSB,
-                "vgpr_log2e_scl_pair": [None] * NUM_MSB,
-                "exp_delta_dup": [None] * NUM_MSB,
-                "row_sums": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                "p_bf16": [[], [], [], []],
-                "sp_pairs_prev": sp_pairs_all_pro,
-            }
-            Softmax.part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
-
-            # -- 2e': PART2 first half for tile 0 --
-            # Runs ops 0..PART2_SPLIT-1: setup(7)+pkfma(16)+pair_exp(8) = 31 ops/MSB.
-            # 4 MSBs × 8 pair_exp = 32 pair_exp + 4 exp_delta (unavoidable pipeline
-            # overhead).
-            # sp_pairs_all_pro[m][0..15] are partially modified (pkfma+8-exp applied).
-            # pro_exp_delta seeds the O-rescale iter_arg for the first core_loop
-            # iteration.
-            pro_part2_ops = Softmax.build_all_part2_ops(
-                ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state
-            )
-            for m in fx.range_constexpr(NUM_MSB):
-                for op in pro_part2_ops[m][:PART2_SPLIT]:
-                    op()
-
-            # -- 2f: Prefetch K(tile 1) → K_b if available --
-            tile_n_const = TILE_N
-            kv_tiles_avail = (actual_kv_len + (TILE_N - 1)) // tile_n_const
-            if const_expr(IS_CAUSAL):
-                # Causal (bottom-right aligned): the last Q row (m_start + TILE_N - 1)
-                # attends to the last K row (actual_kv_len - 1).  The first Q row in
-                # this tile attends to K starting at position
-                #   (actual_kv_len - actual_q_len) + m_start.
-                # So the number of KV tiles needed is:
-                sk_sq_diff = actual_kv_len - actual_q_len
-                sk_sq_tiles = (sk_sq_diff + (TILE_N - 1)) // tile_n_const
-                bx_plus_1 = bx + 1
-                causal_tiles = bx_plus_1 + sk_sq_tiles
-                num_tiles = arith.minui(causal_tiles.ir_value(), kv_tiles_avail)
-            else:
-                # Non-causal: iterate over all KV tiles.
-                num_tiles = kv_tiles_avail
-            num_tiles_idx = arith.index_cast(T.index, num_tiles)
-            # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
-            num_tiles_minus1 = num_tiles - 1
-            num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
-
-            # Load K(tile 1) → K_b for core_loop first iteration.
-            # For num_tiles=1 (128x128), K_b is never used (loop runs 0 iterations).
-            rocdl.sched_barrier(0)
-            k_tile1_stride = tile_n_const * stride_k_seq
-            k_tile1_offset = k_offset + k_tile1_stride
-            kv_remain_t1 = actual_kv_len - TILE_N
-            k_tile1_oob_dg1 = [
-                TDM.make_kv_dg1_with_oob(
-                    K_CFG_OOB,
-                    QK_HDIM,
-                    8,
-                    stride_k_elems_oob,
-                    TDM.per_warp_oob_dim1(
-                        kv_remain_t1 - su * 32,
-                        wave_id,
-                        8,
-                    ),
-                    dim0_stride=200,
-                )
-                for su in range(CNT_SU)
-            ]
-            TDM.load_k_only(
-                ptr_K,
-                k_tile1_offset,
-                stride_k_seq,
-                stride_k_32,
-                wave_id,
-                k_b_base_i32,
-                oob_dg1_list=k_tile1_oob_dg1,
-            )
-            rocdl.sched_barrier(0)
-
-            # -- 2g: Load K(su=0) from K_b for core_loop entry --
-            kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
-
-            # Prologue results: PART0+PART1+PART2 first half done.
-            # old_max = local_max (set by PART2 setup op0); row_sums rescaled
-            # (×exp_delta).
-            pro_old_max = [
-                softmax_state_pro["old_max"][m] for m in fx.range_constexpr(NUM_MSB)
-            ]
-            pro_row_sums = [
-                softmax_state_pro["row_sums"][m] for m in fx.range_constexpr(NUM_MSB)
-            ]
-            pro_local_max = [
-                softmax_state_pro["local_max"][m] for m in fx.range_constexpr(NUM_MSB)
-            ]
-            pro_delta = [
-                softmax_state_pro["delta"][m] for m in fx.range_constexpr(NUM_MSB)
-            ]
-
-            # Partial sp_pairs after first half: yield as separate lo+hi f32 scalars.
-            # Prologue runs pair_exp sequentially (correct v2f32), so extractelement is
-            # safe here.
-            pro_partial_sp_lo_flat = []
-            pro_partial_sp_hi_flat = []
-            for m in fx.range_constexpr(NUM_MSB):
-                for i in fx.range_constexpr(N_SP_PAIRS):
-                    pair = Vec(sp_pairs_all_pro[m][i], dtype=fx.Float32)
-                    pro_partial_sp_lo_flat.append(pair[0].ir_value())
-                    pro_partial_sp_hi_flat.append(pair[1].ir_value())
-            pro_partial_sp_flat = pro_partial_sp_lo_flat + pro_partial_sp_hi_flat
-            # exp_delta from PART2 setup (used by first core_loop iteration's O
-            # rescale).
-            pro_exp_delta = [
-                softmax_state_pro["exp_delta"][m] for m in fx.range_constexpr(NUM_MSB)
-            ]
-
-            # Flatten kv_tiles_init[4 msb][2] → 8 v16bf16
-            kv_flat_init = []
-            for msb in fx.range_constexpr(NUM_MSB):
-                for k in fx.range_constexpr(N_WMMA_K_TILES):
-                    kv_flat_init.append(kv_tiles_init[msb][k])
-
-            # Flatten prologue sp_tiles per SU [CNT_SU][NUM_MSB][1] → 16 v8f32
-            sp_flat_init = []
-            for su in fx.range_constexpr(CNT_SU):
-                for msb in fx.range_constexpr(NUM_MSB):
-                    sp_flat_init.append(all_su_sp_tiles[su][msb][0])
 
             # ================================================================
-            # SECTION 3: Dynamic KV Loop — scf.for_ from tile 1
-            #
-            # Pipeline: K is one tile AHEAD of V in LDS.
-            #   Iteration i: GEMM1 on K(i+1), GEMM2 on V(i)
-            #   After fmha_pipeline: TDM V(i+1) + K(i+2)
-            #
-            # Two sub-loops for causal attention:
-            #   3a: non-causal tiles [1, first_causal_tile) — no mask
-            #   3b: causal tiles [first_causal_tile, num_tiles-1) — with mask
+            # Inner function definitions
+            # (closures over SECTION 1 state: lane_id, wave_id, q_frags, etc.)
             # ================================================================
-            #
-            # Pipeline layout:
-            #   - K in LDS is one tile AHEAD of V in LDS
-            #   - Prologue loaded K(tile 0)+V(tile 0), did QK, prefetched K(tile 1)
-            #   - Iteration i: GEMM1 on K(tile i+1), GEMM2 on V(tile i)
-            #   - After core_loop: TDM V(tile i+1) + K(tile i+2)
-            #
-            # O tiles start as zeros (no PV in prologue).
+
+            def apply_causal_mask(su_sp_tiles, n_start_fx):
+                lane_lo = lane_id & 15
+                lane_hi_x8 = (lane_id >> 4) * 8
+                wave_x32 = wave_id * 32
+                base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
+                neg_inf_c = arith.constant(float("-inf"), type=T.f32)
+                for su in fx.range_constexpr(CNT_SU):
+                    for msb in fx.range_constexpr(NUM_MSB):
+                        off = (msb // 2) * 16 - su * 32 - (msb % 2) * 16
+                        bnd_fx = base + off
+                        v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
+                        masked_elems = []
+                        for e in fx.range_constexpr(8):
+                            cmp_fx = bnd_fx < e
+                            elem_fx = v8w[e]
+                            mval_fx = cmp_fx.select(neg_inf_c, elem_fx)
+                            masked_elems.append(mval_fx)
+                        su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
+
+            def apply_kv_oob_mask(su_sp_tiles, kv_remain_raw):
+                lane_hi = lane_id >> 4
+                lane_hi_x8 = lane_hi * 8
+                base = (kv_remain_raw - 1) - lane_hi_x8
+                neg_inf = arith.constant(float("-inf"), type=T.f32)
+                for su in fx.range_constexpr(CNT_SU):
+                    for msb in fx.range_constexpr(NUM_MSB):
+                        col_base_val = su * 32 + (msb % 2) * 16
+                        bnd = base - col_base_val
+                        v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
+                        masked_elems = []
+                        for e in fx.range_constexpr(8):
+                            cmp = bnd < e
+                            elem = v8w[e]
+                            mval = cmp.select(neg_inf, elem)
+                            masked_elems.append(mval)
+                        su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
 
             def fmha_pipeline(
                 ty,
@@ -1049,71 +827,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     partial_ed_out,
                 )
 
-            # ================================================================
-            # Init iter_args layout (dynamic — offsets depend on N_WMMA_K_TILES):
-            #   [0..15]            o_tiles[4][4] v8f32                  = 16 values
-            #   [16..19]           old_max[4] f32                        = 4 values
-            #   [20..23]           row_sums[4] f32                       = 4 values
-            #   [24..24+KV-1]      kv_tiles[NUM_MSB][N_WMMA_K_TILES]    = KV values
-            #   [24+KV..+3]        local_max[4] f32                      = 4 values
-            #   [24+KV+4..+7]      delta[4] f32                          = 4 values
-            #   [24+KV+8..+23]     sp_tiles[CNT_SU*NUM_MSB] v8f32       = 16 values
-            #   [24+KV+24..+27]    ping-pong bases (i32)                 = 4 values
-            #   [24+KV+28..+91]    partial_sp_pairs[4][16] v2f32        = 64 values
-            #                      (PART2 first half output, double-buffered pipeline)
-            #   [24+KV+92..+95]    exp_delta[4] f32                     = 4 values
-            # ================================================================
-            _KV_SIZE = NUM_MSB * N_WMMA_K_TILES  # 12 for 192-dim, 8 for 128-dim
-            _OFF_LOCAL_MAX = 24 + _KV_SIZE  # 36 for 192-dim
-            _OFF_DELTA = _OFF_LOCAL_MAX + NUM_MSB
-            _OFF_SP = _OFF_DELTA + NUM_MSB
-            _OFF_PP = _OFF_SP + CNT_SU * NUM_MSB
-            _OFF_PSP = _OFF_PP + 4  # partial_sp lo: 64 f32
-            _PSP_SIZE = NUM_MSB * N_SP_PAIRS  # = 64 (lo half)
-            _OFF_PSP_HI = _OFF_PSP + _PSP_SIZE  # partial_sp hi: 64 f32
-            _OFF_PED = _OFF_PSP_HI + _PSP_SIZE  # exp_delta: 4 f32
-            o_flat_init = [zero_v8f32] * (NUM_MSB * N_PV_WMMA_N)
-
-            # Ping-pong bases for iteration 1:
-            #   K_cur = K_b (tile 1 K), V_cur = V_a (tile 0 V)
-            #   K_next = K_a (TDM K target), V_next = V_b (TDM V target)
-            pp_init = [k_b_base_i32, v_a_base_i32, k_a_base_i32, v_b_base_i32]
-
-            init_args = (
-                o_flat_init
-                + pro_old_max
-                + pro_row_sums
-                + kv_flat_init
-                + pro_local_max
-                + pro_delta
-                + sp_flat_init
-                + pp_init
-                + pro_partial_sp_flat
-                + pro_exp_delta
-            )
-
-            # ---- Split point for causal loops (chunked-prefill: sq < sk) ----
-            # Tiles below first_causal_tile are fully under the diagonal and
-            # need no causal mask.  Tiles at or above it cross the diagonal.
-            # When sq == sk, first_causal_tile == num_tiles so loop 1 covers
-            # everything and loop 2 runs zero iterations — no regression.
-            if const_expr(IS_CAUSAL):
-                # Tile t is fully below the diagonal when
-                #   (t+1)*TILE_N - 1 <= causal_offset + m_start
-                # i.e. t < floor((causal_offset + m_start) / TILE_N) + 1
-                # Since m_start = bx * TILE_N this equals bx + floor(causal_offset /
-                # TILE_N).
-                # Clamp to [1, num_tiles-1) since loop 1 starts at tile 1.
-                first_causal_tile = bx + causal_offset // tile_n_const
-                first_causal_tile = arith.maxsi(
-                    first_causal_tile.ir_value(), arith.constant(1, type=T.i32)
-                )
-                first_causal_tile = arith.minui(first_causal_tile, num_tiles_minus1)
-                first_causal_tile_idx = arith.index_cast(T.index, first_causal_tile)
-            else:
-                first_causal_tile_idx = num_tiles_minus1_idx
-
-            # ---- tile_iteration: shared loop body for SECTION 3a / 3b ----
             def tile_iteration(tile_idx, iter_args, causal_n_start=None):
                 """One iteration of the KV loop: unpack -> fmha_pipeline -> pack."""
 
@@ -1234,17 +947,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 }
 
                 # Build TDM state (zero placeholder for memload=False)
-                def mk_zero_v4i32():
-                    return fx.constant_vector(0, T.vec(4, T.i32))
-
-                def mk_zero_v8i32():
-                    return fx.constant_vector(0, T.vec(8, T.i32))
 
                 tdm_state = {
-                    "v_g0": mk_zero_v4i32(),
-                    "v_g1": mk_zero_v8i32(),
-                    "k_g0": mk_zero_v4i32(),
-                    "k_g1": mk_zero_v8i32(),
+                    "v_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+                    "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
+                    "k_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+                    "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
                     "v_salu_queue": [],
                     "k_salu_queue": [],
                 }
@@ -1387,161 +1095,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     + new_exp_delta
                 )
 
-            # ================================================================
-            # SECTION 3a: Main KV loop — non-causal tiles [1, first_causal_tile)
-            # ================================================================
-            for tile_idx, iter_args, loop1_results in scf.for_(
-                arith.index(1),
-                first_causal_tile_idx,
-                arith.index(1),
-                iter_args=init_args,
-            ):
-                yield tile_iteration(tile_idx, iter_args)
-
-            # ================================================================
-            # SECTION 3b: Main KV loop — causal tiles [first_causal_tile, num_tiles-1)
-            # ================================================================
-            for tile_idx, iter_args, loop_results in scf.for_(
-                first_causal_tile_idx,
-                num_tiles_minus1_idx,
-                arith.index(1),
-                iter_args=loop1_results,
-            ):
-                # Causal mask: compute n_start for this tile
-                tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
-                causal_n = tile_idx_i32 * tile_n_const - causal_offset
-                yield tile_iteration(tile_idx, iter_args, causal_n_start=causal_n)
-
-            # ================================================================
-            # SECTION 4: Epilogue — post_process + div_cvt + write_out
-            #
-            # 1. Unpack final loop results (o_tiles, softmax state)
-            # 2. Process endtile (last KV tile): core_loop + ep_finish
-            # 3. Final O-rescale: O *= 1/row_sum
-            # 4. Convert f32 → bf16 and store to LDS
-            # 5. TDM store LDS → global output
-            # 6. (Optional) Compute and store LSE
-            # ================================================================
-            #
-            #   fmha_post_process(is_odd):
-            #     softmax stages 4..7 (PART2) → complete last tile's softmax
-            #     LDS V(su=0..3) → PV_pure (64 WMMAs)
-            #   fmha_div_cvt():
-            #     row_sums cross-MSB reduce → LSE = max*scale + log(sum)
-            #     O = O * rcp(row_sum) → cvt_pk_bf16
-            #   lds_store_D_LSE() + TDM_store_D_LSE()
-            #
-            # For tile_n=128: blk=0 always, no is_odd branching.
-
-            # ---- 4a: Unpack loop results ----
-            # Pin each MSB's values to bank=d/msb for full-bank MSB pattern.
-            ep_o_tiles = []
-            for d in fx.range_constexpr(NUM_MSB):
-                row = []
-                for n in fx.range_constexpr(N_PV_WMMA_N):
-                    row.append(set_vgpr_bank(loop_results[d * N_PV_WMMA_N + n], d))
-                ep_o_tiles.append(row)
-
-            ep_old_max = [
-                set_vgpr_bank(loop_results[16 + i], i)
-                for i in fx.range_constexpr(NUM_MSB)
-            ]
-            ep_row_sums = [
-                set_vgpr_bank(loop_results[20 + i], i)
-                for i in fx.range_constexpr(NUM_MSB)
-            ]
-            ep_local_max = [
-                set_vgpr_bank(loop_results[_OFF_LOCAL_MAX + i], i)
-                for i in fx.range_constexpr(NUM_MSB)
-            ]
-            ep_delta = [
-                set_vgpr_bank(loop_results[_OFF_DELTA + i], i)
-                for i in fx.range_constexpr(NUM_MSB)
-            ]
-
-            # Epilogue ping-pong: V_cur after swap has last tile's V data
-            ep_k_cur_base = loop_results[_OFF_PP]
-            ep_v_cur_base = loop_results[_OFF_PP + 1]
-            ep_kv_lds_addrs = build_kv_lds_addrs(
-                lane_id,
-                ep_k_cur_base,
-                ep_v_cur_base,
-            )
-
-            # ---- 4b: Unpack partial_sp_pairs:
-            # reconstruct v2f32 from separate lo+hi f32 ----
-            ep_partial_sp_lo = [
-                loop_results[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
-            ]
-            ep_partial_sp_hi = [
-                loop_results[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
-            ]
-            ep_partial_sp_pairs = []
-            for m in fx.range_constexpr(NUM_MSB):
-                ep_pairs = [
-                    make_v2f32(
-                        ep_partial_sp_lo[m * N_SP_PAIRS + i],
-                        ep_partial_sp_hi[m * N_SP_PAIRS + i],
-                        m,
-                    )
-                    for i in fx.range_constexpr(N_SP_PAIRS)
-                ]
-                ep_partial_sp_pairs.append(ep_pairs)
-
-            # ---- 4b': Extra state for endtile (N>=2) ----
-            # K(N-1) fragments from loop (GEMM2 stage 3 loaded from K_next).
-            ep_kv_tiles_flat = [
-                loop_results[24 + i] for i in fx.range_constexpr(_KV_SIZE)
-            ]
-            ep_kv_tiles = []
-            for m in fx.range_constexpr(NUM_MSB):
-                row = [
-                    set_vgpr_bank(
-                        ep_kv_tiles_flat[m * N_WMMA_K_TILES + k],
-                        m,
-                    )
-                    for k in fx.range_constexpr(N_WMMA_K_TILES)
-                ]
-                ep_kv_tiles.append(row)
-
-            # K_next / V_next LDS bases for endtile
-            # core_loop kv_lds_addrs_next.
-            ep_k_next_base = loop_results[_OFF_PP + 2]
-            ep_v_next_base = loop_results[_OFF_PP + 3]
-            ep_kv_lds_addrs_next = build_kv_lds_addrs(
-                lane_id,
-                ep_k_next_base,
-                ep_v_next_base,
-            )
-
-            # V(N-1) global offset for endtile GEMM1 TDM.
-            num_tiles_m1_ep = num_tiles - 1
-            ep_v_endtile_offset = v_offset + num_tiles_m1_ep * tile_n_const * stride_v_seq
-
-            # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
-            ia_exp_delta = [
-                set_vgpr_bank(loop_results[_OFF_PED + m], m)
-                for m in fx.range_constexpr(NUM_MSB)
-            ]
-
-            # ---- 4c: s_wait_idle + barrier ----
-            emit_void("s_wait_idle")
-            rocdl.s_barrier_signal(-1)
-            rocdl.s_barrier_wait(-1)
-
-            # ---- 4c': _ep_finish — PART2 + PV_pure + div_cvt + TDM store D ----
-            # o_tiles:           [[v8f32]*N_PV_WMMA_N]*NUM_MSB — accumulated O
-            # sp_pairs_in:       [[v2f32]*N_SP_PAIRS]*NUM_MSB  — PART2 first-half input
-            # exp_delta_rescale: [f32]*NUM_MSB                 — exp_delta for O
-            # rescale before PV
-            # v_base_for_pv:     i32                           — V LDS base for PV_pure
-            # old_max_in:        [f32]*NUM_MSB                 — max across all tiles
-            # seen so far
-            # local_max_in:      [f32]*NUM_MSB                 — local max (same as
-            # old_max after PART0+1)
-            # delta_in:          [f32]*NUM_MSB                 — delta (for PART2 setup)
-            # row_sums_in:       [f32]*NUM_MSB                 — row_sums accumulated
-            # to this point
             def _ep_finish(
                 o_tiles,
                 sp_pairs_in,
@@ -1758,6 +1311,454 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
                 tdm_ops.tensor_wait(0)
 
+            # ================================================================
+            # SECTION 2: Prologue — Tile 0 QK + Partial Softmax (no PV)
+            #
+            # 1. TDM load K(tile 0) → K_a LDS
+            # 2. QK_pure for all 4 SUs (no interleaving, first tile)
+            # 3. TDM load V(tile 0) → V_a LDS
+            # 4. Apply causal + KV OOB masks
+            # 5. sp_tiles → sp_pairs → Softmax PART0+PART1+PART2 (first half)
+            # 6. Prefetch K(tile 1) → K_b
+            # 7. Build initial iter_args for dynamic loop
+            # ================================================================
+            #
+            #   1. TDM K(tile 0, 4 SUs) → wait → QK_pure (64 WMMAs)
+            #   2. TDM V(tile 0, 4 SUs) — overlapped with softmax
+            #   3. sp_tiles → sp_pairs → softmax PART0+PART1 only (no PART2)
+            #   4. TDM K(tile 1) — prefetch K only, V(tile 0) stays in LDS
+            #   5. Wait K(tile 1) → LDS K(su=0) — preload for core_loop entry
+            #
+            # No PV in prologue. PART2 + PV run in core_loop iterations.
+
+            zero_f32 = arith.constant(0.0, type=T.f32)
+            neg_inf = arith.constant(float("-inf"), type=T.f32)
+            zero_v8f32 = fx.constant_vector(0.0, T.vec(8, T.f32))
+
+            # -- 2a: Load K(tile 0) → K_a (ping buffer) --
+            rocdl.sched_barrier(0)
+            TDM.load_k_only(
+                ptr_K,
+                k_offset,
+                stride_k_seq,
+                stride_k_32,
+                wave_id,
+                k_a_base_i32,
+                oob_dg1_list=k_oob_dg1,
+            )
+            rocdl.sched_barrier(0)
+
+            # -- 2b: QK_pure for all 4 SUs --
+            all_su_sp_tiles = []
+            for su in fx.range_constexpr(CNT_SU):
+                kv_tiles_su = Fragment.load_k_su(ty, kv_lds_addrs_a, 0, su)
+                fresh_sp = []
+                for msb in fx.range_constexpr(NUM_MSB):
+                    fresh_sp.append([zero_v8f32])
+                fresh_sp = qk_gemm_pure(ty, 0, su, q_frags, kv_tiles_su, fresh_sp)
+                all_su_sp_tiles.append(fresh_sp)
+
+            # -- 2c: Load V(tile 0) → V_a (ping buffer) --
+            TDM.load_v_only(
+                ptr_V,
+                v_offset,
+                stride_v_seq,
+                stride_v_32,
+                wave_id,
+                v_a_base_i32,
+                oob_dg1_list=v_oob_dg1,
+            )
+
+            # -- 2d': causal mask on prologue tile (n_start=0) --
+            # Bottom-right aligned: shift n_start by -(sk - sq) so the diagonal
+            # is anchored at the bottom-right corner of the QK matrix.
+            causal_offset = actual_kv_len - actual_q_len
+            if const_expr(IS_CAUSAL):
+                pro_causal_n = -causal_offset
+                apply_causal_mask(all_su_sp_tiles, pro_causal_n)
+
+            # -- 2d'': KV OOB mask on prologue tile --
+            apply_kv_oob_mask(all_su_sp_tiles, actual_kv_len)
+
+            # -- 2d: sp_tiles → sp_pairs --
+            sp_pairs_all_pro = Softmax.tiles_to_pairs(all_su_sp_tiles)
+
+            # -- 2e: Softmax PART0+PART1 only (no PART2) --
+            # Pin each MSB's scalar state to its own VGPR bank for the
+            # "全-bankN" (0x00/0x55/0xAA/0xFF) MSB allocation pattern.
+            softmax_state_pro = {
+                "old_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                "local_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                "delta": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                "exp_delta": [None] * NUM_MSB,
+                "cur_max_log2e": [None] * NUM_MSB,
+                "cur_max_log2e_1": [None] * NUM_MSB,
+                "cur_max_log2e_scalar": [None] * NUM_MSB,
+                "cur_max_log2e_dup": [None] * NUM_MSB,
+                "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                "exp_delta_dup": [None] * NUM_MSB,
+                "row_sums": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                "p_bf16": [[], [], [], []],
+                "sp_pairs_prev": sp_pairs_all_pro,
+            }
+            Softmax.part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
+
+            # -- 2e': PART2 first half for tile 0 --
+            # Runs ops 0..PART2_SPLIT-1: setup(7)+pkfma(16)+pair_exp(8) = 31 ops/MSB.
+            # 4 MSBs × 8 pair_exp = 32 pair_exp + 4 exp_delta (unavoidable pipeline
+            # overhead).
+            # sp_pairs_all_pro[m][0..15] are partially modified (pkfma+8-exp applied).
+            # pro_exp_delta seeds the O-rescale iter_arg for the first core_loop
+            # iteration.
+            pro_part2_ops = Softmax.build_all_part2_ops(
+                ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state
+            )
+            for m in fx.range_constexpr(NUM_MSB):
+                for op in pro_part2_ops[m][:PART2_SPLIT]:
+                    op()
+
+            # -- 2f: Prefetch K(tile 1) → K_b if available --
+            tile_n_const = TILE_N
+            kv_tiles_avail = (actual_kv_len + (TILE_N - 1)) // tile_n_const
+            if const_expr(IS_CAUSAL):
+                # Causal (bottom-right aligned): the last Q row (m_start + TILE_N - 1)
+                # attends to the last K row (actual_kv_len - 1).  The first Q row in
+                # this tile attends to K starting at position
+                #   (actual_kv_len - actual_q_len) + m_start.
+                # So the number of KV tiles needed is:
+                sk_sq_diff = actual_kv_len - actual_q_len
+                sk_sq_tiles = (sk_sq_diff + (TILE_N - 1)) // tile_n_const
+                bx_plus_1 = bx + 1
+                causal_tiles = bx_plus_1 + sk_sq_tiles
+                num_tiles = arith.minui(causal_tiles.ir_value(), kv_tiles_avail)
+            else:
+                # Non-causal: iterate over all KV tiles.
+                num_tiles = kv_tiles_avail
+            num_tiles_idx = arith.index_cast(T.index, num_tiles)
+            # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
+            num_tiles_minus1 = num_tiles - 1
+            num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
+
+            # Load K(tile 1) → K_b for core_loop first iteration.
+            # For num_tiles=1 (128x128), K_b is never used (loop runs 0 iterations).
+            rocdl.sched_barrier(0)
+            k_tile1_stride = tile_n_const * stride_k_seq
+            k_tile1_offset = k_offset + k_tile1_stride
+            kv_remain_t1 = actual_kv_len - TILE_N
+            k_tile1_oob_dg1 = [
+                TDM.make_kv_dg1_with_oob(
+                    K_CFG_OOB,
+                    QK_HDIM,
+                    8,
+                    stride_k_elems_oob,
+                    TDM.per_warp_oob_dim1(
+                        kv_remain_t1 - su * 32,
+                        wave_id,
+                        8,
+                    ),
+                    dim0_stride=200,
+                )
+                for su in range(CNT_SU)
+            ]
+            TDM.load_k_only(
+                ptr_K,
+                k_tile1_offset,
+                stride_k_seq,
+                stride_k_32,
+                wave_id,
+                k_b_base_i32,
+                oob_dg1_list=k_tile1_oob_dg1,
+            )
+            rocdl.sched_barrier(0)
+
+            # -- 2g: Load K(su=0) from K_b for core_loop entry --
+            kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
+
+            # Prologue results: PART0+PART1+PART2 first half done.
+            # old_max = local_max (set by PART2 setup op0); row_sums rescaled
+            # (×exp_delta).
+            pro_old_max = [
+                softmax_state_pro["old_max"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_row_sums = [
+                softmax_state_pro["row_sums"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_local_max = [
+                softmax_state_pro["local_max"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_delta = [
+                softmax_state_pro["delta"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+
+            # Partial sp_pairs after first half: yield as separate lo+hi f32 scalars.
+            # Prologue runs pair_exp sequentially (correct v2f32), so extractelement is
+            # safe here.
+            pro_partial_sp_lo_flat = []
+            pro_partial_sp_hi_flat = []
+            for m in fx.range_constexpr(NUM_MSB):
+                for i in fx.range_constexpr(N_SP_PAIRS):
+                    pair = Vec(sp_pairs_all_pro[m][i], dtype=fx.Float32)
+                    pro_partial_sp_lo_flat.append(pair[0].ir_value())
+                    pro_partial_sp_hi_flat.append(pair[1].ir_value())
+            pro_partial_sp_flat = pro_partial_sp_lo_flat + pro_partial_sp_hi_flat
+            # exp_delta from PART2 setup (used by first core_loop iteration's O
+            # rescale).
+            pro_exp_delta = [
+                softmax_state_pro["exp_delta"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+
+            # Flatten kv_tiles_init[4 msb][2] → 8 v16bf16
+            kv_flat_init = []
+            for msb in fx.range_constexpr(NUM_MSB):
+                for k in fx.range_constexpr(N_WMMA_K_TILES):
+                    kv_flat_init.append(kv_tiles_init[msb][k])
+
+            # Flatten prologue sp_tiles per SU [CNT_SU][NUM_MSB][1] → 16 v8f32
+            sp_flat_init = []
+            for su in fx.range_constexpr(CNT_SU):
+                for msb in fx.range_constexpr(NUM_MSB):
+                    sp_flat_init.append(all_su_sp_tiles[su][msb][0])
+
+            # ================================================================
+            # SECTION 3: Dynamic KV Loop — scf.for_ from tile 1
+            #
+            # Pipeline: K is one tile AHEAD of V in LDS.
+            #   Iteration i: GEMM1 on K(i+1), GEMM2 on V(i)
+            #   After fmha_pipeline: TDM V(i+1) + K(i+2)
+            #
+            # Two sub-loops for causal attention:
+            #   3a: non-causal tiles [1, first_causal_tile) — no mask
+            #   3b: causal tiles [first_causal_tile, num_tiles-1) — with mask
+            # ================================================================
+            #
+            # Pipeline layout:
+            #   - K in LDS is one tile AHEAD of V in LDS
+            #   - Prologue loaded K(tile 0)+V(tile 0), did QK, prefetched K(tile 1)
+            #   - Iteration i: GEMM1 on K(tile i+1), GEMM2 on V(tile i)
+            #   - After core_loop: TDM V(tile i+1) + K(tile i+2)
+            #
+            # O tiles start as zeros (no PV in prologue).
+
+            # ================================================================
+            # Init iter_args layout (dynamic — offsets depend on N_WMMA_K_TILES):
+            #   [0..15]            o_tiles[4][4] v8f32                  = 16 values
+            #   [16..19]           old_max[4] f32                        = 4 values
+            #   [20..23]           row_sums[4] f32                       = 4 values
+            #   [24..24+KV-1]      kv_tiles[NUM_MSB][N_WMMA_K_TILES]    = KV values
+            #   [24+KV..+3]        local_max[4] f32                      = 4 values
+            #   [24+KV+4..+7]      delta[4] f32                          = 4 values
+            #   [24+KV+8..+23]     sp_tiles[CNT_SU*NUM_MSB] v8f32       = 16 values
+            #   [24+KV+24..+27]    ping-pong bases (i32)                 = 4 values
+            #   [24+KV+28..+91]    partial_sp_pairs[4][16] v2f32        = 64 values
+            #                      (PART2 first half output, double-buffered pipeline)
+            #   [24+KV+92..+95]    exp_delta[4] f32                     = 4 values
+            # ================================================================
+            _KV_SIZE = NUM_MSB * N_WMMA_K_TILES  # 12 for 192-dim, 8 for 128-dim
+            _OFF_LOCAL_MAX = 24 + _KV_SIZE  # 36 for 192-dim
+            _OFF_DELTA = _OFF_LOCAL_MAX + NUM_MSB
+            _OFF_SP = _OFF_DELTA + NUM_MSB
+            _OFF_PP = _OFF_SP + CNT_SU * NUM_MSB
+            _OFF_PSP = _OFF_PP + 4  # partial_sp lo: 64 f32
+            _PSP_SIZE = NUM_MSB * N_SP_PAIRS  # = 64 (lo half)
+            _OFF_PSP_HI = _OFF_PSP + _PSP_SIZE  # partial_sp hi: 64 f32
+            _OFF_PED = _OFF_PSP_HI + _PSP_SIZE  # exp_delta: 4 f32
+            o_flat_init = [zero_v8f32] * (NUM_MSB * N_PV_WMMA_N)
+
+            # Ping-pong bases for iteration 1:
+            #   K_cur = K_b (tile 1 K), V_cur = V_a (tile 0 V)
+            #   K_next = K_a (TDM K target), V_next = V_b (TDM V target)
+            pp_init = [k_b_base_i32, v_a_base_i32, k_a_base_i32, v_b_base_i32]
+
+            init_args = (
+                o_flat_init
+                + pro_old_max
+                + pro_row_sums
+                + kv_flat_init
+                + pro_local_max
+                + pro_delta
+                + sp_flat_init
+                + pp_init
+                + pro_partial_sp_flat
+                + pro_exp_delta
+            )
+
+            # ---- Split point for causal loops (chunked-prefill: sq < sk) ----
+            # Tiles below first_causal_tile are fully under the diagonal and
+            # need no causal mask.  Tiles at or above it cross the diagonal.
+            # When sq == sk, first_causal_tile == num_tiles so loop 1 covers
+            # everything and loop 2 runs zero iterations — no regression.
+            if const_expr(IS_CAUSAL):
+                # Tile t is fully below the diagonal when
+                #   (t+1)*TILE_N - 1 <= causal_offset + m_start
+                # i.e. t < floor((causal_offset + m_start) / TILE_N) + 1
+                # Since m_start = bx * TILE_N this equals bx + floor(causal_offset /
+                # TILE_N).
+                # Clamp to [1, num_tiles-1) since loop 1 starts at tile 1.
+                first_causal_tile = bx + causal_offset // tile_n_const
+                first_causal_tile = arith.maxsi(
+                    first_causal_tile.ir_value(), arith.constant(1, type=T.i32)
+                )
+                first_causal_tile = arith.minui(first_causal_tile, num_tiles_minus1)
+                first_causal_tile_idx = arith.index_cast(T.index, first_causal_tile)
+            else:
+                first_causal_tile_idx = num_tiles_minus1_idx
+
+            # ---- tile_iteration: shared loop body for SECTION 3a / 3b ----
+            # ================================================================
+            # SECTION 3a: Main KV loop — non-causal tiles [1, first_causal_tile)
+            # ================================================================
+            for tile_idx, iter_args, loop1_results in scf.for_(
+                arith.index(1),
+                first_causal_tile_idx,
+                arith.index(1),
+                iter_args=init_args,
+            ):
+                yield tile_iteration(tile_idx, iter_args)
+
+            # ================================================================
+            # SECTION 3b: Main KV loop — causal tiles [first_causal_tile, num_tiles-1)
+            # ================================================================
+            for tile_idx, iter_args, loop_results in scf.for_(
+                first_causal_tile_idx,
+                num_tiles_minus1_idx,
+                arith.index(1),
+                iter_args=loop1_results,
+            ):
+                # Causal mask: compute n_start for this tile
+                tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
+                causal_n = tile_idx_i32 * tile_n_const - causal_offset
+                yield tile_iteration(tile_idx, iter_args, causal_n_start=causal_n)
+
+            # ================================================================
+            # SECTION 4: Epilogue — post_process + div_cvt + write_out
+            #
+            # 1. Unpack final loop results (o_tiles, softmax state)
+            # 2. Process endtile (last KV tile): core_loop + ep_finish
+            # 3. Final O-rescale: O *= 1/row_sum
+            # 4. Convert f32 → bf16 and store to LDS
+            # 5. TDM store LDS → global output
+            # 6. (Optional) Compute and store LSE
+            # ================================================================
+            #
+            #   fmha_post_process(is_odd):
+            #     softmax stages 4..7 (PART2) → complete last tile's softmax
+            #     LDS V(su=0..3) → PV_pure (64 WMMAs)
+            #   fmha_div_cvt():
+            #     row_sums cross-MSB reduce → LSE = max*scale + log(sum)
+            #     O = O * rcp(row_sum) → cvt_pk_bf16
+            #   lds_store_D_LSE() + TDM_store_D_LSE()
+            #
+            # For tile_n=128: blk=0 always, no is_odd branching.
+
+            # ---- 4a: Unpack loop results ----
+            # Pin each MSB's values to bank=d/msb for full-bank MSB pattern.
+            ep_o_tiles = []
+            for d in fx.range_constexpr(NUM_MSB):
+                row = []
+                for n in fx.range_constexpr(N_PV_WMMA_N):
+                    row.append(set_vgpr_bank(loop_results[d * N_PV_WMMA_N + n], d))
+                ep_o_tiles.append(row)
+
+            ep_old_max = [
+                set_vgpr_bank(loop_results[16 + i], i)
+                for i in fx.range_constexpr(NUM_MSB)
+            ]
+            ep_row_sums = [
+                set_vgpr_bank(loop_results[20 + i], i)
+                for i in fx.range_constexpr(NUM_MSB)
+            ]
+            ep_local_max = [
+                set_vgpr_bank(loop_results[_OFF_LOCAL_MAX + i], i)
+                for i in fx.range_constexpr(NUM_MSB)
+            ]
+            ep_delta = [
+                set_vgpr_bank(loop_results[_OFF_DELTA + i], i)
+                for i in fx.range_constexpr(NUM_MSB)
+            ]
+
+            # Epilogue ping-pong: V_cur after swap has last tile's V data
+            ep_k_cur_base = loop_results[_OFF_PP]
+            ep_v_cur_base = loop_results[_OFF_PP + 1]
+            ep_kv_lds_addrs = build_kv_lds_addrs(
+                lane_id,
+                ep_k_cur_base,
+                ep_v_cur_base,
+            )
+
+            # ---- 4b: Unpack partial_sp_pairs:
+            # reconstruct v2f32 from separate lo+hi f32 ----
+            ep_partial_sp_lo = [
+                loop_results[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
+            ]
+            ep_partial_sp_hi = [
+                loop_results[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
+            ]
+            ep_partial_sp_pairs = []
+            for m in fx.range_constexpr(NUM_MSB):
+                ep_pairs = [
+                    make_v2f32(
+                        ep_partial_sp_lo[m * N_SP_PAIRS + i],
+                        ep_partial_sp_hi[m * N_SP_PAIRS + i],
+                        m,
+                    )
+                    for i in fx.range_constexpr(N_SP_PAIRS)
+                ]
+                ep_partial_sp_pairs.append(ep_pairs)
+
+            # ---- 4b': Extra state for endtile (N>=2) ----
+            # K(N-1) fragments from loop (GEMM2 stage 3 loaded from K_next).
+            ep_kv_tiles_flat = [
+                loop_results[24 + i] for i in fx.range_constexpr(_KV_SIZE)
+            ]
+            ep_kv_tiles = []
+            for m in fx.range_constexpr(NUM_MSB):
+                row = [
+                    set_vgpr_bank(
+                        ep_kv_tiles_flat[m * N_WMMA_K_TILES + k],
+                        m,
+                    )
+                    for k in fx.range_constexpr(N_WMMA_K_TILES)
+                ]
+                ep_kv_tiles.append(row)
+
+            # K_next / V_next LDS bases for endtile
+            # core_loop kv_lds_addrs_next.
+            ep_k_next_base = loop_results[_OFF_PP + 2]
+            ep_v_next_base = loop_results[_OFF_PP + 3]
+            ep_kv_lds_addrs_next = build_kv_lds_addrs(
+                lane_id,
+                ep_k_next_base,
+                ep_v_next_base,
+            )
+
+            # V(N-1) global offset for endtile GEMM1 TDM.
+            num_tiles_m1_ep = num_tiles - 1
+            ep_v_endtile_offset = v_offset + num_tiles_m1_ep * tile_n_const * stride_v_seq
+
+            # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
+            ia_exp_delta = [
+                set_vgpr_bank(loop_results[_OFF_PED + m], m)
+                for m in fx.range_constexpr(NUM_MSB)
+            ]
+
+            # ---- 4c: s_wait_idle + barrier ----
+            emit_void("s_wait_idle")
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+
+            # ---- 4c': _ep_finish — PART2 + PV_pure + div_cvt + TDM store D ----
+            # o_tiles:           [[v8f32]*N_PV_WMMA_N]*NUM_MSB — accumulated O
+            # sp_pairs_in:       [[v2f32]*N_SP_PAIRS]*NUM_MSB  — PART2 first-half input
+            # exp_delta_rescale: [f32]*NUM_MSB                 — exp_delta for O
+            # rescale before PV
+            # v_base_for_pv:     i32                           — V LDS base for PV_pure
+            # old_max_in:        [f32]*NUM_MSB                 — max across all tiles
+            # seen so far
+            # local_max_in:      [f32]*NUM_MSB                 — local max (same as
+            # old_max after PART0+1)
+            # delta_in:          [f32]*NUM_MSB                 — delta (for PART2 setup)
+            # row_sums_in:       [f32]*NUM_MSB                 — row_sums accumulated
+            # to this point
             # ---- 4c'': endtile dispatch — if N>=2: core_loop + ep_finish, else:
             # ep_finish ----
             is_multi = num_tiles >= 2
