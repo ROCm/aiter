@@ -43,7 +43,7 @@ except ModuleNotFoundError as e:
 
 from aiter.ops.shuffle import (
     shuffle_scale_a16w4,
-    shuffle_scale_a16wi4,
+    shuffle_scale_for_int4,
     shuffle_weight,
     shuffle_weight_a16w4,
     shuffle_weight_a16wi4,
@@ -306,9 +306,14 @@ def test_fmoe(
             .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
             .view(dtypes.i4x2)
         )
-        # groupwise scale: [E, K//32, N] bf16 -> (E, N, G//2, 2) for the port kernel.
-        w1_scale_aiter = shuffle_scale_a16wi4(w1_scale).view(-1).contiguous()
-        w2_scale_aiter = shuffle_scale_a16wi4(w2_scale).view(-1).contiguous()
+        # groupwise scale: [E, K//32, N] bf16 -> (E, G//2, N, 2) (OLD-kernel layout,
+        # coalesced N-major gather in the port kernel).
+        w1_scale_aiter = (
+            shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+        )
+        w2_scale_aiter = (
+            shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+        )
     elif WQDType == torch.int4:  # int4 w quant (a8w4)
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
