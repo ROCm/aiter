@@ -11,7 +11,7 @@ on:
         type: string
         required: false
       python_version:
-        description: 'Python version, e.g. 3.10, 3.12, 3.13 (default: builds both 3.10 and 3.12)'
+        description: 'Python version, e.g. 3.11, 3.12, 3.13 (default: builds both 3.11 and 3.12)'
         type: string
         required: false
       gpu_archs:
@@ -36,9 +36,9 @@ jobs:
     uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
-      docker_image_py310: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
-      docker_image_py312: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
-      build_py310: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.10' }}
+      docker_image_py311: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.14_ubuntu24.04_py3.11_pytorch_release_2.12.0@sha256:05743468394cc8f9cce06822635836a31ddfd5956bac36976666d7057713441d' }}
+      docker_image_py312: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0@sha256:c38eeda81d85f00fbe35d3d50ce42ce59c524e87d810624f4eb5c52fddb3b9ad' }}
+      build_py311: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.11' }}
       build_py312: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.12' }}
       gpu_archs: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
       runner: build-only-aiter

@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
+  DOCKER_IMAGE: "rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0@sha256:c38eeda81d85f00fbe35d3d50ce42ce59c524e87d810624f4eb5c52fddb3b9ad"
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
@@ -58,11 +58,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python_version: "3.10"
-            docker_image: "rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+          - python_version: "3.11"
+            docker_image: "rocm/pytorch:rocm7.14_ubuntu24.04_py3.11_pytorch_release_2.12.0@sha256:05743468394cc8f9cce06822635836a31ddfd5956bac36976666d7057713441d"
             build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
-            docker_image: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
+            docker_image: "rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0@sha256:c38eeda81d85f00fbe35d3d50ce42ce59c524e87d810624f4eb5c52fddb3b9ad"
             build_enabled: true
     steps:
       # ---- Common steps (fork and non-fork) ----
@@ -354,7 +354,7 @@ jobs:
     needs: check-signal
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
+      docker-image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0@sha256:c38eeda81d85f00fbe35d3d50ce42ce59c524e87d810624f4eb5c52fddb3b9ad
       artifact-name: triton_wheelhouse
       retention-days: 3
 
