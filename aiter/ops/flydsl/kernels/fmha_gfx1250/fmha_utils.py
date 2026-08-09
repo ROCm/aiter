@@ -2984,3 +2984,986 @@ class TDM:
         rocdl.s_wait_tensorcnt(0)
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
+
+
+# ================================================================
+# Kernel pipeline functions
+# (extracted from fmha_fwd_kernel -- take ctx dict for kernel state)
+# ================================================================
+
+# Iter-arg layout constants (must match fmha_kernel.py SECTION 3 init_args)
+_KV_SIZE = NUM_MSB * N_WMMA_K_TILES
+_OFF_LOCAL_MAX = 24 + _KV_SIZE
+_OFF_DELTA = _OFF_LOCAL_MAX + NUM_MSB
+_OFF_SP = _OFF_DELTA + NUM_MSB
+_OFF_PP = _OFF_SP + CNT_SU * NUM_MSB
+_OFF_PSP = _OFF_PP + 4
+_PSP_SIZE = NUM_MSB * N_SP_PAIRS
+_OFF_PSP_HI = _OFF_PSP + _PSP_SIZE
+_OFF_PED = _OFF_PSP_HI + _PSP_SIZE
+
+
+def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
+    lane_id = ctx["lane_id"]
+    wave_id = ctx["wave_id"]
+    m_start = ctx["m_start"]
+    lane_lo = lane_id & 15
+    lane_hi_x8 = (lane_id >> 4) * 8
+    wave_x32 = wave_id * 32
+    base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
+    neg_inf_c = arith.constant(float("-inf"), type=T.f32)
+    for su in fx.range_constexpr(CNT_SU):
+        for msb in fx.range_constexpr(NUM_MSB):
+            off = (msb // 2) * 16 - su * 32 - (msb % 2) * 16
+            bnd_fx = base + off
+            v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
+            masked_elems = []
+            for e in fx.range_constexpr(8):
+                cmp_fx = bnd_fx < e
+                elem_fx = v8w[e]
+                mval_fx = cmp_fx.select(neg_inf_c, elem_fx)
+                masked_elems.append(mval_fx)
+            su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
+
+
+def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
+    lane_id = ctx["lane_id"]
+    lane_hi = lane_id >> 4
+    lane_hi_x8 = lane_hi * 8
+    base = (kv_remain_raw - 1) - lane_hi_x8
+    neg_inf = arith.constant(float("-inf"), type=T.f32)
+    for su in fx.range_constexpr(CNT_SU):
+        for msb in fx.range_constexpr(NUM_MSB):
+            col_base_val = su * 32 + (msb % 2) * 16
+            bnd = base - col_base_val
+            v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
+            masked_elems = []
+            for e in fx.range_constexpr(8):
+                cmp = bnd < e
+                elem = v8w[e]
+                mval = cmp.select(neg_inf, elem)
+                masked_elems.append(mval)
+            su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
+
+
+def fmha_pipeline_ctx(
+    ctx,
+    ty,
+    memload,
+    q_tiles,  # [4 msb][Q_WMMA_PER_MSB] v16bf16 -- Q data
+    kv_tiles,  # [4 msb][2] v16bf16 -- paired K tiles for WMMA
+    sp_tiles,  # [4 msb][1] v8f32 -- QK accumulators
+    # [4 d_msb][N_PV_WMMA_N] v8f32 -- O accum
+    o_tiles,
+    # [8] i32 -- [K_cur[0:4] + V_cur[4:8]]
+    kv_lds_addrs,
+    tdm_state,  # TDM SGPR descriptors
+    # Softmax state (old_max, local_max, etc.)
+    softmax_state,
+    sgpr_state,  # SGPR refs (s_log2e_scl)
+    gemm2=True,  # run GEMM2 stages?
+    # V global offset for TDM (cur -> next V)
+    tdm_v_offset=None,
+    # K global offset for TDM (next -> next K)
+    tdm_k_offset=None,
+    tdm_k_target=None,  # i32 LDS base K
+    tdm_v_target=None,  # i32 LDS base V
+    # [8] [K_next + V_next] for K reload
+    kv_lds_addrs_next=None,
+    # False=main(GEMM1 K) True=epi(GEMM1 V)
+    gemm1_tdm_is_v=False,
+    # exp_delta from previous tile (for O-rescale)
+    ia_exp_delta=None,
+    # i32 n_start for causal mask (None=skip)
+    causal_n_start=None,
+    # list[CNT_SU] v8i32 OOB dg1 for GEMM1 V TDM
+    endtile_v_oob_dg1=None,
+    # raw i32: valid K cols (None = all 128)
+    kv_oob_cols=None,
+    # list[CNT_SU] v8i32 OOB dg1 K prefetch
+    loop_k_oob_dg1=None,
+    # list[CNT_SU] v8i32 OOB dg1 V load
+    loop_v_oob_dg1=None,
+):
+    """Full core loop: GEMM1 (QK) + softmax + GEMM2 (PV).
+
+    tile_n=128: single pass with 4 SUs (no pi/half loops).
+    4 GEMM1 stages (64 QK WMMAs) + 4 GEMM2 stages (64 PV WMMAs) = 128 total.
+
+    Pipeline per call:
+      GEMM1: QK on current K (in LDS, from kv_lds_addrs[0:4])
+      PART2: run on sp_pairs_prev (from previous tile)
+      PART0+PART1: run on current sp_tiles
+      GEMM2: PV using P tiles x V (in LDS, from kv_lds_addrs[4:8])
+      TDM: GEMM1 loads K(i+1)->K_next; GEMM2 loads V(i)->V_next (main loop)
+           GEMM1 loads V(endtile)->V_next (epilogue, gemm1_tdm_is_v=True)
+
+    kv_lds_addrs: [K_cur[0:4] + V_cur[4:8]] -- built from mixed allocator
+    bases via build_kv_lds_addrs(lane_id, k_cur_base, v_cur_base).
+    kv_lds_addrs_next: same structure for next ping-pong buffer, used for
+    GEMM2 stage 3 K preload (K_next already filled by GEMM1 TDM).
+
+    Returns: (sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list).
+    """
+    stride_k_seq = ctx["stride_k_seq"]
+    stride_v_seq = ctx["stride_v_seq"]
+    stride_k_32 = ctx["stride_k_32"]
+    stride_v_32 = ctx["stride_v_32"]
+    ptr_K = ctx["ptr_K"]
+    ptr_V = ctx["ptr_V"]
+    wave_id = ctx["wave_id"]
+
+    Atom.s_wait_dscnt(LDS_INST_COUNT // 2)  # s_wait_dscnt 0x8
+
+    v_tiles_out = None
+    blk = 0
+
+    # ================================================================
+    # GEMM1 (QK): 4 stages (SU 0..3)
+    # Interleave PART2 on sp_pairs_prev during GEMM1 stages.
+    # ================================================================
+    sp_pairs_all = softmax_state.get("sp_pairs_prev", None)
+    if const_expr(sp_pairs_all is None):
+        sp_pairs_all = [[None] * N_SP_PAIRS for _ in range(NUM_MSB)]
+
+    softmax_ops_by_msb = Softmax.build_all_part2_ops(
+        ty, 0, sp_pairs_all, softmax_state, sgpr_state
+    )
+    # Second half starts at PART2_SPLIT; first half ran in previous GEMM2.
+    softmax_idx_by_msb = [PART2_SPLIT] * NUM_MSB
+
+    # Pre-run setup ops 0..PART2_SETUP_A-2 (skip last = row_sums rescale,
+    # already applied).
+    for m in fx.range_constexpr(NUM_MSB):
+        # ops 0..5, skip op 6
+        for i in fx.range_constexpr(PART2_SETUP_A - 1):
+            softmax_ops_by_msb[m][i]()
+
+    # Build TDM descriptors for GEMM1 stages 0-1.
+    has_tdm_k_g1 = (not gemm1_tdm_is_v) and (tdm_k_offset is not None)
+    has_tdm_v_g1 = gemm1_tdm_is_v and (tdm_v_offset is not None)
+
+    if has_tdm_k_g1:
+        i64 = ir.IntegerType.get_signless(64)
+        _K_CFG = (1 << 16) | K_TDM_CONFIG
+        _stride_k_elems = stride_k_seq >> 1
+        if const_expr(loop_k_oob_dg1 is not None):
+            k_dg1 = loop_k_oob_dg1
+        else:
+            k_dg1 = Vec.from_elements(
+                [
+                    fx.Int32(_K_CFG),
+                    fx.Int32(QK_HDIM << 16),
+                    fx.Int32(8 << 16),
+                    fx.Int32(200 << 16),
+                    fx.Int32(8),
+                    _stride_k_elems,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                ],
+                fx.Int32,
+            )
+        k_addr = compute_global_addr(
+            ptr_K, tdm_k_offset, wave_id, 8 * stride_k_seq,
+        )
+        k_stride_adv = fx.Int64(stride_k_32)
+        _k_warp_off = wave_id * (8 * K_ROW_BYTES)
+        _k_lds_base = tdm_k_target + _k_warp_off
+        k_descs = TDM.build_descs(
+            k_dg1, k_addr, k_stride_adv,
+            _k_lds_base, LDS_K_SU_P_SIZE, CNT_SU,
+        )
+        tdm_state["k_descs"] = k_descs
+        tdm_state["k_desc_idx"] = 0
+
+    if has_tdm_v_g1:
+        i64 = ir.IntegerType.get_signless(64)
+        _V_CFG = (1 << 16) | V_TDM_CONFIG
+        _stride_v_elems = stride_v_seq >> 1
+        if const_expr(endtile_v_oob_dg1 is not None):
+            v_dg1 = endtile_v_oob_dg1
+        else:
+            v_dg1 = Vec.from_elements(
+                [
+                    fx.Int32(_V_CFG),
+                    fx.Int32(128 << 16),
+                    fx.Int32(8 << 16),
+                    fx.Int32(128 << 16),
+                    fx.Int32(8),
+                    _stride_v_elems,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                ],
+                fx.Int32,
+            )
+        v_addr = compute_global_addr(
+            ptr_V, tdm_v_offset, wave_id, 8 * stride_v_seq,
+        )
+        v_stride_adv = fx.Int64(stride_v_32)
+        _v_warp_off = wave_id * (8 * V_ROW_BYTES)
+        _v_lds_base = tdm_v_target + _v_warp_off
+        v_descs = TDM.build_descs(
+            v_dg1, v_addr, v_stride_adv,
+            _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU,
+        )
+        tdm_state["v_descs"] = v_descs
+        tdm_state["v_desc_idx"] = 0
+
+    g1_tdm_type = (
+        KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE
+    )
+    stage_configs = [
+        (0, g1_tdm_type, KV_K, blk, 1),
+        (1, g1_tdm_type, KV_K, blk, 2),
+        (2, KV_NONE, KV_K, blk, 3),
+        (3, KV_NONE, KV_V, blk, 0),
+    ]
+
+    su_sp_tiles_list = []
+
+    # O rescale: all 4 MSBs across GEMM1 stages 0-3.
+    ed_v8 = []
+    for dm in fx.range_constexpr(NUM_MSB):
+        ed_v8.append(fx.vector.broadcast(T.vec(8, T.f32), ia_exp_delta[dm]))
+    o_rescale_by_stage = []
+    for s in fx.range_constexpr(N_PV_WMMA_N):
+        stage_closures = []
+        for dm in fx.range_constexpr(NUM_MSB):
+
+            def mk_rescale(dm=dm, nn=s, ev8=ed_v8[dm]):
+                def op():
+                    o_tiles[dm][nn] = o_tiles[dm][nn] * ev8
+
+                return op
+
+            stage_closures.append(mk_rescale())
+        o_rescale_by_stage.append(stage_closures)
+
+    for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in enumerate(
+        stage_configs
+    ):
+
+        n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
+        kv_tiles_next_raw = [[None] * n_lds for _ in range(NUM_MSB)]
+
+        softmax_stage = (stage_idx + 4) % ALU_STAGES
+        budget_per_msb = ALU_PER_STAGE[softmax_stage] // NUM_MSB
+        softmax_budget = [budget_per_msb, budget_per_msb, 0, 0]
+
+        is_barrier_stage = stage_idx == 2 and (has_tdm_k_g1 or has_tdm_v_g1)
+
+        stage_o_rescale = o_rescale_by_stage[stage_idx]
+
+        sp_tiles, kv_tiles_next_raw = gemm1_interleaved_stage(
+            ty,
+            stage_idx,
+            blk,
+            g_su,
+            t_type,
+            blk,
+            g_su,
+            l_type,
+            l_blk,
+            l_su,
+            q_tiles,
+            kv_tiles,
+            sp_tiles,
+            kv_lds_addrs,
+            kv_tiles_next_raw,
+            softmax_ops_by_msb,
+            softmax_idx_by_msb,
+            softmax_budget,
+            tdm_state,
+            tdm_barrier=is_barrier_stage,
+            o_rescale_ops=stage_o_rescale,
+        )
+
+        su_sp_tiles_list.append(
+            [[sp_tiles[msb][0]] for msb in range(NUM_MSB)]
+        )
+
+        if const_expr(l_type == KV_K):
+            kv_tiles = Fragment.pair_k_tiles(kv_tiles_next_raw, ty)
+        else:
+            v_tiles_out = kv_tiles_next_raw
+
+    if const_expr(not gemm2):
+        return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
+
+    # ================================================================
+    # Between GEMM1 and GEMM2: complete softmax pipeline
+    # ================================================================
+
+    # 1. Flush any remaining PART2 second-half ops
+    for msb in fx.range_constexpr(NUM_MSB):
+        for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb] :]:
+            op()
+
+    # O_resc moved entirely to GEMM1 stages -- no O_resc in GEMM2.
+    o_rescale_exp_delta = None
+
+    # ================================================================
+    # Causal mask on current QK tile (before sp_pairs conversion)
+    # ================================================================
+    if const_expr(causal_n_start is not None):
+        apply_causal_mask(ctx, su_sp_tiles_list, causal_n_start)
+    if const_expr(kv_oob_cols is not None):
+        apply_kv_oob_mask(ctx, su_sp_tiles_list, kv_oob_cols)
+
+    # 2. Build sp_pairs for current tile (all 4 SUs).
+    sp_pairs_current = Softmax.tiles_to_pairs(su_sp_tiles_list)
+
+    # 3. Build all PART0+PART1+PART2 closures for current tile.
+    (
+        g2_ops_by_rid,
+        _,
+        g2_sp_lo_cache,
+        g2_sp_hi_cache,
+    ) = Softmax.build_all_gemm2_ops(
+        ty,
+        blk,
+        sp_pairs_current,
+        softmax_state,
+        sgpr_state,
+    )
+    g2_rid_idx = [0] * RLTS_LEN
+
+    # 4. Build P tiles from p_bf16
+    p_tiles_computed = Softmax.build_p_tiles(ty, softmax_state)
+
+    # ================================================================
+    # GEMM2 (PV): 4 stages (SU 0..3)
+    # ================================================================
+
+    v_tiles_paired = Fragment.pair_v_tiles(v_tiles_out, ty)
+
+    # Build V TDM descriptors for GEMM2 stages 0-1.
+    has_tdm_v_g2 = (not gemm1_tdm_is_v) and (tdm_v_offset is not None)
+    if has_tdm_v_g2:
+        i64 = ir.IntegerType.get_signless(64)
+        _V_CFG = (1 << 16) | V_TDM_CONFIG
+        _stride_v_elems = stride_v_seq >> 1
+        if const_expr(loop_v_oob_dg1 is not None):
+            v_dg1 = loop_v_oob_dg1
+        else:
+            v_dg1 = Vec.from_elements(
+                [
+                    fx.Int32(_V_CFG),
+                    fx.Int32(128 << 16),
+                    fx.Int32(8 << 16),
+                    fx.Int32(128 << 16),
+                    fx.Int32(8),
+                    _stride_v_elems,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                ],
+                fx.Int32,
+            )
+        v_addr = compute_global_addr(
+            ptr_V, tdm_v_offset, wave_id, 8 * stride_v_seq,
+        )
+        v_stride_adv = fx.Int64(stride_v_32)
+        _v_warp_off = wave_id * (8 * V_ROW_BYTES)
+        _v_lds_base = tdm_v_target + _v_warp_off
+        v_descs = TDM.build_descs(
+            v_dg1, v_addr, v_stride_adv,
+            _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU,
+        )
+        tdm_state["v_descs"] = v_descs
+        tdm_state["v_desc_idx"] = 0
+
+    g2_stage_configs = [
+        (0, KV_V, blk, 1, KV_V if has_tdm_v_g2 else KV_NONE, False),
+        (1, KV_V, blk, 2, KV_V if has_tdm_v_g2 else KV_NONE, False),
+        (2, KV_V, blk, 3, KV_NONE, has_tdm_v_g2),
+        (3, KV_K, blk, 0, KV_NONE, False),
+    ]
+
+    for stage_idx, (
+        g_su,
+        l_type,
+        l_blk,
+        l_su,
+        t_type,
+        barrier,
+    ) in enumerate(g2_stage_configs):
+
+        p_tiles_su = p_tiles_computed[g_su]
+
+        n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
+        kv_tiles_next_raw = [[None] * n_lds for _ in range(NUM_MSB)]
+
+        if const_expr(l_type == KV_K):
+            g2_addrs = (
+                kv_lds_addrs_next
+                if kv_lds_addrs_next is not None
+                else kv_lds_addrs
+            )
+        else:
+            g2_addrs = kv_lds_addrs
+
+        o_tiles, kv_tiles_next_raw = gemm2_interleaved_stage(
+            ty,
+            stage_idx,
+            blk,
+            g_su,
+            l_type,
+            l_blk,
+            l_su,
+            v_tiles_paired,
+            p_tiles_su,
+            o_tiles,
+            g2_addrs,
+            kv_tiles_next_raw,
+            g2_ops_by_rid,
+            g2_rid_idx,
+            tdm_state=tdm_state,
+            tdm_type=t_type,
+            tdm_barrier=barrier,
+            o_rescale_exp_delta=(
+                o_rescale_exp_delta if stage_idx == 0 else None
+            ),
+        )
+
+        if const_expr(l_type == KV_V):
+            v_tiles_paired = Fragment.pair_v_tiles(kv_tiles_next_raw, ty)
+        else:
+            kv_tiles = Fragment.pair_k_tiles(kv_tiles_next_raw, ty)
+
+    rocdl.sched_barrier(0)
+
+    # Build partial_sp lo+hi flat lists for yield.
+    partial_sp_lo_out = []
+    partial_sp_hi_out = []
+    for psm in fx.range_constexpr(NUM_MSB):
+        for psi in fx.range_constexpr(N_SP_PAIRS):
+            lo_c = g2_sp_lo_cache[psm][psi]
+            hi_c = g2_sp_hi_cache[psm][psi]
+            if const_expr(lo_c is None or hi_c is None):
+                pair = Vec(sp_pairs_current[psm][psi], dtype=fx.Float32)
+            if const_expr(lo_c is None):
+                lo_c = pair[0].ir_value()
+            if const_expr(hi_c is None):
+                hi_c = pair[1].ir_value()
+            partial_sp_lo_out.append(lo_c)
+            partial_sp_hi_out.append(hi_c)
+
+    partial_ed_out = [
+        softmax_state["exp_delta"][m] for m in fx.range_constexpr(NUM_MSB)
+    ]
+    return (
+        sp_tiles,
+        kv_tiles,
+        o_tiles,
+        su_sp_tiles_list,
+        partial_sp_lo_out,
+        partial_sp_hi_out,
+        partial_ed_out,
+    )
+
+
+def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
+    """One iteration of the KV loop: unpack -> fmha_pipeline -> pack."""
+    lane_id = ctx["lane_id"]
+    wave_id = ctx["wave_id"]
+    actual_kv_len = ctx["actual_kv_len"]
+    stride_k_seq = ctx["stride_k_seq"]
+    stride_v_seq = ctx["stride_v_seq"]
+    k_offset = ctx["k_offset"]
+    v_offset = ctx["v_offset"]
+    tile_n_const = ctx["tile_n_const"]
+    zero_v8f32 = ctx["zero_v8f32"]
+    q_frags = ctx["q_frags"]
+    sgpr_state = ctx["sgpr_state"]
+    ty = ctx["ty"]
+
+    # ---- Unpack iter_args ----
+    o_tiles_flat = [iter_args[i] for i in fx.range_constexpr(16)]
+    o_tiles = []
+    for d in fx.range_constexpr(NUM_MSB):
+        row = []
+        for n in fx.range_constexpr(N_PV_WMMA_N):
+            idx = d * N_PV_WMMA_N + n
+            row.append(set_vgpr_bank(o_tiles_flat[idx], d))
+        o_tiles.append(row)
+
+    ia_old_max = [
+        set_vgpr_bank(iter_args[16 + i], i)
+        for i in fx.range_constexpr(NUM_MSB)
+    ]
+    ia_row_sums = [
+        set_vgpr_bank(iter_args[20 + i], i)
+        for i in fx.range_constexpr(NUM_MSB)
+    ]
+
+    kv_tiles_flat = [
+        iter_args[24 + i] for i in fx.range_constexpr(_KV_SIZE)
+    ]
+    kv_tiles = []
+    for msb in fx.range_constexpr(NUM_MSB):
+        row = []
+        for k in fx.range_constexpr(N_WMMA_K_TILES):
+            ki = msb * N_WMMA_K_TILES + k
+            row.append(set_vgpr_bank(kv_tiles_flat[ki], msb))
+        kv_tiles.append(row)
+
+    ia_local_max = [
+        set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i)
+        for i in fx.range_constexpr(NUM_MSB)
+    ]
+    ia_delta = [
+        set_vgpr_bank(iter_args[_OFF_DELTA + i], i)
+        for i in fx.range_constexpr(NUM_MSB)
+    ]
+
+    ia_sp_flat = [
+        iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)
+    ]
+    prev_su_sp_tiles = []
+    for su in fx.range_constexpr(CNT_SU):
+        msb_list = []
+        for msb in fx.range_constexpr(NUM_MSB):
+            si = su * NUM_MSB + msb
+            msb_list.append([set_vgpr_bank(ia_sp_flat[si], msb)])
+        prev_su_sp_tiles.append(msb_list)
+
+    # Unpack ping-pong bases
+    ia_k_cur_base = iter_args[_OFF_PP]
+    ia_v_cur_base = iter_args[_OFF_PP + 1]
+    ia_k_next_base = iter_args[_OFF_PP + 2]
+    ia_v_next_base = iter_args[_OFF_PP + 3]
+
+    # Build per-lane LDS addresses from ping-pong bases
+    kv_lds_addrs_cur = build_kv_lds_addrs(
+        lane_id,
+        ia_k_cur_base,
+        ia_v_cur_base,
+    )
+    kv_lds_addrs_next = build_kv_lds_addrs(
+        lane_id,
+        ia_k_next_base,
+        ia_v_next_base,
+    )
+
+    # Unpack partial_sp_pairs: reconstruct v2f32 from separate lo+hi f32 scalars
+    ia_partial_sp_lo = [
+        iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
+    ]
+    ia_partial_sp_hi = [
+        iter_args[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
+    ]
+    ia_exp_delta = [
+        set_vgpr_bank(iter_args[_OFF_PED + i], i)
+        for i in fx.range_constexpr(NUM_MSB)
+    ]
+
+    ia_partial_sp_pairs = []
+    for m in fx.range_constexpr(NUM_MSB):
+        msb_pairs = [
+            make_v2f32(
+                ia_partial_sp_lo[m * N_SP_PAIRS + i],
+                ia_partial_sp_hi[m * N_SP_PAIRS + i],
+                m,
+            )
+            for i in fx.range_constexpr(N_SP_PAIRS)
+        ]
+        ia_partial_sp_pairs.append(msb_pairs)
+
+    # SP tiles: zero accumulators (fresh each iteration)
+    sp_tiles = []
+    for msb in fx.range_constexpr(NUM_MSB):
+        sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
+
+    softmax_state = {
+        "old_max": list(ia_old_max),
+        "local_max": list(ia_local_max),
+        "delta": list(ia_delta),
+        "exp_delta": [None] * NUM_MSB,
+        "cur_max_log2e": [None] * NUM_MSB,
+        "cur_max_log2e_1": [None] * NUM_MSB,
+        "cur_max_log2e_scalar": [None] * NUM_MSB,
+        "cur_max_log2e_dup": [None] * NUM_MSB,
+        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+        "exp_delta_dup": [None] * NUM_MSB,
+        "row_sums": list(ia_row_sums),
+        "p_bf16": [[], [], [], []],
+        "sp_pairs_prev": ia_partial_sp_pairs,
+    }
+
+    # Build TDM state (zero placeholder for memload=False)
+    tdm_state = {
+        "v_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+        "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
+        "k_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+        "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
+        "v_salu_queue": [],
+        "k_salu_queue": [],
+    }
+
+    # Compute TDM offsets
+    tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
+
+    tile_n_stride_v = tile_n_const * stride_v_seq
+    cur_v_advance = tile_idx_i32 * tile_n_stride_v
+    cur_v_offset = v_offset + cur_v_advance
+
+    next_tile = tile_idx_i32 + 1
+    tile_n_stride_k = tile_n_const * stride_k_seq
+    next_k_advance = next_tile * tile_n_stride_k
+    next_k_offset = k_offset + next_k_advance
+
+    # Per-tile OOB dg1 for K prefetch and V load
+    _loop_stride_k_elems = stride_k_seq >> 1
+    _loop_stride_v_elems = stride_v_seq >> 1
+    _loop_K_CFG_OOB = (1 << 16) | K_TDM_CONFIG
+    _loop_V_CFG_OOB = (1 << 16) | V_TDM_CONFIG
+
+    loop_v_remain = actual_kv_len - tile_idx_i32 * tile_n_const
+    loop_v_oob_dg1 = [
+        TDM.make_kv_dg1_with_oob(
+            _loop_V_CFG_OOB,
+            128,
+            8,
+            _loop_stride_v_elems,
+            TDM.per_warp_oob_dim1(
+                loop_v_remain - su * 32,
+                wave_id,
+                8,
+            ),
+        )
+        for su in range(CNT_SU)
+    ]
+    loop_k_remain = actual_kv_len - next_tile * tile_n_const
+    loop_k_oob_dg1 = [
+        TDM.make_kv_dg1_with_oob(
+            _loop_K_CFG_OOB,
+            QK_HDIM,
+            8,
+            _loop_stride_k_elems,
+            TDM.per_warp_oob_dim1(
+                loop_k_remain - su * 32,
+                wave_id,
+                8,
+            ),
+            dim0_stride=200,
+        )
+        for su in range(CNT_SU)
+    ]
+
+    # Core fmha_pipeline call
+    (
+        sp_out,
+        kv_out,
+        o_tiles,
+        su_sp_tiles_out,
+        partial_sp_lo_out,
+        partial_sp_hi_out,
+        partial_ed_out,
+    ) = fmha_pipeline_ctx(
+        ctx,
+        ty,
+        False,
+        q_frags,
+        kv_tiles,
+        sp_tiles,
+        o_tiles,
+        kv_lds_addrs_cur,
+        tdm_state,
+        softmax_state,
+        sgpr_state,
+        gemm2=True,
+        tdm_v_offset=cur_v_offset,
+        tdm_v_target=ia_v_next_base,
+        tdm_k_offset=next_k_offset,
+        tdm_k_target=ia_k_next_base,
+        kv_lds_addrs_next=kv_lds_addrs_next,
+        gemm1_tdm_is_v=False,
+        ia_exp_delta=ia_exp_delta,
+        causal_n_start=causal_n_start,
+        loop_k_oob_dg1=loop_k_oob_dg1,
+        loop_v_oob_dg1=loop_v_oob_dg1,
+    )
+
+    # Pack yield tuple with ping-pong swap
+    new_o = []
+    for d in fx.range_constexpr(NUM_MSB):
+        for n in fx.range_constexpr(N_PV_WMMA_N):
+            new_o.append(o_tiles[d][n])
+
+    new_max = [
+        softmax_state["old_max"][i] for i in fx.range_constexpr(NUM_MSB)
+    ]
+    new_sums = [
+        softmax_state["row_sums"][i] for i in fx.range_constexpr(NUM_MSB)
+    ]
+
+    kv_out_flat = []
+    for msb in fx.range_constexpr(NUM_MSB):
+        for k in fx.range_constexpr(N_WMMA_K_TILES):
+            kv_out_flat.append(kv_out[msb][k])
+
+    new_local_max = [
+        softmax_state["local_max"][i] for i in fx.range_constexpr(NUM_MSB)
+    ]
+    new_delta = [
+        softmax_state["delta"][i] for i in fx.range_constexpr(NUM_MSB)
+    ]
+
+    sp_out_flat = []
+    for su in fx.range_constexpr(CNT_SU):
+        for msb in fx.range_constexpr(NUM_MSB):
+            sp_out_flat.append(su_sp_tiles_out[su][msb][0])
+
+    pp_swapped = [
+        ia_k_next_base,
+        ia_v_next_base,
+        ia_k_cur_base,
+        ia_v_cur_base,
+    ]
+
+    new_partial_sp_flat = partial_sp_lo_out + partial_sp_hi_out
+    new_exp_delta = [
+        partial_ed_out[m] for m in fx.range_constexpr(NUM_MSB)
+    ]
+
+    return (
+        new_o
+        + new_max
+        + new_sums
+        + kv_out_flat
+        + new_local_max
+        + new_delta
+        + sp_out_flat
+        + pp_swapped
+        + new_partial_sp_flat
+        + new_exp_delta
+    )
+
+
+def _ep_finish(
+    ctx,
+    o_tiles,
+    sp_pairs_in,
+    exp_delta_rescale,
+    v_base_for_pv,
+    old_max_in,
+    local_max_in,
+    delta_in,
+    row_sums_in,
+    ep_k_cur_base,
+):
+    ty = ctx["ty"]
+    sgpr_state = ctx["sgpr_state"]
+    lane_id = ctx["lane_id"]
+    scalar_f = ctx["scalar_f"]
+    RETURN_LSE = ctx["RETURN_LSE"]
+    ptr_LSE = ctx["ptr_LSE"]
+    bx = ctx["bx"]
+    actual_q_len = ctx["actual_q_len"]
+    q_start_tok = ctx["q_start_tok"]
+    gdz = ctx["gdz"]
+    by = ctx["by"]
+    wave_id = ctx["wave_id"]
+    o_oob_dim1 = ctx["o_oob_dim1"]
+    stride_o_seq = ctx["stride_o_seq"]
+    stride_o_head = ctx["stride_o_head"]
+    ptr_O = ctx["ptr_O"]
+    zero_v8f32 = ctx["zero_v8f32"]
+    q_frags = ctx["q_frags"]
+    actual_kv_len = ctx["actual_kv_len"]
+    stride_v_seq = ctx["stride_v_seq"]
+
+    sfx = {
+        "old_max": list(old_max_in),
+        "local_max": list(local_max_in),
+        "delta": list(delta_in),
+        "exp_delta": [None] * NUM_MSB,
+        "cur_max_log2e": [None] * NUM_MSB,
+        "cur_max_log2e_1": [None] * NUM_MSB,
+        "cur_max_log2e_scalar": [None] * NUM_MSB,
+        "cur_max_log2e_dup": [None] * NUM_MSB,
+        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+        "exp_delta_dup": [None] * NUM_MSB,
+        "row_sums": list(row_sums_in),
+        "p_bf16": [[], [], [], []],
+        "sp_pairs_prev": sp_pairs_in,
+    }
+
+    # PART2 second half: setup ops + pair_exp+cvt+sum.
+    p2ops = Softmax.build_all_part2_ops(
+        ty,
+        0,
+        sp_pairs_in,
+        sfx,
+        sgpr_state,
+    )
+    for m in fx.range_constexpr(NUM_MSB):
+        for i in fx.range_constexpr(PART2_SETUP_A - 1):  # ops 0..6
+            p2ops[m][i]()
+
+    for m in fx.range_constexpr(NUM_MSB):
+        for op in p2ops[m][PART2_SPLIT:]:
+            op()
+
+    p_tiles = Softmax.build_p_tiles(ty, sfx)
+
+    # O rescale
+    for msb in fx.range_constexpr(NUM_MSB):
+        edv8 = fx.vector.broadcast(T.vec(8, T.f32), exp_delta_rescale[msb])
+        for n in fx.range_constexpr(N_PV_WMMA_N):
+            o_tiles[msb][n] = o_tiles[msb][n] * edv8
+
+    # PV_pure
+    kv_pv = build_kv_lds_addrs(lane_id, ep_k_cur_base, v_base_for_pv)
+    for sp in fx.range_constexpr(2):
+        sb = sp * 2
+        vr0, vr1 = Fragment.load_v_two_sus(ty, kv_pv, 0, sb, sb + 1)
+        o_tiles = pv_gemm_pure(
+            ty,
+            0,
+            sb,
+            Fragment.pair_v_tiles(vr0, ty),
+            p_tiles[sb],
+            o_tiles,
+        )
+        o_tiles = pv_gemm_pure(
+            ty,
+            0,
+            sb + 1,
+            Fragment.pair_v_tiles(vr1, ty),
+            p_tiles[sb + 1],
+            o_tiles,
+        )
+
+    # 4d: div_cvt
+    v8f32 = T.vec(8, T.f32)
+    v8bf16 = T.vec(8, T.bf16)
+    rsf = list(sfx["row_sums"])
+    lmf = list(sfx["local_max"])
+    for mb in fx.range_constexpr(0, NUM_MSB, 2):
+        sm = rsf[mb] + rsf[mb + 1]
+        slo = arith.constant(0x76543210, type=T.i32)
+        shi = arith.constant(0xFEDCBA98, type=T.i32)
+        pm = rocdl_permlanex16(
+            ty["f32"],
+            sm,
+            sm,
+            slo,
+            shi,
+            False,
+            False,
+        )
+        sf = sm + pm
+        rsf[mb] = sf
+        rsf[mb + 1] = sf
+    l2e = 0.6931471805599453
+    lse_vals = [None] * NUM_MSB
+    for msb in fx.range_constexpr(NUM_MSB):
+        mxs = lmf[msb] * scalar_f
+        lgs = rocdl.log(ty["f32"], rsf[msb])
+        lse_vals[msb] = lgs * l2e + mxs
+
+    # Store LSE to global: ptr_LSE layout (total_q, nheads) fp32
+    if const_expr(RETURN_LSE):
+        i64_lse = T.i64
+        glbpt_lse = glb_ptr_ty()
+        lse_base_i64 = ptr_base_i64(ptr_LSE)
+
+        wv_lse = rocdl.wave_id()
+        lane_lo_lse = lane_id & 15
+
+        lse_bx128 = bx * 128
+        lse_wv32 = wv_lse * WV_SUBQD
+        lse_base_row = lse_bx128 + lse_wv32
+
+        for msb_lse in [0, 2]:
+            msb_off = 0 if msb_lse == 0 else 16
+            seq_pos = lse_base_row + lane_lo_lse + msb_off
+            lse_valid = seq_pos < actual_q_len
+            _if_lse = scf.IfOp(lse_valid.ir_value())
+            with ir.InsertionPoint(_if_lse.then_block):
+                lse_tok = q_start_tok + seq_pos
+                lse_elem_off = lse_tok * gdz + by
+                lse_byte_off = lse_elem_off * 4
+                lse_byte_off_i64 = fx.Int64(lse_byte_off)
+                lse_addr = lse_base_i64 + lse_byte_off_i64
+                lse_ptr = llvm_dialect.inttoptr(glbpt_lse, lse_addr)
+                llvm_dialect.store(lse_vals[msb_lse], lse_ptr)
+                scf.YieldOp([])
+    obf16 = []
+    for msb in fx.range_constexpr(NUM_MSB):
+        rcp = rocdl.rcp(ty["f32"], rsf[msb])
+        rv8 = fx.vector.broadcast(T.vec(8, T.f32), rcp)
+        mb16 = []
+        for n in fx.range_constexpr(N_PV_WMMA_N):
+            mb16.append(
+                fx.trunc_f(
+                    v8bf16,
+                    o_tiles[msb][n] * rv8,
+                )
+            )
+        obf16.append(mb16)
+
+    # Barrier: ensure all waves finish PV before any wave writes D to V_a LDS.
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
+
+    # 4e: TDM store D (VGPR -> LDS -> Global)
+    i32t = T.i32
+    ldst = lds_ptr_ty()
+    v4i32t = T.vec(4, T.i32)
+    db32 = extract_lds_base_i32(lds_alloc_v_a.get_base())
+    dw_wv = wave_id * LDS_D_WV_SIZE
+    dw = db32 + dw_wv
+    d_thr = fx.make_layout((16, 2), (1, 16))
+    d_crd = idx2crd(lane_id, d_thr)
+    llo = arith.index_cast(T.i32, d_crd[0])
+    lhi = arith.index_cast(T.i32, d_crd[1])
+    loff = llo * TDM_D_TILE_DIM0 + lhi * 16
+    for msb in fx.range_constexpr(NUM_MSB):
+        for n in fx.range_constexpr(N_PV_WMMA_N):
+            ioff = (
+                (msb // 2) * 16 * TDM_D_TILE_DIM0
+                + (msb % 2) * 128
+                + n * 32
+            )
+            la = dw + loff + ioff
+            llvm_dialect.store(
+                fx.vector.bitcast(v4i32t, obf16[msb][n]),
+                llvm_dialect.inttoptr(ldst, la),
+                volatile_=True,
+            )
+    emit_void("s_wait_dscnt 0x0")
+    wsgpr = rocdl.wave_id()
+
+    i64t = T.i64
+    o_tok = q_start_tok + bx * 128 + wsgpr * WV_SUBQD
+    o_elem_off = by * stride_o_head + o_tok * stride_o_seq
+    o64 = ptr_base_i64(ptr_O)
+    boff32 = o_elem_off * 2
+    boff64 = fx.Int64(boff32)
+    oadr64 = o64 + boff64
+
+    alo, ahi = split_i64_to_lo_hi(oadr64)
+    olds2 = extract_lds_base_i32(lds_alloc_v_a.get_base()) + wsgpr * LDS_D_WV_SIZE
+    _dg0 = Vec.from_elements(
+        [fx.Int32(1), olds2, alo, ahi], fx.Int32,
+    )
+    _g0 = fx.Int32((1 << 16) | 0)
+    _g1 = fx.Int32((128 & 0xFFFF) << 16)
+    _td1_lo_o = arith.andi(o_oob_dim1, arith.constant(0xFFFF, type=T.i32))
+    _g2 = arith.ori(
+        arith.shli(_td1_lo_o, arith.constant(16, type=T.i32)),
+        arith.constant((128 >> 16) & 0xFFFF, type=T.i32),
+    )
+    _g3_val = ((32 >> 16) & 0xFFFF) | ((128 & 0xFFFF) << 16)
+    _g3 = fx.Int32(_g3_val)
+    _g4 = fx.Int32(32 & 0xFFFF)
+    _g5 = stride_o_seq
+    _g6 = fx.Int32(0)
+    _g7 = fx.Int32(0)
+    _dg1 = Vec.from_elements(
+        [_g0, _g1, _g2, _g3, _g4, _g5, _g6, _g7], fx.Int32,
+    )
+    tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
+    tdm_ops.tensor_wait(0)
