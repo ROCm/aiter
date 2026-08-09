@@ -109,6 +109,14 @@ def _gemm1_body_a16w4(
     # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
     # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
     _PIPE = K_TILES_TOTAL > 1
+    # Roll the K loop (compact scf.for) ONLY for int4 decode/mid-M tiles (BM==16). The
+    # roll cuts small-M GRBM/SQ_BUSY ~2x where the grid is latency-bound, but COSTS ~12%
+    # at large M (tok4096, t32x128x256_bnt0, BM=32) where the kernel is HBM-adjacent and
+    # wants the unrolled body's ILP/prefetch depth. The tuned CSV uses BM==16 for every
+    # decode/mid row and BM>=32 only for large-M rows, so BM==16 cleanly selects the
+    # regime that wins from rolling. Compile-time (kernel is compiled per tile config);
+    # mxfp4/bf16 never roll (byte-identical to main).
+    _roll_k = _is_int4 and BM <= 16
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
     # Per-k-group A-LDS region (single region at k_wave=1).
@@ -683,12 +691,12 @@ def _gemm1_body_a16w4(
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
-    elif const_expr(not _is_int4):
-        # mxfp4 (a16w4) / bf16 (a16w16): KEEP the fully-unrolled range_constexpr body
-        # BYTE-IDENTICAL to the shipped/tuned PR#4502 kernel. The rolled scf.for below
-        # is int4-ONLY (a16wi4 decode) -- rolling regresses the mxfp4 mainloop (+5% at
-        # tok16), so a16w4 must not take it. Two mainloop variants is the correct trade
-        # (least change to the already-tuned a16w4 path).
+    elif const_expr(not _roll_k):
+        # mxfp4/bf16 (a16w4/a16w16) AND large-M int4 (BM>=32): KEEP the fully-unrolled
+        # range_constexpr body. For mxfp4/bf16 this is BYTE-IDENTICAL to the shipped/tuned
+        # PR#4502 kernel (rolling regressed mxfp4 +5% at tok16). For large-M int4 the
+        # unrolled body's ILP/prefetch depth wins where the kernel is HBM-adjacent (the
+        # roll costs ~12% at tok4096). Only int4 BM==16 decode/mid tiles take the roll.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
