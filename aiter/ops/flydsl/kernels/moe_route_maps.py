@@ -13,12 +13,11 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int32, T
+from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -29,6 +28,44 @@ MAX_G2L_EXPERTS = 512
 # The per-block LDS counter array is sized to this; the dispatcher falls back to
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
+
+
+# ---------------------------------------------------------------------------
+# Buffer helpers (FlyDSL layout API).
+#
+# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
+# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
+# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
+# calling convention): fx.slice on the last coord reads/writes `width` contiguous
+# elements starting at `group_index`.
+# ---------------------------------------------------------------------------
+def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
+    alignment = max(1, elem_ty.width * width // 8)
+    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
+    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
+    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=max_size, num_records_bytes=num_records_bytes
+    )
+
+
+def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
+    value = Vec(fragment.load())
+    return value[0] if width == 1 else value
+
+
+def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
+    )
+    fragment = fx.make_rmem_tensor(width, elem_ty)
+    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
+    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 @fx.struct
@@ -60,13 +97,14 @@ class _RouteG2LStorage:
 def _slot_ptr(base_i64, elem_idx, address_space=1):
     """Raw LLVM pointer to i32 element ``elem_idx`` of the buffer at ``base_i64``.
 
-    The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
-    ops do not produce, so the byte address is formed by hand here.
+    The atomicrmw builder is a raw op and needs an ``!llvm.ptr<n>``; everything
+    up to that boundary stays on the fx pointer surface.
     """
-    ptr = buffer_ops.create_llvm_ptr(
-        base_i64 + fx.Int64(elem_idx) * 4, address_space=address_space
+    space = (
+        fx.AddressSpace.Shared if address_space == 3 else fx.AddressSpace.Global
     )
-    return ptr._value if hasattr(ptr, "_value") else ptr
+    ptr_ty = fx.PointerType.get(fx.Int32.ir_type, space, 4)
+    return fx.to_llvm_ptr(fx.add_offset(fx.inttoptr(ptr_ty, base_i64), elem_idx))
 
 
 def _lds_load(ptr, idx):
@@ -98,11 +136,11 @@ def build_moe_route_maps_module():
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
-            topk_rsrc = ptr_rsrc(topk_ids)
-            c_rsrc = ptr_rsrc(topids_to_rows)
-            a_rsrc = ptr_rsrc(rows_to_tokens)
+            topk_buf = _make_buffer(topk_ids, fx.Int32)
+            c_buf = _make_buffer(topids_to_rows, fx.Int32)
+            a_buf = _make_buffer(rows_to_tokens, fx.Int32)
 
-            e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
+            e = _buffer_load(topk_buf, route, fx.Int32)
 
             ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
             slot = llvm.AtomicRMWOp(
@@ -115,9 +153,9 @@ def build_moe_route_maps_module():
             ).result
 
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, c_rsrc, route)
+            _buffer_store(c_buf, route, row, fx.Int32)
             token = route // fx.Uint32(topk)
-            buffer_ops.buffer_store(token, a_rsrc, row)
+            _buffer_store(a_buf, row, token, fx.Int32)
 
     @flyc.jit
     def launch_route_maps(
@@ -167,10 +205,10 @@ def build_moe_topids_to_rows_module():
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
-            topk_rsrc = ptr_rsrc(topk_ids)
-            out_rsrc = ptr_rsrc(topids_to_rows)
+            topk_buf = _make_buffer(topk_ids, fx.Int32)
+            out_buf = _make_buffer(topids_to_rows, fx.Int32)
 
-            e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
+            e = _buffer_load(topk_buf, route, fx.Int32)
             ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -181,7 +219,7 @@ def build_moe_topids_to_rows_module():
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, out_rsrc, route)
+            _buffer_store(out_buf, route, row, fx.Int32)
 
     @flyc.jit
     def launch_topids_to_rows(
@@ -241,7 +279,6 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         n_buckets: Int32,  # sentinel value == dropped
     ):
         i32 = T.i32
-        f32 = T.f32
         c0 = arith.constant(0, type=i32)
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
@@ -252,20 +289,18 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         # topids_to_rows/gather_w slots unwritten matches the fused single-block
         # kernel (every downstream consumer is bounded by the same nvr/nvt). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_rsrc = ptr_rsrc(num_valid_routes)
-        nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
+        nvr_buf = _make_buffer(num_valid_routes, fx.Int32)
+        nvr = _buffer_load(nvr_buf, c0, fx.Int32)
         in_range = route < fx.Uint32(nvr)
         if in_range:
-            topk_rsrc = ptr_rsrc(topk_ids)
-            g2l_rsrc = ptr_rsrc(g2l_lut)
-            out_rsrc = ptr_rsrc(topids_to_rows)
-            wi_rsrc = ptr_rsrc(weight_in)
-            w_rsrc = ptr_rsrc(gather_w)
+            topk_buf = _make_buffer(topk_ids, fx.Int32)
+            g2l_buf = _make_buffer(g2l_lut, fx.Int32)
+            out_buf = _make_buffer(topids_to_rows, fx.Int32)
+            wi_buf = _make_buffer(weight_in, fx.Float32)
+            w_buf = _make_buffer(gather_w, fx.Numeric.from_ir_type(wdt))
 
-            ge = fx.Uint32(
-                buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
-            )
-            le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
+            ge = fx.Uint32(_buffer_load(topk_buf, route, fx.Int32))
+            le = fx.Uint32(_buffer_load(g2l_buf, ge, fx.Int32))
             is_drop = le == fx.Uint32(n_buckets)
             # Dropped routes fold to bucket 0 but still take a unique slot.
             eff_e = is_drop.select(fx.Uint32(0), le)
@@ -273,10 +308,10 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             # Fused weight cast+mask: read f32 route weight, write weight_dtype
             # (kept -> cast, dropped -> 0). Folds the host topk_weight.to(bf16)
             # copy and the dropped-weight masked_fill into this route pass.
-            w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
-            w_cast = arith.trunc_f(wdt, w_f32)
+            w_f32 = _buffer_load(wi_buf, route, fx.Float32)
+            w_cast = arith.trunc_f(wdt, _raw(w_f32))
             w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
-            buffer_ops.buffer_store(w_out, w_rsrc, route)
+            _buffer_store(w_buf, route, fx.Numeric.from_ir_type(wdt)(w_out), fx.Numeric.from_ir_type(wdt))
 
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -287,7 +322,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, out_rsrc, route)
+            _buffer_store(out_buf, route, row, fx.Int32)
 
     @flyc.jit
     def launch_topids_to_rows_g2l(
@@ -373,7 +408,6 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         n_buckets: Int32,  # local bucket count / sentinel value; <= MAX_ROUTE_BUCKETS
     ):
         i32 = T.i32
-        f32 = T.f32
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
         c0 = arith.constant(0, type=i32)
         c1 = arith.constant(1, type=i32)
@@ -385,14 +419,14 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # has already folded the array's offset into this base.
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
 
-        tk_rsrc = ptr_rsrc(topk_ids)
-        g2l_rsrc = ptr_rsrc(g2l_lut)
-        wi_rsrc = ptr_rsrc(weight_in)
-        w_rsrc = ptr_rsrc(gather_w)
-        out_rsrc = ptr_rsrc(topids_to_rows)
+        tk_buf = _make_buffer(topk_ids, fx.Int32)
+        g2l_buf = _make_buffer(g2l_lut, fx.Int32)
+        wi_buf = _make_buffer(weight_in, fx.Float32)
+        w_buf = _make_buffer(gather_w, fx.Numeric.from_ir_type(wdt))
+        out_buf = _make_buffer(topids_to_rows, fx.Int32)
 
-        nvr_rsrc = ptr_rsrc(num_valid_routes)
-        nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
+        nvr_buf = _make_buffer(num_valid_routes, fx.Int32)
+        nvr = _buffer_load(nvr_buf, c0, fx.Int32)
 
         n_buckets_i32 = fx.Uint32(n_buckets)
         nvr_i32 = fx.Uint32(nvr)
@@ -414,26 +448,25 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # carry -1/stale ids that would OOB-read g2l_lut); oob folds to 0.
         ge = fx.Uint32(0)
         if in_range:
-            ge = fx.Uint32(
-                buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
-            )
+            ge = fx.Uint32(_buffer_load(tk_buf, route, fx.Int32))
 
-        le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
+        le = fx.Uint32(_buffer_load(g2l_buf, ge, fx.Int32))
         is_drop = (le == n_buckets_i32) | oob
         eff_e = is_drop.select(fx.Uint32(0), le)
 
         # Fused weight cast+mask (kept -> cast(f32->wdt), dropped -> 0).
         w_f32 = fx.Float32(0.0)
         if in_range:
-            w_f32 = fx.Float32(
-                buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
-            )
+            w_f32 = fx.Float32(_buffer_load(wi_buf, route, fx.Float32))
         w_cast = arith.trunc_f(wdt, _raw(w_f32))
         w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
 
         my_rank = fx.Uint32(0)
         if in_range:
-            buffer_ops.buffer_store(w_out, w_rsrc, route)
+            _buffer_store(
+                w_buf, route, fx.Numeric.from_ir_type(wdt)(w_out),
+                fx.Numeric.from_ir_type(wdt),
+            )
             my_rank = fx.Uint32(
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
@@ -471,7 +504,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         if in_range:
             base = fx.Uint32(_lds_load(lds_cnt, eff_e))
             row = base + my_rank + eff_e * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, out_rsrc, route)
+            _buffer_store(out_buf, route, row, fx.Int32)
 
     @flyc.jit
     def launch_route_g2l_lds(
@@ -550,7 +583,6 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         E: Int32,  # local bucket count / sentinel value
     ):
         i32 = T.i32
-        f32 = T.f32
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
         c0 = arith.constant(0, type=i32)
         c1 = arith.constant(1, type=i32)
@@ -562,19 +594,19 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         lds1 = lds.lds1.ptr
         lds_lut = lds.lut.ptr
 
-        m_rsrc = ptr_rsrc(expert_mask)
-        ctr_rsrc = ptr_rsrc(counter)
+        m_buf = _make_buffer(expert_mask, fx.Int32)
+        ctr_buf = _make_buffer(counter, fx.Int32)
 
         # Zero the (E,) route counter (global); barrier below orders it before the
         # phase-B atomics (single block, so no cross-block hazard).
         in_bucket = tid < e_count
         if in_bucket:
-            buffer_ops.buffer_store(c0, ctr_rsrc, tid)
+            _buffer_store(ctr_buf, tid, fx.Int32(0), fx.Int32)
 
         # Phase A: load mask -> 0/1 into LDS.
         in_range = tid < fx.Uint32(n)
         if in_range:
-            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            m = _buffer_load(m_buf, tid, fx.Int32)
             nz = m != c0
             _lds_store(lds0, fx.Int32(nz.select(c1, c0)), tid)
 
@@ -599,25 +631,25 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         # lut[i] = enabled ? incl_prefix[i]-1 : E ; keep in LDS for phase B.
         if in_range:
             incl = _lds_load(src, tid)
-            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            m2 = _buffer_load(m_buf, tid, fx.Int32)
             nz2 = m2 != c0
             _lds_store(lds_lut, nz2.select(fx.Uint32(incl) - 1, e_count), tid)
 
         gpu.barrier()
 
         # Phase B: grid-stride over routes.
-        tk_rsrc = ptr_rsrc(topk_ids)
-        wi_rsrc = ptr_rsrc(weight_in)
-        out_rsrc = ptr_rsrc(topids_to_rows)
-        w_rsrc = ptr_rsrc(gather_w)
+        tk_buf = _make_buffer(topk_ids, fx.Int32)
+        wi_buf = _make_buffer(weight_in, fx.Float32)
+        out_buf = _make_buffer(topids_to_rows, fx.Int32)
+        w_buf = _make_buffer(gather_w, fx.Numeric.from_ir_type(wdt))
 
         # Dynamic EP token count: routes >= num_valid_routes belong to dead-tail
         # padding rows of the dispatch buffer (rows >= total_recv) and must not
         # contribute. Load once and fold into the per-route "dropped" predicate so
         # they reuse the existing drop path (gather_w=0, folded to bucket 0). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_rsrc = ptr_rsrc(num_valid_routes)
-        nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
+        nvr_buf = _make_buffer(num_valid_routes, fx.Int32)
+        nvr = _buffer_load(nvr_buf, c0, fx.Int32)
 
         # Iterate only the valid routes ([0, nvr)); the dead-tail padding routes
         # (>= num_valid_routes) are skipped entirely, so topids_to_rows/gather_w
@@ -628,9 +660,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         nvr_i32 = fx.Uint32(nvr)
         for route in range(tid, nvr_i32, MAX_G2L_EXPERTS):
             is_oob = fx.Uint32(route) >= nvr_i32
-            ge_raw = fx.Uint32(
-                buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
-            )
+            ge_raw = fx.Uint32(_buffer_load(tk_buf, route, fx.Int32))
             # Clamp oob routes' global id to 0 BEFORE the LDS LUT lookup: dead-tail
             # dispatch rows (route >= num_valid_routes) may carry -1 / stale garbage
             # expert ids, which would otherwise OOB-read lds_lut. oob is forced to
@@ -641,10 +671,13 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             eff_e = is_drop.select(fx.Uint32(0), le)
 
             # Fused weight cast+mask: kept -> cast(f32->wdt), dropped -> 0.
-            w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
-            w_cast = arith.trunc_f(wdt, w_f32)
+            w_f32 = _buffer_load(wi_buf, route, fx.Float32)
+            w_cast = arith.trunc_f(wdt, _raw(w_f32))
             w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
-            buffer_ops.buffer_store(w_out, w_rsrc, route)
+            _buffer_store(
+                w_buf, route, fx.Numeric.from_ir_type(wdt)(w_out),
+                fx.Numeric.from_ir_type(wdt),
+            )
 
             # oob (dead-tail) routes must NOT claim a real slot: incrementing the
             # counter would inflate masked_m[0] by the whole padding tail,
@@ -663,7 +696,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            buffer_ops.buffer_store(row, out_rsrc, route)
+            _buffer_store(out_buf, route, row, fx.Int32)
 
     @flyc.jit
     def launch_route_g2l_fused(
