@@ -12,11 +12,7 @@ Used by fmha_kernel.py which implements the top-level kernel
 
 from __future__ import annotations
 
-import functools
-from contextlib import contextmanager
 from typing import List
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -24,9 +20,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, gpu, rocdl
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from flydsl.expr import arith, rocdl
+from aiter.ops.flydsl.kernels import vector
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T, Float32, Vector as Vec
@@ -34,7 +29,6 @@ from flydsl.utils.smem_allocator import SmemAllocator
 
 from flydsl._mlir.dialects import fly as fly_d
 from ..layout_utils import idx2crd as idx2crd
-from ..tensor_shim import _run_compiled
 
 
 def glb_ptr_ty():
@@ -60,8 +54,6 @@ K_BASE = 9    # K_M0..K_M3 = 9..12 (ds_load_b128)
 V_BASE = 13   # V_M0..V_M3 = 13..16 (ds_load_tr16_b128)
 
 # Schedule dimensions
-GEMM_INST_COUNT = 24   # WMMAs per GEMM1 stage
-PV_GEMM_INST_COUNT = 16  # WMMAs per GEMM2 stage
 
 
 # GEMM1 schedule: 96 rows
@@ -338,7 +330,6 @@ WV_SUBKV = TG_SUBKV
 SU_K_N = 32                             # rows per SU (sub-unit)
 SU_K_K = QK_HDIM
 CNT_SU = WV_SUBKV // SU_K_N             # 4 SUs per tile
-COMPUTE_N = 128
 
 # WMMA instruction shape
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
@@ -373,7 +364,6 @@ DSWAIT_OCCUPY_WHOLE_WMMA = 1
 WAIT_DSCNT0 = 0
 QK_WMMA_INTERLEAVE = 1
 TDM_LOADS_PER_STAGE = 2
-TDM_WAIT_CNT = TDM_LOADS_PER_STAGE * 2
 
 # LDS layout (byte offsets)
 LDS_K_SU_P_SIZE = 0x3200                 # per-SU K region: 12800 bytes
@@ -422,8 +412,6 @@ ALU_PER_STAGE = [40, 52, 56, 168, 120, 120, 132, 132]
 # Cycle budget per VALU phase in GEMM1 dispatch.
 # exp_f32 costs 3 cycles, all other VALU (pk_add, cvt, mov) costs 1 cycle.
 # Budget=3 → exactly 1 exp op per phase, or up to 3 cheap ops.
-GEMM1_VALU_PER_PHASE = 3
-
 N_SP_PAIRS = VPS_MSB_SP // 2  # 16 v2f32 pairs per MSB (compact, no -inf padding)
 
 # GEMM2 PV constants
@@ -448,16 +436,6 @@ def emit_void(inst_str, operands=None, constraints="", **kwargs):
         None, operands or [], inst_str, constraints, has_side_effects=True, **kwargs
     )
 
-
-def emit_result(result_type, inst_str, operands=None, constraints="", **kwargs):
-    return llvm_dialect.inline_asm(
-        result_type,
-        operands or [],
-        inst_str,
-        constraints,
-        has_side_effects=True,
-        **kwargs,
-    )
 
 
 def sched_barrier(mask=0):
@@ -1485,14 +1463,10 @@ PART1_INSTS = 8  # cross-MSB merge + delta (total, not per MSB)
 RLTS_LEN = 9  # run-ids: 0-3 PART0, 4 PART1, 5-8 PART2
 
 N_VALID_GROUPS = CNT_SU  # 4 groups of valid data per MSB
-VALID_GROUP_SIZE = 8  # f32 per valid group (one QK accum per SU)
 VALID_GROUP_STRIDE = 8  # stride between groups (no padding)
 
 
 # Unified FMHA Kernel
-
-
-@functools.lru_cache(maxsize=None)
 
 
 class Fragment:
@@ -1758,20 +1732,6 @@ class Pipeline:
         return schedule
 
     @staticmethod
-    def get_lds_slots(stage, gemm_idx, cycle23, qpoint=GEMM_INST_COUNT // 4 - 1):
-        # qpoint: the WMMA index where s_wait_dscnt occupies the slot.
-        # GEMM1 (QK): GEMM_INST_COUNT//4-1 = 5. GEMM2 (PV): PV_GEMM_INST_COUNT//4-1 = 3.
-        if const_expr(DSWAIT_OCCUPY_WHOLE_WMMA):
-            if const_expr(stage >= 1):
-                if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-                    return 0
-        if const_expr(cycle23 == 1):
-            if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-                return 0
-            return 1
-        return 2
-
-    @staticmethod
     def emit_qk_wmma(ty, wmma_op, q_tiles, kv_tiles, sp_tiles):
         """Emit one QK WMMA. Returns updated SP tiles.
 
@@ -1845,13 +1805,7 @@ class Pipeline:
 
 # Prologue Constants
 
-Q_TILE_M = 128
-Q_TILE_D = QK_HDIM  # = 192
 K_TILE_N = 128  # TDM load tile = compute tile (N=128)
-K_COMPUTE_N = 128  # compute tile (QK WMMA uses SU0+SU1)
-K_SU_SIZE = 64
-NUM_K_SU = 2  # TDM loads 2 SUs (= compute)
-NUM_K_SU_COMPUTE = 2
 
 # TDM dim0=200 -> LDS inner stride = 200*2 = 400B
 # (2-way bank conflicts)
@@ -1859,43 +1813,6 @@ K_ROW_BYTES = 400
 V_ROW_BYTES = 288
 K_SU_HALF_OFFSET = 0x1900  # 16 * K_ROW_BYTES = 16 * 400 = 6400
 V_SU_HALF_OFFSET = 0x1200
-V_LDS_OFFSET = 0x8800  # after 2 K SUs: 2×0x4400
-PINGPONG_OFFSET = 0x11800  # one-ping: K(0x8800)+V(0x9000)
-K_SU1_OFFSET = 0x4400
-V_SU1_OFFSET = 0x4800
-
-
-K_D_HALF_OFFSET = 0x2200
-K_LOAD_STRIDE = 32
-NUM_K_LOADS_PER_HALF = 8
-
-# WMMA tiling: 4 groups, each with (k_bank_pair, k_frag_indices)
-GROUP_CONFIG = [
-    ((0, 1), (0, 1, 2, 3)),
-    ((2, 3), (0, 1, 2, 3)),
-    ((0, 1), (4, 5, 6, 7)),
-    ((2, 3), (4, 5, 6, 7)),
-]
-
-# Accumulator column base for causal mask
-ACC_COL_BASE = {
-    (0, 0): 0,
-    (0, 1): 16,
-    (2, 0): 64,
-    (2, 1): 80,
-    (1, 0): 8,
-    (1, 1): 24,
-    (3, 0): 72,
-    (3, 1): 88,
-    (0, 2): 32,
-    (0, 3): 48,
-    (2, 2): 96,
-    (2, 3): 112,
-    (1, 2): 40,
-    (1, 3): 56,
-    (3, 2): 104,
-    (3, 3): 120,
-}
 
 # TDM config constants.
 # K: dim0=192 (QK_HDIM), no padding. QK_HDIM=192 is not a multiple of any
@@ -1930,11 +1847,8 @@ lds_alloc_v_b = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_v_b")
 lds_alloc_v_b.ptr = CNT_SU * LDS_V_SU_P_SIZE
 
 TDM_D_TILE_DIM0 = 128 * 2  # 256 bytes per LDS row
-TDM_D_TENSOR_DIM0 = 128 * 2
 WV_SUBQD = 32
 LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024  # 9216 bytes per wave
-
-lds_allocator = lds_alloc_k_a
 
 # Prologue Helpers
 
@@ -1968,10 +1882,6 @@ def mul_nuw(a, b):
     return arith.muli(_ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw())
 
 
-def acc_bank(g_idx, tile):
-    return (g_idx & 1) + 2 * (1 if tile >= 2 else 0)
-
-
 def setreg(hwreg_enc, value):
     """s_setreg_imm32_b32 via llvm.amdgcn.s.setreg intrinsic.
     hwreg_enc = id | (offset << 6) | ((size-1) << 11)"""
@@ -1979,20 +1889,6 @@ def setreg(hwreg_enc, value):
     val = arith.constant(value, type=T.i32)
     llvm_dialect.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
-
-def s_wait_tensorcnt(cnt):
-    from flydsl.expr import rocdl as _rocdl_expr
-
-    _rocdl_expr.s_wait_tensorcnt(cnt)
-
-
-# LDS / Fragment Helpers
-
-def lds_load_b128(lds_base_raw, byte_offset_raw):
-    lds_ptr_ty = lds_ptr_ty()
-    total = lds_base_raw + byte_offset_raw
-    ptr = llvm_dialect.inttoptr(lds_ptr_ty, total)
-    return llvm_dialect.load(T.vec(4, T.i32), ptr)
 
 
 # FlyDSL Phase Functions
@@ -2105,8 +2001,6 @@ def compute_global_addr(tensor, byte_offset, wave_id, stride_32):
     wave_off = fx.Int64(wave_id * stride_32)
     return base_i64 + off_i64 + wave_off
 
-compute_k_global_addr = compute_global_addr
-compute_v_global_addr = compute_global_addr
 
 
 # LDS base extraction helper
@@ -2621,180 +2515,6 @@ def pv_gemm_pure(ty, blk, su, v_tiles, p_tiles_su, o_tiles):
         o_tiles = Pipeline.emit_pv_wmma(ty, wmma_op, v_tiles, p_tiles_su, o_tiles)
         sched_barrier(0)
     return o_tiles
-
-
-def fmha_pipeline(
-    ty,
-    memload,
-    q_tiles,  # [4 msb][Q_WMMA_PER_MSB] v16bf16 — Q data
-    kv_tiles,  # [4 msb][2] v16bf16 — paired K tiles for WMMA
-    sp_tiles,  # [4 msb][1] v8f32 — QK accumulators
-    o_tiles,  # [4 d_msb][N_PV_WMMA_N] v8f32 — O accumulators (or None)
-    kv_lds_addrs,  # [4 K_addr + 4 V_addr] i32 — LDS address VGPRs
-    tdm_state,  # TDM SGPR descriptors
-    softmax_state,  # Softmax state (old_max, local_max, row_sums, delta, etc.)
-    sgpr_state,  # SGPR references (s_log2e_scl, etc.)
-    gemm2=True,  # Whether to run GEMM2 stages
-):
-    """Full core loop: GEMM1 (QK) + softmax + GEMM2 (PV).
-
-    tile_n=128: single pass with 4 SUs (no pi/half loops).
-    4 GEMM1 stages (96 QK WMMAs for QK_HDIM=192) + 4 GEMM2 stages (64 PV WMMAs
-    via the compact, no-padding schedule = 16 WMMAs/stage × 4 SUs).
-
-    Pipeline per call:
-      GEMM1: QK on current K (in LDS) → sp_tiles per SU
-      PART2: run on sp_pairs_prev (from previous tile) → P tiles + rescale O
-      PART0+PART1: run on current sp_tiles → update max/delta for next PART2
-      GEMM2: PV using P tiles × V (in LDS) → O accumulates
-
-    Returns: (sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list).
-      su_sp_tiles_list: [CNT_SU][NUM_MSB][1] v8f32 — per-SU QK output for
-                        next iteration's sp_pairs_prev.
-    """
-    Atom.s_wait_dscnt(LDS_INST_COUNT // 2)  # s_wait_dscnt 0x8
-
-    v_tiles_out = None
-    blk = 0
-
-    # ================================================================
-    # GEMM1 (QK): 4 stages (SU 0..3)
-    # Interleave PART2 on sp_pairs_prev during GEMM1 stages.
-    # ================================================================
-    sp_pairs_all = softmax_state.get("sp_pairs_prev", None)
-    if const_expr(sp_pairs_all is None):
-        sp_pairs_all = [[None] * N_SP_PAIRS for _ in range_constexpr(NUM_MSB)]
-
-    softmax_ops_by_msb = Softmax.build_all_part2_ops(
-        ty, 0, sp_pairs_all, softmax_state, sgpr_state
-    )
-    softmax_idx_by_msb = [0] * NUM_MSB
-
-    stage_configs = [
-        (0, KV_V if memload else KV_NONE, KV_K, blk, 1),
-        (1, KV_V if memload else KV_NONE, KV_K, blk, 2),
-        (2, KV_NONE, KV_K, blk, 3),
-        (3, KV_NONE, KV_V, blk, 0),
-    ]
-
-    su_sp_tiles_list = []
-
-    for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in enumerate(stage_configs):
-
-        _n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
-        kv_tiles_next_raw = [[None] * _n_lds for _ in range_constexpr(NUM_MSB)]
-
-        softmax_stage = (stage_idx + 4) % ALU_STAGES
-        budget_per_msb = ALU_PER_STAGE[softmax_stage] // NUM_MSB
-        softmax_budget = [budget_per_msb] * NUM_MSB
-
-        sp_tiles, kv_tiles_next_raw = gemm1_interleaved_stage(
-            ty,
-            stage_idx,
-            blk,
-            g_su,
-            t_type,
-            blk,
-            g_su,
-            l_type,
-            l_blk,
-            l_su,
-            q_tiles,
-            kv_tiles,
-            sp_tiles,
-            kv_lds_addrs,
-            kv_tiles_next_raw,
-            softmax_ops_by_msb,
-            softmax_idx_by_msb,
-            softmax_budget,
-            tdm_state,
-        )
-
-        su_sp_tiles_list.append(
-            [[sp_tiles[msb][0]] for msb in range_constexpr(NUM_MSB)]
-        )
-
-        if const_expr(l_type == KV_K):
-            kv_tiles = Fragment.pair_k_tiles(kv_tiles_next_raw, ty)
-        else:
-            v_tiles_out = kv_tiles_next_raw
-
-    if const_expr(not gemm2):
-        return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
-
-    # ================================================================
-    # Between GEMM1 and GEMM2: complete softmax pipeline
-    # ================================================================
-
-    # 1. Run remaining PART2 ops (budget was insufficient during GEMM1)
-    for msb in range_constexpr(NUM_MSB):
-        for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb] :]:
-            op()
-
-    # 2. Convert per-SU sp_tiles → sp_pairs for current tile
-    sp_pairs_current = Softmax.tiles_to_pairs(su_sp_tiles_list)
-
-    # 3. Run PART0+PART1 on current tile's sp_pairs → updates max/delta
-    Softmax.part01_only(ty, blk, sp_pairs_current, softmax_state, sgpr_state)
-
-    # 4. Build P tiles from p_bf16 (produced by PART2)
-    p_tiles_computed = Softmax.build_p_tiles(ty, softmax_state)
-
-    # ================================================================
-    # fmha_mask placeholder (no causal mask)
-    # ================================================================
-    emit_void("s_nop 0")
-
-    # ================================================================
-    # GEMM2 (PV): 4 stages (SU 0..3)
-    # No softmax interleaving — PART0+PART1 already ran above.
-    # ================================================================
-
-    v_tiles_paired = Fragment.pair_v_tiles(v_tiles_out, ty)
-
-    empty_ops = [[] for _ in range_constexpr(RLTS_LEN)]
-    empty_idx = [0] * RLTS_LEN
-
-    g2_stage_configs = [
-        (0, KV_V, blk, 1),
-        (1, KV_V, blk, 2),
-        (2, KV_V, blk, 3),
-        (3, KV_K, blk, 0),
-    ]
-
-    for stage_idx, (g_su, l_type, l_blk, l_su) in enumerate(g2_stage_configs):
-
-        p_tiles_su = p_tiles_computed[g_su]
-
-        _n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
-        kv_tiles_next_raw = [[None] * _n_lds for _ in range_constexpr(NUM_MSB)]
-
-        o_tiles, kv_tiles_next_raw = gemm2_interleaved_stage(
-            ty,
-            stage_idx,
-            blk,
-            g_su,
-            l_type,
-            l_blk,
-            l_su,
-            v_tiles_paired,
-            p_tiles_su,
-            o_tiles,
-            kv_lds_addrs,
-            kv_tiles_next_raw,
-            empty_ops,
-            empty_idx,
-        )
-
-        if const_expr(l_type == KV_V):
-            v_tiles_paired = Fragment.pair_v_tiles(kv_tiles_next_raw, ty)
-        else:
-            kv_tiles = Fragment.pair_k_tiles(kv_tiles_next_raw, ty)
-
-    return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
-
-
-
 
 
 class TDM:

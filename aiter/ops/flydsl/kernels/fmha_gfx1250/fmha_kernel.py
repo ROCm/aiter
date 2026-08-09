@@ -21,13 +21,10 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, rocdl
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr.primitive import const_expr, range_constexpr
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T, Vector as Vec
-from flydsl.utils.smem_allocator import SmemAllocator
 
-from ..layout_utils import idx2crd as idx2crd
 from ..tensor_shim import _run_compiled
 
 from .fmha_utils import *  # constants, classes, prologue helpers
