@@ -125,7 +125,7 @@ jobs:
                 echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
                 exit 1
               fi
-              python3 -c "import sys, zipfile; wheel = sys.argv[1]; names = zipfile.ZipFile(wheel).namelist(); print(f\"Wheel entries: {len(names)}\"); assert \"aiter/__init__.py\" in names; assert any(name.startswith(\"aiter/jit/module_aiter_core\") and name.endswith(\".so\") for name in names), \"missing module_aiter_core.so\"" "${wheels[0]}"
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; names = zipfile.ZipFile(wheel).namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"Wheel entries: {len(names)}; HSA arches: {sorted(arches)}\"); assert \"aiter/__init__.py\" in names; assert arches == {\"gfx950\"}, f\"unexpected HSA arches: {sorted(arches)}\"; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${wheels[0]}"
             '
 
       - name: Upload AITER wheel
