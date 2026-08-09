@@ -254,7 +254,6 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     use_mx_gemm = b_dtype in ("fp4", "fp8")
-    is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
@@ -272,15 +271,10 @@ def _precompile_to_cache(
             return torch.float16
         if dtype == "bf16":
             return torch.bfloat16
-        if dtype == "int4":
-            return torch.int4 if hasattr(torch, "int4") else torch.uint8
         return torch.int8
 
     def _alloc(shape, dtype):
-        # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
         # Cache key only depends on shape+dtype+strides — values don't matter.
-        if dtype == getattr(torch, "int4", None):
-            return torch.empty(shape, device=dev, dtype=dtype)
         return torch.zeros(shape, device=dev, dtype=dtype)
 
     def _user_a_shape():
@@ -293,16 +287,11 @@ def _precompile_to_cache(
         # User-level w1 shape: (E, 2*inter_dim, model_dim) in storage dtype.
         if b_dtype == "fp4":
             return (E, 2 * inter_dim, model_dim // 2)
-        if b_dtype == "int4":
-            # int4 packed: 2 elements per byte
-            return (E, 2 * inter_dim, model_dim // 2)
         return (E, 2 * inter_dim, model_dim)
 
     def _user_w2_shape():
         # User-level w2 shape: (E, model_dim, inter_dim) in storage dtype.
         if b_dtype == "fp4":
-            return (E, model_dim, inter_dim // 2)
-        if b_dtype == "int4":
             return (E, model_dim, inter_dim // 2)
         return (E, model_dim, inter_dim)
 
@@ -322,9 +311,6 @@ def _precompile_to_cache(
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
         if not use_mx_gemm:
-            if is_int4_weight:
-                # a16wi4: bf16 activations, int4 weights — no activation scale.
-                return None
             return None
         if a_dtype == "fp8":
             if a_scale_one:
@@ -505,13 +491,6 @@ def _precompile_to_cache(
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
             if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
-            elif is_int4_weight:
-                # a16wi4: bf16 groupwise scale over (E, K//32, N).
-                w1_scale = torch.zeros(
-                    E * (model_dim // 32) * (2 * inter_dim),
-                    device=dev,
-                    dtype=torch.bfloat16,
-                )
             else:
                 w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -686,12 +665,6 @@ def _precompile_to_cache(
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
-            elif is_int4_weight:
-                w2_scale = torch.zeros(
-                    E * (inter_dim // 32) * model_dim,
-                    device=dev,
-                    dtype=torch.bfloat16,
-                )
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
