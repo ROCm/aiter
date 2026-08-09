@@ -940,3 +940,63 @@ def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
     _check_close(
         d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
     )
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage1_result_independent_of_buffer_contents():
+    """A caller-provided v2 stage1 buffer must not leak its prior contents.
+
+    fused_moe hands one buffer to every MoE layer, so whatever the kernel
+    leaves untouched carries the previous layer's output rather than the
+    fresh-allocation garbage a per-call torch.empty produced. Run the same
+    problem twice against differently poisoned buffers: every byte the kernel
+    writes has to agree, and every byte that disagrees has to still hold its
+    own poison, i.e. was never written and is not read downstream.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    torch.set_default_device("cuda")
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 16, 4, 32
+    tile_m = 32
+    d = _generate_a8w4_situv2_vec4_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=21
+    )
+    sorted_rows = max(
+        d["sorted_ids"].shape[0], d["sorted_expert_ids"].shape[0] * tile_m
+    )
+
+    def run(poison: int) -> torch.Tensor:
+        buf = torch.full(
+            (sorted_rows, inter_dim), poison, dtype=torch.uint8, device="cuda"
+        ).view(dtypes.fp8)
+        out, _scale = flydsl_moe_stage1(
+            a=d["a_q"],
+            w1=d["w1_q_shuf"],
+            sorted_token_ids=d["sorted_ids"],
+            sorted_expert_ids=d["sorted_expert_ids"],
+            num_valid_ids=d["num_valid_ids"],
+            out=buf,
+            topk=d["topk"],
+            tile_m=tile_m,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="fp8",
+            act="situv2",
+            situ_beta=SITUV2_BETA,
+            situ_linear_beta=SITUV2_LINEAR_BETA,
+            w1_scale=d["w1_scale_shuf"],
+            a1_scale=d["a_scale_sort"],
+            v2_output_layout=True,
+        )
+        torch.cuda.synchronize()
+        return out.view(torch.uint8)
+
+    first = run(0xA5).clone()
+    second = run(0x5A)
+
+    untouched = first != second
+    assert not bool(untouched.all()), "kernel wrote nothing; the test is vacuous"
+    assert torch.equal(first[untouched], torch.full_like(first[untouched], 0xA5))
+    assert torch.equal(second[untouched], torch.full_like(second[untouched], 0x5A))
