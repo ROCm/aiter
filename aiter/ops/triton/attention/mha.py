@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -77,6 +78,50 @@ def mha_set_swizzle(value: Literal["default", "spatial"]):
 
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
     return max(int(window_size[0]), 0)
+
+
+def supports_kimi_k3_fp8_prefill_gfx942() -> bool:
+    """Return whether the architecture-private Kimi-K3 FP8 kernel is usable."""
+    return arch_info.get_arch() == "gfx942" and hasattr(torch, "float8_e4m3fnuz")
+
+
+def kimi_k3_fp8_prefill_gfx942(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    descale_q: torch.Tensor,
+    descale_k: torch.Tensor,
+    descale_v: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the opt-in gfx942 FP8 D192/V128 12-head varlen kernel."""
+    if not supports_kimi_k3_fp8_prefill_gfx942():
+        raise NotImplementedError("Kimi-K3 FP8 prefill requires gfx942")
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.mha import (
+        mha_varlen_fwd_gfx942,
+    )
+
+    return mha_varlen_fwd_gfx942(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        descale_q=descale_q,
+        descale_k=descale_k,
+        descale_v=descale_v,
+        out=out,
+    )
 
 
 def _flash_attn_forward(
