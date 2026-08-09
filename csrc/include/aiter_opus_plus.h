@@ -13,6 +13,8 @@
 #include <c10/util/Half.h>
 #endif
 #include <hip/hip_bf16.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 
 namespace aiter {
 using namespace opus;
