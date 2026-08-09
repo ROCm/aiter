@@ -30,11 +30,11 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils import types
 
 
 @triton.jit
@@ -300,7 +300,7 @@ def _attn_qk(
 ):
     """QK^T + scale + mask for one already-staged key block. ``k`` is already in
     its MFMA dot-operand layout; returns float32 scores in ``mfmaLayout``. For
-    FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64).
+    FP8 the QK^T uses the CDNA3 MFMA path.
     """
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     if IS_FP8:
@@ -1603,13 +1603,25 @@ def mha_varlen_fwd_gfx942(
     else:
         assert v.dtype == torch.bfloat16
 
-    batch = cu_seqlens_q.numel() - 1
+    expected_out_shape = q.shape[:-1] + (v.shape[-1],)
+    expected_out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     if out is None:
         out = torch.empty(
-            q.shape[:-1] + (v.shape[-1],),
-            dtype=torch.bfloat16 if is_fp8 else q.dtype,
+            expected_out_shape,
+            dtype=expected_out_dtype,
             device=q.device,
         )
+    else:
+        if out.shape != expected_out_shape:
+            raise ValueError(
+                f"expected out shape {expected_out_shape}, got {out.shape}"
+            )
+        if out.device != q.device:
+            raise ValueError(f"expected out on {q.device}, got {out.device}")
+        if out.dtype != expected_out_dtype:
+            raise TypeError(f"expected out dtype {expected_out_dtype}, got {out.dtype}")
+
+    batch = cu_seqlens_q.numel() - 1
 
     q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
     k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
@@ -1623,9 +1635,7 @@ def mha_varlen_fwd_gfx942(
     num_kv_splits = config.pop("NUM_KV_SPLITS", 1)
     direct_registers = config.pop("DIRECT_REGISTERS", True)
     kv_buffers = config.pop("KV_BUFFERS", 2)
-    if causal:
-        num_kv_splits = 1
-    elif max_seqlen_k < num_kv_splits * block_n:
+    if causal or max_seqlen_k < num_kv_splits * block_n:
         num_kv_splits = 1
     grid = (
         num_kv_splits * batch * q.shape[1] * triton.cdiv(max_seqlen_q, block_m),

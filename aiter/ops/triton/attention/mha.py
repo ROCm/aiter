@@ -102,7 +102,9 @@ def kimi_k3_fp8_prefill_gfx942(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the opt-in gfx942 FP8 D192/V128 12-head varlen kernel."""
     if not supports_kimi_k3_fp8_prefill_gfx942():
-        raise NotImplementedError("Kimi-K3 FP8 prefill requires gfx942")
+        raise NotImplementedError(
+            "Kimi-K3 FP8 prefill requires gfx942 and torch.float8_e4m3fnuz support"
+        )
     from aiter.ops.triton._gluon_kernels.gfx942.attention.mha import (
         mha_varlen_fwd_gfx942,
     )

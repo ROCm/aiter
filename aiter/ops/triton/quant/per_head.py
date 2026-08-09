@@ -7,6 +7,13 @@ import torch
 import triton
 import triton.language as tl
 
+_FP8_DTYPES = {
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+}
+
 
 @triton.jit
 def _per_head_absmax_partial(
@@ -94,6 +101,8 @@ def dynamic_per_head_quant_fp8(
         raise ValueError(f"expected rank-3 input, got {value.shape}")
     if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported input dtype {value.dtype}")
+    if fp8_dtype not in _FP8_DTYPES:
+        raise TypeError(f"unsupported FP8 output dtype {fp8_dtype}")
 
     num_tokens, num_heads, head_dim = value.shape
     elements_per_head = num_tokens * head_dim
