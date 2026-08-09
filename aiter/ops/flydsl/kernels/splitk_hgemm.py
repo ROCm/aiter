@@ -12,7 +12,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import GTensor, get_dtype_in_kernel
 
@@ -46,8 +46,8 @@ class WmmaHalf_m16n16k16(WmmaHalfBase):
 
     def __call__(self, a_frag, b_frag, c_frag):
         if self.dtype == "bf16":
-            a_frag_vi16 = vector.bitcast(T.vec(self.WMMA_A_FRAG_VALUES, T.i16), a_frag)
-            b_frag_vi16 = vector.bitcast(T.vec(self.WMMA_B_FRAG_VALUES, T.i16), b_frag)
+            a_frag_vi16 = fx.Vector(a_frag).bitcast(fx.Int16)
+            b_frag_vi16 = fx.Vector(b_frag).bitcast(fx.Int16)
             return rocdl.mfma_f32_16x16x16bf16_1k(
                 T.f32x4, [a_frag_vi16, b_frag_vi16, c_frag, 0, 0, 0]
             )
@@ -254,7 +254,6 @@ def compile_hgemm_kernel(
         signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
@@ -404,7 +403,7 @@ def compile_hgemm_kernel(
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
-                zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
+                zero_vec = fx.Vector.filled(LDG_VEC_SIZE, 0.0, fx_dtype)
                 for i in range_constexpr(LDG_REG_C_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = global_tid // LDG_C_X_THREADS
@@ -688,33 +687,25 @@ def compile_hgemm_kernel(
                         b_frag = b_frags[jj]
                         if const_expr(MFMA_PER_WARP_K == 2):
                             # split a
-                            a_i64x2 = vector.bitcast(T.i64x2, a_frag)
-                            a0_i64 = vector.extract(
-                                a_i64x2, static_position=[0], dynamic_position=[]
-                            )
-                            a1_i64 = vector.extract(
-                                a_i64x2, static_position=[1], dynamic_position=[]
-                            )
-                            a_v0 = vector.bitcast(
-                                T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64])
-                            )
-                            a_v1 = vector.bitcast(
-                                T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64])
-                            )
+                            a_i64x2 = fx.Vector(a_frag).bitcast(fx.Int64)
+                            a0_i64 = fx.Vector(a_i64x2)[0]
+                            a1_i64 = fx.Vector(a_i64x2)[1]
+                            a_v0 = fx.Vector(
+                                fx.Vector.from_elements([a0_i64], fx.Int64)
+                            ).bitcast(fx.Float16)
+                            a_v1 = fx.Vector(
+                                fx.Vector.from_elements([a1_i64], fx.Int64)
+                            ).bitcast(fx.Float16)
                             # split b
-                            b_i64x2 = vector.bitcast(T.i64x2, b_frag)
-                            b0_i64 = vector.extract(
-                                b_i64x2, static_position=[0], dynamic_position=[]
-                            )
-                            b1_i64 = vector.extract(
-                                b_i64x2, static_position=[1], dynamic_position=[]
-                            )
-                            b_v0 = vector.bitcast(
-                                T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64])
-                            )
-                            b_v1 = vector.bitcast(
-                                T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64])
-                            )
+                            b_i64x2 = fx.Vector(b_frag).bitcast(fx.Int64)
+                            b0_i64 = fx.Vector(b_i64x2)[0]
+                            b1_i64 = fx.Vector(b_i64x2)[1]
+                            b_v0 = fx.Vector(
+                                fx.Vector.from_elements([b0_i64], fx.Int64)
+                            ).bitcast(fx.Float16)
+                            b_v1 = fx.Vector(
+                                fx.Vector.from_elements([b1_i64], fx.Int64)
+                            ).bitcast(fx.Float16)
                             # wmma
                             c_idx = ii * WARP_N_STEPS + jj
                             acc_in = c_frags_new[c_idx]
@@ -1007,12 +998,8 @@ def compile_hgemm_kernel(
                 for kk in range_constexpr(WMMA_C_FRAG_VALUES):
                     lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
                     lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                    val = vector.extract(
-                        c_frags[ii * WARP_N_STEPS + jj],
-                        static_position=[kk],
-                        dynamic_position=[],
-                    )
-                    val = val.truncf(dtype_)
+                    val = fx.Vector(c_frags[ii * WARP_N_STEPS + jj])[kk]
+                    val = val.to(fx_dtype)
                     if const_expr(IS_SLICE_K):
                         cs_store_scalar(wid_k, lds_m_idx, lds_n_idx, val)
                     else:
@@ -1039,17 +1026,11 @@ def compile_hgemm_kernel(
                         )
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
                     # split to vec2s
-                    vec2_ty = T.vec(2, dtype_)
+                    T.vec(2, dtype_)
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                        e0 = vector.extract(
-                            pk_val, static_position=[vec_idx * 2], dynamic_position=[]
-                        )
-                        e1 = vector.extract(
-                            pk_val,
-                            static_position=[vec_idx * 2 + 1],
-                            dynamic_position=[],
-                        )
-                        pair = vector.from_elements(vec2_ty, [e0, e1])
+                        e0 = fx.Vector(pk_val)[vec_idx * 2]
+                        e1 = fx.Vector(pk_val)[vec_idx * 2 + 1]
+                        pair = fx.Vector.from_elements([e0, e1])
                         pair_v = (
                             pair._value if const_expr(hasattr(pair, "_value")) else pair
                         )

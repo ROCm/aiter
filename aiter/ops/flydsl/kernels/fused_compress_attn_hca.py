@@ -51,10 +51,16 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 from .tensor_shim import _run_compiled, _to_raw
+
+
+def _velem(vec, i):
+    """Element *i* of *vec* as a raw ir.Value (this kernel feeds raw MLIR ops)."""
+    return _to_raw(fx.Vector(vec)[i])
+
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
@@ -197,10 +203,10 @@ def _build_compress_forward_kernel(
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        ragged_id = vector.extract(plan_vec, static_position=[0], dynamic_position=[])
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
-        window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
+        ragged_id = _velem(plan_vec, 0)
+        batch_id = _velem(plan_vec, 1)
+        position = _velem(plan_vec, 2)
+        window_len = _velem(plan_vec, 3)
 
         # Sentinel-skip: run the whole body only for position >= 0, as a closure
         # under a runtime `if` (rewriter sees an opaque call -> scf.if).
@@ -243,11 +249,9 @@ def _build_compress_forward_kernel(
                         _to_raw(hi),
                     )
                     lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
-                    lo16_v = vector.from_elements(T.vec(1, T.i32), [lo16])
-                    bf16_pair = vector.bitcast(T.vec(2, T.bf16), lo16_v)
-                    bf16_v = vector.extract(
-                        bf16_pair, static_position=[0], dynamic_position=[]
-                    )
+                    lo16_v = fx.Vector.from_elements([lo16], fx.Int32)
+                    bf16_pair = fx.Vector(lo16_v).bitcast(fx.BFloat16)
+                    bf16_v = _velem(bf16_pair, 0)
                     return [arith.extf(f32, bf16_v)]
                 else:
                     # base must be VEC-aligned (caller guarantees by
@@ -260,17 +264,15 @@ def _build_compress_forward_kernel(
                         raw_s = buffer_ops.buffer_load(
                             rsrc, off_dw, vec_width=1, dtype=i32
                         )
-                        raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                        raw = fx.Vector.from_elements([raw_s], fx.Int32)
                     else:
                         raw = buffer_ops.buffer_load(
                             rsrc, off_dw, vec_width=dwords, dtype=i32
                         )
-                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                     out = []
                     for i in range_constexpr(VEC):
-                        bf16_v = vector.extract(
-                            vec_bf16, static_position=[i], dynamic_position=[]
-                        )
+                        bf16_v = _velem(vec_bf16, i)
                         out.append(arith.extf(f32, bf16_v))
                     return out
 
@@ -283,10 +285,7 @@ def _build_compress_forward_kernel(
                     if const_expr(VEC == 1):
                         # vec_width=1 returns scalar, not 1-vec.
                         return [raw]
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [_velem(raw, i) for i in range(VEC)]
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 loads.
                     assert VEC == 8
@@ -302,13 +301,9 @@ def _build_compress_forward_kernel(
                     )
                     out = []
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_velem(r0, i))
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_velem(r1, i))
                     return out
 
             def _issue_phase2_loads(k_i32):
@@ -521,14 +516,14 @@ def _build_compress_forward_kernel(
                 if const_expr(VEC == 1):
                     buffer_ops.buffer_store(comp_list[0], out_rsrc, out_off)
                 elif const_expr(VEC <= 4):
-                    out_vec = vector.from_elements(T.vec(VEC, T.f32), comp_list)
+                    out_vec = fx.Vector.from_elements(comp_list, fx.Float32)
                     buffer_ops.buffer_store(out_vec, out_rsrc, out_off)
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 stores.
                     assert VEC == 8
                     half = VEC // 2
-                    v0 = vector.from_elements(T.vec(half, T.f32), comp_list[0:half])
-                    v1 = vector.from_elements(T.vec(half, T.f32), comp_list[half:VEC])
+                    v0 = fx.Vector.from_elements(comp_list[0:half], fx.Float32)
+                    v1 = fx.Vector.from_elements(comp_list[half:VEC], fx.Float32)
                     buffer_ops.buffer_store(v0, out_rsrc, out_off)
                     buffer_ops.buffer_store(
                         v1,
@@ -698,8 +693,8 @@ def _build_norm_rope_scatter_kernel(
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
+        batch_id = _velem(plan_vec, 1)
+        position = _velem(plan_vec, 2)
 
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
@@ -720,10 +715,7 @@ def _build_norm_rope_scatter_kernel(
                 raw = buffer_ops.buffer_load(
                     kvc_rsrc, base_off, vec_width=VEC, dtype=f32
                 )
-                comp_lane = [
-                    vector.extract(raw, static_position=[i], dynamic_position=[])
-                    for i in range(VEC)
-                ]
+                comp_lane = [_velem(raw, i) for i in range(VEC)]
             else:
                 assert VEC == 8
                 half = 4
@@ -736,12 +728,8 @@ def _build_norm_rope_scatter_kernel(
                     vec_width=half,
                     dtype=f32,
                 )
-                comp_lane = [
-                    vector.extract(r0, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ] + [
-                    vector.extract(r1, static_position=[i], dynamic_position=[])
-                    for i in range(half)
+                comp_lane = [_velem(r0, i) for i in range(half)] + [
+                    _velem(r1, i) for i in range(half)
                 ]
 
             # -- RMSNorm (wave reduce-add of squares / D + eps; rsqrt) --
@@ -767,27 +755,22 @@ def _build_norm_rope_scatter_kernel(
                     raw_s = buffer_ops.buffer_load(
                         rmsw_rsrc, off_dw, vec_width=1, dtype=i32
                     )
-                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                    raw = fx.Vector.from_elements([raw_s], fx.Int32)
                 else:
                     raw = buffer_ops.buffer_load(
                         rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 rmsw_lane = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
+                    bf16_v = _velem(vec_bf16, i)
                     rmsw_lane.append(arith.extf(f32, bf16_v))
             else:
                 if const_expr(VEC <= 4):
                     raw = buffer_ops.buffer_load(
                         rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32
                     )
-                    rmsw_lane = [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    rmsw_lane = [_velem(raw, i) for i in range(VEC)]
                 else:
                     half = 4
                     r0 = buffer_ops.buffer_load(
@@ -799,12 +782,8 @@ def _build_norm_rope_scatter_kernel(
                         vec_width=half,
                         dtype=f32,
                     )
-                    rmsw_lane = [
-                        vector.extract(r0, static_position=[i], dynamic_position=[])
-                        for i in range(half)
-                    ] + [
-                        vector.extract(r1, static_position=[i], dynamic_position=[])
-                        for i in range(half)
+                    rmsw_lane = [_velem(r0, i) for i in range(half)] + [
+                        _velem(r1, i) for i in range(half)
                     ]
 
             normed_lane = [
@@ -857,18 +836,14 @@ def _build_norm_rope_scatter_kernel(
                 cos_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(cos_vec, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(sin_vec, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
@@ -941,15 +916,13 @@ def _build_norm_rope_scatter_kernel(
                 ]
                 cache_off = ArithValue(cache_base) + tid_x_vec
                 out_vec_t = T.vec(VEC, T.bf16)
-                raw_vec = vector.from_elements(vecVf32, out_lane)
+                raw_vec = fx.Vector.from_elements(out_lane, fx.Float32)
                 bf16_vec = raw_vec.truncf(out_vec_t)
                 cache_off_dw = ArithValue(cache_off) >> c_one_i32
                 dwords = (VEC + 1) // 2
-                bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
+                bf16_as_i32 = fx.Vector(bf16_vec).bitcast(fx.Int32)
                 if const_expr(dwords == 1):
-                    scalar_i32 = vector.extract(
-                        bf16_as_i32, static_position=[0], dynamic_position=[]
-                    )
+                    scalar_i32 = _velem(bf16_as_i32, 0)
                     buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                 else:
                     buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)

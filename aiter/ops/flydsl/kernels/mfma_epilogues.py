@@ -28,7 +28,7 @@ This module provides:
   uses ``lds_out_split``), each handling half of the N dimension.
 
 These helpers are intentionally *dialect-agnostic*: callers pass the dialect
-modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
+modules (`arith`, `gpu`) and the `range_constexpr` iterator.
 """
 
 from __future__ import annotations
@@ -92,7 +92,6 @@ def default_epilog(
 def c_shuffle_epilog(
     *,
     arith,
-    vector,
     gpu,
     scf=None,
     range_constexpr,
@@ -275,10 +274,10 @@ def c_shuffle_epilog(
 
                     _if_ld = scf.IfOp(_is_group_b, [vec_frag], has_else=True)
                     with ir.InsertionPoint(_if_ld.then_block):
-                        fb = vector.load_op(vec_frag, lds_out_split, [lds_idx])
+                        fb = fx.Vector.load(vec_frag, lds_out_split, [lds_idx])
                         scf.YieldOp([fb])
                     with ir.InsertionPoint(_if_ld.else_block):
-                        fa = vector.load_op(vec_frag, lds_out, [lds_idx])
+                        fa = fx.Vector.load(vec_frag, lds_out, [lds_idx])
                         scf.YieldOp([fa])
                     frag = _if_ld.results[0]
 
@@ -404,7 +403,7 @@ def c_shuffle_epilog(
                 col_pair0 = col_base_nr + (n_lane * c_evec)  # even col within tile
 
                 lds_idx_pair = row_base_lds + col_pair0
-                frag = vector.load_op(vec_frag, lds_out, [lds_idx_pair])
+                frag = fx.Vector.load(vec_frag, lds_out, [lds_idx_pair])
 
                 store_pair(
                     row_local=row_local,
@@ -435,7 +434,6 @@ def mfma_epilog(
     # Default epilog (required when use_cshuffle=False)
     body_row: Callable | None = None,
     # CShuffle epilog (required when use_cshuffle=True)
-    vector=None,
     gpu=None,
     scf=None,
     tile_m: int | None = None,
@@ -468,7 +466,6 @@ def mfma_epilog(
 
     return c_shuffle_epilog(
         arith=arith,
-        vector=vector,
         gpu=gpu,
         scf=scf,
         range_constexpr=range_constexpr,

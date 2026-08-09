@@ -70,7 +70,7 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -163,7 +163,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         max_m: Int32,
     ):
         i32 = T.i32
-        vec_ty = ir.VectorType.get([store_vw], i32) if store_vw > 1 else None
+        ir.VectorType.get([store_vw], i32) if store_vw > 1 else None
 
         tile = ArithValue(fx.block_idx.x)
         e = ArithValue(fx.block_idx.y)
@@ -229,7 +229,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                 if store_vw == 1:
                     buffer_ops.buffer_store(elems[0], dst_rsrc, dst_off)
                 else:
-                    vec = vector.from_elements(vec_ty, elems)
+                    vec = fx.Vector.from_elements(elems, fx.Int32)
                     buffer_ops.buffer_store(vec, dst_rsrc, dst_off)
                 scf.YieldOp([])
 

@@ -47,7 +47,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -138,7 +138,7 @@ def build_moe_gather_reduce_module(
         tid = fx.thread_idx.x
 
         i32 = T.i32
-        vec_i32_ty = T.vec(VEC, i32)
+        T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
         # (Ternary, not multi-line if: the flydsl tracer does not capture vars
@@ -231,13 +231,7 @@ def build_moe_gather_reduce_module(
                                 dtype=i32,
                             )
                             for lane in range_constexpr(VEC):
-                                raw_dw = fx.Uint32(
-                                    vector.extract(
-                                        raw_vec,
-                                        static_position=[lane],
-                                        dynamic_position=[],
-                                    )
-                                )
+                                raw_dw = fx.Uint32(fx.Vector(raw_vec)[lane])
                                 lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
                                 red[2 * lane] = red[2 * lane] + lo_f32
                                 red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
@@ -251,7 +245,7 @@ def build_moe_gather_reduce_module(
                         _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
                         for lane in range(VEC)
                     ]
-                    out_vec = vector.from_elements(vec_i32_ty, packed)
+                    out_vec = fx.Vector.from_elements(packed, fx.Int32)
                     buffer_ops.buffer_store(
                         out_vec, out_rsrc, out_row_dw_base + dw_base
                     )

@@ -16,14 +16,13 @@ Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
 
 from __future__ import annotations
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import arith, rocdl
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import vector
 
 from .fmha_schedule import (
     GEMM1_SCHEDULE,
@@ -330,11 +329,9 @@ def _broadcast_f32_to_v2f32(val, bank=0):
 
 
 def make_wmma_frag_bf16(vec4_lo, vec4_hi):
-    bf16_ty = ir.BF16Type.get()
-    vec8_bf16_ty = ir.VectorType.get([8], bf16_ty)
-    v0 = vector.bitcast(vec8_bf16_ty, vec4_lo)
-    v1 = vector.bitcast(vec8_bf16_ty, vec4_hi)
-    return vector.shuffle(v0, v1, list(range_constexpr(16)))
+    v0 = fx.Vector(vec4_lo).bitcast(fx.BFloat16)
+    v1 = fx.Vector(vec4_hi).bitcast(fx.BFloat16)
+    return v0.shuffle(v1, list(range_constexpr(16))).ir_value()
 
 
 def _pair_k_tiles_for_wmma(kv_tiles_raw, ty):
@@ -368,18 +365,22 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
     v4s = []
     for i in range_constexpr(4):
         v4s.append(
-            vector.shuffle(
-                v2bf16_list[i * 2], v2bf16_list[i * 2 + 1], list(range_constexpr(4))
-            )
+            fx.Vector(v2bf16_list[i * 2])
+            .shuffle(v2bf16_list[i * 2 + 1], list(range_constexpr(4)))
+            .ir_value()
         )
 
     # Stage 2: 4 v4bf16 → 2 v8bf16
     v8s = []
     for i in range_constexpr(2):
-        v8s.append(vector.shuffle(v4s[i * 2], v4s[i * 2 + 1], list(range_constexpr(8))))
+        v8s.append(
+            fx.Vector(v4s[i * 2])
+            .shuffle(v4s[i * 2 + 1], list(range_constexpr(8)))
+            .ir_value()
+        )
 
     # Stage 3: 2 v8bf16 → 1 v16bf16
-    result = vector.shuffle(v8s[0], v8s[1], list(range_constexpr(16)))
+    result = fx.Vector(v8s[0]).shuffle(v8s[1], list(range_constexpr(16))).ir_value()
     return set_vgpr_bank(result, bank)
 
 
@@ -393,7 +394,7 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
 
 def _atom_wmma_init(ty, src_a, src_b, bank_dst):
     _sched_barrier(0)
-    zero = vector.broadcast(ty["v8f32"], arith.unwrap(arith.constant(0.0, type=T.f32)))
+    zero = fx.Vector.filled(8, 0.0, fx.Float32).ir_value()
 
     result = rocdl_dialect.wmma_f32_16x16x32_bf16(
         ty["v8f32"],

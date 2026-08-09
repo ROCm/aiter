@@ -18,8 +18,6 @@ from flydsl.expr import arith, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels import vector
-
 from .fmha_core_loop import (
     QK_HDIM,
     _rocdl_exp2,
@@ -174,10 +172,9 @@ def lds_load_b128(lds_base_raw, byte_offset_raw):
 
 
 def make_wmma_frag_bf16(vec4_lo, vec4_hi):
-    vec8bf16_ty = ir.VectorType.get([8], ir.BF16Type.get())
-    v0 = vector.bitcast(vec8bf16_ty, vec4_lo)
-    v1 = vector.bitcast(vec8bf16_ty, vec4_hi)
-    return vector.shuffle(v0, v1, list(range(16)))
+    v0 = fx.Vector(vec4_lo).bitcast(fx.BFloat16)
+    v1 = fx.Vector(vec4_hi).bitcast(fx.BFloat16)
+    return v0.shuffle(v1, list(range(16))).ir_value()
 
 
 # ============================================================================
@@ -442,20 +439,22 @@ def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
         g_idx, tile = key
         bank = _acc_bank(g_idx, tile)
         col_base = ACC_COL_BASE[key] + su_col_offset
-        acc = accs[key]
+        acc = fx.Vector(accs[key])
+        masked_elements = []
 
         for i in fx.range_constexpr(8):
             col = col_base + i
-            elem = vector.extract(acc, [], static_position=[i])
+            elem = acc[i]
             cmp = arith.unwrap(
                 arith.cmpi(
                     arith.CmpIPredicate.slt, row_pos, arith.constant(col, type=T.i32)
                 )
             )
-            masked = llvm_dialect.select(cmp, neg_inf_raw, elem)
-            acc = vector.insert(masked, acc, [], static_position=[i])
+            masked = llvm_dialect.select(cmp, neg_inf_raw, elem.ir_value())
+            masked_elements.append(masked)
 
-        accs[key] = set_vgpr_bank(acc, bank)
+        masked_acc = fx.Vector.from_elements(masked_elements, fx.Float32)
+        accs[key] = set_vgpr_bank(masked_acc.ir_value(), bank)
     return accs
 
 
@@ -485,9 +484,9 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     for bank in fx.range_constexpr(4):
         running_max = set_vgpr_bank(neg_inf_raw, bank)
         for key in tiles_by_bank[bank]:
-            acc = accs[key]
+            acc = fx.Vector(accs[key])
             for i in fx.range_constexpr(8):
-                elem = vector.extract(acc, [], static_position=[i])
+                elem = acc[i]
                 running_max = arith.maxnumf(running_max, elem)
         max_per_bank[bank] = set_vgpr_bank(running_max, bank)
         rocdl.sched_barrier(0)
@@ -513,10 +512,10 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
         scale_b = set_vgpr_bank(softmax_scale_raw, bank)
         running_sum = set_vgpr_bank(zero_raw, bank)
         for key in tiles_by_bank[bank]:
-            acc = accs[key]
+            acc = fx.Vector(accs[key])
             for i in fx.range_constexpr(8):
-                elem = vector.extract(acc, [], static_position=[i])
-                x = llvm_dialect.intr_fma(elem, scale_b, neg_ms)
+                elem = acc[i]
+                x = llvm_dialect.intr_fma(elem.ir_value(), scale_b, neg_ms)
                 exp_val = _rocdl_exp2(f32, x)
                 running_sum = arith.addf(running_sum, exp_val)
         row_sum[bank] = set_vgpr_bank(running_sum, bank)
@@ -558,8 +557,7 @@ def _phase6_compute_lds_offsets(wave_id):
 
 def _build_tdm_dgroup1(config_val, stride_i32):
     """Build TDM GROUP1 descriptor (vec<8xi32>)."""
-    return vector.from_elements(
-        T.vec(8, T.i32),
+    return fx.Vector.from_elements(
         [
             arith.constant(config_val, type=T.i32),
             arith.constant(256 << 16, type=T.i32),
@@ -570,6 +568,7 @@ def _build_tdm_dgroup1(config_val, stride_i32):
             arith.constant(0, type=T.i32),
             arith.constant(0, type=T.i32),
         ],
+        fx.Int32,
     )
 
 
@@ -642,7 +641,7 @@ def _k_tdm_issue_pair(
     cur_addr = addr_i64
     for i, lds_off in enumerate([lds_off_0, lds_off_1]):
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
-        dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
+        dg0 = fx.Vector.from_elements([pred, lds_off, addr_lo, addr_hi], fx.Int32)
         tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, k_dgroup1))
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
@@ -679,7 +678,7 @@ def _phase_first_v_tdm_flydsl(
     cur_addr = v_addr_i64
     for i, lds_off in enumerate(lds_offsets):
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
-        dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
+        dg0 = fx.Vector.from_elements([pred, lds_off, addr_lo, addr_hi], fx.Int32)
         tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, v_dgroup1))
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
@@ -737,7 +736,7 @@ def _phase_v_tdm_blk1_flydsl(
     cur_addr = v_addr_i64
     for i, lds_off in enumerate(lds_offsets):
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
-        dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
+        dg0 = fx.Vector.from_elements([pred, lds_off, addr_lo, addr_hi], fx.Int32)
         tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, v_dgroup1))
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)

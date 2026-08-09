@@ -70,7 +70,7 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -312,17 +312,17 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 dwords4 = buffer_ops.buffer_load(
                     hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
                 )
-                vec8_bf16_ty = T.vec(8, T.bf16)
+                T.vec(8, T.bf16)
                 vec8_f32_ty = T.vec(8, f32)
-                bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
+                bf16x8 = fx.Vector(dwords4).bitcast(fx.BFloat16)
                 f32x8 = bf16x8.extf(vec8_f32_ty)
 
                 # per-block amax over this lane's 8 elems, then a butterfly
                 # shuffle_xor across the block's 4 lanes.
                 block_amax = c.c0_f32
                 for j in range_constexpr(8):
-                    xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
-                    absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
+                    xj = fx.Vector(f32x8)[j]
+                    absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(xj)], [], [])
                     block_amax = arith.maximumf(block_amax, absj)
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(
@@ -355,20 +355,20 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 dword_raw = buffer_ops.buffer_load(
                     hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
                 )
-                vec1_i32_ty = T.vec(1, i32)
-                vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
+                T.vec(1, i32)
+                T.vec(ELEMS_PER_LANE, T.bf16)
                 vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
-                bf16_pair = vector.bitcast(
-                    vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
-                )
+                bf16_pair = fx.Vector(
+                    fx.Vector.from_elements([dword_raw], fx.Int32)
+                ).bitcast(fx.BFloat16)
                 f32_pair = bf16_pair.extf(vec2_f32_ty)
-                x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
-                x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
+                x0 = fx.Vector(f32_pair)[0]
+                x1 = fx.Vector(f32_pair)[1]
 
                 # per-block amax: max over this lane's 2 elems, then a butterfly
                 # shuffle_xor across the block's 16 lanes.
-                abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
-                abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
+                abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(x0)], [], [])
+                abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(x1)], [], [])
                 block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(

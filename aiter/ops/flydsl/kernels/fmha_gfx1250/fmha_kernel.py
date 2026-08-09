@@ -59,7 +59,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..tensor_shim import _run_compiled
 from .fmha_core_loop import (
@@ -306,7 +306,7 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
             )
         )
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
-        dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
+        dg0 = fx.Vector.from_elements([pred, lds_off, addr_lo, addr_hi], fx.Int32)
         descs.append((dg0, _dg1_list[su]))
         if su < n_su - 1:
             cur_addr = arith.addi(cur_addr, stride_adv_i64)
@@ -347,8 +347,7 @@ def _make_kv_dg1_with_oob(
     _sgpr2 = arith.shli(_td1_lo, arith.constant(16, type=T.i32))
     if dim0_stride is None:
         dim0_stride = dim0_elems
-    return vector.from_elements(
-        T.vec(8, T.i32),
+    return fx.Vector.from_elements(
         [
             arith.constant(config_bf16, type=T.i32),
             arith.constant(dim0_elems << 16, type=T.i32),
@@ -359,6 +358,7 @@ def _make_kv_dg1_with_oob(
             arith.constant(0, type=T.i32),
             arith.constant(0, type=T.i32),
         ],
+        fx.Int32,
     )
 
 
@@ -409,8 +409,7 @@ def _tdm_load_k_only(
     k_dg1 = (
         oob_dg1_list
         if oob_dg1_list is not None
-        else vector.from_elements(
-            T.vec(8, T.i32),
+        else fx.Vector.from_elements(
             [
                 arith.constant(_K_CONFIG_BF16, type=T.i32),
                 arith.constant(_DIM0_VALID << 16, type=T.i32),
@@ -421,6 +420,7 @@ def _tdm_load_k_only(
                 arith.constant(0, type=T.i32),
                 arith.constant(0, type=T.i32),
             ],
+            fx.Int32,
         )
     )
 
@@ -475,8 +475,7 @@ def _tdm_load_v_only(
     v_dg1 = (
         oob_dg1_list
         if oob_dg1_list is not None
-        else vector.from_elements(
-            T.vec(8, T.i32),
+        else fx.Vector.from_elements(
             [
                 arith.constant(_V_CONFIG_BF16, type=T.i32),
                 arith.constant(_DIM0_ELEMS << 16, type=T.i32),
@@ -487,6 +486,7 @@ def _tdm_load_v_only(
                 arith.constant(0, type=T.i32),
                 arith.constant(0, type=T.i32),
             ],
+            fx.Int32,
         )
     )
 
@@ -1547,8 +1547,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     if const_expr(loop_k_oob_dg1 is not None):
                         k_dg1 = loop_k_oob_dg1
                     else:
-                        k_dg1 = vector.from_elements(
-                            T.vec(8, T.i32),
+                        k_dg1 = fx.Vector.from_elements(
                             [
                                 arith.constant(_K_CFG, type=T.i32),
                                 arith.constant(QK_HDIM << 16, type=T.i32),
@@ -1559,6 +1558,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
                             ],
+                            fx.Int32,
                         )
                     k_addr = _compute_k_global_addr(
                         ptr_K,
@@ -1595,8 +1595,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     if const_expr(endtile_v_dg1 is not None):
                         v_dg1 = endtile_v_dg1
                     else:
-                        v_dg1 = vector.from_elements(
-                            T.vec(8, T.i32),
+                        v_dg1 = fx.Vector.from_elements(
                             [
                                 arith.constant(_V_CFG, type=T.i32),
                                 arith.constant(128 << 16, type=T.i32),
@@ -1607,6 +1606,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
                             ],
+                            fx.Int32,
                         )
                     v_addr = _compute_v_global_addr(
                         ptr_V,
@@ -1818,8 +1818,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     if const_expr(loop_v_oob_dg1 is not None):
                         v_dg1 = loop_v_oob_dg1
                     else:
-                        v_dg1 = vector.from_elements(
-                            T.vec(8, T.i32),
+                        v_dg1 = fx.Vector.from_elements(
                             [
                                 arith.constant(_V_CFG, type=T.i32),
                                 arith.constant(128 << 16, type=T.i32),
@@ -1830,6 +1829,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
                             ],
+                            fx.Int32,
                         )
                     v_addr = _compute_v_global_addr(
                         ptr_V,
@@ -2152,13 +2152,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 }
 
                 # ---- Build TDM state (zero placeholder for memload=False) ----
-                _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
+                def _mk_zero_v4i32():
+                    return fx.Vector.filled(4, 0, fx.Int32)
 
-                def _mk_zero_v4i32(_zero_i32=_zero_i32):
-                    return vector.broadcast(ty["v4i32"], _zero_i32)
-
-                def _mk_zero_v8i32(_zero_i32=_zero_i32):
-                    return vector.broadcast(ty["v8i32"], _zero_i32)
+                def _mk_zero_v8i32():
+                    return fx.Vector.filled(8, 0, fx.Int32)
 
                 tdm_state = {
                     "v_g0": _mk_zero_v4i32(),
@@ -2430,13 +2428,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     "sp_pairs_prev": ia_partial_sp_pairs,
                 }
 
-                _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
+                def _mk_zero_v4i32():
+                    return fx.Vector.filled(4, 0, fx.Int32)
 
-                def _mk_zero_v4i32(_zero_i32=_zero_i32):
-                    return vector.broadcast(ty["v4i32"], _zero_i32)
-
-                def _mk_zero_v8i32(_zero_i32=_zero_i32):
-                    return vector.broadcast(ty["v8i32"], _zero_i32)
+                def _mk_zero_v8i32():
+                    return fx.Vector.filled(8, 0, fx.Int32)
 
                 tdm_state = {
                     "v_g0": _mk_zero_v4i32(),
@@ -2924,9 +2920,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 rocdl.s_barrier_wait(-1)
 
                 # 4e: TDM store D (VGPR -> LDS -> Global)
-                _i32t = ir.IntegerType.get_signless(32)
                 _ldst = ir.Type.parse("!llvm.ptr<3>")
-                _v4i32t = ir.VectorType.get([4], _i32t)
                 _db32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
                 _dw_wv = arith.muli(
                     arith.unwrap(wave_id),
@@ -2967,7 +2961,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             arith.unwrap(arith.constant(_ioff, type=T.i32)),
                         )
                         llvm_dialect.store(
-                            vector.bitcast(_v4i32t, _obf16[_msb][_n]),
+                            fx.Vector(_obf16[_msb][_n]).bitcast(fx.Int32),
                             llvm_dialect.inttoptr(_ldst, _la),
                             volatile_=True,
                         )
@@ -3014,14 +3008,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32)),
                     ),
                 )
-                _dg0 = vector.from_elements(
-                    T.vec(4, T.i32),
+                _dg0 = fx.Vector.from_elements(
                     [
                         arith.unwrap(arith.constant(1, type=T.i32)),
                         _olds2,
                         _alo,
                         _ahi,
                     ],
+                    fx.Int32,
                 )
                 _g0 = arith.unwrap(arith.constant((1 << 16) | 0, type=T.i32))
                 _g1 = arith.unwrap(arith.constant((128 & 0xFFFF) << 16, type=T.i32))
@@ -3037,8 +3031,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _g5 = stride_o_seq
                 _g6 = arith.unwrap(arith.constant(0, type=T.i32))
                 _g7 = arith.unwrap(arith.constant(0, type=T.i32))
-                _dg1 = vector.from_elements(
-                    T.vec(8, T.i32),
+                _dg1 = fx.Vector.from_elements(
                     [
                         _g0,
                         _g1,
@@ -3049,6 +3042,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _g6,
                         _g7,
                     ],
+                    fx.Int32,
                 )
                 tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
                 tdm_ops.tensor_wait(0)
@@ -3088,12 +3082,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # DBG: row_sums entering endtile core_loop (= ep_row_sums from
                 # loop_results)
 
-                _et_z = arith.unwrap(arith.constant(0, type=T.i32))
                 _et_tdm = {
-                    "v_g0": vector.broadcast(ty["v4i32"], _et_z),
-                    "v_g1": vector.broadcast(ty["v8i32"], _et_z),
-                    "k_g0": vector.broadcast(ty["v4i32"], _et_z),
-                    "k_g1": vector.broadcast(ty["v8i32"], _et_z),
+                    "v_g0": fx.Vector.filled(4, 0, fx.Int32),
+                    "v_g1": fx.Vector.filled(8, 0, fx.Int32),
+                    "k_g0": fx.Vector.filled(4, 0, fx.Int32),
+                    "k_g1": fx.Vector.filled(8, 0, fx.Int32),
                     "v_salu_queue": [],
                     "k_salu_queue": [],
                 }

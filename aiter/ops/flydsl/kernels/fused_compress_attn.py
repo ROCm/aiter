@@ -81,7 +81,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtypeInt,
 )
@@ -94,6 +94,12 @@ from aiter.utility.mx_types import (
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
+
+
+def _velem(vec, i):
+    """Element *i* of *vec* as a raw ir.Value (this kernel feeds raw MLIR ops)."""
+    return _to_raw(fx.Vector(vec)[i])
+
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -351,10 +357,10 @@ def _build_kernel(
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        ragged_id = vector.extract(plan_vec, static_position=[0], dynamic_position=[])
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
-        window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
+        ragged_id = _velem(plan_vec, 0)
+        batch_id = _velem(plan_vec, 1)
+        position = _velem(plan_vec, 2)
+        window_len = _velem(plan_vec, 3)
 
         # ---- Step 2: sentinel-skip ----
         # Sentinel-skip: run the whole body only for position >= 0. A bare
@@ -454,21 +460,15 @@ def _build_kernel(
                     # buffer_load(vec_width=1) returns a scalar i32; wrap into
                     # vec<1xi32> before bitcasting to vec<2xbf16>.
                     raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
-                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                    raw = fx.Vector.from_elements([raw_s], fx.Int32)
                 else:
                     raw = buffer_ops.buffer_load(
                         rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16,
-                        static_position=[i],
-                        dynamic_position=[],
-                    )
-                    f32_v = arith.extf(f32, bf16_v)
-                    out.append(f32_v)
+                    out.append(arith.extf(f32, _to_raw(_velem(vec_bf16, i))))
                 return out
 
             def _load_f32_vec(rsrc, off_elems_i32):
@@ -481,10 +481,7 @@ def _build_kernel(
                     raw = buffer_ops.buffer_load(
                         rsrc, off_elems_i32, vec_width=vw, dtype=f32
                     )
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [_to_raw(_velem(raw, i)) for i in range(VEC)]
                 else:
                     # VEC == 8 -> 2x dwordx4
                     assert VEC == 8
@@ -498,16 +495,10 @@ def _build_kernel(
                         vec_width=half,
                         dtype=f32,
                     )
-                    out = []
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
-                    return out
+                    v0, v1 = fx.Vector(r0), fx.Vector(r1)
+                    return [_to_raw(v0[i]) for i in range_constexpr(half)] + [
+                        _to_raw(v1[i]) for i in range_constexpr(half)
+                    ]
 
             # Buffer resources reused across K iters.
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
@@ -871,18 +862,14 @@ def _build_kernel(
                 cos_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(cos_vec, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(sin_vec, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
@@ -940,7 +927,7 @@ def _build_kernel(
                     # Build a per-block GTensor and store VEC bf16 via dword path.
                     # bf16 VEC ? {2, 4, 8} = {4, 8, 16} bytes = {1, 2, 4} dwords.
                     out_vec_t = T.vec(VEC, T.bf16)
-                    raw_vec = vector.from_elements(vecVf32, out_lane)
+                    raw_vec = fx.Vector.from_elements(out_lane, fx.Float32)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
                         kv_cache, max_size=True
@@ -948,12 +935,10 @@ def _build_kernel(
                     # cache_off is in bf16 elements; convert to dword for the i32-vec store.
                     cache_off_dw = ArithValue(cache_off) >> arith.constant(1, type=i32)
                     dwords = (VEC + 1) // 2
-                    bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
+                    bf16_as_i32 = fx.Vector(bf16_vec).bitcast(fx.Int32)
                     if const_expr(dwords == 1):
                         # vec<1xi32> -> scalar i32 store
-                        scalar_i32 = vector.extract(
-                            bf16_as_i32, static_position=[0], dynamic_position=[]
-                        )
+                        scalar_i32 = _velem(bf16_as_i32, 0)
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                     else:
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
@@ -1163,8 +1148,8 @@ def _build_kernel(
                         )
                     else:
                         # VEC == 8: store 2 dwords (8 bytes) via vec<2xi32>
-                        store_vec = vector.from_elements(
-                            T.vec(2, i32), [dword[0], dword[1]]
+                        store_vec = fx.Vector.from_elements(
+                            [dword[0], dword[1]], fx.Int32
                         )
                         buffer_ops.buffer_store(
                             store_vec,
@@ -1602,10 +1587,10 @@ def _build_kernel_ksplit(
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        ragged_id = vector.extract(plan_vec, static_position=[0], dynamic_position=[])
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
-        window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
+        ragged_id = _velem(plan_vec, 0)
+        batch_id = _velem(plan_vec, 1)
+        position = _velem(plan_vec, 2)
+        window_len = _velem(plan_vec, 3)
 
         # Sentinel-skip: whole body runs only for position >= 0, as a closure
         # under a runtime `if` (see the CSA kernel above for the rationale).
@@ -1641,10 +1626,7 @@ def _build_kernel_ksplit(
                     raw = buffer_ops.buffer_load(
                         rsrc, off_elems_i32, vec_width=VEC, dtype=f32
                     )
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [_to_raw(_velem(raw, i)) for i in range(VEC)]
                 else:
                     assert VEC == 8
                     half = VEC // 2
@@ -1657,34 +1639,25 @@ def _build_kernel_ksplit(
                         vec_width=half,
                         dtype=f32,
                     )
-                    out = []
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
-                    return out
+                    v0, v1 = fx.Vector(r0), fx.Vector(r1)
+                    return [_to_raw(v0[i]) for i in range_constexpr(half)] + [
+                        _to_raw(v1[i]) for i in range_constexpr(half)
+                    ]
 
             def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
                 off_dw = ArithValue(off_elems_i32) >> c_one_i32
                 dwords = (VEC + 1) // 2
                 if const_expr(dwords == 1):
                     raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
-                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                    raw = fx.Vector.from_elements([raw_s], fx.Int32)
                 else:
                     raw = buffer_ops.buffer_load(
                         rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    out.append(arith.extf(f32, bf16_v))
+                    out.append(arith.extf(f32, _to_raw(_velem(vec_bf16, i))))
                 return out
 
             def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
@@ -1936,18 +1909,14 @@ def _build_kernel_ksplit(
                     cos_vals = [
                         arith.extf(
                             f32,
-                            vector.extract(
-                                cos_vec, static_position=[i], dynamic_position=[]
-                            ),
+                            _velem(cos_vec, i),
                         )
                         for i in range(PAIRS_PER_THREAD)
                     ]
                     sin_vals = [
                         arith.extf(
                             f32,
-                            vector.extract(
-                                sin_vec, static_position=[i], dynamic_position=[]
-                            ),
+                            _velem(sin_vec, i),
                         )
                         for i in range(PAIRS_PER_THREAD)
                     ]
@@ -1995,18 +1964,16 @@ def _build_kernel_ksplit(
                         + lid_x_vec
                     )
                     out_vec_t = T.vec(VEC, T.bf16)
-                    raw_vec = vector.from_elements(vecVf32, out_lane)
+                    raw_vec = fx.Vector.from_elements(out_lane, fx.Float32)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
                         kv_cache, max_size=True
                     )
                     cache_off_dw = ArithValue(cache_off) >> c_one_i32
                     dwords = (VEC + 1) // 2
-                    bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
+                    bf16_as_i32 = fx.Vector(bf16_vec).bitcast(fx.Int32)
                     if const_expr(dwords == 1):
-                        scalar_i32 = vector.extract(
-                            bf16_as_i32, static_position=[0], dynamic_position=[]
-                        )
+                        scalar_i32 = _velem(bf16_as_i32, 0)
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                     else:
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
@@ -2177,8 +2144,8 @@ def _build_kernel_ksplit(
                             dword, out_rsrc, byte_off, offset_is_bytes=True
                         )
                     else:
-                        store_vec = vector.from_elements(
-                            T.vec(2, i32), [dword[0], dword[1]]
+                        store_vec = fx.Vector.from_elements(
+                            [dword[0], dword[1]], fx.Int32
                         )
                         buffer_ops.buffer_store(
                             store_vec, out_rsrc, byte_off, offset_is_bytes=True

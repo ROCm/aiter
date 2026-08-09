@@ -55,12 +55,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import vector as vector_dialect
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -75,6 +76,12 @@ from aiter.utility.mx_types import (
 )
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
+
+
+def _velem(vec, i):
+    """Element *i* of *vec* as a raw ir.Value (this kernel feeds raw MLIR ops)."""
+    return _to_raw(fx.Vector(vec)[i])
+
 
 _STATIC_ADAPTOR_CACHE = {}
 _STATIC_ADAPTOR_CACHE_MAX = 64
@@ -181,25 +188,25 @@ def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
     """
     i32 = T.i32
     f32 = T.f32
-    vec_f32 = T.vec(vec, f32)
+    T.vec(vec, f32)
     vec_bf16 = T.vec(vec, T.bf16)
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = vector.from_elements(vec_f32, raw)
+    f32v = fx.Vector.from_elements(raw, fx.Float32)
     bf16v = f32v.truncf(vec_bf16)
 
     # bf16 -> i32 dwords: VEC bf16 = VEC/2 dwords
     dwords = vec // 2
-    bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
+    bf16_as_i32 = fx.Vector(bf16v).bitcast(fx.Int32)
     off_bytes = row_base_bytes + ArithValue(idx) * (vec * 2)
 
     if const_expr(dwords <= 4):
         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
     else:
         # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
-        lo = vector.extract_strided_slice(
+        lo = vector_dialect.extract_strided_slice(
             T.vec(4, i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
         )
-        hi = vector.extract_strided_slice(
+        hi = vector_dialect.extract_strided_slice(
             T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
         )
         buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -252,8 +259,8 @@ def _store_fp8_packed(
         dword_list.append(pk)
 
     off_bytes = row_base_bytes + ArithValue(idx) * vec
-    store_vec_ty = T.vec(n_dwords, i32)
-    store_vec = vector.from_elements(store_vec_ty, dword_list)
+    T.vec(n_dwords, i32)
+    store_vec = fx.Vector.from_elements(dword_list)
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
 
 
@@ -414,7 +421,7 @@ def _build_kernel(
                 tid_x_vec = ArithValue(tid_val) * VEC
                 off_dw = tid_x_vec >> 1
                 f32_list = _load_bf16_raw(wrsrc, off_dw)
-                f32_vec = vector.from_elements(T.vec(VEC, f32), f32_list)
+                f32_vec = fx.Vector.from_elements(f32_list, fx.Float32)
                 rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
                 fx.memref_store_vec(f32_vec, rmem)
                 return fx.memref_load_vec(rmem)
@@ -427,11 +434,9 @@ def _build_kernel(
             out = []
             if const_expr(dwords <= 4):
                 raw = buffer_ops.buffer_load(rsrc, off_dw, vec_width=dwords, dtype=i32)
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
+                    bf16_v = _velem(vec_bf16, i)
                     out.append(arith.extf(f32, bf16_v))
             else:
                 half_dw = 4
@@ -443,11 +448,9 @@ def _build_kernel(
                         vec_width=half_dw,
                         dtype=i32,
                     )
-                    vbf16 = vector.bitcast(T.vec(half_bf16, T.bf16), r)
+                    vbf16 = fx.Vector(r).bitcast(fx.BFloat16)
                     for i in range_constexpr(half_bf16):
-                        bf16_v = vector.extract(
-                            vbf16, static_position=[i], dynamic_position=[]
-                        )
+                        bf16_v = _velem(vbf16, i)
                         out.append(arith.extf(f32, bf16_v))
             return out
 
@@ -621,18 +624,14 @@ def _build_kernel(
                 cos_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            cos_raw, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(cos_raw, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            sin_raw, static_position=[i], dynamic_position=[]
-                        ),
+                        _velem(sin_raw, i),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
@@ -695,7 +694,7 @@ def _build_kernel(
             )
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
-            q_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), q_f32_list)
+            q_f32_fly_vec = fx.Vector.from_elements(q_f32_list, fx.Float32)
             q_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             fx.memref_store_vec(q_f32_fly_vec, q_rmem)
             x_f32 = fx.memref_load_vec(q_rmem)
@@ -762,7 +761,7 @@ def _build_kernel(
             kv_off_dw = kv_off_elems >> 1
 
             kv_f32_list = _load_bf16_raw(kv_rsrc, kv_off_dw)
-            kv_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), kv_f32_list)
+            kv_f32_fly_vec = fx.Vector.from_elements(kv_f32_list, fx.Float32)
             kv_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             fx.memref_store_vec(kv_f32_fly_vec, kv_rmem)
             x_vec_f32 = fx.memref_load_vec(kv_rmem)

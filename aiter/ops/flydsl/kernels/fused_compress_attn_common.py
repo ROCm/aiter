@@ -13,14 +13,16 @@ byte-identical so the V4 nm-asm sparse-attn reader sees one layout).
 from contextlib import contextmanager
 from functools import lru_cache
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl, scf
+from flydsl._mlir.dialects import vector as vector_dialect
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
 )
@@ -125,7 +127,7 @@ def emit_group_fp8_nm_asm_scatter(
         nope_off = ArithValue(cache_base) + ArithValue(lane) * arith.constant(
             VEC, type=i32
         )
-        store_vec = vector.from_elements(T.vec(VEC // 4, i32), dwords)
+        store_vec = fx.Vector.from_elements(dwords, fx.Int32)
         buffer_ops.buffer_store(
             store_vec, out_rsrc, _to_raw(nope_off), offset_is_bytes=True
         )
@@ -152,10 +154,10 @@ def emit_group_fp8_nm_asm_scatter(
         krope_off = ArithValue(krope_base) + ArithValue(rope_rel) * arith.constant(
             VEC, type=i32
         )
-        rope_f32 = vector.from_elements(vecVf32, rotated_lane)
+        rope_f32 = fx.Vector.from_elements(rotated_lane, fx.Float32)
         rope_bf16 = rope_f32.truncf(T.vec(VEC, T.bf16))
         dwr = (VEC + 1) // 2
-        rope_i32 = vector.bitcast(T.vec(dwr, i32), rope_bf16)
+        rope_i32 = fx.Vector(rope_bf16).bitcast(fx.Int32)
         krope_off_dw = ArithValue(krope_off) >> c_one_i32
         if dwr <= 4:
             # VEC<=8 (wave64): single dwordx{dwr} store.
@@ -163,10 +165,10 @@ def emit_group_fp8_nm_asm_scatter(
         else:
             # VEC=16 (wave32) -> dwr=8: no dwordx8 store; split into 2x dwordx4.
             c4_i32 = arith.constant(4, type=i32)
-            lo = vector.extract_strided_slice(
+            lo = vector_dialect.extract_strided_slice(
                 T.vec(4, i32), rope_i32, offsets=[0], sizes=[4], strides=[1]
             )
-            hi = vector.extract_strided_slice(
+            hi = vector_dialect.extract_strided_slice(
                 T.vec(4, i32), rope_i32, offsets=[4], sizes=[4], strides=[1]
             )
             buffer_ops.buffer_store(lo, krope_rsrc, _to_raw(krope_off_dw))

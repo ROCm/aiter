@@ -637,11 +637,7 @@ def launch_gemm_a8w4_tdm(
                             for sub in range_constexpr(2):
                                 sub_wn = half * 2 + sub
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                packed_i32 = vector.extract(
-                                    packed_v2i32,
-                                    static_position=[sub],
-                                    dynamic_position=[],
-                                )
+                                packed_i32 = fx.Vector(packed_v2i32)[sub]
                                 col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                 lds_store_b32(
                                     stC_idx,

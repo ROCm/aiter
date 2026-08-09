@@ -47,7 +47,6 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels import vector
 
 from .splitk_hgemm import (
     OnlineScheduler,
@@ -556,10 +555,9 @@ def compile_small_m_hgemm_kernel(
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
-        zero_a_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
-        zero_a_async_vec = vector.broadcast(T.vec(LDG_ASYNC_VEC_SIZE, dtype_), c_zero_d)
+        zero_a_vec = fx.Vector.filled(LDG_VEC_SIZE, 0.0, fx_dtype)
+        zero_a_async_vec = fx.Vector.filled(LDG_ASYNC_VEC_SIZE, 0.0, fx_dtype)
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
@@ -668,11 +666,13 @@ def compile_small_m_hgemm_kernel(
         B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         B_FRAG_T = T.vec(WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, dtype_)
-        zero_b_frag = vector.broadcast(B_FRAG_T, c_zero_d)
+        zero_b_frag = fx.Vector.filled(
+            WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, 0.0, fx_dtype
+        )
         c_frags = [acc_init] * (C_FRAGS_LEN * N_TILE_REPEAT)
 
         def zero_c_tile(c_g, bias_g, tile_n_offset):
-            zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
+            zero_vec = fx.Vector.filled(LDG_VEC_SIZE, 0.0, fx_dtype)
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = global_tid // LDG_C_X_THREADS
@@ -980,19 +980,11 @@ def compile_small_m_hgemm_kernel(
                     linear_bytes_offset = (
                         c_g.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
                     )
-                    vec2_ty = T.vec(2, dtype_)
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                        e0 = vector.extract(
-                            pk_val,
-                            static_position=[vec_idx * 2],
-                            dynamic_position=[],
-                        )
-                        e1 = vector.extract(
-                            pk_val,
-                            static_position=[vec_idx * 2 + 1],
-                            dynamic_position=[],
-                        )
-                        pair = vector.from_elements(vec2_ty, [e0, e1])
+                        pk_vec = fx.Vector(pk_val)
+                        e0 = pk_vec[vec_idx * 2]
+                        e1 = pk_vec[vec_idx * 2 + 1]
+                        pair = fx.Vector.from_elements([e0, e1], fx_dtype)
                         pair_byte_offset = arith.index_cast(
                             T.i64,
                             linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES),
@@ -1052,12 +1044,8 @@ def compile_small_m_hgemm_kernel(
                             warp_atom_m_idx + stmatrix_c_m_vec_idx + kk
                         )
                         lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                        val = vector.extract(
-                            tile_c_frags_[ii * WARP_N_STEPS + jj],
-                            static_position=[kk],
-                            dynamic_position=[],
-                        )
-                        cs_store_scalar(lds_m_idx, lds_n_idx, val.truncf(dtype_))
+                        val = fx.Vector(tile_c_frags_[ii * WARP_N_STEPS + jj])[kk]
+                        cs_store_scalar(lds_m_idx, lds_n_idx, val.to(fx_dtype))
 
         if const_expr(IS_SPLIT_K and not B_TO_LDS):
             for tile_i in range_constexpr(N_TILE_REPEAT):

@@ -1,11 +1,13 @@
 ---
-name: flydsl-kernel-code-cleanup
+name: kernel-code-cleanup
 description: >
   Modernize FlyDSL kernels: replace raw MLIR dialects (arith, scf, vector, llvm,
   memref, math), ArithValue, redundant fx.* wrapping, fx.Index, buffer_ops,
   SmemPtr/SmemAllocator, per-tile *_atom_call, and raw rocdl.mfma_* with the
   current fx.* surface (fx types, Python control flow, make_buffer_tensor,
-  SharedAllocator, fx.copy/fx.gemm, local @flyc.jit if/else). Also trims comments
+  SharedAllocator, fx.copy/fx.gemm, make_layout_tv/make_tiled_copy TV layouts,
+  to_llvm_ptr, arch-dispatched fx.rocdl.s_waitcnt, local @flyc.jit if/else). Also
+  trims comments
   and dead code and applies the _run_compiled fast launch path. Use when
   reviewing, cleaning, or migrating existing kernels.
 allowed-tools: Read Edit Bash Grep Glob Agent
@@ -161,6 +163,60 @@ Runtime bounds must be typed (`fx.Int64`) or the rewriter unrolls and drops
 - `math.*` → `fx` math helpers (`expr/math.py`); keep `math_dialect.fma` etc. only
   where no wrapper exists.
 
+### 3b. `fly.ptr` → `!llvm.ptr` (backend-resolved address space)
+
+When you hold an `fx` pointer (`fly.ptr`) and need a raw `!llvm.ptr` at a hard
+boundary, use the DSL primitive — it maps the pointer's semantic address space to
+the backend's LLVM address-space number for you. Don't hand-build one with a
+hardcoded `<1>` / `<3>` via `IntToPtrOp`.
+
+```python
+# Before (hardcoded address space)
+p = buffer_ops.create_llvm_ptr(lds_addr, address_space=3)
+p = mem_ops._create_llvm_ptr(val, address_space=1)   # a.k.a. mem_ops.to_llvm_ptr
+# After
+p = ptr.llvm_ptr          # property on an fx pointer
+p = fx.to_llvm_ptr(ptr)   # equivalent free function; backend resolves the AS
+```
+
+- Applies only when you already have a `fly.ptr`. A raw int/index address (e.g. an
+  LDS byte offset with no pointer form) still needs manual construction — note it.
+- `mem_ops.get_llvm_ptr` / `element_ptr` also fold in `+ offset*dtype_bytes`
+  arithmetic; keep the offset math (layout views / `get_element_ptr`) and only swap
+  the final ptr cast for `.llvm_ptr`.
+
+### 3c. Manual `s_waitcnt` bitfields → `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)`
+
+Hand-encoding a wait-counter bitfield (or calling `rocdl.s_waitcnt(magic)` with a
+raw number) is arch-fragile — the field widths differ per arch (CDNA3 `lgkmcnt`
+max 15 vs RDNA 63). The keyword form of `fx.rocdl.s_waitcnt`
+(`expr/rocdl/universal.py`) is arch-dispatched across gfx942/gfx950/gfx11xx/gfx120x
+and packs the correct bitfield for you.
+
+```python
+# Before
+rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))   # per-kernel encoder
+rocdl.s_waitcnt(0)                             # raw "wait for everything"
+_s_waitcnt(0xC07F)                             # magic LGKMCNT_0_ONLY bitfield
+# After
+fx.rocdl.s_waitcnt(lgkmcnt=0)                  # wait for LDS/SMEM only
+fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)         # wait for all
+fx.rocdl.s_waitcnt(lgkmcnt=0)
+```
+
+- Unset fields default to "no wait" (their per-arch max) — name only the counters
+  you need.
+- Delete the now-unused per-kernel `_encode_waitcnt` / `_s_waitcnt` shims and magic
+  `*CNT_*` constants once your changes make them dead.
+- `sched_barrier` / `sched_group_barrier` have no keyword fx wrapper — keep raw
+  `rocdl.sched_barrier(...)`. The legacy raw form stays available as positional
+  `fx.rocdl.s_waitcnt(bitfield)` for a boundary the keyword form can't express;
+  localize it.
+- **Scheduler-sensitive.** `s_waitcnt` placement drives hot-loop pipelining in
+  tuned attention/GEMM kernels — an op-identical swap can still shift the schedule.
+  Verify perf (median-based), not just correctness, and don't mass-migrate
+  pervasively-tuned kernels (e.g. `flash_attn_gfx950.py`, `mla_fwd_decode_*`).
+
 ---
 
 ## 4. `SmemAllocator` / `SmemPtr` → `SharedAllocator`
@@ -254,7 +310,43 @@ fx.mma_atom_call(mma, frag_C, frag_A, frag_B, frag_C)           # single tile
 
 ---
 
-## 7. Per-tile `*_atom_call` → `fx.copy` / `fx.gemm`
+## 7. Tiled copy/MMA: build from a TV layout, iterate with `fx.copy` / `fx.gemm`
+
+### 7a. Build the tiled copy/MMA (TV layout)
+
+A tiled copy is a copy atom laid over a **thread-value (TV) layout** plus a tiler.
+Build the TV layout from separate thread/value layouts with `fx.make_layout_tv`
+(returns `(tile_mn, tv_layout)`), pass both to `fx.make_tiled_copy`, slice
+per-thread with `.get_slice(tid)`, then partition the tensor. See
+`examples/02-tiledCopy.py`.
+
+```python
+# thread + value layouts -> (tile_mn, tv_layout) -> tiled copy
+thr_layout = fx.make_layout((4, 1), (1, 1))
+val_layout = fx.make_layout((1, 8), (1, 1))
+copy_atom  = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+tile_mn, tv_layout = fx.make_layout_tv(thr_layout, val_layout)
+tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tile_mn)
+thr_copy   = tiled_copy.get_slice(tid)
+part_src   = thr_copy.partition_S(bA)   # bA = fx.slice(fx.zipped_divide(A, tile), (None, bid))
+part_dst   = thr_copy.partition_D(bB)
+frag       = fx.make_fragment_like(part_src)
+```
+
+- `fx.make_tiled_copy_tv(atom, thr_layout, val_layout)` is the one-call shortcut
+  for the `make_layout_tv` + `make_tiled_copy` pair above. Prefer it, or the
+  explicit two-liner, over hand-building a TV layout inline in `make_tiled_copy`.
+- For copies matched to an MMA operand layout, do **not** hand-build a TV layout —
+  use `fx.make_tiled_copy_A/B/C(copy_atom, tiled_mma)` (they read the atom's
+  `tv_layout_{A,B,C}_tiled`), then `.get_slice(tid)` + `partition_S` /
+  `.retile(frag)`. See `examples/03-tiledMma.py`.
+- Build the MMA with `fx.make_tiled_mma(mma_atom, atom_layout)`; slice with
+  `.thr_slice(tid)` / `.get_slice(tid)` and make fragments via
+  `make_fragment_{A,B,C}`.
+- Layouts passed to `make_layout_tv` must be **static** (compile-time) — plain
+  Python-int shapes/strides in `make_layout`.
+
+### 7b. Iterate with `fx.copy` / `fx.gemm`
 
 `copy_atom_call` / `mma_atom_call` issue a single atom instance. `fx.copy` /
 `fx.gemm` iterate the atom over a tiled/partitioned layout and take atom state as
@@ -339,6 +431,8 @@ def _run_compiled(exe, *args):             # in-tree
    grep -nE "SmemPtr|SmemAllocator|\.finalize\(\)" <file>
    grep -nE "fx\.(Int32|Int64|Float32)\(fx\.(Int32|Int64|Float32)\(" <file>
    grep -nE "rocdl\.mfma_|\bmfma_(f32|i32)_|copy_atom_call|mma_atom_call" <file>
+   grep -nE "create_llvm_ptr|_create_llvm_ptr|get_llvm_ptr|IntToPtrOp" <file>
+   grep -nE "s_waitcnt\(|_encode_waitcnt|_s_waitcnt|CNT_[0-9A-Z_]*=|0x[Cc]07[Ff]" <file>
    ```
 2. **Triage:** do mechanical swaps (operators, casts, `vector.extract/bitcast`)
    first; structural ones (control flow, `buffer_ops` offsets, MMA loops) next.
@@ -367,10 +461,13 @@ def _run_compiled(exe, *args):             # in-tree
 | `scf.ForOp` / `scf.IfOp` | `range_constexpr` / `range(..., init=)` / Python `if` / `const_expr` |
 | `buffer_ops.*` + offsets | `fx.rocdl.make_buffer_tensor` + layout + `fx.copy_atom_call` |
 | raw `llvm`/`memref` access | `fx.make_view` / `fx.get_iter` / `SharedAllocator` |
+| `create_llvm_ptr(v, address_space=N)` / manual `IntToPtrOp` | `ptr.llvm_ptr` / `fx.to_llvm_ptr(ptr)` (backend-resolved AS) |
+| `rocdl.s_waitcnt(_encode_waitcnt(...))` / magic bitfield | `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)` (arch-dispatched) |
 | `SmemAllocator`/`SmemPtr` + `finalize()` | `@fx.struct` + `fx.SharedAllocator().allocate(...).peek().view(...)` |
 | `scf.IfOp(_raw(cond))` branch w/ outputs | branch helpers + local `@flyc.jit` |
 | `fx.Int32(fx.Int32(x))` / wrapping const ints | plain Python int; wrap once |
 | `rocdl.mfma_*` raw intrinsic | `fx.make_mma_atom(fx.rocdl.MFMA(...))` + `fx.gemm` |
+| hand-built TV layout in `make_tiled_copy` | `fx.make_layout_tv` + `fx.make_tiled_copy` / `make_tiled_copy_tv`; `_A/_B/_C` for MMA operands |
 | per-tile `*_atom_call` loop | `fx.copy` / `fx.gemm` (state as kwargs) |
 | restated/dead/stale comments, blank runs | delete; keep *why*; aim for net LOC drop |
 | per-call `@flyc.jit` on a hot path | `_run_compiled(exe, *args)` fast dispatch |
