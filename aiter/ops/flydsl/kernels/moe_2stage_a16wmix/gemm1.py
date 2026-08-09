@@ -8,9 +8,8 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_dsl_value, as_ir_value
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_dsl_value, as_ir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import _silu_mul_batch, _situ_mul_batch
@@ -539,9 +538,7 @@ def _gemm1_body_a16w4(
             T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
         )
         scale_n_gate = [col_g_list[ni] for ni in range_constexpr(num_acc_n)]
-        scale_n_up = [
-            col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)
-        ]
+        scale_n_up = [col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)]
 
     # ---- B tile load + compute helpers ----------------------------------------
     def load_b_tile(base_k):
