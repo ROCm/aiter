@@ -26,16 +26,21 @@ _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
-    """Return the ``exp`` helper (see gfx950 kernel for the rationale)."""
+    """Return the ``exp`` helper (see gfx950 kernel for the rationale).
+
+    ``rocdl.exp2`` requires a raw ``ir.Value``; a FlyDSL ``Float32`` wrapper (as
+    produced by re-typing a loop-carried value) is not one, and the arithmetic
+    below may hand back either. ``as_ir_value`` normalises both.
+    """
     if g_is_log2_scaled:
 
         def _fast_exp(x):
-            return rocdl.exp2(T.f32, x)
+            return rocdl.exp2(T.f32, as_ir_value(x))
 
     else:
 
         def _fast_exp(x):
-            return rocdl.exp2(T.f32, x * _LOG2E)
+            return rocdl.exp2(T.f32, as_ir_value(x * _LOG2E))
 
     return _fast_exp
 
@@ -177,6 +182,18 @@ def compile_chunk_gated_delta_h_gfx942(
 
     # Per-wave accumulators: only this wave's slice of the N_REPEAT axis.
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
+
+    # -- Loop-carried gate/u prefetch --
+    # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they can be
+    # issued a full iteration ahead.
+    #
+    # The carried values are raw loads only -- exp()/in-bounds selects stay at
+    # the use site, so the prefetch block has no arithmetic hanging off the
+    # loads and nothing forces a wait in the issuing iteration.
+    N_GATE_G = 5 if USE_G else 0  # g_last + 4 g_row
+    N_GATE_GK = NUM_K_BLOCKS * 4 if USE_GK else 0
+    N_U = N_REPEAT_LOCAL * 4
+    N_GU = N_GATE_G + N_GATE_GK + N_U
 
     # -- LDS layout --
     # All four buffers use the same GROUP-MAJOR + XOR scheme (see _grp_idx in the
@@ -535,7 +552,55 @@ def compile_chunk_gated_delta_h_gfx942(
 
         NUM_W_LOADS = W_LOADS_PER_THREAD
 
-        # -- Prologue: pre-load first chunk's w data --
+        def _load_gate_u(it_i32):
+            """Issue chunk ``it_i32``'s g/gk/u loads; return them as a flat list.
+
+            Pure loads -- no exp, no in-bounds select -- so nothing in the
+            issuing iteration depends on the results. Order must match the
+            N_GATE_G / N_GATE_GK / N_U unpacking in the loop body.
+
+            Out-of-range rows on the tail chunk (and the whole speculative
+            chunk NT) are address-clamped to row 0 exactly as the w prefetch
+            already is; the values are masked at the use site, so loading
+            garbage here is harmless.
+            """
+            out = []
+            next_end = (it_i32 + fx.Int32(1)) * fx.Int32(BT)
+            last_idx = (next_end < T_local).select(
+                next_end, T_local
+            ) - fx.Int32(1)
+            row_base = (
+                it_i32 * fx.Int32(BT)
+                + wid_m * fx.Int32(16)
+                + lane_m_base * fx.Int32(4)
+            )
+            if const_expr(USE_G):
+                out.append(g_[fx.Int64(i_h * T_flat + (bos + last_idx))])
+                for elem_i in range_constexpr(4):
+                    abs_row = row_base + fx.Int32(elem_i)
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    out.append(g_[fx.Int64(i_h * T_flat + (bos + safe_row))])
+            if const_expr(USE_GK):
+                gk_chunk_base = (bos + last_idx) * fx.Int32(H * K) + i_h * fx.Int32(K)
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for elem_i in range_constexpr(4):
+                        global_k = (
+                            fx.Int32(kb * 64)
+                            + wid_m * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        out.append(gk_[fx.Int64(gk_chunk_base + global_k)])
+            for nr in range_constexpr(N_REPEAT_LOCAL):
+                u_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
+                for elem_i in range_constexpr(4):
+                    abs_row = row_base + fx.Int32(elem_i)
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    u_off = v_base + safe_row * stride_v + u_col
+                    out.append(v_.vec_load((fx.Int64(u_off),), 1))
+            return out
+
+        # -- Prologue: pre-load first chunk's w + gate/u data --
         i_t0_i32 = fx.Int32(0)
         w_prefetch_init = []
         for i_load in range_constexpr(W_LOADS_PER_THREAD):
@@ -545,16 +610,21 @@ def compile_chunk_gated_delta_h_gfx942(
             g_off = w_base + safe_row * stride_w + col
             w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
 
-        init_state = [_to_raw(v) for v in h_accs] + [
-            _to_raw(v) for v in w_prefetch_init
-        ]
+        gu_prefetch_init = _load_gate_u(i_t0_i32)
+
+        init_state = (
+            [_to_raw(v) for v in h_accs]
+            + [_to_raw(v) for v in w_prefetch_init]
+            + [_to_raw(v) for v in gu_prefetch_init]
+        )
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
-            w_prefetch_all = list(state[NUM_H_ACCS:])
+            w_prefetch_all = list(state[NUM_H_ACCS : NUM_H_ACCS + NUM_W_LOADS])
+            gu_prefetch_all = list(state[NUM_H_ACCS + NUM_W_LOADS :])
             i_t_i32 = fx.Int32(i_t)
 
             # -- w LDS write offsets (group-major [BT][K/4][4] + XOR) --
@@ -657,60 +727,25 @@ def compile_chunk_gated_delta_h_gfx942(
                     # transposed to lds_kt[kcol, row].
                     k_prefetch_lds_t.append((row, col))
 
-            # last_idx for gating
-            next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
-            last_idx_raw = (next_chunk_end < T_local).select(
-                next_chunk_end, T_local
-            ) - fx.Int32(1)
+            # -- g / gk / u: unpack this chunk's values, prefetched last iter --
+            # Values come back off the loop-carried state as bare IR values; the
+            # f32 gates must be re-wrapped as Float32 before they can feed
+            # rocdl.exp2 (which needs a Value, not a raw carried operand). u is
+            # left alone -- it is bf16 and its use site already wraps it.
+            gu_all = list(gu_prefetch_all)
 
-            # -- g / gk / u prefetch (simple batched, no OPT-VC interleave) --
+            def _as_f32(v):
+                return fx.Float32(as_ir_value(v))
+
             if const_expr(USE_G):
-                g_last_off = i_h * T_flat + (bos + last_idx_raw)
-                g_last_val = g_[fx.Int64(g_last_off)]
-                g_row_vals = []
-                for elem_i in range_constexpr(4):
-                    abs_row = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid_m * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    in_bounds = abs_row < T_local
-                    safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                    g_row_off = i_h * T_flat + (bos + safe_row)
-                    g_row_vals.append((g_[fx.Int64(g_row_off)], in_bounds))
-
+                g_last_val = _as_f32(gu_all[0])
+                g_row_raw = [_as_f32(v) for v in gu_all[1:5]]
             if const_expr(USE_GK):
-                gk_chunk_base = (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(K)
-                gk_last_prefetch = []
-                for kb in range_constexpr(NUM_K_BLOCKS):
-                    kb_elems = []
-                    for elem_i in range_constexpr(4):
-                        global_k = (
-                            fx.Int32(kb * 64)
-                            + wid_m * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        gk_raw = gk_[fx.Int64(gk_chunk_base + global_k)]
-                        kb_elems.append(_fast_exp(gk_raw))
-                    gk_last_prefetch.append(kb_elems)
-
-            u_prefetch = []
-            for nr in range_constexpr(N_REPEAT_LOCAL):
-                u_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
-                for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid_m * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col
-                    u_prefetch.append(v_.vec_load((fx.Int64(u_off),), 1))
+                gk_raw_all = [
+                    _as_f32(v)
+                    for v in gu_all[N_GATE_G : N_GATE_G + N_GATE_GK]
+                ]
+            u_prefetch = gu_all[N_GATE_G + N_GATE_GK :]
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
             # A-frag (w): lane holds w[m=BT row, k]; plain read of lds_w.
@@ -804,8 +839,17 @@ def compile_chunk_gated_delta_h_gfx942(
                 exp_g_last = _fast_exp(g_last_val)
                 gate_elems = []
                 for elem_i in range_constexpr(4):
-                    g_row, in_bounds = g_row_vals[elem_i]
-                    gate = _fast_exp(g_last_val - g_row)
+                    # in_bounds is recomputed here rather than carried: it is a
+                    # couple of VALU ops and keeping it off the prefetch keeps
+                    # the loop-carried set to raw loads only.
+                    abs_row = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid_m * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    in_bounds = abs_row < T_local
+                    gate = _fast_exp(g_last_val - g_row_raw[elem_i])
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
@@ -818,8 +862,13 @@ def compile_chunk_gated_delta_h_gfx942(
 
             if const_expr(USE_GK):
                 for kb in range_constexpr(NUM_K_BLOCKS):
+                    # exp() applied here, not at load time, so the prefetch has
+                    # no arithmetic depending on the loads.
                     gk_vec = fx.Vector.from_elements(
-                        [gk_last_prefetch[kb][elem_i] for elem_i in range_constexpr(4)],
+                        [
+                            _fast_exp(gk_raw_all[kb * 4 + elem_i])
+                            for elem_i in range_constexpr(4)
+                        ],
                         dtype=fx.Float32,
                     )
                     for nr in range_constexpr(N_REPEAT_LOCAL):
@@ -872,7 +921,11 @@ def compile_chunk_gated_delta_h_gfx942(
 
             gpu.barrier()
 
-            # -- next iteration's w prefetch (batched) --
+            # -- next iteration's w + gate/u prefetch (batched) --
+            # Issued here, before GEMM2, so the whole MFMA chain below sits
+            # between the loads and their consumption at the top of the next
+            # iteration. On the last iteration these read chunk NT, which is
+            # out of range and address-clamped; the values are discarded.
             next_i_t_i32 = i_t_i32 + fx.Int32(1)
             w_next_prefetch = []
             for i_load in range_constexpr(W_LOADS_PER_THREAD):
@@ -881,6 +934,8 @@ def compile_chunk_gated_delta_h_gfx942(
                 safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                 g_off = w_base + safe_row * stride_w + col
                 w_next_prefetch.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
+
+            gu_next_prefetch = _load_gate_u(next_i_t_i32)
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             # A-frag (k): lane holds k[m=V head dim? no] -> k is [BT, K]; we want
@@ -912,9 +967,11 @@ def compile_chunk_gated_delta_h_gfx942(
                             k_a_frag, vn_b_frag, h_accs_in[acc_idx]
                         )
 
-            results = yield [_to_raw(v) for v in h_accs_in] + [
-                _to_raw(v) for v in w_next_prefetch
-            ]
+            results = (
+                yield [_to_raw(v) for v in h_accs_in]
+                + [_to_raw(v) for v in w_next_prefetch]
+                + [_to_raw(v) for v in gu_next_prefetch]
+            )
 
         h_accs_final = list(results[:NUM_H_ACCS])
 
