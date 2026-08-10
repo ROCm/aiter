@@ -496,7 +496,7 @@ def test_fmoe(
             aiter.fused_moe.kernel_bench_callable = None
         kernel_us = {}
         for _name, _call in kernel_bench_callable:
-            _, _us = run_perftest(_call, num_iters=20, num_warmup=5)
+            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
@@ -525,8 +525,8 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=20,
-        num_warmup=5,
+        num_iters=5,
+        num_warmup=2,
         **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):

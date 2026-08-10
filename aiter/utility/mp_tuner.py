@@ -70,7 +70,6 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
-    whole_result_compare_fn=None,
 ):
     from aiter.test_common import run_perftest
 
@@ -127,16 +126,7 @@ def worker(
                 )
                 for el in ref
             ]
-            if whole_result_compare_fn is not None:
-                err_ratio = whole_result_compare_fn(
-                    tuple(ref),
-                    tuple(res),
-                    msg=f"info:{info} ",
-                    printLog=printLog,
-                )
-                max_err_ratio = _merge_error_ratio(max_err_ratio, err_ratio)
-            compare_count = 0 if whole_result_compare_fn is not None else len(ref)
-            for i in range(compare_count):
+            for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     # Skip generic reshape when a custom compare_fn is given: it
                     # handles shape/dtype itself (e.g. v2 stage1 compares fp4-packed
@@ -322,7 +312,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             # Optional rest[3]: explicit max_abs_delta for catastrophic error detection.
             # Optional rest[4]: output_keys -- names of output tensors to NaN-init.
-            # Optional rest[5]: whole-result custom compare callable.
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
             compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
@@ -331,9 +320,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 rest[4]
                 if len(rest) > 4 and isinstance(rest[4], (list, tuple))
                 else None
-            )
-            whole_result_compare_fn = (
-                rest[5] if len(rest) > 5 and callable(rest[5]) else None
             )
             arg_key_list = list(args[0]) if gen_data is not None else None
 
@@ -355,7 +341,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             )
 
             # Run worker with explicit GPU ID
-            ret = worker(*work_args, whole_result_compare_fn=whole_result_compare_fn)
+            ret = worker(*work_args)
             rets.append(ret)
         return rets
 

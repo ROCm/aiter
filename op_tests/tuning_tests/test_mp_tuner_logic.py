@@ -16,7 +16,6 @@ import multiprocessing as mp
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
-from unittest import mock
 
 
 def _wait_for_release(release, value):
@@ -392,84 +391,6 @@ class TestWorkerErrorRatio(unittest.TestCase):
         self.assertIsNotNone(merge_error_ratio)
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
-
-
-class TestWholeResultComparison(unittest.TestCase):
-
-    def test_worker_runs_whole_result_compare_once_after_timing(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
-        reference = ("reference",)
-        result = ("payload", "scale")
-        state = {"timed": False, "calls": 0}
-
-        def fake_run_perftest(_func, *_args, **_kwargs):
-            state["timed"] = True
-            return result, 7.5
-
-        def whole_result_compare(ref, res, msg="", printLog=True):
-            self.assertTrue(state["timed"])
-            self.assertEqual(ref, reference)
-            self.assertEqual(res, result)
-            state["calls"] += 1
-            return 0.2
-
-        with (
-            mock.patch("aiter.test_common.run_perftest", fake_run_perftest),
-            mock.patch.object(tuner.torch.cuda, "set_device"),
-            mock.patch.object(tuner.torch.cuda, "synchronize"),
-        ):
-            ret = tuner.worker(
-                0,
-                "info",
-                lambda: None,
-                (),
-                {},
-                ref=reference,
-                whole_result_compare_fn=whole_result_compare,
-            )
-
-        self.assertEqual(ret, ("info", 7.5, 0.2))
-        self.assertEqual(state["calls"], 1)
-
-    def test_task_rest_forwards_whole_result_compare(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
-
-        def whole_result_compare(ref, res, msg="", printLog=True):
-            return 0.0
-
-        task = (
-            "info",
-            None,
-            (),
-            lambda: None,
-            (),
-            {},
-            None,
-            (),
-            {},
-            ("reference",),
-            1e-2,
-            1e-2,
-            None,
-            None,
-            None,
-            whole_result_compare,
-        )
-        captured = []
-
-        def fake_worker(*args, **kwargs):
-            captured.append((args, kwargs))
-            return "info", 1.0, 0.0
-
-        pid = mp.current_process().pid
-        with (
-            mock.patch.object(tuner, "worker", fake_worker),
-            mock.patch.object(tuner.torch.cuda, "set_device"),
-        ):
-            tuner.work_group({pid: 0}, False, 0.05, (1, {}), task)
-
-        self.assertEqual(len(captured), 1)
-        self.assertIs(captured[0][1]["whole_result_compare_fn"], whole_result_compare)
 
 
 if __name__ == "__main__":
