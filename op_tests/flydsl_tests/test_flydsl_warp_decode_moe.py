@@ -441,15 +441,22 @@ def test_down_reduce_fp8(case):
 # Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
 # -------------------------------------------------------------------------
 # GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
-# weight-row offset. These two cases run the real DeepSeek-V3 expert count
-# (E=256, H7168/I2048/TOPK8) and force the *max-id* expert (E-1, the largest
-# weight-row offset) into the routing, locking in offset-arithmetic
-# correctness at production expert counts. Verified cos=1.0 on gfx950; the
-# only FlyDSL addressing limit (buffer_load's i32 dword index) is reached
-# solely by >8 GB weight tensors, far above any ticket shape (see the plan's
-# Phase A / ?9). References are computed for the routed (b,k) rows only, so
-# HBM use is dominated by the ~3.5 GB FP8 weight tensors (guarded below).
-_DEEPSEEK_REAL_E = dict(B=1, HIDDEN=7168, INTER=2048, E=256, TOPK=8)
+# weight-row offset. These cases run the real ticket expert counts and force
+# the *max-id* expert (E-1, the largest weight-row offset) into the routing,
+# locking in offset-arithmetic correctness at production expert counts:
+#   * DeepSeek-V3   (E=256, H7168/I2048/TOPK8)  -- the largest ticket tensor.
+#   * Qwen3Next TP1 (E=512, H2048/I512/TOPK10)  -- the largest ticket E.
+# Verified cos=1.0 on gfx950; the only FlyDSL addressing limit (buffer_load's
+# i32 dword index) is reached solely by >8 GB weight tensors, far above any
+# ticket shape (see the plan's Phase A / ?9). References are computed for the
+# routed (b,k) rows only, so HBM use is dominated by the FP8 weight tensors
+# (~3.5 GB for DeepSeek; guarded below).
+# name -> dict(B, HIDDEN, INTER, E, TOPK)  (HIDDEN = model/output dim, INTER =
+# expert intermediate / contraction; matches the _gen_* helpers' semantics).
+REAL_E_CASES = [
+    ("deepseek_v3_e256", dict(B=1, HIDDEN=7168, INTER=2048, E=256, TOPK=8)),
+    ("qwen3next_tp1_e512", dict(B=1, HIDDEN=2048, INTER=512, E=512, TOPK=10)),
+]
 _REAL_E_MIN_FREE_GB = 16.0
 
 
@@ -458,16 +465,17 @@ def _skip_if_low_hbm():
     free_gb = free_bytes / 1e9
     if free_gb < _REAL_E_MIN_FREE_GB:
         pytest.skip(
-            f"needs >= {_REAL_E_MIN_FREE_GB:.0f} GB free HBM for the E=256 weight "
+            f"needs >= {_REAL_E_MIN_FREE_GB:.0f} GB free HBM for the real-E weight "
             f"tensors (have {free_gb:.1f} GB)"
         )
 
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
-def test_gate_up_fp8_real_expert_count():
-    """gate_up at real E=256 with the max-offset expert forced (G1 regression)."""
+@pytest.mark.parametrize("case", [pytest.param(d, id=n) for n, d in REAL_E_CASES])
+def test_gate_up_fp8_real_expert_count(case):
+    """gate_up at real E with the max-offset expert forced (G1 regression)."""
     _skip_if_low_hbm()
-    d = _DEEPSEEK_REAL_E
+    d = case
     x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
         d["B"], d["HIDDEN"], d["INTER"], d["E"], d["TOPK"], "pertensor"
     )
@@ -493,10 +501,11 @@ def test_gate_up_fp8_real_expert_count():
 
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
-def test_down_reduce_fp8_real_expert_count():
-    """down_reduce at real E=256 with the max-offset expert forced (G1 regression)."""
+@pytest.mark.parametrize("case", [pytest.param(d, id=n) for n, d in REAL_E_CASES])
+def test_down_reduce_fp8_real_expert_count(case):
+    """down_reduce at real E with the max-offset expert forced (G1 regression)."""
     _skip_if_low_hbm()
-    d = _DEEPSEEK_REAL_E
+    d = case
     inter, w_down, router_ids, router_wts, wds = _gen_down(
         d["B"], d["INTER"], d["HIDDEN"], d["E"], d["TOPK"], "pertensor"
     )
