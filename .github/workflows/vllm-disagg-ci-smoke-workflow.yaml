@@ -20,10 +20,10 @@ on:
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
-        description: "Official vLLM ROCm image used to build and run current AITER"
+        description: "Pinned official vLLM ROCm image used by upstream DI build #17"
         required: false
         type: string
-        default: "vllm/vllm-openai-rocm:nightly"
+        default: "vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
