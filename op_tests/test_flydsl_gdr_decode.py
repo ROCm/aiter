@@ -132,6 +132,17 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
     return args, pool, indices
 
 
+def _clone_pool(pool):
+    """Copy the pool keeping its layout; ``clone()`` would densify a padded view
+    and hand the kernel a contiguous pool instead of the strided one."""
+    out = torch.empty_strided(
+        pool.shape, pool.stride(), dtype=pool.dtype, device=pool.device
+    )
+    out.copy_(pool)
+    assert out.stride() == pool.stride(), "kernel pool lost the padded stride"
+    return out
+
+
 def _kda_reference(args, initial_state):
     from aiter.ops.torch_ref.kda import kda_gate, l2norm, naive_recurrent_kda
 
@@ -193,7 +204,7 @@ def test_kda_per_channel_gate_matches_torch_reference(
     if not shuffle:
         initial_state = initial_state.transpose(-1, -2)
 
-    kernel_pool = pool.clone()
+    kernel_pool = _clone_pool(pool)
     flydsl_ops.flydsl_gdr_decode(
         args["q"],
         args["k"],
