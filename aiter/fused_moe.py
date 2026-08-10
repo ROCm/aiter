@@ -2561,13 +2561,11 @@ def get_2stage_cfgs(
     )
     if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         if not is_flydsl_available():
-            # a16wi4 is FlyDSL-only. Falling through would hand W1/W2 -- preshuffled
-            # for the FlyDSL port by shuffle_weight_a16wi4 (kpack=16) -- to a CK/ASM
-            # stage1 that expects the CK int4 layout (kpack=8), i.e. silently wrong
-            # numbers rather than a failure.
+            # a16wi4 is FlyDSL-only: no CK/ASM stage1 consumes the bf16-A x int4-W
+            # (per_1x32) combination, so there is no fallback to fall through to.
             raise NotImplementedError(
                 "a16wi4 (per_1x32 int4 weights) requires FlyDSL; no CK/ASM kernel "
-                "consumes the FlyDSL a16wi4 weight layout."
+                "consumes the a16wi4 weight layout."
             )
         # a16wi4 (bf16 A x int4 W) with no tuned CSV row: route to the shared a16w-mix
         # port (moe_2stage_a16wmix, w_dtype="int4") on a single safe config, mirroring

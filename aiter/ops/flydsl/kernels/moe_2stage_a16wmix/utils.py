@@ -106,32 +106,57 @@ def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
     )
 
 
-def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
+def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False):
     """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
 
-    ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the
-    mxfp4 sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8,
-    and scales the mantissa by 16, so the x16 is folded into eff = scale*16.
-    ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar .to(BFloat16).
+    ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
+    unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
+    eff = scale*16. ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar.
+
+    ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
+    ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
+    nibble) -- the "interleaved-by-4" packing. So the SAME two cvt loads (byte_sel j on
+    raw_even/raw_odd) give f_lo[j]=K_j and f_hi[j]=K_{j+4}, and the correct v8bf16 order
+    K0..K7 is all-lows-then-all-highs (a pure output REORDER, zero extra instructions).
+    ``old_pack=False`` (contiguous {2j,2j+1} packing, mxfp4 fp4 upconvert order):
+    interleaved lo_j,hi_j == K_{2j},K_{2j+1}.
     """
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
     if use_k16:
         # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
-        bf16s = []
+        los = []
+        his = []
         for j in range_constexpr(4):
             f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
             f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            bf16s.append(f_lo.to(fx.BFloat16))
-            bf16s.append(f_hi.to(fx.BFloat16))
+            los.append(f_lo.to(fx.BFloat16))
+            his.append(f_hi.to(fx.BFloat16))
+        if old_pack:
+            bf16s = los + his  # K0..K3 (los), K4..K7 (his)
+        else:
+            bf16s = [x for pair in zip(los, his) for x in pair]  # K0,K1,...,K7
         return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
-    i32s = []
+    los = []
+    his = []
     for j in range_constexpr(4):
-        f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
-        f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-        i32s.append(fx.Int32(_cvt_pk_bf16_f32_se(_raw(f_lo), _raw(f_hi))))
+        los.append(fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff)
+        his.append(fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff)
+    if old_pack:
+        # v8bf16 = [K0,K1,K2,K3, K4,K5,K6,K7]; pk pairs (K0,K1),(K2,K3),(K4,K5),(K6,K7).
+        i32s = [
+            fx.Int32(_cvt_pk_bf16_f32_se(_raw(los[0]), _raw(los[1]))),
+            fx.Int32(_cvt_pk_bf16_f32_se(_raw(los[2]), _raw(los[3]))),
+            fx.Int32(_cvt_pk_bf16_f32_se(_raw(his[0]), _raw(his[1]))),
+            fx.Int32(_cvt_pk_bf16_f32_se(_raw(his[2]), _raw(his[3]))),
+        ]
+    else:
+        i32s = [
+            fx.Int32(_cvt_pk_bf16_f32_se(_raw(los[j]), _raw(his[j])))
+            for j in range_constexpr(4)
+        ]
     v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
