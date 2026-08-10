@@ -360,12 +360,11 @@ def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
 
 
 def test_negative_slot_is_skipped_and_zero_is_not():
-    """Pins this kernel's invalid-slot contract, which is not the reference's.
+    """A negative slot is skipped; slot 0 is valid and is decoded.
 
-    aiter skips ``pool_idx < 0`` and writes nothing, leaving the caller's buffer
-    untouched; the reference treats ``state_idx <= 0`` as invalid and zero-fills.
-    They differ on both boundary and behaviour, so slot 0 being *processed* is
-    the point.
+    The kernel guards each row on ``read_pool_idx >= 0 & write_pool_idx >= 0``,
+    so a negative index leaves both the output row and the pool untouched, while
+    slot 0 goes through like any other slot.
     """
     B, H, dt = 4, 12, torch.bfloat16
     args, pool, _ = _kda_inputs(B, H, dt, first_index=0, padded=False, shuffle=True)
@@ -396,31 +395,34 @@ def test_negative_slot_is_skipped_and_zero_is_not():
     assert not torch.equal(kernel_pool[0], pool[0])
 
 
-def test_kda_tuned_rows_are_not_reachable_from_the_scalar_gate():
-    """The 12:12 rows time a per-channel kernel; scalar GDR keeps its fallback.
+def test_tuned_config_lookup_is_keyed_by_gate_mode(monkeypatch):
+    """Each gate picks its own tuned config, or the fallback when it has none.
 
     Both gates share (arch, dtypes, B, Sq, heads, dims), so without gate_mode in
-    the key a scalar call at K3's geometry silently inherits a config tuned for
-    a different binary.
+    the key a scalar call at a per-channel-tuned shape would inherit a config
+    tuned for a different binary.
     """
-    from aiter.ops.flydsl.linear_attention_kernels import (
-        GDR_GPU_ARCH,
-        get_default_kwargs,
-    )
+    from aiter.ops.flydsl import linear_attention_kernels as lak
 
     fallback = {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
-    tuned_batches = (1, 4, 64, 256)
+    kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
+    gdr_config = {"NUM_BLOCKS_PER_V_DIM": 8, "NUM_WARPS": 4, "WARP_THREADS_K": 16}
+    dtypes = ("torch.bfloat16", "torch.float32")
+    geometry = (4, 1, 12, 12, 128, 128)
+    key = (*dtypes, lak.GDR_GPU_ARCH, *geometry)
 
-    def lookup(B, gate_mode):
-        return get_default_kwargs(
-            "torch.bfloat16", "torch.float32", B, 1, 12, 12, 128, 128, gate_mode
-        )
+    monkeypatch.setattr(
+        lak,
+        "GDR_GLOBAL_CONFIG_MAP",
+        {(*key, "kda"): kda_config, (*key, "gdr"): gdr_config},
+    )
+    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
+    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == gdr_config
 
-    if all(lookup(B, "kda") == fallback for B in tuned_batches):
-        pytest.skip(f"no 12x12 kda row for {GDR_GPU_ARCH}")
-
-    for B in tuned_batches:
-        assert lookup(B, "gdr") == fallback, f"scalar GDR at B={B} took a kda row"
+    # With only a per-channel row, the scalar gate must not inherit it.
+    monkeypatch.setattr(lak, "GDR_GLOBAL_CONFIG_MAP", {(*key, "kda"): kda_config})
+    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
+    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == fallback
 
 
 @pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
