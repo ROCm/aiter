@@ -197,7 +197,21 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `_get_down_reduce_fp4`. End-to-end **PASS** (`/tmp/repro_down_fp4_entry.py`, cos 0.999998).
       **op_test landed**: `test_down_reduce_fp4` (parametrized `DOWN_FP4_CASES`, self-contained
       FP4-codebook + E8M0 gen, dequant reference, max-offset expert forced) — 2 cases pass;
-      full file green (20 passed). Still TODO: A/B perf sweep (FP4 vs FP8 down at B∈{1,2,4,8}).
+      full file green (20 passed).
+- [x] **A/B perf sweep landed** (`bench_down_fp4` + `DOWN_FP4_PERF_SHAPES`, second markdown
+      table; GPU 6, gfx950, device timing, 50 iters). **Finding: the first-cut FP4 `down` is
+      NOT yet faster** — at DeepSeek E=8 I2048/H7168 it is **1.58× slower at B=1** (25.2 vs
+      15.97 µs) and ~parity at B=4 (49.5 vs 47.2 µs); B2=27.3 µs, B8=96.4 µs. FP4 TB/s is
+      2.5–5.2 vs FP8 7–10, i.e. the kernel is **convert/latency-bound, not BW-bound**, so
+      halving the weight bytes buys nothing here. Root causes: (a) at **E=8** the weights fit
+      in MALL (FP4 58 MB / FP8 117 MB) so reads aren't cold-HBM; (b) FP4 default **kVector=8**
+      ⇒ 2× the iterations (⇒ 2× activation + per-`(h,iter)` sub-dword E8M0 byte loads + loop
+      overhead) vs FP8 kVector=16; (c) the **serialized `s_nop 2`** dot2 (G7 ILP not yet
+      applied) + no prefetch (G8). **FP4-win prerequisites (deferred to Phase D/E):** measure
+      at **real E=256 cold HBM** (where 0.5 B/elt dominates), raise FP4 to **kVector=16/32**
+      (§6, needs INTER%1024/%2048), hoist the E8M0 load, and land the **s_nop-free
+      4-accumulator single-drain** dot2 (G7) + prefetch (G8). Correct + wired + tested now;
+      the perf uplift is an optimization task, not a correctness gap.
 - [ ] **gate_up FP4** (apply the down recipe; gate on accuracy).
 - [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
       natural home for the ILP scheme (plan §2).
