@@ -46,6 +46,47 @@ def test_kda_gate_matches_vllm_formula():
     torch.testing.assert_close(got[0], expected)
 
 
+def test_kda_gate_picks_the_mode_by_rank_when_heads_equal_channels():
+    """At H == K a shape test cannot tell the two gates apart.
+
+    The mode used to come from ``a.shape[-1] == len(A_log)``, so a square
+    per-channel gate read as scalar and spread A_log along channels instead of
+    heads -- silently, and in the oracle the kernel is judged against.
+    """
+    torch.manual_seed(0)
+    B, T, N, g_min = 1, 2, 8, -5.0  # H == K == N
+
+    a = torch.randn(B, T, N, N, dtype=torch.float32, device=DEVICE)
+    A_log = torch.randn(N, dtype=torch.float32, device=DEVICE) * 0.5
+    dt_bias = torch.randn(N, N, dtype=torch.float32, device=DEVICE) * 0.1
+
+    # A_log varies along heads, so transposing it would change the answer.
+    expected = g_min * torch.sigmoid(A_log.exp()[:, None] * (a + dt_bias))
+    torch.testing.assert_close(kda_gate(a, A_log, dt_bias, g_min=g_min), expected)
+
+
+def test_kda_gate_rejects_mismatched_shapes():
+    """Explicit shapes, so a misrouted tensor raises instead of broadcasting."""
+    B, T, H, K = 1, 2, 4, 8
+    A_log = torch.zeros(H, dtype=torch.float32, device=DEVICE)
+
+    with pytest.raises(ValueError, match=r"`a`'s head axis must be 4"):
+        kda_gate(
+            torch.zeros(B, T, K, H, device=DEVICE),  # head axis transposed
+            A_log,
+            torch.zeros(K, H, device=DEVICE),
+            g_min=-5.0,
+        )
+
+    with pytest.raises(ValueError, match=r"`dt_bias` must have shape \(4, 8\)"):
+        kda_gate(
+            torch.zeros(B, T, H, K, device=DEVICE),
+            A_log,
+            torch.zeros(H, device=DEVICE),  # scalar bias on a per-channel gate
+            g_min=-5.0,
+        )
+
+
 def test_scalar_gate_is_the_gdr_softplus_form():
     torch.manual_seed(0)
     T, H = 4, 6

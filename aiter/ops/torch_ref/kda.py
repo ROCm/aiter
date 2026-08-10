@@ -44,10 +44,34 @@ def kda_gate(
     Returns:
         Decay in log space, shaped like ``a`` -- callers apply ``exp``.
     """
+    if a.dim() not in (3, 4):
+        raise ValueError(
+            f"`a` must be (B, T, H) or (B, T, H, K); got {tuple(a.shape)}."
+        )
+    if A_log.dim() != 1:
+        raise ValueError(f"`A_log` must be (H,); got {tuple(A_log.shape)}.")
+
+    # Rank picks the mode: shape alone is ambiguous once H == K.
+    per_channel = a.dim() == 4
+    num_heads = A_log.shape[0]
+    heads = a.shape[-2] if per_channel else a.shape[-1]
+    if heads != num_heads:
+        raise ValueError(
+            f"`a`'s head axis must be {num_heads} to match `A_log`; "
+            f"got {tuple(a.shape)}."
+        )
+    bias_shape = (num_heads, a.shape[-1]) if per_channel else (num_heads,)
+    if dt_bias.shape != bias_shape:
+        raise ValueError(
+            f"`dt_bias` must have shape {bias_shape} for a "
+            f"{'per-channel' if per_channel else 'scalar'} gate; "
+            f"got {tuple(dt_bias.shape)}."
+        )
+
     x = a.float() + dt_bias.float()
     A = A_log.float().exp()
-    # a is (..., H) or (..., H, K); line A up with the head axis either way.
-    A = A if a.shape[-1] == A.shape[0] else A[:, None]
+    if per_channel:
+        A = A[:, None]
 
     if g_min is None:
         beta_x = softplus_beta * x
