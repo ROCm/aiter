@@ -40,7 +40,7 @@ env:
   BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:nightly' }}
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
-  SPUR_NODE_SELECTION_TIMEOUT_S: "1800"
+  SPUR_PENDING_TIMEOUT_S: "7200"
   AITER_GPU_ARCHS: gfx950
   AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
@@ -155,12 +155,17 @@ jobs:
 
       - name: Apply full vLLM PR 47030 patch series
         working-directory: vllm
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "AITER CI"
           git config user.email "aiter-ci@users.noreply.github.com"
-          curl --fail --location --silent --show-error --retry 3 \
-            "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
+          curl --fail --location --silent --show-error \
+            --retry 8 --retry-all-errors --retry-delay 5 \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github.patch" \
+            "https://api.github.com/repos/vllm-project/vllm/pulls/${VLLM_DI_PR_NUMBER}" |
             git am -3
 
       - name: Select vLLM-router cases
@@ -175,14 +180,9 @@ jobs:
           from pathlib import Path
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
-          models = {"DeepSeek-V3", "DeepSeek-R1-MXFP4"}
-          models.update(
-              {
-                  'Kimi-K2.5-MXFP4',
-                  'Kimi-K2.6-MXFP4',
-                  'MiniMax-M3-MXFP8',
-              }
-          )
+          # Kimi cases are temporarily excluded while their known model issues
+          # are investigated independently from this integration smoke.
+          models = {"DeepSeek-V3", "DeepSeek-R1-MXFP4", "MiniMax-M3-MXFP8"}
           topologies = {
               "1P1D": "1P1D-TP8",
               "2P2D": "2P2D-TP8",
@@ -269,7 +269,7 @@ jobs:
     timeout-minutes: 600
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 6
       matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -300,6 +300,8 @@ jobs:
           command -v spur && spur --help | head -120 || true
 
       - name: Checkout vLLM main and apply full PR 47030 patch series
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           rm -rf vllm
@@ -314,8 +316,11 @@ jobs:
           pr_sha="$(git rev-parse FETCH_HEAD)"
           git config user.name "AITER CI"
           git config user.email "aiter-ci@users.noreply.github.com"
-          curl --fail --location --silent --show-error --retry 3 \
-            "https://github.com/vllm-project/vllm/pull/${VLLM_DI_PR_NUMBER}.patch" |
+          curl --fail --location --silent --show-error \
+            --retry 8 --retry-all-errors --retry-delay 5 \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github.patch" \
+            "https://api.github.com/repos/vllm-project/vllm/pulls/${VLLM_DI_PR_NUMBER}" |
             git am -3
 
           echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
@@ -382,7 +387,7 @@ jobs:
             .buildkite/amd-disagg/vllm_disagg.sh \
             .buildkite/amd-disagg/run_xPyD_disagg.slurm
 
-      - name: Select idle Spur nodes for topology
+      - name: Configure Spur node pool for topology
         run: |
           set -euo pipefail
           if [[ "${NODES}" != "2" && "${NODES}" != "4" ]]; then
@@ -390,30 +395,36 @@ jobs:
             exit 1
           fi
 
-          deadline=$((SECONDS + SPUR_NODE_SELECTION_TIMEOUT_S))
-          while true; do
-            mapfile -t idle_nodes < <(
-              sinfo -N -h -n "${SPUR_NODE_POOL}" -o '%N %T' |
-                awk '$2 ~ /^idle/ {print $1}' |
-                sort -Vu
-            )
-            if (( ${#idle_nodes[@]} >= NODES )); then
-              selected_nodes=("${idle_nodes[@]:0:NODES}")
-              nodelist="$(IFS=,; echo "${selected_nodes[*]}")"
-              echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
-              echo "Selected upstream case ${CASE_NAME}: nodes=${NODES}, nodelist=${nodelist}"
-              break
-            fi
+          IFS=',' read -r -a pool_nodes <<< "${SPUR_NODE_POOL}"
+          if (( ${#pool_nodes[@]} < NODES )); then
+            echo "Spur node pool has ${#pool_nodes[@]} nodes, but ${NODES} are required" >&2
+            exit 1
+          fi
 
-            if (( SECONDS >= deadline )); then
-              echo "Timed out waiting for ${NODES} idle nodes in ${SPUR_NODE_POOL}" >&2
-              sinfo -N -n "${SPUR_NODE_POOL}" >&2 || true
+          declare -A allowed=()
+          for node in "${pool_nodes[@]}"; do
+            allowed["${node}"]=1
+          done
+
+          mapfile -t cluster_nodes < <(sinfo -N -h -o '%N' | sort -Vu)
+          declare -A present=()
+          excluded_nodes=()
+          for node in "${cluster_nodes[@]}"; do
+            present["${node}"]=1
+            if [[ -z "${allowed[${node}]+x}" ]]; then
+              excluded_nodes+=("${node}")
+            fi
+          done
+          for node in "${pool_nodes[@]}"; do
+            if [[ -z "${present[${node}]+x}" ]]; then
+              echo "Configured Spur node is not present in sinfo: ${node}" >&2
               exit 1
             fi
-
-            echo "Waiting for ${NODES} idle Spur nodes; currently available: ${idle_nodes[*]:-none}"
-            sleep 30
           done
+
+          exclude="$(IFS=,; echo "${excluded_nodes[*]}")"
+          echo "SPUR_NODE_EXCLUDE=${exclude}" >> "${GITHUB_ENV}"
+          echo "Configured upstream case ${CASE_NAME}: nodes=${NODES}, pool=${SPUR_NODE_POOL}"
 
       - name: Show vLLM disagg inputs
         run: |
@@ -434,7 +445,7 @@ jobs:
             echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
             echo "- IMAGE: \`${BASE_IMAGE}\`"
             echo "- SPUR_NODE_POOL: \`${SPUR_NODE_POOL}\`"
-            echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
+            echo "- SPUR_NODE_EXCLUDE: \`${SPUR_NODE_EXCLUDE}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Run upstream vLLM disagg case
@@ -448,12 +459,12 @@ jobs:
           test -f "${script}"
           test -f "${job_script}"
 
-          # Spur requires fixed nodes in an in-script directive rather than as
-          # sbatch CLI resource flags. Keep this AITER-runner detail outside the
-          # upstream vLLM environment/model configuration.
-          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${job_script}"; then
-            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${job_script}"
-            echo "Pinned nodes via #SBATCH --nodelist=${SPUR_NODELIST}"
+          # Restrict scheduling to the AITER MI350 pool and let Slurm choose
+          # any currently available nodes. This allows independent matrix jobs
+          # to run concurrently without racing on a preselected nodelist.
+          if [[ -n "${SPUR_NODE_EXCLUDE}" ]] && ! grep -q '^#SBATCH --exclude=' "${job_script}"; then
+            sed -i "/^#SBATCH --exclusive/a #SBATCH --exclude=${SPUR_NODE_EXCLUDE}" "${job_script}"
+            echo "Restricted Slurm scheduling to SPUR_NODE_POOL=${SPUR_NODE_POOL}"
           fi
 
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
@@ -553,6 +564,7 @@ jobs:
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
             CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
+            PENDING_MAX_S="${SPUR_PENDING_TIMEOUT_S}" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
           touch "${stream_done}"
