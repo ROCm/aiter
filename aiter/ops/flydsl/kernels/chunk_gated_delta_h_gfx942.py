@@ -131,9 +131,7 @@ def compile_chunk_gated_delta_h_gfx942(
     assert K <= 256
     assert K % 64 == 0
     assert BV % 16 == 0
-    # gfx942 LDS budget: after the lds_vnt reclaim (Gap 4, sized to BV not V), the
-    # 4 LDS buffers total ~58 KiB at BV=64 (< 64 KiB/CU), so BV=64 now fits. The
-    # previous cap of 32 was due to the old V-sized lds_vnt (66.5 KiB at BV=64).
+    # gfx942 LDS budget: BV=64 is largest V-tile size that fits under the LDS budget.
     assert BV <= 64, (
         f"gfx942 LDS budget caps BV at 64 (got BV={BV}); "
         "BV>64 overflows the 64 KiB/CU LDS limit at K=128, BT=64."
@@ -157,11 +155,11 @@ def compile_chunk_gated_delta_h_gfx942(
     #                             owns N_REPEAT_LOCAL of the N_REPEAT column
     #                             tiles instead of looping over all of them.
     #
-    # Why: LDS (38-56 KiB) allows only ONE workgroup per CU on gfx942's 64 KiB,
+    # Why: LDS (38-56 KiB) allows only one workgroup per CU on gfx942's 64 KiB,
     # so a CU holds NUM_WARPS waves and no more. With NUM_WARPS=4 that is 1
     # wave/SIMD, far too little to hide HBM latency in a kernel that is
     # memory-bound at ~33% of peak. Splitting the V axis across waves multiplies
-    # resident waves by NR_SPLIT at ZERO extra HBM traffic and identical CU
+    # resident waves by NR_SPLIT at zero extra HBM traffic and identical CU
     # coverage: LDS depends only on BV, and each wave's share of the h
     # accumulators (and hence its VGPR footprint) shrinks by the same factor.
     #
@@ -255,8 +253,12 @@ def compile_chunk_gated_delta_h_gfx942(
     # time, so the block must tile it. This holds for every legal NR_SPLIT
     # (BLOCK_THREADS = 256*NR_SPLIT <= 16*BV, and BV*LDS_H_NG = 32*BV), but
     # assert it rather than rely on the algebra.
-    assert (BV * LDS_H_NG) % BLOCK_THREADS == 0, (
-        f"h snapshot drain ({BV * LDS_H_NG} groups) must tile "
+    # The drain walks pairs of adjacent k-groups (one 16 B store per thread), so
+    # the block must tile the pair count and a row must hold an even number of
+    # groups.
+    assert LDS_H_NG % 2 == 0, f"h drain pairs k-groups; K/4={LDS_H_NG} must be even"
+    assert (BV * (LDS_H_NG // 2)) % BLOCK_THREADS == 0, (
+        f"h snapshot drain ({BV * LDS_H_NG // 2} pairs) must tile "
         f"BLOCK_THREADS={BLOCK_THREADS}"
     )
 
@@ -636,8 +638,7 @@ def compile_chunk_gated_delta_h_gfx942(
             # Each thread holds a bf16x8 run = two adjacent k-groups, whose
             # swizzled positions are NOT adjacent, so the single ds_write_b128
             # becomes two ds_write_b64. That is the price of making the far
-            # hotter A-frag read (below) conflict-free, and matches what the HIP
-            # reference does for its w panels.
+            # hotter A-frag read (below) conflict-free.
             w_prefetch_lds_all = []
             for i_load in range_constexpr(W_LOADS_PER_THREAD):
                 row, col = _w_slot(i_load)
@@ -668,22 +669,40 @@ def compile_chunk_gated_delta_h_gfx942(
             # Consecutive tids walk consecutive k-groups at fixed v, so the XOR
             # term is constant across the wave (conflict-free 8 B/lane) and the
             # HBM side is both coalesced and vectorized (it was scalar bf16).
-            VG_TOTAL = BV * LDS_H_NG
-            for vg_base in range_constexpr(0, VG_TOTAL, BLOCK_THREADS):
-                linear = fx.Int32(vg_base) + tid
-                g_idx = linear % fx.Int32(LDS_H_NG)
-                v_loc = linear // fx.Int32(LDS_H_NG)
-                bf16_tile = fx.ptr_load(
-                    lds_h_ptr + _lds_h_idx(v_loc, g_idx), result_type=v4bf16_type
+            # Each thread drains two adjacent k-groups as one 16 B store. The
+            # groups are consecutive k and h is [v, k] with k contiguous, so the
+            # pair is contiguous in HBM and 16 B aligned (g0 is even, K and
+            # stride_h are multiples of 8 elements). That halves the store count
+            # and doubles the transaction width: 1024 contiguous B per wave
+            # instruction instead of 512.
+            #
+            # The LDS side stays two b64 reads. The XOR swizzle puts adjacent
+            # groups at non-adjacent slots on purpose, so this is a
+            # store-side widening only.
+            VG_PAIRS = BV * (LDS_H_NG // 2)
+            for vp_base in range_constexpr(0, VG_PAIRS, BLOCK_THREADS):
+                linear = fx.Int32(vp_base) + tid
+                pair = linear % fx.Int32(LDS_H_NG // 2)
+                v_loc = linear // fx.Int32(LDS_H_NG // 2)
+                g0 = pair * fx.Int32(2)
+                lo = fx.ptr_load(
+                    lds_h_ptr + _lds_h_idx(v_loc, g0), result_type=v4bf16_type
+                )
+                hi = fx.ptr_load(
+                    lds_h_ptr + _lds_h_idx(v_loc, g0 + fx.Int32(1)),
+                    result_type=v4bf16_type,
+                )
+                bf16_pair = _vector.shuffle(
+                    as_ir_value(lo), as_ir_value(hi), list(range(8))
                 )
                 v_global = i_v * fx.Int32(BV) + v_loc
                 h_off = (
                     h_base
                     + i_t_i32 * stride_h
                     + v_global * fx.Int32(K)
-                    + g_idx * fx.Int32(4)
+                    + g0 * fx.Int32(4)
                 )
-                h_.vec_store((fx.Int64(h_off),), bf16_tile, 4)
+                h_.vec_store((fx.Int64(h_off),), bf16_pair, 8)
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
             for i_wp in range_constexpr(NUM_W_LOADS):
