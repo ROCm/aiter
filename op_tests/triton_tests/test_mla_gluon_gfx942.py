@@ -26,7 +26,10 @@ from aiter.ops.triton.utils._triton import arch_info
 if arch_info.get_arch() != "gfx942":
     pytest.skip("the gfx942 MLA kernel requires gfx942", allow_module_level=True)
 
-from aiter.ops.triton.attention.mla import mla_gluon_gfx942, mla_gluon_gfx942_graph
+from aiter.ops.triton._gluon_kernels.gfx942.attention.mla import (
+    _mla_gluon_gfx942,
+)
+from aiter.ops.triton.attention.mla import mla_gluon_gfx942
 
 BLOCK_SIZE = 768
 HEAD_DIM_CKV = 512
@@ -223,7 +226,7 @@ def test_combined_physical_cache_ragged(
 ) -> None:
     case = _make_case(batch_size, qlen, seq_lens, seed=17 + batch_size + qlen)
 
-    mla_gluon_gfx942_graph(
+    mla_gluon_gfx942(
         case.q_nope,
         case.q_pe,
         case.kv_buffer,
@@ -241,7 +244,7 @@ def test_low_level_split_reduction_forced_64bit_load() -> None:
 
     # Force the pointer-based variant on a small allocation so the test does
     # not need to reserve more than 2 GiB of device memory.
-    mla_gluon_gfx942(
+    _mla_gluon_gfx942(
         case.q_nope,
         case.q_pe,
         case.kv_buffer[:, :HEAD_DIM_CKV],
@@ -273,7 +276,7 @@ def test_q_pe_validation(invalid_q_pe: str) -> None:
         match = "leading dimensions"
 
     with pytest.raises(AssertionError, match=match):
-        mla_gluon_gfx942(
+        _mla_gluon_gfx942(
             case.q_nope,
             q_pe,
             case.kv_buffer[:, :HEAD_DIM_CKV],
@@ -293,7 +296,7 @@ def test_cuda_graph_replay_with_metadata_mutation() -> None:
 
     # Compile both stages before capture. Capture then owns the split
     # workspaces allocated by the wrapper.
-    mla_gluon_gfx942_graph(
+    mla_gluon_gfx942(
         case.q_nope,
         case.q_pe,
         case.kv_buffer,
@@ -306,7 +309,7 @@ def test_cuda_graph_replay_with_metadata_mutation() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        mla_gluon_gfx942_graph(
+        mla_gluon_gfx942(
             case.q_nope,
             case.q_pe,
             case.kv_buffer,

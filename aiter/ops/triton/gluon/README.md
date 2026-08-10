@@ -255,8 +255,7 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 
 ### `aiter/ops/triton/_gluon_kernels/gfx942/attention/mla.py` — CDNA3 MLA Decode
 
-**Public API:** `aiter.ops.triton.attention.mla.mla_gluon_gfx942(...)` and
-`aiter.ops.triton.attention.mla.mla_gluon_gfx942_graph(...)`
+**Public API:** `aiter.ops.triton.attention.mla.mla_gluon_gfx942(...)`
 
 **Test:**
 
@@ -266,9 +265,11 @@ python -m pytest -q op_tests/triton_tests/test_mla_gluon_gfx942.py
 
 **Description:** Synchronous-LDS bf16 MLA decode for gfx942 with 12 query
 heads, 512 latent dimensions, 64 RoPE dimensions, PAGE_SIZE=1, and QLEN 1 or 4.
-The graph adapter accepts a combined `[N, 576]` physical cache and ragged
-token-index/indptr metadata. It supports split reduction, causal QLEN masking,
-optional QLEN-head fusion, and a 64-bit-address load path for caches over 2 GiB.
+The public adapter accepts a combined `[N, 576]` physical cache and ragged
+token-index/indptr metadata. The separate-cache tuning wrapper remains private
+to the gfx942 kernel module. The implementation supports split reduction,
+causal QLEN masking, optional QLEN-head fusion, and a 64-bit-address load path
+for caches over 2 GiB.
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 

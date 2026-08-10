@@ -397,7 +397,7 @@ def _mla_decode_gfx942_kernel(
         gl.amd.cdna3.buffer_store(lse, Mid_lse, offs_lse, mask=out_mask)
 
 
-def mla_gluon_gfx942(
+def _mla_gluon_gfx942(
     q_nope,
     q_pe,
     kv_c_cache,
@@ -421,7 +421,7 @@ def mla_gluon_gfx942(
     reduce_num_warps=8,
     fuse_qlen_heads=False,
 ):
-    """Run the gfx942 MLA decode kernel.
+    """Run the low-level gfx942 MLA decode kernel.
 
     Query and output tensors may be shaped either ``[B, H, D]`` or
     ``[B, QLEN, H, D]``. With ``use_2d_view=False``, ``req_to_tokens`` is a
@@ -446,7 +446,7 @@ def mla_gluon_gfx942(
 
     assert (
         arch_info.get_arch() == "gfx942"
-    ), f"mla_gluon_gfx942 requires gfx942, got {arch_info.get_arch()}"
+    ), f"_mla_gluon_gfx942 requires gfx942, got {arch_info.get_arch()}"
     assert (
         q_nope.dim() == 4
     ), f"q_nope must be 4-D [B, QLEN, H, D], got {q_nope.dim()}-D"
@@ -458,14 +458,14 @@ def mla_gluon_gfx942(
     head_dim_kpe = q_pe.shape[-1]
     assert (
         head_dim_ckv == 512
-    ), f"mla_gluon_gfx942 requires head_dim_ckv=512, got {head_dim_ckv}"
+    ), f"_mla_gluon_gfx942 requires head_dim_ckv=512, got {head_dim_ckv}"
     assert head_dim_kpe == 64, f"expected head_dim_kpe=64, got {head_dim_kpe}"
-    assert page_size == 1, "mla_gluon_gfx942 requires page_size=1"
+    assert page_size == 1, "_mla_gluon_gfx942 requires page_size=1"
 
     block_h = 16
     assert (
         nhead <= block_h
-    ), f"mla_gluon_gfx942 handles at most {block_h} heads, got {nhead}"
+    ), f"_mla_gluon_gfx942 handles at most {block_h} heads, got {nhead}"
 
     has_pe = q_pe is not None
 
@@ -600,7 +600,7 @@ def _graph_launch_config(batch_size: int, qlen: int) -> tuple[int, int, int]:
     return splits, 32, 2
 
 
-def mla_gluon_gfx942_graph(
+def mla_gluon_gfx942(
     q_nope,
     q_pe,
     kv_buffer,
@@ -627,7 +627,7 @@ def mla_gluon_gfx942_graph(
     fuse_qlen_heads = qlen == 4 and batch_size >= 8
     kv_c = kv_buffer[:, :512]
     k_pe = kv_buffer[:, 512:]
-    return mla_gluon_gfx942(
+    return _mla_gluon_gfx942(
         q_nope,
         q_pe,
         kv_c,
