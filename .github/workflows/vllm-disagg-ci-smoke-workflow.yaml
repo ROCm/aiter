@@ -330,6 +330,10 @@ jobs:
           #!/usr/bin/env bash
           source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
           export GPU_ARCHS=gfx950
+          # vLLM PR 50999 switched local MP rendezvous to FileStore, while
+          # AITER 0.1.19 custom all-reduce currently requires TCPStore.
+          export VLLM_ROCM_USE_AITER_CUSTOM_AR=0
+          echo "[aiter-stock] AITER custom all-reduce=${VLLM_ROCM_USE_AITER_CUSTOM_AR}"
           if [[ "${MODEL_NAME:-}" == "DeepSeek-V3" ]]; then
               export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}"
               echo "[aiter-stock] DeepSeek-V3 execute-model timeout=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS}s"
