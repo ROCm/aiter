@@ -31,7 +31,7 @@ dropped-slot marker (dest PE == npes); "tis" = recv-slot -> global source-token 
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, T
+from flydsl.expr import arith, const_expr, range_constexpr
 from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -50,7 +50,7 @@ from flydsl.expr.rocdl import (
     cvt_scale_pk8_f32_fp4,
     cvt_scalef32_pk8_fp4_f32,
 )
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 import mori.cco.device.flydsl as cco
 from . import flydsl_prims as P
@@ -123,6 +123,7 @@ def make_dispatch(
     push_group_cap=0,
     off_pg_running=0,
     off_pg_rowmap=0,
+    push_group_scale_wmma_rep=0,
 ):
     # fp4 (e2m1) packs 2 values/byte -> token is hidden_dim/2 bytes; dispatch is a
     # pure byte mover (no fp4 decode).
@@ -137,6 +138,19 @@ def make_dispatch(
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
+    # push-group MX scales: the sender quantizes, so the wire carries a linear
+    # [row, scale_dim] e8m0 scale, but the GEMM reads the WMMA-preshuffled layout
+    # whose position depends on the row's slot within its destination expert --
+    # known only here, after the capacity atomic. Apply the permutation on the
+    # store side so the receiver needs no repacking pass at all. All four bytes of
+    # a source dword share one mx_block group and land in one destination dword,
+    # so this stays a dword store, just at a permuted index.
+    preshuffle_scales = enable_scales and push_group and push_group_scale_wmma_rep > 0
+    if preshuffle_scales and push_group_cap % (push_group_scale_wmma_rep * 16):
+        raise ValueError(
+            f"push_group_cap={push_group_cap} must be a multiple of "
+            f"wmma_rep*16={push_group_scale_wmma_rep * 16} to preshuffle scales"
+        )
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_dispatch(
@@ -309,6 +323,28 @@ def make_dispatch(
                     rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
                     peer_scales = fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
                     rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
+                    if const_expr(preshuffle_scales):
+                        # dst_dword = e*(CAP*sdpr) + out_row*(sdpr*wmma_rep)
+                        #             + scale_dword*wmma_rep + wmma_row, with
+                        # out_row = (slot // rows_per_tile)*16 + slot % 16 and
+                        # wmma_row = (slot % rows_per_tile) // 16.
+                        rows_per_tile = arith.constant(
+                            push_group_scale_wmma_rep * 16
+                        )
+                        scale_tile = cursor // rows_per_tile
+                        row_in_tile = cursor - scale_tile * rows_per_tile
+                        wmma_row = row_in_tile // arith.constant(16)
+                        row_lane16 = row_in_tile - wmma_row * arith.constant(16)
+                        out_row = scale_tile * arith.constant(16) + row_lane16
+                        dst_base = (
+                            local_expert
+                            * arith.constant(push_group_cap * scale_num_i32)
+                            + out_row
+                            * arith.constant(
+                                scale_num_i32 * push_group_scale_wmma_rep
+                            )
+                            + wmma_row
+                        )
                     for k_off in range(lane, scale_num_i32, WAVE):
                         scale_val = buffer_load(
                             rsrc_inp_scales,
@@ -316,11 +352,13 @@ def make_dispatch(
                             vec_width=1,
                             dtype=T.i32,
                         )
-                        buffer_store(
-                            scale_val,
-                            rsrc_peer_scales,
-                            dest_tok_id * scale_num_i32 + k_off,
-                        )
+                        if const_expr(preshuffle_scales):
+                            dst_off = dst_base + k_off * arith.constant(
+                                push_group_scale_wmma_rep
+                            )
+                        else:
+                            dst_off = dest_tok_id * scale_num_i32 + k_off
+                        buffer_store(scale_val, rsrc_peer_scales, dst_off)
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). _DISP_NSTREAMS
             # vec4 streams for memory-level parallelism, one-stream tail for the

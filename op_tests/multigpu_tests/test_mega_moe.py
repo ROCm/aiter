@@ -45,6 +45,7 @@ from aiter import ActivationType, QuantType, get_gfx
 from aiter.fused_moe import fused_moe
 from aiter.ops.shuffle import shuffle_weight, moe_shuffle_scale
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.kernels.per_token_mx_quant import per_1x32_mx_quant
 from aiter.utility import fp4_utils
 from aiter import get_hip_quant, get_torch_quant, pertoken_quant
 
@@ -271,6 +272,9 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
 # Shared setup (fed to BOTH reference and device path)
 # --------------------------------------------------------------------------- #
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
+# GEMM1 M-tile of the push path; also fixes the e8m0 scale preshuffle geometry
+# (wmma_rep = tile_m // 16) that dispatch has to write on the send side.
+_PUSH_TILE_M = 64
 
 
 def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED):
@@ -490,6 +494,12 @@ class DeviceMoEPipeline:
         self.comm = Communicator.init(
             self.dist_ctx.world, r, uid
         )
+        # Push-group quantizes on the SEND side: the wire then carries fp8 (half the
+        # dispatch bytes) and, more importantly, the receiver never runs a quant pass
+        # over the padded E*cap grid. Dispatch permutes the e8m0 scale into GEMM1's
+        # WMMA layout as it lands each row, so nothing has to repack it afterwards.
+        self.send_quant = self.push_group
+        self.pg_wmma_rep = _PUSH_TILE_M // 16
         cfg = EpDispatchCombineConfig(
             rank=r,
             world_size=self.dist_ctx.world,
@@ -498,6 +508,13 @@ class DeviceMoEPipeline:
             num_experts_per_rank=self.EPR,
             num_experts_per_token=self.topk,
             data_type=self.transport_dtype,
+            dispatch_data_type=(
+                torch.float8_e4m3fn if self.send_quant else self.transport_dtype
+            ),
+            combine_data_type=self.transport_dtype,
+            scale_dim=(self.hdim // 32) if self.send_quant else 0,
+            scale_type_size=1 if self.send_quant else 0,
+            push_group_scale_wmma_rep=self.pg_wmma_rep if self.send_quant else 0,
             combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
             push_group=self.push_group,      # explicit switch (was AITER_EP_PUSH_GROUP)
         )
@@ -508,11 +525,17 @@ class DeviceMoEPipeline:
     def _layer_step(self, x, l):
         ids, wts = self.routings[l]
         xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
+        # Quantize once per token here rather than once per landed row later: this
+        # runs on [tokens, hidden] instead of the [E*cap, hidden] recv grid, and it
+        # parallelizes over MX groups so a wide row is not one warp's latency chain.
+        send_x, send_scale = (xn, None)
+        if self.send_quant:
+            send_x, send_scale = per_1x32_mx_quant(xn, quant_mode="fp8")
         # Recompute routing every layer (mode A: atomic routing inside dispatch)
         # instead of replaying a precomputed handle. return_routing=True hands
         # back this layer's forward dest-slot map, which combine then consumes.
         recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
-            xn, wts, None, ids, return_routing=True
+            send_x, wts, send_scale, ids, return_routing=True
         )
         ep_kwargs = None
         if self.op.cfg.is_fused and self.op.cfg.push_group:
@@ -529,15 +552,17 @@ class DeviceMoEPipeline:
             ep = self.op.ep_scatter_params()
             pg = self.op.push_group_moe_inputs()
             grouped_a8w4_tdm_moe_push_scatter(
-                pg["disp_out"].view(dtypes.bf16), pg["pg_running"], pg["pg_rowmap"],
+                pg["disp_out"] if self.send_quant else pg["disp_out"].view(dtypes.bf16),
+                pg["pg_running"], pg["pg_rowmap"],
                 self.w1_a, self.w2_a, self.w1_s, self.w2_s,
+                disp_scale=pg["disp_scale"], dtype=dtypes.bf16,
                 E_local=self.EPR, model_dim=self.hdim, inter_dim=self.idim,
                 cap=pg["cap"], activation=self.spec["activation"],
                 situ_beta=self.spec.get("situ_beta", 1.0),
                 situ_linear_beta=self.spec.get("situ_linear_beta", 1.0),
                 # GEMM1 K=hidden -> tile_k=256 (matches pull); GEMM2 K=inter_dim ->
                 # tile_k2=128, aligning to pull's tuned GEMM2 tile (don't inherit 256).
-                tile_m=64, tile_n=256, tile_k=256, num_buffers=2,
+                tile_m=_PUSH_TILE_M, tile_n=256, tile_k=256, num_buffers=2,
                 tile_k2=128,
                 ep_arena_handle=ep["ep_arena_handle"],
                 ep_comb_inp_off=ep["ep_comb_inp_off"],
