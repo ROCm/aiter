@@ -6,14 +6,14 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.aot.flydsl.common import run_only_env
+from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -916,9 +916,11 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
-        # configs have no pre-registered AOT cache entry).
-        kwargs["check_aot_cache"] = args.csv_filter is None
+        # Targeted configs and env-selected SiTUv2 modes have no pre-registered
+        # AOT cache entry, so let those cases compile on demand.
+        kwargs["check_aot_cache"] = (
+            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+        )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -1274,12 +1276,26 @@ def test_bm16_tiled_scale_boundary():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _iter_with_env(case_iter, **env_overrides):
+    """Keep temporary environment overrides active while cases are consumed."""
+    with ExitStack() as stack:
+        for name, value in env_overrides.items():
+            stack.enter_context(override_env(name, value))
+        yield from case_iter
+
+
 _case_iters = []
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     if not args.no_flydsl_csv:
-        _case_iters.append(_iter_csv_cases())
+        _case_iters.append(
+            _iter_with_env(
+                _iter_csv_cases(),
+                AITER_SITUV2_A8W4="1",
+                AITER_SITUV2_A4W4=None,
+            )
+        )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
     # SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
