@@ -20,7 +20,6 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     lds_addr_keepalive,
-    sgpr_opaque,
     make_lds_copy_ops,
     pipeline_fence,
     situv2_consts,
@@ -279,18 +278,6 @@ def launch_gemm_a8w4_tdm(
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
-
-        def buf_ptr_opaque(s):
-            """``buf_ptr`` with the stage base hidden from constant folding.
-
-            Only needed on the constexpr-unrolled drain tail; see sgpr_opaque.
-            """
-            return fx.index_cast(
-                T.index,
-                fx.Int32(
-                    sgpr_opaque(fx.index_cast(T.i32, ptr_to_idx(buf_ptr(s))))
-                ),
-            )
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -1077,14 +1064,14 @@ def launch_gemm_a8w4_tdm(
                 unswitch(steady_mid)
                 for j in range_constexpr(PRE):
                     kt = n_steady + j
-                    buf = buf_ptr_opaque(kt % num_buffers)
+                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     has_next = XT and j + 1 < PRE
                     if const_expr(not XT):
                         pipeline_fence(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                         )
                     nxt_buf = (
-                        buf_ptr_opaque((kt + 1) % num_buffers)
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
                         else None
                     )
