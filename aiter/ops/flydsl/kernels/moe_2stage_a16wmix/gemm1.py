@@ -109,21 +109,18 @@ def _gemm1_body_a16w4(
     # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
     # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
     _PIPE = K_TILES_TOTAL > 1
-    # Roll the K loop (compact scf.for) ONLY for int4 decode/mid-M tiles (BM==16). The
-    # roll cuts small-M GRBM/SQ_BUSY ~2x where the grid is latency-bound, but COSTS ~12%
-    # at large M (tok4096, t32x128x256_bnt0, BM=32) where the kernel is HBM-adjacent and
-    # wants the unrolled body's ILP/prefetch depth. The tuned CSV uses BM==16 for every
-    # decode/mid row (t{16}x{16,32,64,128}x{...}) and BM>=32 only for large-M rows, so
-    # BM==16 cleanly selects the regime that wins from rolling. Compile-time predicate
-    # (kernel is compiled per tile config); mxfp4/bf16 never roll (byte-identical to main).
+    # Roll the K loop (compact scf.for) ONLY for int4 decode/mid tiles. Rolling cuts
+    # GRBM/SQ_BUSY ~2x where the grid is latency-bound but COSTS ~12% at large M
+    # (tok4096, BM=32), which is HBM-adjacent and wants the unrolled body's ILP/prefetch
+    # depth; mxfp4/bf16 never roll, keeping them byte-identical to PR#4502. The tuned CSV
+    # uses BM==16 for every decode/mid row and BM>=32 only for large-M, so BM<=16 selects
+    # the winning regime. Compile-time -- the kernel is compiled per tile config.
     #
-    # KNOWN-BAD combo excluded: the rolled loop produces WRONG results for
-    # k_wave==1 (num_n_waves==4) + num_acc_n==1 + TILE_K>=256 (e.g. t16x64x256), while
-    # the unrolled path is correct there and every other rolled combo (kw2/kw4-tk256,
-    # kw1-tk128, kw1-tk256-tn128 num_acc_n==2) is correct. Root cause is in the rolled
-    # scf.for's iter-arg/A-DMA interaction at this narrow shape; no production CSV row
-    # uses it (kw1-tk256 in prod is only BM=32, which is unrolled). Fall back to the
-    # correct unrolled body rather than roll it -- a correctness guard, not a perf choice.
+    # _roll_bad is a CORRECTNESS guard, not a perf choice: the rolled loop computes WRONG
+    # results for k_wave==1 + num_acc_n==1 + TILE_K>=256 (e.g. t16x64x256), an iter-arg/
+    # A-DMA interaction at that one shape; every other rolled combo is correct. No
+    # production row hits it today (kw1-tk256 is only BM=32, unrolled), but a future
+    # retune could pick one, so fall back to the unrolled body instead of rolling it.
     _roll_bad = (k_wave == 1) and (num_acc_n == 1) and (TILE_K >= 256)
     _roll_k = _is_int4 and BM <= 16 and not _roll_bad
     A_LDS_STAGES = 2 if _PIPE else 1
@@ -762,11 +759,7 @@ def _gemm1_body_a16w4(
         compute_tile(b0, preload_a(0))
         gpu.barrier()
     elif const_expr(not _roll_k):
-        # mxfp4/bf16 (a16w4/a16w16) AND large-M int4 (BM>=32): KEEP the fully-unrolled
-        # range_constexpr body. For mxfp4/bf16 this is BYTE-IDENTICAL to the shipped/tuned
-        # PR#4502 kernel (rolling regressed mxfp4 +5% at tok16). For large-M int4 the
-        # unrolled body's ILP/prefetch depth wins where the kernel is HBM-adjacent (the
-        # roll costs ~12% at tok4096). Only int4 BM==16 decode/mid tiles take the roll.
+        # mxfp4/bf16 and large-M int4: fully-unrolled body (rationale at _roll_k).
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
@@ -786,13 +779,10 @@ def _gemm1_body_a16w4(
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
     else:
-        # int4 (a16wi4): ROLLED software pipeline (runtime scf.for). Same prefetch
-        # structure as the unrolled body: B(kt+1) issued before compute(kt); A
-        # double-buffered LDS. Loop runs [0, K_TILES_TOTAL-1) carrying the prefetched
-        # B-tile and the accumulator VALUES (rmem tensor objects cannot cross an
-        # scf.for iteration); the final tile is an epilogue after the loop. Rolling the
-        # ~12.7K-line unrolled body to ~2.2K cuts small-M GRBM/SQ_BUSY ~2x (see commit).
-        # prologue: tile-0 A DMA + B loads in flight.
+        # int4 decode/mid: ROLLED software pipeline (runtime scf.for), same prefetch
+        # structure as the unrolled body. Loop runs [0, K_TILES_TOTAL-1) and carries the
+        # prefetched B-tile plus the accumulator VALUES -- rmem tensor objects cannot
+        # cross an scf.for iteration -- so the final tile is an epilogue after the loop.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
 
