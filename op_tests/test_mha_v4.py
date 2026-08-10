@@ -6,10 +6,12 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_LOG2E,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
     mha_v4_packed,
+    mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
@@ -105,6 +107,11 @@ def test_attention_format_ids_are_stable():
     assert int(AttentionFormat.UINT8) == 11
     assert int(AttentionFormat.INT4) == 12
     assert int(AttentionFormat.UINT4) == 13
+
+
+def test_mha_v4_q_multiplier_recipe():
+    softmax_scale = 128**-0.5
+    assert mha_v4_q_multiplier(softmax_scale) == softmax_scale * MHA_V4_LOG2E
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")

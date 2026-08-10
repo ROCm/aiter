@@ -35,6 +35,11 @@ MHA_V4_LOG2E = 1.4426950408889634
 MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 
 
+def mha_v4_q_multiplier(softmax_scale: float) -> float:
+    """Return the Q multiplier expected by the MX attention quantizers."""
+    return softmax_scale * MHA_V4_LOG2E
+
+
 @compile_ops("module_fmha_v4_fwd")
 def rotate_activation_mxfp6_quant(
     out: Tensor,
@@ -839,7 +844,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp4_q(
-            q, softmax_scale * MHA_V4_LOG2E
+            q, mha_v4_q_multiplier(softmax_scale)
         )
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
@@ -865,7 +870,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp6_q(
-            q, softmax_scale * MHA_V4_LOG2E
+            q, mha_v4_q_multiplier(softmax_scale)
         )
         k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):

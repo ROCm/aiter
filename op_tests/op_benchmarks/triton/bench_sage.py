@@ -21,10 +21,10 @@ from aiter.ops.mha import (
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
-    MHA_V4_LOG2E,
     AttentionFormat,
     mha_v4,
     mha_v4_packed,
+    mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
@@ -78,7 +78,7 @@ def _production_quantize_v(value: torch.Tensor):
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(
-        query, softmax_scale * MHA_V4_LOG2E
+        query, mha_v4_q_multiplier(softmax_scale)
     )
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
@@ -88,7 +88,7 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
 
 def _production_quantize_f4f4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(
-        query, softmax_scale * MHA_V4_LOG2E
+        query, mha_v4_q_multiplier(softmax_scale)
     )
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
@@ -99,7 +99,7 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
 
 def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
     q_fp6, q_scale = quantize_mxfp6_q(
-        query, softmax_scale * MHA_V4_LOG2E
+        query, mha_v4_q_multiplier(softmax_scale)
     )
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
@@ -457,7 +457,7 @@ def generate_test_tensors(
         rotation = create_hadamard_matrix(
             d_head, device=device, dtype=torch.float32
         ) / (d_head**0.5)
-        q_scale_log2 = (d_head**-0.5) * MHA_V4_LOG2E
+        q_scale_log2 = mha_v4_q_multiplier(d_head**-0.5)
         q_base = torch.matmul(q_rotated, rotation) / q_scale_log2
         k_base = torch.matmul(k_rotated, rotation)
         q = q_base.view(1, 1, sq, d_head).expand(batch, hq, -1, -1).clone()
