@@ -628,11 +628,7 @@ def _gemm1_body_a16w4(
         ]
 
     def compute_tile(b_tile, a_frags):
-        # Accumulators are the module-level rmem tensors, mutated IN PLACE. Both the
-        # unrolled body and the rolled scf.for use this: an rmem tensor is memref-backed,
-        # so mutating it across scf.for iterations is a side effect, not SSA dataflow --
-        # the fly-promote-regmem-to-vectorssa pass lifts it to loop iter_args itself, with
-        # no hand-rolled per-iteration load/store round-trip.
+        # Accumulators are the enclosing rmem tensors, mutated in place.
         g_raw, u_raw, g_sc, u_sc = b_tile
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
