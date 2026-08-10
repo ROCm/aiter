@@ -83,6 +83,35 @@ def fp8x2_to_bf16x2(src_i32, scale_f32, *, hi: bool):
     return fx.rocdl.cvt_scalef32_pk_bf16_fp8(bf16x2_ty, src_i32, scale_f32, hi)
 
 
+def fp4x2_to_bf16x2(src_i32, scale_f32, *, sel: int):
+    """Scaled convert of one MXFP4(e2m1) pair -> ``vector<2xbf16>``.
+
+    ``src_i32`` packs eight FP4 nibbles (four bf16 pairs); ``sel in {0,1,2,3}``
+    selects the pair (nibbles ``2*sel, 2*sel+1``).  Each output equals
+    ``fp4_value * scale_f32`` (the hardware applies the f32 e8m0 block scale).
+    ``sel`` is a compile-time ``I32Attr`` -- unroll callers, never loop it
+    (a runtime ``scf.for`` iv fails the attribute builder with ``bad_cast``).
+    """
+    bf16x2_ty = ir.VectorType.get([2], T.bf16())
+    return fx.rocdl.cvt_scalef32_pk_bf16_fp4(bf16x2_ty, src_i32, scale_f32, sel)
+
+
+def e8m0_byte_to_f32(byte_val):
+    """Decode one E8M0 biased-exponent byte to an f32 scale (``shl 23`` + bitcast).
+
+    ``byte_val`` is an i8 ``ir.Value`` (as loaded from a uint8 scale tensor); it
+    is zero-extended, shifted into the f32 exponent field, and reinterpreted.
+    Bit-exact vs ``aiter.utility.fp4_utils.e8m0_to_f32`` on the normal exponent
+    range (bytes 1..254); the ``0`` / ``0xFF`` specials are never produced for
+    real MXFP4 weights.
+    """
+    from flydsl._mlir.dialects import arith as std_arith
+
+    byte_i32 = std_arith.ExtUIOp(T.i32(), byte_val).result
+    shifted = std_arith.ShLIOp(byte_i32, _i32_const(23)).result
+    return llvm.bitcast(T.f32(), shifted)
+
+
 def bf16x2_to_i32(pair_vec):
     """Reinterpret a ``vector<2xbf16>`` as an i32 (dot2 packs 2 bf16 per VGPR)."""
     return llvm.bitcast(T.i32(), pair_vec)
@@ -611,6 +640,173 @@ def build_down_reduce_fp8_module(
                     )
 
         # Reduce runs on all lanes (cross-lane shuffles); only lane 0 stores.
+        y_sum = [
+            fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
+            for h in range(kh_per_warp)
+        ]
+        y_rsrc = _ptr_rsrc(y_ptr)
+        if lane == 0:
+            for h in range_constexpr(kh_per_warp):
+                buffer_ops.buffer_store(
+                    BFloat16(y_sum[h]).ir_value(), y_rsrc, token_b * hidden + out_j0 + h
+                )
+
+    @flyc.jit
+    def _launch(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(inter_ptr, wd_ptr, wds_ptr, rid_ptr, rwt_ptr, y_ptr).launch(
+            grid=(grid_x, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
+# -------------------------------------------------------------------------
+# Phase B -- down_reduce MXFP4 fast path (BF16 intermediate, FP4 e2m1 weights)
+# -------------------------------------------------------------------------
+def build_down_reduce_fp4_module(
+    inter: int,
+    hidden: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    serialize_dot2: bool = True,
+    scale_bn: int = 1,
+    scale_bk: int = 32,
+    kh_per_warp: int = 1,
+):
+    """Build the down_reduce MXFP4 launcher (BF16 intermediate, FP4 e2m1 weights).
+
+    Structurally identical to :func:`build_down_reduce_fp8_module` (one wave =
+    ``kh_per_warp`` adjacent ``y[b, out_j]`` outputs; shared activation load +
+    ``kh_per_warp`` independent weight-row loads in flight; butterfly reduce;
+    lane 0 stores), but the weights are **MXFP4**:
+
+      * One i32 packs **8** FP4 nibbles = 4 bf16 pairs, so a lane's ``kVector``
+        elements need ``kVector/8`` weight dwords (vs ``kVector/4`` for FP8) --
+        half the weight bandwidth, the ticket's #1 win at B>=2.
+      * Each pair is converted with ``cvt_scalef32_pk_bf16_fp4(..., sel)``
+        (``sel = ipair % 4``), and the per-block **E8M0** scale is applied *in
+        the convert* (the hardware scaled convert).  Because each lane's
+        ``kVector`` chunk lies within one ``scale_bk`` block (enforced below),
+        the block scale is uniform across the lane's pairs for that iteration;
+        applying it in-convert is exactly equivalent to scaling the partial dot.
+      * ``router_wt`` is lane-uniform and folded after the dot (as in FP8).
+
+    Scale layout is **Block2D<BN,BK>** E8M0 (MXFP4 default ``BN=1``, ``BK=32``):
+    ``w_down_scale`` is ``uint8`` [(E*HIDDEN)//BN, INTER//BK] row-major over
+    (weight-row-block, K-block).
+
+    Shapes / layout (row-major, contiguous):
+      * inter        [B, TOPK, INTER]        bf16       (row = b*TOPK + k)
+      * w_down       [E, HIDDEN, INTER] FP4  (uint8 [.., INTER//2]; row = e*HIDDEN + out_j)
+      * w_down_scale uint8 (E8M0)            [(E*HIDDEN)//BN, INTER//BK]
+      * router_ids   [B, TOPK]               int32
+      * router_wts   [B, TOPK]               float32    (normalized to sum 1 per token)
+      * y            [B, HIDDEN]             bf16
+    """
+    if kvector is None:
+        # FP4 fast path: 1 i32 = 8 FP4 = one weight dword per lane per iter.
+        kvector = 8
+    if kvector % 8 != 0:
+        raise ValueError(
+            f"kVector must be a multiple of 8 for FP4 (8 fp4/i32), got {kvector}"
+        )
+    if kh_per_warp < 1:
+        raise ValueError(f"kh_per_warp must be >= 1, got {kh_per_warp}")
+    if hidden % kh_per_warp != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by kh_per_warp={kh_per_warp}")
+    ktile_n = WARP_SIZE * kvector
+    if inter % ktile_n != 0:
+        raise ValueError(f"INTER={inter} not divisible by 64*kVector={ktile_n}")
+    if scale_bk % kvector != 0:
+        raise ValueError(
+            f"MXFP4 scale_bk={scale_bk} must be a multiple of kVector={kvector} "
+            "so each lane's K-chunk lies in one scale block"
+        )
+    if inter % scale_bk != 0:
+        raise ValueError(f"INTER={inter} not divisible by scale_bk={scale_bk}")
+    num_iter = inter // ktile_n
+    n_pairs = kvector // 2  # bf16 pairs (dot2 iterations) per lane per iter
+    n_wwords = kvector // 8  # FP4 weight dwords per lane per iter (8 fp4 each)
+    n_cols = hidden // kh_per_warp  # output column-groups per token
+    scale_cols = inter // scale_bk
+
+    @flyc.kernel
+    def _kernel(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        col = bid % n_cols
+        token_b = bid // n_cols
+        out_j0 = col * kh_per_warp
+
+        inter_rsrc = _ptr_rsrc(inter_ptr)
+        wd_rsrc = _ptr_rsrc(wd_ptr)
+        wds_rsrc = _ptr_rsrc(wds_ptr)
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+
+        acc = [fx.Float32(0.0) for _ in range(kh_per_warp)]
+
+        for k in range_constexpr(top_k):
+            ridx = token_b * top_k + k
+            e = fx.Int32(
+                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
+            )
+            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
+
+            for i in range_constexpr(num_iter):
+                k_base = i * ktile_n + lane * kvector
+                inter_row = token_b * top_k + k
+                a_word0 = (inter_row * inter + k_base) // 2
+                # Shared activation load + kh independent FP4 weight loads.
+                aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                dw = [
+                    load_i32_words(wd_rsrc, (w_row[h] * inter + k_base) // 8, n_wwords)
+                    for h in range(kh_per_warp)
+                ]
+                col_blk = k_base // scale_bk
+                for h in range_constexpr(kh_per_warp):
+                    # E8M0 block scale for this (weight row, K-block), applied
+                    # in the convert; uniform over the lane's chunk this iter.
+                    sidx = fx.Int32(w_row[h] // scale_bn * scale_cols + col_blk)
+                    blk_byte = buffer_ops.buffer_load(
+                        wds_rsrc, sidx, vec_width=1, dtype=T.i8()
+                    )
+                    blk_scale = e8m0_byte_to_f32(blk_byte)
+                    dot_i = fx.Float32(0.0).ir_value()
+                    for ipair in range_constexpr(n_pairs):
+                        w_word = ipair // 4
+                        sel = ipair % 4
+                        d_i32 = bf16x2_to_i32(
+                            fp4x2_to_bf16x2(dw[h][w_word], blk_scale, sel=sel)
+                        )
+                        dot_i = dot2_f32_bf16(
+                            aw[ipair], d_i32, dot_i, serialize=serialize_dot2
+                        )
+                    # router_wt is lane-uniform; the block scale is already in
+                    # the converted weights, so only fold rw here.
+                    acc[h] = acc[h] + fx.Float32(dot_i) * fx.Float32(rw)
+
         y_sum = [
             fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
             for h in range(kh_per_warp)
