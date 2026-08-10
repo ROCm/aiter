@@ -151,6 +151,14 @@ Status legend: [ ] todo · [~] in progress · [x] done
       row_byte_off_i64, num_records_bytes=row_nb)`) with in-row i32 offsets, or (b) keep the
       whole-tensor resource but compute the element/byte offset in i64.
       Root cause: `w_row * hidden` is i32; DeepSeek `(255*2048+2047)*7168 ≈ 3.76e9 > INT32_MAX`.
+- [ ] **`num_records` clamp — >4 GB weight tensors mandate option (a).**
+      `create_buffer_resource_from_addr` clamps `num_records` to **`0xFFFFFFFF` (4 GB)**, so a
+      whole-tensor resource (option (b)) **cannot address past 4 GB** even with an i64 offset —
+      the HW OOB check zeroes reads beyond it. Any expert weight tensor larger than 4 GB
+      therefore **requires the per-row i64 base approach (a)**, which sizes `num_records` per
+      row. This is already true for **Kimi-K3** (`896·3072·3584 ≈ 9.2 GB FP8 / 4.9 GB MXFP4`,
+      §8.2) and any comparably large E×dims. Prefer (a) as the default fix; treat (b) as a
+      convenience only for sub-4 GB tensors.
 - [ ] Add the **E=256 / E=512 correctness cases** to the op_test so this can't regress
       (these are the first real ticket-shape tests; see the coverage matrix §8.2).
 - **Where:** both `build_gate_up_fp8_module` and `build_down_reduce_fp8_module`
@@ -208,7 +216,17 @@ Status legend: [ ] todo · [~] in progress · [x] done
       all shipped dtypes, closing the coverage matrix (§8.2); feed the same shapes to CK.
 
 ### Follow-on (out of scope for this convergence)
-- [ ] FP8/MXFP8 **activation** input (fuse input-side BF16→FP8 quant into gate_up).
+- [ ] **Plain FP8 activation** input (per-tensor / per-token): fuse input-side BF16→FP8 quant
+      into gate_up; convert `x` via the same `cvt_scalef32_pk_bf16_fp8` op, fold the real
+      scale after dot2 (exponent-only convert, §2).
+- [ ] **MXFP8 (block-scaled) activation** input — *distinct from plain FP8*: microscaled FP8
+      with per-block (e8m0) scales on the activation, mirroring the MXFP4 weight path but on
+      `x`. Needs an activation-side per-block scale convert + fold; block granularity per the
+      model's contract. Required for a faithful **Kimi-K3** op (MXFP8 activations, §8.2).
+- [ ] **Parameterized gate_up activation — SiTU-GLU** (not just SiLU). Both kernels currently
+      **hardcode `silu(gate)·up`**; make the epilogue activation selectable and add a
+      **SiTU-GLU** path. Required for a faithful **Kimi-K3** op (K3's `hidden_act == "situ"`,
+      SiTU-GLU per the public spec); SiLU stays the default for DeepSeek/MiniMax/Qwen.
 - [ ] Re-test XCD swizzle on small-grid Qwen after a cross-wave reuse tiling lands.
 - [ ] K3-report techniques: lane-teams over disjoint expert subsets; offline weight
       permutation to cut runtime dequant (needs a versioned prepack layout contract).
@@ -285,6 +303,18 @@ the phase bullets reference it rather than re-listing shapes.
 | Qwen3Next TP1 | 2048 | 512 | 10 | **512** | ✅ (kv8) | ⏳ **B/F** (add correctness + perf rows) |
 | Qwen3Next TP2 | 2048 | 256 | 10 | **512** | ⛔ | `INTER%512≠0`; needs short-INTER `kLanesPerOutput` path (see §6) |
 | Qwen3Next TP4 | 2048 | 128 | 10 | **512** | ⛔ | `INTER%512≠0`; same short-INTER gap |
+| Kimi-K3 (routed, latent MoE) | **3584** | 3072 | **16** | **896** | ✅ (gate_up kv8 / down kv16) | ⏳ **follow-on** (needs MXFP4 + FP8/MXFP8 act; E=896 max-stresses G1) |
+
+**Kimi-K3 mapping note (public spec, arXiv 2607.24653 / Moonshot model card).** K3 is a
+**latent MoE**: the 7168 hidden is projected to a **3584-wide latent** and the routed
+experts run *on the latent*, so the warp-decode routed-expert GEMM uses **HIDDEN(contract)
+= 3584** (not 7168), INTER = 3072, E = 896, TOPK = 16. The dims are divisible for the
+current kernels (gate_up `3584 % 512 == 0` ⇒ kv8; down `3072 % 1024 == 0` ⇒ kv16, H2 ok),
+but K3 is **follow-on**: it needs MXFP4 weights (Phase B) + MXFP8 activations (follow-on),
+and its **E=896** is the harshest G1 overflow case (`895*3072*3584 ≈ 9.9e9 ≫ INT32_MAX`) —
+a good stress test once Phase A lands. The 2 **shared** experts run dense on the full 7168
+and are out of scope for the routed warp-decode path. Suggested by a colleague as a
+bench/tune target; verify against the shipped weights before publishing numbers.
 
 | Axis | Target | Status / owning phase |
 |---|---|---|
@@ -304,6 +334,9 @@ the phase bullets reference it rather than re-listing shapes.
   across all shipped dtypes; feed the same shapes to the CK side-by-side (§4 Phase F).
 - **Deferred (kernel-support, not just test):** short-INTER **Qwen TP2/TP4** (I=256/128) —
   add the `kLanesPerOutput` subgroup path first, then the coverage rows.
+- **Follow-on:** **Kimi-K3** (latent-MoE routed expert: H_contract=3584, I=3072, E=896,
+  TOPK=16, MXFP4+MXFP8) — add once Phase B (MXFP4) + FP8/MXFP8 activation land; doubles as
+  the harshest G1 overflow stress case.
 
 ## 9. Open questions / risks
 
@@ -334,3 +367,15 @@ the phase bullets reference it rather than re-listing shapes.
   gate"). Recorded that no real ticket config is validated today (perf sweep pins E=8), that
   MiniMax and Qwen3Next are absent, and that Qwen TP2/TP4 short-INTER is a kernel-support gap
   (not just a missing test). Wired Phases A/F and §5 to reference the matrix.
+- _Kimi-K3 shape (2026-08-10)_ — on a colleague's suggestion, confirmed K3's public dims
+  (arXiv 2607.24653 / Moonshot model card): latent MoE, routed-expert contraction **3584**
+  (not 7168), INTER 3072, E 896, TOPK 16, MXFP4+MXFP8. Added it to §8.2 as a **follow-on**
+  coverage row with   a mapping note; flagged E=896 as the harshest G1 overflow stress case.
+  No `kimi`/`k3` shape preset existed in-repo; this is the first record of the dims.
+- _K3 faithful-op gaps (2026-08-10)_ — folded in three items surfaced by the K3 analysis:
+  (1) Phase A now notes the **`num_records` 4 GB clamp** ⇒ >4 GB tensors (e.g. K3) **mandate**
+  per-row i64 base addressing (option (a)), not a whole-tensor i64 offset; (2) split the
+  follow-on activation item into **plain FP8** vs **MXFP8 (block-scaled)**; (3) added a
+  follow-on to **parameterize the gate_up activation and add SiTU-GLU** (kernels hardcode
+  SiLU today) for a faithful K3 op. Bench/tune on K3 shapes still only needs Phases A+B; these
+  three are for correctness-faithful K3.
