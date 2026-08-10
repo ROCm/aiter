@@ -398,6 +398,7 @@ def _top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    rowEndsPerRow: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -410,9 +411,16 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    rowEndsPerRow: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel — the C++
-    side ignores the workspace argument for decode."""
+    side ignores the workspace argument for decode.
+
+    `seqLens` is per-SEQUENCE and bounds row `r` by
+    `seqLens[r // next_n] - next_n + (r % next_n) + 1` — one KV row per query
+    token. Callers whose index cache packs several tokens into one entry
+    (DeepSeek-V4 CSA) must pass `rowEndsPerRow` instead: one end per ROW, taken
+    as is, with `seqLens` then unused."""
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
     # The original mb dispatch is commented out below for reference:
     #   workspace = None
@@ -420,7 +428,16 @@ def top_k_per_row_decode(
     #       size = topk_mb_workspace_size(numRows, stride0, k, True)
     #       workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_decode(
-        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        None,
+        rowEndsPerRow,
     )
 
 

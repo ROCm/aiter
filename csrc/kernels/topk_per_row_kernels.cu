@@ -386,6 +386,9 @@ __global__ void radix_kernel_persistent(T const* in,
     }
     else
     {
+        // One KV row per query token. A caller whose index cache packs several
+        // tokens into an entry passes per-ROW ends and next_n == 1, which
+        // collapses this to `rowEnds[batch_id]` — see top_k_per_row_decode.
         row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
     }
 
@@ -1974,6 +1977,8 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     }
     else
     {
+        // One KV row per query token; per-ROW ends arrive as next_n == 1, which
+        // collapses this to `rowEnds[batch_id]` — see top_k_per_row_decode.
         rowEnd   = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
         rowStart = 0;
     }
@@ -2623,7 +2628,8 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t stride0,
                           int64_t /*stride1*/,
                           int64_t k = 2048,
-                          std::optional<torch::Tensor> workspace = std::nullopt)
+                          std::optional<torch::Tensor> workspace = std::nullopt,
+                          std::optional<torch::Tensor> rowEndsPerRow = std::nullopt)
 {
     if (numRows <= 0) return;
 
@@ -2638,7 +2644,19 @@ void top_k_per_row_decode(const torch::Tensor& logits,
 
     float* logits_ptr = logits.data_ptr<float>();
     int* indices_ptr  = indices.data_ptr<int>();
-    int* seq_lens_ptr = seqLens.data_ptr<int>();
+
+    // A caller that computed its own per-ROW ends passes them here, and the
+    // per-sequence expression must not be applied on top. `next_n = 1` is
+    // exactly that identity:
+    //     rowEnds[r / 1] - 1 + (r % 1) + 1  ==  rowEnds[r]
+    // so the ends array goes in the rowEnds slot unchanged and no kernel needs
+    // a second code path. `next_n` reaches nothing but that expression (see
+    // radix_kernel_persistent / radix_topk_one_block_kernel) — keep it that
+    // way, or this collapse stops holding and the row bound silently reverts
+    // to the one-KV-row-per-token rule.
+    const bool per_row = rowEndsPerRow.has_value();
+    int* seq_lens_ptr  = per_row ? rowEndsPerRow->data_ptr<int>() : seqLens.data_ptr<int>();
+    if (per_row) next_n = 1;
 
     // Always use one-block path for decode.
     const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);

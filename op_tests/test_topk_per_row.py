@@ -312,6 +312,146 @@ def test_top_k_per_row_decode(
     return ret
 
 
+def _decode_row_ends_logits(row_ends: torch.Tensor, width: int, seed: int):
+    """Logits whose out-of-range tail is *attractive*, plus the -inf reference.
+
+    Padding the tail with -inf (as create_random_logits does) makes a too-large
+    row bound invisible: the kernel would scan the tail, pick nothing from it,
+    and still match. Here the tail holds the largest values in the row, so a
+    bound that overshoots pulls them in and the comparison fails. The reference
+    is the same tensor with the tail masked to -inf, i.e. the answer for a
+    kernel that respects the bound exactly.
+    """
+    torch.manual_seed(seed)
+    logits = torch.randn(row_ends.shape[0], width, dtype=torch.float32, device="cuda")
+    cols = torch.arange(width, device="cuda")
+    out_of_range = cols[None, :] >= row_ends[:, None]
+    logits = logits + out_of_range * 100.0
+    return logits, logits.masked_fill(out_of_range, float("-inf"))
+
+
+def test_decode_row_ends_per_row():
+    """Regression for `top_k_per_row_decode(..., rowEndsPerRow=...)`.
+
+    `seqLens` is per-SEQUENCE and bounds row r by
+    `seqLens[r // next_n] - next_n + (r % next_n) + 1` -- one KV row per query
+    token. A caller whose index cache packs several tokens into one entry
+    (DeepSeek-V4 CSA) computes its own per-ROW ends and passes them here; the
+    C++ side routes them into the rowEnds slot and forces next_n = 1, which
+    collapses that expression to `rowEnds[r]`.
+
+    So this asserts three things:
+      1. the ends are honoured verbatim, for ends no per-sequence seqLens could
+         produce (irregular, non-monotonic);
+      2. `seqLens` and `next_n` are ignored -- both are passed deliberately
+         wrong, so dropping the `next_n = 1` collapse silently reverts every
+         bound to the one-KV-row-per-token rule and this fails;
+      3. it selects the same elements as the seqLens path when the ends agree.
+    """
+    top_k, width = 512, 4096
+    # Short rows (end <= top_k) and long rows straddle the kernel's two code
+    # paths; the ends are deliberately non-monotonic and not a fixed stride
+    # apart, so no (seqLens, next_n) pair could generate them.
+    row_ends = torch.tensor(
+        [1, 2048, 17, 513, 4096, 128, 3000, 511, 2049, 512, 4095, 1000],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    num_rows = row_ends.numel()
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    logits, logits_ref = _decode_row_ends_logits(row_ends, width, seed=7)
+
+    # Wrong on purpose, and in range: if a regression made the kernel read
+    # these, the bound would be wrong rather than out of bounds -- a mismatch,
+    # not a segfault.
+    bogus_seq_lens = torch.full((num_rows,), width, dtype=torch.int32, device="cuda")
+    bogus_next_n = 3
+
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    aiter.top_k_per_row_decode(
+        logits,
+        bogus_next_n,
+        bogus_seq_lens,
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        k=top_k,
+        rowEndsPerRow=row_ends,
+    )
+    torch.cuda.synchronize()
+
+    # A row with end <= top_k takes the kernel's fill path, which emits the
+    # identity 0..end-1 padded with -1 -- independent of the values, so it
+    # pins the bound exactly. Comparing the whole row matters: an overshooting
+    # bound keeps the same leading entries and only shows up in the padding.
+    for row_idx in range(num_rows):
+        end = int(row_ends[row_idx])
+        if end > top_k:
+            continue
+        expected = torch.full((top_k,), -1, dtype=torch.int32, device="cuda")
+        expected[:end] = torch.arange(end, dtype=torch.int32, device="cuda")
+        assert torch.equal(indices[row_idx], expected), (
+            f"[row_ends_per_row] row {row_idx} (end={end}) took the fill path "
+            f"but did not emit 0..{end - 1} padded with -1; got "
+            f"{indices[row_idx][: end + 4].tolist()}"
+        )
+
+    # Long rows run the real radix top-k, so compare against torch on the
+    # masked logits.
+    ref = logits_ref.topk(min(top_k, int(row_ends.max())), dim=-1)[1]
+    assert compare_topk_results(
+        logits_ref, indices, ref, row_starts, row_ends, top_k
+    ), "[row_ends_per_row] per-row ends did not match torch.topk over the bounded region"
+
+    # Same bound expressed both ways must select the same elements. Here the
+    # ends DO follow the per-sequence rule, so the seqLens path is the oracle.
+    # Compared as sets, not bytes: the kernel returns a row in index order
+    # rather than value order, and its tail is not stable across launches, so
+    # even two identical calls differ elementwise. That is what
+    # compare_topk_results is set-based for.
+    next_n, batch_size, context_len = 4, 3, 2600
+    eq_rows = batch_size * next_n
+    seq_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device="cuda")
+    rows = torch.arange(eq_rows, device="cuda")
+    eq_ends = (seq_lens[rows // next_n] - next_n + (rows % next_n) + 1).to(torch.int32)
+    eq_starts = torch.zeros(eq_rows, dtype=torch.int32, device="cuda")
+    eq_logits, eq_logits_ref = _decode_row_ends_logits(eq_ends, width, seed=13)
+
+    idx_seq_lens = torch.empty((eq_rows, top_k), dtype=torch.int32, device="cuda")
+    idx_per_row = torch.empty((eq_rows, top_k), dtype=torch.int32, device="cuda")
+    # The per-row call still gets a wrong seqLens, so it can only agree by
+    # actually reading eq_ends.
+    wrong_seq_lens = torch.full((batch_size,), width, dtype=torch.int32, device="cuda")
+    for out, lens, extra in (
+        (idx_seq_lens, seq_lens, {}),
+        (idx_per_row, wrong_seq_lens, {"rowEndsPerRow": eq_ends}),
+    ):
+        aiter.top_k_per_row_decode(
+            eq_logits,
+            next_n,
+            lens,
+            out,
+            eq_rows,
+            eq_logits.stride(0),
+            eq_logits.stride(1),
+            k=top_k,
+            **extra,
+        )
+    torch.cuda.synchronize()
+    assert compare_topk_results(
+        eq_logits_ref, idx_per_row, idx_seq_lens, eq_starts, eq_ends, top_k
+    ), (
+        "[row_ends_per_row] per-row ends selected different elements than the "
+        "equivalent seqLens path -- the next_n = 1 collapse no longer holds"
+    )
+    print(
+        f"[row_ends_per_row] PASS: {num_rows} irregular per-row ends honoured "
+        f"verbatim (bogus seqLens/next_n={bogus_next_n} ignored), and "
+        f"{eq_rows} rows agreed with the seqLens path"
+    )
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -423,8 +563,9 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-# Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
+# Correctness regressions (run in CI via `python3 <file>`).
 test_mb_workspace_reuse()
+test_decode_row_ends_per_row()
 
 
 df = []
