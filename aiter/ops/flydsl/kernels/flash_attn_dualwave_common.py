@@ -1397,6 +1397,14 @@ class DualwaveFp8KernelContext:
         """
         traits = self.traits
         if const_expr(traits.SPLITK):
+            # A split runs its body only when its KV segment is non-empty. Under
+            # VARLEN the grid's y extent is sized for the longest sequence, so a
+            # shorter sequence's excess q-blocks must ALSO be skipped -- left to
+            # run they would write into the next packed sequence's rows. Both
+            # predicates apply, so AND them; without VARLEN split_nonempty alone
+            # is the guard and this is byte-identical to before.
+            if const_expr(traits.VARLEN):
+                return self.split_nonempty & (self.q_start < self.seqlen_q_v)
             return self.split_nonempty
         if const_expr(traits.VARLEN):
             return self.q_start < self.seqlen_q_v

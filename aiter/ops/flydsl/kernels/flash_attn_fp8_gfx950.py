@@ -118,8 +118,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
     assert num_heads % num_kv_heads == 0
     NUM_KV_SPLITS = int(num_kv_splits)
     assert NUM_KV_SPLITS >= 1
-    if varlen and num_kv_splits and int(num_kv_splits) > 1:
-        raise ValueError("varlen is not supported together with num_kv_splits > 1")
+    # varlen + split-K: each sequence has its OWN kv length, so the per-segment
+    # KV range must come from that sequence's length rather than a batch-wide
+    # scalar. init_tile_bounds already derives the segment [split_t0, split_t_end)
+    # from self.seqlen_kv_v, which is per-sequence under VARLEN (init_sequence_
+    # lengths reads cu_seqlens_kv[b+1]-cu_seqlens_kv[b]); the paged block-table
+    # stage and store_empty_split likewise key on the per-sequence max_num_tiles,
+    # so empty/partial segments past a short sequence contribute nothing to the
+    # combine. compute_active_guard ANDs the split-nonempty and per-sequence
+    # q-range predicates under VARLEN+SPLITK. So the combination is now built.
     # Sinks seed m_row per split, so under split-K exp(sink) would be counted
     # once per split in the combine denominator (the combine kernel has no sink
     # input to correct it). Refuse the combination rather than compute wrong
