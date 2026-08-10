@@ -47,12 +47,8 @@ env:
 
 jobs:
   build_aiter_wheel:
-    name: Build gfx950 Aiter wheel
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    name: Build gfx950 Aiter wheel (disabled for stock-image A/B)
+    if: ${{ false }}
     runs-on: build-only-aiter
     steps:
       - name: Checkout AITER
@@ -259,7 +255,7 @@ jobs:
 
   vllm-disagg-smoke:
     name: ${{ matrix.case_name }}
-    needs: [build_aiter_wheel, select_vllm_cases]
+    needs: [select_vllm_cases]
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -280,12 +276,6 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
-      - name: Download AITER wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
-
       - name: Show runner and Slurm state
         run: |
           set -euo pipefail
@@ -327,60 +317,37 @@ jobs:
           echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
           echo "VLLM_TEST_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
 
-      - name: Add offline AITER wheel overlay to the upstream case
+      - name: Configure stock-image AITER runtime
         run: |
           set -euo pipefail
-          artifact_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
-          mapfile -d '' wheels < <(find "${artifact_dir}" -type f -name '*.whl' -print0)
-          if [[ "${#wheels[@]}" -ne 1 ]]; then
-            echo "Expected exactly one AITER wheel in ${artifact_dir}, found ${#wheels[@]}" >&2
-            find "${artifact_dir}" -type f -printf '%P\n' >&2 || true
-            exit 1
-          fi
-
           disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
           test -d "${disagg_dir}"
           rm -rf "${disagg_dir}/aiter_overlay"
-          mkdir -p "${disagg_dir}/aiter_overlay"
-          # A wheel is a ZIP archive. Extract it on the login runner so compute
-          # nodes only consume the staged overlay and never invoke pip or PyPI.
-          python3 -m zipfile -e "${wheels[0]}" "${disagg_dir}/aiter_overlay"
-          test -f "${disagg_dir}/aiter_overlay/aiter/__init__.py"
 
-          # PR #47030 supports overriding the cluster environment file. Use an
-          # AITER-owned wrapper to select the offline overlay without patching
-          # the upstream vLLM runtime script.
-          cat > "${disagg_dir}/aiter_cluster_env.sh" <<'SH'
+          # Keep the same upstream environment and V3 timeout used by the
+          # overlay run, but import AITER directly from the nightly image.
+          cat > "${disagg_dir}/stock_cluster_env.sh" <<'SH'
           #!/usr/bin/env bash
-          overlay_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aiter_overlay"
           source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
           export GPU_ARCHS=gfx950
-          export PYTHONPATH="${overlay_root}${PYTHONPATH:+:${PYTHONPATH}}"
           if [[ "${MODEL_NAME:-}" == "DeepSeek-V3" ]]; then
               export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}"
-              echo "[aiter-overlay] DeepSeek-V3 execute-model timeout=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS}s"
+              echo "[aiter-stock] DeepSeek-V3 execute-model timeout=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS}s"
           fi
-          python3 - "${overlay_root}" <<'PY'
+          python3 - <<'PY'
           from importlib.metadata import version
-          from pathlib import Path
-          import sys
           import aiter
           import flydsl
 
-          root = Path(sys.argv[1]).resolve()
-          loaded = Path(aiter.__file__).resolve()
           print(
-              f"[aiter-overlay] loaded {loaded}; "
+              f"[aiter-stock] loaded {aiter.__file__}; "
               f"flydsl={version('flydsl')} at {flydsl.__file__}"
           )
-          if root not in loaded.parents:
-              raise SystemExit(f"AITER was not loaded from {root}")
           PY
           SH
-          chmod +x "${disagg_dir}/aiter_cluster_env.sh"
+          chmod +x "${disagg_dir}/stock_cluster_env.sh"
 
-          du -sh "${disagg_dir}/aiter_overlay"
-          grep -n "aiter-overlay" "${disagg_dir}/aiter_cluster_env.sh"
+          grep -n "aiter-stock" "${disagg_dir}/stock_cluster_env.sh"
           grep -n 'CLUSTER_ENV_IN=' "${disagg_dir}/run_xPyD_disagg.slurm"
           grep -n 'export CLUSTER_ENV=' "${disagg_dir}/run_xPyD_disagg.slurm"
           git -C "${GITHUB_WORKSPACE}/vllm" diff --exit-code -- \
@@ -436,7 +403,7 @@ jobs:
             echo "- vLLM branch: \`${VLLM_BRANCH}\`"
             echo "- vLLM base SHA: \`${VLLM_BASE_SHA}\`"
             echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
-            echo "- AITER gfx950 wheel overlay: \`PREBUILD_KERNELS=0 (offline, no compute-node pip)\`"
+            echo "- AITER runtime: \`stock nightly image (no AITER overlay)\`"
             echo "- DeepSeek-V3 execute-model timeout: \`900s\`"
             echo "- Upstream request warmup patch: \`disabled\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
@@ -563,7 +530,7 @@ jobs:
             IMAGE="${BASE_IMAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
-            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
+            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/stock_cluster_env.sh" \
             PENDING_MAX_S="${SPUR_PENDING_TIMEOUT_S}" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
