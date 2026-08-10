@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import csv
 import os
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -105,14 +104,8 @@ def flydsl_gdr_decode(
 ):
     device = query.device
     dtype = query.dtype
-    # Set only for a foreign launch stream, the one case needing reordering.
-    producer_stream = None
     if stream is None:
         stream = torch.cuda.current_stream(device)
-    else:
-        current_stream = torch.cuda.current_stream(device)
-        if stream != current_stream:
-            producer_stream = current_stream
     read_indices = indices if read_indices is None else read_indices
     write_indices = indices if write_indices is None else write_indices
     for input in [
@@ -198,16 +191,9 @@ def flydsl_gdr_decode(
         assert (
             a.stride(-1) == 1
         ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
-    # The transpose, `.contiguous()` staging and write-back are GPU copies that
-    # would race a launch on a foreign `stream`; run them there, after one wait.
-    # The caller orders the results. Entering the context costs ~5us against a
-    # ~7us kernel, so it is skipped when the stream is already the caller's.
-    with torch.cuda.device(device.index), (
-        nullcontext() if producer_stream is None else torch.cuda.stream(stream)
-    ):
-        if producer_stream is not None:
-            stream.wait_stream(producer_stream)
-
+    # Staging copies share `stream` with the launch, so it is ordered against
+    # them. Inputs produced elsewhere are the caller's to order.
+    with torch.cuda.device(device.index), torch.cuda.stream(stream):
         if need_shuffle_state:
             state_ = state.permute(0, 1, 3, 2).contiguous()
         else:

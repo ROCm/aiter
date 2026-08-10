@@ -332,11 +332,12 @@ def test_consumer_native_a_layout_is_rejected():
 
 
 def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
-    """A staged `.contiguous()` copy must land before the kernel reads it, even
-    when the launch is on another stream.
+    """A staged `.contiguous()` copy must be issued on the launch stream.
 
-    The sleep makes the failure deterministic: it holds the current stream, so a
-    copy left there cannot finish before a launch on ``side`` would start.
+    Ordering the inputs against ``side`` is the caller's job, so the sync does it
+    and leaves only the wrapper's own copies under test. The sleep then makes the
+    failure deterministic: it holds the current stream, so a copy left there
+    cannot finish before a launch on ``side`` would start.
     """
     B, H, dt = 2, 12, torch.bfloat16
     args, pool, indices = _kda_inputs(
@@ -350,7 +351,25 @@ def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
     initial_state = pool[indices.long()].clone()
     kernel_pool = pool.clone()
 
+    # A compile inside the timed section runs for seconds and outlasts the
+    # sleep, closing the window; warm this config on throwaway buffers first.
+    flydsl_ops.flydsl_gdr_decode(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["a"],
+        args["b"],
+        args["dt_bias"],
+        args["A_log"],
+        indices,
+        pool.clone(),
+        torch.empty_like(args["out"]),
+        use_qk_l2norm=True,
+        need_shuffle_state=True,
+    )
+
     side = torch.cuda.Stream()
+    torch.cuda.synchronize()
     torch.cuda._sleep(100_000_000)
     flydsl_ops.flydsl_gdr_decode(
         args["q"],
