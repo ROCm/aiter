@@ -203,17 +203,17 @@ def build_reduce_problem(
     )
     final_lse = torch.empty(num_out_rows, num_heads, dtype=torch.float32, device=device)
 
-    return dict(
-        partial_output=partial_output,
-        partial_lse=partial_lse,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-        final_output=final_output,
-        final_lse=final_lse,
-        max_seqlen_q=qo_len,
-        num_out_rows=num_out_rows,
-    )
+    return {
+        "partial_output": partial_output,
+        "partial_lse": partial_lse,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+        "final_output": final_output,
+        "final_lse": final_lse,
+        "max_seqlen_q": qo_len,
+        "num_out_rows": num_out_rows,
+    }
 
 
 def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
@@ -273,7 +273,12 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
         atol=2e-2,
         msg=f"[{tag}] lse    ",
     )
-    ok = (err_out == 0) and (err_lse == 0)
+    finite = (
+        torch.isfinite(gpu_out).all().item() and torch.isfinite(gpu_lse).all().item()
+    )
+    if not finite:
+        print(f"FAIL  [{tag}] non-finite kernel output")
+    ok = finite and (err_out == 0) and (err_lse == 0)
     print(f"{'PASS' if ok else 'FAIL'}  {tag}  {us:>8.2f} us")
 
     # Bytes moved by the reduce: read all partial outputs + partial lses +
@@ -331,7 +336,8 @@ def main():
 
     # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
     heads_for_dim = {
-        128: [1, 16, 128],
+        # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
+        128: [1, 16, 96, 128],
         512: [8, 16, 128],
     }
 

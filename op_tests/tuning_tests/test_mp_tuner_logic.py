@@ -11,9 +11,16 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
+import importlib
+import multiprocessing as mp
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+
+
+def _wait_for_release(release, value):
+    release.wait(timeout=5)
+    return value
 
 
 class FakeAsyncResult:
@@ -77,7 +84,7 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
                 else:
                     consecutive_timeouts = 0
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error_type = type(e).__name__
             is_mapping_error = error_type == "KeyError"
 
@@ -109,7 +116,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Should NOT break early with interleaved success")
@@ -130,7 +137,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "Should break after 4 consecutive timeouts (half of 8)")
@@ -153,7 +160,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Should NOT break: success at task 3 resets counter")
@@ -171,7 +178,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, _restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "2 GPUs: half=1, first timeout should break")
@@ -193,7 +200,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
             2: now - 200,
         }
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, _restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Pending task resets consecutive, so no break")
@@ -213,7 +220,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         completed_ids = {k for k, _ in completed}
@@ -233,7 +240,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         completed_ids = {k for k, _ in completed}
@@ -258,7 +265,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(restart, "No restart without root cause")
@@ -280,7 +287,7 @@ class TestAcceleratorError(unittest.TestCase):
         ]
         start_times = {k: now for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "AcceleratorError should break")
@@ -289,6 +296,101 @@ class TestAcceleratorError(unittest.TestCase):
         self.assertIn(0, completed_ids)
         self.assertIn(1, completed_ids)
         self.assertNotIn(2, completed_ids, "Task 2 not reached due to break")
+
+
+class TestTaskExecutionTiming(unittest.TestCase):
+
+    def test_queued_task_has_no_elapsed_execution_time(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        elapsed_since_start = getattr(tuner, "_elapsed_since_task_start", None)
+
+        self.assertIsNotNone(
+            elapsed_since_start,
+            "mp_tuner must calculate timeout from the worker execution start",
+        )
+        self.assertIsNone(elapsed_since_start([0.0], 0, now=100.0))
+        self.assertEqual(elapsed_since_start([55.0], 0, now=100.0), 45.0)
+
+    def test_worker_records_start_only_when_task_leaves_queue(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        init_start_times = getattr(tuner, "_init_task_start_times", None)
+        run_with_tracking = getattr(tuner, "_run_with_start_tracking", None)
+
+        self.assertIsNotNone(init_start_times)
+        self.assertIsNotNone(run_with_tracking)
+
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 2)
+        manager = ctx.Manager()
+        release = manager.Event()
+        pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
+        try:
+            first = pool.apply_async(
+                run_with_tracking, (0, _wait_for_release, (release, "first"))
+            )
+            second = pool.apply_async(
+                run_with_tracking, (1, _wait_for_release, (release, "second"))
+            )
+
+            deadline = time.monotonic() + 5
+            while start_times[0] == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertGreater(start_times[0], 0)
+            self.assertEqual(
+                start_times[1],
+                0,
+                "Queued task must not get a start timestamp",
+            )
+
+            release.set()
+            self.assertEqual(first.get(timeout=5), "first")
+            self.assertEqual(second.get(timeout=5), "second")
+            self.assertGreater(start_times[1], 0)
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+            manager.shutdown()
+
+
+class TestTaskStartTimeReset(unittest.TestCase):
+
+    def test_reset_clears_only_the_given_slots(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        reset_start_times = getattr(tuner, "_reset_task_start_times", None)
+
+        self.assertIsNotNone(
+            reset_start_times,
+            "submitting a task must clear its start-time slot, otherwise a "
+            "resubmitted task is judged against the previous attempt's timestamp",
+        )
+        slots = [11.0, 22.0, 33.0]
+        reset_start_times(slots, [0, 2])
+        self.assertEqual(list(slots), [0, 22.0, 0])
+
+
+class TestWorkerErrorRatio(unittest.TestCase):
+
+    def test_nonfinite_error_ratio_is_rejected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(
+            merge_error_ratio,
+            "worker must reject non-finite comparator error ratios",
+        )
+        for observed in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(observed=observed):
+                self.assertEqual(merge_error_ratio(0.0, observed), 1.0)
+
+    def test_finite_error_ratio_keeps_maximum(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(merge_error_ratio)
+        self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
+        self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
 
 
 if __name__ == "__main__":

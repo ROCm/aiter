@@ -1,6 +1,6 @@
 import torch
 import triton
-from typing import Optional
+
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -9,9 +9,9 @@ _LOGGER = AiterTritonLogger()
 
 def fused_mul_add(
     x: torch.Tensor,
-    a: torch.Tensor | float | int,
-    b: torch.Tensor | float | int,
-    out: Optional[torch.Tensor] = None,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
+    out: torch.Tensor | None = None,
 ):
     """
     Computes elementwise multiplicated and addtion: out = x * a + b
@@ -34,15 +34,11 @@ def fused_mul_add(
 
     N = x.numel()
     assert x.is_contiguous(), "x should be contiguous"
-    assert (
-        isinstance(a, float)
-        or isinstance(a, int)
-        or (isinstance(a, torch.Tensor) and a.is_contiguous() and a.numel() in [1, N])
+    assert isinstance(a, (float, int)) or (
+        isinstance(a, torch.Tensor) and a.is_contiguous() and a.numel() in [1, N]
     ), "a should be a scalar or contiguous tensor with the same number of elements as x"
-    assert (
-        isinstance(b, float)
-        or isinstance(b, int)
-        or (isinstance(b, torch.Tensor) and b.is_contiguous() and b.numel() in [1, N])
+    assert isinstance(b, (float, int)) or (
+        isinstance(b, torch.Tensor) and b.is_contiguous() and b.numel() in [1, N]
     ), "b should be a scalar or contiguous tensor with the same number of elements as x"
 
     if out is None:
@@ -52,7 +48,7 @@ def fused_mul_add(
             out.is_contiguous() and out.numel() == N
         ), "out should be contiguous with the same number of elements as x"
 
-    if isinstance(a, float) or isinstance(a, int):
+    if isinstance(a, (float, int)):
         IS_A_SCALAR = True
         IS_A_TENSOR = False
     elif isinstance(a, torch.Tensor) and a.is_contiguous():
@@ -61,7 +57,7 @@ def fused_mul_add(
             IS_A_SCALAR = True
         else:
             IS_A_SCALAR = False
-    if isinstance(b, float) or isinstance(b, int):
+    if isinstance(b, (float, int)):
         IS_B_SCALAR = True
         IS_B_TENSOR = False
     elif isinstance(b, torch.Tensor) and b.is_contiguous():

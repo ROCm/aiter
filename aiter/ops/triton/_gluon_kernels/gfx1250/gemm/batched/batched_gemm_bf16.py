@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental import gluon
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _GLUON_REPR_KEYS = [
@@ -391,6 +392,9 @@ def _batched_gemm_bf16_compute_bound_kernel(
     ADD_BIAS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
+    num_warps: gl.constexpr,
+    waves_per_eu: gl.constexpr,
+    cache_modifier: gl.constexpr,
 ):
     gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
 
