@@ -14,16 +14,11 @@ on:
         required: false
         type: string
         default: "/data/xinhuang/vllm-disagg-logs/"
-      spur_nodelist_2:
-        description: "Optional comma-separated Spur nodes for the 2-node smoke job"
+      spur_node_pool:
+        description: "Comma-separated Spur node pool used to select idle nodes for each smoke job"
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
-      spur_nodelist_4:
-        description: "Optional comma-separated Spur nodes for the 4-node smoke job"
-        required: false
-        type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
         description: "Official vLLM ROCm image used to build and run current AITER"
         required: false
@@ -44,8 +39,8 @@ env:
   VLLM_DI_PR_NUMBER: "47030"
   BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:nightly' }}
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
-  SPUR_NODELIST_2: ${{ inputs.spur_nodelist_2 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15' }}
-  SPUR_NODELIST_4: ${{ inputs.spur_nodelist_4 || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  SPUR_NODE_SELECTION_TIMEOUT_S: "1800"
   AITER_GPU_ARCHS: gfx950
   AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
@@ -285,20 +280,6 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
-      - name: Select Spur nodes for topology
-        run: |
-          set -euo pipefail
-          if [[ "${NODES}" == "2" ]]; then
-            nodelist="${SPUR_NODELIST_2}"
-          elif [[ "${NODES}" == "4" ]]; then
-            nodelist="${SPUR_NODELIST_4}"
-          else
-            echo "Unsupported node count: ${NODES}" >&2
-            exit 1
-          fi
-          echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
-          echo "Selected upstream case ${CASE_NAME}: nodes=${NODES}, nodelist=${nodelist}"
-
       - name: Download AITER wheel
         uses: actions/download-artifact@v4
         with:
@@ -401,6 +382,39 @@ jobs:
             .buildkite/amd-disagg/vllm_disagg.sh \
             .buildkite/amd-disagg/run_xPyD_disagg.slurm
 
+      - name: Select idle Spur nodes for topology
+        run: |
+          set -euo pipefail
+          if [[ "${NODES}" != "2" && "${NODES}" != "4" ]]; then
+            echo "Unsupported node count: ${NODES}" >&2
+            exit 1
+          fi
+
+          deadline=$((SECONDS + SPUR_NODE_SELECTION_TIMEOUT_S))
+          while true; do
+            mapfile -t idle_nodes < <(
+              sinfo -N -h -n "${SPUR_NODE_POOL}" -o '%N %T' |
+                awk '$2 ~ /^idle/ {print $1}' |
+                sort -Vu
+            )
+            if (( ${#idle_nodes[@]} >= NODES )); then
+              selected_nodes=("${idle_nodes[@]:0:NODES}")
+              nodelist="$(IFS=,; echo "${selected_nodes[*]}")"
+              echo "SPUR_NODELIST=${nodelist}" >> "${GITHUB_ENV}"
+              echo "Selected upstream case ${CASE_NAME}: nodes=${NODES}, nodelist=${nodelist}"
+              break
+            fi
+
+            if (( SECONDS >= deadline )); then
+              echo "Timed out waiting for ${NODES} idle nodes in ${SPUR_NODE_POOL}" >&2
+              sinfo -N -n "${SPUR_NODE_POOL}" >&2 || true
+              exit 1
+            fi
+
+            echo "Waiting for ${NODES} idle Spur nodes; currently available: ${idle_nodes[*]:-none}"
+            sleep 30
+          done
+
       - name: Show vLLM disagg inputs
         run: |
           set -euo pipefail
@@ -419,6 +433,7 @@ jobs:
             echo "- Upstream case: \`${CASE_NAME}\`"
             echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
             echo "- IMAGE: \`${BASE_IMAGE}\`"
+            echo "- SPUR_NODE_POOL: \`${SPUR_NODE_POOL}\`"
             echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
