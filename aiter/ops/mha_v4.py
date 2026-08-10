@@ -442,7 +442,7 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
-def _quantize_mxfp4(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     if head_dim != 128 or not input.is_contiguous():
         raise ValueError("MXFP4 quantization requires contiguous hd128 BSHD input")
@@ -454,8 +454,8 @@ def _quantize_mxfp4(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     return quantized, scale
 
 
-@_quantize_mxfp4.register_fake
-def _quantize_mxfp4_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+@quantize_mxfp4_q.register_fake
+def _quantize_mxfp4_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     del multiplier
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
@@ -505,7 +505,7 @@ def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
-def _quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     if head_dim != 128 or not input.is_contiguous():
         raise ValueError(
@@ -519,7 +519,7 @@ def _quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]
     return quantized, scale
 
 
-@_quantize_mxfp6_q.register_fake
+@quantize_mxfp6_q.register_fake
 def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     del multiplier
     batch, sequence, heads, head_dim = input.shape
@@ -529,7 +529,7 @@ def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_raw", mutates_args=())
-def _quantize_mxfp6_k_raw(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     if head_dim != 128 or not input.is_contiguous():
         raise ValueError(
@@ -545,7 +545,7 @@ def _quantize_mxfp6_k_raw(input: Tensor) -> tuple[Tensor, Tensor]:
     return reorder_fp6_k_lds_order_triton(packed, scale, tile=128, return_raw=True)
 
 
-@_quantize_mxfp6_k_raw.register_fake
+@quantize_mxfp6_k.register_fake
 def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
@@ -555,7 +555,7 @@ def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
-def _quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     if head_dim != 128 or not input.is_contiguous():
         raise ValueError("FP8 V quantization requires contiguous hd128 BSHD input")
@@ -616,7 +616,7 @@ def _quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     return quantized, scale
 
 
-@_quantize_v_fp8.register_fake
+@quantize_v_fp8.register_fake
 def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, _, heads, head_dim = input.shape
     return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
@@ -625,19 +625,26 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
-def _quantize_v_mxfp4_raw(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("MXFP4 V quantization requires contiguous hd128 BSHD input")
     return pack_v_mxfp4_colmajor_raw(input)
 
 
-@_quantize_v_mxfp4_raw.register_fake
+@quantize_v_mxfp4.register_fake
 def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
     tiles = fp4_v_padded_sequence(sequence) // 128
     return input.new_empty(
         (fp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     ), input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
+
+
+_quantize_mxfp4 = quantize_mxfp4_q
+_quantize_v_mxfp4_raw = quantize_v_mxfp4
+_quantize_mxfp6_q = quantize_mxfp6_q
+_quantize_mxfp6_k_raw = quantize_mxfp6_k
+_quantize_v_fp8 = quantize_v_fp8
 
 
 def _v_mxfp4_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
@@ -821,12 +828,14 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = _quantize_mxfp4(q, softmax_scale * MHA_V4_LOG2E)
+        q_quantized, q_descale = quantize_mxfp4_q(
+            q, softmax_scale * MHA_V4_LOG2E
+        )
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
-            v_quantized, v_descale = _quantize_v_fp8(v)
+            v_quantized, v_descale = quantize_v_fp8(v)
         else:
-            v_quantized, v_descale = _quantize_v_mxfp4_raw(v)
+            v_quantized, v_descale = quantize_v_mxfp4(v)
         _launch_mxfp4_coalesced(
             q_quantized,
             q_descale,
@@ -845,12 +854,14 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = _quantize_mxfp6_q(q, softmax_scale * MHA_V4_LOG2E)
-        k_quantized, k_descale = _quantize_mxfp6_k_raw(k)
+        q_quantized, q_descale = quantize_mxfp6_q(
+            q, softmax_scale * MHA_V4_LOG2E
+        )
+        k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):
-            v_quantized, v_descale = _quantize_v_fp8(v)
+            v_quantized, v_descale = quantize_v_fp8(v)
         else:
-            v_quantized, v_descale = _quantize_v_mxfp4_raw(v)
+            v_quantized, v_descale = quantize_v_mxfp4(v)
         _launch_mxfp6(
             q_quantized,
             q_descale,

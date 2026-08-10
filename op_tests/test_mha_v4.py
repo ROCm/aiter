@@ -8,14 +8,14 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
-    _quantize_mxfp4,
-    _quantize_v_mxfp4_raw,
     mha_v4,
     mha_v4_packed,
     mxfp4_k_view,
-    quantize_mxfp4_k,
     quantize_fp8,
     quantize_int8,
+    quantize_mxfp4_k,
+    quantize_mxfp4_q,
+    quantize_v_mxfp4,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -178,8 +178,8 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
 def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
-    raw, scale = _quantize_v_mxfp4_raw(value)
-    raw_again, scale_again = _quantize_v_mxfp4_raw(value)
+    raw, scale = quantize_v_mxfp4(value)
+    raw_again, scale_again = quantize_v_mxfp4(value)
     expected_raw, expected_scale = _reference_mxfp4_v(value)
 
     assert raw.shape == (fp4_v_raw_buffer_size(2, sequence, 3),)
@@ -199,7 +199,7 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     value = torch.randn(
         (2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16
     )
-    dense, dense_scale = _quantize_mxfp4(value, 1.0)
+    dense, dense_scale = quantize_mxfp4_q(value, 1.0)
     raw, scale = quantize_mxfp4_k(value)
     coalesced = mxfp4_k_view(raw, scale)
 
