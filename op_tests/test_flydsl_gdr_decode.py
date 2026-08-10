@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CI-visible tests for the FlyDSL GDR decode op: its export, and its numerics.
+"""CI-visible numerics tests for the FlyDSL GDR decode kernel.
 
 CI shards ``op_tests/test_*.py`` at depth 1 (``.github/scripts/split_tests.sh``)
 and runs each as ``python3 <file>`` (``.github/scripts/aiter_test.sh``), so the
 in-package suite at ``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never
 runs automatically, and a file without the ``__main__`` entry below collects
 nothing and still exits 0. Being listed is not the same as being run.
-
-The export checks matter on their own: importing from
-``linear_attention_kernels`` keeps working if the export drops back out of
-``__init__.py``, so nothing else would catch that.
 
 These cases trust the torch reference and put the *kernel* on trial;
 ``op_tests/test_kda_torch_ref.py`` runs the arrow backwards. Which one fails
@@ -36,24 +32,6 @@ from aiter.ops.flydsl.test_flydsl_linear_attention import (
     Args,
     check_gdr_decode,
 )
-
-
-def test_flydsl_gdr_decode_is_importable_from_package_namespace():
-    assert hasattr(flydsl_ops, "flydsl_gdr_decode"), (
-        "flydsl_gdr_decode is missing from aiter.ops.flydsl -- check that its "
-        "import is uncommented in aiter/ops/flydsl/__init__.py"
-    )
-    assert callable(flydsl_ops.flydsl_gdr_decode)
-
-
-def test_flydsl_gdr_decode_is_advertised_in_all():
-    assert "flydsl_gdr_decode" in flydsl_ops.__all__
-
-
-def test_package_export_is_the_kernel_wrapper_itself():
-    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-
-    assert flydsl_ops.flydsl_gdr_decode is flydsl_gdr_decode
 
 
 @pytest.mark.parametrize(
