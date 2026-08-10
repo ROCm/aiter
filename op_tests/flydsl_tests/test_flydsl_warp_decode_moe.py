@@ -563,6 +563,115 @@ def test_down_reduce_fp4(case):
 
 
 # -------------------------------------------------------------------------
+# Phase B -- gate_up MXFP4 (BF16 activation, FP4 e2m1 + E8M0 block scale)
+# -------------------------------------------------------------------------
+from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
+    flydsl_warp_decode_gate_up_fp4,
+)
+
+# name, B, HIDDEN, INTER, E, TOPK. HIDDEN (the contraction) must be a multiple
+# of 64*8=512 (FP4 fast path).
+GATE_UP_FP4_CASES = [
+    ("gate_up_fp4_h512_i256_e8_tk2", 1, 512, 256, 8, 2),
+    ("gate_up_fp4_h1024_i128_e8_tk4", 2, 1024, 128, 8, 4),
+]
+
+
+def _gen_gate_up_fp4(B, HIDDEN, INTER, E, TOPK):
+    """MXFP4 gate_up inputs + fp32 dequantized reference weights.
+
+    Mirrors ``_gen_down_fp4`` but with two weight streams (gate, up), each with
+    its own E8M0 block scale; contraction dim is HIDDEN.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    rows = E * INTER
+    scale_cols = HIDDEN // _MXFP4_BK
+    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=device)
+
+    def _one():
+        codes = torch.randint(
+            0, 16, (rows, HIDDEN), generator=gen, device=device, dtype=torch.int32
+        )
+        sbytes = torch.randint(
+            123,
+            132,
+            (rows, scale_cols),
+            generator=gen,
+            device=device,
+            dtype=torch.int32,
+        )
+        blk = torch.pow(2.0, sbytes.float() - 127.0)
+        deq = (lut[codes.long()] * blk.repeat_interleave(_MXFP4_BK, dim=1)).reshape(
+            E, INTER, HIDDEN
+        )
+        packed = ((codes[:, 1::2] << 4) | codes[:, 0::2]).to(torch.uint8)
+        w = packed.reshape(E, INTER, HIDDEN // 2).contiguous()
+        s = sbytes.to(torch.uint8).reshape(rows, scale_cols).contiguous()
+        return w, s, deq
+
+    w_gate, gs, w_gate_deq = _one()
+    w_up, us, w_up_deq = _one()
+
+    x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    router_ids = torch.randint(
+        0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
+    )
+    router_ids[0, 0] = E - 1  # exercise the max weight-row offset
+    return x, w_gate, w_up, gs, us, router_ids, w_gate_deq, w_up_deq
+
+
+def _ref_gate_up_fp4(x, w_gate_deq, w_up_deq, router_ids):
+    B, HIDDEN = x.shape
+    E, INTER, _ = w_gate_deq.shape
+    TOPK = router_ids.shape[1]
+    xf = x.float()
+    out = torch.empty(B, TOPK, INTER, dtype=torch.bfloat16, device=x.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(router_ids[b, k])
+            gate = xf[b] @ w_gate_deq[e].T
+            up = xf[b] @ w_up_deq[e].T
+            silu = gate / (1.0 + torch.exp(-gate))
+            out[b, k] = (silu * up).to(torch.bfloat16)
+    return out
+
+
+def _run_gate_up_fp4_case(case, *, cos_thresh=0.99):
+    name, B, HIDDEN, INTER, E, TOPK = case
+    print("=" * 78)
+    print(f"[flydsl] warp-decode gate_up MXFP4  case={name}")
+    x, w_gate, w_up, gs, us, router_ids, wg_deq, wu_deq = _gen_gate_up_fp4(
+        B, HIDDEN, INTER, E, TOPK
+    )
+    out = flydsl_warp_decode_gate_up_fp4(
+        x, w_gate, w_up, router_ids, gs, us, scale_block=(1, _MXFP4_BK)
+    )
+    torch.cuda.synchronize()
+    ref = _ref_gate_up_fp4(x, wg_deq, wu_deq, router_ids)
+    cos = _cosine(ref, out)
+    max_delta = (ref.float() - out.float()).abs().max().item()
+    denom = ref.float().abs().max().item() + 1e-6
+    passed = cos >= cos_thresh
+    print(
+        f"  cos_sim={cos:.6f} (thresh {cos_thresh}), "
+        f"max_delta={max_delta:.4f} ({100*max_delta/denom:.2f}% of max)"
+    )
+    print(f"    ref  sample: {ref.float().reshape(-1)[:6].tolist()}")
+    print(f"    test sample: {out.float().reshape(-1)[:6].tolist()}")
+    print(f"    --> {'PASS' if passed else 'FAIL'}")
+    return passed, cos
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in GATE_UP_FP4_CASES])
+def test_gate_up_fp4(case):
+    passed, _ = _run_gate_up_fp4_case(case)
+    assert passed
+
+
+# -------------------------------------------------------------------------
 # Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
 # -------------------------------------------------------------------------
 # GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
