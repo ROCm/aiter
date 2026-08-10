@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import triton
@@ -12,22 +12,36 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
+
+# Architectures that have a gluon kernel
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _is_gluon_available():
+    """True if the current GPU arch has a Gluon port of this kernel."""
+    try:
+        arch = get_arch()
+        return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
+    except Exception:
+        return False
 
 
 def fused_clamp_act_mul(
     inp: torch.Tensor,
-    out: torch.Tensor | None = None,
-    scale: torch.Tensor | None = None,
+    out: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0,
     activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
-    weights: torch.Tensor | None = None,
+    weights: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
+    backend: Optional[str] = None,
 ):
     """
     Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
@@ -45,6 +59,8 @@ def fused_clamp_act_mul(
         dtype_quant: if ``None``, no quantization; output is written in ``inp.dtype``
             (or the dtype of a pre-allocated ``out``) and ``scale`` is unused. Otherwise
             the result is FP8-group-quantized with ``dtype_quant`` and per-128 scales.
+        backend: ``"triton"`` or ``"gluon"``. If ``None`` (default), picks ``"gluon"``
+            on architectures with a Gluon port (``gfx1250``) and ``"triton"`` elsewhere.
 
     Constraints:
         ``N`` must be a power of two, ``N >= 128``, and ``N % 128 == 0`` so each row
@@ -181,36 +197,110 @@ def fused_clamp_act_mul(
         scale_col_stride = 0
         scale_arg = inp  # placeholder, unused when HAS_QUANT is False
 
-    _fused_clamp_silu_mul_kernel[(M,)](
-        inp,
-        out,
-        scale_arg,
-        weights if HAVE_WEIGHTS else inp,
-        M,
-        n_half,
-        inp.stride(0),
-        inp.stride(1),
-        out.stride(0),
-        out.stride(1),
-        scale_row_stride,
-        scale_col_stride,
-        weights.stride(0) if HAVE_WEIGHTS else 0,
-        weights.stride(1) if HAVE_WEIGHTS else 0,
-        swiglu_limit,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=quant_block_size,
-        SCALE_FMT=scale_dtype_fmt,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_WEIGHTS=HAVE_WEIGHTS,
-        WEIGHT_BROADCAST=WEIGHT_BROADCAST,
-        HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
-        HAS_QUANT=HAS_QUANT,
-        ACTIVATION=activation,
-        SHUFFLE=shuffle_scale,
-        SCALE_N_PAD=scale_n_pad,
-        num_warps=num_warps,
-    )
+    # Resolve backend: gfx1250 uses the Gluon port, otherwise the Triton kernel.
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        # The Gluon kernel reshapes each row into [NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE]
+        # for the group-quant reduction, so BLOCK_SIZE_N must be a whole number of
+        # quant groups.
+        assert BLOCK_SIZE_N % quant_block_size == 0, (
+            f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a multiple of "
+            f"quant_block_size ({quant_block_size})"
+        )
+
+        # Decide by MB moved.
+        if (M*D*2*2+M*D*2 < 20):
+            ROWS_PER_PROG = 1
+            BLOCK_SIZE_M = 1
+        elif (M*D*2*2+M*D*2 < 500):
+            ROWS_PER_PROG = 2
+            BLOCK_SIZE_M = 2
+        else:
+            ROWS_PER_PROG = 2
+            BLOCK_SIZE_M = 2
+
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+
+        from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
+            _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
+        )
+
+        # compressed version only helpful if replicated 10 times, not two
+        _fused_clamp_silu_mul_gluon_kernel[
+            (triton.cdiv(M, ROWS_PER_PROG),)
+        ](
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
+            ROWS_PER_PROG=ROWS_PER_PROG,
+            cache_modifier=".cg",
+        )
+    else:
+        _fused_clamp_silu_mul_kernel[(M,)](
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
+        )
 
     if HAS_QUANT:
         if transpose_scale:
