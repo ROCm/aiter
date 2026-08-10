@@ -97,7 +97,7 @@ def generate_cp_test_data(seq_len, seq_len_kv):
         (1024, 1560),
     ],
 )
-@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("disable_cp", [True, False])
 @pytest.mark.parametrize("clean_logits", [True, False])
