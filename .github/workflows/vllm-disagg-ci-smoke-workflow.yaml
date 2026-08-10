@@ -279,7 +279,16 @@ jobs:
 
           diagnostic_dir="${GITHUB_WORKSPACE}/vllm-disagg-role-logs"
           case "${diagnostic_dir}" in
-            "${GITHUB_WORKSPACE}/"*) rm -rf -- "${diagnostic_dir}" ;;
+            "${GITHUB_WORKSPACE}/"*)
+              if [[ -e "${diagnostic_dir}" ]]; then
+                chmod -R u+rwX "${diagnostic_dir}" 2>/dev/null || true
+                rm -rf -- "${diagnostic_dir}" 2>/dev/null || true
+                if [[ -e "${diagnostic_dir}" ]]; then
+                  sudo -n rm -rf -- "${diagnostic_dir}"
+                fi
+                test ! -e "${diagnostic_dir}"
+              fi
+              ;;
             *) echo "Refusing to clean unexpected path: ${diagnostic_dir}" >&2; exit 1 ;;
           esac
 
@@ -531,9 +540,10 @@ jobs:
               role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID}"
             fi
             if [[ -n "${role_dir}" && -d "${role_dir}" ]]; then
-              mkdir -p vllm-disagg-role-logs
+              role_artifact_dir="vllm-disagg-role-logs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              mkdir -p "${role_artifact_dir}"
               find "${role_dir}" -maxdepth 1 -type f -name '*.log' \
-                -exec cp -f --no-preserve=mode,ownership,timestamps {} vllm-disagg-role-logs/ \;
+                -exec cp -f --no-preserve=mode,ownership,timestamps {} "${role_artifact_dir}/" \;
               echo "- Role logs: copied top-level logs from \`${role_dir}\`"
             else
               echo "> No role-log directory for Slurm job \`${SLURM_JOB_ID:-unknown}\`."
@@ -551,4 +561,4 @@ jobs:
             slurm-submit.txt
             slurm-sacct.txt
             vllm-disagg-job.log
-            vllm-disagg-role-logs/
+            vllm-disagg-role-logs-${{ github.run_id }}-${{ github.run_attempt }}/
