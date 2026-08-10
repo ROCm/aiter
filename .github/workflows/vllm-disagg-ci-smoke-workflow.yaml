@@ -37,7 +37,8 @@ env:
   VLLM_BRANCH: main
   # TODO: Remove the temporary fetch/cherry-pick after vLLM PR #47030 merges.
   VLLM_DI_PR_NUMBER: "47030"
-  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:nightly' }}
+  # Image used by the passing vLLM AMD DI Buildkite build #17 on 2026-07-30.
+  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e' }}
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   SPUR_PENDING_TIMEOUT_S: "7200"
