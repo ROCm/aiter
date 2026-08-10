@@ -72,6 +72,39 @@ def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
     )
 
 
+def dot2_f32_bf16_drain(pairs, *, n_acc: int = 4):
+    """``sum_i dot2(a_i, b_i)`` over ``pairs`` via ``n_acc`` **independent**
+    accumulators, then a single drain add (the G7 s_nop-free scheme).
+
+    ``pairs`` is a Python list of ``(a_i32, b_i32)`` (each two bf16 packed in a
+    VGPR).  The pairs round-robin across ``k = min(n_acc, len(pairs))`` f32
+    accumulators, so a dot2 and the next dot2 that *reuses* the same accumulator
+    are separated by ``k-1`` other (independent) dot2s -- that spacing hides the
+    accumulator-RAW latency, so those intermediate dot2s need no ``s_nop``.  Only
+    the **last** write to each accumulator is emitted with ``s_nop`` (serialize),
+    because the drain add reads it immediately with no further spacing.  Net
+    ``s_nop`` count drops from ``len(pairs)`` to ``k`` (one per accumulator),
+    which is the G7 win once ``len(pairs) > n_acc``.  The ``k`` partials are summed
+    once at the end (linear drain); the result matches the serialized chain up to
+    f32 add reassociation.
+    """
+    if not pairs:
+        return fx.Float32(0.0).ir_value()
+    n = len(pairs)
+    k = min(n_acc, n)
+    accs = [fx.Float32(0.0).ir_value() for _ in range(k)]
+    # Last global index that writes each accumulator residue (its s_nop cover).
+    last_for = {idx % k: idx for idx in range(n)}
+    for idx in range(n):
+        a_i32, b_i32 = pairs[idx]
+        j = idx % k
+        accs[j] = dot2_f32_bf16(a_i32, b_i32, accs[j], serialize=(last_for[j] == idx))
+    total = fx.Float32(accs[0])
+    for j in range(1, k):
+        total = total + fx.Float32(accs[j])
+    return total.ir_value()
+
+
 def fp8x2_to_bf16x2(src_i32, scale_f32, *, hi: bool):
     """Scaled convert of one fp8(e4m3) pair -> ``vector<2xbf16>``.
 
@@ -841,6 +874,7 @@ def build_down_reduce_fp4_module(
     scale_bn: int = 1,
     scale_bk: int = 32,
     kh_per_warp: int = 1,
+    dot2_acc: int = 4,
 ):
     """Build the down_reduce MXFP4 launcher (BF16 intermediate, FP4 e2m1 weights).
 
@@ -859,6 +893,13 @@ def build_down_reduce_fp4_module(
         the block scale is uniform across the lane's pairs for that iteration;
         applying it in-convert is exactly equivalent to scaling the partial dot.
       * ``router_wt`` is lane-uniform and folded after the dot (as in FP8).
+      * **G7 dot2 ILP**: ``dot2_acc`` (default 4) independent f32 accumulators
+        round-robin the per-lane pairs so consecutive ``v_dot2_f32_bf16`` write
+        different registers -- the accumulator-RAW hazard is hidden by ILP rather
+        than a fixed ``s_nop 2``, then a single drain sums the partials.  Since
+        MXFP4's ``kVector=8`` gives exactly ``n_pairs=4`` pairs/iter, 4 accumulators
+        make each iter's dots fully independent.  ``dot2_acc<=1`` keeps the
+        serialized ``s_nop`` chain (``serialize_dot2``) for A/B comparison.
 
     Scale layout is **Block2D<BN,BK>** E8M0 (MXFP4 default ``BN=1``, ``BK=32``):
     ``w_down_scale`` is ``uint8`` [(E*HIDDEN)//BN, INTER//BK] row-major over
@@ -931,6 +972,12 @@ def build_down_reduce_fp4_module(
             rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
 
+            # G7 ILP: collect every (iter, pair) contribution for each output h
+            # into one pair list, so the drain spreads them over `dot2_acc`
+            # independent accumulators across the *whole* K-range (s_nop only on
+            # the final write per accumulator).  The E8M0 block scale is folded
+            # in-convert, so cross-iter accumulation of the raw dots is exact.
+            pairs_h = [[] for _ in range(kh_per_warp)]
             for i in range_constexpr(num_iter):
                 k_base = i * ktile_n + lane * kvector
                 inter_row = token_b * top_k + k
@@ -950,19 +997,27 @@ def build_down_reduce_fp4_module(
                         wds_rsrc, sidx, vec_width=1, dtype=T.i8()
                     )
                     blk_scale = e8m0_byte_to_f32(blk_byte)
-                    dot_i = fx.Float32(0.0).ir_value()
                     for ipair in range_constexpr(n_pairs):
                         w_word = ipair // 4
                         sel = ipair % 4
                         d_i32 = bf16x2_to_i32(
                             fp4x2_to_bf16x2(dw[h][w_word], blk_scale, sel=sel)
                         )
-                        dot_i = dot2_f32_bf16(
-                            aw[ipair], d_i32, dot_i, serialize=serialize_dot2
+                        pairs_h[h].append((aw[ipair], d_i32))
+
+            for h in range_constexpr(kh_per_warp):
+                if const_expr(dot2_acc > 1):
+                    dot_h = dot2_f32_bf16_drain(pairs_h[h], n_acc=dot2_acc)
+                else:
+                    dot_h = fx.Float32(0.0).ir_value()
+                    for idx in range_constexpr(len(pairs_h[h])):
+                        a_i32, d_i32 = pairs_h[h][idx]
+                        dot_h = dot2_f32_bf16(
+                            a_i32, d_i32, dot_h, serialize=serialize_dot2
                         )
-                    # router_wt is lane-uniform; the block scale is already in
-                    # the converted weights, so only fold rw here.
-                    acc[h] = acc[h] + fx.Float32(dot_i) * fx.Float32(rw)
+                # router_wt is lane-uniform; the block scale is already in the
+                # converted weights, so only fold rw here.
+                acc[h] = acc[h] + fx.Float32(dot_h) * fx.Float32(rw)
 
         y_sum = [
             fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
