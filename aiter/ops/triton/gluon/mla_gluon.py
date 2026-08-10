@@ -1009,11 +1009,10 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # nhead > 16 tiles heads into cdiv(nhead, BLOCK_H) blocks on grid axis 2.
-        # Total stage-1 WGs = batch * NUM_KV_SPLITS * (NUM_M_BLOCKS * qlen), so the
-        # ~256-WG split budget divides by NUM_M_BLOCKS as well (head blocks already
-        # fill the machine, mirroring how bh64 folds head blocks into the grid).
-        NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
+        # nhead > 16 tiles heads into cdiv(nhead, BLOCK_H) blocks on grid axis 2, so
+        # the ~256-WG split budget also divides by those head blocks; that division
+        # lives in _bh16_num_kv_splits (head blocks already fill the machine,
+        # mirroring how bh64 folds head blocks into the grid).
         if REGIME == "bh16bn128":
             assert (
                 batch_size == 1
