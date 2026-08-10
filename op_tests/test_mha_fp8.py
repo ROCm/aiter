@@ -34,6 +34,7 @@ def run_ck(
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
         if return_lse:
+
             def run_fp8_lse():
                 out, lse, _, _ = _flash_attn_forward(
                     q,
