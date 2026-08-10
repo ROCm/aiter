@@ -1,184 +1,87 @@
 # MHA V4 Entrypoint And FMHA V4 Engine
 
-> Evolving engineering plan for contributors and coding agents. This is not release documentation.
-> Carefully update the status, decisions, and checklist whenever you change the design.
+> Engineering reference for contributors. Keep current contracts here; preserve detailed history
+> only where it explains an ABI, correctness constraint, or measured performance decision.
 
-## Status
+## Current Status
 
-- Last updated: 2026-08-09.
-- Development branch: `mha_v4`, forked from `mxfp6_fmha_gfx950` at `8ccca033`.
-- Preserve `mxfp6_fmha_gfx950` as the validated integration baseline; do not add MHA v4 work to it.
-- Phase: dense BF16-output extraction and xDiT migration implemented and validated on gfx950.
-- `mha_v4` and `mha_v4_packed` support the six initial gfx950 combinations.
-- A gfx942/CDNA3 signed INT8/FP8 manifest row and code object are also preserved under v4.
-- Keep upstream `aiter/ops/mha.py` annotation style unchanged. New MHA v4 entrypoints deliberately
-    use `Optional[T]`: the equivalent `T | None` annotations caused measured Inductor regressions in
-    end-to-end model execution.
+Last updated: 2026-08-10. Dense BF16-output MHA v4 and the xDiT integration are implemented and
+validated on gfx950. A gfx942 signed INT8/FP8 row is also preserved under v4.
 
-## Fixed First-Release Decisions
+The public raw and packed APIs support six dense combinations:
 
-- Public module and entrypoint: `aiter.ops.mha_v4.mha_v4`.
-- Internal JIT, CSV, HSA directory, and launcher family: `fmha_v4_fwd`.
-- Six dense format combinations listed in [Current Dense Performance](#current-dense-performance).
-- Batched, non-causal MHA only; head dimension 128; BF16 output.
-- Forward/inference only: no backward, dropout, dropout mask, or RNG state.
-- `return_lse=False` is reserved in the API, but `True` is unsupported until an LSE-writing kernel
-    is implemented.
-- Explicit format dispatch; never infer the kernel from packed width or V dtype.
-- Stable format IDs distinguish signed and unsigned integer operands (`INT8`, `UINT8`, `INT4`,
-  `UINT4`). Future RDNA3/RDNA4 IU8/IU4 kernels map these IDs to the WMMA NEG-bit signedness fields;
-  signedness is never inferred from packed storage dtype.
-- Value formats are ordered floating-point largest-to-smallest, then integer: FP32, FP16, BF16,
-  explicit FP8 encodings, explicit FP6 encodings, FP4 E2M1, then signed/unsigned INT8/INT4.
-- FP16 is reserved even though the initial manifest has no FP16 row.
-- FP6 encodings are explicit: ID 7 is `FP6_E2M3` (the current kernels; `MXFP6` remains an alias),
-  while ID 8 is reserved for `FP6_E3M2` (`MXBF6` shorthand). Packed width alone must not select
-  between them because both encode four values in three bytes.
-- NVFP4 is deferred. It uses the same FP4 E2M1 values as MXFP4 but a different dual-scale recipe,
-  so future support belongs in `AttentionScaleMode` and manifest rows, not a new value format.
-- MXFP8 likewise uses an FP8 value encoding plus an E8M0 block-scale mode; it does not need a new
-    `AttentionFormat`. TF32 is an FP32 compute mode rather than a stored operand format. FP64, NF4,
-    INT2, and other formats stay out of the first enum until an attention kernel and ABI require them.
-- Unsupported capabilities fail clearly; never fall back to `aiter.ops.mha`.
-- No Sage branding in the public API because the six combinations do not map cleanly to Sage
-    versions.
+| Q/K | V | Output |
+|---|---|---|
+| INT8 | FP8 | BF16 |
+| FP8 | FP8 | BF16 |
+| MXFP6 E2M3 | FP8 | BF16 |
+| MXFP4 E2M1 | FP8 | BF16 |
+| MXFP6 E2M3 | MXFP4 E2M1 | BF16 |
+| MXFP4 E2M1 | MXFP4 E2M1 | BF16 |
+
+Current scope is batched, dense, non-causal MHA with matching Q/KV head counts, BF16 raw inputs,
+head dimension 128, and BF16 output. It is inference-only: no backward, dropout, RNG state, LSE,
+GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never fall back to
+`aiter.ops.mha`.
+
+## Stable Decisions And Ownership
+
+- `aiter.ops.mha_v4` owns mixed-precision preprocessing, packed-layout reconstruction, format and
+    scale validation, and the raw/packed Python APIs. `aiter.ops.mha` and `fmha_v3_fwd` retain their
+    generic ownership.
+- `fmha_v4_fwd` is the internal JIT, launcher, manifest, and HSA family. V4 identifies an extensible
+    dispatch and ABI generation, not a universal replacement for v3.
+- Dispatch is explicit in Q/K/V formats and scale modes. Tensor dtype, packed width, stride, and
+    storage size validate a selected row; they never select one.
+- Format IDs are stable and distinguish encodings and integer signedness. `FP6_E2M3` is the active
+    FP6 encoding (`MXFP6` alias); `FP6_E3M2` is reserved. Scale granularity remains a separate
+    `AttentionScaleMode`, allowing MXFP8 or NVFP4-style recipes without inventing value formats.
+- Q, K, and V preprocessing remain separate custom ops for distributed overlap. Exotic layouts
+    cross custom-op boundaries as contiguous raw buffers and are rebuilt by MHA v4 view helpers in
+    the final launch boundary.
+- The public name is not Sage-branded because the supported combinations do not map exactly to one
+    SageAttention version.
+- Preserve `Optional[T]` annotations in entrypoints and fake implementations. `T | None` caused a
+    measured Inductor regression in end-to-end model execution.
+
+The current implementation is intentionally one module, `aiter/ops/mha_v4.py`; a speculative
+subpackage split is not part of the design. It exports:
+
+- `mha_v4` and `mha_v4_packed`;
+- `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, and `scale_modes_for_formats`;
+- canonical per-tensor, MX Q/K, and V quantizers;
+- `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` for raw-buffer reconstruction;
+- `mha_v4_q_multiplier` for the MX Q scaling recipe.
 
 ## Authoritative References
 
-- Public implementation: `aiter/ops/mha_v4.py`.
-- Dedicated host launcher: `csrc/py_itfs_cu/asm_mha_v4_fwd.cu`.
-- Explicit manifests and binaries: `hsa/<arch>/fmha_v4_fwd/`.
-- Generic `aiter.ops.mha` and `fmha_v3_fwd` are restored to non-mixed-format ownership.
-- Benchmark and production preprocessing reference: `op_tests/op_benchmarks/triton/bench_sage.py`.
-- Compile-safe production integration reference:
-    `/app/xDiT/xfuser/core/distributed/attention_backend.py`.
+- API and preprocessing ownership: `aiter/ops/mha_v4.py`.
+- Host launcher: `csrc/py_itfs_cu/asm_mha_v4_fwd.cu`.
+- Manifests and binaries: `hsa/<arch>/fmha_v4_fwd/`.
+- Benchmark integration: `op_tests/op_benchmarks/triton/bench_sage.py`.
+- Compile-safe distributed integration: `/app/xDiT/xfuser/core/distributed/attention_backend.py`.
 - Canonical PyISA sources: `/workspace/diffusion-models-inference-private/asm/fmha_sage_fwd/gfx950/`.
-- Approximate BF16 source for a later phase:
-    `/workspace/diffusion-models-inference-private/asm/fmha_v3_fwd/mi350/fwd_hd128_bf16_block.py`.
 
-## Implementation Checklist
+## Validated Baseline
 
-### Dense Extraction
+Dense extraction, dedicated dispatch, six raw preprocessing paths, packed launch, benchmark
+migration, and xDiT migration are complete. Production callers now delegate quantization, MX Q
+scaling, scale recipes, and packed views to MHA v4 while retaining separate xDiT Q/K/V custom ops
+for Ulysses overlap.
 
-- [x] Define format IDs without binding format to scale granularity.
-- [x] Add the `fmha_v4_fwd` manifest with explicit Q/K/V/O formats and kernel identity.
-- [x] Add a dedicated C++/HIP launcher with no dtype- or shape-based format inference.
-- [x] Add the final ASM launch custom op and fake implementation.
-- [x] Move or wrap Q, K, and V preprocessing as independent compile-safe custom ops.
-- [x] Keep exotic K/V views inside the final custom-op boundary; pass contiguous backing buffers.
-- [x] Implement `mha_v4(...) -> torch.Tensor` for the six dense combinations.
-- [x] Expose `mha_v4_packed` for kernel-only benchmarks and integrations with packed operands.
-- [x] Migrate `bench_sage.py` kernel-only and `--e2e` paths.
-- [x] Migrate xDiT callers to `aiter.ops.mha_v4` in the xDiT repository without mixing
-    cross-repository changes into the AITER PR.
-- [x] Remove branch-added mixed-format wrappers and automatic I8FP8 routing from `aiter.ops.mha`.
-- [x] Restore mixed-format ownership out of the v3 host, manifest, and code-object slots.
+Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
+finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
+unaligned and unequal sequence lengths, retained Wan captures, and balanced multi-GPU target-shape
+benchmarks. The focused suites currently pass `46/46` in `op_tests/test_mha_v4.py` and `15/15` in
+xDiT `tests/test_aiter_mixed_attention.py`.
 
-### Validation Gates
+Still deferred:
 
-- [x] Eager accuracy for all six combinations against the pure BF16 reference through
-    `bench_sage.py`.
-- [x] `torch.compile(fullgraph=True)` eager/compiled bitwise parity for every raw preprocessing and
-    launch path.
-- [x] Allocator churn plus a downstream `.contiguous()` consumer for every raw path.
-- [x] Finite-output checks for packed and raw paths.
-- [x] Explicit manifest dispatch observed for every gfx950 symbol/code object.
-- [ ] Add automated rejection tests for unsupported format, mask, layout, head-dimension, and
-    head-count requests.
-- [x] Run the requested long-context command:
-    `python op_tests/op_benchmarks/triton/bench_sage.py --b 1 --hq 5 --sq 8192 --d 128 --kernel all`.
-- [x] `python -m pytest -q op_tests/test_mha_v4.py`: 37 passed.
-- [x] Run the balanced real target-shape benchmark and record GPU count plus code-object hashes.
-
-### Deferred Phases
-
-- [ ] Sparse 256x128 ragged-LUT kernels and Sparge integration.
-- [ ] VSA compatibility and, if needed, an exact 128x128 sparse kernel.
-- [ ] LSE-writing kernels and ring-attention integration.
-- [ ] FP8 output with an explicit data/scale contract.
-- [ ] Approximate BF16-input kernel under a distinct identity from v3 BF16.
-- [ ] GQA, causal, varlen, additional head dimensions, and other Q/K/V/O combinations.
-- [ ] Add more gfx942/CDNA3 combinations, gfx1250/CDNA5, and RDNA3/RDNA4 manifest rows/code objects.
-    RDNA integer rows must encode A/B signedness explicitly for IU8/IU4 WMMA selection.
-
-## Design Index
-
-- [Naming And Layers](#naming-and-layers)
-- [Goal](#goal)
-- [Current Dense Performance](#current-dense-performance)
-- [Package Boundary](#package-boundary)
-- [Public API Levels](#public-api-levels)
-- [Formats And Scales](#formats-and-scales)
-- [Output Contract](#output-contract)
-- [Explicit Kernel Dispatch](#explicit-kernel-dispatch)
-- [Sparse Contract](#sparse-contract)
-- [VSA Compatibility](#vsa-compatibility)
-- [Output ABI Evolution](#output-abi-evolution)
-- [`torch.compile` Rules](#torchcompile-rules)
-- [Migration](#migration)
-- [Open Decisions](#open-decisions)
-- [Required Validation](#required-validation)
-
-## Naming And Layers
-
-Use `fmha_v4_fwd` for the internal launch family, generated manifest, JIT module, and HSA directory:
-
-```text
-aiter/hsa/<arch>/fmha_v4_fwd/
-```
-
-This name is recognizable beside `fmha_v3_fwd`, but it is not the primary application API. A v4
-engine denotes a more extensible dispatch and kernarg contract, not universally better accuracy or
-a replacement for every v3 kernel.
-
-In AITER terminology, FMHA means fused multi-head attention; it does not mean forward-only. The
-direction is expressed by the `_fwd` or `_bwd` suffix, as in the existing `fmha_v3_fwd` and
-`fmha_v3_bwd` families. Therefore `fmha_v4` would not communicate the lack of backward support more
-clearly than `mha_v4`.
-
-The first public API is `aiter.ops.mha_v4`. A future unification may move stable functionality into
-`aiter.ops.mha`, but the initial separation avoids adding more format-specific routing to that
-already broad module.
-
-The public function remains `mha_v4(...)`; its contract explicitly states inference-only and
-forward-only. The low-level custom op, JIT module, CSV, and code-object directory use
-`fmha_v4_fwd`, where the direction suffix is useful and consistent with AITER conventions.
-
-Do not brand the first API as Sage. INT8/FP8 resembles SageAttention v1 and MXFP4/FP8 is related to
-later low-precision attention work, but the supported format combinations do not map exactly onto
-SageAttention versions. `mha_v4` describes the explicit engine generation without making a
-potentially misleading algorithm claim.
-
-## Goal
-
-Create an FMHA v4 engine independent of `aiter.ops.mha` that can grow without encoding kernel
-identity in tensor dtype, packed width, or incidental storage layout.
-
-The initial release includes six dense, non-causal, head-dimension-128 MHA kernels:
-
-- INT8 Q/K with FP8 V;
-- FP8 Q/K with FP8 V;
-- MXFP6 Q/K with FP8 V;
-- MXFP4 Q/K with FP8 V;
-- MXFP6 Q/K with MXFP4 V;
-- MXFP4 Q/K with MXFP4 V.
-
-All six initially write BF16 output. Unsupported combinations return an explicit error; there is no
-fallback to `aiter.ops.mha`.
-
-Head dimension 128 is an initial manifest capability, not a permanent public-API restriction. The
-API derives logical head dimensions from its inputs and dispatch key; future manifest rows may add
-other dimensions without introducing another entrypoint.
-
-Sparse execution, VSA compatibility, Sparge policy, causal attention, grouped-query attention,
-varlen attention, approximate BF16 input, and low-precision output are follow-up work.
-
-This entrypoint is inference-only. It does not expose dropout, a dropout mask, backward state, or an
-RNG state. RNG state in the existing generic FMHA API exists to reproduce training-time dropout;
-without dropout it has no role in MHA v4.
-
-When the approximate BF16 kernel is added, it must not replace or silently dispatch from AITER's
-existing BF16 FMHA implementation.
+- sparse ragged-LUT execution, VSA/Sparge compatibility, and ring/LSE support;
+- low-precision output with an explicit data/scale ABI;
+- approximate BF16 input under a distinct identity from v3 BF16;
+- GQA, causal, varlen, other head dimensions, and more Q/K/V/O combinations;
+- broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
 
 ## Current Dense Performance
 
@@ -197,25 +100,9 @@ These values are the current optimization baselines, not portable performance gu
 the exact benchmark shape, harness revision, GPU count, and code-object hashes when promoting them
 to release-facing documentation.
 
-## Package Boundary
-
-```text
-aiter/ops/mha_v4/
-    __init__.py       stable raw-QKV and packed exports
-    api.py            raw-QKV preprocessing and packed orchestration
-    types.py          formats, scale modes, LUT, and operand/output records
-    quant.py          shared compile-safe quantization custom ops
-    _ops.py           launch custom op and fake implementation
-    _manifest.py      generated or loaded kernel capability table
-```
-
-This package must not import the high-level dispatch machinery in `aiter.ops.mha`. The final
-custom op calls a dedicated C++/HIP FMHA v4 launcher. Existing code-object loading utilities may be
-shared where their contracts match.
-
 ## Public API Levels
 
-Establish two public levels and keep direct code-object launch private.
+MHA v4 exposes raw and packed levels. Direct code-object launch remains private.
 
 ### Raw QKV API
 
@@ -235,18 +122,10 @@ output = mha_v4(
 )
 ```
 
-The input tensors are unquantized BF16 in the first implementation. `q_format`, `k_format`, and
-`v_format` specify the formats prepared for the ASM kernel. Output is BF16 in the initial API.
-
-Each operand format is independent at the API level. The manifest defines supported combinations;
-for example, an MXFP4 Q plus MXFP6 K combination returns a clear unsupported-kernel error until a
-matching kernel exists. No combination is inferred from tensor dtype or shape.
-
-The first release rejects causal mode, grouped-query head counts, sparse metadata, `return_lse=True`,
-head dimensions other than 128, and formats not listed in the initial kernel matrix.
-
-Q, K, and V preprocessing remain separate custom ops. This lets `torch.compile` and distributed
-schedulers run each operation as soon as its corresponding input is available.
+Inputs are contiguous BF16 BSHD tensors. The requested formats select canonical per-operand
+preprocessing and an explicit ASM row; unsupported combinations fail. Q/K must currently match.
+Output is BF16, and a supplied `out` must match Q's shape/device. Q, K, and V preprocessing remain
+separate custom ops so distributed schedulers can overlap each with its input communication.
 
 ### Packed Expert API
 
@@ -273,48 +152,34 @@ output = mha_v4_packed(
 )
 ```
 
-The packed API takes each operand's data tensor, scale tensor, value format, and scale mode
-explicitly. The launcher validates this complete key against one manifest row.
+The packed API takes each operand's data, descale, format, and scale mode explicitly. It validates
+the complete recipe plus dtype, shape, and layout before launching. Call
+`scale_modes_for_formats()` for the production recipe rather than duplicating mode triples.
 
-Packed layout is also part of that explicit contract. MXFP4 Q/K rows use the chunk-major
-coalesced K layout produced by `quantize_mxfp4_k`; incompatible token-strided storage is rejected.
-
-Exotic LDS-order tensors are represented by contiguous backing buffers plus metadata. An
-`as_strided` view never crosses a custom-op boundary; the final launch op reconstructs it while
-populating the kernarg.
+MX Q/K/V producers return contiguous raw buffers where the ASM layout is not an ordinary tensor
+layout. `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` reconstruct logical views. Raw buffers,
+not exotic strided views, cross custom-op boundaries; final xDiT launch ops rebuild the views.
 
 ### MXFP4 V Contract
 
 The F4F4 and F6F4 rows use true MXFP4 V: E2M1 values with one E8M0 scale for every
-`(channel, 32-token)` block. `pack_v_mxfp4_colmajor_raw` fuses block-amax reduction,
-ceil-power-of-two scale generation, normalization, E2M1 encoding, and the final col-major ASM
-layout. One single-warp Triton program owns an exact `(32-token, 32-channel)` scale block, giving
-16 disjoint programs per `(batch, head, 128-token tile)`. It loads the contiguous `32x32` BF16
-block once, derives all 32 E8M0 scales with exponent-bit arithmetic, normalizes with exact
-power-of-two multiplies, and packs adjacent channels with gfx950 native FP4 conversion. It returns
-a contiguous FP4 raw buffer and a uint8 scale image with shape
-`[batch, heads, ceil(sequence / 128) * 512]`. Ragged-tail loads are masked and the raw buffer's
-64-byte launch slack is zeroed.
-
-The scale image is already in the ASM gather order; it is not a generic row-major scale tensor.
-The raw producer and final launch custom-op names must be versioned whenever its dtype, shape, or
-layout changes so existing Inductor guards cannot reuse an older per-channel-F32 contract. Packed
-launches select `E8M0_PER_1X32` only for MXFP4 V; MX Q/K with FP8 V retains
+`(channel, 32-token)` block. `quantize_v_mxfp4` fuses amax, ceil-power-of-two scale generation,
+normalization, E2M1 encoding, and the final col-major ASM layout. It returns a contiguous raw FP4
+buffer plus a uint8 scale image shaped `[batch, heads, ceil(sequence / 128) * 512]`; ragged loads
+are masked and the 64-byte launch slack is zero. The scale image is already in ASM gather order,
+not generic row-major metadata. Packed launch uses `E8M0_PER_1X32`; FP8 V uses
 `F32_PER_CHANNEL`.
 
-The active gfx950 implementations are the trailing-underscore F4F4/F6F4 PyISA sources. Both
-reclaim prologue-only workitem-decomposition registers: `v1:v2` hold the two current V-scale
-dwords and `v3` holds the E8M0 identity scale. Scale loads issue at QK exit so softmax hides their
-VMEM latency before the existing PV drain. Existing 4-aligned operand banks do not move, and the
-allocation remains 256 VGPR. F4F4 restores next-K0 prefetch under the penultimate PV MFMA; F6F4
-keeps its split-FP6 K0 prefetch at the PV tail because the earlier placement was flat in balanced
-eight-GPU testing.
+One single-warp Triton program owns each `(32-token, 32-channel)` block, eliminating overlapping
+writers. The deployed trailing-underscore F4F4/F6F4 kernels load V scales at QK exit so softmax
+hides their VMEM latency, retain 95 SGPR and 256 VGPR, and use 66,048 and 43,008 bytes LDS
+respectively. F4F4 keeps next-K0 prefetch under the penultimate PV MFMA; F6F4 keeps split-FP6 K0
+prefetch at the PV tail because earlier placement was flat in balanced eight-GPU testing.
 
-Promotion requires byte equality against an independent Torch payload/scale reference at sequence
-lengths `1, 127, 128, 129, 257`, deterministic repeated output, zero slack, eager/fullgraph parity,
-allocator churn, the full MHA v4 and xDiT mixed-attention suites, and repeated retained Wan
-captures. The validated underscore candidates preserve 95 SGPR and 256 VGPR usage; F4F4 uses
-66,048 bytes LDS and F6F4 uses 43,008 bytes LDS. At
+Any producer dtype, shape, or layout change requires a versioned custom-op name. Promotion requires
+byte equality against the independent Torch payload/scale reference at sequences
+`1, 127, 128, 129, 257`, deterministic output, zero slack, eager/fullgraph parity, allocator churn,
+both focused suites, and repeated retained Wan captures. At
 `b=1,hq=hk=5,sq=sk=65536,d=dv=128`, final eight-GPU e2e medians were
 `3574.8 TFLOP/s` for F4F4 versus `3459.0` for F4F8, and `3351.2 TFLOP/s` for F6F4 versus
 `3205.1` for F6F8. The deployed code-object SHA256 values are
@@ -323,29 +188,16 @@ captures. The validated underscore candidates preserve 95 SGPR and 256 VGPR usag
 
 ### Future MXFP6 K Fusion
 
-The production MXFP6 K path deliberately remains two stages:
+Production MXFP6 K deliberately remains two stages: native hd128 Hadamard/scale/E2M3 packing, then
+a Triton reorder into the compact 17,408-byte-per-tile ABI. Direct fusion must preserve exactly
+12,288 bytes of C0/C1 data, a 4,096-byte reserved region, and a 1,024-byte scale tail. The safest
+next design is one tile per Triton program, with disjoint 16-byte C0, 8-byte C1, and scale-tail
+owners.
 
-1. the native gfx950 kernel fuses normalized hd128 Hadamard rotation, E8M0 scale generation, and
-    dense E2M3 packing into 24-byte blocks;
-2. one Triton pass reorders those blocks into the compact 17,408-byte-per-tile K ABI and writes the
-    embedded scale tail.
-
-A future implementation may remove the dense intermediate and full reorder, but it must preserve
-the compact ABI exactly: 12,288 bytes of C0/C1 data, a 4,096-byte reserved region, and a 1,024-byte
-scale tail per 128-token tile. The promising design is a direct packer that owns one complete tile
-per program/workgroup, writes disjoint 16-byte C0 and 8-byte C1 segments, and emits each scale-tail
-dword from one owner. A Triton implementation that performs the normalized Hadamard in registers
-before the existing direct compact pack is the safest retry. An alternative is a native kernel that
-uses an intrinsic or store primitive capable of writing the six-dword FP6 result to two destinations
-without slicing a compiler vector.
-
-Do not retry (or be cautious) the rejected native implementation by splitting
-`__builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32` with element indexing, vector shuffles, temporary
-vectors, `memcpy`, or LDS reinterpret loads. Those variants could match the reference bytes on
-sampled tensors yet corrupted unrelated later allocations under allocator churn. Also do not write
-the shifted Region-B scale image with overlapping byte stores from multiple workgroups. Every
-formed source pointer must be in bounds; masking only the selected value is insufficient because
-the compiler may speculate an invalid padded-tail load.
+Rejected native attempts split `__builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32` through element
+indexing, shuffles, temporary vectors, `memcpy`, or LDS reinterpretation. They could match sampled
+bytes yet corrupt later allocations. Do not use overlapping scale-image stores, form out-of-bounds
+tail pointers, or assume a masked selection prevents speculative invalid loads.
 
 Promotion requires byte equality against `reorder_fp6_k_lds_order_triton` for compact data, scale
 tails, and valid scale bytes at sequence lengths `1, 127, 128, 129, 257`; guarded-allocation stress;
@@ -390,40 +242,26 @@ An FP8, FP6, FP4, or INT8 format does not imply a scale mode. The manifest expli
 scale mode and scale storage format for Q, K, V, and O. This permits future kernels to reuse the
 same number format with different quantization granularities without changing the public enum.
 
-The raw API initially chooses the production scale mode associated with the selected manifest row.
-The packed API requires it explicitly in each operand descriptor. A future raw API option may
-request a non-default scale mode when more than one kernel supports the same Q/K/V/O formats.
+The raw API chooses the production recipe through `scale_modes_for_formats`; the packed API requires
+that exact recipe explicitly. Add configurable scale modes only when multiple kernels support the
+same Q/K/V formats.
 
 ## Output Contract
 
-The initial API supports BF16 output only and does not expose an `output_format` argument yet. It
-returns a plain BF16 `torch.Tensor`. If `out` is supplied, the kernel writes it and returns the
-same tensor.
+The API returns a BF16 tensor. If `out` is supplied, the kernel writes and returns that same tensor.
+Low-precision output will require an explicit data/scale ownership contract and a versioned ABI;
+do not add an output record before a kernel and downstream consumer require it.
 
-This matches current AITER behavior: low-level `fmha_v3_fwd` returns its internal four-tensor tuple,
-but user-facing `flash_attn_func`, FP8/I8FP8 wrappers, and the current MX-packed wrapper return only
-the output tensor. xDiT likewise consumes a tensor directly.
-
-When FP8 output is added, the API will need to return or accept both data and scale. That extension
-may introduce an `AttentionOutput` record or a separate quantized-output API. Do not add the record
-to the BF16-only release before its data/scale ownership and downstream use are concrete.
-
-Reserve `return_lse: bool = False` in both raw and packed APIs. The initial manifest has no
-LSE-writing rows, so `return_lse=True` returns a clear unsupported-capability error. Once kernels
-write LSE, the return convention is:
+`return_lse=False` is reserved in both APIs; `True` currently fails clearly. Once supported, use:
 
 ```python
 output = mha_v4(..., return_lse=False)
 output, lse = mha_v4(..., return_lse=True)
 ```
 
-LSE is contiguous FP32 with shape `[batch, query_heads, query_length]`. It is the natural-log
-log-sum-exp of the exact scaled logits used by the selected kernel, before output quantization. This
-is the state ring attention needs to merge partial outputs from different KV shards.
-
-Adding LSE must not add dropout or RNG outputs. The launch custom op should use a versioned schema
-or a dedicated LSE-returning op so its output arity remains stable under `torch.compile`; the Python
-wrapper may select that op using the specialized `return_lse` boolean.
+LSE must be contiguous FP32 `[batch, query_heads, query_length]`, representing the natural-log
+log-sum-exp of the selected kernel's scaled logits. Use a versioned or dedicated LSE custom op so
+compiled output arity remains stable; do not add dropout or RNG outputs.
 
 ## Explicit Kernel Dispatch
 
@@ -469,9 +307,7 @@ The approximate BF16 kernel uses a distinct symbol, code-object slot, and manife
 
 ## Sparse Contract
 
-Deferred to the sparse follow-up PR. The first release does not accept sparse metadata.
-
-The primary sparse input is a ragged LUT:
+Sparse support is deferred. The proposed common descriptor is:
 
 ```python
 @dataclass(frozen=True)
@@ -483,51 +319,17 @@ class AttentionBlockSparseLut:
     kv_block_size: int = 128
 ```
 
-All three tensors are contiguous device `int32` tensors. `lut_start` and `lut_count` contain one
-entry per `(batch, query_head, query_block)`. Every active query block must contain at least one KV
-block until kernels define an empty-row result.
-
-`block_mask_to_lut()` is a convenience custom op. It may overallocate `kv_block_indices` to avoid
-data-dependent output shapes and graph breaks. The packed expert API accepts a prebuilt LUT.
-
-Sparse selection is explicit and resolves a sparse manifest row and code object. A non-null LUT
-must never silently redirect a dense kernel, and sparse selection is never inferred from extra
-kernarg pointers.
-
-Current sparse PyISA kernels append these pointers to the v3 kernarg:
-
-```text
-0x290  kv_block_indices
-0x2a0  lut_start
-0x2b0  lut_count
-```
-
-Dense v1 kernels retain the 656-byte kernarg and current sparse v1 kernels retain the 704-byte
-kernarg. Each manifest row declares its ABI and size.
+The tensors are contiguous device `int32`; start/count have one entry per
+`(batch, query_head, query_block)`. LUT creation must avoid data-dependent allocations. Sparse
+selection is an explicit manifest dimension and ABI, never an inference from extra pointers or a
+silent redirect from a dense request.
 
 ### VSA Compatibility
 
-AITER's existing `vsa_sparse_attention` is primarily a sparse execution API. It does not discover
-the sparse pattern. Its caller supplies a fixed-capacity LUT and a count for every
-`(batch, query_head, 128-query-token block)`.
-
-Its metadata differs from the FMHA v4 ragged ABI:
-
-- the VSA LUT row has capacity `ceil(kv_len / 128)`;
-- entry zero is an absolute KV-block index and later entries are delta encoded;
-- `block_counts` gives the active prefix and the final row slot is reserved for CK lookahead;
-- FMHA v4 uses flat absolute indices plus `lut_start` and `lut_count`;
-- current VSA selection granularity is 128 query tokens, while the existing PyISA sparse kernels
-  share one KV list across a 256-query-token workgroup.
-
-The encoding conversion is cheap and belongs in a compile-safe GPU custom op. The query-block
-geometry is not merely an encoding difference. Two adjacent VSA rows may select different KV
-blocks, whereas the current eight-wave PyISA kernel cooperatively stages one selected KV block for
-both 128-row wavegroups. Merging the two lists would either change semantics or require computing
-their union and masking membership separately for each wavegroup.
-
-FMHA v4 therefore treats VSA as another producer of the common ragged sparse descriptor, with the
-descriptor retaining `query_block_size`. Exact VSA support follows this order:
+AITER VSA supplies delta-encoded fixed-capacity rows plus counts at 128-query-token granularity;
+the proposed MHA v4 descriptor uses flat absolute indices and explicit start/count. Encoding
+conversion is cheap, but geometry is not: current 256x128 PyISA workgroups share one KV list across
+two 128-row halves, while adjacent VSA rows may differ. Exact support therefore follows:
 
 1. Directly use an existing 256x128 sparse kernel when adjacent 128-query VSA rows are identical or
     when the policy natively emits 256-query rows, as current xDiT Sparge recipes do.
@@ -538,22 +340,15 @@ descriptor retaining `query_block_size`. Exact VSA support follows this order:
     overlap to make union overcompute cheaper than the 128x128 kernel. This is a separate optimized
     ABI, not the default conversion.
 
-The public compatibility helper may accept the existing `(block_lut, block_counts)` tensors,
-decode them to an `AttentionBlockSparseLut`, and call the same `fmha_v4_packed` executor. It must
-not maintain a second Q/K/V quantization or code-object dispatch stack.
-
-VSA-specific ordered-prefix optimizations, such as processing high-priority blocks with live
-running-max updates and freezing the max for a tail, are optional kernel metadata. They can extend
-the ragged descriptor with a per-row `freeze_after` tensor and select a matching manifest row.
-Plain VSA compatibility does not require this optimization; AITER's current CK API exposes no
-freeze metadata.
+A compatibility helper may decode existing VSA tensors into the common descriptor and reuse the
+same packed executor. It must not create another quantization or dispatch stack. Ordered-prefix
+optimizations such as `freeze_after` are optional manifest-selected extensions, not prerequisites
+for compatibility.
 
 ## Output ABI Evolution
 
-Existing kernels write BF16 output through the v1 FMHA argument layout. Low-precision-output
-kernels require a versioned extension rather than repurposed fields.
-
-A v2 layout reserves explicit slots after the sparse extension for at least:
+Existing kernels write BF16 through the v1 argument layout. Low-precision output requires a
+versioned extension rather than repurposed fields, with explicit metadata for at least:
 
 ```text
 output scale pointer
@@ -562,66 +357,37 @@ output scale format and mode
 output scale strides or contiguous-layout metadata
 ```
 
-The exact offsets are fixed with the first low-precision-output kernel. Existing v1 binaries
-continue to launch with their original argument sizes.
+Fix offsets with the first implementing kernel; existing v1 binaries retain their original size.
 
 ## `torch.compile` Rules
 
-1. Q, K, and V preprocessing are separate custom ops so distributed scheduling can overlap them.
-2. The ASM launch is always a custom op, including variants with ordinary dense storage.
-3. Custom ops return contiguous backing buffers for exotic K or V layouts. Required views are
-   reconstructed only inside the final launch op.
-4. Fake implementations return exact public data and scale shapes and dtypes without loading a
-   code object.
-5. Custom-op names are versioned whenever output shape, packed storage layout, or ABI changes.
-6. Compile validation includes allocator churn and a downstream consumer such as
-   `output.data.contiguous()`.
-7. Sparse LUT creation avoids data-dependent allocations.
-8. Public functions, fake implementations, and custom-op declarations use `Optional[T]`, not
-    `T | None`. The union-operator annotation style caused a measured `torch.compile` performance
-    regression in the current branch. Preserve the existing `aiter.ops.mha` annotation rewrite and
-    apply the same convention throughout the new entrypoints.
+1. Keep Q, K, and V preprocessing as separate custom ops; keep ASM launch behind a custom op.
+2. Pass exotic layouts across custom-op boundaries as contiguous raw buffers and rebuild views at
+    launch. Fake implementations must expose exact public shapes and dtypes.
+3. Version custom-op names whenever output shape, packed layout, or ABI changes.
+4. Validate compiled paths with allocator churn and a downstream consumer.
+5. Avoid data-dependent sparse allocations.
+6. Use `Optional[T]`, not `T | None`, in public/fake/custom-op declarations because the latter
+    caused a measured end-to-end Inductor regression.
 
-## Migration
+## Forward Roadmap
 
-Remove all branch-added custom-kernel wrappers and automatic I8FP8 routing from `aiter.ops.mha`.
-The benchmark and xDiT call `aiter.ops.mha_v4` directly. Avoid compatibility aliases unless an
-external downstream consumer requires a deprecation window.
-
-Migration is staged:
-
-1. Add format and scale types, `fmha_v4_fwd` manifest, dedicated host launcher, packed
-    BF16-output launch op, and fake implementation.
-2. Move production Q/K/V preprocessing for the six dense combinations behind MHA v4 custom ops.
-3. Add raw-QKV and packed APIs with BF16 tensor output.
-4. Move `bench_sage.py` and xDiT callers, then remove custom-kernel logic from `aiter.ops.mha`.
-5. In a later PR, add sparse manifest rows, code objects, LUT validation, and sparse launch tests.
-6. Later add VSA compatibility and Sparge policy over the shared ragged-LUT executor.
-7. Later add the approximate BF16 code object under its distinct identity.
-8. Later add the versioned FP8-output ABI; consider other output formats afterward.
-
-## Open Decisions
-
-The first-release public contract is fixed: `aiter.ops.mha_v4`, six dense format combinations,
-non-causal MHA, head dimension 128, and plain BF16 tensor output. Remaining implementation choices
-that do not change this public contract are:
-
-1. Decide whether the packed expert API is public in the first release or kept private until a
-   second caller needs it. The raw-QKV API is required for xDiT either way.
-2. Finalize the manifest schema and whether it is generated from a dedicated CSV or represented by
-   a small static table for the first six rows. A dedicated CSV is preferred because sparse and
-   output-format dimensions are planned.
-3. Decide whether Q/K/V preprocessing custom ops live in `aiter.ops.mha_v4.quant` immediately or
-   initially reuse implementations from current quant modules behind private wrappers.
-4. Attach exact shape, harness, GPU-count, and code-object hashes to the performance baseline.
+1. Add sparse manifest rows, ragged-LUT validation, and exact 256x128/128x128 execution paths.
+2. Add VSA/Sparge adapters over the shared sparse descriptor and packed executor.
+3. Add LSE under a stable output schema for ring attention.
+4. Add approximate BF16 under a distinct symbol and code object from generic v3 BF16.
+5. Add a versioned low-precision-output ABI once data/scale ownership is concrete.
+6. Expand architectures, head dimensions, sequence modes, and format combinations only through
+    explicit manifest rows.
 
 ## Required Validation
 
-- eager and compiled parity for every supported Q/K/V/O combination;
-- compiled allocator-churn tests with downstream consumers;
-- dense and sparse correctness against a pure BF16 reference;
-- sparse LUT validation, including partial KV tails and varied per-query-block counts;
-- dispatch tests proving every explicit key resolves to the intended symbol and code object;
-- rejection tests for unsupported combinations and descriptor mismatches;
-- fixed-input repeated determinism and all-GPU long-context tests for synchronization changes;
-- balanced multi-GPU target-shape performance tests after correctness gates pass.
+Every dense change must preserve eager/fullgraph parity, finite output, allocator-churn safety,
+explicit dispatch, unsupported-contract rejection, deterministic fixed-input behavior, and BF16
+reference accuracy. Layout or quantizer changes additionally require byte-level tests at aligned
+and ragged sequences. Synchronization or performance changes require repeated retained captures
+and balanced multi-GPU target-shape benchmarking.
+
+Sparse work adds LUT validation for partial KV tails, varied row counts, empty-row policy, explicit
+sparse dispatch, and correctness against BF16. ABI or output-shape changes require versioned custom
+ops and compatibility tests for existing binaries.
