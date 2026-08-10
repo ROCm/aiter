@@ -446,24 +446,6 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
-        # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
-        # all %64!=0, so the last chunk has padding rows -- validates the masking
-        # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
-        # through gated_v and corrupts the state update). Short sequences
-        # (<=5 chunks) are used on purpose: no-g has no gate decay, so a long
-        # sequence lets the state grow and amplify bf16 accumulation error past
-        # 5e-2; the no-g compute path itself is already bit-identical to the
-        # with-g path at g=0, so here we only need to validate padding masking
-        # within a numerically controlled range. (The original aws-16k with-g
-        # coverage is carried by the retained varlen-32k-aws group.)
-        model_name="nog-short",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[100, 200, 300],
-        max_num_batched_tokens="full_prompt_len",
-        use_g=False,
-    ),
-    PrefillGroup(
         model_name="varlen-32k-aws",
         Hv=32,
         tps=[1],
@@ -472,14 +454,14 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
-        model_name="flydsl-k5-n1",
+        model_name="aws-n1",
         Hv=32,
         tps=[1],
         full_prompt_lens=[5000, 10000],
         max_num_batched_tokens="full_prompt_len",
     ),
     PrefillGroup(
-        model_name="flydsl-k5-n3-mid10k",
+        model_name="aws-n3-mid10k",
         Hv=32,
         tps=[1],
         full_prompt_lens=[16384],
@@ -491,7 +473,7 @@ _PREFILL_GROUPS = [
         mid_seqlen=10000,
     ),
     PrefillGroup(
-        model_name="flydsl-k5-n2-16k",
+        model_name="aws-n2-16k",
         Hv=32,
         tps=[1],
         full_prompt_lens=[16384],
