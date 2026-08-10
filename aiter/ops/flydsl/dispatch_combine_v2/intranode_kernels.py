@@ -1389,6 +1389,74 @@ def make_combine_scatter(
     return run
 
 
+def make_combine_fused_sync(
+    *,
+    rank,
+    npes,
+    off_xdb_mem,
+):
+    """Cross-device barrier kernel for the split fused-combine path.
+
+    A single 1-block, 1-wave kernel that does ONLY Stage A: wait until every
+    peer's gemm2 P2P writes into our comb_inp are globally visible. Launch this
+    first on the stream, then the ``include_sync=False`` reduce kernel (grid
+    fully free). Kernel retirement (stream-ordered) is the completion signal the
+    reduce waits on -- no in-kernel fence needed.
+
+    One wave suffices: only lanes [0, npes) do any work (push the phase to each
+    peer, then poll the npes local slots), there is no cross-warp dependency and
+    hence no fx.barrier(). The kernel's cost is the peer wait, not thread count.
+
+    Because there is exactly one block, the per-block flag bookkeeping collapses
+    to a single monotonic counter in xdb_flag[0]; the remaining xdb_flag_slots
+    stay untouched. That makes this path EXCLUSIVE: within a run that uses it,
+    the per-block (single-kernel) variant must never also run, or it would read
+    a stale counter from its own slot and clear its barrier without waiting.
+    """
+
+    @flyc.kernel(known_block_size=[WAVE, 1, 1])
+    def ep_combine_fused_sync(
+        arena: Int64,
+        addr_xdb_flag: Int64,
+        my_lsa_rank: Int32,
+    ):
+        tid = fx.thread_idx.x
+        window = cco.Window(arena)
+        rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
+        # single monotonic phase (one block owns the counter; slot 0)
+        phase = fx.Int64(buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64))
+        # push this call's phase to every peer's shared xdb slot [rank]
+        if tid < npes:
+            xdb_remote = fx.Int64(
+                window.lsa_ptr(tid, off_xdb_mem)
+            ) + fx.Int64(rank) * fx.Int64(8)
+            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # advance the counter for the next call (single writer, no atomic)
+        if tid == 0:
+            buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, 0)
+        # poll each peer's local slot until it reports >= this call's phase.
+        if tid < npes:
+            xdb_peer_slot = fx.Int64(
+                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_ge_i64(xdb_peer_slot, phase)
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_xdb_flag: Int64,
+        my_lsa_rank: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_combine_fused_sync(arena, addr_xdb_flag, my_lsa_rank).launch(
+            grid=(1, 1, 1),
+            block=[WAVE, 1, 1],
+            stream=stream,
+        )
+
+    return run
+
+
 def make_combine_fused_reduce(
     *,
     rank,
@@ -1402,9 +1470,15 @@ def make_combine_fused_reduce(
     off_comb_inp,
     off_xdb_mem,
     slot_stride_nbytes=None,
+    include_sync=True,
     _s3_cache=2,
 ):
     """Combine for the gemm2-fused scatter path (combine_mode='scatter_fused').
+
+    ``include_sync=True`` (default) keeps the original single-kernel behavior
+    (Stage A cross-device barrier + Stage B reduce). ``include_sync=False``
+    emits ONLY Stage B (grid fully free), for the split path where a separate
+    ``make_combine_fused_sync`` 1-block kernel does the barrier first.
 
     gemm2 has already P2P-written each token's WEIGHTED per-expert result into this
     rank's comb_inp[origin_lid*topk + k] (one contiguous topk-block per token). So
@@ -1417,6 +1491,13 @@ def make_combine_fused_reduce(
 
     bf16/f32 non-quant only (the fused path carries a bf16 wire).
     """
+    if include_sync and block_num > xdb_flag_slots:
+        # Stage A indexes xdb_flag[bid]; a larger grid would run off the array.
+        raise ValueError(
+            f"combine block_num {block_num} exceeds xdb_flag_slots "
+            f"{xdb_flag_slots}; use the split path (include_sync=False) or "
+            f"raise xdb_flag_slots"
+        )
     to_acc, from_acc, zero_acc = _accum_funcs(hidden_elem_size)
     wire_nbytes = hidden_dim * hidden_elem_size  # valid bytes per slot (hidden row)
     n_i32 = wire_nbytes // 4  # valid i32 units read per slot (unpadded)
@@ -1456,38 +1537,41 @@ def make_combine_fused_reduce(
         # xdb slot, then EVERY block independently polls the local slots for its own
         # flag. No shared comb_bar => no atomic contention, no reset, no block-0
         # funnel; the monotonic flag needs no reset. ──
-        phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64))
-        if grid_thread_id < npes:
-            xdb_remote = fx.Int64(
-                window.lsa_ptr(grid_thread_id, off_xdb_mem)
-            ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), phase)
-        # advance this block's private counter for the next call (single writer)
-        if tid == 0:
-            buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
-        # block 0 fills the unused tail counters [block_num, xdb_flag_slots) so a
-        # later call that picks a larger block_num still reads synced counters.
-        if const_expr(xdb_flag_slots > block_num):
-            if bid == 0:
-                _tail = xdb_flag_slots - block_num
-                _nthr = warp_num_per_block * WAVE
-                for r in range_constexpr((_tail + _nthr - 1) // _nthr):
-                    idx = tid + r * _nthr
-                    if idx < _tail:
-                        buffer_store(
-                            phase + arith.constant(1, type=T.i64),
-                            rsrc_xdb_flag,
-                            block_num + idx,
-                        )
-        # every block independently polls the shared local slots (local reads).
-        # `>=` not `==`: a faster peer can lap us and overwrite its monotonic push
-        # with a higher call count before our late-scheduled blocks read it.
-        if tid < npes:
-            xdb_peer_slot = fx.Int64(
-                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
-            P.spin_until_ge_i64(xdb_peer_slot, phase)
-        fx.barrier()
+        # Compile-time gate: the split path (include_sync=False) omits Stage A and
+        # relies on a separate 1-block make_combine_fused_sync launched first.
+        if include_sync:
+            phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64))
+            if grid_thread_id < npes:
+                xdb_remote = fx.Int64(
+                    window.lsa_ptr(grid_thread_id, off_xdb_mem)
+                ) + fx.Int64(rank) * fx.Int64(8)
+                P.store_i64_system(xdb_remote, arith.constant(0), phase)
+            # advance this block's private counter for the next call (single writer)
+            if tid == 0:
+                buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
+            # block 0 fills the unused tail counters [block_num, xdb_flag_slots) so a
+            # later call that picks a larger block_num still reads synced counters.
+            if const_expr(xdb_flag_slots > block_num):
+                if bid == 0:
+                    _tail = xdb_flag_slots - block_num
+                    _nthr = warp_num_per_block * WAVE
+                    for r in range_constexpr((_tail + _nthr - 1) // _nthr):
+                        idx = tid + r * _nthr
+                        if idx < _tail:
+                            buffer_store(
+                                phase + arith.constant(1, type=T.i64),
+                                rsrc_xdb_flag,
+                                block_num + idx,
+                            )
+            # every block independently polls the shared local slots (local reads).
+            # `>=` not `==`: a faster peer can lap us and overwrite its monotonic push
+            # with a higher call count before our late-scheduled blocks read it.
+            if tid < npes:
+                xdb_peer_slot = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+                ) + fx.Int64(tid) * fx.Int64(8)
+                P.spin_until_ge_i64(xdb_peer_slot, phase)
+            fx.barrier()
 
         # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
         comb_inp_base = fx.Int64(addr_comb_inp)
