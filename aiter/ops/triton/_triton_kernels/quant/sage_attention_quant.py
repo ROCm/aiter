@@ -13,7 +13,9 @@ def mha_v4_per_tensor_amax_kernel(
 ):
     block = tl.program_id(0)
     offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=0.0).to(tl.float32)
+    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=0.0).to(
+        tl.float32
+    )
     tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
 
 
@@ -61,6 +63,7 @@ def mha_v4_per_tensor_quant_kernel(
     else:
         quantized = values * (1.0 / scale)
     tl.store(output_ptr + offsets, quantized, mask=mask)
+
 
 ################# Sage V2 quantization kernels ####################
 
@@ -364,7 +367,8 @@ def sage_quant_v_fp4_colmajor_kernel(
     per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
     64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
     chan -> high nibble). One program packs one 1024 B block. Cosine-equivalent to the numpy
-    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral)."""
+    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral).
+    """
     pid = tl.program_id(0)
     u = pid % 8
     t = (pid // 8) % nT

@@ -79,7 +79,9 @@ def compare_accuracy(current, reference):
     # rows: the global flatten cosine is dominated by the largest-magnitude elements, so an
     # aligned kernel with a handful of blown-up rows still reports a low global cosine. The
     # median over rows is the alignment gate we trust.
-    rc = torch.nn.functional.cosine_similarity(current_f, reference_f, dim=-1).reshape(-1)
+    rc = torch.nn.functional.cosine_similarity(current_f, reference_f, dim=-1).reshape(
+        -1
+    )
     print(
         f"  Per-row cosine (over D): mean={rc.mean().item():.6f} "
         f"median={rc.median().item():.6f} p10={rc.quantile(0.10).item():.6f} "

@@ -77,9 +77,7 @@ def _production_quantize_v(value: torch.Tensor):
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(
-        query, mha_v4_q_multiplier(softmax_scale)
-    )
+    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_fp8, v_scale = _production_quantize_v(value)
@@ -87,9 +85,7 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
 
 
 def _production_quantize_f4f4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(
-        query, mha_v4_q_multiplier(softmax_scale)
-    )
+    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_raw, v_scale = quantize_v_mxfp4(value)
@@ -98,14 +94,10 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
 
 
 def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
-    q_fp6, q_scale = quantize_mxfp6_q(
-        query, mha_v4_q_multiplier(softmax_scale)
-    )
+    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = mxfp6_k_view(
-        k_raw, k_scale_raw, batch, sequence, heads
-    )
+    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
     if not mxfp4_v:
         v_quantized, v_scale = _production_quantize_v(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale

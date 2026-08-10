@@ -41,7 +41,9 @@ def _reference_mxfp4_v(value):
     batch, sequence, heads, _ = value.shape
     padded_sequence = fp4_v_padded_sequence(sequence)
     tiles = padded_sequence // 128
-    padded = torch.nn.functional.pad(value.float(), (0, 0, 0, 0, 0, padded_sequence - sequence))
+    padded = torch.nn.functional.pad(
+        value.float(), (0, 0, 0, 0, 0, padded_sequence - sequence)
+    )
     padded = padded.permute(0, 2, 1, 3)
 
     column = torch.arange(64, device=value.device)
@@ -57,7 +59,9 @@ def _reference_mxfp4_v(value):
         device=value.device,
     )
     payload = raw[:-64].view(batch, heads, tiles * 8192)
-    scale = torch.empty((batch, heads, tiles * 512), dtype=torch.uint8, device=value.device)
+    scale = torch.empty(
+        (batch, heads, tiles * 512), dtype=torch.uint8, device=value.device
+    )
     for tile in range(tiles):
         for channel_block in range(4):
             for token_half in range(2):
@@ -70,19 +74,27 @@ def _reference_mxfp4_v(value):
                 for token_block in range(2):
                     columns = slice(token_block * 32, (token_block + 1) * 32)
                     amax = block[:, :, columns].abs().amax(dim=2)
-                    exponent = torch.ceil(torch.log2(torch.clamp_min(amax, 1e-12) / 6.0))
+                    exponent = torch.ceil(
+                        torch.log2(torch.clamp_min(amax, 1e-12) / 6.0)
+                    )
                     exponents.append(exponent)
-                    normalized[:, :, columns] = block[:, :, columns] / torch.exp2(exponent[:, :, None])
+                    normalized[:, :, columns] = block[:, :, columns] / torch.exp2(
+                        exponent[:, :, None]
+                    )
 
                 code = _e2m1_code_ties_low(normalized)
                 packed = code[..., 0::2] | (code[..., 1::2] << 4)
-                payload[:, :, tile * 8192 + unit * 1024 : tile * 8192 + (unit + 1) * 1024] = packed.flatten(2)
+                payload[
+                    :, :, tile * 8192 + unit * 1024 : tile * 8192 + (unit + 1) * 1024
+                ] = packed.flatten(2)
 
                 scale_base = tile * 512 + token_half * 256
                 for token_block, exponent in enumerate(exponents):
                     encoded = (exponent + 127).clamp(0, 255).to(torch.uint8)
                     for pair in range(16):
-                        offset = scale_base + token_block * 128 + 8 * pair + channel_block
+                        offset = (
+                            scale_base + token_block * 128 + 8 * pair + channel_block
+                        )
                         scale[:, :, offset] = encoded[:, :, 2 * pair]
                         scale[:, :, offset + 4] = encoded[:, :, 2 * pair + 1]
     return raw, scale
@@ -120,9 +132,9 @@ def test_mha_v4_int8_quantization_matches_torch(clip):
     torch.manual_seed(17)
     value = torch.randn((2, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
     expected_scale = value.float().abs().max() * clip / 127.0
-    expected = torch.clamp(
-        torch.round(value.float() / expected_scale), -128, 127
-    ).to(torch.int8)
+    expected = torch.clamp(torch.round(value.float() / expected_scale), -128, 127).to(
+        torch.int8
+    )
 
     actual, scale = quantize_int8(value, clip)
 
@@ -227,9 +239,7 @@ def test_mha_v4_mxfp6_k_raw_views(sequence):
 @pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
 def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     torch.manual_seed(sequence)
-    value = torch.randn(
-        (2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16
-    )
+    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
     dense, dense_scale = quantize_mxfp4_q(value, 1.0)
     raw, scale = quantize_mxfp4_k(value)
     coalesced = mxfp4_k_view(raw, scale)
@@ -239,10 +249,8 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     chunk = torch.arange(4, device="cuda")
     byte = torch.arange(16, device="cuda")
     raw_offset = (
-        torch.arange(2, device="cuda")[:, None, None, None, None]
-        * (3 * tiles * 8192)
-        + torch.arange(3, device="cuda")[None, None, :, None, None]
-        * (tiles * 8192)
+        torch.arange(2, device="cuda")[:, None, None, None, None] * (3 * tiles * 8192)
+        + torch.arange(3, device="cuda")[None, None, :, None, None] * (tiles * 8192)
         + (token // 128)[None, :, None, None, None] * 8192
         + chunk[None, None, None, :, None] * 2048
         + (token % 128)[None, :, None, None, None] * 16

@@ -339,7 +339,9 @@ def mha_v4_packed(
                 1,
             )
             if k.stride() != expected_k_stride:
-                raise ValueError("MXFP4/FP8 K must use the coalesced MHA v4 tile layout")
+                raise ValueError(
+                    "MXFP4/FP8 K must use the coalesced MHA v4 tile layout"
+                )
         else:
             tiles = (k.shape[1] + 127) // 128
             expected_k_stride = (
@@ -482,9 +484,7 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
     raw = input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
-    scale = input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
     rotate_activation_mxfp4_quant_k(raw, scale, input)
     return raw, scale
 
@@ -494,9 +494,9 @@ def _quantize_mxfp4_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
-    ), input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+
+
 def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
     """Rebuild the logical MXFP4 K view from its contiguous backing buffer."""
     batch, sequence, heads, _ = scale.shape
@@ -517,9 +517,7 @@ def mxfp6_k_view(
     heads: int,
 ) -> tuple[Tensor, Tensor]:
     """Rebuild the logical MXFP6 K and scale views from raw backing buffers."""
-    return fp6_k_lds_order_views_from_raw(
-        raw, scale_raw, batch, sequence, heads
-    )
+    return fp6_k_lds_order_views_from_raw(raw, scale_raw, batch, sequence, heads)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
@@ -556,9 +554,7 @@ def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
     packed = input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
-    scale = input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
     rotate_activation_mxfp6_quant(packed, scale, input, 1.0)
     return reorder_fp6_k_lds_order_triton(packed, scale, tile=128, return_raw=True)
 
@@ -676,7 +672,9 @@ def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
     )
 
 
-@torch.library.custom_op("aiter::mha_v4_launch_mxfp4_coalesced_v2", mutates_args=("out",))
+@torch.library.custom_op(
+    "aiter::mha_v4_launch_mxfp4_coalesced_v2", mutates_args=("out",)
+)
 def _launch_mxfp4_coalesced(
     q: Tensor,
     q_descale: Tensor,
@@ -747,9 +745,7 @@ def _launch_mxfp6(
     softmax_scale: float,
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
-    k, k_descale = mxfp6_k_view(
-        k_raw, k_descale_raw, q.shape[0], sequence_k, heads
-    )
+    k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
     v = (
         v_data
         if _is_fp8_format(resolved_v_format)
@@ -843,9 +839,7 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp4_q(
-            q, mha_v4_q_multiplier(softmax_scale)
-        )
+        q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
@@ -869,9 +863,7 @@ def mha_v4(
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp6_q(
-            q, mha_v4_q_multiplier(softmax_scale)
-        )
+        q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
         k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
