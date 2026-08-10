@@ -70,13 +70,12 @@ def _detect_arch():
     try:
         import torch
 
-        name = getattr(
-            torch.cuda.get_device_properties(0), "gcnArchName", ""
-        ).split(":")[0]
-        if name.startswith("gfx"):
-            return name
-    except Exception:
-        pass
+        props = torch.cuda.get_device_properties(0)
+        name = getattr(props, "gcnArchName", "").split(":")[0]
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        name = ""
+    if name.startswith("gfx"):
+        return name
     return "native"
 
 
