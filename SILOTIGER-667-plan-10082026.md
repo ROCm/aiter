@@ -191,7 +191,9 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `[E, HIDDEN, INTER//2]` + `w_down_scale` uint8 E8M0 `[(E*HIDDEN)//BN, INTER//BK]`,
       `scale_block=(1,32)` default, `kvector=8` via `pick_kvector_fp4`, cached via
       `_get_down_reduce_fp4`. End-to-end **PASS** (`/tmp/repro_down_fp4_entry.py`, cos 0.999998).
-      Still TODO: op_test case + A/B perf sweep.
+      **op_test landed**: `test_down_reduce_fp4` (parametrized `DOWN_FP4_CASES`, self-contained
+      FP4-codebook + E8M0 gen, dequant reference, max-offset expert forced) — 2 cases pass;
+      full file green (20 passed). Still TODO: A/B perf sweep (FP4 vs FP8 down at B∈{1,2,4,8}).
 - [ ] **gate_up FP4** (apply the down recipe; gate on accuracy).
 - [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
       natural home for the ILP scheme (plan §2).
