@@ -40,7 +40,7 @@ env:
   BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e' }}
   VLLM_ROUTER_IMAGE: vllm/vllm-router@sha256:0eb9f5befddec4cf56346b6f016d8396c721f635f6771c105fc739bbf1e10bcc
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
-  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   AITER_GPU_ARCHS: gfx950
   AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
