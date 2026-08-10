@@ -15,6 +15,7 @@ import torch
 
 import aiter.ops.flydsl as flydsl_ops
 from aiter.ops.flydsl import is_flydsl_available
+from aiter.test_common import checkAllclose
 
 pytestmark = pytest.mark.skipif(
     not is_flydsl_available(), reason="flydsl is not installed"
@@ -70,26 +71,17 @@ def test_flydsl_gdr_decode_matches_reference(args):
 
 G_MIN = -5.0
 K = V = 128
+RTOL = ATOL = 1e-3
 
 
-def assert_close_rmse(name, ref, tri, ratio=1e-3, err_atol=1e-3):
-    """vLLM's own bar (``test_kda.py:92``): RMSE-relative with an absolute
-    escape hatch, at the packed-vs-dense decode pair's (1e-3, 1e-3). The ratio
-    alone is not the bar.
-    """
-    ref, tri = ref.detach().float(), tri.detach().float()
-    abs_err = (ref - tri).abs().max().item()
-    if abs_err <= err_atol:
-        return abs_err
-    assert not torch.isnan(ref).any(), f"{name}: NaN in ref"
-    assert not torch.isnan(tri).any(), f"{name}: NaN in tri"
-    rmse_diff = (ref - tri).square().mean().sqrt().item()
-    rmse_base = ref.square().mean().sqrt().item()
-    rel_err = rmse_diff / (rmse_base + 1e-8)
-    assert (
-        rel_err < ratio
-    ), f"{name}: max abs err {abs_err:.6f}, rmse ratio {rel_err:.6f} >= {ratio}"
-    return abs_err
+def assert_close(name, ref, out):
+    """Every element must sit within rtol/atol of the torch reference."""
+    ref, out = ref.detach().float(), out.detach().float()
+    mismatched = checkAllclose(out, ref, rtol=RTOL, atol=ATOL, msg=f"{name} ")
+    assert mismatched == 0, (
+        f"{name}: {mismatched:.3%} of elements outside rtol={RTOL} atol={ATOL}, "
+        f"max abs delta {(out - ref).abs().max().item():.3e}"
+    )
 
 
 def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1):
@@ -228,12 +220,8 @@ def test_kda_per_channel_gate_matches_torch_reference(
     if not shuffle:
         got_state = got_state.transpose(-1, -2)
 
-    out_err = assert_close_rmse("o", ref_out, args["out"])
-    state_err = assert_close_rmse("ht", ref_state, got_state)
-
-    # Tripwire under the bar above: agreement is ~1e-4, so drift to just inside
-    # 1e-3 would pass while signalling that something changed.
-    assert out_err < 5e-4 and state_err < 5e-4, (out_err, state_err)
+    assert_close("o", ref_out, args["out"])
+    assert_close("ht", ref_state, got_state)
 
 
 def test_channel_strided_a_is_rejected():
@@ -362,8 +350,8 @@ def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
     torch.cuda.synchronize()
 
     ref_out, ref_state = _kda_reference(args, initial_state)
-    assert_close_rmse("o", ref_out, args["out"])
-    assert_close_rmse("ht", ref_state, kernel_pool[indices.long()])
+    assert_close("o", ref_out, args["out"])
+    assert_close("ht", ref_state, kernel_pool[indices.long()])
 
 
 def test_non_contiguous_dt_bias_is_copied_not_rejected():
@@ -399,8 +387,8 @@ def test_non_contiguous_dt_bias_is_copied_not_rejected():
     )
 
     ref_out, ref_state = _kda_reference(args, initial_state)
-    assert_close_rmse("o", ref_out, args["out"])
-    assert_close_rmse("ht", ref_state, kernel_pool[indices.long()])
+    assert_close("o", ref_out, args["out"])
+    assert_close("ht", ref_state, kernel_pool[indices.long()])
 
 
 def test_negative_slot_is_skipped_and_zero_is_not():
