@@ -124,7 +124,10 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
-    C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
+    # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
+    # (STORE_N+16) to break the ds_store bank conflict; reserve that here so the
+    # padded C tile fits the shared LDS arena (harmless for the narrower act path).
+    C_STORE_B = ((tile_m * (tile_n + 16) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -787,6 +790,21 @@ def launch_gemm_a8w4_tdm(
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
+            # b128 passthrough store: stage the C tile into LDS as a dense row-major
+            # tile with a PADDED row pitch to break the ds_store bank conflict while
+            # keeping the TDM store's contiguous (coalesced) global write. An
+            # unpadded tile has row pitch STORE_N bf16 == STORE_N/2 dwords (mult of
+            # 32), so the 16 rows one b128 writes (row = lane%16) all land on the
+            # same banks -> 16-way conflict (4x the b128 4-cycle floor). Padding the
+            # pitch to STORE_N+STORE_PAD makes bank = ((STORE_N+STORE_PAD)/2)*row mod
+            # 32 spread the rows; STORE_PAD=16 -> +8 dwords/row -> 4-way = floor.
+            # The pad columns are never written to global: the TDM store reads the
+            # full (tile_m, STORE_PITCH) dense tile but its per-dim OOB extent clamps
+            # the inner axis to STORE_N, dropping cols [STORE_N, STORE_PITCH). The
+            # real STORE_N cols of each row stay contiguous in LDS and in global, so
+            # the global write is still fully coalesced (1 KB/row bursts).
+            STORE_PAD = 16 if not stage1_act else 0
+            STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
@@ -933,16 +951,18 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
-                            # The compile-time row byte offset wm*16*STORE_N*2
-                            # grows past the 16-bit ds immediate range for the
-                            # higher wm rows (STORE_N == tile_n on this
-                            # passthrough path), which would force a per-store
-                            # address v_add. When it overflows, launder that row
-                            # offset into the base through an opaque SGPR (row_rel
-                            # loses the wm*16 term, which now lives in the base)
-                            # so each ds_store keeps its small wn immediate --
-                            # same fix as the drain ds_loads.
-                            row_byte = wm * 16 * STORE_N * 2
+                            # Padded dense staging: physical = row*STORE_PITCH + col,
+                            # so the 16 rows one b128 writes (row = lane%16) step by
+                            # STORE_PITCH/2 dwords instead of STORE_N/2. With
+                            # STORE_PAD=16 that is 264 dwords == 8 mod 32, spreading
+                            # the rows to 4-way (the b128 floor) vs the unpadded
+                            # 16-way. The compile-time row byte offset
+                            # wm*16*STORE_PITCH*2 still overflows the 16-bit ds
+                            # immediate for the higher wm rows, so (as in the drain
+                            # ds_loads) launder that row offset into the base through
+                            # an opaque SGPR and drop the wm*16 term from row_rel, so
+                            # each ds_store keeps its small wn immediate.
+                            row_byte = wm * 16 * STORE_PITCH * 2
                             spill = const_expr(
                                 row_byte + (wmma_n_rep - 1) * 16 * 2 > 0xFFFF
                             )
@@ -951,8 +971,8 @@ def launch_gemm_a8w4_tdm(
                                 + fx.index_cast(T.index, opaque_const_i32(row_byte))
                             ) if spill else stC_idx
                             st_off = (
-                                ((wmb + lane16) * STORE_N + col_rel) * 2
-                            ) if spill else ((row_rel * STORE_N + col_rel) * 2)
+                                ((wmb + lane16) * STORE_PITCH + col_rel) * 2
+                            ) if spill else ((row_rel * STORE_PITCH + col_rel) * 2)
                             hv_i32 = hv.bitcast(fx.Int32).ir_value()
                             lds_store_b128_raw(st_base, st_off, hv_i32)
                             cur_hv_raws.append(hv_i32)
@@ -989,15 +1009,36 @@ def launch_gemm_a8w4_tdm(
                 oc_store = oc
                 c_iter = fx.get_iter(arg_c)
             c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-            gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-            atomC = make_tdm_store(gtC, mn_oob, out_stride)
-            fx.copy(
-                atomC,
-                lds_view(
+            if const_expr(stage1_act):
+                gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                src = lds_view(
                     fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)
-                ),
-                gtC,
-            )
+                )
+            else:
+                # Padded dense store matching the b128 staging above. The LDS tile
+                # is (tile_m, STORE_PITCH) dense; the TDM store reads the full padded
+                # width contiguously (row stays coalesced), but the per-dim OOB
+                # extent clamps the inner axis to STORE_N, dropping the pad cols
+                # [STORE_N, STORE_PITCH) so they never reach global. The global row
+                # stride is out_stride (the real, unpadded pitch), so the pad exists
+                # only in LDS. dim0=row extent clamps M (mn_oob); dim1=col extent
+                # clamps to STORE_N.
+                gtC = global_view(
+                    c_iter, c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                )
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [mn_oob, STORE_N],
+                    strides=[out_stride, None],
+                    num_warps=num_waves,
+                )
+                src = lds_view(
+                    fx.recast_iter(oc_store, base_ptr),
+                    (tile_m, STORE_PITCH),
+                    (STORE_PITCH, 1),
+                )
+            fx.copy(atomC, src, gtC)
             tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
