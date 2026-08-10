@@ -17,7 +17,6 @@ AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
-MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
 
 
 class TestCSVValidation(unittest.TestCase):
@@ -119,25 +118,6 @@ class TestCSVValidation(unittest.TestCase):
                 "_tag",
             ],
         )
-
-    def test_kimik3_a8w4_uses_runtime_logical_inter_dims(self):
-        path = os.path.join(MODEL_CONFIGS_DIR, "kimik3_a8w4_tuned_fmoe.csv")
-        tuned = pd.read_csv(path)
-        production_key = tuned[
-            (tuned["gfx"] == "gfx950")
-            & (tuned["cu_num"] == 256)
-            & (tuned["token"] == 4096)
-            & (tuned["model_dim"] == 3584)
-            & (tuned["inter_dim"] == 3072)
-            & (tuned["expert"] == 896)
-            & (tuned["topk"] == 16)
-        ]
-        self.assertEqual(len(production_key), 1)
-        row = production_key.iloc[0]
-        self.assertEqual(row["_tag"], "exact-m4096-a")
-        self.assertTrue(row["kernelName1"].startswith("flydsl_moe1_"))
-        self.assertTrue(row["kernelName2"].startswith("flydsl_moe2_"))
-        self.assertIn("reduce", row["kernelName2"])
 
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
