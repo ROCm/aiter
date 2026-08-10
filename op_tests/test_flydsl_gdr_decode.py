@@ -8,13 +8,6 @@ and runs each as ``python3 <file>`` (``.github/scripts/aiter_test.sh``), so the
 in-package suite at ``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never
 runs automatically, and a file without the ``__main__`` entry below collects
 nothing and still exits 0. Being listed is not the same as being run.
-
-These cases trust the torch reference and put the *kernel* on trial;
-``op_tests/test_kda_torch_ref.py`` runs the arrow backwards. Which one fails
-localises the fault: here alone, the per-channel kernel; there alone, the
-reference; both, the gate formula they share.
-
-Keep it thin -- shapes belong here, the reference kernel belongs in-package.
 """
 
 import pytest
@@ -27,7 +20,7 @@ pytestmark = pytest.mark.skipif(
     not is_flydsl_available(), reason="flydsl is not installed"
 )
 
-# Skips at import when flydsl or a GPU is missing, taking this module with it.
+# This import skips the whole module when flydsl or a GPU is missing.
 from aiter.ops.flydsl.test_flydsl_linear_attention import (
     Args,
     check_gdr_decode,
@@ -37,7 +30,7 @@ from aiter.ops.flydsl.test_flydsl_linear_attention import (
 @pytest.mark.parametrize(
     "args",
     [
-        # Smallest GQA shape, the pre-847 scalar path.
+        # Smallest GQA shape on the scalar-gate path.
         Args(
             dtype=torch.bfloat16,
             b=1,

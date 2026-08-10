@@ -47,7 +47,7 @@ class Args:
     head_k_dim: int
     head_v_dim: int
     use_qk_l2norm: bool = True
-    # KDA pairs an f32 bias with a lower-precision query; None is pre-847 behaviour.
+    # KDA pairs an f32 bias with a lower-precision query.
     dt_bias_dtype: torch.dtype | None = None
 
 

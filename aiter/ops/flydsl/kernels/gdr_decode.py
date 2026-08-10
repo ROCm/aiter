@@ -47,7 +47,7 @@ def create_vk_gdr_decode_kernel(
 ):
     # "gdr": per-head decay, -exp(A_log) * softplus(a + dt_bias).
     # "kda": per-channel decay, g_min * sigmoid(exp(A_log) * (a + dt_bias)).
-    # Separate binaries, so "gdr" stays bit-identical to pre-847.
+    # Separate binaries, so adding "kda" leaves "gdr" bit-identical.
     assert gate_mode in ("gdr", "kda"), gate_mode
     PER_CHANNEL = gate_mode == "kda"
     # The out store narrows anything that is not bf16 to f16.
