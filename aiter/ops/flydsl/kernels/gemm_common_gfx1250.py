@@ -157,6 +157,71 @@ def lds_addr_keepalive(*bases_idx):
     )
 
 
+def vgpr_keepalive(*raw_vals):
+    """Pin arbitrary VGPR *data* values live to this program point.
+
+    The data-register analogue of :func:`lds_addr_keepalive`. Where that helper
+    pins ds base *addresses*, this one pins whole register values (scalars or
+    vectors) that are passed in raw. It reads each value through a
+    side-effecting inline-asm no-op, so the value's live range extends past this
+    point and the register allocator cannot reuse its physical register(s) for a
+    def emitted before it.
+
+    Motivating case (epilogue): the store data is produced by a ``v_cvt`` batch
+    into a small window of VGPRs, then stored to LDS. With that window reused
+    across every store, the *next* cvt batch overwrites registers that in-flight
+    stores still read -- a WAR hazard the backend gates with
+    ``s_wait_alu depctr_vm_vsrc(N)``. Pinning one store batch's data across the
+    next cvt batch forces that batch onto fresh registers (ping-pong across two
+    banks), so the WAR wait disappears. Relies on VGPR headroom (occupancy at
+    the floor, no spills).
+
+    Args:
+        *raw_vals: raw ``ir.Value`` operands (e.g. ``vec<4xi32>`` store data).
+    """
+    vals = [_raw(v) for v in raw_vals]
+    if not vals:
+        return
+    llvm_dialect.InlineAsmOp(
+        res=None,
+        operands_=vals,
+        asm_string="; vgpr keepalive",
+        constraints=",".join(["v"] * len(vals)),
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+def opaque_const_i32(c):
+    """Return the compile-time i32 *c* as a value the optimizer cannot fold.
+
+    An inline-asm ``s_mov_b32`` identity: the constant is materialized into an
+    SGPR, then passed through opaque asm whose result LLVM cannot re-analyze as
+    a constant.
+
+    Purpose: keep a compile-time ``slot * PITCH`` out of the ds_load immediate.
+    In a fully-unrolled pipeline drain the slot index is a compile-time
+    constant, so ``slot * PITCH`` fuses with each ds_load's small byte offset;
+    the fused sum overflows the 16-bit ds immediate range and the backend emits
+    a per-load ``v_add`` instead of folding the offset. The runtime steady loop
+    is immune because its ``slot * PITCH`` comes from the loop counter and lives
+    in an SGPR. Laundering the drain's pitch through this opaque SGPR reproduces
+    that: the region base is formed once (base + pitch) and every ds_load keeps
+    its small compile-time immediate. ``rocdl.readfirstlane`` does NOT work here
+    -- LLVM knows readfirstlane of a uniform constant is that constant and folds
+    it straight back.
+    """
+    const_val = _raw(arith.constant(c, type=T.i32))
+    return llvm_dialect.InlineAsmOp(
+        T.i32,
+        [const_val],
+        "s_mov_b32 $0, $1",
+        "=s,s",
+        has_side_effects=False,
+        is_align_stack=False,
+    ).result
+
+
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
     """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM).
 

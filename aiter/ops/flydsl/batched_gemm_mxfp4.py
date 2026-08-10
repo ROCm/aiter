@@ -11,6 +11,8 @@ as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -20,8 +22,38 @@ from .kernels.tensor_shim import ptr_arg
 SCALE_GROUP_SIZE = 32
 WMMA_K_GFX1250 = 128
 
+# Workgroup-cluster degree for the contiguous-M grouped a8w4 kernel. Off by
+# default; "auto" picks the largest supported degree dividing the N-tile count.
+# Cluster peers share one M-tile and differ only in N-tile, so a single
+# CLUSTER_LOAD_ASYNC fans the shared A / A-scale load out to every peer's LDS.
+_CLUSTER_N_ENV = "AITER_FLYDSL_MXFP4_CLUSTER_N"
+_SUPPORTED_CLUSTER_N = (4, 3, 2)
+
 # a_dtype -> A bytes per code (fp4 = 2 codes/byte; fp6/fp8 = 1 byte/code).
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
+
+
+def _pick_cluster_n(n_tiles: int) -> int:
+    """Cluster degree for ``n_tiles`` N-tiles; 1 means no clustering.
+
+    A cluster's mask names every one of its workgroups, so a partially filled
+    cluster would stall -- only degrees that divide ``n_tiles`` are usable.
+    """
+    want = os.environ.get(_CLUSTER_N_ENV, "1").strip().lower()
+    if want in ("", "0", "1", "off", "false"):
+        return 1
+    if want == "auto":
+        for c in _SUPPORTED_CLUSTER_N:
+            if n_tiles % c == 0:
+                return c
+        return 1
+    try:
+        forced = int(want)
+    except ValueError:
+        return 1
+    if forced in _SUPPORTED_CLUSTER_N and n_tiles % forced == 0:
+        return forced
+    return 1
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -83,6 +115,16 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_scale_tensor = out  # dummy, never written
     else:
         quant_scale_tensor = quant_scale.view(torch.uint8)
+    # Cluster degree fans the shared A / A-scale load across N-tile peers via a
+    # single CLUSTER_LOAD_ASYNC. A partial cluster names workgroups that never
+    # launch and would stall, so cluster_n must divide the N-tile count.
+    n_tiles = (N + (tile_n - 1)) // tile_n
+    cluster_n = _pick_cluster_n(n_tiles)
+    if cluster_n > 1 and n_tiles % cluster_n:
+        raise ValueError(
+            f"cluster_n={cluster_n} does not divide n_tiles={n_tiles} "
+            f"(N={N}, tile_n={tile_n})"
+        )
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -110,6 +152,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         stage1_quant_out,
         quant_wmma_rep,
         quant_scale_tensor,
+        cluster_n,
     )
     return out
 

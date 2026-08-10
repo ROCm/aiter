@@ -20,10 +20,12 @@ from .gemm_common_gfx1250 import (
     lds_addr_keepalive,
     lds_load_b32_raw,
     lds_load_b128_raw,
+    opaque_const_i32,
     lds_store_b32_raw,
     lds_store_b64_raw,
     lds_store_b128_raw,
     pipeline_fence,
+    vgpr_keepalive,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -63,6 +65,7 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
+    cluster_n: Constexpr[int] = 1,
 ):
     cache_tag = (
         K,
@@ -80,6 +83,7 @@ def launch_gemm_a8w4_tdm(
         TDM_DESCRIPTOR_VERSION,
         stage1_quant_out,
         quant_wmma_rep,
+        cluster_n,
     )
     _ = cache_tag
     WMMA_M = WMMA_N = 16
@@ -120,7 +124,10 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
-    C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
+    # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
+    # (STORE_N+16) to break the ds_store bank conflict; reserve that here so the
+    # padded C tile fits the shared LDS arena (harmless for the narrower act path).
+    C_STORE_B = ((tile_m * (tile_n + 16) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -134,11 +141,12 @@ def launch_gemm_a8w4_tdm(
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
+    _cn = f"_cn{cluster_n}" if cluster_n > 1 else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cn}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -171,19 +179,39 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
-        # DeepGEMM contiguous-M swizzle
+        # DeepGEMM contiguous-M swizzle. A cluster's peers are cluster_n
+        # CONSECUTIVE block ids, and they must land on one m_tile and differ only
+        # in n_tile, so the swizzle runs on cluster granularity (N counted in
+        # units of cluster_n) and n_tile is reassembled from the cluster-local id.
+        # cluster_n is a Python constant, so each ternary picks its form at build
+        # time. A statement-level `if` cannot be used inside the kernel: the AST
+        # rewriter turns it into a traced branch whose assignments never escape.
         TILES_PER_GROUP = 16
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
-        blocks_per_group = total_n_tiles * TILES_PER_GROUP
-        group = bid_x // blocks_per_group
+        swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
+        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
+        n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
+        blocks_per_group = n_units * TILES_PER_GROUP
+        group = swz_id // blocks_per_group
         group_first_tile = group * TILES_PER_GROUP
-        in_group = bid_x - group * blocks_per_group
+        in_group = swz_id - group * blocks_per_group
         rem_tiles = total_m_tiles - group_first_tile
         group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
         m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
         blk_m = m_tile * tile_m
-        blk_n = (in_group // group_tiles) * tile_n
+        n_unit = in_group // group_tiles
+        blk_n = (
+            (n_unit * cluster_n + local_n) * tile_n
+            if cluster_n > 1
+            else n_unit * tile_n
+        )
+        # All peers of a 1D cluster share this tile's A rows (they only differ in
+        # n_tile), so one A load can serve the whole cluster. The peer set is the
+        # entire cluster, hence a constant all-ones mask -- no cluster-local id
+        # needed. Only A is broadcast: B and the B scale are indexed by n_tile,
+        # which is exactly what differs between peers.
+        a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 else 0
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
@@ -364,7 +392,7 @@ def launch_gemm_a8w4_tdm(
             def wave_sel(a, b, c, d):  # pick this wave's value (else B-scale)
                 return is_a.select(a, is_b.select(b, is_as.select(c, d)))
 
-            def make_dgroup1(inner, outer, stride0, elem_bytes, pad_iv, pad_am, oob):
+            def make_dgroup1(inner, outer, stride0, elem_bytes, pad_iv, pad_am, oob, wg_mask=0):
                 # GROUP1 (vec<8xi32>) for num_warps=1 (one whole tensor per wave):
                 # dim0=inner (innermost), dim1=outer (outermost). Same bit layout as
                 # tdm_ops.make_tensor_descriptor_2d.
@@ -374,7 +402,20 @@ def launch_gemm_a8w4_tdm(
                     pad_en = 1
                 else:
                     enc_iv, enc_am, pad_en = 0, 0, 0
-                g0 = fx.Int32((dsc << 16) | (pad_en << 20) | (enc_iv << 22) | (enc_am << 25))
+                # A non-zero workgroup_mask (bits [15:0]) switches this load from
+                # GLOBAL_LOAD_ASYNC to CLUSTER_LOAD_ASYNC, fanning one load out to
+                # every cluster peer's LDS. early_timeout (bit 21) lets GL1 re-broadcast
+                # to latecomers instead of holding early arrivals for a wider merge --
+                # only meaningful, and only set, when multicast is on.
+                early_timeout = 1 if wg_mask else 0
+                g0 = fx.Int32(
+                    (wg_mask & 0xFFFF)
+                    | (dsc << 16)
+                    | (pad_en << 20)
+                    | (early_timeout << 21)
+                    | (enc_iv << 22)
+                    | (enc_am << 25)
+                )
                 g1 = fx.Int32((inner & 0xFFFF) << 16)
                 if const_expr(oob is None):
                     g2 = fx.Int32(((inner >> 16) & 0xFFFF) | ((outer & 0xFFFF) << 16))
@@ -395,8 +436,13 @@ def launch_gemm_a8w4_tdm(
             glb_base = [fx.Int64(fx.ptrtoint(fx.get_iter(j.gt))) for j in jobs]  # tile byte base
             lds_within = [(j.lds_off * 4 if j.on_i32 else j.lds_off) for j in jobs]  # LDS byte off in slot
             k_bytes = [j.k_adv for j in jobs]  # per-k-tile global byte advance
+            # Per-job multicast mask (jobs order A, B, A-scale, B-scale). Only A and
+            # its scale are shared across a cluster's peers; B / B-scale differ by
+            # n_tile, so they stay per-workgroup (mask 0).
+            mcast = [a_mcast_mask, 0, a_mcast_mask, 0]
             dgroup1 = wave_sel(*[make_dgroup1(j.inner, j.outer, j.stride, 4 if j.on_i32 else 1,
-                                              j.pad_iv, j.pad_am, j.oob) for j in jobs])
+                                              j.pad_iv, j.pad_am, j.oob, wg_mask=mcast[t])
+                                 for t, j in enumerate(jobs)])
 
         def issue(s, kt):
             if const_expr(FOURW):
@@ -573,12 +619,12 @@ def launch_gemm_a8w4_tdm(
 
         def pf_load(p, bases, ksl):
             ba, bb, bsa, bsb = bases
-            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
-            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 pf_act[p][wm].store(load_a(ba, wm, ksl))
             for wn in range_constexpr(wmma_n_rep):
                 pf_wt[p][wn].store(load_b(bb, wn, ksl))
+            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             # Pack all scales into one wide rmem vector store. from_elements
             # consumes the ds-reads exactly like load_a/load_b's shuffle, so the
             # backend tracks the ds->pack dependency; no manual wait here.
@@ -676,12 +722,34 @@ def launch_gemm_a8w4_tdm(
                                    else (0, bases1, 0))
                             pf_step(ksl % 2, nxt)
 
-                    pipeline_fence(outstanding=0)
+                    # The drain is fully unrolled, so its slot index is a
+                    # compile-time constant and slot*PITCH is a constant the
+                    # backend fuses into every ds_load byte offset -- that
+                    # overflows the ds immediate range and forces a per-load
+                    # v_add (see the tail vs steady ISA). The steady loop is
+                    # immune because its slot*PITCH is derived from the runtime
+                    # loop counter and lives in an SGPR. Launder the drain's
+                    # slot*PITCH through an opaque inline-asm SGPR so it likewise
+                    # cannot fold into the offset: the region base is then formed
+                    # once (base + slot) and each ds_load keeps its small
+                    # compile-time immediate offset. (readfirstlane does not work
+                    # -- LLVM folds readfirstlane of a uniform constant away.)
+                    def drain_buf_idx(slot):
+                        slot = slot % num_buffers
+                        if slot == 0:
+                            return stC_idx
+                        return stC_idx + fx.index_cast(
+                            T.index, opaque_const_i32(slot * PITCH)
+                        )
+
                     for j in range_constexpr(num_buffers):
+                        if const_expr(j != num_buffers - 1):
+                            pipeline_fence(outstanding=TDM_PER * (num_buffers - j - 2))
+
                         kt = n_steady + j
                         s = kt % num_buffers
-                        bases = bases_of(ptr_to_idx(buf_ptr(s)))
-                        bases1 = bases_of(ptr_to_idx(buf_ptr((kt + 1) % num_buffers)))
+                        bases = bases_of(drain_buf_idx(s))
+                        bases1 = bases_of(drain_buf_idx(kt + 1))
                         has_next = kt + 1 < K_TILES
                         for ksl in range_constexpr(KWS):
                             nxt = ((((ksl + 1) % 2), bases, ksl + 1) if const_expr(ksl < KWS - 1)
@@ -722,6 +790,21 @@ def launch_gemm_a8w4_tdm(
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
+            # b128 passthrough store: stage the C tile into LDS as a dense row-major
+            # tile with a PADDED row pitch to break the ds_store bank conflict while
+            # keeping the TDM store's contiguous (coalesced) global write. An
+            # unpadded tile has row pitch STORE_N bf16 == STORE_N/2 dwords (mult of
+            # 32), so the 16 rows one b128 writes (row = lane%16) all land on the
+            # same banks -> 16-way conflict (4x the b128 4-cycle floor). Padding the
+            # pitch to STORE_N+STORE_PAD makes bank = ((STORE_N+STORE_PAD)/2)*row mod
+            # 32 spread the rows; STORE_PAD=16 -> +8 dwords/row -> 4-way = floor.
+            # The pad columns are never written to global: the TDM store reads the
+            # full (tile_m, STORE_PITCH) dense tile but its per-dim OOB extent clamps
+            # the inner axis to STORE_N, dropping cols [STORE_N, STORE_PITCH). The
+            # real STORE_N cols of each row stay contiguous in LDS and in global, so
+            # the global write is still fully coalesced (1 KB/row bursts).
+            STORE_PAD = 16 if not stage1_act else 0
+            STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
@@ -819,8 +902,22 @@ def launch_gemm_a8w4_tdm(
                         alignment=2,
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+                # Software-pipeline the b128 store data across STORE_PIPE_DEPTH+1
+                # VGPR banks: pin the previous STORE_PIPE_DEPTH wm rows' store
+                # data live across this row's cvt batch so the allocator gives
+                # this row's cvts fresh registers instead of reusing an older
+                # row's (which its in-flight ds_stores still read). Depth 1
+                # removes the WAR s_wait_alu(vm_vsrc) from reuse; deeper reserves
+                # more banks so the scheduler can hoist this row's cvts ahead of
+                # the older rows' stores, hiding the cvt latency and removing the
+                # RAW s_wait_alu(va_vdst) too. Only the passthrough b128 path
+                # reuses a narrow register window; the b64 act path is untouched.
+                STORE_PIPE_DEPTH = 4
+                STORE_PIN_STRIDE = 2
+                recent_hv_rows = []
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
+                    cur_hv_raws = []
                     for wn in range_constexpr(wmma_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
                         acc = Vec(accs[wm * wmma_n_rep + wn])
@@ -854,11 +951,48 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
-                            lds_store_b128_raw(
-                                stC_idx,
-                                (row_rel * STORE_N + col_rel) * 2,
-                                hv.bitcast(fx.Int32).ir_value(),
+                            # Padded dense staging: physical = row*STORE_PITCH + col,
+                            # so the 16 rows one b128 writes (row = lane%16) step by
+                            # STORE_PITCH/2 dwords instead of STORE_N/2. With
+                            # STORE_PAD=16 that is 264 dwords == 8 mod 32, spreading
+                            # the rows to 4-way (the b128 floor) vs the unpadded
+                            # 16-way. The compile-time row byte offset
+                            # wm*16*STORE_PITCH*2 still overflows the 16-bit ds
+                            # immediate for the higher wm rows, so (as in the drain
+                            # ds_loads) launder that row offset into the base through
+                            # an opaque SGPR and drop the wm*16 term from row_rel, so
+                            # each ds_store keeps its small wn immediate.
+                            row_byte = wm * 16 * STORE_PITCH * 2
+                            spill = const_expr(
+                                row_byte + (wmma_n_rep - 1) * 16 * 2 > 0xFFFF
                             )
+                            st_base = (
+                                stC_idx
+                                + fx.index_cast(T.index, opaque_const_i32(row_byte))
+                            ) if spill else stC_idx
+                            st_off = (
+                                ((wmb + lane16) * STORE_PITCH + col_rel) * 2
+                            ) if spill else ((row_rel * STORE_PITCH + col_rel) * 2)
+                            hv_i32 = hv.bitcast(fx.Int32).ir_value()
+                            lds_store_b128_raw(st_base, st_off, hv_i32)
+                            cur_hv_raws.append(hv_i32)
+                    if const_expr(not stage1_act):
+                        # Pin the last STORE_PIPE_DEPTH rows' store data across
+                        # this row's cvts. The keepalive is side-effecting, so it
+                        # is also a scheduling barrier; fire it only every
+                        # STORE_PIN_STRIDE rows so the scheduler keeps large
+                        # barrier-free windows to hoist cvts in (kills the RAW
+                        # va_vdst) while still forcing fresh banks (kills the WAR
+                        # vm_vsrc).
+                        recent_hv_rows.append(cur_hv_raws)
+                        if const_expr(wm % STORE_PIN_STRIDE == STORE_PIN_STRIDE - 1):
+                            pin = [
+                                r
+                                for row in recent_hv_rows[-STORE_PIPE_DEPTH:]
+                                for r in row
+                            ]
+                            if pin:
+                                vgpr_keepalive(*pin)
 
             # -- Shared LDS -> TDM store to global --
             workgroup_barrier()
@@ -875,20 +1009,41 @@ def launch_gemm_a8w4_tdm(
                 oc_store = oc
                 c_iter = fx.get_iter(arg_c)
             c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-            gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-            atomC = make_tdm_store(gtC, mn_oob, out_stride)
-            fx.copy(
-                atomC,
-                lds_view(
+            if const_expr(stage1_act):
+                gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                src = lds_view(
                     fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)
-                ),
-                gtC,
-            )
+                )
+            else:
+                # Padded dense store matching the b128 staging above. The LDS tile
+                # is (tile_m, STORE_PITCH) dense; the TDM store reads the full padded
+                # width contiguously (row stays coalesced), but the per-dim OOB
+                # extent clamps the inner axis to STORE_N, dropping the pad cols
+                # [STORE_N, STORE_PITCH) so they never reach global. The global row
+                # stride is out_stride (the real, unpadded pitch), so the pad exists
+                # only in LDS. dim0=row extent clamps M (mn_oob); dim1=col extent
+                # clamps to STORE_N.
+                gtC = global_view(
+                    c_iter, c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                )
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [mn_oob, STORE_N],
+                    strides=[out_stride, None],
+                    num_warps=num_waves,
+                )
+                src = lds_view(
+                    fx.recast_iter(oc_store, base_ptr),
+                    (tile_m, STORE_PITCH),
+                    (STORE_PITCH, 1),
+                )
+            fx.copy(atomC, src, gtC)
             tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(
+    kargs = (
         arg_c,
         arg_a,
         arg_b,
@@ -900,7 +1055,23 @@ def launch_gemm_a8w4_tdm(
         i32_m,
         N,
         f32_swiglu_limit,
-    ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
+    )
+    grid = (m_tiles * n_tiles, 1, 1)
+    if cluster_n > 1:
+        # The cluster geometry must reach BOTH the kernel definition (value_attrs)
+        # and the launch site (cluster=): if only one carries it the cluster never
+        # forms and the TDM loads silently fall back to the slow per-load path.
+        kernel(
+            *kargs,
+            value_attrs={"rocdl.cluster_dims": f"{cluster_n},1,1"},
+        ).launch(
+            grid=grid,
+            block=(block, 1, 1),
+            stream=stream,
+            cluster=(cluster_n, 1, 1),
+        )
+    else:
+        kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
