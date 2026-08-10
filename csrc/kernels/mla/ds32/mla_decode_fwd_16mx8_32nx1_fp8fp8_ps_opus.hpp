@@ -1054,10 +1054,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     __builtin_amdgcn_sched_barrier(0);
 
     // Stagger: the group that skipped the prologue barrier does its extra one here.
-    if constexpr(!STAGGER)
-    {
-        __builtin_amdgcn_s_barrier();
-    }
+    // if constexpr(!STAGGER)
+    // {
+    //     __builtin_amdgcn_s_barrier();
+    // }
 }
 
 template <class Traits, bool STAGGER>
