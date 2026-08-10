@@ -176,7 +176,7 @@ def launch_gemm_a8w4_tdm(
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
     # Marked when on, so the baseline keeps its original symbol.
-    _next_stage = "_next_stage" if next_stage_on else ""
+    _next_stage = "_prefetch" if next_stage_on else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -611,9 +611,9 @@ def launch_gemm_a8w4_tdm(
         MMA_GROUP_NO_ACT = 4
         # Fraction of the slots that carry the prefetch reads; the rest close the
         # region on pure MFMA, covering the next k128's REUSE fence.
-        FENCE_READ_FRONT = 0.5
+        FENCE_READ_FRONT = 1
         # WMMA reserved as that closing group.
-        FENCE_COVER_MMA = 16
+        FENCE_COVER_MMA = 8
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
