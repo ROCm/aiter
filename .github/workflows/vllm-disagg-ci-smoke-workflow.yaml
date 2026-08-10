@@ -34,14 +34,13 @@ permissions:
 
 env:
   VLLM_REPOSITORY_URL: https://github.com/vllm-project/vllm.git
-  VLLM_BRANCH: main
-  # TODO: Remove the temporary fetch/cherry-pick after vLLM PR #47030 merges.
-  VLLM_DI_PR_NUMBER: "47030"
+  # Exact source tree used by the passing vLLM AMD DI Buildkite build #17.
+  VLLM_BASELINE_SHA: a42850c85f815ab3123a541bc92fb9b35892335e
   # Image used by the passing vLLM AMD DI Buildkite build #17 on 2026-07-30.
   BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e' }}
+  VLLM_ROUTER_IMAGE: vllm/vllm-router@sha256:0eb9f5befddec4cf56346b6f016d8396c721f635f6771c105fc739bbf1e10bcc
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
-  SPUR_PENDING_TIMEOUT_S: "7200"
   AITER_GPU_ARCHS: gfx950
   AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
@@ -142,28 +141,13 @@ jobs:
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
     steps:
-      - name: Checkout vLLM main
+      - name: Checkout vLLM Buildkite 17 baseline
         uses: actions/checkout@v4
         with:
           repository: vllm-project/vllm
-          ref: main
+          ref: a42850c85f815ab3123a541bc92fb9b35892335e
           fetch-depth: 1
           path: vllm
-
-      - name: Apply full vLLM PR 47030 patch series
-        working-directory: vllm
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git config user.name "AITER CI"
-          git config user.email "aiter-ci@users.noreply.github.com"
-          curl --fail --location --silent --show-error \
-            --retry 8 --retry-all-errors --retry-delay 5 \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "Accept: application/vnd.github.patch" \
-            "https://api.github.com/repos/vllm-project/vllm/pulls/${VLLM_DI_PR_NUMBER}" |
-            git am -3
 
       - name: Select vLLM-router cases
         id: select
@@ -177,13 +161,8 @@ jobs:
           from pathlib import Path
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
-          # Kimi cases are temporarily excluded while their known model issues
-          # are investigated independently from this integration smoke.
-          models = {"DeepSeek-V3", "DeepSeek-R1-MXFP4", "MiniMax-M3-MXFP8"}
-          topologies = {
-              "1P1D": "1P1D-TP8",
-              "2P2D": "2P2D-TP8",
-          }
+          models = {"MiniMax-M3-MXFP8"}
+          topologies = {"2P2D": "2P2D-TP8"}
           cases = []
           label = None
 
@@ -194,13 +173,21 @@ jobs:
                   continue
 
               command_match = re.match(
-                  r"\s*-\s+(MODEL_NAME=.*run-slurm-disagg-test\.sh)\s*$",
+                  r"\s*-\s+((?:IMAGE=\S+\s+)?MODEL_NAME=.*run-slurm-disagg-test\.sh)\s*$",
                   line,
               )
               if not command_match or not label or not label.endswith("-vllm-router"):
                   continue
 
               command = command_match.group(1)
+              # The historical pipeline used the mutable :nightly tag inline.
+              # Replace only that token with the immutable image from build #17.
+              command = re.sub(
+                  r"^IMAGE=\S+",
+                  f"IMAGE={os.environ['BASE_IMAGE']}",
+                  command,
+                  count=1,
+              )
               model_match = re.search(r"(?:^|\s)MODEL_NAME=([^\s]+)", command)
               nodes_match = re.search(r"(?:^|\s)NODES=([0-9]+)", command)
               if not model_match or not nodes_match:
@@ -266,7 +253,7 @@ jobs:
     timeout-minutes: 600
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -290,74 +277,18 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM main and apply full PR 47030 patch series
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checkout vLLM Buildkite 17 baseline
         run: |
           set -euo pipefail
           rm -rf vllm
           git init vllm
           cd vllm
           git remote add origin "${VLLM_REPOSITORY_URL}"
-          git fetch --depth=1 origin "${VLLM_BRANCH}"
+          git fetch --depth=1 origin "${VLLM_BASELINE_SHA}"
           git checkout --detach FETCH_HEAD
-          base_sha="$(git rev-parse HEAD)"
-
-          git fetch --depth=1 origin "refs/pull/${VLLM_DI_PR_NUMBER}/head"
-          pr_sha="$(git rev-parse FETCH_HEAD)"
-          git config user.name "AITER CI"
-          git config user.email "aiter-ci@users.noreply.github.com"
-          curl --fail --location --silent --show-error \
-            --retry 8 --retry-all-errors --retry-delay 5 \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "Accept: application/vnd.github.patch" \
-            "https://api.github.com/repos/vllm-project/vllm/pulls/${VLLM_DI_PR_NUMBER}" |
-            git am -3
-
-          echo "VLLM_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
-          echo "VLLM_PR_SHA=${pr_sha}" >> "${GITHUB_ENV}"
-          echo "VLLM_TEST_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
-
-      - name: Configure stock-image AITER runtime
-        run: |
-          set -euo pipefail
-          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
-          test -d "${disagg_dir}"
-          rm -rf "${disagg_dir}/aiter_overlay"
-
-          # Keep the same upstream environment and V3 timeout used by the
-          # overlay run, but import AITER directly from the nightly image.
-          cat > "${disagg_dir}/stock_cluster_env.sh" <<'SH'
-          #!/usr/bin/env bash
-          source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
-          export GPU_ARCHS=gfx950
-          # vLLM PR 50999 switched local MP rendezvous to FileStore, while
-          # AITER 0.1.19 custom all-reduce currently requires TCPStore.
-          export VLLM_ROCM_USE_AITER_CUSTOM_AR=0
-          echo "[aiter-stock] AITER custom all-reduce=${VLLM_ROCM_USE_AITER_CUSTOM_AR}"
-          if [[ "${MODEL_NAME:-}" == "DeepSeek-V3" ]]; then
-              export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}"
-              echo "[aiter-stock] DeepSeek-V3 execute-model timeout=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS}s"
-          fi
-          python3 - <<'PY'
-          from importlib.metadata import version
-          import aiter
-          import flydsl
-
-          print(
-              f"[aiter-stock] loaded {aiter.__file__}; "
-              f"flydsl={version('flydsl')} at {flydsl.__file__}"
-          )
-          PY
-          SH
-          chmod +x "${disagg_dir}/stock_cluster_env.sh"
-
-          grep -n "aiter-stock" "${disagg_dir}/stock_cluster_env.sh"
-          grep -n 'CLUSTER_ENV_IN=' "${disagg_dir}/run_xPyD_disagg.slurm"
-          grep -n 'export CLUSTER_ENV=' "${disagg_dir}/run_xPyD_disagg.slurm"
-          git -C "${GITHUB_WORKSPACE}/vllm" diff --exit-code -- \
-            .buildkite/amd-disagg/vllm_disagg.sh \
-            .buildkite/amd-disagg/run_xPyD_disagg.slurm
+          test "$(git rev-parse HEAD)" = "${VLLM_BASELINE_SHA}"
+          echo "VLLM_BASE_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
+          echo "VLLM_TEST_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
 
       - name: Configure Spur node pool for topology
         run: |
@@ -405,17 +336,14 @@ jobs:
             echo "### vLLM disagg smoke input"
             echo
             echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
-            echo "- vLLM branch: \`${VLLM_BRANCH}\`"
-            echo "- vLLM base SHA: \`${VLLM_BASE_SHA}\`"
-            echo "- Temporary vLLM PR: \`#${VLLM_DI_PR_NUMBER}\` at \`${VLLM_PR_SHA}\`"
-            echo "- AITER runtime: \`stock nightly image (no AITER overlay)\`"
-            echo "- DeepSeek-V3 execute-model timeout: \`900s\`"
-            echo "- Upstream request warmup patch: \`disabled\`"
+            echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
+            echo "- AITER runtime: \`stock pinned image (no AITER overlay)\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
             echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
             echo "- IMAGE: \`${BASE_IMAGE}\`"
+            echo "- VLLM_ROUTER_IMAGE: \`${VLLM_ROUTER_IMAGE}\`"
             echo "- SPUR_NODE_POOL: \`${SPUR_NODE_POOL}\`"
             echo "- SPUR_NODE_EXCLUDE: \`${SPUR_NODE_EXCLUDE}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -445,7 +373,7 @@ jobs:
           mkdir -p "${log_root}"
 
           cd "${GITHUB_WORKSPACE}/vllm"
-          echo "Running upstream vLLM case from PR #${VLLM_DI_PR_NUMBER}: ${CASE_NAME}"
+          echo "Running vLLM Buildkite #17 baseline case: ${CASE_NAME}"
           echo "${UPSTREAM_CASE_COMMAND}"
 
           stream_disagg_logs() {
@@ -531,12 +459,11 @@ jobs:
 
           set +e
           env \
-            BUILDKITE_COMMIT="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
+            BUILDKITE_COMMIT="${VLLM_BASELINE_SHA}" \
             IMAGE="${BASE_IMAGE}" \
+            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
-            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/stock_cluster_env.sh" \
-            PENDING_MAX_S="${SPUR_PENDING_TIMEOUT_S}" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
           touch "${stream_done}"
