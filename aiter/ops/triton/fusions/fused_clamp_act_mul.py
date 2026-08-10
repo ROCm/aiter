@@ -214,52 +214,18 @@ def fused_clamp_act_mul(
             f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a multiple of "
             f"quant_block_size ({quant_block_size})"
         )
-        
+
         # Decide by MB moved.
         if (M*D*2*2+M*D*2 < 20):
-            num_buffers = 1
+            ROWS_PER_PROG = 1
+            BLOCK_SIZE_M = 1
         elif (M*D*2*2+M*D*2 < 500):
-            num_buffers = 2
+            ROWS_PER_PROG = 2
+            BLOCK_SIZE_M = 2
         else:
-            num_buffers = 2
+            ROWS_PER_PROG = 2
+            BLOCK_SIZE_M = 2
 
-
-    # Args are identical for both kernels; the Gluon kernel takes one extra
-    # `cache_modifier` constexpr (threaded into every gl.load).
-    kernel_args = (
-        inp,
-        out,
-        scale_arg,
-        weights if HAVE_WEIGHTS else inp,
-        M,
-        n_half,
-        inp.stride(0),
-        inp.stride(1),
-        out.stride(0),
-        out.stride(1),
-        scale_row_stride,
-        scale_col_stride,
-        weights.stride(0) if HAVE_WEIGHTS else 0,
-        weights.stride(1) if HAVE_WEIGHTS else 0,
-        swiglu_limit,
-    )
-    kernel_constexprs = dict(
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=quant_block_size,
-        SCALE_FMT=scale_dtype_fmt,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_WEIGHTS=HAVE_WEIGHTS,
-        WEIGHT_BROADCAST=WEIGHT_BROADCAST,
-        HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
-        HAS_QUANT=HAS_QUANT,
-        ACTIVATION=activation,
-        SHUFFLE=shuffle_scale,
-        SCALE_N_PAD=scale_n_pad,
-        num_warps=num_warps,
-    )
-
-    if backend == "gluon":
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
@@ -268,22 +234,72 @@ def fused_clamp_act_mul(
             _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
         )
 
-        _LOGGER.info(
-            f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
-        )
-        
+        # compressed version only helpful if replicated 10 times, not two
         _fused_clamp_silu_mul_gluon_kernel[
-            (triton.cdiv(M, num_buffers),)
+            (triton.cdiv(M, ROWS_PER_PROG),)
         ](
-            *kernel_args,
-            **kernel_constexprs,
-            ROWS_PER_PROG=num_buffers,
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
+            ROWS_PER_PROG=ROWS_PER_PROG,
             cache_modifier=".cg",
         )
     else:
         _fused_clamp_silu_mul_kernel[(M,)](
-            *kernel_args,
-            **kernel_constexprs,
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
         )
 
     if HAS_QUANT:

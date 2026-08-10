@@ -48,6 +48,7 @@ def _fused_clamp_silu_mul_kernel(
     weights_stride_n,    # weights col stride
     swiglu_limit,        # clamp bound (used only when HAVE_SWIGLU_CLAMP)
     ROWS_PER_PROG: gl.constexpr,    # ring buffers = rows per program = loop trips
+    BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     QUANT_BLOCK_SIZE: gl.constexpr,
     SCALE_FMT: gl.constexpr,
@@ -68,24 +69,24 @@ def _fused_clamp_silu_mul_kernel(
 
     # one 2d shared layout for ROWS_PER_PROGx2*N
     shared_tdm_layout_2d: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
-    pid = gl.program_id(0)                 
+    pid = gl.program_id(0)
     m_start = pid * ROWS_PER_PROG
 
     # gate + up
     gate_up_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, 2 * BLOCK_SIZE_N], shared_tdm_layout_2d
-    )
+        inp_ptr.dtype.element_ty, [BLOCK_SIZE_M, 1, 2 * BLOCK_SIZE_N], shared_tdm_layout_2d
+    ) # rows per prog tied to LDS, loop should be decoupled TODO
 
     inp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=inp_ptr,
-        shape=[M, 2 * n_half],
+        shape=[M, 2 * n_half], # could be M - m_start TODO
         strides=[inp_stride_m, inp_stride_n],
         block_shape=[1, 2 * BLOCK_SIZE_N],
         layout=shared_tdm_layout_2d,
     )
 
     # load both gate + up
-    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_up_smem.index(0))
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_up_smem)
 
     gLayout2D: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
@@ -94,8 +95,8 @@ def _fused_clamp_silu_mul_kernel(
         order=[1, 0],
     )
     sLayout2D: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[1, 32],
+        size_per_thread=[1, 8], # issue?
+        threads_per_warp=[1, 32], # issue?
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
@@ -114,7 +115,7 @@ def _fused_clamp_silu_mul_kernel(
         row = m_start + i
 
         # prefetch
-        if i + 1 < ROWS_PER_PROG:
+        if i + 1 < ROWS_PER_PROG: # turn this to epilogue TODO, remove dynamic
             nxt = i + 1
             gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_up_smem.index(nxt))
 
@@ -156,7 +157,7 @@ def _fused_clamp_silu_mul_kernel(
             gl.amd.gfx1250.tdm.async_wait(0)
 
         # reshape then slice
-        gate_up = gate_up_smem.index(i).reshape([2 * BLOCK_SIZE_N])
+        gate_up = gate_up_smem.index(i).reshape([2 * BLOCK_SIZE_N]) # index(i) -- issue TODO
         gate = gate_up.slice(0, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
         up = gate_up.slice(BLOCK_SIZE_N, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
 
