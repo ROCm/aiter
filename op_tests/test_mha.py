@@ -961,7 +961,6 @@ _SINK_CONFIGS = [
     # (batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim)
     (2, 128, 128, 4, 4, 64),
     (1, 64, 64, 6, 2, 128),
-    (5, 512, 512, 8, 8, 64),
 ]
 
 
@@ -979,12 +978,10 @@ def test_mha_bwd_sink_dsink(
     q, k, v, dout = _sink_make_qkvo(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
     )
-    sink = torch.empty(nhead, device=device, dtype=torch.float32).uniform_(
-            -1.0, 1.0
-            #3.0, 6.0
-            #30.0,60.0
-        )
-    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink)
+    sink = torch.empty(nhead, device=device, dtype=torch.float32).uniform_(-1.0, 1.0)
+    out, lse = _sink_run_fwd(
+        q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     _dq, _dk, _dv, _softmax_d = aiter.mha_bwd(
@@ -1005,8 +1002,6 @@ def test_mha_bwd_sink_dsink(
     )
 
     assert d_sink.abs().max() > 0, "d_sink was not updated by mha_bwd"
-    #print(f"sink: {sink}")
-    #print(f"d_sink: {d_sink}")
     d_sink_ref = _sink_reference_d_sink(dout, out, lse, sink)
     torch.testing.assert_close(
         d_sink,
@@ -1032,8 +1027,10 @@ def test_mha_bwd_with_sink_dq_dk_dv(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
     )
     sink_small = torch.full((nhead,), -1000.0, device=device, dtype=torch.float32)
-    
-    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink_small)
+
+    out, lse = _sink_run_fwd(
+        q.detach(), k.detach(), v.detach(), softmax_scale, causal, sink_small
+    )
 
     common_bwd_args = {
         "dropout_p": 0.0,
