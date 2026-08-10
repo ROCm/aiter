@@ -36,11 +36,20 @@ def reduce_scatter(
     dim=0,
     use_custom=False,
     distributed_init_method: str | None = None,
+    force_fallback=False,
 ):
     """Per-rank worker. Runs reduce_scatter on x with the given dim and
-    returns (output, per-call latency in us)."""
+    returns (output, per-call latency in us).
+
+    force_fallback: set AITER_CUSTOM_AR_MAX_SIZE=0 so the custom kernel is
+    disabled and every reduce_scatter takes the pynccl fallback path in
+    CudaCommunicator.reduce_scatter. This exercises the non-zero-dim fallback
+    that used to mis-lay-out its result (movedim direction + discarded
+    reshape/movedim); must be set before the group's CustomAllreduce is built."""
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
+    if force_fallback:
+        os.environ["AITER_CUSTOM_AR_MAX_SIZE"] = "0"
     logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
     set_custom_all_reduce(True)
     init_distributed_environment(
@@ -102,6 +111,7 @@ def run_reduce_scatter_parallel(
     rand_seed,
     use_custom,
     distributed_init_method,
+    force_fallback=False,
 ):
     """Spawn tp_size processes, each running one reduce_scatter call.
     Returns list of (out, us) per rank."""
@@ -114,7 +124,16 @@ def run_reduce_scatter_parallel(
         rets.append(
             pool.apply_async(
                 reduce_scatter,
-                args=(tp_size, pp_size, i, x, dim, use_custom, distributed_init_method),
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    x,
+                    dim,
+                    use_custom,
+                    distributed_init_method,
+                    force_fallback,
+                ),
             )
         )
     pool.close()
@@ -122,10 +141,15 @@ def run_reduce_scatter_parallel(
     return [el.get() for el in rets]
 
 
-def run_case(label, shape, dim, dtype, tp_size, init_method_factory):
+def run_case(
+    label, shape, dim, dtype, tp_size, init_method_factory, force_fallback=False
+):
     """End-to-end one case: spawn the custom run, compute accuracy against
     the analytic PyTorch reference, collect latency. Returns one row for
     the summary table.
+
+    force_fallback routes every reduce_scatter through the pynccl fallback
+    (custom AR disabled) instead of the custom kernel.
 
     No external-library comparison — other libs (torch.distributed /
     pynccl) don't support scatter on non-zero dims, so latency-vs-them
@@ -141,6 +165,7 @@ def run_case(label, shape, dim, dtype, tp_size, init_method_factory):
         rand_seed,
         True,
         init_method_factory(),
+        force_fallback,
     )
 
     # Analytic reference vs each rank's output.
@@ -157,6 +182,7 @@ def run_case(label, shape, dim, dtype, tp_size, init_method_factory):
 
     return {
         "case": label,
+        "path": "fallback" if force_fallback else "custom",
         "shape": str(tuple(shape)),
         "dim": dim,
         "dtype": str(dtype).split(".")[-1],
@@ -224,6 +250,21 @@ def build_cases(tp_size, dtype):
     ]
 
 
+def build_fallback_cases(tp_size, dtype):
+    """Cases that exercise the pynccl fallback (custom AR disabled), covering
+    every scatter axis. dim=1 and dim=2 are the regression targets: the old
+    fallback used the wrong movedim direction and discarded its reshape/movedim
+    results, so it returned a transposed (garbage) tensor for non-zero dims.
+
+    Only the requirement shape[dim] % tp_size == 0 matters here (no pack/vec
+    alignment gates on the fallback), so keep the shapes small."""
+    return [
+        ("fallback_dim0", (4 * tp_size, 8, 6), 0),
+        ("fallback_dim1_mid", (5, 4 * tp_size, 6), 1),
+        ("fallback_dim2_last", (5, 8, 4 * tp_size), 2),
+    ]
+
+
 l_dtype = ["bf16"]
 
 parser = argparse.ArgumentParser(description="reduce_scatter accuracy + latency test")
@@ -250,6 +291,19 @@ parser.add_argument(
     default=8,
     help="tensor-parallel world size (default: 8)",
 )
+parser.add_argument(
+    "-s",
+    "--suite",
+    type=str,
+    choices=["custom", "fallback", "all"],
+    default="all",
+    help="which kernel path to test: custom kernel, pynccl fallback, or both",
+)
+
+# The fallback path uses int-valued bf16 inputs whose reduced sum is exact, so a
+# correct result matches the reference to the bit; any nonzero error means the
+# non-zero-dim fallback mis-laid-out its output (the bug this guards against).
+FALLBACK_TOL = 1e-6
 
 
 if __name__ == "__main__":
@@ -266,25 +320,52 @@ if __name__ == "__main__":
         return get_distributed_init_method(get_ip(), get_open_port())
 
     rows = []
+    failures = []
     for dtype in dtypes_to_run:
-        all_cases = build_cases(tp_size, dtype)
-        if args.case is None:
-            cases_to_run = all_cases
-        else:
-            cases_to_run = [c for c in all_cases if c[0] == args.case]
-            assert cases_to_run, f"no case named {args.case!r}"
-        for label, shape, dim in cases_to_run:
-            print(
-                f"\n=== {label}  shape={shape}  dim={dim}  dtype={dtype}  tp={tp_size} ==="
-            )
-            row = run_case(label, shape, dim, dtype, tp_size, init_method_factory)
-            print(
-                f"  max_abs_err={row['max_abs_err']:.4g}  "
-                f"mean_abs_err={row['mean_abs_err']:.4g}  "
-                f"latency={row['min_us']:.2f}-{row['max_us']:.2f}us"
-            )
-            rows.append(row)
+        # (case-list, force_fallback) per selected suite.
+        suites = []
+        if args.suite in ("custom", "all"):
+            suites.append((build_cases(tp_size, dtype), False))
+        if args.suite in ("fallback", "all"):
+            suites.append((build_fallback_cases(tp_size, dtype), True))
+
+        for all_cases, force_fallback in suites:
+            if args.case is None:
+                cases_to_run = all_cases
+            else:
+                cases_to_run = [c for c in all_cases if c[0] == args.case]
+            for label, shape, dim in cases_to_run:
+                path = "fallback" if force_fallback else "custom"
+                print(
+                    f"\n=== [{path}] {label}  shape={shape}  dim={dim}  "
+                    f"dtype={dtype}  tp={tp_size} ==="
+                )
+                row = run_case(
+                    label,
+                    shape,
+                    dim,
+                    dtype,
+                    tp_size,
+                    init_method_factory,
+                    force_fallback,
+                )
+                print(
+                    f"  max_abs_err={row['max_abs_err']:.4g}  "
+                    f"mean_abs_err={row['mean_abs_err']:.4g}  "
+                    f"latency={row['min_us']:.2f}-{row['max_us']:.2f}us"
+                )
+                rows.append(row)
+                # Fallback cases have an exact reference -> any error is a bug.
+                if force_fallback and row["max_abs_err"] > FALLBACK_TOL:
+                    failures.append(
+                        f"{label} (dim={dim}): max_abs_err={row['max_abs_err']:.4g}"
+                    )
 
     df = pd.DataFrame(rows)
     print("\n=== reduce_scatter summary ===")
     print(df.to_markdown(index=False, floatfmt=".4g"))
+
+    assert not failures, (
+        "reduce_scatter fallback produced wrong results (non-zero-dim layout bug):\n  "
+        + "\n  ".join(failures)
+    )
