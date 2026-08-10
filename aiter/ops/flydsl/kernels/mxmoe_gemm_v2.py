@@ -5,7 +5,6 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import (
     BFloat16,
     Float4E2M1FN,
@@ -16,6 +15,7 @@ from flydsl.expr.typing import (
     T,
 )
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import (

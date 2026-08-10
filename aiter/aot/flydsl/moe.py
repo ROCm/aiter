@@ -147,6 +147,12 @@ def parse_csv(csv_path: str):
                     continue
                 if name.startswith("flydsl_moe2_layout_"):
                     continue
+                # a4w4 mxmoe-port kernels are precompiled by mxfp4_moe.py; they
+                # share the flydsl_ prefix but are absent from this module's
+                # registry, so without this guard every CSV row naming one is
+                # reported as an unknown kernel.
+                if name.startswith("flydsl_mxmoe_"):
+                    continue
 
                 params = get_flydsl_kernel_params(name)
                 if params is None:
@@ -1091,7 +1097,6 @@ def compile_one_config(
                     )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
