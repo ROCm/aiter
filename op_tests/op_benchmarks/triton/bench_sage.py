@@ -21,8 +21,8 @@ from aiter.ops.mha import (
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
-    AttentionFormat,
     MHA_V4_LOG2E,
+    AttentionFormat,
     mha_v4,
     mha_v4_packed,
     mxfp4_k_view,

@@ -10,13 +10,16 @@ from torch import Tensor
 
 from aiter import dtypes
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
+    mha_v4_per_tensor_amax_kernel,
+    mha_v4_per_tensor_quant_kernel,
+    mha_v4_per_tensor_scale_kernel,
     sage_quant_v_amax_finalize_kernel,
     sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-    fp6_k_raw_buffer_sizes,
     fp6_k_lds_order_views_from_raw,
+    fp6_k_raw_buffer_sizes,
     reorder_fp6_k_lds_order_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -28,8 +31,8 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
 
-
 MHA_V4_LOG2E = 1.4426950408889634
+MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 
 
 @compile_ops("module_fmha_v4_fwd")
@@ -375,32 +378,63 @@ def mha_v4_packed(
     return out
 
 
-@torch.library.custom_op("aiter::mha_v4_quantize_int8", mutates_args=())
-def _quantize_int8(input: Tensor) -> tuple[Tensor, Tensor]:
-    scale = input.float().abs().max() / 127.0
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    quantized = torch.clamp(torch.round(input.float() / scale), -128, 127).to(
-        torch.int8
+def _quantize_per_tensor(
+    input: Tensor, output_dtype: torch.dtype, dtype_max: float, clip: float
+) -> tuple[Tensor, Tensor]:
+    if not input.is_contiguous():
+        raise ValueError("MHA v4 per-tensor quantization requires contiguous input")
+    numel = input.numel()
+    blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
+    partial = input.new_empty((blocks,), dtype=torch.float32)
+    scale = input.new_empty((1,), dtype=torch.float32)
+    output = input.new_empty(input.shape, dtype=output_dtype)
+    mha_v4_per_tensor_amax_kernel[(blocks,)](
+        input,
+        partial,
+        numel,
+        BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
+        num_warps=8,
     )
-    return quantized, scale.reshape(1).to(torch.float32)
+    scale_block = triton.next_power_of_2(blocks)
+    mha_v4_per_tensor_scale_kernel[(1,)](
+        partial,
+        scale,
+        blocks,
+        dtype_max=dtype_max / clip,
+        BLOCK_SIZE=scale_block,
+        num_warps=8,
+    )
+    mha_v4_per_tensor_quant_kernel[(blocks,)](
+        input,
+        output,
+        scale,
+        numel,
+        IS_INT8=output_dtype == torch.int8,
+        BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
+        num_warps=8,
+    )
+    return output, scale
 
 
-@_quantize_int8.register_fake
-def _quantize_int8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+@torch.library.custom_op("aiter::mha_v4_quantize_int8_v2", mutates_args=())
+def quantize_int8(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tensor]:
+    return _quantize_per_tensor(input, torch.int8, 127.0, clip)
+
+
+@quantize_int8.register_fake
+def _quantize_int8_fake(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tensor]:
+    del clip
     return input.new_empty(input.shape, dtype=torch.int8), input.new_empty(
         (1,), dtype=torch.float32
     )
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_fp8", mutates_args=())
-def _quantize_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
-    scale = input.float().abs().max() / torch.finfo(dtypes.fp8).max
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    # The dtype conversion performs the format's native rounding and saturation.
-    return (input.float() / scale).to(dtypes.fp8), scale.reshape(1).to(torch.float32)
+def quantize_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _quantize_per_tensor(input, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0)
 
 
-@_quantize_fp8.register_fake
+@quantize_fp8.register_fake
 def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
         (1,), dtype=torch.float32
@@ -774,13 +808,13 @@ def mha_v4(
         raise ValueError("out must match Q's shape/device and have BF16 dtype")
 
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
-        q_quantized, q_descale = _quantize_int8(q)
-        k_quantized, k_descale = _quantize_int8(k)
-        v_quantized, v_descale = _quantize_fp8(v)
+        q_quantized, q_descale = quantize_int8(q)
+        k_quantized, k_descale = quantize_int8(k)
+        v_quantized, v_descale = quantize_fp8(v)
     elif q_format in _FP8_FORMATS and v_format == q_format:
-        q_quantized, q_descale = _quantize_fp8(q)
-        k_quantized, k_descale = _quantize_fp8(k)
-        v_quantized, v_descale = _quantize_fp8(v)
+        q_quantized, q_descale = quantize_fp8(q)
+        k_quantized, k_descale = quantize_fp8(k)
+        v_quantized, v_descale = quantize_fp8(v)
     elif q_format == AttentionFormat.MXFP4 and v_format in (
         *_FP8_FORMATS,
         AttentionFormat.MXFP4,

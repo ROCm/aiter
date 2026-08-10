@@ -14,6 +14,8 @@ from aiter.ops.mha_v4 import (
     mha_v4_packed,
     mxfp4_k_view,
     quantize_mxfp4_k,
+    quantize_fp8,
+    quantize_int8,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -100,6 +102,46 @@ def test_attention_format_ids_are_stable():
     assert int(AttentionFormat.UINT8) == 11
     assert int(AttentionFormat.INT4) == 12
     assert int(AttentionFormat.UINT4) == 13
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+@pytest.mark.parametrize("clip", [1.0, 0.9])
+def test_mha_v4_int8_quantization_matches_torch(clip):
+    torch.manual_seed(17)
+    value = torch.randn((2, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
+    expected_scale = value.float().abs().max() * clip / 127.0
+    expected = torch.clamp(
+        torch.round(value.float() / expected_scale), -128, 127
+    ).to(torch.int8)
+
+    actual, scale = quantize_int8(value, clip)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(scale, expected_scale.reshape(1))
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+def test_mha_v4_fp8_quantization_matches_torch():
+    torch.manual_seed(19)
+    value = torch.randn((2, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
+    expected_scale = value.float().abs().max() / torch.finfo(torch.float8_e4m3fn).max
+    expected = (value.float() / expected_scale).to(torch.float8_e4m3fn)
+
+    actual, scale = quantize_fp8(value)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(scale, expected_scale.reshape(1))
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+@pytest.mark.parametrize("quantize", [quantize_int8, quantize_fp8])
+def test_mha_v4_per_tensor_quantization_handles_zero(quantize):
+    value = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+
+    actual, scale = quantize(value)
+
+    assert torch.count_nonzero(actual) == 0
+    assert torch.equal(scale, torch.ones_like(scale))
 
 
 def test_mha_v4_raw_buffer_sizes_are_stable():

@@ -3,6 +3,65 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
+
+@triton.jit
+def mha_v4_per_tensor_amax_kernel(
+    input_ptr,
+    partial_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block = tl.program_id(0)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=0.0).to(tl.float32)
+    tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
+
+
+@triton.jit
+def mha_v4_per_tensor_scale_kernel(
+    partial_ptr,
+    scale_ptr,
+    num_partials,
+    dtype_max: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    partial = tl.load(partial_ptr + offsets, mask=offsets < num_partials, other=0.0)
+    maximum = tl.max(partial, axis=0)
+    scale = maximum / dtype_max
+    scale = tl.where(scale > 0.0, scale, 1.0)
+    tl.store(scale_ptr, scale)
+
+
+@triton.jit
+def mha_v4_per_tensor_quant_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    numel,
+    IS_INT8: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block = tl.program_id(0)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    if IS_INT8:
+        quantized = values / scale
+        quantized = tl.inline_asm_elementwise(
+            "v_rndne_f32 $0, $1",
+            "=v,v",
+            args=[quantized],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        quantized = tl.maximum(tl.minimum(quantized, 127.0), -128.0)
+    else:
+        quantized = values * (1.0 / scale)
+    tl.store(output_ptr + offsets, quantized, mask=mask)
+
 ################# Sage V2 quantization kernels ####################
 
 

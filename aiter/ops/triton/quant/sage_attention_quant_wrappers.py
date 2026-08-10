@@ -16,8 +16,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_q_kernel,
     sage_quant_kernel,
     sage_quant_v_fp4_colmajor_kernel,
-    sage_quant_v_mxfp4_colmajor_kernel,
     sage_quant_v_kernel,
+    sage_quant_v_mxfp4_colmajor_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
