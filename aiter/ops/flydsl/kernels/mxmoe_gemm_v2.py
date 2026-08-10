@@ -304,8 +304,6 @@ def gemm2_body_v2(
     else:
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
 
-    _stids_pf = _prefetch_stids(arg_stids, m_row, BM, epi_lanes=_G2_EPI_LANES)
-
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
 
@@ -792,23 +790,7 @@ def gemm2_body_v2(
         g2_defer_weight=g2_defer_weight,
         g2_out_pitch_align=g2_out_pitch_align,
         g2_scale_blk=g2_scale_blk,
-        stids_pf=_stids_pf,
     )
-
-
-def _prefetch_stids(arg_stids, m_row, BM, epi_lanes=_G2_EPI_LANES):
-    ptr = global_typed_ptr(arg_stids, T.i32, align=4)
-    view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
-    stids = fx.rocdl.make_buffer_tensor(view, max_size=True)
-    load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
-    m_lane = fx.Int32(gpu.thread_id("x")) // epi_lanes
-    out = []
-    epi_rows = 256 // epi_lanes
-    for mr in range_constexpr(BM // epi_rows):
-        frag = fx.make_rmem_tensor(1, Int32)
-        fx.copy(load_i32, stids[None, m_row + mr * epi_rows + m_lane], frag)
-        out.append(Vec(frag.load())[0])
-    return out
 
 
 # ---- Atomic bf16 epilogue (shared store path; gemm2 down-proj) ----
@@ -838,7 +820,6 @@ def atomic_bf16_epilog(
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
-    stids_pf=None,
 ):
     if SBM is None:
         SBM = BM
@@ -901,10 +882,7 @@ def atomic_bf16_epilog(
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + mr * EPI_ROWS + m_lane
-        if const_expr(stids_pf is not None):
-            packed.append(stids_pf[mr])
-        else:
-            packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
+        packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
         if const_expr(not defer_w):
             weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 

@@ -68,9 +68,6 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     idx_M0 = _udiv(remap, n0)
     idx_N0 = remap - idx_M0 * n0
 
-    if m01 == 1:
-        return idx_M0, idx_N0
-
     # M0_tmp = M0 / M01 ; M0_mod_M01 = M0 - M0_tmp*M01 ; M01_adapt = (idx_M0 < M0 - M0_mod) ? M01 : M0_mod
     M0_tmp = _udiv(M0, m01c)
     M0_mod = M0 - M0_tmp * m01c
