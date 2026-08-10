@@ -94,9 +94,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     G_HEAD_MAJOR: bool = False,
     BF16_CONVERT_TRUNC: bool = _BF16_CONVERT_TRUNC_DEFAULT,
 ):
-    """Compile the GDN K5 kernel into a @flyc.jit launcher taking the tensors
-    (k, v, w, v_new, g, gk, h, h0, ht, cu_seqlens, chunk_offsets,
-    state_indices) then T_val, T_flat, N_val, grid_v, grid_nh, stream.
+    """Compile the GDN K5 kernel into the @flyc.jit launcher below.
 
     ``STATE_DTYPE_BF16`` puts ``h0`` / ``ht`` in bf16 (promote on load, demote
     on store); the f32 accumulator and the LDS layouts are unchanged.
@@ -259,10 +257,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # [64][BT] row-major + S<2,2,8> + S<4,2,4>, the layout form of HIP's
         # ``k_panel_rotating_pair_addr_bytes``. Two swizzles because the store
         # (K-row bits 3..5) and the MFMA A read (bits 0..3) must both stay
-        # conflict-free, folding six row bits into the four usable bits 3..6,
-        # while one SwizzleType is a single XOR window at one shift. Index with
-        # fx.slice, NOT partition_S -- the partition path mishandles a NESTED
-        # composed layout and silently produces wrong addresses.
+        # conflict-free, folding six row bits into the four usable bits 3..6.
+        # Index with fx.slice: partition_S mishandles a NESTED composed layout
+        # and silently produces wrong addresses.
         def _k_panel_view(kb, group):
             """k panel ``kb`` as (64, (group, BT/group)): same addresses either
             way -- group=4 is the MFMA A operand, group=2 the store pair."""
@@ -321,7 +318,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         thr_cp_a = fx.make_tiled_copy_A(cp_lds_x4, tiled_mma).get_slice(tid)
         thr_cp_b = fx.make_tiled_copy_B(cp_lds_x4, tiled_mma).get_slice(tid)
 
-        # Per-lane source partitions: one address per K-tile, computed once.
         pS_w = thr_cp_a.partition_S(sW)  # GEMM1 A: ((4,1), 1, (4, NUM_K_BLOCKS))
         pS_h = thr_cp_b.partition_S(sH)  # GEMM1 B: ((4,1), N_REPEAT, K_TILES)
         pS_gv = thr_cp_b.partition_S(sGV)  # GEMM2 B: ((4,1), N_REPEAT, BT_TILES)
@@ -336,9 +332,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         frag_w_rt = thr_cp_a.retile(frag_w)
         frag_h_rt = thr_cp_b.retile(frag_h)
         frag_gv_rt = thr_cp_b.retile(frag_gv)
-        # Accumulators: b_v (GEMM1) over the (BT, BV) tile, one h state acc per
-        # 64-K block. ``fx.Vector(frag.load())`` reshapes the partition's NESTED
-        # shape to the flat (4,) of the hand-built vectors -- do not strip it.
+        # Accumulators: b_v (GEMM1) over (BT, BV), one h acc per 64-K block.
+        # ``fx.Vector(frag.load())`` reshapes NESTED -> flat (4,); keep it.
         frag_bv = fx.make_rmem_tensor(
             fx.tiled_mma_partition_shape(fx.MmaOperand.C, tiled_mma, (BT, BV)),
             fx.Float32,
@@ -357,7 +352,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         load_vec_group = tid % THREADS_PER_ROW_64
         load_col_group = load_vec_group * (LOAD_VEC_WIDTH // 4)
 
-        # -- Prologue: compute bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
             bos = _load_vec(cp_i32, fx.slice(cu_view, (i_n, None)), 1, fx.Int32)
             eos = _load_vec(cp_i32, fx.slice(cu_view, (i_n + 1, None)), 1, fx.Int32)
@@ -370,9 +364,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             NT = (T_local + (BT - 1)) // BT
             boh = i_n * NT
 
-        # Rows past the sequence end clamp to 0 instead of being masked -- with
-        # max_size descriptors this keeps w / k / u in range; the gate zeroes
-        # what those aliased padding rows contribute.
+        # Rows past the sequence end clamp to 0 rather than being masked -- with
+        # max_size descriptors that is what keeps w / k / u in range.
         def _clamp_row(row):
             return (row < T_local).select(row, 0)
 
@@ -436,10 +429,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         if const_expr(STORE_FINAL_STATE):
             ht_view = _gview(ht_tensor, state_slot_base, (V, K // 4, 4), (K, 4, 1))
 
-        # g offset = i_h*g_stride_h + token*g_stride_t (+ batch when dense):
-        # head-major [B, H, T_flat] -> (T_flat, 1), token-major [B, T_flat, H]
-        # -> (1, H). varlen is flattened to B==1 with a global token, so bos
-        # folds into the base; the per-token term is the leading coordinate.
+        # g strides (g_stride_h, g_stride_t): head-major [B, H, T_flat] is
+        # (T_flat, 1), token-major [B, T_flat, H] is (1, H). varlen flattens to
+        # B==1 with a global token, so bos folds into the base.
         if const_expr(USE_G):
             if const_expr(G_HEAD_MAJOR):
                 g_stride_h = t_flat64
@@ -491,9 +483,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     _acc_cell = frag_h_accs[kb][None, None, slot]
                     _acc_cell.store(fx.Vector(_acc_cell.load()) + loaded_vec)
 
-        # Pipelined chunk loop: the prologue stages chunk 0's w/k in LDS, then
-        # each iteration prefetches the next chunk's w (during GEMM1) and k
-        # (after gating) into VGPRs, publishing them at the GEMM2 end.
+        # Pipelined chunk loop: the prologue stages chunk 0's w/k, then each
+        # iteration prefetches the next chunk's w/k and publishes it at the end.
         GEMM1_PF_SPLIT = 1
         k_vec_group_pf = lane & 7
         k_row_base_pf = k_vec_group_pf * 8
@@ -501,8 +492,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         k_t0_pf = k_pair_col_pf * 2
         k_t1_pf = k_t0_pf + 1
 
-        # Cooperative staging of one chunk's w / k, split so the main loop can
-        # issue the loads early and publish to LDS only at the GEMM2 end.
+        # Load and store are split so the main loop can issue the loads early;
         # ``row_base=None`` is chunk 0 (absolute row == in-chunk row).
         def _load_w_rows(row_base=None):
             rows = []
@@ -568,9 +558,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
         # PROLOGUE: stage chunk 0's w/k under a block-uniform NT>0 guard -- an
         # empty varlen sequence has bos == T_flat, so its clamped w/k address
-        # would run past the input, and skipping is correct because the loop
-        # then runs 0 times. The helpers are closures so the ``if`` holds only
-        # calls and a barrier, keeping views/atoms out of the scf.if state.
+        # would run past the input, and skipping is correct since the loop then
+        # runs 0 times. Closures keep views/atoms out of the scf.if state.
         has_work = NT > 0
         if has_work:
             _store_w_rows(_load_w_rows())
@@ -660,9 +649,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # -- GEMM1: b_v = w @ h_state, with the w_next prefetch interleaved.
             frag_bv.fill(0.0)
 
-            # One 64-K block, each fx.gemm one 16-K tile over all N_REPEAT
-            # v-tiles. The K-tiles stay individually addressable so the w_next
-            # prefetch can split the blocks and sched_barrier can land per ks.
+            # One 64-K block, one fx.gemm per 16-K tile: the K-tiles stay
+            # individually addressable for the w_next split and sched_barrier.
             def _gemm1_kblock(kb):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
                     for half in range_constexpr(K_STEP // 16):
@@ -691,7 +679,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(GEMM1_PF_SPLIT):
                 _gemm1_kblock(kb)
 
-            # Prefetch the next chunk's w.
             next_i_t = i_t_i32 + 1
             next_chunk_base = next_i_t * BT
             w_next = _load_w_rows(next_chunk_base)
@@ -704,7 +691,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # may now overwrite panel 1.
             gpu.barrier()
 
-            # -- FUSED v_new + gating + gated_v store, on the prefetched u/g --
             if const_expr(USE_G):
                 exp_g_last = _fast_exp(g_last)
                 gate_elems = []
@@ -803,9 +789,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     fx.BFloat16,
                 )
 
-            # -- GEMM2: h += k^T @ v_new_gated, each 64-K block its own M tile
-            # (hence its own k panel view and accumulator). The A operand takes
-            # an explicit fx.slice per k-tile (see _k_panel_view).
+            # -- GEMM2: h += k^T @ v_new_gated, each 64-K block its own M tile,
+            # k panel view and accumulator. A takes an fx.slice per k-tile.
             BT_STEPS = BT // K_STEP
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
