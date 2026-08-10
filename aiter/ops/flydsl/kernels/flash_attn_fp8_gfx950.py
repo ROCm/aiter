@@ -49,6 +49,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     head_dim,
     causal=True,
     dtype_str="bf16",
+    out_dtype_str="bf16",
     num_kv_heads=None,
     waves_per_eu=2,
     daz=True,
@@ -59,6 +60,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     num_kv_splits=1,
     varlen=False,
     cross_seqlen=False,
+    use_sinks=False,
     bn128=None,
     paged=False,
     prefetch_bound="none",
@@ -85,8 +87,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
         raise RuntimeError(f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}")
     if head_dim != 128:
         raise RuntimeError(f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}")
-    if dtype_str not in ("bf16", "f16", "fp8"):
-        raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16/fp8 only, got dtype={dtype_str}")
+    # dtype_str is the INPUT/COMPUTE (QKV) dtype. This builder is genuinely
+    # fp8-only: the traits factory hardcodes DTYPE_STR="fp8", so a non-fp8 value
+    # here would silently build an fp8 kernel. Reject it rather than mislead.
+    if dtype_str != "fp8":
+        raise RuntimeError(f"flash_attn_dualwave_swp_fp8 builds fp8 QKV only, got dtype={dtype_str}")
+    # out_dtype_str is the OUTPUT store dtype, independent of the fp8 QKV compute.
+    # Both are 2-byte, so every address, num_records bound and store packet is
+    # unchanged; only the f32->out conversion at the store sites differs.
+    if out_dtype_str not in ("bf16", "f16"):
+        raise RuntimeError(f"flash_attn_dualwave_swp_fp8 output supports bf16/f16 only, got out_dtype={out_dtype_str}")
     # fp8 split-K was rejected here. What blocked it was the combine pass
     # packing its output as DTYPE_STR (the input dtype) rather than the
     # kernel's fixed 2-byte output; see pack_output in the common module.
@@ -110,6 +120,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
     assert NUM_KV_SPLITS >= 1
     if varlen and num_kv_splits and int(num_kv_splits) > 1:
         raise ValueError("varlen is not supported together with num_kv_splits > 1")
+    # Sinks seed m_row per split, so under split-K exp(sink) would be counted
+    # once per split in the combine denominator (the combine kernel has no sink
+    # input to correct it). Refuse the combination rather than compute wrong
+    # output; the single-split path is fully supported. This is the production
+    # path -- the adapter never builds split-K.
+    if use_sinks and int(num_kv_splits) > 1:
+        raise ValueError("attention sinks are not supported together with num_kv_splits > 1")
 
     # All compile-time tile/layout constants live in the fp8 traits object.
     traits = _make_dualwave_swp_fp8_traits(
@@ -126,6 +143,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         num_kv_splits=num_kv_splits,
         varlen=varlen,
         cross_seqlen=cross_seqlen,
+        out_dtype_str=out_dtype_str,
+        use_sinks=use_sinks,
         bn128=bn128,
         paged=paged,
         prefetch_bound=prefetch_bound,
@@ -182,6 +201,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
         BlockTable: fx.Tensor,
+        Sink: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
@@ -208,6 +228,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             head_dim_runtime,
             BlockTable=BlockTable,
             block_table_stride=block_table_stride,
+            Sink=Sink,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -359,7 +380,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
             if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
                 stagger_extra_barrier_if_one(ctx.stagger_i32)
 
-            m_row = ctx.c_neg_inf
+            # Attention sinks seed the running max with the per-head sink logit
+            # (raw units) so it participates in the max from the first tile; its
+            # denominator contribution is added once in the epilogue. Off the
+            # main-loop critical path -- init only.
+            if const_expr(traits.USE_SINKS):
+                m_row = fx.Float32(softmax_helper.load_sink_logit())
+            else:
+                m_row = ctx.c_neg_inf
             l_row = ctx.c_zero_f
             v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
@@ -459,8 +487,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 v_v_a = kv_lds_to_regs.load_v(a_buf)
                 pf_a = _pf_tile(j + fx.Index(4))
                 pf_b = _pf_tile(j + fx.Index(5))
-                kv_gmem_to_lds.load_k(pf_a * BN, f_a_buf)
-                kv_gmem_to_lds.load_k(pf_b * BN, f_b_buf)
+                # Resolve both prefetch page ids under ONE lgkmcnt(0) drain, and
+                # reuse them for the V half at C6. Unbatched this cost four
+                # drains per iteration -- K and V for a given tile resolve the
+                # SAME page id, so the four lookups only ever held two distinct
+                # values. Measured at 2.8% of kernel latency (ATT, M=4023).
+                pf_pages = kv_gmem_to_lds.end_page_ids(
+                    kv_gmem_to_lds.begin_page_ids([pf_a, pf_b])
+                ) if const_expr(traits.PAGED) else [None, None]
+                kv_gmem_to_lds.load_k(pf_a * BN, f_a_buf, pf_pages[0])
+                kv_gmem_to_lds.load_k(pf_b * BN, f_b_buf, pf_pages[1])
                 _cluster_boundary()
 
                 # C5 (cmp): softmax and PV for subtile a. Carries its own
@@ -470,8 +506,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
                 # C6 (mem): V for subtile b, plus the V half of the prefetch.
                 v_v_b = kv_lds_to_regs.load_v(b_buf)
-                kv_gmem_to_lds.load_v(pf_a * BN, f_a_buf)
-                kv_gmem_to_lds.load_v(pf_b * BN, f_b_buf)
+                # Same two page ids as the K half at C4 -- already in SGPRs, so
+                # this cluster issues no LDS read and no drain at all.
+                kv_gmem_to_lds.load_v(pf_a * BN, f_a_buf, pf_pages[0])
+                kv_gmem_to_lds.load_v(pf_b * BN, f_b_buf, pf_pages[1])
                 _cluster_boundary()
 
                 # C7 (cmp): softmax and PV for subtile b, then the loop back
@@ -487,6 +525,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
             l_row = loop_results[1]
             v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
+            # Sinks: add exp(sink) to the denominator (epilogue only). The sink
+            # has no value vector, so it contributes to l_row but not v_o.
+            if const_expr(traits.USE_SINKS):
+                l_row = fx.Float32(softmax_helper.add_sink_denom(l_row, m_row))
             inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
             inv_l = ArithValue(fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
             if const_expr(traits.FP8_PV):
@@ -573,6 +615,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
         BlockTable: fx.Tensor,
+        Sink: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -614,6 +657,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             KDescale,
             VDescale,
             BlockTable,
+            Sink,
             seq_len,
             seq_len_kv,
             stride_q_n,
@@ -668,6 +712,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_descale=None,
         block_table=None,
         block_table_stride=None,
+        sink=None,
         stream=None,
     ):
         if stride_kv_n is None:
@@ -705,6 +750,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
+        # Sink is only read under const_expr(USE_SINKS); use O as a placeholder.
+        if sink is None:
+            sink = O
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return _run_compiled(
                 launch_flash_attn_dualwave_swp,
@@ -719,6 +767,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 k_descale,
                 v_descale,
                 block_table,
+                sink,
                 batch_size,
                 seq_len,
                 seq_len_kv,
@@ -750,6 +799,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_descale=None,
         block_table=None,
         block_table_stride=None,
+        sink=None,
         stream=None,
     ):
         if stride_kv_n is None:
@@ -780,6 +830,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
+        if sink is None:
+            sink = O
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(
                 launch_flash_attn_dualwave_swp,
@@ -794,6 +846,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 k_descale,
                 v_descale,
                 block_table,
+                sink,
                 batch_size,
                 seq_len,
                 seq_len_kv,

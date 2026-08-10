@@ -593,6 +593,8 @@ class DualwaveSwpFp8Traits:
     BLOCK_Q: int
     CAUSAL: bool
     DTYPE_STR: str
+    OUT_DTYPE_STR: str
+    USE_SINKS: bool
     WAVES_PER_EU: int
     DAZ: bool
     DUALWAVE_SWP_LAZY_RESCALE: bool
@@ -664,16 +666,23 @@ class DualwaveSwpFp8Traits:
             self.HEAD_DIM,
             self.CAUSAL,
             self.DTYPE_STR,
+            # Output store dtype: bf16/f16 select different pack instructions at
+            # the store sites, so it must key the cache.
+            self.OUT_DTYPE_STR,
+            # Attention sinks add a per-head init/epilogue term (const_expr
+            # branch), so on/off compiles different code.
+            self.USE_SINKS,
             self.WAVES_PER_EU,
             self.DAZ,
             self.DUALWAVE_SWP_LAZY_RESCALE,
             self.DUALWAVE_SWP_SETPRIO,
-            self.DUALWAVE_SWP_DEBUG_LAZY_COUNTS,
+            # DUALWAVE_SWP_DEBUG_LAZY_COUNTS and CROSS_SEQLEN are set into traits
+            # but never read by the kernel or helpers, so they only multiplied
+            # compiled variants with identical code -- dropped from the tag.
             self.DUALWAVE_SWP_ENABLE_STAGGER,
             self.NUM_KV_SPLITS,
             self.SPLITK,
             self.VARLEN,
-            self.CROSS_SEQLEN,
             # PAGED must stay in the tag: dense and paged differ only in const_expr
             # branches, so without it both hash to one key and the builder's cache
             # hands back whichever compiled first.
@@ -720,6 +729,8 @@ def _make_dualwave_swp_fp8_traits(
     num_kv_splits=1,
     varlen=False,
     cross_seqlen=False,
+    out_dtype_str="bf16",
+    use_sinks=False,
     bn128=None,
     paged=False,
     prefetch_bound="none",
@@ -960,6 +971,8 @@ def _make_dualwave_swp_fp8_traits(
         BLOCK_Q=block_q,
         CAUSAL=causal,
         DTYPE_STR="fp8",
+        OUT_DTYPE_STR=str(out_dtype_str),
+        USE_SINKS=bool(use_sinks),
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
         DUALWAVE_SWP_LAZY_RESCALE=bool(dualwave_swp_lazy_rescale),
@@ -1052,6 +1065,7 @@ class DualwaveFp8KernelContext:
         head_dim_runtime=None,
         BlockTable=None,
         block_table_stride=None,
+        Sink=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -1076,6 +1090,7 @@ class DualwaveFp8KernelContext:
         self.head_dim_runtime = head_dim_runtime
         self.BlockTable = BlockTable
         self.block_table_stride = block_table_stride
+        self.Sink = Sink
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -1313,6 +1328,17 @@ class DualwaveFp8KernelContext:
                 fastmath=self.fm_fast,
             )
         )
+        if const_expr(self.traits.USE_SINKS):
+            # Attention sinks: a per-head virtual logit added only to the softmax
+            # denominator. m_row is carried in RAW un-descaled logit units and
+            # c_logit_scale = rsqrt(d)*log2e*qd*kd already folds in log2e, so the
+            # sink -- a real logit -- maps to raw units by sink*log2e/c_logit_scale
+            # (equivalently sink / (rsqrt(d)*qd*kd)). c_log2e is kept for the
+            # epilogue denominator term. Per-head [num_query_heads] fp32 tensor.
+            self.c_log2e = c_log2e_f
+            _sink_iter = fx.get_iter(self.Sink)
+            self.sink_addr_i64 = fx.Int64(fx.ptrtoint(_sink_iter))
+            self.sink_nrec_bytes = fx.Int64(self.traits.NUM_HEADS_Q * 4)
 
     def init_tile_bounds(self):
         traits = self.traits
@@ -1449,6 +1475,59 @@ class DualwaveFp8KernelContext:
         ref = getattr(self, "ctx_ref", self)
         return ref.q_head_row
 
+    def load_sink_logit(self):
+        """Per-M-row sink logit in RAW un-descaled logit units.
+
+        Gathers Sink[q_head_row] -- q_head_row is the per-M-row q-head under GQA
+        packing (a scalar workgroup head otherwise), the same index the output
+        store uses -- so the sink broadcasts across packed M rows by construction.
+        Returns sink*log2e/c_logit_scale so it lands in the same raw units m_row
+        carries (c_logit_scale folds in log2e; dividing it out and re-applying
+        log2e leaves rsqrt(d)*qd*kd, the pure logit scale)."""
+        ref = getattr(self, "ctx_ref", self)
+        rsrc = buffer_ops.create_buffer_resource_from_addr(
+            as_mlir_value(ref.sink_addr_i64), num_records_bytes=as_mlir_value(ref.sink_nrec_bytes)
+        )
+        sink_f32 = fx.Float32(
+            buffer_ops.buffer_load(
+                rsrc, as_mlir_value(fx.Int32(self.ctx_head_row())), vec_width=1, dtype=T.f32
+            )
+        )
+        # raw = sink * log2e / c_logit_scale
+        scaled = _fmul(sink_f32, ref.c_log2e, self.fm_fast)
+        inv_logit = rocdl.rcp(T.f32, as_mlir_value(ref.c_logit_scale))
+        return _fmul(fx.Float32(scaled), fx.Float32(inv_logit), self.fm_fast)
+
+    def sink_denom_term(self, m_row):
+        """exp(sink) contribution to the softmax denominator, in the l_row domain.
+
+        l_row = sum_i exp2(scaled_logit_i - scaled_m). The sink adds exp2 of its
+        own scaled logit relative to the final scaled row max. m_row is raw, so
+        the scaled row max is m_row*c_logit_scale and the scaled sink logit is
+        sink*log2e; their difference feeds exp2. Added once, in the epilogue, so
+        it stays off the main-loop critical path. Because m_row was seeded with
+        the sink, m_row >= sink and this term is <= 1 (no overflow)."""
+        ref = getattr(self, "ctx_ref", self)
+        sink_f32 = fx.Float32(
+            buffer_ops.buffer_load(
+                buffer_ops.create_buffer_resource_from_addr(
+                    as_mlir_value(ref.sink_addr_i64),
+                    num_records_bytes=as_mlir_value(ref.sink_nrec_bytes),
+                ),
+                as_mlir_value(fx.Int32(self.ctx_head_row())),
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        sink_scaled = _fmul(sink_f32, ref.c_log2e, self.fm_fast)
+        m_scaled = _fmul(m_row, ref.c_logit_scale, self.fm_fast)
+        diff = _fsub(fx.Float32(sink_scaled), fx.Float32(m_scaled), self.fm_fast)
+        return rocdl.exp2(T.f32, as_mlir_value(diff))
+
+    def add_sink_denom(self, l_row, m_row):
+        """l_row + exp(sink) denominator term (epilogue only)."""
+        return _fadd(l_row, self.sink_denom_term(m_row), self.fm_fast)
+
     def read_i32x8_lds(self, base_ptr, byte_row):
         halves = []
         for h in range_constexpr(2):
@@ -1521,6 +1600,22 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         return [f32[i] for i in range_constexpr(8)]
 
     def _pack_fp8_i32x8(self, f32_vals):
+        # `old` is the merge source: cvt_pk_fp8_f32 writes one 16-bit half
+        # (word_sel) and preserves the other. The word_sel=0 call writes the low
+        # half and word_sel=1 immediately overwrites the high half, so nothing of
+        # `old` survives the pair -- its value is genuinely dead, and passing a
+        # zero constant costs one `v_mov_b32 vN, 0` per word (16 per iteration,
+        # 1.14% of kernel latency, confirmed in ATT).
+        #
+        # Do NOT "fix" this with llvm.mlir_undef. Tried 2026-08-07: it removes all
+        # 16 movs (1515 -> 1499 instructions, ATT confirms zero remaining) and is
+        # bit-identical, but is 0.41% SLOWER in steady state (184.65 vs 183.90 us
+        # at M=4023, 15 interleaved repeats, non-overlapping ranges). An undef
+        # source lets the allocator pick any register for the cvt destination,
+        # which costs more in register pressure and copies than the mov saved. The
+        # zero constant pins a clean destination and the mov issues in a slot that
+        # was going spare -- VALU is 39% of latency but the kernel is not
+        # VALU-issue-bound, so removing VALU instructions does not shorten it.
         c0 = as_mlir_value(fx.Int32(0))
         words = []
         for g in range_constexpr(8):
@@ -1728,7 +1823,7 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
         v = rocdl.readfirstlane(T.i32, v)
         return fx.Index(fx.Int32(v))
 
-    def page_id_for_tile(self, tile_idx):
+    def _clamp_tile(self, tile_idx):
         # Clamp into the staged window. The BN128 ring prefetches up to 5 tiles
         # past split_t_end, and those tiles' LDS slots hold no valid page id.
         # Dense absorbs the same overrun via num_records; paged cannot, because
@@ -1737,23 +1832,50 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
         # re-reads the last live page instead; the data is wrong but in-bounds,
         # and the epilogue masks these tiles out regardless.
         last = self.split_t_end - fx.Index(1)
-        safe = fx.Index((tile_idx < last).select(tile_idx, last))
-        return self.finish_page_id(self.load_page_id_lds(safe))
+        return fx.Index((tile_idx < last).select(tile_idx, last))
+
+    def page_id_for_tile(self, tile_idx):
+        return self.finish_page_id(self.load_page_id_lds(self._clamp_tile(tile_idx)))
+
+    def begin_page_ids(self, tile_indices):
+        """Issue the LDS reads for several tiles without draining.
+
+        Returns opaque handles for ``end_page_ids``. Splitting issue from finish
+        is what lets one ``s_waitcnt lgkmcnt(0)`` cover N lookups instead of N
+        drains -- the same split the bf16 path makes across its call sites, but
+        batched, because the BN128 ring resolves several tiles per iteration.
+        """
+        return [self.load_page_id_lds(self._clamp_tile(t)) for t in tile_indices]
+
+    def end_page_ids(self, handles):
+        """Drain once, then promote every handle to an SGPR page id.
+
+        One ``s_waitcnt lgkmcnt(0)`` for the whole batch. The readfirstlanes
+        after it are register-only and need no further wait: lgkmcnt(0) has
+        already retired every LDS read issued before it, including all of these.
+        """
+        rocdl.s_waitcnt(self.traits.LGKMCNT_0_ONLY)
+        return [fx.Index(fx.Int32(rocdl.readfirstlane(T.i32, h))) for h in handles]
 
 class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def _kv_src(self, which, tile_start):
+    def _kv_src(self, which, tile_start, page_id=None):
         """Resolve (descriptor, tile_soffset) for a KV tile.
 
         Dense keeps one whole-tensor descriptor and moves with soffset; paged
         rebases per page and the tile term vanishes -- the page view already
         starts at the tile. Callers that fold the tile into their voffset must
         use ``tile_voffset`` instead of adding it themselves.
+
+        ``page_id`` lets a caller pass an already-resolved id (see
+        ``begin_page_ids``/``end_page_ids``) so several tiles share one drain.
+        Left None, the tile resolves its own, which costs a drain per call.
         """
         if const_expr(self.traits.PAGED):
-            page_id = self.page_id_for_tile(tile_start // fx.Index(self.traits.BLOCK_N))
+            if page_id is None:
+                page_id = self.page_id_for_tile(tile_start // fx.Index(self.traits.BLOCK_N))
             return self.kv_page_div(which, page_id), 0
         div = self.k_div if which == "k" else self.v_div
         return div, tile_start * self.stride_kv_n_v
@@ -1764,10 +1886,10 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             return fx.Index(0)
         return tile_start * self.stride_kv_n_v
 
-    def load_k(self, tile_start, buf_id):
+    def load_k(self, tile_start, buf_id, page_id=None):
         traits = self.traits
         eb = traits.ELEM_BYTES
-        k_div, k_soffset = self._kv_src("k", tile_start)
+        k_div, k_soffset = self._kv_src("k", tile_start, page_id)
         k_lds_byte_base = self.lds_kv_base_idx + self.k_buf_base(buf_id) * eb
         for d in range_constexpr(self.NUM_DMA_K):
             lds_addr = (
@@ -1780,9 +1902,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             src_elem = self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
             self.buffer_load_lds_128(k_div, lds_addr, src_elem, k_soffset)
 
-    def load_v(self, tile_start, buf_id):
+    def load_v(self, tile_start, buf_id, page_id=None):
         if const_expr(self.traits.FP8_PV):
-            self._stage_v_fp8_block(tile_start, buf_id)
+            self._stage_v_fp8_block(tile_start, buf_id, page_id)
         else:
             self._stage_vt_dequant_fp8(tile_start, buf_id)
 
@@ -1798,15 +1920,15 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             p = buffer_ops.create_llvm_ptr(off, address_space=3)
             llvm.StoreOp(as_mlir_value(zero), p, alignment=16)
 
-    def _stage_v_fp8_block(self, tile_start, buf_id):
+    def _stage_v_fp8_block(self, tile_start, buf_id, page_id=None):
         traits = self.traits
         if const_expr(traits.VDMA):
-            return self._stage_v_fp8_block_dma(tile_start, buf_id)
+            return self._stage_v_fp8_block_dma(tile_start, buf_id, page_id)
         v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
         buf_off = buf_id * v_tile_bytes
         n = self.wave_id * fx.Index(8) + self.lane // fx.Index(8)
         d_block = self.lane % fx.Index(8)
-        v_div, _ = self._kv_src("v", tile_start)
+        v_div, _ = self._kv_src("v", tile_start, page_id)
         src_elem = (
             self.kv_gmem_elem_offset
             + n * self.stride_kv_n_v
@@ -1829,7 +1951,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         lds_ptr = buffer_ops.create_llvm_ptr(byte_off, address_space=3)
         llvm.StoreOp(as_mlir_value(Vec(v16)), lds_ptr, alignment=16)
 
-    def _stage_v_fp8_block_dma(self, tile_start, buf_id):
+    def _stage_v_fp8_block_dma(self, tile_start, buf_id, page_id=None):
         traits = self.traits
         v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
         buf_off = buf_id * v_tile_bytes
@@ -1841,7 +1963,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         c_sub = (w16 >= fx.Int32(8)) & (w16 < fx.Int32(12))
         n = dest_n + c_add.select(fx.Int32(4), fx.Int32(0)) - c_sub.select(fx.Int32(4), fx.Int32(0))
         d_block = self.lane // fx.Index(8)
-        v_div, v_soffset = self._kv_src("v", tile_start)
+        v_div, v_soffset = self._kv_src("v", tile_start, page_id)
         src_elem = self.kv_gmem_elem_offset + fx.Index(n) * self.stride_kv_n_v + d_block * fx.Index(16)
         self.buffer_load_lds_128(v_div, lds_addr, src_elem, v_soffset)
 
@@ -2202,10 +2324,23 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
+    def _pack_out_pair(self, a, b):
+        """Pack two f32 output elements into one i32, per the output store dtype.
+
+        Both bf16 and f16 store as 2 bytes, so the packet layout is identical --
+        only the conversion differs. cvt_pkrtz (= v_cvt_pkrtz_f16_f32) mirrors
+        cvt_pk_bf16_f32's (src_a -> lo16, src_b -> hi16) ordering, so downstream
+        lane-swap and store code is unchanged. Returns a raw i32 MLIR value.
+        """
+        if const_expr(self.traits.OUT_DTYPE_STR == "f16"):
+            v2 = rocdl.cvt_pkrtz(Vec.make_type(2, fx.Float16), as_mlir_value(a), as_mlir_value(b))
+            return as_mlir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
+        return rocdl.cvt_pk_bf16_f32(a, b)
+
     def _o_pack_2dw(self, v_o, dc, store_group):
         r_base = store_group * 4
-        lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
-        hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
+        lo = self._pack_out_pair(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
+        hi = self._pack_out_pair(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
         return lo, hi
 
     def _swap_half_partner(self, dw):
@@ -2335,11 +2470,16 @@ class DualwaveSplitKCombineContext:
         self.elem_dtype = dtype_to_elem_type(self.traits.DTYPE_STR)
         # Element type of the split-K partials in the workspace, and of the
         # final output. NOT the input dtype: the main kernel packs partials
-        # with cvt_pk_bf16_f32 whatever it reads (see _o_pack_2dw), the row
-        # stride is HEAD_DIM // 2 i32, and store_output scales its offset by 2.
-        # For an fp8 kernel elem_dtype is one byte, so using it here unpacks 8
+        # with the 2-byte output packer whatever it reads (see _o_pack_2dw), the
+        # row stride is HEAD_DIM // 2 i32, and store_output scales its offset by
+        # 2. For an fp8 kernel elem_dtype is one byte, so using it here unpacks 8
         # elements where 4 are meant and packs 4 into one i32 instead of two.
-        self.part_dtype = fx.BFloat16 if self.traits.DTYPE_STR == "fp8" else self.elem_dtype
+        # It follows OUT_DTYPE_STR (bf16/f16), matching the main kernel's store
+        # packer so the partial read-back and final pack stay consistent.
+        if self.traits.DTYPE_STR == "fp8":
+            self.part_dtype = dtype_to_elem_type(self.traits.OUT_DTYPE_STR)
+        else:
+            self.part_dtype = self.elem_dtype
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
