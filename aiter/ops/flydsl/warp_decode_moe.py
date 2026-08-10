@@ -71,7 +71,9 @@ def _get_down_reduce(
 
 
 @functools.lru_cache(maxsize=64)
-def _get_gate_up_fp4(hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk):
+def _get_gate_up_fp4(
+    hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk, dot2_acc
+):
     return build_gate_up_fp4_module(
         hidden,
         inter,
@@ -80,6 +82,7 @@ def _get_gate_up_fp4(hidden, inter, top_k, kvector, serialize_dot2, scale_bn, sc
         serialize_dot2=serialize_dot2,
         scale_bn=scale_bn,
         scale_bk=scale_bk,
+        dot2_acc=dot2_acc,
     )
 
 
@@ -223,6 +226,7 @@ def flydsl_warp_decode_gate_up_fp4(
     *,
     scale_block: tuple[int, int] = (1, 32),
     serialize_dot2: bool = True,
+    dot2_acc: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **MXFP4** weights (BF16 activation, FP4 e2m1 + E8M0).
@@ -241,6 +245,10 @@ def flydsl_warp_decode_gate_up_fp4(
             [(E*INTER)//BN, HIDDEN//BK] row-major over (weight-row-block, K-block),
             (BN, BK) = ``scale_block``.
         scale_block:  (BN, BK); MXFP4 default (1, 32).
+        dot2_acc:     G7 independent dot2 accumulators per stream. **Default 1
+            (serialized)**: G7 measured ~4% slower for gate_up on gfx950 (the two
+            gate/up streams already cover the hazard and the B=1 grid is
+            occupancy-bound); ``>1`` enables the s_nop-free ILP path (see builder).
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -268,7 +276,7 @@ def flydsl_warp_decode_gate_up_fp4(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     launcher = _get_gate_up_fp4(
-        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk
+        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, dot2_acc
     )
     grid_x = B * TOPK * INTER
     _run(

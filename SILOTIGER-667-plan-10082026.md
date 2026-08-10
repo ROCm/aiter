@@ -240,6 +240,18 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       15.15→**13.54 µs (1.12×)**, B2 0.91×, B4 1.00×, B8 0.99×; cos **1.0000** at all B. G7
       helps exactly where decode is latency/serialization-bound (**B=1**) and is neutral at
       B≥2 (occupancy already hides the stall). Correct + wired + swept.
+- [x] **G7 also wired on FP4 `gate_up`, but defaulted OFF (`dot2_acc=1`) — negative result.**
+      Same `dot2_f32_bf16_drain` applied to both gate/up streams (collect all `(iter,pair)`
+      pairs, drain each through `dot2_acc` accumulators); threaded through
+      `build_gate_up_fp4_module` / `_get_gate_up_fp4` / `flydsl_warp_decode_gate_up_fp4`.
+      **A/B (GPU 6, gfx950, 100 iters, DeepSeek-like H7168(contraction)/I2048/E8):** G7 is
+      **~4% slower** (B1 0.94–0.96×, B2 0.97×, B4 0.98×, B8 ~1.0×); cos **1.0000**. Root cause:
+      gate_up already runs **two interleaved dot2 streams** (gate+up) that mutually cover the
+      accumulator hazard, and its B=1 grid `B*TOPK*INTER`=16384 waves (vs `down`'s
+      `B*HIDDEN/kh`=3584) is **occupancy-bound not latency-bound**, so removing `s_nop` buys
+      nothing while the extra accumulators/drain adds cost a little. **Decision:** default
+      gate_up to the serialized path; keep the `dot2_acc` knob wired to re-test once kVector
+      16/32 lengthens each stream's independent-pair count (may flip the balance).
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
