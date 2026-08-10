@@ -31,7 +31,7 @@ dropped-slot marker (dest PE == npes); "tis" = recv-slot -> global source-token 
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, T
+from flydsl.expr import arith, const_expr, range_constexpr
 from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -50,7 +50,7 @@ from flydsl.expr.rocdl import (
     cvt_scale_pk8_f32_fp4,
     cvt_scalef32_pk8_fp4_f32,
 )
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 import mori.cco.device.flydsl as cco
 from . import flydsl_prims as P

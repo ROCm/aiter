@@ -16,7 +16,6 @@ from flydsl.expr import (
     rocdl,
     tdm_ops,
 )
-from aiter.ops.flydsl.kernels import vector
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
