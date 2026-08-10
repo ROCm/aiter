@@ -173,6 +173,12 @@ class EpDispatchCombineConfig:
     #                  cap_per_expert silently DROPS the overflow (finalize clamp).
     #                  Smaller cap => fewer padding tiles => faster, at that risk.
     cap_per_expert: int = 0
+    # push_group + pre-quantized (fp8) tokens: the sender's scale is linear, but the
+    # consuming GEMM wants it WMMA-preshuffled, and the preshuffled position depends
+    # on the row's slot within its destination expert. Set this to the GEMM's
+    # tile_m//16 to have dispatch apply that permutation as it scatters the scale,
+    # which removes the receiver-side quant+repack pass entirely. 0 => linear scale.
+    push_group_scale_wmma_rep: int = 0
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -210,15 +216,14 @@ class EpDispatchCombineConfig:
                 f"token_nbytes={self.token_nbytes}"
             )
         if self.is_asymmetric_dtype:
-            # asymmetric dtype (separate disp_out/comb_stg buffers): gather/non-quant/
-            # non-StdMoE only.
-            if (
-                self.combine_mode != "gather"
-                or self.combine_quant_type != "none"
-                or self.enable_std_moe
-            ):
+            # asymmetric dtype (separate disp_out/comb_stg buffers): non-quant /
+            # non-StdMoE. Every combine mode is fine as long as the return wire is
+            # sized off combine_dtype, which is what wire_elem_size / the combine
+            # builders use; combine_quant_type would be a second, conflicting say
+            # over that wire, and StdMoE's convert kernels are bf16-only.
+            if self.combine_quant_type != "none" or self.enable_std_moe:
                 raise ValueError(
-                    "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
+                    "combine_data_type (asymmetric dtype) requires "
                     "combine_quant_type=none, enable_std_moe=False"
                 )
             if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
@@ -295,11 +300,13 @@ class EpDispatchCombineConfig:
 
     @property
     def wire_elem_size(self):
-        """comb_inp transport element size: 1 byte for fp8 paths, else elem_size."""
+        """comb_inp transport element size: 1 byte for fp8 paths, else the COMBINE
+        element size (not the dispatch one -- a narrow dispatch dtype must not
+        shrink the return wire that gemm2's epilogue writes)."""
         return (
             1
             if self.combine_quant_type in ("fp8_direct_cast", "fp8_blockwise")
-            else self.elem_size
+            else self.combine_elem_size
         )
 
     @property
@@ -523,10 +530,20 @@ class EpDispatchCombineOp:
         is_fp4 = cfg.is_fp4
         is_fp8 = cfg.is_fp8
         token_nbytes = cfg.token_nbytes  # per-token transport bytes (fp4 = hidden/2)
-        if (is_fp4 or is_fp8) and cfg.is_scatter:
+        # The restriction is about the COMBINE wire: a scatter combine accumulates
+        # into the peer slot, which the fp4/fp8 accumulators do not implement (that
+        # is what combine_quant_type=fp8_direct_cast is for). A narrow dispatch dtype
+        # with a bf16 combine is fine -- dispatch is a pure byte mover and the two
+        # directions carry independent buffers -- and is how the push path sends
+        # pre-quantized tokens.
+        combine_is_narrow = cfg.combine_dtype == torch.float4_e2m1fn_x2 or (
+            cfg.combine_dtype in _FP8_DTYPES
+        )
+        if (is_fp4 or is_fp8) and cfg.is_scatter and combine_is_narrow:
             raise ValueError(
-                "plain fp4/fp8 token dtype is gather-only "
-                "(fp8 quant uses combine_quant_type=fp8_direct_cast, not data_type)"
+                "plain fp4/fp8 token dtype is gather-only for a symmetric op "
+                "(fp8 quant uses combine_quant_type=fp8_direct_cast, not data_type); "
+                "set combine_data_type=bf16 for a narrow-dispatch / wide-combine op"
             )
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
@@ -707,6 +724,7 @@ class EpDispatchCombineOp:
             push_group_cap=self._push_group_cap,
             off_pg_running=arena.offset("pg_running") if cfg.push_group else 0,
             off_pg_rowmap=arena.offset("pg_rowmap") if cfg.push_group else 0,
+            push_group_scale_wmma_rep=cfg.push_group_scale_wmma_rep,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -725,7 +743,7 @@ class EpDispatchCombineOp:
                     npes=cfg.world_size,
                     experts_per_token=topk,
                     hidden_dim=hidden_dim,
-                    hidden_elem_size=elem_size,
+                    hidden_elem_size=cfg.combine_elem_size,
                     max_tok_per_rank=max_tok_per_rank,
                     block_num=b,
                     warp_num_per_block=w,
@@ -742,7 +760,7 @@ class EpDispatchCombineOp:
                     npes=cfg.world_size,
                     experts_per_token=topk,
                     hidden_dim=hidden_dim,
-                    hidden_elem_size=elem_size,
+                    hidden_elem_size=cfg.combine_elem_size,
                     max_tok_per_rank=max_tok_per_rank,
                     max_recv=recv_cap,
                     block_num=b,
@@ -1254,17 +1272,36 @@ class EpDispatchCombineOp:
         """Torch views of the fixed-slot recv grid + the dispatch-emitted combine
         map, for the push-group MoE (grouped_a8w4_tdm_moe_push_scatter). ``disp_out``
         is [num_local_experts*CAP, hidden] grouped bf16, ``pg_running`` the per-expert
-        landed counts, ``pg_rowmap`` the (rrows+1,2) {dst_packed, weight} map."""
+        landed counts, ``pg_rowmap`` the (rrows+1,2) {dst_packed, weight} map.
+
+        When the sender pre-quantized (``push_group_scale_wmma_rep > 0``), ``disp_out``
+        is the fp8 payload and ``disp_scale`` is the matching WMMA-preshuffled e8m0
+        scale, both already in the layout GEMM1 reads -- the caller runs no quant
+        pass at all."""
         if not self._push_group:
             return None
         rrows = self._pg_recv_rows
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        wmma_rep = self.cfg.push_group_scale_wmma_rep
+        disp_scale = None
+        if wmma_rep > 0:
+            cap = self._push_group_cap
+            disp_scale = from_gpu_ptr(
+                self.arena.local_ptr("out_scales"),
+                (
+                    self.cfg.num_experts_per_rank,
+                    cap // wmma_rep,
+                    (self.cfg.hidden_dim // 32) * wmma_rep,
+                ),
+                torch.uint8,
+            )
         return dict(
             disp_out=from_gpu_ptr(
                 self.arena.local_ptr("disp_out"),
                 (rrows, cols),
                 self.cfg.dispatch_dtype,
             ),
+            disp_scale=disp_scale,
             pg_running=from_gpu_ptr(
                 self.arena.local_ptr("pg_running"),
                 (self.cfg.num_experts_per_rank,),

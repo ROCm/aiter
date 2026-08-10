@@ -18,32 +18,36 @@ with the drop sentinel in ``reset_push_group`` before dispatch, so any row a
 token never landed in already reads sentinel (combine skips it).
 
 Parallel, one thread per local expert (single block, ``num_local_experts`` <= 1024).
-Two facts make this trivially parallel with no prefix-scan / no compaction:
+The schedule is COMPACTED: the first ``num_valid/tile_m`` metadata entries are all
+non-empty tiles, which is what lets the persistent GEMM1 scheduler bound its work
+by ``num_valid`` instead of walking a static ``E*CAP/tile_m`` grid that is almost
+entirely padding. Two facts keep the compaction cheap:
 
-  * The GEMM launches a FIXED grid of ``E*tiles_per_expert`` M-tiles and skips
-    padding tiles via the ``expert_ids == n_experts`` sentinel, so it never reads
-    ``num_valid`` and does not need the schedule compacted. We therefore write a
-    fixed, NON-compacted layout: expert ``le``'s tile ``t`` lives at meta index
-    ``le*tiles_per_expert + t``; unused slots keep the host-prefilled defaults
-    (tile_row_base=-1, expert_ids=E skip, tile_valid=0).
+  * A metadata entry is self-describing (row base, global expert id, valid rows),
+    so the ORDER among valid tiles is irrelevant. A fetch-and-add on ``num_valid``
+    therefore allocates slots directly -- no prefix scan, and in particular no
+    cross-wave scan even though the experts span several waves.
   * Each expert's counter is owned by exactly one thread, so the read-then-zero
     of ``pg_running[le]`` is race-free within the kernel (cross-rank races are
     already fenced by dispatch's end barrier + combine's barrier around it).
 
+Slots past ``num_valid/tile_m`` keep the host-prefilled defaults (tile_row_base=-1,
+expert_ids=E skip, tile_valid=0), so a caller that still launches the static grid
+remains correct -- it just pays for the padding tiles.
+
 The previous single-thread version serialized ~E*(2+3*tiles) global mem ops behind
 one lane, which was pure latency (~25 us/call at E=96); this issues them across E
-threads concurrently. ``num_valid`` (unused by the GEMM, kept for the unit test)
-is summed via a cheap atomic_add.
+threads concurrently.
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, T
+from flydsl.expr import arith, const_expr
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.dispatch_combine_v2.intranode_kernels import WAVE
 from aiter.ops.flydsl.dispatch_combine_v2 import flydsl_prims as P
@@ -84,11 +88,23 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
             # ceil(count / tile_m); tile_m is a power of two.
             num_tiles = (count + (tile_m - 1)) // tile_m
             gid = le + arith.constant(rank * experts_per_rank)
+            # Compact metadata slots. Each entry is self-describing (row base,
+            # expert, valid rows), so the order among valid tiles is irrelevant and
+            # a fetch-and-add allocator suffices -- no cross-wave prefix scan is
+            # needed even though the experts span several waves. Allocating in ROWS
+            # keeps num_valid's meaning (total valid rows); every allocation is a
+            # multiple of tile_m so the division back to a slot index is exact.
+            # Experts that received nothing add 0 and claim no slot, so the first
+            # num_valid/tile_m entries are exactly the non-empty tiles and the
+            # persistent GEMM scheduler never walks a padding tile.
+            row_base = fx.Int32(
+                P.atomic_add_global(num_valid_addr, num_tiles * tile_m)
+            )
+            meta_base = row_base // tile_m
             for t in const_expr(range(tiles_per_expert)):
                 active = t < num_tiles
                 if active:
-                    # fixed (non-compacted) slot: le*tiles_per_expert + t.
-                    meta = le * tiles_per_expert + t
+                    meta = meta_base + t
                     buffer_store(le * cap + (t * tile_m), rsrc_trb, meta)
                     buffer_store(gid, rsrc_eid, meta)
                     # valid rows in THIS tile = min(tile_m, count - t*tile_m); the
@@ -98,9 +114,6 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
                     rem = count - arith.constant(t * tile_m)
                     valid = arith.select(rem < tile_m, rem, arith.constant(tile_m))
                     buffer_store(valid, rsrc_tv, meta)
-            # num_valid is unused by the GEMM (fixed grid + sentinel skip); kept
-            # correct for the unit test via a cheap atomic (host pre-zeroes it).
-            P.atomic_add_global(num_valid_addr, num_tiles * tile_m)
 
     @flyc.jit
     def run(
