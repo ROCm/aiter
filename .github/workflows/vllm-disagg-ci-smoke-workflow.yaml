@@ -277,6 +277,24 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
+      - name: Cancel superseded 5-8-only Slurm job
+        run: |
+          set -euo pipefail
+          stale_job_id=4182
+          stale_job="$(scontrol show job "${stale_job_id}" 2>/dev/null || true)"
+          if [[ -z "${stale_job}" ]]; then
+            echo "Superseded Slurm job ${stale_job_id} is no longer present"
+            exit 0
+          fi
+          if ! grep -qE 'JobName=vllm-disagg-pd([[:space:]]|$)' <<< "${stale_job}" || \
+             ! grep -qE "UserId=$(whoami)([[:space:]]|$)" <<< "${stale_job}"; then
+            echo "Refusing to cancel Slurm job ${stale_job_id}: ownership or job name does not match" >&2
+            echo "${stale_job}" >&2
+            exit 1
+          fi
+          echo "Cancelling superseded Slurm job ${stale_job_id} from run 31383654024"
+          scancel "${stale_job_id}"
+
       - name: Checkout vLLM Buildkite 17 baseline
         run: |
           set -euo pipefail
@@ -520,13 +538,17 @@ jobs:
               echo "> No job log at \`${job_log}\`; the workload may not have launched."
             fi
 
-            role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID:-}"
-            if [[ -d "${role_dir}" ]]; then
+            role_dir=""
+            if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+              role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID}"
+            fi
+            if [[ -n "${role_dir}" && -d "${role_dir}" ]]; then
               mkdir -p vllm-disagg-role-logs
-              cp -a "${role_dir}/." vllm-disagg-role-logs/
-              echo "- Role logs: copied from \`${role_dir}\`"
+              find "${role_dir}" -maxdepth 1 -type f -name '*.log' \
+                -exec cp -f --no-preserve=mode,ownership,timestamps {} vllm-disagg-role-logs/ \;
+              echo "- Role logs: copied top-level logs from \`${role_dir}\`"
             else
-              echo "> No role-log directory at \`${role_dir}\`."
+              echo "> No role-log directory for Slurm job \`${SLURM_JOB_ID:-unknown}\`."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
