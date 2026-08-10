@@ -199,7 +199,7 @@ def _gfx1250_kids() -> dict:
         return {}
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_opus_workspace(
     device: torch.device, ws_shape: tuple, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -258,7 +258,7 @@ def _alloc_splitk_workspace(
             ws_dtype = _OPUS_WS_TORCH_DTYPE.get(inst.fuse_ws_dtype, torch.float32)
         else:
             # ws-variant: fp32 workspace; launcher clamps split_k down from splitK.
-            split_k = int(splitK) if int(splitK) > 1 else 1
+            split_k = max(1, int(splitK))
             ws_dtype = torch.float32
     else:
         # Kid table unavailable: widest-element (fp32) upper bound. split_k must
@@ -326,9 +326,7 @@ def opus_gemm_a16w16_tune(
     workspace = None
     if 20000 <= kernelId < 30000:
         batch, M, N = Y.shape
-        workspace = _alloc_splitk_workspace(
-            kernelId, batch, M, N, splitK, XQ.device
-        )
+        workspace = _alloc_splitk_workspace(kernelId, batch, M, N, splitK, XQ.device)
     # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
     # (the kernel has no N-tail mask and no K-tail mask; M-tail IS handled
     # via the bounded gmem desc). A CSV winner picked through

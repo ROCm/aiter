@@ -84,7 +84,7 @@ def _patch_flaky_hip_device_count():
 _patch_flaky_hip_device_count()
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
-from opus_gemm_common import (  # noqa: E402
+from opus_gemm_common import (
     BIAS_AWARE_KIDS,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
@@ -112,12 +112,12 @@ from opus_gemm_common import (  # noqa: E402
     gfx1250_splitk_fuse_kernels_list,
 )
 
-from aiter import dtypes, logger  # noqa: E402
-from aiter.ops.opus.gemm_op_a16w16 import (  # noqa: E402
+from aiter import dtypes, logger
+from aiter.ops.opus.gemm_op_a16w16 import (
     opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
 )
-from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner  # noqa: E402
-from aiter.utility.mp_tuner import mp_tuner  # noqa: E402
+from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 # gfx1250 candidate-filter knobs (see _gfx1250_select_candidates).
 GFX1250_TOP_TILES = 8  # top-N tiles by grid-occupancy fit
