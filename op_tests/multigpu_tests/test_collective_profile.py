@@ -23,18 +23,19 @@ After running, check the generated trace file (e.g., trace_rank0.json)
 and search for "record_param_comms" events.
 """
 
-import os
 import json
+import os
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
 
 from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_reduce_scatter,
-    tensor_model_parallel_all_gather,
 )
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
@@ -94,7 +95,7 @@ def run_worker(local_rank, world_size):
             residual = torch.randn(shape, dtype=torch.float16, device=device)
             weight = torch.randn(hidden_size, dtype=torch.float16, device=device)
             eps = 1e-5
-            out2, residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            out2, _residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                 out1, residual, weight, eps
             )
             torch.cuda.synchronize()
@@ -156,8 +157,8 @@ def main():
     # Check if we're already in a torchrun environment
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # Running under torchrun, use environment variables directly
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         run_worker(local_rank, world_size)
     else:
         # Not in torchrun, spawn processes manually

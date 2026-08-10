@@ -15,15 +15,17 @@ Example:
         -n 16,4 -b 1 -c 13 -cpw 4
 """
 
-import torch
-import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
+import itertools
+import random
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -32,11 +34,7 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.fp8 and kv_dtype == dtypes.fp8:
-        return False
-    if get_gfx() == "gfx942":
-        return False
-    return True
+    return get_gfx() == "gfx950"
 
 
 def cal_diff(
@@ -97,7 +95,7 @@ def ref_masked_attention(
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
-    l = attn_weights_exp.sum(-1)  # noqa: E741
+    l = attn_weights_exp.sum(-1)
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
@@ -135,7 +133,7 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
@@ -307,6 +305,8 @@ def aiter_cp_rank_decode(
     is_causal,
     cp_world_size,
     cp_rank,
+    q_scale=None,
+    kv_scale=None,
 ):
     """Run aiter persistent MLA decode for ONE CP rank.
 
@@ -383,6 +383,8 @@ def aiter_cp_rank_decode(
         nhead_kv=nhead_kv,
         sm_scale=sm_scale,
         num_kv_splits=max_split_per_batch,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
         work_meta_data=work_meta_data,
         work_indptr=work_indptr,
         work_info_set=work_info_set,
@@ -480,6 +482,15 @@ def test_mla_cp(
     ).to(kvtype)
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16).to(dtype)
 
+    # fp8 paths need explicit (unit) descale factors; the asm kernel rejects fp8 Q
+    # without them.
+    q_scale = (
+        torch.ones([1], dtype=torch.float, device=dev) if dtype == dtypes.fp8 else None
+    )
+    kv_scale = (
+        torch.ones([1], dtype=torch.float, device=dev) if kvtype == dtypes.fp8 else None
+    )
+
     # ---- full-KV causal golden via the EXISTING reference ------------------ #
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -493,6 +504,8 @@ def test_mla_cp(
         qk_rope_head_dim,
         dtype=out_dtype,
         is_causal=True,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
     )
 
     # ---- build per-rank LOCAL indices ONCE (shared by reference + kernel) --- #
@@ -551,6 +564,8 @@ def test_mla_cp(
             dtype=out_dtype,
             cp_world_size=W,
             cp_rank=r,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
         )
         cp_outs.append(o_r)
         cp_lses.append(l_r)
@@ -579,6 +594,8 @@ def test_mla_cp(
             is_causal,
             W,
             r,
+            q_scale,
+            kv_scale,
         )
         rank_us.append(us)
 
@@ -629,7 +646,7 @@ def test_mla_cp(
             aiter_merged_lse,
             msg=f"mla_cp_round_robin W={W} qlen={qlen} [golden vs aiter_merge lse]:......",
         )
-    cal_diff(out_ref, aiter_merged_out, "out", False)
+    cal_diff(out_ref, aiter_merged_out, "out", dtype == dtypes.fp8)
     ret["cp:err_ref"] = err_ref
     ret["cp:err_aiter"] = err
     ret["cp:world_size"] = W
@@ -677,7 +694,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"]],
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
     default=[dtypes.d_dtypes["bf16"]],
     metavar="{bf16, fp8}",
@@ -688,7 +705,7 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"]],
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
     metavar="{bf16, fp8}",
     default=[dtypes.d_dtypes["bf16"]],
@@ -719,7 +736,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 2), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8), (64, 17)],
+    default=[(16, 4), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8), (64, 17)],
     help="""Number of heads, decode_qlen pairs.
     e.g.: -n 16,4""",
 )
@@ -781,8 +798,8 @@ for nhead, decode_qlen in args.nhead:
         args.max_split_per_batch,
         args.cp_world_size,
     ):
-        if dtype != dtypes.bf16 or kvtype != dtypes.bf16:
-            # CP round-robin path validated for bf16/bf16 only for now.
+        if dtype == dtypes.bf16 and kvtype == dtypes.fp8:
+            # bf16 Q with fp8 KV has no round-robin CP kernel variant.
             continue
         if not check_support(dtype, kvtype, nhead):
             continue

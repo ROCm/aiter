@@ -25,12 +25,12 @@
 import ctypes
 import platform
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.distributed import ReduceOp
-from aiter import logger
 
+from aiter import logger
 
 # === export types and functions from nccl to Python ===
 # for the original nccl definition, please check
@@ -124,7 +124,7 @@ class Function:
 
 
 class NCCLLibrary:
-    exported_functions = [
+    exported_functions: ClassVar[list[Any]] = [
         # const char* ncclGetErrorString(ncclResult_t result)
         Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
         # ncclResult_t  ncclGetVersion(int *version);
@@ -294,11 +294,11 @@ class NCCLLibrary:
 
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
-    path_to_library_cache: dict[str, Any] = {}
+    path_to_library_cache: ClassVar[dict[str, Any]] = {}
 
     # class attribute to store the mapping from library path
     #  to the corresponding dictionary
-    path_to_dict_mapping: dict[str, dict[str, Any]] = {}
+    path_to_dict_mapping: ClassVar[dict[str, dict[str, Any]]] = {}
 
     def __init__(self, so_file: str | None = None):
         so_file = so_file or "librccl.so.1"
@@ -308,7 +308,7 @@ class NCCLLibrary:
                 lib = ctypes.CDLL(so_file)
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
-        except Exception as e:
+        except Exception:
             logger.error(
                 "Failed to load NCCL library from %s. "
                 "It is expected if you are not running on NVIDIA/AMD GPUs."
@@ -320,7 +320,7 @@ class NCCLLibrary:
                 so_file,
                 platform.platform(),
             )
-            raise e
+            raise
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
@@ -548,10 +548,10 @@ class NCCLLibrary:
 
 __all__ = [
     "NCCLLibrary",
+    "buffer_type",
+    "cudaStream_t",
+    "ncclComm_t",
     "ncclDataTypeEnum",
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
-    "ncclComm_t",
-    "cudaStream_t",
-    "buffer_type",
 ]
