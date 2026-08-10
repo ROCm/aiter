@@ -185,8 +185,13 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `build_down_reduce_fp4_module` (kVector=8 default: 1 i32 = 8 FP4 = one weight
       dword/lane/iter, `n_wwords = kVector/8`, `w_word = ipair//4`, `sel = ipair%4`; E8M0 byte
       loaded via `dtype=T.i8()` → `e8m0_byte_to_f32`). **Correctness PASS** on gfx950
-      (`/tmp/repro_down_fp4.py`, cos 0.999999 at H1/H2, incl. max-offset expert). Still TODO:
-      entry-point `w_dtype`/`flydsl_warp_decode_down_reduce` wiring + op_test + A/B perf.
+      (`/tmp/repro_down_fp4.py`, cos 0.999999 at H1/H2, incl. max-offset expert).
+      **Entry point wired**: `flydsl_warp_decode_down_reduce_fp4` (separate fn, not a
+      `w_dtype` switch — cleaner given the FP8 scale-mode branches) takes `w_down` uint8
+      `[E, HIDDEN, INTER//2]` + `w_down_scale` uint8 E8M0 `[(E*HIDDEN)//BN, INTER//BK]`,
+      `scale_block=(1,32)` default, `kvector=8` via `pick_kvector_fp4`, cached via
+      `_get_down_reduce_fp4`. End-to-end **PASS** (`/tmp/repro_down_fp4_entry.py`, cos 0.999998).
+      Still TODO: op_test case + A/B perf sweep.
 - [ ] **gate_up FP4** (apply the down recipe; gate on accuracy).
 - [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
       natural home for the ILP scheme (plan §2).
