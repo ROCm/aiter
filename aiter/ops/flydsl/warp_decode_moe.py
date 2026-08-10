@@ -85,7 +85,15 @@ def _get_gate_up_fp4(hidden, inter, top_k, kvector, serialize_dot2, scale_bn, sc
 
 @functools.lru_cache(maxsize=64)
 def _get_down_reduce_fp4(
-    inter, hidden, top_k, kvector, serialize_dot2, scale_bn, scale_bk, kh_per_warp
+    inter,
+    hidden,
+    top_k,
+    kvector,
+    serialize_dot2,
+    scale_bn,
+    scale_bk,
+    kh_per_warp,
+    dot2_acc,
 ):
     return build_down_reduce_fp4_module(
         inter,
@@ -96,6 +104,7 @@ def _get_down_reduce_fp4(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
+        dot2_acc=dot2_acc,
     )
 
 
@@ -383,6 +392,7 @@ def flydsl_warp_decode_down_reduce_fp4(
     scale_block: tuple[int, int] = (1, 32),
     serialize_dot2: bool = True,
     kh_per_warp: int | None = None,
+    dot2_acc: int = 4,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **MXFP4** weights (BF16 intermediate, FP4 e2m1 + E8M0).
@@ -403,6 +413,8 @@ def flydsl_warp_decode_down_reduce_fp4(
             row-major over (weight-row-block, K-block), (BN, BK) = ``scale_block``.
         scale_block:  (BN, BK); MXFP4 default (1, 32).
         kh_per_warp:  outputs per wave (defaults to 2 when HIDDEN is even, else 1).
+        dot2_acc:     G7 independent dot2 accumulators (default 4; s_nop-free ILP).
+            ``<=1`` falls back to the serialized ``s_nop`` chain (``serialize_dot2``).
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -447,7 +459,15 @@ def flydsl_warp_decode_down_reduce_fp4(
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
     launcher = _get_down_reduce_fp4(
-        INTER, HIDDEN, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, kh_per_warp
+        INTER,
+        HIDDEN,
+        TOPK,
+        kvector,
+        serialize_dot2,
+        scale_bn,
+        scale_bk,
+        kh_per_warp,
+        dot2_acc,
     )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run(

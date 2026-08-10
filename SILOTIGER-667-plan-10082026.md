@@ -222,8 +222,24 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `test_gate_up_fp4` (`GATE_UP_FP4_CASES`, dequant ref, max-offset expert) — 2 pass; full
       file **22 passed**. Accuracy: cos ≥ 0.99 holds through the SiLU on these shapes. Perf
       A/B deferred to Phase D/E with the `down` levers (kVector 16/32, G7 ILP, G8 prefetch).
-- [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
-      natural home for the ILP scheme (plan §2).
+- [x] **G7 s_nop-free multi-accumulator dot2 landed on FP4 `down`.** `dot2_f32_bf16_drain`
+      round-robins the per-`(h,k)` pairs across `dot2_acc` (default **4**) independent f32
+      accumulators; consecutive `v_dot2_f32_bf16` write different registers so the
+      accumulator-RAW hazard is hidden by ILP (no `s_nop`), and only the **final write per
+      accumulator** carries `s_nop 2` (the drain add reads it immediately). Restructured the
+      k-loop to **collect all `(iter,pair)` contributions into one drain per `(h,k)`** (was a
+      per-`(h,iter)` `dot_i` + `acc += dot_i*rw`), so the accumulators persist across the whole
+      K-range and s_nop count drops from `num_iter*n_pairs` to `dot2_acc` per `(h,k)` (16→4 at
+      DeepSeek I2048). Threaded `dot2_acc` through `build_down_reduce_fp4_module`,
+      `_get_down_reduce_fp4`, and `flydsl_warp_decode_down_reduce_fp4` (`dot2_acc<=1` keeps the
+      serialized `s_nop` chain for A/B). **Impl notes:** compile-time branch needs
+      `const_expr(dot2_acc>1)` (a bare `if` lowers to `scf.if` and values don't escape); pair
+      lists are built with comprehensions / `range_constexpr` index loops (a plain in-kernel
+      `for` over a Python list is rewritten to a dynamic loop and fails to loop-carry).
+      **A/B (GPU 6, gfx950, device timing, 100 iters, DeepSeek I2048/H7168/E8):** B1
+      15.15→**13.54 µs (1.12×)**, B2 0.91×, B4 1.00×, B8 0.99×; cos **1.0000** at all B. G7
+      helps exactly where decode is latency/serialization-bound (**B=1**) and is neutral at
+      B≥2 (occupancy already hides the stall). Correct + wired + swept.
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
