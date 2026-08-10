@@ -446,3 +446,30 @@ def test_negative_slot_is_skipped_and_zero_is_not():
     # Slot 0 is valid here even though the reference would call it invalid.
     assert not (args["out"][1] == 7.0).all()
     assert not torch.equal(kernel_pool[0], pool[0])
+
+
+def test_kda_tuned_rows_are_not_reachable_from_the_scalar_gate():
+    """The 12:12 rows time a per-channel kernel; scalar GDR keeps its fallback.
+
+    Both gates share (arch, dtypes, B, Sq, heads, dims), so without gate_mode in
+    the key a scalar call at K3's geometry silently inherits a config tuned for
+    a different binary.
+    """
+    from aiter.ops.flydsl.linear_attention_kernels import (
+        GDR_GPU_ARCH,
+        get_default_kwargs,
+    )
+
+    fallback = {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
+    tuned_batches = (1, 4, 64, 256)
+
+    def lookup(B, gate_mode):
+        return get_default_kwargs(
+            "torch.bfloat16", "torch.float32", B, 1, 12, 12, 128, 128, gate_mode
+        )
+
+    if all(lookup(B, "kda") == fallback for B in tuned_batches):
+        pytest.skip(f"no 12x12 kda row for {GDR_GPU_ARCH}")
+
+    for B in tuned_batches:
+        assert lookup(B, "gdr") == fallback, f"scalar GDR at B={B} took a kda row"

@@ -8,7 +8,8 @@ Kimi-K3 decodes at a 1:1 head ratio, which matches no row in
 ``gdr_decode_tuned.csv`` -- all of them are GQA at ratio 2 or 4 -- so an untuned
 call falls back to (1, 4, 8) and any timing taken before the sweep measures the
 fallback. ``--sweep`` produces the missing rows; ``--bench`` compares against the
-deployed Triton kernel.
+deployed Triton kernel. Rows go out as ``gate_mode=kda``, which the table keys on,
+so they never reach the scalar gate.
 
 ``--bench`` reports two numbers because they differ by ~2x at decode batch sizes
 and quoting the wrong one is the easy mistake: ``call_us`` (host cost included,
@@ -73,7 +74,7 @@ LOOP_ITERS = 500
 
 CSV_HEADER = (
     "arch,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,"
-    "NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration"
+    "NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration,gate_mode"
 )
 
 
@@ -344,7 +345,7 @@ def sweep(args):
         nbpv, nw, wtk = best_cfg
         rows.append(
             f"{arch},{DTYPE},{STATE_DTYPE},{B},1,{H},{H},{K},{V},"
-            f"{nbpv},{nw},{wtk},{best_us}"
+            f"{nbpv},{nw},{wtk},{best_us},kda"
         )
 
     print(CSV_HEADER)

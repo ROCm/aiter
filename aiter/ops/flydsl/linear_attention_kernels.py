@@ -34,6 +34,7 @@ def get_default_kwargs(
     num_v_heads,
     head_k_dim,
     head_v_dim,
+    gate_mode="gdr",
 ):
     d = {}
     d["NUM_BLOCKS_PER_V_DIM"] = 1
@@ -57,8 +58,9 @@ def get_default_kwargs(
                     int(obj["head_v_dim"]),
                 )
                 d_str, sd_str = obj["dtype"], obj["state_dtype"]
+                gm = obj.get("gate_mode") or "gdr"
                 if float(obj["duration"]) < 10000.0:
-                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd, gm)] = {
                         "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
                         "NUM_WARPS": int(obj["NUM_WARPS"]),
                         "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
@@ -75,6 +77,7 @@ def get_default_kwargs(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            gate_mode,
         ),
         None,
     )
@@ -219,6 +222,7 @@ def flydsl_gdr_decode(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            gate_mode,
         )
         exe = create_vk_gdr_decode_kernel(
             get_dtype_str(query.dtype),
