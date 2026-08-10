@@ -422,7 +422,15 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
         parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
-        return parsed is not None and parsed.get("mode", "atomic") == "reduce"
+        if parsed is None:
+            return False
+        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
+        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
+        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
+        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
+            return False
+        return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
     if func is _flydsl_v2_stage2_wrapper:
@@ -796,6 +804,34 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
+    # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
+    _is_a16w4_situv2 = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and activation == ActivationType.Situv2
+    )
+    if _is_a16w4_situv2:
+        for _bad, _why in (
+            (
+                get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
+                (
+                    f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
+                    f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})"
+                ),
+            ),
+            (bias1 is not None or bias2 is not None, "per-expert bias"),
+            (expert_mask is not None, "expert-parallel masking"),
+            (
+                not (isShuffled and isG1U1 and not doweight_stage1),
+                "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
+            ),
+        ):
+            if _bad:
+                raise NotImplementedError(
+                    f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
+                )
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -836,9 +872,10 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert (
-        not metadata.flat or get_gfx() == "gfx950"
-    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
+    assert not metadata.flat or get_gfx() in (
+        "gfx942",
+        "gfx950",
+    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1003,6 +1040,7 @@ def fused_moe_1stage(
     M: int | None = None,
     device=None,
     doweight_stage1: bool | None = None,
+    flat: int = 0,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -1094,6 +1132,7 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
+                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -2252,7 +2291,7 @@ def get_2stage_cfgs(
         run_1stage = False
         run_1stage_xbf16 = False
         # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = False
+        cfg_flat = 0
         if (
             activation,
             q_type,
@@ -2317,9 +2356,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
-            cfg_flat = False
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2374,6 +2413,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
+                flat=cfg_flat,
             ),
             None,
             block_m,
@@ -2563,7 +2603,19 @@ def get_2stage_cfgs(
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
-    use_mxfp4_flydsl = (
+    # a16w4-SiTUv2 (bf16 A x mxfp4 W) -> ported 2-stage path; SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
+    _is_a16w4_situv2 = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
+    use_mxfp4_flydsl = _is_a16w4_situv2 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
@@ -2571,18 +2623,8 @@ def get_2stage_cfgs(
             or _flydsl_force
         )
         and (
-            (
-                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
-            )
-            or (
-                # a16w4 bf16/fp16 x mxfp4: routed to the mixed_moe a16w4 kernel
-                # ONLY for SiTUv2. Situv2 uniquely identifies this path, so
-                # GPT-OSS / legacy bf16-Swiglu keep their CK-Tile routing.
-                q_dtype_a in (dtypes.bf16, dtypes.fp16)
-                and q_dtype_w == dtypes.fp4x2
-                and activation == ActivationType.Situv2
-            )
+            q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+            and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         )
         and is_shuffled
         and use_g1u1
@@ -2598,17 +2640,15 @@ def get_2stage_cfgs(
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype routing:
-        #   "fp4"         => a4w4 fp4/fp4
-        #   "fp8"         => a8w4 fp8/fp4 (or a8w8 with w=fp8)
-        #   "bf16"/"fp16" => a16w4 bf16/fp16 x mxfp4 (SiTUv2 only; no act scale)
-        if q_dtype_a == dtypes.fp4x2:
-            _a_type = "fp4"
-        elif q_dtype_a == dtypes.fp8:
-            _a_type = "fp8"
-        elif q_dtype_a == dtypes.bf16:
+        #   "bf16" => a16w4 bf16/fp4 (no A quant, SiTUv2)
+        #   "fp4"  => a4w4 fp4/fp4
+        #   "fp8"  => a8w4 fp8/fp4 (or a8w8 with w=fp8)
+        if _is_a16w4_situv2:
             _a_type = "bf16"
+        elif q_dtype_a == dtypes.fp4x2:
+            _a_type = "fp4"
         else:
-            _a_type = "fp16"
+            _a_type = "fp8"
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
@@ -3008,7 +3048,20 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
-    if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
+    # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
+    # skip the throwaway (token_num, topk, inter_dim) alloc (up to ~tens of MB at
+    # prefill). Gate matches the a16w4 branch of _flydsl_moe_stage1_impl.
+    _is_a16w4_port = (
+        quant_type == QuantType.per_1x32
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and getattr(w1, "dtype", None) == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
+    )
+    if _is_a16w4_port:
+        a2 = None
+    elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
@@ -3039,9 +3092,7 @@ def fused_moe_2stages(
     if stage1_func is _flydsl_stage1_wrapper:
         if stage2_func is _flydsl_v2_stage2_wrapper:
             extra_stage1_args["v2_output_layout"] = True
-        # SiTUv2 beta/linear_beta are compile-time constants baked into the
-        # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
-        # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
+        # SiTUv2 beta/linear_beta -> stage1 (runtime on the a16w4 port, baked on a8w4/a4w4); None -> 1.0.
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
