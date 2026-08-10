@@ -128,16 +128,14 @@ _MI355X_TABLE = {
     },
 }
 
-# ── gfx1250 (256 CU, wave32) — RE-TUNED 2026-07-15 EP4, bf16, vec4 combine + inner-unroll
-# scheduling, 2-pass block x warp sweep (tok 16..16384). Dispatch warp 32 / block 192;
-# combine is warp-sensitive at small tok (warp 2 <=128, warp 4 mid, warp 8 large; block
-# 64->96->128). GUARDRAIL: block_num < CU (256); 192 ceiling (Phase-2 grid barrier).
+# ── gfx1250 (256 CU, wave32) — EP4, bf16, vec4 combine + load-first scheduling
+# (mori #530). Dispatch warp grows to 32, block 192; combine block grows 64->192.
+# GUARDRAIL: the Phase-2 grid barrier needs co-residence, so block_num <= CU (256).
 _GFX1250_SCHED_BF16 = (
-    (128, 128, 8, 64, 2),  # <=128:  latency-bound; combine warp 2 (fewest warps win)
-    (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
-    (1536, 192, 32, 96, 4),  # <=1536: comb block 96
-    (4096, 192, 32, 128, 8),  # <=4096: comb block 128, warp 8 (#500)
-    (None, 192, 32, 192, 8),  # >4096:  comb block 192, warp 8 (#500; 242/273 GB/s @8192/16384)
+    (256, 128, 16, 64, 4),  # <=256:  latency-bound; small comb block 64/4
+    (512, 192, 32, 128, 4),  # <=512:  disp peak; comb 128/4
+    (4096, 192, 32, 128, 8),  # <=4096: comb block 128, warp 8
+    (None, 192, 32, 192, 8),  # >4096:  comb block 192, warp 8
 )
 _GFX1250_DEFAULT = dict(
     dispatch_block_num=192,
@@ -146,8 +144,17 @@ _GFX1250_DEFAULT = dict(
     combine_warp_num_per_block=16,
     schedule=_GFX1250_SCHED_BF16,
 )
-# DeepSeek-V4-Pro (hidden 7168, topk 6): geometry is topk-independent, reuse topk=8.
-_GFX1250_SCHED_BF16_T6 = _GFX1250_SCHED_BF16
+# DeepSeek-V4-Pro (hidden 7168, topk 6) — EP4 bf16, separately tuned (mori #530) for
+# the load-once/store-many + 4-way dispatch kernel. Dispatch wants block 256 + warp 32
+# above 1024 tok (<=256 tok is latency-flat); combine also wants block 256 (== CU, so
+# blocks stay co-resident 1/CU) with warp ramping 4->16, except tiny tok where a 256
+# block starves the gather.
+_GFX1250_SCHED_BF16_T6 = (
+    (256, 128, 16, 64, 4),  # <=256:  disp latency-flat; comb small-block 64/4
+    (512, 192, 32, 128, 4),  # <=512:  disp warp 32 (192x32 == 256x32); comb 128/4
+    (1024, 192, 32, 128, 8),  # <=1024: comb 128/8
+    (None, 256, 32, 256, 16),  # >1024:  disp 256x32; comb 256x16
+)
 # EP8 RE-TUNED 2026-07-13 cross-node (UALink fabric). Dispatch block 128 (warp 16->32);
 # combine block 64 uniformly best (warp 4->8->16). Fabric caps disp ~200 GB/s;
 # world_size-independent so this also serves single-node EP8.

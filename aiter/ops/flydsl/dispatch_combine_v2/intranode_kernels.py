@@ -80,7 +80,10 @@ def _BALLOT_INT():
     # Context (flydsl>=0.3.0 no longer auto-establishes one at import).
     return T.i64 if WAVE == 64 else T.i32
 _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
-_MAIN_STRIDE_I32 = 2 * _LANE_STRIDE_I32
+# dispatch scatter unroll: gfx12/gfx1250 (WAVE=32) benefits from 4 vec4 streams
+# for memory-level parallelism; gfx9 (WAVE=64) stays at 2.
+_DISP_NSTREAMS = 4 if WAVE == 32 else 2
+_MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
 # NOTE: the cross-device xdb barrier is kept inlined per kernel (dispatch Phase 2,
@@ -319,9 +322,9 @@ def make_dispatch(
                             dest_tok_id * scale_num_i32 + k_off,
                         )
 
-            # Token-embedding scatter: each lane owns 4 i32 (16B). Two vec4 streams
-            # for memory-level parallelism, one-stream tail for the remainder;
-            # dropped slots set copy_end == lane_i32_off (no-op).
+            # Token-embedding scatter: each lane owns 4 i32 (16B). _DISP_NSTREAMS
+            # vec4 streams for memory-level parallelism, one-stream tail for the
+            # remainder; dropped slots set copy_end == lane_i32_off (no-op).
             peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
             remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
@@ -336,12 +339,17 @@ def make_dispatch(
                     is_dup_or_overflow, lane_i32_off, safe_end_i32
                 )
                 for chunk in range(lane_i32_off, copy_end_main, _MAIN_STRIDE_I32):
-                    vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32)
-                    vec_b = buffer_load(
-                        rsrc_src, chunk + _LANE_STRIDE_I32, vec_width=4, dtype=T.i32
-                    )
-                    buffer_store(vec_a, rsrc_dst, chunk)
-                    buffer_store(vec_b, rsrc_dst, chunk + _LANE_STRIDE_I32)
+                    vecs = [
+                        buffer_load(
+                            rsrc_src,
+                            chunk + k * _LANE_STRIDE_I32,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
+                        for k in range_constexpr(_DISP_NSTREAMS)
+                    ]
+                    for k in range_constexpr(_DISP_NSTREAMS):
+                        buffer_store(vecs[k], rsrc_dst, chunk + k * _LANE_STRIDE_I32)
             if const_expr(safe_end_i32 < n_i32):
                 copy_end_tail = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
                 for chunk in range(
@@ -356,8 +364,11 @@ def make_dispatch(
                     buffer_store(vec_a, rsrc_dst, chunk)
 
         if const_expr(enable_signal):
-            # Self-reset total_recv (warp 0 zeros it here + release-fence; only warp 0
-            # accumulates into it in Phase 3, so no cross-block race). CUDAGraph-safe.
+            # Self-reset total_recv (replaces the host-side total_recv.zero_()):
+            # only global warp 0 touches it — lane 0 zeros it here, all lanes
+            # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
+            # drains this store before the Phase-3 adds; total_recv is local, so
+            # no release fence / L2 writeback is needed. CUDAGraph-safe.
             if global_warp_id == 0:
                 if lane == 0:
                     buffer_store(
@@ -365,9 +376,13 @@ def make_dispatch(
                         create_buffer_resource_from_addr(addr_total_recv),
                         0,
                     )
-                P.fence_system_release()
 
             # ── Phase 2: grid barrier + per-peer count signal ──
+            # s_barrier only syncs wavefronts; drain memory counters first so the
+            # token/count stores above are complete before the grid barrier makes
+            # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
+            # implicit s_waitcnt).
+            P.waitcnt_all()
             fx.barrier()
             if tid == 0:
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
@@ -376,7 +391,6 @@ def make_dispatch(
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
                     P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    P.fence_system_acquire()
                     buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32)
@@ -590,6 +604,12 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
     return to_accum, from_accum, zero_accum
 
 
+# Fixed size of the per-block xdb flag counter array for the gather combine entry
+# barrier: one i64 per block. 256 == the CU count (the max combine block_num), so
+# block_num never exceeds it. Deliberately a hard-coded compile-time constant.
+xdb_flag_slots = 256
+
+
 def make_combine(
     *,
     rank,
@@ -644,40 +664,63 @@ def make_combine(
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
-        rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
-        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
+        rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
 
-        # ── Stage 1: cross-device entry barrier (block 0 only) ──
-        # Block 0 handles the full xdb handshake, then signals other blocks
-        # via comb_bar. Eliminates the grid barrier and per-block xdb spin.
+        # ── Stage 1: per-block cross-device entry barrier ──
+        # Each block owns a PRIVATE flag counter xdb_flag[bid]; all counters stay
+        # in lockstep (== combine call count) because every block bumps its own
+        # once per call (single writer -> no atomic, no cross-block race). Block 0
+        # pushes this call's flag to every peer's shared xdb slot (npes posted
+        # writes); then EVERY block independently polls the SAME local slots for
+        # its own flag. No shared comb_bar (no atomic contention / reset /
+        # cross-call race) and no block-0 funnel; the monotonic flag needs no
+        # reset. Polling is local (peer pushes into our slots), so the extra
+        # per-block spins add no remote traffic.
+        phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64))
         if grid_thread_id < npes:
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
-        if grid_thread_id == 0:
-            P.atomic_add_global(
-                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64)
-            )
-        if grid_thread_id < npes:
+            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # advance this block's private counter for the next call (single writer)
+        if tid == 0:
+            buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
+        # block 0 fills the unused tail counters [block_num, xdb_flag_slots) in
+        # parallel so a later call that picks a larger block_num still reads
+        # synced counters. Nobody reads these slots this call => no cross-block
+        # race. block 0 has warp_num_per_block*WAVE threads, which can be < the
+        # tail (e.g. WAVE=32, warp=4 => 128 threads < 256-block_num), so stride
+        # over the tail in a compile-time-fixed number of rounds (1-2 in practice).
+        if const_expr(xdb_flag_slots > block_num):
+            if bid == 0:
+                _tail = xdb_flag_slots - block_num
+                _nthr = warp_num_per_block * WAVE
+                for r in range_constexpr((_tail + _nthr - 1) // _nthr):
+                    idx = tid + r * _nthr
+                    if idx < _tail:
+                        buffer_store(
+                            phase + arith.constant(1, type=T.i64),
+                            rsrc_xdb_flag,
+                            block_num + idx,
+                        )
+        # every block independently polls the shared local slots (local reads).
+        # Use >= (not ==): every block — including late-scheduled ones — reads the
+        # slot, so a faster peer can lap us and overwrite its (monotonic) push with
+        # a higher call count before our late blocks read it. `>=` still releases
+        # (a peer being ahead is the safe direction); `==` would deadlock.
+        if tid < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
-            P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-        if bid == 0:
-            fx.barrier()
-            if tid == 0:
-                P.store_i32_system(
-                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
-                )
-        if bid != 0:
-            if tid == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
-            fx.barrier()
-            if tid == 0:
-                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_ge_i64(xdb_peer_slot, phase)
+        fx.barrier()
+        # No acquire fence needed here: the gather reads peer out_tok via
+        # non-temporal loads (cache-bypassing, always fresh from HBM), and the
+        # spin above is a control dependency ordering the gather after the flag.
+        # Peer's out_tok is written before its flag push (kernel boundary), so
+        # observing the flag implies the data is ready.
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -861,12 +904,10 @@ def make_combine(
 
             _accum_loop()
 
-        # Epilogue: block 0 waits for every other block to finish (comb_bar
-        # increments from Stage-1), then resets comb_bar for the next call.
-        if global_warp_id == 0:
-            if lane == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
-                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
+        # No exit barrier: the per-block monotonic flag needs no reset, and gather
+        # does no post-completion work, so kernel retirement (stream-ordered) is
+        # the only completion signal the host needs. This removes the former
+        # (block_num-1)-way contended atomic_add on comb_bar.
 
     @flyc.jit
     def run(
@@ -1461,37 +1502,47 @@ def make_combine_fused_reduce(
 
         window = cco.Window(arena)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
-        rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
+        rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
 
         # ── Stage A: cross-device barrier — wait until all peers' gemm2 P2P writes
-        # into our comb_inp are globally visible. Block-0-only xdb handshake, then
-        # signal other blocks via comb_bar (same as make_combine Stage 1; #487). ──
+        # into our comb_inp are globally visible. Per-block private flag counters,
+        # same scheme as make_combine Stage 1: each block owns xdb_flag[bid] (single
+        # writer, no atomic), block 0 pushes this call's flag to every peer's shared
+        # xdb slot, then EVERY block independently polls the local slots for its own
+        # flag. No shared comb_bar => no atomic contention, no reset, no block-0
+        # funnel; the monotonic flag needs no reset. ──
+        phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64))
         if grid_thread_id < npes:
-            xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
-            if grid_thread_id == 0:
-                P.atomic_add_global(
-                    fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64)
-                )
+            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # advance this block's private counter for the next call (single writer)
+        if tid == 0:
+            buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
+        # block 0 fills the unused tail counters [block_num, xdb_flag_slots) so a
+        # later call that picks a larger block_num still reads synced counters.
+        if const_expr(xdb_flag_slots > block_num):
+            if bid == 0:
+                _tail = xdb_flag_slots - block_num
+                _nthr = warp_num_per_block * WAVE
+                for r in range_constexpr((_tail + _nthr - 1) // _nthr):
+                    idx = tid + r * _nthr
+                    if idx < _tail:
+                        buffer_store(
+                            phase + arith.constant(1, type=T.i64),
+                            rsrc_xdb_flag,
+                            block_num + idx,
+                        )
+        # every block independently polls the shared local slots (local reads).
+        # `>=` not `==`: a faster peer can lap us and overwrite its monotonic push
+        # with a higher call count before our late-scheduled blocks read it.
+        if tid < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
-            P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-        if bid == 0:
-            fx.barrier()
-            if tid == 0:
-                P.store_i32_system(
-                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
-                )
-        if bid != 0:
-            if tid == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
-            fx.barrier()
-            if tid == 0:
-                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_ge_i64(xdb_peer_slot, phase)
+        fx.barrier()
 
         # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
         comb_inp_base = fx.Int64(addr_comb_inp)
@@ -1592,12 +1643,10 @@ def make_combine_fused_reduce(
             for u in range(main_end + lane, eff, WAVE):
                 _one(unit_base + u)
 
-        # Epilogue: block 0 waits for every other block (comb_bar increments from
-        # Stage A), then resets comb_bar for the next call (#494 race fix).
-        if global_warp_id == 0:
-            if lane == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
-                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
+        # No exit barrier: the per-block monotonic flag needs no reset, and the
+        # reduce does no post-completion work, so kernel retirement (stream-ordered)
+        # is the only completion signal the host needs. This removes both the former
+        # comb_bar reset (#494) and its (block_num-1)-way contended atomic_add.
 
     @flyc.jit
     def run(
