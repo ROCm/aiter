@@ -30,7 +30,7 @@ class StandaloneResult:
 def logits_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     x64 = x.double()
     y64 = y.double()
-    denominator = x64.square().sum() + y64.square().sum()
+    denominator = x64.square().sum() + y64.square().sum() + 1e-8
     return float(1 - 2 * (x64 * y64).sum() / denominator)
 
 
