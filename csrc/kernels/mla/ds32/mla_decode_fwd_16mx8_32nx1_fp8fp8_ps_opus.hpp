@@ -177,7 +177,13 @@ __device__ inline auto make_layout_kv_indices_rope(int warp_id, int lane_id)
 // Global -> LDS map for the K nope sub-range (d in [0, 512), fp8). The token
 // dimension is folded into the per-thread page offset (see make_layout_kv_indices),
 // so this layout only describes the d / warp distribution. Row-major d, seed
-// {D_128B_NOPE_SIZE, 1}. Identical scheme to dsa_v32.
+// {D_128B_NOPE_SIZE, 1}. Same scheme as dsa_v32 plus the V-read bank swizzle.
+//
+// buffer_load_lds has no per-lane LDS address: the hardware writes lane l to
+// dst + l * VEC_KV_NOPE, so lane l owns d-group l % threads_d of token-in-line
+// l / threads_d. The swizzle (see T::SWZ_D_BYTES) therefore has to permute the
+// *source*: lanes on tokens 4..7 fetch the d-group the readers will ask that slot
+// for, and the fixed LDS destination then holds the permuted data.
 template <typename T>
 __device__ inline auto make_layout_gk_nope(int warp_id, int lane_id)
 {
@@ -192,12 +198,14 @@ __device__ inline auto make_layout_gk_nope(int warp_id, int lane_id)
     constexpr auto gk_block_dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
                                                    opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
+    const int tok_in_line = lane_id / threads_d;
+    const int d_grp = (lane_id % threads_d) ^ ((tok_in_line & T::SWZ_TOK_BIT) ? 1 : 0);
+
     return opus::make_layout(
         gk_block_shape,
         opus::unfold_x_stride(
             gk_block_dim, gk_block_shape, opus::tuple{opus::number<T::D_128B_NOPE_SIZE>{}, 1_I}),
-        opus::unfold_p_coord(gk_block_dim,
-                             opus::tuple{warp_id / T::smem_n_rpt, lane_id % threads_d}));
+        opus::unfold_p_coord(gk_block_dim, opus::tuple{warp_id / T::smem_n_rpt, d_grp}));
 }
 
 template <typename T>
@@ -221,12 +229,17 @@ __device__ inline auto make_layout_sk_nope(int warp_id)
 }
 
 // LDS -> register map for the K nope A-operand (fed to the 16x16x128 fp8 MFMA).
-template <typename T>
+//
+// EN is the GEMM0_E_N token tile, which used to be a y-dim of a single layout. It
+// is a template parameter now because it selects token-in-line 0..3 vs 4..7, and
+// only the latter carry swizzled d-groups (T::SWZ_D_BYTES): this tile's lane ->
+// d-group map is XORed to match, which no single product layout can express. The
+// caller adds the tile's own EN * smem_n_rpt * D_128B_NOPE_SIZE byte base.
+template <typename T, int EN>
 __device__ inline auto make_layout_rk_nope(int lane_id)
 {
     constexpr auto rk_block_shape =
         opus::make_tuple(opus::number<T::smem_n_rpt>{},
-                         opus::number<T::GEMM0_E_N>{},
                          opus::number<T::W_N / T::smem_n_rpt>{},
                          opus::number<T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE>{},
                          opus::number<T::WARP_SIZE / T::W_N>{},
@@ -234,8 +247,7 @@ __device__ inline auto make_layout_rk_nope(int lane_id)
 
     constexpr auto rk_block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(
-            opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
@@ -245,9 +257,10 @@ __device__ inline auto make_layout_rk_nope(int lane_id)
             rk_block_dim,
             rk_block_shape,
             opus::tuple{opus::number<T::smem_linear_wave_nope + T::smem_padding_32B_nope>{}, 1_I}),
-        opus::unfold_p_coord(
-            rk_block_dim,
-            opus::tuple{lane_id_n % T::smem_n_rpt, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
+        opus::unfold_p_coord(rk_block_dim,
+                             opus::tuple{lane_id_n % T::smem_n_rpt,
+                                         lane_id_n / T::smem_n_rpt,
+                                         (lane_id / T::W_N) ^ EN}));
 }
 
 // Global -> LDS map for the K rope sub-range (d in [512, 576), fp8). The caller
@@ -354,7 +367,7 @@ __device__ inline auto make_layout_rk_rope(int lane_id)
 // bring-up opus_vtr_bringup.cu) then requires the stride assignment below. NOTE the
 // naive "grp->line, lane_hi->token" layout instead gives line=k/8,tok=k%8, which
 // paired V with the wrong P token; LSE (a token reduction) still passed, hiding it.
-template <class T>
+template <class T, int EN>
 __device__ inline auto make_layout_rv(int lane_id)
 {
     constexpr int lane_per_grp = 16;                     // ds_read_b64_tr_b8 group
@@ -364,22 +377,27 @@ __device__ inline auto make_layout_rv(int lane_id)
     constexpr int hi_hi        = lane_hi / hi_lo;        // lane_hi / n_rpt -> token (2)
     constexpr int line         = T::smem_linear_wave_nope + T::smem_padding_32B_nope;
 
-    // Groups / stride seeds:
-    //   G0 GEMM1_E_N : W_N d-tile within the SLICE_D=32 slice   (stride W_N)
-    //   G1 grp       : 16-lane group -> token-in-line low bits  (stride D_128B)
-    //   G2 hi_lo     : lane_hi % n_rpt -> n_rpt line (P's k%4)  (stride line)
-    //   G3 hi_hi     : lane_hi / n_rpt -> token-in-line high    (stride n_rpt*D_128B)
-    //   G4 lane_lo   : W_N half (d 0..7 / 8..15)                (stride VEC_TR_V)
-    //   G5 vec       : the VEC_TR_V contiguous dims per inst    (stride 1)
-    constexpr auto rv_block_shape = opus::make_tuple(opus::number<T::GEMM1_E_N>{},
-                                                     opus::number<T::smem_n_rpt>{},
+    // Bank swizzle (T::SWZ_D_BYTES): tokens 4..7 of a line hold their 16 B d-groups
+    // XORed by one. G2 below *is* that token bit, and bit 4 of this instruction's
+    // byte address comes from EN alone -- the slice bases are multiples of SLICE_D,
+    // the line/token/slot strides are all 0 mod 32, and lane_lo/vec stay under 16 --
+    // so the XOR collapses to a compile-time +/- SWZ_D_BYTES on the token-high
+    // stride. This needs the LDS block to be 32 B aligned (see smem_kv).
+    constexpr int swz = ((EN * T::W_N) & T::SWZ_D_BYTES) ? -T::SWZ_D_BYTES : T::SWZ_D_BYTES;
+
+    // Groups / stride seeds (EN's own W_N d-tile base is added by the caller):
+    //   G0 grp       : 16-lane group -> token-in-line low bits  (stride D_128B)
+    //   G1 hi_lo     : lane_hi % n_rpt -> n_rpt line (P's k%4)  (stride line)
+    //   G2 hi_hi     : lane_hi / n_rpt -> token-in-line high    (stride n_rpt*D_128B + swz)
+    //   G3 lane_lo   : W_N half (d 0..7 / 8..15)                (stride VEC_TR_V)
+    //   G4 vec       : the VEC_TR_V contiguous dims per inst    (stride 1)
+    constexpr auto rv_block_shape = opus::make_tuple(opus::number<T::smem_n_rpt>{},
                                                      opus::number<hi_lo>{},
                                                      opus::number<hi_hi>{},
                                                      opus::number<lane_lo>{},
                                                      opus::number<T::VEC_TR_V>{});
 
-    constexpr auto rv_block_dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}),
-                                                   opus::make_tuple(opus::p_dim{}),
+    constexpr auto rv_block_dim = opus::make_tuple(opus::make_tuple(opus::p_dim{}),
                                                    opus::make_tuple(opus::p_dim{}),
                                                    opus::make_tuple(opus::p_dim{}),
                                                    opus::make_tuple(opus::p_dim{}),
@@ -391,14 +409,14 @@ __device__ inline auto make_layout_rv(int lane_id)
 
     return opus::make_layout(
         rv_block_shape,
-        opus::unfold_x_stride(rv_block_dim,
-                              rv_block_shape,
-                              opus::tuple{opus::number<T::W_N>{},
-                                          opus::number<T::D_128B_NOPE_SIZE>{},
-                                          opus::number<line>{},
-                                          opus::number<T::smem_n_rpt * T::D_128B_NOPE_SIZE>{},
-                                          opus::number<T::VEC_TR_V>{},
-                                          1_I}),
+        opus::unfold_x_stride(
+            rv_block_dim,
+            rv_block_shape,
+            opus::tuple{opus::number<T::D_128B_NOPE_SIZE>{},
+                        opus::number<line>{},
+                        opus::number<T::smem_n_rpt * T::D_128B_NOPE_SIZE + swz>{},
+                        opus::number<T::VEC_TR_V>{},
+                        1_I}),
         opus::unfold_p_coord(rv_block_dim,
                              opus::tuple{grp_id, lh % hi_lo, lh / hi_lo, lane_in_grp % lane_lo}));
 }
@@ -627,11 +645,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto u_kv_indices_rope = make_layout_kv_indices_rope<T>(warp_id, lane_id);
     auto u_gk_nope         = make_layout_gk_nope<T>(warp_id, lane_id);
     auto u_sk_nope         = make_layout_sk_nope<T>(warp_id);
-    auto u_rk_nope         = make_layout_rk_nope<T>(lane_id);
     auto u_gk_rope         = make_layout_gk_rope<T>(lane_id);
     auto u_sk_rope         = make_layout_sk_rope<T>(warp_id);
     auto u_rk_rope         = make_layout_rk_rope<T>(lane_id);
-    auto u_rv              = make_layout_rv<T>(lane_id);
+    // One layout per e_n token tile: the bank swizzle's XOR differs between
+    // token-in-line 0..3 and 4..7, which a single product layout cannot express.
+    auto u_rk_nope0 = make_layout_rk_nope<T, 0>(lane_id);
+    auto u_rk_nope1 = make_layout_rk_nope<T, 1>(lane_id);
+    auto u_rv0      = make_layout_rv<T, 0>(lane_id);
+    auto u_rv1      = make_layout_rv<T, 1>(lane_id);
 
     auto mfma0_nope =
         make_mfma<D_K, D_Q, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
@@ -645,6 +667,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                                                 mfma_adaptor_swap_ab{});
 
     using k_nope_tile_t = vector_t<D_K, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
+    using v_tile_t      = vector_t<D_K, T::W_N * T::W_K_ROPE / T::WARP_SIZE>;
     using s_tile_t      = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope[2];
@@ -676,6 +699,23 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         constexpr int dim_in_blk      = s % slices_per_drpt;
         return number<drpt * T::smem_n_rpt*(T::smem_linear_wave_nope + T::smem_padding_32B_nope) +
                       dim_in_blk * T::SLICE_D>{};
+    };
+
+    // Both nope reads are issued per e_n tile so that each one carries the right
+    // compile-time swizzle. The instruction count per call is unchanged, so the
+    // k_nope_ds_read_insts / v_ds_read_insts waitcnt budgets still hold.
+    constexpr auto k_en_off = number<T::smem_n_rpt * T::D_128B_NOPE_SIZE>{};
+    constexpr auto v_en_off = number<T::W_N>{};
+
+    auto load_k_nope = [&](auto& dst, auto noff, auto slice) {
+        auto* tile = reinterpret_cast<k_nope_tile_t*>(&dst);
+        tile[0]    = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope0 + noff + slice);
+        tile[1]    = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope1 + noff + slice + k_en_off);
+    };
+    auto load_v = [&](auto& dst, auto noff, auto slice) {
+        auto* half = reinterpret_cast<v_tile_t*>(&dst);
+        half[0]    = tr_load<T::VEC_TR_V>(s_k_nope, u_rv0 + noff + slice);
+        half[1]    = tr_load<T::VEC_TR_V>(s_k_nope, u_rv1 + noff + slice + v_en_off);
     };
 
     constexpr index_t s_len      = vector_traits<typename decltype(mma0_rope)::vtype_c>::size();
@@ -718,8 +758,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], 0, 0);
             if constexpr(idx + 2 < T::GEMM0_NOPE_E_K)
             {
-                k[slot] = load<T::VEC_KV_NOPE>(s_k_nope,
-                                               u_rk_nope + noff + sk_nope_slice(number<idx + 2>{}));
+                load_k_nope(k[slot], noff, sk_nope_slice(number<idx + 2>{}));
                 s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
             }
             else if constexpr(idx + 1 < T::GEMM0_NOPE_E_K)
@@ -756,7 +795,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             o[idx]             = mma1(p, v[slot], o[idx]);
             if constexpr(idx + 2 < T::NUM_D_SLICES)
             {
-                v[slot] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + noff + sv_slice(number<idx + 2>{}));
+                load_v(v[slot], noff, sv_slice(number<idx + 2>{}));
                 s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
             }
             else if constexpr(idx + 1 < T::NUM_D_SLICES)
@@ -837,8 +876,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int nxt_page      = cur_page;
     int nxt_page_rope = cur_page_rope;
 
-    v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
-    v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
+    load_k_nope(v_k_nope[0], 0_I, sk_nope_slice(0_I));
+    load_k_nope(v_k_nope[1], 0_I, sk_nope_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
     stage_end();
 
@@ -861,9 +900,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_2();
         __builtin_amdgcn_sched_barrier(0);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + cur_slot * kv_slot_off);
-        v_k_nope[1] =
-            load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + cur_slot * kv_slot_off + sk_nope_slice(1_I));
+        load_k_nope(v_k_nope[0], cur_slot * kv_slot_off, sk_nope_slice(0_I));
+        load_k_nope(v_k_nope[1], cur_slot * kv_slot_off, sk_nope_slice(1_I));
         nxt_page      = load_kv_page(t + 3);
         nxt_page_rope = load_kv_page_rope(t + 3);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
@@ -882,8 +920,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // stage2 [mem]: read V(t-1); prefetch tile t+2 into the slot tile t-2 vacated
         // (its PV ran in the previous phase, two barriers back, which also absorbs the
         // one-stage stagger skew). Mask S(t) here, before stage3 folds it into softmax.
-        v_v[0] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + prev_slot * kv_slot_off);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + prev_slot * kv_slot_off + sv_slice(1_I));
+        load_v(v_v[0], prev_slot * kv_slot_off, sv_slice(0_I));
+        load_v(v_v[1], prev_slot * kv_slot_off, sv_slice(1_I));
         async_load_kv(((cur_slot + 2) & 3) * kv_slot_off, cur_page, cur_page_rope);
         mask_oob_scores(vs_cur, t);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
@@ -1006,8 +1044,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     // stage1 [mem]: read V(T-1) su0
     const int last_slot = slot_of(tile_end - 1);
-    v_v[0]              = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + last_slot * kv_slot_off);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + last_slot * kv_slot_off + sv_slice(1_I));
+    load_v(v_v[0], last_slot * kv_slot_off, sv_slice(0_I));
+    load_v(v_v[1], last_slot * kv_slot_off, sv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     stage_end();
 
@@ -1159,7 +1197,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
     // 4 LDS slots: with a distance-2 prefetch a phase keeps tile t-1 (PV pending), t
     // (QK now), t+1 (fetched) and t+2 (in flight) resident at the same time. 4 * ~18.6KB
     // = ~74.5KB, which fits gfx950's LDS at 2 blocks/CU. Non-pipelined paths use slot 0.
-    __shared__ char smem_kv[4 * T::smem_kv_bytes()];
+    // The alignment is load-bearing: make_layout_rv folds the bank swizzle's XOR into a
+    // +/- SWZ_D_BYTES stride, which is only equivalent to the XOR while bit 4 of the
+    // block's base address is zero.
+    __shared__ __align__(128) char smem_kv[4 * T::smem_kv_bytes()];
 
     const int work_idx_start = kargs.work_indptr[work_id];
     const int work_idx_end   = kargs.work_indptr[work_id + 1];
