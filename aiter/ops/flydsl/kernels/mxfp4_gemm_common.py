@@ -23,6 +23,10 @@ def _raw(v):
     return v
 
 
+def _udiv(x, d):
+    return fx.Int32(fx.Uint32(x) // fx.Uint32(d))
+
+
 def _lds_ptr3(base_i32, byte_off_i32):
     addr_i64 = fx.Int64(base_i32 + byte_off_i32)
     return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
@@ -145,18 +149,17 @@ def _umax_i32(a, b):
     return fx.Int32(arith.select(is_gt, _raw(a), _raw(b)))
 
 
+def _dpp_umax_step(a32, dpp_ctrl):
+    swapped = dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), dpp_ctrl, 0xF, 0xF, True)
+    return _umax_i32(a32, fx.Int32(swapped))
+
+
 def _inline_dpp_quad_amax(a32):
-    a32 = fx.Int32(_raw(a32))
-    s1 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0xB1, 0xF, 0xF, True))
-    a32 = _umax_i32(a32, s1)
-    s2 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0x4E, 0xF, 0xF, True))
-    return _umax_i32(a32, s2)
+    return _dpp_umax_step(_dpp_umax_step(a32, 0xB1), 0x4E)
 
 
 def _inline_dpp_pair_amax(a32):
-    a32 = fx.Int32(_raw(a32))
-    s1 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0xB1, 0xF, 0xF, True))
-    return _umax_i32(a32, s1)
+    return _dpp_umax_step(a32, 0xB1)
 
 
 def k_half_for(k):

@@ -3,7 +3,6 @@
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
 import os
-from contextlib import nullcontext as _nullcontext
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -12,19 +11,14 @@ from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
-    _udiv,
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
     kStages,
 )
 from .tensor_shim import _run_compiled as run_compiled
-
-
-def _g2_hints_ctx():
-    return _nullcontext()
-
 
 __all__ = [
     "compile_gemm2_a4w4_port",
@@ -43,15 +37,6 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
     active_experts = min(routes, NE)
     sort_blocks = (routes + active_experts * (SBM - 1) + SBM - 1) // SBM
     return sort_blocks * (SBM // BM)
-
-
-def _xcd_unswizzle(pid, total, nxcd):
-    n = fx.Int32(nxcd)
-    q = fx.Int32(fx.Uint32(total) // fx.Uint32(n))
-    r = total - q * n
-    xc = fx.Int32(fx.Uint32(pid) % fx.Uint32(n))
-    inx = fx.Int32(fx.Uint32(pid) // fx.Uint32(n))
-    return xc * q + (xc < r).select(xc, r) + inx
 
 
 # ---- gemm2 (down-proj) compile ----
@@ -737,26 +722,25 @@ def mxfp4_moe_gemm2(
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
     # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after
     # i32_hidden; when has_pad is False they are 0 and the kernel folds pad math away.
-    with _g2_hints_ctx():
-        run_compiled(
-            launch,
-            inter_sorted_quant.data_ptr(),
-            inter_sorted_shuffled_scale.data_ptr(),
-            w2_u8.data_ptr(),
-            w2_scale_u8.data_ptr(),
-            sorted_expert_ids.data_ptr(),
-            cumsum_tensor.data_ptr(),
-            sorted_token_ids.data_ptr(),
-            sorted_weights.data_ptr(),
-            M_logical,
-            max_m_blocks,
-            grid_blocks,
-            D_INTER,
-            D_HIDDEN,
-            int(inter_dim_pad),
-            int(model_dim_pad),
-            out.data_ptr(),
-            out_scale.data_ptr(),
-            torch.cuda.current_stream() if stream is None else stream,
-        )
+    run_compiled(
+        launch,
+        inter_sorted_quant.data_ptr(),
+        inter_sorted_shuffled_scale.data_ptr(),
+        w2_u8.data_ptr(),
+        w2_scale_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        sorted_weights.data_ptr(),
+        M_logical,
+        max_m_blocks,
+        grid_blocks,
+        D_INTER,
+        D_HIDDEN,
+        int(inter_dim_pad),
+        int(model_dim_pad),
+        out.data_ptr(),
+        out_scale.data_ptr(),
+        torch.cuda.current_stream() if stream is None else stream,
+    )
     return out

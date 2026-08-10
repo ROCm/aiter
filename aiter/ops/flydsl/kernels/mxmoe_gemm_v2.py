@@ -21,6 +21,7 @@ from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import (
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
+    _udiv,
     flat_buffer_view,
     global_typed_ptr,
     kBS_stride_k0_dw,
@@ -37,13 +38,7 @@ STORE_CACHE_MODIFIER = 2
 
 _FP8_E8M0_SHIFT = 7
 
-
-def _g2_epi_lanes():
-    return 32
-
-
-def _udiv(x, d):
-    return fx.Int32(fx.Uint32(x) // fx.Uint32(d))
+_G2_EPI_LANES = 32
 
 
 def bq_view(
@@ -309,7 +304,7 @@ def gemm2_body_v2(
     else:
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
 
-    _stids_pf = _prefetch_stids(arg_stids, m_row, BM, epi_lanes=_g2_epi_lanes())
+    _stids_pf = _prefetch_stids(arg_stids, m_row, BM, epi_lanes=_G2_EPI_LANES)
 
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -801,7 +796,7 @@ def gemm2_body_v2(
     )
 
 
-def _prefetch_stids(arg_stids, m_row, BM, epi_lanes=32):
+def _prefetch_stids(arg_stids, m_row, BM, epi_lanes=_G2_EPI_LANES):
     ptr = global_typed_ptr(arg_stids, T.i32, align=4)
     view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
     stids = fx.rocdl.make_buffer_tensor(view, max_size=True)
@@ -848,7 +843,7 @@ def atomic_bf16_epilog(
     if SBM is None:
         SBM = BM
     BN_P = BN + g2_c_pad
-    EPI_LANES = _g2_epi_lanes()
+    EPI_LANES = _G2_EPI_LANES
     EPI_ROWS = 256 // EPI_LANES
     M_REPS = BM // EPI_ROWS
     ROUTE_VEC = 256 // EPI_LANES
@@ -1006,9 +1001,9 @@ def atomic_bf16_epilog(
                     if const_expr(g2_scale_blk == route_vec):
                         pass
                     elif const_expr(g2_scale_blk == 2 * route_vec):
-                        amax_bits = fx.Int32(_raw(_inline_dpp_pair_amax(amax_bits)))
+                        amax_bits = _inline_dpp_pair_amax(amax_bits)
                     elif const_expr(g2_scale_blk == 32):
-                        amax_bits = fx.Int32(_raw(_inline_dpp_quad_amax(amax_bits)))
+                        amax_bits = _inline_dpp_quad_amax(amax_bits)
                     ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
                     e8m0 = ax_e - fx.Int32(_FP8_E8M0_SHIFT)
                     e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
