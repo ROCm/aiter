@@ -716,6 +716,7 @@ def build_gate_up_fp4_module(
     serialize_dot2: bool = True,
     scale_bn: int = 1,
     scale_bk: int = 32,
+    dot2_acc: int = 1,
 ):
     """Build the gate_up MXFP4 launcher (BF16 activation, FP4 e2m1 weights).
 
@@ -731,6 +732,14 @@ def build_gate_up_fp4_module(
         ``scale_bk`` block (enforced below), so the block scale is uniform over
         the lane's pairs that iteration; applying it in-convert then accumulating
         across iterations is exactly the block-scaled dot.
+      * **G7 dot2 ILP** (``dot2_acc>1``): the gate/up pairs from *all* iterations
+        are drained through ``dot2_acc`` independent accumulators each (see
+        :func:`dot2_f32_bf16_drain`).  **Default is 1 (serialized) for gate_up**:
+        A/B on gfx950 shows G7 is ~4% *slower* here (0.94-1.0x) because the two
+        interleaved gate/up dot2 streams already cover the accumulator hazard and
+        gate_up's B=1 grid (``B*TOPK*INTER``) is large enough to be occupancy- not
+        latency-bound -- unlike ``down`` (``dot2_acc=4`` default, +12% at B=1).
+        The knob stays wired for experimentation (e.g. with larger kVector).
 
     Scale layout is **Block2D<BN,BK>** E8M0 (MXFP4 default ``BN=1``, ``BK=32``):
     ``w_*_scale`` is ``uint8`` [(E*INTER)//BN, HIDDEN//BK] row-major over
@@ -798,10 +807,12 @@ def build_gate_up_fp4_module(
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
         wus_rsrc = _ptr_rsrc(wus_ptr)
 
-        # E8M0 scale is baked into the converted weights, so accumulate a single
-        # gate/up dot across iterations (one reduce each).
-        gate_dot = fx.Float32(0.0).ir_value()
-        up_dot = fx.Float32(0.0).ir_value()
+        # E8M0 scale is baked into the converted weights, so a lane's gate/up dot
+        # is one long accumulation across iterations.  G7: collect every
+        # (iter, pair) contribution, then drain each stream through `dot2_acc`
+        # independent accumulators (s_nop only on the final write per accumulator).
+        gate_pairs = []
+        up_pairs = []
         for i in range_constexpr(num_iter):
             k_base = i * ktile_n + lane * kvector
             x_word0 = (token_b * hidden + k_base) // 2
@@ -822,10 +833,22 @@ def build_gate_up_fp4_module(
                 x_i32 = xw[ipair]
                 g_i32 = bf16x2_to_i32(fp4x2_to_bf16x2(gw[w_word], gs, sel=sel))
                 u_i32 = bf16x2_to_i32(fp4x2_to_bf16x2(uw[w_word], us, sel=sel))
+                gate_pairs.append((x_i32, g_i32))
+                up_pairs.append((x_i32, u_i32))
+
+        if const_expr(dot2_acc > 1):
+            gate_dot = dot2_f32_bf16_drain(gate_pairs, n_acc=dot2_acc)
+            up_dot = dot2_f32_bf16_drain(up_pairs, n_acc=dot2_acc)
+        else:
+            gate_dot = fx.Float32(0.0).ir_value()
+            up_dot = fx.Float32(0.0).ir_value()
+            for idx in range_constexpr(len(gate_pairs)):
+                xg_i32, g_i32 = gate_pairs[idx]
+                xu_i32, u_i32 = up_pairs[idx]
                 gate_dot = dot2_f32_bf16(
-                    x_i32, g_i32, gate_dot, serialize=serialize_dot2
+                    xg_i32, g_i32, gate_dot, serialize=serialize_dot2
                 )
-                up_dot = dot2_f32_bf16(x_i32, u_i32, up_dot, serialize=serialize_dot2)
+                up_dot = dot2_f32_bf16(xu_i32, u_i32, up_dot, serialize=serialize_dot2)
 
         gate_acc = fx.Float32(wave_reduce_add_f32(gate_dot))
         up_acc = fx.Float32(wave_reduce_add_f32(up_dot))
