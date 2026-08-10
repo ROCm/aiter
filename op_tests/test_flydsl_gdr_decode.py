@@ -17,6 +17,15 @@ import aiter.ops.flydsl as flydsl_ops
 from aiter.ops.flydsl import is_flydsl_available
 from aiter.test_common import checkAllclose
 
+# CI runs this file as a script, so ``op_tests`` is not a package on sys.path;
+# under pytest from the repo root it is.
+try:
+    from kda_ref import kda_gate, l2norm, naive_recurrent_kda
+except ModuleNotFoundError as e:
+    if e.name != "kda_ref":
+        raise
+    from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
+
 pytestmark = pytest.mark.skipif(
     not is_flydsl_available(), reason="flydsl is not installed"
 )
@@ -144,8 +153,6 @@ def _clone_pool(pool):
 
 
 def _kda_reference(args, initial_state):
-    from aiter.ops.torch_ref.kda import kda_gate, l2norm, naive_recurrent_kda
-
     return naive_recurrent_kda(
         l2norm(args["q"]),
         l2norm(args["k"]),

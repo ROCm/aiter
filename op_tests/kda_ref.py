@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Pure-PyTorch reference for the Kimi Delta Attention (KDA) recurrence.
+"""Test-only PyTorch oracle for the Kimi Delta Attention (KDA) recurrence.
 
-Oracle for the per-channel decay work on ``flydsl_gdr_decode``. Nothing in aiter
-could serve: the Triton references' ``IS_KDA`` branches change the pointer layout
-but still compute the scalar gate.
+Judges ``flydsl_gdr_decode`` from ``op_tests/test_flydsl_gdr_decode.py`` and the
+KDA decode benchmark. It lives here rather than under ``aiter/`` on purpose: it
+is not an op anyone should call, and nothing on the inference path may reach it.
 
 Ported from ``naive_recurrent_kda`` in vLLM (``tests/models/kimi_k3/test_kda.py``),
-itself from FLA's ``naive.py``.
+itself from FLA's ``naive.py``. Staying close to that source is what makes the
+oracle trustworthy, so keep it obvious by inspection -- f32 throughout, one
+timestep per iteration, no fusion, no shape dispatch.
+
+Nothing already in aiter could serve: the Triton references' ``IS_KDA`` branches
+change the pointer layout but still compute the scalar gate.
 """
 
 from __future__ import annotations
@@ -29,59 +34,21 @@ def kda_gate(
     a: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
-    g_min: float | None = None,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
+    g_min: float,
 ) -> torch.Tensor:
-    """Log-space decay from the raw gate input.
+    """KDA's per-channel decay, in log space.
 
     Args:
-        a: ``(B, T, H, K)`` per-channel, or ``(B, T, H)`` scalar per head.
-        A_log: ``(H,)``, always f32, broadcast across channels.
-        dt_bias: ``(H, K)`` per-channel, or ``(H,)`` scalar per head.
-        g_min: KDA's lower bound, -5. None selects the GDR softplus gate.
+        a: ``(B, T, H, K)`` raw gate input.
+        A_log: ``(H,)``, per head, so it broadcasts across channels.
+        dt_bias: ``(H, K)``, per channel.
+        g_min: KDA's lower bound on the decay, -5 in K3.
 
     Returns:
         Decay in log space, shaped like ``a`` -- callers apply ``exp``.
     """
-    if a.dim() not in (3, 4):
-        raise ValueError(
-            f"`a` must be (B, T, H) or (B, T, H, K); got {tuple(a.shape)}."
-        )
-    if A_log.dim() != 1:
-        raise ValueError(f"`A_log` must be (H,); got {tuple(A_log.shape)}.")
-
-    # Rank picks the mode: shape alone is ambiguous once H == K.
-    per_channel = a.dim() == 4
-    num_heads = A_log.shape[0]
-    heads = a.shape[-2] if per_channel else a.shape[-1]
-    if heads != num_heads:
-        raise ValueError(
-            f"`a`'s head axis must be {num_heads} to match `A_log`; "
-            f"got {tuple(a.shape)}."
-        )
-    bias_shape = (num_heads, a.shape[-1]) if per_channel else (num_heads,)
-    if dt_bias.shape != bias_shape:
-        raise ValueError(
-            f"`dt_bias` must have shape {bias_shape} for a "
-            f"{'per-channel' if per_channel else 'scalar'} gate; "
-            f"got {tuple(dt_bias.shape)}."
-        )
-
-    x = a.float() + dt_bias.float()
-    A = A_log.float().exp()
-    if per_channel:
-        A = A[:, None]
-
-    if g_min is None:
-        beta_x = softplus_beta * x
-        softplus_x = torch.where(
-            beta_x <= softplus_threshold,
-            torch.log1p(torch.exp(beta_x)) / softplus_beta,
-            x,
-        )
-        return -A * softplus_x
-    return g_min * torch.sigmoid(A * x)
+    A = A_log.float().exp()[:, None]
+    return g_min * torch.sigmoid(A * (a.float() + dt_bias.float()))
 
 
 def naive_recurrent_kda(
@@ -100,7 +67,7 @@ def naive_recurrent_kda(
         q, k, v: ``(B, T, H, K)`` / ``(B, T, H, V)``. Apply :func:`l2norm` first
             if the kernel under test normalizes internally -- this does not,
             matching the vLLM reference.
-        g: log-space decay, ``(B, T, H, K)`` or ``(B, T, H)``.
+        g: log-space decay, ``(B, T, H, K)``.
         beta: ``(B, T, H)``, already through sigmoid.
         initial_state: ``(B, H, K, V)``.
 
@@ -114,8 +81,6 @@ def naive_recurrent_kda(
         scale = K**-0.5
 
     q, k, v, g, beta = (x.float() for x in (q, k, v, g, beta))
-    if g.dim() == 3:
-        g = g[..., None].expand(B, T, H, K)
     q = q * scale
 
     S = k.new_zeros(B, H, K, V)

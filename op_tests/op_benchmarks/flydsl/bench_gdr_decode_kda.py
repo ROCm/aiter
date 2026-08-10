@@ -46,7 +46,14 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.gdr_decode import create_vk_gdr_decode_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, get_dtype_str
-from aiter.ops.torch_ref.kda import kda_gate, l2norm, naive_recurrent_kda
+
+# The KDA oracle is test-only, so it ships with op_tests rather than with aiter
+# and is not importable from an installed wheel.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
 
 # K3 @ TP8: 12 heads 1:1, 128-wide, bf16 activations over an f32 paged state.
 H, K, V = 12, 128, 128
