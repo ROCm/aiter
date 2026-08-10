@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -151,6 +151,28 @@ def test_v2_a8w8_k384_does_not_consume_scale_padding():
     assert logits_diff(clean.out, clean.ref) <= limit
     assert logits_diff(poisoned.out, poisoned.ref) <= limit
     torch.testing.assert_close(poisoned.out, clean.out, rtol=0, atol=0)
+
+
+@pytest.mark.l2_device
+@pytest.mark.parametrize("BK", [128, 256])
+def test_v2_a8w8_k_pad_weights_read_back_as_zero(BK):
+    # has_pad K-skip shrinks only the B-weight buffer to the real K; the A buffer
+    # keeps the padded extent (aq_num_records covers K_BYTES). A dropped B bound
+    # would therefore multiply live A tail data by live B tail data.
+    limit = STANDALONE_LOGITS_DIFF_LIMIT
+    result = run_standalone_v2_a8w8(
+        BM=32,
+        BN=128,
+        BK=BK,
+        K=2 * BK,
+        inter_dim_pad=BK,
+        limit=limit,
+    )
+    assert not result.out.isnan().any()
+    assert logits_diff(result.out, result.ref) <= limit
+    # Guard against a vacuous test: the tail must carry enough signal that
+    # consuming it would be visible.
+    assert logits_diff(result.ref_if_pad_consumed, result.ref) > 100 * limit
 
 
 @pytest.mark.l2_device

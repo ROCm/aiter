@@ -3,9 +3,9 @@
 
 import functools
 import os
-from pathlib import Path
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -139,7 +139,8 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
     return cos_diff
-    
+
+
 def _dump_prefilter_candidates(profile_df, args, stage_tag):
     root = os.environ.get("AITER_TUNE_CANDIDATE_DUMP_DIR")
     if not root:

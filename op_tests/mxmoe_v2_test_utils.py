@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -17,6 +17,9 @@ class StandaloneResult:
     scales: dict[str, torch.Tensor]
     limit: float | None = None
     launch: Callable[[], torch.Tensor] | None = None
+    # What the output would be if the K-pad tail were multiplied in instead of
+    # read back as zero; only set when inter_dim_pad > 0.
+    ref_if_pad_consumed: torch.Tensor | None = None
 
     @property
     def a_scale(self):
@@ -54,6 +57,7 @@ def run_standalone_v2_a8w8(
     poison_real_scale=False,
     epilog="atomic",
     use_nt=False,
+    inter_dim_pad=0,
 ):
     from aiter import dtypes
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
@@ -64,6 +68,12 @@ def run_standalone_v2_a8w8(
     from aiter.utility import fp4_utils
 
     device = "cuda"
+    K_real = K - inter_dim_pad
+    if K_real <= 0 or K_real % 32 != 0:
+        raise AssertionError(
+            f"inter_dim_pad must leave a 32-aligned real K; got K={K}, "
+            f"inter_dim_pad={inter_dim_pad}"
+        )
     E = topk = 1
     N = BN
     max_sorted = BM
@@ -144,6 +154,7 @@ def run_standalone_v2_a8w8(
             b_dtype="fp8",
             epilog=epilog,
             use_nt=use_nt,
+            inter_dim_pad=inter_dim_pad,
         )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -156,12 +167,18 @@ def run_standalone_v2_a8w8(
 
     a_deq = a_q.float() * fp4_utils.e8m0_to_f32(a_scale_raw).repeat_interleave(32, 1)
     b_deq = b_q[0].float() * fp4_utils.e8m0_to_f32(b_scale_raw).repeat_interleave(32, 1)
-    ref = (a_deq.double() @ b_deq.double().T).to(torch.bfloat16).float()
+
+    def _matmul(k):
+        return (
+            (a_deq[:, :k].double() @ b_deq[:, :k].double().T).to(torch.bfloat16).float()
+        )
+
     return StandaloneResult(
         out=out.float(),
-        ref=ref,
+        ref=_matmul(K_real),
         payloads={"a": a_q, "b": b_shuffled},
         scales={"a": a_scale, "b": b_scale},
         limit=limit,
         launch=launch,
+        ref_if_pad_consumed=_matmul(K) if inter_dim_pad else None,
     )
