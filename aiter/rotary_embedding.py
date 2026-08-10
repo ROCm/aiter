@@ -1195,7 +1195,7 @@ class ProportionalRotaryEmbedding(RotaryEmbedding):
             dtype,
         )
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         freq_exponents = (
             torch.arange(0, 2 * self.rope_angles, 2, dtype=dtypes.fp32)
             / self.head_size
