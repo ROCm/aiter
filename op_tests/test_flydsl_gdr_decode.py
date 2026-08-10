@@ -100,10 +100,8 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
         "v": torch.randn(B, T, H, V, dtype=dt, device=dev),
         "a": torch.randn(B, T, H, K, dtype=dt, device=dev),
         "b": torch.randn(B, T, H, dtype=dt, device=dev),
-        "dt_bias": (
-            torch.randn(H, K, dtype=torch.float32, device=dev) * 0.1
-        ).contiguous(),
-        "A_log": (torch.randn(H, dtype=torch.float32, device=dev) * 0.5).contiguous(),
+        "dt_bias": torch.randn(H, K, dtype=torch.float32, device=dev) * 0.1,
+        "A_log": torch.randn(H, dtype=torch.float32, device=dev) * 0.5,
         "out": torch.zeros(B, T, H, V, dtype=dt, device=dev),
     }
 
