@@ -2403,7 +2403,11 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
-        use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            routeks_uses_ksplit,
+        )
+
+        use_ksplit_s1 = routeks_uses_ksplit(numel, warps_per_block)
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
@@ -2644,9 +2648,6 @@ def _get_compiled_fused_quant_preshuffle(
     )
 
 
-_ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
-
-
 @functools.cache
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
@@ -2747,7 +2748,11 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
-        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            routeks_uses_ksplit,
+        )
+
+        use_ksplit = routeks_uses_ksplit(numel, warps_per_block)
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,

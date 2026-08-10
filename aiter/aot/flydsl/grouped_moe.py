@@ -156,7 +156,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_module,
         build_moe_contiguous_psum_remap_module,
+        build_moe_route_psum_fused_module,
     )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
@@ -165,7 +167,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         build_moe_fused_route_quant_scatter_st_ksplit_module,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        BLOCK_THREADS,
         build_moe_gather_reduce_module,
+        build_moe_gather_reduce_row_module,
         build_moe_gather_reduce_wave_module,
     )
     from aiter.ops.flydsl.kernels.moe_route_maps import (
@@ -188,17 +192,17 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     numel = token_num * topk
     grid = max(1, (numel + 255) // 256)
 
-    def _route_ksplit(feat_dim, source_topk, out_e, out_m):
-        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
-        # sets remap_rows on the grouped MoE fast path (row_starts stays None).
-        # Precompile both ksplit=True (small token) and ksplit=False (large token).
-        for ks in (True, False):
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m, remap_rows=False):
+        # Remap is fused only into the large-grid no-K-split variant. The small
+        # K-split path consumes rows already remapped by contiguous psum.
+        variants = (False,) if remap_rows else (True, False)
+        for ks in variants:
             launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
                 quant_mode=quant_mode,
                 source_topk=source_topk,
-                remap_rows=False,
+                remap_rows=remap_rows,
                 ksplit=ks,
             )
             launch(
@@ -207,7 +211,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 ptr_arg(torch.empty(0, dtype=u8, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                1,
+                max_m if remap_rows else 1,
                 numel,
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 grid,
@@ -254,6 +258,17 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
 
         _topids_to_rows()
 
+        psum = build_moe_contiguous_psum_module()
+        psum(
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            E,
+            tile_m,
+            stream=0,
+        )
+
         psum_remap = build_moe_contiguous_psum_remap_module()
         psum_remap(
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
@@ -269,11 +284,32 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             stream=0,
         )
 
+        route_psum = build_moe_route_psum_fused_module()
+        route_psum(
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            numel,
+            E,
+            max_m,
+            tile_m,
+            stream=0,
+        )
+
         _route_ksplit(
             feat_dim=model_dim,
             source_topk=topk,
             out_e=1,
             out_m=contiguous_m,
+        )
+        _route_ksplit(
+            feat_dim=model_dim,
+            source_topk=topk,
+            out_e=1,
+            out_m=contiguous_m,
+            remap_rows=True,
         )
         a2_out_e, a2_out_m = 1, contiguous_m
     else:
@@ -367,10 +403,31 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
-    # The wave-per-row variant replaces both vec widths once token_num crosses
-    # AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS, and takes no vec parameter.
+    out_dwords = model_dim // 2
+    row_iters = (out_dwords + BLOCK_THREADS * 4 - 1) // (BLOCK_THREADS * 4)
+    if split_k == 1 and row_iters <= 4:
+        gather_reduce_row = build_moe_gather_reduce_row_module(
+            model_dim,
+            topk,
+            out_dtype,
+            split_k,
+            4,
+        )
+        gather_reduce_row(
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            token_num,
+            a2_out_e * a2_out_m * (model_dim // 2),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            stream=0,
+        )
+    # The wave-per-row variant replaces both CTA variants once token_num crosses
+    # AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS. Runtime uses four adjacent
+    # dwords per lane to reduce loop and memory-instruction pressure.
     gather_reduce_wave = build_moe_gather_reduce_wave_module(
-        model_dim, topk, out_dtype, split_k
+        model_dim, topk, out_dtype, split_k, vec_dwords=4
     )
     gather_reduce_wave(
         ptr_arg(torch.empty(0, dtype=dtype, device=dev)),

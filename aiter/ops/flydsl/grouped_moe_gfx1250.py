@@ -444,6 +444,12 @@ def _grouped_a8w4_tdm_moe(
     _gather_w_buf = None
     _ep_nvr = None
     _ep_nvt = None
+    numel = token_num * topk
+    fuse_route_psum = (
+        not _is_ep
+        and numel <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        and E <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
     if _is_ep:
         if num_local_tokens is not None:
             _ep_nvt = (
@@ -477,11 +483,36 @@ def _grouped_a8w4_tdm_moe(
             num_local_tokens=num_local_tokens,
             num_valid_routes=_ep_nvr,
         )
+    elif fuse_route_psum:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids, E, max_m, tile_m
+        )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    _starts, psum, _ = contiguous_psum_remap(
-        _masked_m, topids_to_rows, E, max_m, tile_m, num_valid_routes=_ep_nvr
-    )
+
+    # For small route grids, the K-split quant kernel needs pre-remapped rows.
+    # Larger grids use the no-K-split kernel, which can remap each row while it
+    # is already loading the route for quantization and avoids a standalone
+    # O(numel) psum-remap pass.
+    fuse_remap_quant = False
+    _starts = None
+    if not fuse_route_psum:
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            routeks_uses_ksplit,
+        )
+
+        fuse_remap_quant = not routeks_uses_ksplit(numel, 8)
+        if fuse_remap_quant:
+            _starts, psum, _ = contiguous_psum(_masked_m, E, tile_m)
+        else:
+            _starts, psum, _ = contiguous_psum_remap(
+                _masked_m,
+                topids_to_rows,
+                E,
+                max_m,
+                tile_m,
+                num_valid_routes=_ep_nvr,
+            )
     psum = psum.to(torch.int32).contiguous()
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
@@ -515,6 +546,8 @@ def _grouped_a8w4_tdm_moe(
         masked_m=None,
         topids_to_rows=topids_to_rows,
         source_topk=topk,
+        row_starts=_starts if fuse_remap_quant else None,
+        route_max_m=max_m if fuse_remap_quant else 0,
         num_valid_routes=_ep_nvr,
     )
 
@@ -1042,12 +1075,37 @@ def _get_compiled_gather_reduce(
 
 
 @functools.cache
+def _get_compiled_gather_reduce_row(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    vec_dwords: int = 4,
+    w_dtype: str = "f32",
+):
+    """Compile and cache the persistent row-wise gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_row_module,
+    )
+
+    return build_moe_gather_reduce_row_module(
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        vec_dwords,
+        w_dtype,
+    )
+
+
+@functools.cache
 def _get_compiled_gather_reduce_wave(
     model_dim: int,
     topk: int,
     out_dtype: str,
     split_k: int = 1,
     w_dtype: str = "f32",
+    vec_dwords: int = 4,
 ):
     """Compile and cache the wave-per-row MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1055,7 +1113,7 @@ def _get_compiled_gather_reduce_wave(
     )
 
     return build_moe_gather_reduce_wave_module(
-        model_dim, topk, out_dtype, split_k, w_dtype
+        model_dim, topk, out_dtype, split_k, w_dtype, vec_dwords
     )
 
 
@@ -1081,6 +1139,52 @@ def _use_gather_reduce_wave(token_num: int) -> bool:
     """One wave per row once there are enough rows to keep the machine busy."""
     min_tokens = AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS
     return min_tokens > 0 and int(token_num) >= min_tokens
+
+
+def _use_gather_reduce_row(
+    token_num: int,
+    model_dim: int,
+    split_k: int,
+    vec_dwords: int,
+    num_compute_units: int,
+    is_ep: bool = False,
+) -> bool:
+    """Choose the persistent row kernel from device and problem geometry."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        BLOCK_THREADS,
+        WAVE_SIZE,
+    )
+
+    out_dwords = int(model_dim) // 2
+    waves_per_block = BLOCK_THREADS // WAVE_SIZE
+    dwords_per_iter = BLOCK_THREADS * int(vec_dwords)
+    n_iters = (out_dwords + dwords_per_iter - 1) // dwords_per_iter
+    if split_k != 1 or n_iters > 4:
+        return False
+
+    num_compute_units = max(1, int(num_compute_units))
+    if is_ep:
+        # EP can expose a large static receive buffer with only a small dynamic
+        # valid prefix. Switch once the static CTA grid would exceed one full
+        # persistent wave of row CTAs across the device.
+        min_tokens = num_compute_units * waves_per_block
+        return int(token_num) >= min_tokens
+
+    # Wave mode packs eight rows per CTA. Row mode is useful while that grid
+    # supplies at most one or two CTAs per CU; after that, wave mode already has
+    # enough occupancy and its lower scheduling overhead wins. Narrow rows light
+    # up fewer than three waves in a row CTA, so use the conservative one-CTA/CU
+    # crossover. This scales with the actual device rather than fixed batch sizes.
+    row_active_waves = min(
+        waves_per_block,
+        (out_dwords + WAVE_SIZE * int(vec_dwords) - 1)
+        // (WAVE_SIZE * int(vec_dwords)),
+    )
+    target_wave_ctas_per_cu = 1 if row_active_waves < 3 else 2
+    max_tokens = (
+        num_compute_units * waves_per_block * target_wave_ctas_per_cu
+    )
+    return int(token_num) <= max_tokens
 
 
 @functools.cache
@@ -1301,12 +1405,37 @@ def flydsl_moe_gather_reduce(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
-    if _use_gather_reduce_wave(token_num):
+    gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    wave_vec = 4
+    use_wave = _use_gather_reduce_wave(token_num)
+    is_ep = num_valid_tokens is not None
+    use_row = False
+    if is_ep or use_wave:
+        num_compute_units = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        use_row = _use_gather_reduce_row(
+            token_num,
+            model_dim,
+            split_k,
+            wave_vec,
+            num_compute_units,
+            is_ep=is_ep,
+        )
+    if use_row:
+        launch = _get_compiled_gather_reduce_row(
+            model_dim,
+            topk,
+            out_dtype,
+            split_k,
+            wave_vec,
+            w_dtype,
+        )
+    elif use_wave:
         launch = _get_compiled_gather_reduce_wave(
-            model_dim, topk, out_dtype, split_k, w_dtype
+            model_dim, topk, out_dtype, split_k, w_dtype, wave_vec
         )
     else:
-        gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
         launch = _get_compiled_gather_reduce(
             model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
         )
