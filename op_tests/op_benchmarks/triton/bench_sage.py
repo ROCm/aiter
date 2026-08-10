@@ -26,6 +26,8 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_packed,
     mxfp4_k_view,
+    mxfp4_v_view,
+    mxfp6_k_view,
     native_fp8_format,
     quantize_mxfp4_k,
     quantize_mxfp4_q,
@@ -48,12 +50,8 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-    fp6_k_lds_order_views_from_raw,
-)
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
-    fp4_v_padded_sequence,
     sage_quant,
     sage_quant_f4f4,
     sage_quant_mxfp4,
@@ -93,13 +91,7 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_raw, v_scale = quantize_v_mxfp4(value)
-    batch, sequence, heads, _ = value.shape
-    padded_sequence = fp4_v_padded_sequence(sequence)
-    v_fp4 = torch.as_strided(
-        v_raw,
-        (batch, sequence, heads, 128),
-        (heads * padded_sequence * 64, 64, padded_sequence * 64, 1),
-    )
+    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
@@ -109,7 +101,7 @@ def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
     )
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = fp6_k_lds_order_views_from_raw(
+    k_fp6, k_scale = mxfp6_k_view(
         k_raw, k_scale_raw, batch, sequence, heads
     )
     if not mxfp4_v:
@@ -117,17 +109,7 @@ def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
     v_raw, v_scale = quantize_v_mxfp4(value)
-    padded_sequence = fp4_v_padded_sequence(value.shape[1])
-    v_quantized = torch.as_strided(
-        v_raw,
-        value.shape,
-        (
-            value.shape[2] * padded_sequence * 64,
-            64,
-            padded_sequence * 64,
-            1,
-        ),
-    )
+    v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
 

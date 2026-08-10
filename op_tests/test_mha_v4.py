@@ -11,10 +11,13 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_packed,
     mxfp4_k_view,
+    mxfp4_v_view,
+    mxfp6_k_view,
     quantize_fp8,
     quantize_int8,
     quantize_mxfp4_k,
     quantize_mxfp4_q,
+    quantize_mxfp6_k,
     quantize_v_mxfp4,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
@@ -190,6 +193,27 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     assert torch.equal(raw, raw_again)
     assert torch.equal(scale, scale_again)
     assert torch.count_nonzero(raw[-64:]) == 0
+    logical = mxfp4_v_view(raw, scale, sequence)
+    assert logical.shape == value.shape
+    assert logical.stride() == (
+        3 * fp4_v_padded_sequence(sequence) * 64,
+        64,
+        fp4_v_padded_sequence(sequence) * 64,
+        1,
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")
+@pytest.mark.parametrize("sequence", [128, 129, 257])
+def test_mha_v4_mxfp6_k_raw_views(sequence):
+    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
+    raw, scale_raw = quantize_mxfp6_k(value)
+    packed, scale = mxfp6_k_view(raw, scale_raw, 2, sequence, 3)
+
+    assert packed.shape == (2, sequence, 3, 96)
+    assert scale.shape == (2, sequence, 3, 4)
+    assert packed.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert scale.untyped_storage().data_ptr() == scale_raw.untyped_storage().data_ptr()
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")

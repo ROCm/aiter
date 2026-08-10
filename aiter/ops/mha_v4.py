@@ -504,6 +504,19 @@ def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
     )
 
 
+def mxfp6_k_view(
+    raw: Tensor,
+    scale_raw: Tensor,
+    batch: int,
+    sequence: int,
+    heads: int,
+) -> tuple[Tensor, Tensor]:
+    """Rebuild the logical MXFP6 K and scale views from raw backing buffers."""
+    return fp6_k_lds_order_views_from_raw(
+        raw, scale_raw, batch, sequence, heads
+    )
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
 def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
@@ -647,7 +660,8 @@ _quantize_mxfp6_k_raw = quantize_mxfp6_k
 _quantize_v_fp8 = quantize_v_fp8
 
 
-def _v_mxfp4_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
+def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
+    """Rebuild the logical MXFP4 V view from its contiguous backing buffer."""
     batch, heads, _ = scale.shape
     padded_sequence = fp4_v_padded_sequence(sequence)
     return torch.as_strided(
@@ -674,12 +688,12 @@ def _launch_mxfp4_coalesced(
     v = (
         v_data
         if _is_fp8_format(resolved_v_format)
-        else _v_mxfp4_view(v_data, v_descale, k.shape[1])
+        else mxfp4_v_view(v_data, v_descale, k.shape[1])
     )
-    v_scale_mode = (
-        AttentionScaleMode.F32_PER_CHANNEL
-        if _is_fp8_format(resolved_v_format)
-        else AttentionScaleMode.E8M0_PER_1X32
+    scale_modes = scale_modes_for_formats(
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        resolved_v_format,
     )
     mha_v4_packed(
         q,
@@ -691,9 +705,7 @@ def _launch_mxfp4_coalesced(
         AttentionFormat.MXFP4,
         AttentionFormat.MXFP4,
         resolved_v_format,
-        AttentionScaleMode.E8M0_PER_1X32,
-        AttentionScaleMode.E8M0_PER_1X32,
-        v_scale_mode,
+        *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
     )
@@ -730,18 +742,18 @@ def _launch_mxfp6(
     softmax_scale: float,
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
-    k, k_descale = fp6_k_lds_order_views_from_raw(
+    k, k_descale = mxfp6_k_view(
         k_raw, k_descale_raw, q.shape[0], sequence_k, heads
     )
     v = (
         v_data
         if _is_fp8_format(resolved_v_format)
-        else _v_mxfp4_view(v_data, v_descale, sequence_k)
+        else mxfp4_v_view(v_data, v_descale, sequence_k)
     )
-    v_scale_mode = (
-        AttentionScaleMode.F32_PER_CHANNEL
-        if _is_fp8_format(resolved_v_format)
-        else AttentionScaleMode.E8M0_PER_1X32
+    scale_modes = scale_modes_for_formats(
+        AttentionFormat.MXFP6,
+        AttentionFormat.MXFP6,
+        resolved_v_format,
     )
     mha_v4_packed(
         q,
@@ -753,9 +765,7 @@ def _launch_mxfp6(
         AttentionFormat.MXFP6,
         AttentionFormat.MXFP6,
         resolved_v_format,
-        AttentionScaleMode.E8M0_PER_1X32,
-        AttentionScaleMode.E8M0_PER_1X32,
-        v_scale_mode,
+        *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
     )
