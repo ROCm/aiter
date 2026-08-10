@@ -90,18 +90,8 @@ def _device_cu_count() -> int:
 # gfx942: minimum grid fill (CTAs / CU_count) a tile size must achieve to be
 # chosen. _heuristic_bv takes the LARGEST legal BV clearing this bar.
 #
-# Re-measured on MI325X after the group-major+XOR LDS relayout (070a1c8f1) and
-# the bf16 rounding fix (fad8f74a3), which cut per-CTA cost and moved the
-# trade-off. Full 17-shape x {16,32,64} sweep: BV=64 wins at fill64 >= 0.63 but
-# LOSES at 0.32 (shapes 3/4, where BV=32 is 10-13% faster), so the previous
-# BV=64-specific threshold of 0.30 was too permissive. Anything in [0.45, 0.60]
-# gives the same picks on every preset shape; 0.50 is the midpoint.
-#
-# This supersedes a two-branch rule (special-case BV=64, else a target-CTA
-# heuristic). That version mispicked because its fallback jumped straight to
-# BV=16, skipping BV=32 entirely -- merely raising the old threshold made shapes
-# 3/4 *worse* (76% off best rather than 15%).
-_GFX942_MIN_FILL = 0.50
+
+_GFX942_MIN_FILL = 0.37
 
 
 # -- Kernel variants -----------------------------------------------------
