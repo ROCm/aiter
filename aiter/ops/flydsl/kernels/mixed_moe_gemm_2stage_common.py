@@ -547,11 +547,9 @@ def compile_mixed_moe_gemm1_common(
 
             x_elem = default_f8_type()
             f32 = T.f32
-            i64 = T.i64
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec16_x = T.vec(vec16_elems, x_elem)
-            T.vec(2, i64)
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
@@ -1475,8 +1473,6 @@ def compile_mixed_moe_gemm1_common(
                         epilogue_pf = (None, tw_pf, bias_pf)
 
                     c0_i64 = arith.constant(0, type=T.i64)
-                    T.vec(4, T.i64)
-                    T.vec(8, T.i32)
 
                     def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                         v4 = fx.Vector.from_elements([x0, x1, x2, x3], fx.Int64)
@@ -1608,8 +1604,6 @@ def compile_mixed_moe_gemm1_common(
                     a_scale_vals: list of A scale scalars indexed by mi_packed.
                     """
                     c0_i64 = arith.constant(0, type=T.i64)
-                    T.vec(4, T.i64)
-                    T.vec(8, T.i32)
 
                     def pack(x0, x1, x2, x3):
                         v4 = fx.Vector.from_elements([x0, x1, x2, x3], fx.Int64)
@@ -3586,13 +3580,11 @@ def compile_mixed_moe_gemm2_common(
             x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
-            i64 = T.i64
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec8_elems = 8 if a_elem_bytes == 1 else 4
             vec4_elems = 4 if a_elem_bytes == 1 else 2
             vec16_x = T.vec(vec16_elems, x_elem)
-            T.vec(2, i64)
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
