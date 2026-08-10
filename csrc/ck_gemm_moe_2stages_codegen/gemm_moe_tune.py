@@ -215,6 +215,37 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     return cos_diff
 
 
+def _token_major_to_sorted_routes(
+    values, sorted_ids, num_valid_ids, token_num, *, mark_padding=False
+):
+    """Gather [token, topk, K] values into the padded sorted-route row ABI."""
+    packed = sorted_ids.to(torch.int64)
+    token = packed & 0x00FFFFFF
+    slot = (packed >> 24) & 0xFF
+    valid = (
+        (torch.arange(sorted_ids.numel(), device=sorted_ids.device) < num_valid_ids[0])
+        & (token < int(token_num))
+        & (slot < int(values.shape[1]))
+    )
+    out = torch.empty(
+        (sorted_ids.numel(), values.shape[-1]), dtype=values.dtype, device=values.device
+    )
+    if mark_padding:
+        out.fill_(float("nan"))
+    else:
+        out.zero_()
+    out[valid] = values[token[valid], slot[valid]]
+    return out
+
+
+def sorted_stage1_cosine_diff_compare(ref, res, msg="", printLog=True):
+    # Padding rows are intentionally not written by Stage1. The reference keeps
+    # them NaN, so compare only rows containing a real route. A real route that
+    # quantizes to all zeros remains valid and is still checked.
+    valid = ~torch.isnan(ref.float()).all(dim=-1)
+    return cosine_diff_compare(ref[valid], res[valid], msg=msg, printLog=printLog)
+
+
 def tensor_compare_diagnostics(
     ref, res, rtol=1e-2, atol=1e-2, max_items=3, sample_elements=4096
 ):
@@ -740,6 +771,7 @@ class FmoeTuner(TunerCommon):
         kparams,
         blockM,
         act_type,
+        output_sorted=False,
     ):
         from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
@@ -757,6 +789,7 @@ class FmoeTuner(TunerCommon):
             activation=act_type,
             inter_dim_pad=0,
             bias=bias,
+            output_sorted=output_sorted,
         )
         return out
 
@@ -1141,6 +1174,7 @@ class FmoeTuner(TunerCommon):
             )
         kid = kparams["kid"]
         reduce_block_n = kparams.get("reduce_block_n")
+        route_shape = {"token_num": int(moe_buf.shape[0]), "topk": int(topk)}
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
@@ -1160,6 +1194,7 @@ class FmoeTuner(TunerCommon):
                 kernel_id=kid,
                 inter_dim_pad=0,
                 return_per_slot=True,
+                **route_shape,
             )
             if route_out.dtype == torch.uint8:  # MXFP8 route_out
                 return opus_moe_stage2_reduce_token_slot_route_output_fwd(
@@ -1185,6 +1220,7 @@ class FmoeTuner(TunerCommon):
             block_m=blockM,
             kernel_id=kid,
             inter_dim_pad=0,
+            **route_shape,
         )
 
     @staticmethod
@@ -1937,6 +1973,17 @@ class FmoeTuner(TunerCommon):
             }
 
     @staticmethod
+    def generate_opus_sorted_stage2_data(*args, **kwargs):
+        data = FmoeTuner.generate_data_2stages(*args, **kwargs)
+        data["a2_qt_sorted"] = _token_major_to_sorted_routes(
+            data["a2_qt"],
+            data["sorted_ids"],
+            data["num_valid_ids"],
+            data["moe_buf"].shape[0],
+        )
+        return data
+
+    @staticmethod
     def generate_data_1stage(
         token,
         model_dim,
@@ -2051,6 +2098,7 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -2089,8 +2137,11 @@ class FmoeTuner(TunerCommon):
                 ref1.reshape(-1, inter_dim)
             )
             a2 = a2_fp8_bytes.view(dtypes.fp8).view(token_num, topk, inter_dim)
+            if output_sorted:
+                a2 = _token_major_to_sorted_routes(
+                    a2, sorted_ids, num_valid_ids, token_num, mark_padding=True
+                )
             return a2
-
         if quant_type == QuantType.per_1x128:
             ref1, _ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
@@ -3974,6 +4025,7 @@ class FmoeTuner(TunerCommon):
             "moe_buf",
             "bias",
         ]
+        sorted_run_keys = ["a2_qt_sorted", *run_keys[1:]]
 
         for blockM in blockMs:
             if blockM not in (16, 32, 64, 128):
@@ -4033,6 +4085,55 @@ class FmoeTuner(TunerCommon):
                             cosine_diff_compare,
                         )
                     )
+                    tasks_opus.append(
+                        (
+                            (info, "stage1", inst.profile_name, blockM, 0, 1),
+                            FmoeTuner.generate_data_2stages,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                act_type,
+                                dtype,
+                                q_dtype_a,
+                                q_dtype_w,
+                                q_type,
+                                use_g1u1,
+                                doweight_stage1,
+                                blockM,
+                                1,
+                                True,
+                            ),
+                            FmoeTuner.run_opus_stage1_out,
+                            (
+                                [
+                                    "a1_qt_fp8_cast",
+                                    "w1_qt_shffle_ck",
+                                    "sorted_ids",
+                                    "sorted_expert_ids",
+                                    "num_valid_ids",
+                                    "w1_scale_aiter",
+                                    "a1_scale_e8m0_one_sort",
+                                    "bias",
+                                ],
+                                topk,
+                                s1_params,
+                                blockM,
+                                act_type,
+                                True,
+                            ),
+                            {},
+                            FmoeTuner.run_torch_moe_stage1,
+                            s1_ref_args[:-3] + (blockM, False, True),
+                            {"output_sorted": True},
+                            None,
+                            0.01,
+                            0.01,
+                            sorted_stage1_cosine_diff_compare,
+                        )
+                    )
             for kname, kparams in get_opus_a8w4_stage2_kernels(token=token).items():
                 # tuner blockM is the moe_sorting block_m; valid only when it
                 # equals the kid's SORT_BLOCK_M.
@@ -4067,6 +4168,38 @@ class FmoeTuner(TunerCommon):
                         gen_args,
                         FmoeTuner.run_opus_stage2_out,
                         run_args,
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        s2_ref_args,
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        cosine_diff_compare,
+                    )
+                )
+                tasks_opus.append(
+                    (
+                        (
+                            info,
+                            "stage2",
+                            kname.replace("opus_moe2_", "opus_moe2_layout_", 1),
+                            blockM,
+                            0,
+                            1,
+                        ),
+                        FmoeTuner.generate_opus_sorted_stage2_data,
+                        gen_args,
+                        FmoeTuner.run_opus_stage2_out,
+                        (
+                            sorted_run_keys,
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
                         {},
                         FmoeTuner.run_torch_moe_stage2,
                         s2_ref_args,
@@ -5479,8 +5612,8 @@ class FmoeTuner(TunerCommon):
                         "falling back to additive fairness"
                     )
 
-            # v2 is a transient tuning-time pairing marker; the persistent v2
-            # marker is kernelName2's ``flydsl_moe2_layout_`` prefix. Drop it before the
+            # v2 is a transient tuning-time pairing marker; the persistent layout
+            # marker is kernelName2's ``_moe2_layout_`` segment. Drop it before the
             # best-row selection so it never reaches the tuned CSV. (It still
             # appears in the profile_fmoe.csv debug dump, since prorfiles
             # captured the pre-strip DataFrame by reference; that is fine -- the

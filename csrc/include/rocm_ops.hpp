@@ -333,9 +333,11 @@ namespace py = pybind11;
           py::arg("sorted_expert_ids"),                                             \
           py::arg("num_valid_ids"),                                                 \
           py::arg("out"),                                                           \
+          py::arg("token_num"),                                                     \
+          py::arg("topk"),                                                          \
           py::arg("block_m"),                                                       \
           py::arg("kernel_id"),                                                     \
-          py::arg("inter_dim_pad"));                                                 \
+          py::arg("inter_dim_pad"));                                                \
     m.def("opus_moe_stage2_reduce_token_slot_route_output_fwd",                     \
           &opus_moe_stage2_reduce_token_slot_route_output_fwd,                      \
           "Opus MoE route-output topk reduce",                                      \
@@ -356,6 +358,7 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                                  \
           py::arg("out"),                                                            \
           py::arg("out_scale"),                                                      \
+          py::arg("topk"),                                                           \
           py::arg("block_m"),                                                        \
           py::arg("kernelName"),                                                     \
           py::arg("inter_dim_pad"),                                                  \

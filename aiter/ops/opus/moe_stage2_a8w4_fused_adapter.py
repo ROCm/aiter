@@ -257,9 +257,10 @@ def opus_a8w4_stage2_wrapper(
         raise ValueError("Opus A8W4 stage2 does not support EP expert_mask/topk_ids")
     if a2_scale is None or w2_scale is None:
         raise ValueError("Opus A8W4 stage2 requires a2_scale and w2_scale")
-    if inter_states.dim() != 3:
+    if inter_states.dim() not in (2, 3):
         raise ValueError(
-            "Opus A8W4 stage2 expects inter_states=[token, topk, inter_dim], "
+            "Opus A8W4 stage2 expects inter_states=[token, topk, inter_dim] or "
+            "[sorted_row, inter_dim], "
             f"got {tuple(inter_states.shape)}"
         )
     from .moe_stage2_a8w4_meta import (
@@ -271,13 +272,14 @@ def opus_a8w4_stage2_wrapper(
     expected_w2 = (
         w2.shape[0],
         w2.shape[1],
-        inter_states.shape[2] // kernel_contract.fp4_values_per_byte,
+        inter_states.shape[-1] // kernel_contract.fp4_values_per_byte,
     )
     if tuple(w2.shape) != expected_w2:
         raise ValueError(
             f"Opus A8W4 stage2 expects w2={list(expected_w2)}, got {tuple(w2.shape)}"
         )
-    expected_out = (inter_states.shape[0], w2.shape[1])
+    token_num = inter_states.shape[0] if inter_states.dim() == 3 else out.shape[0]
+    expected_out = (token_num, w2.shape[1])
     if tuple(out.shape) != expected_out:
         raise ValueError(
             f"Opus A8W4 stage2 expects out={list(expected_out)}, "
@@ -303,6 +305,8 @@ def opus_a8w4_stage2_wrapper(
             kernel_id=int(kernel_id),
             inter_dim_pad=actual_inter_dim_pad,
             return_per_slot=True,
+            token_num=token_num,
+            topk=int(topk),
         )
         if route_out.dtype == torch.uint8:  # MXFP8 route_out
             return opus_moe_stage2_reduce_token_slot_route_output_fwd(
@@ -328,6 +332,8 @@ def opus_a8w4_stage2_wrapper(
         block_m=sort_block_m,
         kernel_id=int(kernel_id),
         inter_dim_pad=actual_inter_dim_pad,
+        token_num=token_num,
+        topk=int(topk),
     )
 
 

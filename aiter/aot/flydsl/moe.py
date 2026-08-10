@@ -111,7 +111,7 @@ def parse_csv(csv_path: str):
                 else None
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
-            stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
+            stage1_v2_output_layout = "_moe2_layout_" in stage2_name
             stage2_v2_params = (
                 parse_flydsl_v2_gemm2_kernel(stage2_name)
                 if stage1_v2_output_layout
@@ -146,6 +146,12 @@ def parse_csv(csv_path: str):
                 if not name or not name.startswith("flydsl_"):
                     continue
                 if name.startswith("flydsl_moe2_layout_"):
+                    continue
+                # a4w4 mxmoe-port kernels are precompiled by mxfp4_moe.py; they
+                # share the flydsl_ prefix but are absent from this module's
+                # registry, so without this guard every CSV row naming one is
+                # reported as an unknown kernel.
+                if name.startswith("flydsl_mxmoe_"):
                     continue
 
                 params = get_flydsl_kernel_params(name)
@@ -1091,7 +1097,6 @@ def compile_one_config(
                     )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 

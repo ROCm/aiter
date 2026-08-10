@@ -1296,5 +1296,66 @@ def test_chunk_opt_vk_varlen(
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
+def _free_gib() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.mem_get_info()[0] / 2**30
+
+
+@pytest.mark.skipif(_free_gib() < 24, reason="needs ~12 GiB of free device memory")
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        pytest.param([134400], id="single-2100-chunks"),
+        pytest.param([45000, 45000, 45000], id="varlen-2112-chunks"),
+    ],
+)
+def test_chunk_fwd_h_beyond_int32_chunk_offsets(seqlens):
+    """Chunk offsets past 2**31 elements must not wrap.
+
+    With H*K*V == 2**20 the per-chunk stride into ``h`` overflows int32 at chunk
+    2048; before the offsets were widened this wrote behind the buffer and
+    faulted the GPU. Zero k/w/u and no gate leave the state untouched, so every
+    chunk snapshot must come back exactly equal to the initial state.
+    """
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+
+    H, K, V, BT = 64, 128, 128, 64
+    T = sum(seqlens)
+    zero = torch.zeros(1, T, H, K, device=device, dtype=torch.bfloat16)
+    u = torch.zeros(1, T, H, V, device=device, dtype=torch.bfloat16)
+    h0 = torch.randn(len(seqlens), H, K, V, device=device, dtype=torch.float32)
+    cu_seqlens = None
+    if len(seqlens) > 1:
+        cu_seqlens = torch.tensor(
+            [0] + torch.tensor(seqlens).cumsum(0).tolist(),
+            device=device,
+            dtype=torch.int32,
+        )
+
+    h, _, ht = chunk_gated_delta_rule_fwd_h(
+        k=zero,
+        w=zero,
+        u=u,
+        g=None,
+        gk=None,
+        initial_state=h0,
+        output_final_state=True,
+        chunk_size=BT,
+        save_new_value=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert torch.equal(ht, h0)
+    base = 0
+    for s, seqlen in enumerate(seqlens):
+        want = h0[s].to(h.dtype)
+        for i in range(base, base + -(-seqlen // BT)):
+            assert torch.equal(h[0, i], want), f"chunk {i} of sequence {s}"
+        base += -(-seqlen // BT)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
