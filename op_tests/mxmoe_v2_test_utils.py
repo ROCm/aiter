@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-from pathlib import Path
 from typing import Callable
 
 import torch
@@ -34,11 +32,6 @@ def logits_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     y64 = y.double()
     denominator = x64.square().sum() + y64.square().sum()
     return float(1 - 2 * (x64 * y64).sum() / denominator)
-
-
-def load_baseline_limit() -> float:
-    path = Path(__file__).parent / "flydsl_tests/data/mxmoe_v2_gfx950_baseline.json"
-    return json.loads(path.read_text())["standalone_logits_diff_limit"]
 
 
 def _poison_high_kpack(scale, groups, chunks):

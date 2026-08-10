@@ -20,10 +20,11 @@ from aiter.ops.shuffle import shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from op_tests.mxmoe_v2_test_utils import (
-    load_baseline_limit,
     logits_diff,
     run_standalone_v2_a8w8,
 )
+
+STANDALONE_LOGITS_DIFF_LIMIT = 1e-5
 
 
 def test_v2_gemm2_compile_rejects_bn64():
@@ -136,7 +137,7 @@ def test_v2_a8w8_coupling_negative_control():
 
 @pytest.mark.l2_device
 def test_v2_a8w8_k384_does_not_consume_scale_padding():
-    limit = load_baseline_limit()
+    limit = STANDALONE_LOGITS_DIFF_LIMIT
     clean = run_standalone_v2_a8w8(BM=32, BN=128, BK=128, K=384, limit=limit)
     poisoned = run_standalone_v2_a8w8(
         BM=32,
@@ -154,7 +155,7 @@ def test_v2_a8w8_k384_does_not_consume_scale_padding():
 
 @pytest.mark.l2_device
 def test_v2_a8w8_scale_poison_negative_control():
-    limit = load_baseline_limit()
+    limit = STANDALONE_LOGITS_DIFF_LIMIT
     bad = run_standalone_v2_a8w8(
         BM=32,
         BN=128,
@@ -442,7 +443,7 @@ def test_v2_stage1_scale_producers_ignore_k_padding_in_chained_gemm2():
 @pytest.mark.l2_device
 def test_v2_a8w8_bm16_standalone_only():
     result = run_standalone_v2_a8w8(
-        BM=16, BN=128, BK=128, K=384, limit=load_baseline_limit()
+        BM=16, BN=128, BK=128, K=384, limit=STANDALONE_LOGITS_DIFF_LIMIT
     )
     assert logits_diff(result.out, result.ref) <= result.limit
 
@@ -456,7 +457,7 @@ def test_v2_a8w8_bm16_standalone_only():
     ],
 )
 def test_v2_a8w8_large_tile_nt_branches(BM, BN, epilog):
-    limit = load_baseline_limit()
+    limit = STANDALONE_LOGITS_DIFF_LIMIT
     result = run_standalone_v2_a8w8(
         BM=BM,
         BN=BN,
