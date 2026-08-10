@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# ruff: noqa: E402
 
 import functools
 import os
@@ -8,10 +7,6 @@ from pathlib import Path
 import sys
 import tempfile
 from typing import Any, ClassVar
-
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-if not sys.path or sys.path[0] != _REPO_ROOT:
-    sys.path.insert(0, _REPO_ROOT)
 
 import pandas as pd
 import torch
