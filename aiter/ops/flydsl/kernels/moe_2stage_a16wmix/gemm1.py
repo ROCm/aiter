@@ -109,18 +109,9 @@ def _gemm1_body_a16w4(
     # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
     # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
     _PIPE = K_TILES_TOTAL > 1
-    # Roll the K loop (compact scf.for) ONLY for int4 decode/mid tiles. Rolling cuts
-    # GRBM/SQ_BUSY ~2x where the grid is latency-bound but COSTS ~12% at large M
-    # (tok4096, BM=32), which is HBM-adjacent and wants the unrolled body's ILP/prefetch
-    # depth; mxfp4/bf16 never roll, keeping them byte-identical to PR#4502. The tuned CSV
-    # uses BM==16 for every decode/mid row and BM>=32 only for large-M, so BM<=16 selects
-    # the winning regime. Compile-time -- the kernel is compiled per tile config.
-    #
-    # _roll_bad is a CORRECTNESS guard, not a perf choice: the rolled loop computes WRONG
-    # results for k_wave==1 + num_acc_n==1 + TILE_K>=256 (e.g. t16x64x256), an iter-arg/
-    # A-DMA interaction at that one shape; every other rolled combo is correct. No
-    # production row hits it today (kw1-tk256 is only BM=32, unrolled), but a future
-    # retune could pick one, so fall back to the unrolled body instead of rolling it.
+    # Roll the K loop only for int4 decode/mid (BM<=16): ~2x less GRBM/SQ_BUSY when
+    # latency-bound, ~12% worse at large M; mxfp4/bf16 never roll (byte-identical to #4502).
+    # _roll_bad: the rolled loop is WRONG for kw1+num_acc_n1+tk>=256 -- correctness guard.
     _roll_bad = (k_wave == 1) and (num_acc_n == 1) and (TILE_K >= 256)
     _roll_k = _is_int4 and BM <= 16 and not _roll_bad
     A_LDS_STAGES = 2 if _PIPE else 1
@@ -140,13 +131,8 @@ def _gemm1_body_a16w4(
         (N_OUT // 16, bl_k0, 4, 16, 16),
         (bl_stride_n0, bl_stride_k0, bl_stride_klane, 16, 1),
     )
-    # W (int4, a16wi4) OLD-kernel preshuffle layout: pack_int8_to_packed_int4(
-    #   shuffle_weight(w.i8, (16,16))) -- kpack=8 BYTES (K16 per klane slot), the layout
-    #   the replaced FlyDSL int4 kernel used. shape (N_OUT/16, K/64, klane=4, nlane=16,
-    #   kpack=8), byte strides (n0, 512, 128, 8, 1). One port MFMA-K32 block c=k0*4+klane
-    #   is the CONCATENATION of two adjacent klane slots (2*(c%2), +1) 128 B apart (see
-    #   load_b_raw int4 branch); the byte packing is "interleaved-by-4" (byte j = K_j |
-    #   K_{j+4}<<4), consumed by _int4_nibble_to_bf16x8(old_pack=True).
+    # int4 W: OLD-kernel preshuffle, kpack=8 (K16/klane slot), strides (n0,512,128,8,1);
+    # one MFMA-K32 = two klane slots 128B apart, bytes interleaved-by-4 (byte j = K_j|K_{j+4}<<4).
     if const_expr(_is_int4):
         i4l_k0 = K // 64
         i4l_stride_klane = 128
@@ -390,10 +376,8 @@ def _gemm1_body_a16w4(
         return raw
 
     def load_b_raw_int4(base_k, n_blk, n_intra):
-        # int4 OLD layout (kpack=8): a port MFMA-K32 block c = k0*4 + lane_div_16 is the
-        # concat of two adjacent klane slots (2*(c%2), 2*(c%2)+1) 128 B apart -> two
-        # dwordx2 loads. raw[k0i] = [slot_a i32#0, i32#1, slot_b i32#0, i32#1]; each i32
-        # (8 nibbles) is one MFMA K-step, "interleaved-by-4" packed (upconvert old_pack).
+        # kpack=8: K32 block c=k0*4+lane_div_16 = klane slots 2*(c%2),+1 (128B apart) ->
+        # two dwordx2; raw[k0i]=[a#0,a#1,b#0,b#1], each i32 = one K-step.
         raw = []
         for k0i in range_constexpr(_k0_count):
             k0 = (base_k + fx.Int32(k0i * 128)) // fx.Int32(128)
@@ -480,12 +464,8 @@ def _gemm1_body_a16w4(
         return scales
 
     def load_b_scale_int4(base_k, n_full):
-        # int4 groupwise (bf16-pair) scale, per-lane N (within-expert) = n_full.
-        # group_size=32 == one K32 step, so adj_ku = base_k//32 + (ku//4)*4 + lane_div_16
-        # (mxfp4 K->group map). Buffer (E, G//2, N, 2) bf16 (shuffle_scale_for_int4, the
-        # OLD-kernel layout): dword = e*(G//2*N) + (adj_ku//2)*N + n_full, half by parity.
-        # N-major over lanes -> 16 consecutive lanes read 16 consecutive dwords (one 64B
-        # cache line) instead of a G//2-strided gather, which the (E,N,G//2,2) layout hit.
+        # int4 scale (E,G//2,N,2) bf16: dword = e*(G//2*N) + (adj_ku//2)*N + n_full, half
+        # by parity. N-major, so 16 lanes share one 64B line (vs a G//2-strided gather).
         scales = []
         for ku in range_constexpr(k_unroll):
             _k0_blk = ku // 4
@@ -690,11 +670,7 @@ def _gemm1_body_a16w4(
                     _mma(accs_gate[mi][ni], a8, gb)
                     _mma(accs_up[mi][ni], a8, ub)
 
-    # ---- flatten/unflatten of a B-tile for scf.for loop-carried state ---------
-    # load_b_tile returns (g_raw, u_raw, g_sc, u_sc), each a list over ni (num_acc_n).
-    #   fp4/int4: raw[ni] = list[_k0_count] of list[4] i32; sc[ni] = list[k_unroll] f32.
-    #   bf16:     raw[ni] = list[k_unroll] of v8bf16 Vector; sc = None.
-    # Flat order: [g_raw...][u_raw...][g_sc...][u_sc...] (raw before scales).
+    # Flatten/unflatten a B-tile for scf.for iter_args; order [g_raw][u_raw][g_sc][u_sc].
     def _flatten_b_tile(b_tile):
         g_raw, u_raw, g_sc, u_sc = b_tile
         flat = []
@@ -779,10 +755,8 @@ def _gemm1_body_a16w4(
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
     else:
-        # int4 decode/mid: ROLLED software pipeline (runtime scf.for), same prefetch
-        # structure as the unrolled body. Loop runs [0, K_TILES_TOTAL-1) and carries the
-        # prefetched B-tile plus the accumulator VALUES -- rmem tensor objects cannot
-        # cross an scf.for iteration -- so the final tile is an epilogue after the loop.
+        # Rolled pipeline: loop [0,K_TILES_TOTAL-1) carries the prefetched B-tile + acc
+        # VALUES (rmem cannot cross scf.for); the last tile is the epilogue.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
 
@@ -817,10 +791,8 @@ def _gemm1_body_a16w4(
             _acc_to_vals(acc_gate) + _acc_to_vals(acc_up) + _flatten_b_tile(b_cur)
         )
 
-        # Manual scf.for emission: this body function is NOT AST-transformed (only the
-        # @flyc.kernel entry is), so the range(..., init=) loop sugar is unavailable
-        # here -- emit the loop-carried scf.ForOp directly. iter_args carry the flat
-        # state as raw ir.Values; re-wrap to DSL values via init_state exemplars.
+        # Not AST-transformed (only @flyc.kernel entries are), so range(...,init=) sugar
+        # is unavailable -- emit scf.ForOp directly; iter_args are raw ir.Values.
         _lb = as_ir_value(fx.Index(0))
         _ub = as_ir_value(fx.Index(K_TILES_TOTAL - 1))
         _step = as_ir_value(fx.Index(1))
