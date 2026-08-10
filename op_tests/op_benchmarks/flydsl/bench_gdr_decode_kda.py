@@ -14,6 +14,9 @@ so they never reach the scalar gate.
 ``--bench`` reports two numbers because they differ by ~2x at decode batch sizes
 and quoting the wrong one is the easy mistake: ``call_us`` (host cost included,
 what a decode loop runs at) and ``kernel_us`` (excluded, what the sweep ranks on).
+Both come as mean ± std over ``TRIALS`` trials on fresh inputs. The kernel-axis
+win is a few percent, which is the size of the drift, so a number without its
+spread cannot be quoted as a win.
 
 Usage:
     # Tuning sweep, emits rows in gdr_decode_tuned.csv format
@@ -71,7 +74,10 @@ WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
 # What get_default_kwargs falls back to when no row matches the shape.
 FALLBACK_CONFIG = (1, 4, 8)
 
-# How many of the sweep's leaders get re-timed, and over how many trials.
+# How many of the sweep's leaders get re-timed, and how many independent trials
+# every timing is repeated over -- in the sweep and in the A/B alike. One
+# measurement cannot separate a real difference from run-to-run drift when the
+# two kernels land within a few percent of each other, which they do here.
 TOP_N = 5
 TRIALS = 5
 
@@ -154,11 +160,16 @@ def flydsl_runner(inp, config):
 
     ``flydsl_gdr_decode`` resolves its config from ``gdr_decode_tuned.csv``, so a
     sweep must build the kernel directly. need_shuffle_state=False, K3's layout.
+
+    q/k/v stay views into ``mixed_qkv``, the same buffer the Triton comparator
+    reads, and the kernel is compiled against those strides. One layout for the
+    sweep and the A/B both: a config tuned against dense inputs would be tuned
+    for a kernel no consumer builds.
     """
     nbpv, nw, wtk = config
     state = inp["pool"]
     out = torch.zeros(inp["B"], 1, H, V, dtype=DTYPE, device=state.device)
-    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
+    q, k, v = inp["q"], inp["k"], inp["v"]
     exe = create_vk_gdr_decode_kernel(
         get_dtype_str(DTYPE),
         get_dtype_str(inp["A_log"].dtype),
@@ -419,21 +430,24 @@ def load_triton(vllm_path):
     return mod.fused_recurrent_kda_packed_decode
 
 
-def bench_one(B, flydsl_gdr_decode, triton_fn):
-    """One row of both A/B tables: every measurement at one batch size.
+def bench_one(B, flydsl_gdr_decode, triton_fn, seed=0):
+    """One trial of both A/B tables: every measurement at one batch size.
 
     Its own function so the timed closures bind parameters, not a loop variable.
     Both kernels decay the pool in place, hence the ``copy_(pool0)`` before each
     measurement.
     """
-    inp = make_inputs(B)
+    inp = make_inputs(B, seed=seed)
     pool0 = inp["pool"].clone()
     out = torch.zeros(B, 1, H, V, dtype=DTYPE, device="cuda")
 
-    # Hoisted deliberately: q/k/v are packed-buffer views and the wrapper calls
-    # .contiguous(), so timing this would charge FlyDSL for unpacking per call.
-    # Packed reads are a separate ticket, so the unpack gets its own column.
-    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
+    # K3 hands q/k/v over as views into one packed buffer, and since #4573 the
+    # wrapper compiles against the strides it is given instead of copying to
+    # dense. So the strided reads are what a consumer pays and they belong inside
+    # FlyDSL's own number. Flattening first is not the cheaper option and is not
+    # measured: it costs 12.8-13.7 us against a strided penalty of at most 0.55
+    # us (B=64; free at B=1, faster at B=4). Measured on gfx950, both layouts.
+    q, k, v = inp["q"], inp["k"], inp["v"]
 
     def fly():
         flydsl_gdr_decode(
@@ -483,21 +497,14 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
         tri_call = call_us(tri)
 
     # What a caller got before the sweep: with no 12x12 row the wrapper falls
-    # back to (1, 4, 8). Bound directly, since the wrapper now finds a row.
+    # back to (1, 4, 8). Bound directly, since the wrapper now finds a row. Same
+    # inputs as the column above, so the two differ only by the config.
     inp["pool"].copy_(pool0)
     untuned_run, _ = flydsl_runner(inp, FALLBACK_CONFIG)
     untuned_run()
     torch.cuda.synchronize()
     inp["pool"].copy_(pool0)
     untuned_kernel = kernel_us(untuned_run)
-
-    unpack_kernel = kernel_us(
-        lambda: (
-            inp["q"].contiguous(),
-            inp["k"].contiguous(),
-            inp["v"].contiguous(),
-        )
-    )
 
     def ratio(tri, fly):
         return math.nan if math.isnan(tri) else tri / fly
@@ -512,9 +519,8 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
         "tri_kernel": tri_kernel,
         "fly_kernel": fly_kernel,
         "kernel_speedup": ratio(tri_kernel, fly_kernel),
-        # Kernel-axis asides: what tuning bought, what a packed caller would pay.
+        # Kernel-axis aside: what the tuning sweep bought over the fallback.
         "untuned_kernel": untuned_kernel,
-        "unpack_kernel": unpack_kernel,
         "fly_ok": fly_ok,
         "fly_err": fly_err,
         "tri_ok": tri_ok,
@@ -522,9 +528,55 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
     }
 
 
+_TIMED_KEYS = (
+    "tri_call",
+    "fly_call",
+    "call_speedup",
+    "tri_kernel",
+    "fly_kernel",
+    "kernel_speedup",
+    "untuned_kernel",
+)
+
+
+def mean_std(xs):
+    """Mean and *sample* std, so one trial reports nan instead of a confident 0."""
+    if any(math.isnan(x) for x in xs):
+        return math.nan, math.nan
+    return statistics.fmean(xs), statistics.stdev(xs) if len(xs) > 1 else math.nan
+
+
+def bench_trials(B, flydsl_gdr_decode, triton_fn):
+    """Repeat every measurement at one batch size over ``TRIALS`` trials.
+
+    A fresh seed per trial, so the spread covers the input values and their
+    allocation too, not only clock drift. Speedups average the per-trial ratio
+    rather than dividing the two averages: the kernels are timed back to back
+    within a trial, so the ratio is the paired quantity and its std is the one
+    that says whether the win survives the noise.
+    """
+    runs = [bench_one(B, flydsl_gdr_decode, triton_fn, seed=t) for t in range(TRIALS)]
+
+    row = {"B": B}
+    for key in _TIMED_KEYS:
+        row[key] = mean_std([r[key] for r in runs])
+
+    # Parity has to hold in every trial, and the reported error is the worst one.
+    row["fly_ok"] = all(r["fly_ok"] for r in runs)
+    row["fly_err"] = max(r["fly_err"] for r in runs)
+    row["tri_ok"] = (
+        None if runs[0]["tri_ok"] is None else all(r["tri_ok"] for r in runs)
+    )
+    row["tri_err"] = max(r["tri_err"] for r in runs)
+    return row
+
+
 def print_table(caption, columns, table):
-    """``columns`` is (heading, width, key) each, plus 'x' on any *_speedup key."""
-    print(f"\n{caption}\n")
+    """``columns`` is (heading, width, key) each, plus 'x' on any *_speedup key.
+
+    Every cell but ``B`` is mean ± std over ``TRIALS`` trials.
+    """
+    print(f"\n{caption}\n{TRIALS} trials, mean ± std\n")
     header = " ".join(f"{head:>{w}}" for head, w, _ in columns)
     print(header)
     print("-" * len(header))
@@ -533,10 +585,10 @@ def print_table(caption, columns, table):
         for _, w, key in columns:
             if key == "B":
                 cells.append(f"{r['B']:>{w}}")
-            elif key.endswith("speedup"):
-                cells.append(f"{r[key]:>{w - 1}.2f}x")
             else:
-                cells.append(f"{r[key]:>{w}.2f}")
+                mean, std = r[key]
+                unit = "x" if key.endswith("speedup") else ""
+                cells.append(f"{f'{mean:.2f}{unit} ± {std:.2f}':>{w}}")
         print(" ".join(cells))
 
 
@@ -548,6 +600,13 @@ def bench(args):
     kernels are host-bound, so the kernel is not the constraint. The kernel table
     is what the sweep ranks on. FlyDSL goes through the public wrapper either
     way, so the numbers are what a consumer gets, tuning table included.
+
+    Every cell is repeated over ``TRIALS`` trials. The kernels sit within a few
+    percent of each other, so a single shot cannot tell the gap from the drift.
+
+    Both sides read K3's packed q/k/v, which is the ticket's "same inputs", and
+    the sweep tunes against those same strides -- so the row the wrapper looks up
+    describes the kernel being measured.
     """
     from aiter.ops.flydsl import flydsl_gdr_decode
 
@@ -555,15 +614,15 @@ def bench(args):
     triton_fn = load_triton(args.vllm)
     print(f"\narch {arch} · H={H} K=V={K} bf16 · f32 state · all times us")
 
-    table = [bench_one(B, flydsl_gdr_decode, triton_fn) for B in BATCHES]
+    table = [bench_trials(B, flydsl_gdr_decode, triton_fn) for B in BATCHES]
 
     print_table(
         "how fast a decode loop runs -- wall clock per call, calls back to back",
         [
             ("B", 5, "B"),
-            ("Triton", 10, "tri_call"),
-            ("FlyDSL", 10, "fly_call"),
-            ("speedup", 9, "call_speedup"),
+            ("Triton", 14, "tri_call"),
+            ("FlyDSL", 14, "fly_call"),
+            ("speedup", 14, "call_speedup"),
         ],
         table,
     )
@@ -571,16 +630,18 @@ def bench(args):
         "how fast the kernels are -- device time per call, host cost excluded",
         [
             ("B", 5, "B"),
-            ("Triton", 10, "tri_kernel"),
-            ("FlyDSL", 10, "fly_kernel"),
-            ("speedup", 9, "kernel_speedup"),
+            ("Triton", 14, "tri_kernel"),
+            ("FlyDSL", 14, "fly_kernel"),
+            ("speedup", 14, "kernel_speedup"),
             ("FlyDSL untuned", 15, "untuned_kernel"),
-            ("QKV unpack", 12, "unpack_kernel"),
         ],
         table,
     )
 
-    print("\nparity vs the torch reference (both must hold, or the timing is noise):")
+    print(
+        f"\nparity vs the torch reference, worst of {TRIALS} trials"
+        " (both must hold, or the timing is noise):"
+    )
     for r in table:
         tri_ok, tri_err = r["tri_ok"], r["tri_err"]
         t = "n/a" if tri_ok is None else f"{'ok' if tri_ok else 'FAIL'} {tri_err:.1e}"

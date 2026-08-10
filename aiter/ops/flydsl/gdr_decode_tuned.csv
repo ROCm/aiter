@@ -5375,7 +5375,7 @@ gfx950,torch.bfloat16,torch.float32,253,1,16,64,128,128,8,4,16,358.3230000000003
 gfx950,torch.bfloat16,torch.float32,254,1,16,64,128,128,8,4,16,360.0035000000007,gdr
 gfx950,torch.bfloat16,torch.float32,255,1,16,64,128,128,8,1,4,361.3235000000004,gdr
 gfx950,torch.bfloat16,torch.float32,256,1,16,64,128,128,8,4,16,362.8634999999995,gdr
-gfx950,torch.bfloat16,torch.float32,1,1,12,12,128,128,8,2,16,6.80,kda
-gfx950,torch.bfloat16,torch.float32,4,1,12,12,128,128,4,4,16,7.33,kda
-gfx950,torch.bfloat16,torch.float32,64,1,12,12,128,128,4,2,32,20.85,kda
-gfx950,torch.bfloat16,torch.float32,256,1,12,12,128,128,4,4,16,77.24,kda
+gfx950,torch.bfloat16,torch.float32,1,1,12,12,128,128,32,2,32,6.61,kda
+gfx950,torch.bfloat16,torch.float32,4,1,12,12,128,128,4,4,16,7.31,kda
+gfx950,torch.bfloat16,torch.float32,64,1,12,12,128,128,1,4,16,21.57,kda
+gfx950,torch.bfloat16,torch.float32,256,1,12,12,128,128,4,4,16,75.24,kda
