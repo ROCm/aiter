@@ -132,10 +132,10 @@ All remain in force.
 | Item | Status | Note |
 |---|---|---|
 | FP8→BF16 convert (ROCDL op) | ✅ shipped | `cvt_scalef32_pk_bf16_fp8` in WIP. |
-| FP4→BF16 convert (ROCDL op) | ⏳ verify | `cvt_scalef32_pk_bf16_fp4(src, scale, sel_index)` — confirm the 4-`sel` op form and e8m0 scale path on gfx950 (Phase A). |
+| FP4→BF16 convert (ROCDL op) | ✅ measured | `cvt_scalef32_pk_bf16_fp4(res, src, scale, src_sel_index)` — the 4-`sel` form (`sel∈{0,1,2,3}` selects one of the 4 bf16 pairs in an 8-FP4 i32). **Exact vs the MXFP4 codebook** on gfx950 (`max_abs_err=0`, cos=1.0, packing matches `fp4_utils` nibble order); `sel` must be a compile-time int (`I32Attr`) — unroll, don't loop. Repro: `/tmp/repro_fp4_primitive.py`. |
 | `v_dot2_f32_bf16` ILP (no s_nop, 1 drain) | ⏳ verify | reference proves the pattern; re-validate exact vs torch in the WIP surface. |
 | i64 offset addressing in FlyDSL | ✅ measured | WIP `fx.*` offsets are 64-bit-safe up to the **i32 dword-index limit** (`buffer_load` truncates offset to i32): correct for all ticket shapes (≤3.74 GB tensors), breaks only >8 GB (K3). Per-row i64 base is the K3 fix. |
-| e8m0 → f32 decode (`bitcast(shli(byte,23))`) | ⏳ verify | reference pattern; validate vs `aiter.utility.fp4_utils`. |
+| e8m0 → f32 decode (`bitcast(shli(byte,23))`) | ✅ measured | In-kernel `shl(byte,23)+bitcast` is **bit-exact vs `fp4_utils.e8m0_to_f32`** on the normal exponent range (bytes 1..254) on gfx950. The `0`/`0xFF` specials are never produced for real MXFP4 weights (out of scope). Same repro. |
 
 ---
 
@@ -172,6 +172,11 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
   `w_word0`/`a_word0`); only the K3-scale item touches kernel addressing.
 
 ### Phase B — MXFP4 / FP4 (G2)  [ ]  ← ticket #1 win
+- [x] **Primitives de-risked** (gfx950, `/tmp/repro_fp4_primitive.py`): the 4-`sel`
+      `cvt_scalef32_pk_bf16_fp4` convert is **exact vs the MXFP4 codebook** and the e8m0
+      `shl 23 + bitcast` decode is **bit-exact vs `fp4_utils.e8m0_to_f32`** (normal range).
+      Gotcha: `src_sel_index` is an `I32Attr` → must be a compile-time constant (unroll the 4
+      `sel` calls; a `for sel in range(4)` becomes an `scf.for` and fails with `bad_cast`).
 - [ ] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
       128-bit FP4 load → `cvt_scalef32_pk_bf16_fp4` (4 `sel` per i32) → dot2. **e8m0 per-block
       scale** (`block_k=32` covers the lane's 8-elt chunk) applied after the dot; router_wt
@@ -400,3 +405,12 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   substantive work**, Phase A reduced to regression tests + the deferred K3-scale per-row i64
   fix. Updated §1/§3/§4/§8.2/§9. Repros in `/tmp/repro_g1.py`, `/tmp/repro_g1_down.py`,
   `/tmp/repro_k3_addr.py`.
+- _Qwen-TP1 E=512 regression folded in (2026-08-10)_ — parametrized the real-E op_tests over
+  `REAL_E_CASES = {deepseek_v3_e256, qwen3next_tp1_e512}` (both stages, max-offset expert
+  forced); all 4 pass on gfx950. Closes the Phase A regression-test item; §8.2 matrix updated.
+- _Phase B primitives de-risked (2026-08-10)_ — validated the two FP4 primitives on gfx950
+  (`/tmp/repro_fp4_primitive.py`): the 4-`sel` `cvt_scalef32_pk_bf16_fp4` convert is exact vs
+  the MXFP4 codebook (packing matches `fp4_utils` nibble order) and the e8m0 `shl 23 + bitcast`
+  decode is bit-exact vs `fp4_utils.e8m0_to_f32` (normal range). Recorded the `src_sel_index`
+  `I32Attr` compile-time-constant gotcha. Marked the §3 feasibility rows ✅ measured and added
+  a Phase B "primitives de-risked" checkbox. **Next substantive step: `build_down_reduce_fp4_module`.**
