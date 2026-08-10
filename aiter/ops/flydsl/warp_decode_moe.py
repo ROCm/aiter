@@ -23,6 +23,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_down_reduce_fp4_module,
     build_down_reduce_fp8_module,
+    build_gate_up_fp4_module,
     build_gate_up_fp8_module,
     pick_kvector,
 )
@@ -66,6 +67,19 @@ def _get_down_reduce(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_gate_up_fp4(hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk):
+    return build_gate_up_fp4_module(
+        hidden,
+        inter,
+        top_k,
+        kvector=kvector,
+        serialize_dot2=serialize_dot2,
+        scale_bn=scale_bn,
+        scale_bk=scale_bk,
     )
 
 
@@ -171,6 +185,81 @@ def flydsl_warp_decode_gate_up(
 
     launcher = _get_gate_up(
         HIDDEN, INTER, TOPK, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+    )
+    grid_x = B * TOPK * INTER
+    _run(
+        launcher,
+        (
+            ptr_arg(x),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(w_gate_scale),
+            ptr_arg(w_up_scale),
+            ptr_arg(router_ids),
+            ptr_arg(out),
+            grid_x,
+            torch.cuda.current_stream(),
+        ),
+    )
+    return out
+
+
+def flydsl_warp_decode_gate_up_fp4(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    router_ids: torch.Tensor,
+    w_gate_scale: torch.Tensor,
+    w_up_scale: torch.Tensor,
+    *,
+    scale_block: tuple[int, int] = (1, 32),
+    serialize_dot2: bool = True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gate_up stage with **MXFP4** weights (BF16 activation, FP4 e2m1 + E8M0).
+
+    Same ``silu(gate)*up`` epilogue as :func:`flydsl_warp_decode_gate_up`, but
+    ``w_gate`` / ``w_up`` are MXFP4 (8 FP4 nibbles / i32, half the FP8 weight
+    bandwidth) with per-block E8M0 scales applied in the hardware scaled convert.
+
+    Args:
+        x:            [B, HIDDEN] bfloat16 (row-major, contiguous).
+        w_gate/w_up:  MXFP4 weights for [E, INTER, HIDDEN], packed 2 FP4/byte:
+            ``uint8`` [E, INTER, HIDDEN//2] (row = e*INTER + j). Logical HIDDEN
+            is taken from ``x``.
+        router_ids:   [B, TOPK] int32.
+        w_gate_scale/w_up_scale: ``uint8`` E8M0 block scales, each
+            [(E*INTER)//BN, HIDDEN//BK] row-major over (weight-row-block, K-block),
+            (BN, BK) = ``scale_block``.
+        scale_block:  (BN, BK); MXFP4 default (1, 32).
+        out:          optional [B, TOPK, INTER] bfloat16 output buffer.
+
+    Returns:
+        [B, TOPK, INTER] bfloat16 intermediate.
+    """
+    assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
+    assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
+    assert w_gate.shape == w_up.shape, "w_gate and w_up must share shape"
+    assert w_gate.dim() == 3, "w_gate must be [E, INTER, HIDDEN//2] (uint8)"
+
+    B, HIDDEN = x.shape
+    E, INTER, packed_h = w_gate.shape
+    assert HIDDEN % 2 == 0, "HIDDEN must be even (2 FP4 per byte)"
+    assert (
+        packed_h == HIDDEN // 2
+    ), f"w_gate last dim {packed_h} != HIDDEN//2 {HIDDEN // 2}"
+    TOPK = router_ids.shape[1]
+
+    scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
+    assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
+    assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
+
+    kvector = pick_kvector_fp4(HIDDEN)
+    if out is None:
+        out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
+
+    launcher = _get_gate_up_fp4(
+        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk
     )
     grid_x = B * TOPK * INTER
     _run(
