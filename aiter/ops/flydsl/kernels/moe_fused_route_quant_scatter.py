@@ -1274,6 +1274,15 @@ def build_moe_fused_quant_preshuffle_module(
     return launch_fused
 
 
+ROUTEKS_KSPLIT_MIN_GRID_BLOCKS = 512
+
+
+def routeks_uses_ksplit(numel: int, warps_per_block: int) -> bool:
+    """Whether route-indexed quant needs K-split to expose enough parallelism."""
+    grid_blocks = (int(numel) + int(warps_per_block) - 1) // int(warps_per_block)
+    return grid_blocks < ROUTEKS_KSPLIT_MIN_GRID_BLOCKS
+
+
 def build_moe_fused_quant_preshuffle_route_ksplit_module(
     feat_dim: int,
     wmma_rep: int,
