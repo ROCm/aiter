@@ -438,6 +438,131 @@ def test_down_reduce_fp8(case):
 
 
 # -------------------------------------------------------------------------
+# Phase B -- down_reduce MXFP4 (BF16 intermediate, FP4 e2m1 + E8M0 block scale)
+# -------------------------------------------------------------------------
+from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
+    flydsl_warp_decode_down_reduce_fp4,
+)
+
+# The MXFP4 codebook (E2M1); index = 4-bit nibble. Mirrors the LUT hardcoded in
+# aiter.utility.fp4_utils.mxfp4_to_f32 (which we can't import here because this
+# torch build lacks torch.float4_e2m1fn_x2, referenced by that helper).
+_MXFP4_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+# MXFP4 uses a fixed Block2D<1,32> E8M0 scale (BK=32 by spec). INTER must be a
+# multiple of 64*8=512 (one i32 = 8 FP4 = one weight dword/lane/iter).
+# name, B, INTER, HIDDEN, E, TOPK
+DOWN_FP4_CASES = [
+    ("down_fp4_i512_h256_e8_tk2", 1, 512, 256, 8, 2),
+    ("down_fp4_i1024_h128_e8_tk4", 2, 1024, 128, 8, 4),
+]
+_MXFP4_BK = 32
+
+
+def _gen_down_fp4(B, INTER, HIDDEN, E, TOPK):
+    """MXFP4 down inputs + fp32 dequantized reference weights.
+
+    FP4 codebook weights with power-of-two E8M0 block scales (both exactly
+    representable in bf16 after the scaled convert), so the only error source is
+    bf16 rounding of the intermediate + dot2 summation order.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260810)
+    rows = E * HIDDEN
+    scale_cols = INTER // _MXFP4_BK
+    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=device)
+
+    codes = torch.randint(
+        0, 16, (rows, INTER), generator=gen, device=device, dtype=torch.int32
+    )
+    # E8M0 bytes in a moderate power-of-two range (2^-4 .. 2^4) => exact.
+    sbytes = torch.randint(
+        123, 132, (rows, scale_cols), generator=gen, device=device, dtype=torch.int32
+    )
+    blk = torch.pow(2.0, sbytes.float() - 127.0)
+    w_deq = (lut[codes.long()] * blk.repeat_interleave(_MXFP4_BK, dim=1)).reshape(
+        E, HIDDEN, INTER
+    )
+
+    # Pack 2 FP4/byte (low nibble = even element) -> uint8 [E, HIDDEN, INTER//2].
+    packed = ((codes[:, 1::2] << 4) | codes[:, 0::2]).to(torch.uint8)
+    w_down = packed.reshape(E, HIDDEN, INTER // 2).contiguous()
+    w_scale = sbytes.to(torch.uint8).reshape(rows, scale_cols).contiguous()
+
+    inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    router_ids = torch.randint(
+        0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
+    )
+    router_ids[0, 0] = E - 1  # exercise the max weight-row offset
+    router_wts = torch.rand((B, TOPK), generator=gen, device=device).float()
+    router_wts = router_wts / router_wts.sum(dim=1, keepdim=True)
+    return inter, w_down, w_scale, router_ids, router_wts, w_deq
+
+
+def _ref_down_fp4(inter, w_deq, router_ids, router_wts):
+    B, TOPK, _ = inter.shape
+    _, HIDDEN, _ = w_deq.shape
+    interf = inter.float()
+    y = torch.zeros(B, HIDDEN, device=inter.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(router_ids[b, k])
+            y[b] += float(router_wts[b, k]) * (interf[b, k] @ w_deq[e].T)
+    return y.to(torch.bfloat16)
+
+
+def _run_down_fp4_case(case, *, cos_thresh=0.99):
+    name, B, INTER, HIDDEN, E, TOPK = case
+    print("=" * 78)
+    print(f"[flydsl] warp-decode down_reduce MXFP4  case={name}")
+    inter, w_down, w_scale, router_ids, router_wts, w_deq = _gen_down_fp4(
+        B, INTER, HIDDEN, E, TOPK
+    )
+    out = flydsl_warp_decode_down_reduce_fp4(
+        inter, w_down, router_ids, router_wts, w_scale, scale_block=(1, _MXFP4_BK)
+    )
+    torch.cuda.synchronize()
+    ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)
+    cos = _cosine(ref, out)
+    max_delta = (ref.float() - out.float()).abs().max().item()
+    denom = ref.float().abs().max().item() + 1e-6
+    passed = cos >= cos_thresh
+    print(
+        f"  cos_sim={cos:.6f} (thresh {cos_thresh}), "
+        f"max_delta={max_delta:.4f} ({100*max_delta/denom:.2f}% of max)"
+    )
+    print(f"    ref  sample: {ref.float().reshape(-1)[:6].tolist()}")
+    print(f"    test sample: {out.float().reshape(-1)[:6].tolist()}")
+    print(f"    --> {'PASS' if passed else 'FAIL'}")
+    return passed, cos
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_FP4_CASES])
+def test_down_reduce_fp4(case):
+    passed, _ = _run_down_fp4_case(case)
+    assert passed
+
+
+# -------------------------------------------------------------------------
 # Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
 # -------------------------------------------------------------------------
 # GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
