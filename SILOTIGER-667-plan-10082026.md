@@ -76,6 +76,10 @@ All remain in force.
   `./flydsl_venv/bin/python -m pytest -q op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`
   (or `./flydsl_venv/bin/python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`). The
   default env's triton 3.3.1 < gluon's 3.6.0 requirement, which blocks `import aiter`.
+- **GPU selection:** run on **GPU 6** — prefix the command (or export first) with
+  `HIP_VISIBLE_DEVICES=6` so the process sees a single device indexed as `cuda:0`, e.g.
+  `HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python -m pytest -q op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`.
+  (Isolating one device also keeps the cold-HBM-read perf numbers clean.)
 - **Kernel location:** `aiter/ops/flydsl/kernels/warp_decode_moe.py` (+ a Python
   wrapper/entry point in `aiter/ops/flydsl/warp_decode_moe.py`), matching the existing
   MoE FlyDSL layout. New datatype/perf variants extend these files (or a sibling in the
