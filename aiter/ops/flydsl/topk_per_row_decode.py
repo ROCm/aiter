@@ -88,12 +88,21 @@ def _environ_kernel_config() -> dict:
     return {k: v for k, v in cfg.items() if v is not None}
 
 
-def _default_kernel_config(
+def _resolved_kernel_config(
     num_rows: int,
     max_model_len: int,
     arch: str | None = None,
+    overrides: dict | None = None,
 ) -> dict:
+    """Derive the tiered config, folding each override in at the point the field is
+    defined rather than over the finished dict. Several fields (blocks_per_row above
+    all) are derived *from* other fields, so an override applied afterwards would
+    leave the config internally inconsistent -- e.g. a forced bits_per_pass of 10
+    against a blocks_per_row already collapsed to 1 on the strength of the default
+    11, which the kernel then rejects.
+    """
     arch = arch or get_rocm_arch()
+    overrides = overrides or {}
 
     # Grid width per row: enough workgroups to cover the row at LOAD_VEC elements
     # per thread, clamped to [2, 32] (32 = the wg cap the mid/long tiers can use;
@@ -109,6 +118,14 @@ def _default_kernel_config(
     bits_per_pass = (
         11 if cu_count >= 128 or SMEM_CAPACITY_MAP.get(arch, 0) >= 128 * 1024 else 10
     )
+    bits_per_pass = overrides.get("bits_per_pass", bits_per_pass)
+    tier_mode = overrides.get("tier_mode", "auto")
+
+    # The kernel compiles its single-workgroup launch path (blocks_per_row == 1) only
+    # when the short tier exists, which needs an 11-bit histogram and a tier mode that
+    # can reach that tier. Every grid=1 fold below is gated on this, so a forced
+    # bits_per_pass or tier_mode cannot leave behind a width the kernel refuses.
+    single_wg_ok = bits_per_pass == 11 and tier_mode in ("auto", "short")
 
     # Max cooperating workgroups per row for the mid/long tiers (the real wg count
     # is min(blocks_per_row, cap)). Scales down with batch size: a single long row
@@ -126,6 +143,9 @@ def _default_kernel_config(
     else:  #  num_rows >= 8
         tiered_long_cap_default = 8
 
+    tiered_mid_cap_default = overrides.get("tiered_mid_cap", tiered_mid_cap_default)
+    tiered_long_cap_default = overrides.get("tiered_long_cap", tiered_long_cap_default)
+
     # Batch-aware short vs multi-block crossover (arch-specific base/slope/cap). The
     # multi-block barrier floor grows under CU contention as more rows launch, while
     # the single-workgroup path is flat in batch. Bucket num_rows to the next pow 2
@@ -133,10 +153,11 @@ def _default_kernel_config(
     base, slope, cap = _SHORT_MAX_PARAMS.get(arch, _SHORT_MAX_PARAMS["gfx942"])
     short_max_rows = _next_pow2(num_rows)
     tiered_short_max = min(cap, base + short_max_rows * slope)
+    tiered_short_max = overrides.get("tiered_short_max", tiered_short_max)
 
     # Local copy so the grid=1 fold below can raise it to keep mid_max >= short_max
     # (kernel validation requires it when force_single_wg lifts short_max to L).
-    tiered_mid_max = _TIERED_MID_MAX
+    tiered_mid_max = overrides.get("tiered_mid_max", _TIERED_MID_MAX)
 
     # Dead-block trim (gfx950 only). The launch grid is (blocks_per_row, num_rows) but
     # the real workers per row = min(blocks_per_row, tier_cap); the excess workgroups
@@ -150,7 +171,7 @@ def _default_kernel_config(
     # FLYDSL_TOPK_TIERED_TRIM (0/1) overrides; gfx942 is untouched (default 0).
     trim_on = _env_int("FLYDSL_TOPK_TIERED_TRIM", 1 if arch == "gfx950" else 0)
     if trim_on:
-        if max_model_len <= tiered_short_max and bits_per_pass == 11:
+        if max_model_len <= tiered_short_max and single_wg_ok:
             # All rows short-tier (active_parts=1): every block but one is dead and the
             # barrier-free single-wg tier has nothing for the extras to hide latency for
             # -> collapse to grid=1 (HIP one-block shape). Needs the kernel bpr==1 path.
@@ -159,7 +180,7 @@ def _default_kernel_config(
             max_model_len > tiered_short_max
             and num_rows * 32 <= cu_count * _CDNA_OCCUPANCY
         ):
-            if max_model_len <= _TIERED_MID_MAX:
+            if max_model_len <= tiered_mid_max:
                 max_active_parts = tiered_mid_cap_default
             else:
                 max_active_parts = max(tiered_mid_cap_default, tiered_long_cap_default)
@@ -184,7 +205,7 @@ def _default_kernel_config(
         budget = envelope // num_rows
         if budget >= 2:
             blocks_per_row = min(blocks_per_row, budget)
-        elif bits_per_pass == 11:
+        elif single_wg_ok:
             # budget<2: even a width-2 grid can't fit the batch in one wave. The padded
             # grid would launch (blocks_per_row-1)*num_rows dead blocks that occupy
             # co-resident slots and serialize the real workers -> catastrophic latency.
@@ -227,7 +248,7 @@ def _default_kernel_config(
         if mb_env is not None and mb_cap is not None:
             mb_cap = mb_env
         if mb_cap:
-            blocks_per_row = max(1, min(blocks_per_row, mb_cap))
+            blocks_per_row = max(1 if single_wg_ok else 2, min(blocks_per_row, mb_cap))
 
     # Row-proportional parts (gfx950 only). The launch grid width is sized for the
     # padded buffer, so short rows over-provision cooperating workgroups; the kernel
@@ -250,26 +271,22 @@ def _default_kernel_config(
     return {
         "blocks_per_row": blocks_per_row,
         "bits_per_pass": bits_per_pass,
-        "scan_stages": _TIERED_SCAN_STAGES,
+        "scan_stages": overrides.get("scan_stages", _TIERED_SCAN_STAGES),
         "tiered_short_max": tiered_short_max,
         "tiered_mid_cap": tiered_mid_cap_default,
         "tiered_mid_max": tiered_mid_max,
         "tiered_long_cap": tiered_long_cap_default,
-        "mask_non_finite": False,
-        "tier_mode": "auto",
+        "mask_non_finite": bool(overrides.get("mask_non_finite", False)),
+        "tier_mode": tier_mode,
         "row_proportional_parts": bool(rpp_on),
         "early_stop": bool(es_on) and num_rows <= 1,
     }
 
 
 def _kernel_config(num_rows: int, max_model_len: int, arch: str | None = None) -> dict:
-    default_config = _default_kernel_config(num_rows, max_model_len, arch)
-    environ_config = _environ_kernel_config()
-
-    kernel_config = {
-        **default_config,
-        **environ_config,
-    }
+    kernel_config = _resolved_kernel_config(
+        num_rows, max_model_len, arch, _environ_kernel_config()
+    )
 
     bits_per_pass = kernel_config["bits_per_pass"]
     if bits_per_pass not in (10, 11):
