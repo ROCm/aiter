@@ -344,25 +344,40 @@ def flydsl_unified_attention(
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
 
-    # Tier selection. Split-K only fires when ALL hold; otherwise single-pass.
-    #  - max_seqlen_q == 1 (all-decode): the ONLY case the dense-q split-K
-    #    workspace/combine addresses correctly (they have no cu_seqlens_q, so a
-    #    mixed/prefill varlen batch would be miscombined). This is the necessary
-    #    condition that keeps split-K inside the Phase-1-proven-correct envelope.
+    # Tier selection. Split-K fires when ALL hold; otherwise single-pass.
     #  - max_seqlen_k > 512: below this the combine pass does not amortize (it is
     #    also Triton's own force_2d_decode cutoff).
     #  - num_2d_prgms < target: the machine is underfilled, which is the only
-    #    regime split-K helps. A full launch would only add combine overhead.
+    #    regime split-K helps. A full launch would only add combine overhead. A
+    #    high-chunk mixed batch (a long prefill) fills the machine on its own and
+    #    fails this test, so it stays single-pass -- only LOW-chunk mixes and
+    #    all-decode route to split-K.
     #  - sinks is None: split-K + sinks is refused by the builder (exp(sink)
     #    would be counted once per split in the combine denominator).
     #
+    # The former max_seqlen_q == 1 (all-decode) condition is gone: the combine
+    # kernel now rebases its O write on cu_seqlens_q (init_descriptors), so a
+    # varlen batch with unequal query lengths is combined correctly. The dense
+    # workspace format is unchanged -- an all-decode batch is byte-identical.
+    #
     # num_2d_prgms is the single-pass base workgroup count: num_kv_heads *
-    # sum_i ceil(query_len_i / BLOCK_Q). For all-decode every query_len is 1 and
-    # BLOCK_Q >= 1, so each sequence contributes exactly one q-block and this is
-    # num_kv_heads * num_seqs.
+    # sum_i ceil(query_len_i / BLOCK_Q), the packed per-sequence work count (not
+    # the dense grid, which over-counts the masked padding blocks of the short
+    # sequences). BLOCK_Q is the packed q-block span: block_m divided by the GQA
+    # group, since GQA_PACK_M rides num_queries_per_kv heads in the M dimension.
+    # For all-decode every query_len is 1, so each sequence contributes one
+    # q-block and this collapses to num_kv_heads * num_seqs; a mixed batch's
+    # chunk sequence contributes ceil(chunk_len / BLOCK_Q) blocks.
+    #
+    # cu_seqlens_q lives on device; summing per-sequence block counts forces one
+    # host sync per call. It is a single dispatch-time reduction, not in the
+    # kernel, and only on the fp8/gfx950 path that reaches here.
     num_kv_splits = 1
-    if max_seqlen_q == 1 and max_seqlen_k > _PAGE_SIZE * 8 and sinks is None:
-        num_2d_prgms = num_kv_heads * num_seqs
+    if max_seqlen_k > _PAGE_SIZE * 8 and sinks is None:
+        block_q = _BLOCK_M // num_queries_per_kv
+        seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        num_q_blocks = int(((seqlens_q + (block_q - 1)) // block_q).sum().item())
+        num_2d_prgms = num_kv_heads * num_q_blocks
         if num_2d_prgms < _TARGET_NUM_PRGMS:
             num_kv_splits = _split_count(num_2d_prgms)
 

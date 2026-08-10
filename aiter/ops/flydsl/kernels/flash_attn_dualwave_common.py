@@ -2481,6 +2481,7 @@ class DualwaveSplitKCombineContext:
         seq_len=None,
         stride_q_n=None,
         LSE=None,
+        CuSeqQ=None,
     ):
         if isinstance(traits_or_ctx, DualwaveSplitKCombineContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -2495,6 +2496,9 @@ class DualwaveSplitKCombineContext:
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.stride_q_n = stride_q_n
+        # cu_seqlens_q, read only under VARLEN to rebase the packed O write per
+        # sequence (see init_descriptors). None/placeholder on the dense path.
+        self.CuSeqQ = CuSeqQ
 
     def init_types_and_constants(self):
         self.elem_dtype = dtype_to_elem_type(self.traits.DTYPE_STR)
@@ -2547,11 +2551,31 @@ class DualwaveSplitKCombineContext:
         self.ws_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(self.WS)))
 
     def init_descriptors(self):
-        per_batch_elems = self.seq_len_v * self.stride_q_n_v
-        batch_byte_off = self.batch_idx * per_batch_elems * fx.Index(2)
+        # O is packed by cu_seqlens_q under VARLEN, so sequence batch_idx's rows
+        # start at cu_seqlens_q[batch_idx], NOT batch_idx*seq_len -- the workspace
+        # stays dense (seq_len q-slots per batch, filled at local q_row) but the
+        # final write must land at the ragged O offset. The per-sequence num_records
+        # bound doubles as the OOB guard for the padding combine rows the grid
+        # launches past a short sequence's own query length (seq_idx >= seqlen_q).
+        #
+        # Dense equivalence: with cu = [0,1,2,...] (all-decode) q_tok_base ==
+        # batch_idx and seqlen_q == 1 == seq_len, so both terms below collapse to
+        # the previous batch_idx*seq_len formula and the write is byte-identical.
+        if const_expr(self.traits.VARLEN):
+            _cuq_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1))
+            _cu_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            _cu_v1i32 = Vec.make_type(1, fx.Int32)
+            q_tok_base = _cu_load(_cuq_div, self.batch_idx, _cu_atom, _cu_v1i32)
+            q_tok_end = _cu_load(_cuq_div, self.batch_idx + fx.Index(1), _cu_atom, _cu_v1i32)
+            seqlen_q = q_tok_end - q_tok_base
+        else:
+            q_tok_base = self.batch_idx * self.seq_len_v
+            seqlen_q = self.seq_len_v
+        o_batch_elems = seqlen_q * self.stride_q_n_v
+        batch_byte_off = q_tok_base * self.stride_q_n_v * fx.Index(2)
         self.o_rsrc = buffer_ops.create_buffer_resource_from_addr(
             as_mlir_value(fx.Int64(fx.ptrtoint(fx.get_iter(self.O))) + fx.Int64(batch_byte_off)),
-            num_records_bytes=as_mlir_value(fx.Int64(per_batch_elems * fx.Index(2))),
+            num_records_bytes=as_mlir_value(fx.Int64(o_batch_elems * fx.Index(2))),
         )
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
 

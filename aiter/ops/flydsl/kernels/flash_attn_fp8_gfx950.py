@@ -591,11 +591,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
     def flash_attn_splitk_combine_kernel(
         O: fx.Tensor,  # noqa: E741
         WS: fx.Tensor,
+        CuSeqQ: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
     ):
-        ctx = DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n)
+        ctx = DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n, CuSeqQ=CuSeqQ)
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
@@ -683,7 +684,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
         if const_expr(SPLITK):
             combine_rows = bs_idx * NUM_HEADS_Q * sl_idx
-            flash_attn_splitk_combine_kernel(O, DebugCounts, batch_size, seq_len, stride_q_n).launch(
+            flash_attn_splitk_combine_kernel(O, DebugCounts, CuSeqQ, batch_size, seq_len, stride_q_n).launch(
                 grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
