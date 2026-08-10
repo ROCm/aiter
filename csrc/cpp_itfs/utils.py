@@ -51,8 +51,9 @@ sys.path.insert(0, os.path.join(AITER_PYTHON_ROOT_DIR, "aiter", "jit", "utils"))
 
 from chip_info import get_gfx_runtime
 
-DEFAULT_GPU_ARCH = get_gfx_runtime()
-GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
+GPU_ARCH = os.environ.get("GPU_ARCHS")
+if GPU_ARCH is None:
+    GPU_ARCH = get_gfx_runtime()
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 HOME_PATH = os.environ.get("HOME")
@@ -160,7 +161,7 @@ def validate_and_update_archs():
     ), f"One of GPU archs of {archs} is invalid or not supported"
     for i in range(len(archs)):
         if archs[i] == "native":
-            archs[i] = DEFAULT_GPU_ARCH
+            archs[i] = get_gfx_runtime()
 
     return archs
 
