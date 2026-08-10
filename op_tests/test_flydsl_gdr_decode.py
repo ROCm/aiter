@@ -153,25 +153,25 @@ def _kda_reference(args, initial_state):
         (1, 8, torch.bfloat16, True, False, 0, 1),
         (4, 12, torch.bfloat16, True, False, 0, 1),
         (2, 12, torch.float16, True, False, 0, 1),
-        # K3 as deployed, every landmine at once: (D_v, D_k) state, padded
-        # storage, slots numbered from 1, strided index column.
+        # Every awkward input at once: (D_v, D_k) state layout, padded storage,
+        # slots numbered from 1, and a strided index column.
         (4, 12, torch.bfloat16, False, True, 1, 8),
         (4, 12, torch.bfloat16, False, False, 1, 1),
         (4, 12, torch.bfloat16, True, True, 1, 1),
         (4, 12, torch.bfloat16, True, False, 1, 8),
-        # The batch sizes with 12x12 rows in gdr_decode_tuned.csv; before
-        # these, only B=4's geometry was reachable from a test.
+        # The remaining batch sizes that select a tuned launch config, so every
+        # tuned geometry runs rather than only the one B=4 picks.
         (1, 12, torch.bfloat16, True, False, 1, 1),
         (64, 12, torch.bfloat16, True, False, 1, 1),
         (256, 12, torch.bfloat16, True, False, 1, 1),
-        # Past K3's head count: no tuned row, so the fallback geometry.
+        # A large head count with no tuned config, on the fallback geometry.
         (2, 64, torch.bfloat16, True, False, 1, 1),
     ],
     ids=[
         "b1_h8_bf16",
         "b4_h12_bf16",
         "b2_h12_fp16",
-        "k3_deployed",
+        "all_at_once",
         "no_shuffle",
         "padded_state",
         "strided_indices",
@@ -186,7 +186,7 @@ def test_kda_per_channel_gate_matches_torch_reference(
 ):
     """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x).
 
-    H is 1:1 with the k heads -- K3's ratio, which the scalar path never saw.
+    Heads are 1:1 with the k heads here, unlike the GQA shapes above.
     """
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index, padded, shuffle, indices_stride=indices_stride
