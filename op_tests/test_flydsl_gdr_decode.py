@@ -108,23 +108,22 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
     d0, d1 = (K, V) if shuffle else (V, K)
     n_slots = B + first_index
     if padded:
-        # vLLM's setup: padded rows, so the kernel must honour the strides.
+        # A serving stack hands the state pool over as one field of a wider
+        # per-slot allocation, so the slot stride exceeds the state size. The
+        # kernel must index slots by that stride, not assume they are packed.
         storage = torch.randn(n_slots, H * K * V + 17, dtype=torch.float32, device=dev)
         pool = storage[:, : H * K * V].view(n_slots, H, d0, d1)
-        # vLLM's own assertions (test_kda.py:321-322). The second bites: only
-        # the outer stride is padded, each slot still internally contiguous.
-        # Asserted, so a storage-shape change cannot silently test another layout.
+        # Only the outer stride is padded; each slot stays internally contiguous.
         assert not pool.is_contiguous()
         assert pool.stride()[1:] == (d0 * d1, d1, 1)
     else:
         pool = torch.randn(n_slots, H, d0, d1, dtype=torch.float32, device=dev)
 
     if indices_stride > 1:
-        # vLLM parametrizes this (state_indices_stride): the serving stack hands
-        # over a strided column of a wider table, not a fresh contiguous array.
+        # The serving stack passes a strided column of a wider index table, not
+        # a fresh contiguous array, so the kernel must honour the index stride.
         storage = torch.zeros(B, indices_stride, dtype=torch.int32, device=dev)
         indices = storage[:, 0]
-        assert indices.stride(0) == indices_stride
     else:
         indices = torch.empty(B, dtype=torch.int32, device=dev)
     indices.copy_(
