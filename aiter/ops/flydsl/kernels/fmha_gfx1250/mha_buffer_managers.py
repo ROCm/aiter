@@ -58,6 +58,17 @@ _DEFAULT_NUM_WAVES = 8
 _N_BLOCK_CHOICES = (32, 64, 128, 256)
 _DEFAULT_N_BLOCK = 64
 
+# O epilogue software pipeline (OManager16b, see its docstring). 64-col transpose
+# units keep each coalesced global store a full 128B row; _O_INFLIGHT_UNITS units
+# stay resident in an LDS ring and overlap.
+_O_COLS_PER_TILE = 64
+_O_INFLIGHT_UNITS = 2
+_O_DSCNT_MAX = 63  # s_wait_dscnt SIMM16[5:0]
+
+# LDS budget the O ring fits inside (the caller's non-current K|V slot):
+# 8 waves * 2 units * 2KB = 32KB.
+_O_LDS_BUDGET_BYTES = 32 * 1024
+
 # K global->LDS async write tile: 8(kv) x 32(hdim) per warp call (one b128/lane).
 _K_WR_TILE_KV = 8
 _K_WR_TILE_HD = _WMMA_K
@@ -593,46 +604,87 @@ class VManager16b:
 class OManager16b:
     """Owns the O epilogue: fp32 WMMA accumulator -> bf16 -> global VRAM.
 
-    PV leaves each wave's 16 x v_hdim tile in the gfx1250 accumulator layout (row
-    striped across lanes, == the K/V B-frag shape): for d-tile ``k`` lane ``l``
-    holds ``O[q = l%16, d = (l//16)*8 + 16*k + {0..7}]`` (8 contiguous d). That is
-    not coalesced for a global store (adjacent lanes = different q rows), so O
-    bounces through per-warp staging LDS: store the accumulator in-place, re-read
-    it giving each lane 8 contiguous d of a fixed q, then ``buffer_store`` coalesced.
+    PV leaves each wave's 16 x v_hdim tile in the accumulator layout: for d-tile
+    ``k`` lane ``l`` holds ``O[q = l%16, d = (l//16)*8 + 16*k + {0..7}]``. Adjacent
+    lanes hold different q rows, so O is transposed through per-warp staging LDS --
+    store accumulator-indexed, re-read giving each lane 8 contiguous d of one q,
+    then ``buffer_store`` coalesced.
 
-    Staging LDS (per warp): 16(q) x v_hdim bf16, row-major with the 8-bf16 chunk
-    index XOR-swizzled (``slot = chunk ^ (q >> shift)``; see the _O swizzle note
-    above) -> no padding, both b128 store and read bank-conflict-free. May reuse
-    the K/V LDS region (epilogue only) if the caller barriers first.
+    The 16 x v_hdim warp tile splits into ``n_units = v_hdim / cols_per_tile``
+    self-contained transpose units. Staging LDS is an ``inflight_units``-deep ring
+    of ``cols_per_tile``-wide slots, each 16(q) x cols_per_tile bf16, row-major with
+    the 8-bf16 chunk XOR-swizzled (``slot = chunk ^ (q >> shift)``) -> no padding,
+    b128 store and read bank-conflict-free. The units software-pipeline: unit u+1's
+    ds_stores are issued ahead of unit u's ds_load re-read + coalesced buffer_store,
+    hiding the LDS round-trip. ``cols_per_tile=64`` keeps each global store a full
+    128B row. The caller points ``ptr_lds`` at the non-current K|V slot (holding a
+    dead prefetch no wave reads), so no threadgroup barrier is needed.
 
-    Config (caller-maintained) via the constructor: ``v_hdim``, ``gqa_ratio``,
-    ``num_waves``.
+    Ordering uses ``s_wait_dscnt``. DSCNT is a single in-order 6-bit counter shared
+    by ds_store and ds_load, so every DS op's global issue index is tracked at
+    compile time and a dependency is awaited via ``clamp(issued - 1 - gidx, 0, 63)``.
+
+    Constructor config: ``v_hdim``, ``gqa_ratio``, ``num_waves``, ``cols_per_tile``,
+    ``inflight_units``, ``lds_budget_bytes``.
     """
 
-    def __init__(self, *, v_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES):
+    def __init__(
+        self,
+        *,
+        v_hdim,
+        gqa_ratio,
+        num_waves=_DEFAULT_NUM_WAVES,
+        cols_per_tile=_O_COLS_PER_TILE,
+        inflight_units=_O_INFLIGHT_UNITS,
+        lds_budget_bytes=_O_LDS_BUDGET_BYTES,
+    ):
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
-        self.v_hdim = v_hdim  # compile-time
-        self.gqa_ratio = gqa_ratio  # compile-time
-        self.num_waves = num_waves  # compile-time
+        self.v_hdim = v_hdim
+        self.gqa_ratio = gqa_ratio
+        self.num_waves = num_waves
         self.block_m = _WMMA_M * num_waves  # Q/O rows per threadgroup
-        self.d_tiles = v_hdim // _WMMA_M  # 16-col WMMA output tiles == frags/lane
-        self._row_bytes = v_hdim * _BF16_BYTES  # unpadded LDS row (bf16)
-        self._warp_stride = _WMMA_M * self._row_bytes
-        self._chunks_per_row = v_hdim // _CHUNK_ELEMS  # G = b128 chunks per row
+        self.d_tiles = v_hdim // _WMMA_M  # WMMA output tiles == frags/lane
+
+        cpt = min(v_hdim, cols_per_tile)
+        cpt = (cpt // _WMMA_M) * _WMMA_M  # 16-col aligned
+        if cpt < _WMMA_M:
+            raise ValueError(f"cols_per_tile={cols_per_tile} too small")
+        if v_hdim % cpt != 0:
+            raise NotImplementedError(
+                f"v_hdim={v_hdim} not a multiple of cols_per_tile={cpt}"
+            )
+        self.cols_per_tile = cpt
+        self.n_units = v_hdim // cpt
+        self.tiles_per_unit = cpt // _WMMA_M  # ds_store ops per unit == ds_load ops
+        self.inflight_units = min(inflight_units, self.n_units)
+
+        # LDS geometry, per unit slot; the ring holds inflight_units slots.
+        self._row_bytes = cpt * _BF16_BYTES
+        self._slot_stride = _WMMA_M * self._row_bytes
+        self._warp_stride = self.inflight_units * self._slot_stride
+        self._chunks_per_row = cpt // _CHUNK_ELEMS  # G, b128 chunks per slot row
         # XOR swizzle: slot = chunk ^ (q // _sw_div), shift = max(0, 4 - log2(G)).
         shift = max(0, 4 - int(self._chunks_per_row).bit_length() + 1)
         self._sw_div = 1 << shift
 
+        total = num_waves * self._warp_stride
+        if total > lds_budget_bytes:
+            raise ValueError(
+                f"O ring {total}B (waves={num_waves} x inflight={self.inflight_units} x "
+                f"slot={self._slot_stride}B) exceeds budget {lds_budget_bytes}B"
+            )
+
     def get_lds_size_in_byte(self):
-        """LDS bytes the caller must reserve for O staging (all waves)."""
+        """LDS bytes the caller must reserve for O staging (all waves, whole ring)."""
         return self.num_waves * self._warp_stride
 
-    def _lds_byte(self, q_row, d_col):
-        """Swizzled LDS byte offset (within a warp region) of O(q_row, d_col)."""
+    def _lds_byte(self, slot_idx, q_row, d_col):
+        """Swizzled LDS byte offset (within a warp region) of ring-slot ``slot_idx``'s
+        O(q_row, d_col) (``d_col`` is slot-local, in [0, cols_per_tile))."""
         chunk = d_col // _CHUNK_ELEMS
         sw = chunk ^ (q_row // self._sw_div)
-        return q_row * fx.Int32(self._row_bytes) + sw * _CHUNK_BYTES
+        return slot_idx * self._slot_stride + q_row * fx.Int32(self._row_bytes) + sw * _CHUNK_BYTES
 
     def store_o_to_vram(
         self,
@@ -652,63 +704,104 @@ class OManager16b:
     ):
         """Reshape this warp's 16 x v_hdim fp32 accumulator to bf16 and store it.
 
-        ``o_frags[k]`` is this lane's v8 fp32 for d-tile ``k`` (class docstring
-        layout), already softmax-normalized (O / row-sum). Rows with seq >= q_len
-        are dropped via the ``buffer_store`` mask. The mask redirects drops to
-        offset ``0x7FFFFFFF``, so ``o_rsrc`` MUST carry the tensor's real
-        ``num_records`` (``max_size=False`` / ``num_records_bytes``) or it faults.
+        ``o_frags[k]`` is this lane's v8 fp32 for d-tile ``k``, already normalized
+        (O / row-sum). Rows with seq >= q_len are dropped via the buffer_store mask,
+        which redirects to offset ``0x7FFFFFFF`` -- so ``o_rsrc`` MUST carry the real
+        ``num_records`` (``max_size=False``) or it faults.
         """
         if len(o_frags) != self.d_tiles:
             raise ValueError(
                 f"expected {self.d_tiles} O frags (v_hdim//{_WMMA_M}); got {len(o_frags)}"
             )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
-
-        # --- write: accumulator -> LDS. lane -> (q=lane%16, d_half=(lane//16)*8);
-        # d-tile k adds 16*k.
         q_st = lane_idx % _WMMA_M
         d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
-        for k in fx.range_constexpr(self.d_tiles):
-            d_col = d_half + fx.Int32(k * _WMMA_M)
-            bf = o_frags[k].to(fx.BFloat16)  # v8 f32 -> v8 bf16 (v_cvt_pk_bf16_f32)
-            lds_ptr = buffer_ops.create_llvm_ptr(
-                lds_warp + self._lds_byte(q_st, d_col), address_space=3
-            )
-            llvm_dialect.store(bf.ir_value(), lds_ptr, alignment=_CHUNK_BYTES)
-
-        # Writes must retire before the re-read (per-warp region -> intra-wave
-        # counter wait, no threadgroup barrier).
-        rocdl.s_wait_dscnt(0)
-
-        # --- read: LDS -> VGPR (coalesced) -> global store. Enumerate the 16 x G
-        # b128 chunks q-major, 32 per round: f = round*32 + lane -> (q = f//G,
-        # d = (f%G)*8). Consecutive lanes = consecutive d of a row -> coalesced.
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
         base_row = block_x * self.block_m + warp_idx * _WMMA_M
-        for r in fx.range_constexpr(self.d_tiles):
-            f = fx.Int32(r * _WAVE_LANES) + lane_idx  # 32 chunks dealt per round
-            q_out = f // self._chunks_per_row  # q-row within this warp [0,16)
-            d_rd = (f % self._chunks_per_row) * _CHUNK_ELEMS
-            lds_ptr = buffer_ops.create_llvm_ptr(
-                lds_warp + self._lds_byte(q_out, d_rd), address_space=3
-            )
-            data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+        G = self._chunks_per_row
+        TPU = self.tiles_per_unit  # ds_store ops per unit == ds_load rounds per unit
+        NSL = self.inflight_units  # ring depth (units resident at once)
 
-            pr = base_row + q_out  # global packed row
-            q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
-            seq = pr // self.gqa_ratio
-            valid = seq < q_len
-            token = q_start + seq
-            off_elems = (
-                o_base_elems
-                + token * stride_o_seq
-                + q_head * stride_o_head
-                + d_rd
-            )
-            buffer_ops.buffer_store(
-                data,
-                o_rsrc,
-                off_elems * _BF16_BYTES,
-                mask=valid,
-                offset_is_bytes=True,
-            )
+        # DSCNT is one in-order 6-bit counter for both ds_store and ds_load: op X has
+        # retired <=> DSCNT <= issued-1-X. Track each DS op's global index and await a
+        # dependency ``dep`` via s_wait_dscnt(clamp(issued-1-dep, 0, 63)).
+        issued = 0  # DS ops emitted so far (global issue index)
+        unit_last_store = {}  # unit -> gidx of its final ds_store (all TPU stores done)
+        unit_loads = {}  # unit -> list of gidx of its TPU ds_loads
+
+        def emit_write(u):
+            """Issue unit ``u``'s TPU ds_stores (accumulator -> ring slot u%NSL)."""
+            nonlocal issued
+            slot = u % NSL
+            prev = u - NSL  # last occupant of this slot
+            if prev >= 0:
+                # WAR: prev unit's re-reads must retire before we overwrite the slot.
+                dep = unit_loads[prev][-1]
+                rocdl.s_wait_dscnt(max(0, min(_O_DSCNT_MAX, issued - 1 - dep)))
+            last = None
+            for kk in range(TPU):
+                k = u * TPU + kk
+                d_col = d_half + fx.Int32(kk * _WMMA_M)  # slot-local column
+                bf = o_frags[k].to(fx.BFloat16)
+                lds_ptr = buffer_ops.create_llvm_ptr(
+                    lds_warp + self._lds_byte(slot, q_st, d_col), address_space=3
+                )
+                llvm_dialect.store(bf.ir_value(), lds_ptr, alignment=_CHUNK_BYTES)
+                last = issued
+                issued += 1
+            unit_last_store[u] = last
+
+        def emit_read(u):
+            """Re-read unit ``u`` coalesced (ring slot u%NSL) and buffer_store to VRAM."""
+            nonlocal issued
+            slot = u % NSL
+            # RAW: every re-read pulls d-columns spanning all TPU stores of the unit,
+            # so wait for the unit's final store before the first load.
+            dep = unit_last_store[u]
+            rocdl.s_wait_dscnt(max(0, min(_O_DSCNT_MAX, issued - 1 - dep)))
+            loaded = []
+            gidxs = []
+            for r in range(TPU):
+                f = fx.Int32(r * _WAVE_LANES) + lane_idx  # 32 b128 chunks per round
+                q_out = f // G  # q-row within this warp [0,16)
+                d_local = (f % G) * _CHUNK_ELEMS
+                lds_ptr = buffer_ops.create_llvm_ptr(
+                    lds_warp + self._lds_byte(slot, q_out, d_local), address_space=3
+                )
+                data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+                loaded.append((data, q_out, d_local))
+                gidxs.append(issued)
+                issued += 1
+            unit_loads[u] = gidxs
+            d_base = fx.Int32(u * self.cols_per_tile)  # global d origin of this unit
+            for r in range(TPU):
+                data, q_out, d_local = loaded[r]
+                # RAW: this load's data must be in VGPR before storing it to VRAM.
+                rocdl.s_wait_dscnt(max(0, min(_O_DSCNT_MAX, issued - 1 - gidxs[r])))
+                pr = base_row + q_out  # global packed row
+                q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
+                seq = pr // self.gqa_ratio
+                valid = seq < q_len
+                token = q_start + seq
+                off_elems = (
+                    o_base_elems
+                    + token * stride_o_seq
+                    + q_head * stride_o_head
+                    + d_base
+                    + d_local
+                )
+                buffer_ops.buffer_store(
+                    data,
+                    o_rsrc,
+                    off_elems * _BF16_BYTES,
+                    mask=valid,
+                    offset_is_bytes=True,
+                )
+
+        # Two-stage pipeline: prime unit 0, then overlap unit u+1's write with unit
+        # u's read. n_units == 1 collapses to a single write+read with one RAW wait.
+        emit_write(0)
+        for u in range(self.n_units):
+            if u + 1 < self.n_units:
+                emit_write(u + 1)
+            emit_read(u)

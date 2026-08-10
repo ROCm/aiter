@@ -435,17 +435,28 @@ def _core_attention(
         scale=softmax_scale,
     )
 
-    # ---- K staging: N_KV_PP ping-pong buffers the main loop rotates through.
-    # KManager owns only one block's swizzle/size; the ring is the caller's. ----
+    # ---- K/V staging: N_KV_PP ping-pong slots, K and V interleaved so each slot is a
+    # contiguous ``K.ppX | V.ppX``: [K.pp0 | V.pp0][K.pp1 | V.pp1]. The managers report
+    # only their own footprint; the caller floors each block at MIN_KV_BLK_BYTES so a
+    # slot (k_blk + v_blk) stays >= the O ring budget it later reuses (32KB). ----
+    MIN_KV_BLK_BYTES = 16 * 1024
     k_mgr = KManager16b(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
-    k_blk_bytes = k_mgr.get_lds_size_in_byte()
-    k_smem = smem.allocate(N_KV_PP * k_blk_bytes)
-    k_lds_base = fx.Int32(fx.ptrtoint(k_smem.peek().ptr))
+    v_mgr = VManager16b(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+    k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+    v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+    slot_bytes = k_blk_bytes + v_blk_bytes
+    kv_smem = smem.allocate(N_KV_PP * slot_bytes)
+    kv_lds_base = fx.Int32(fx.ptrtoint(kv_smem.peek().ptr))
 
-    def _k_lds_buf(pp):  # base of ping-pong buffer ``pp`` (int or fx.Int32; folds when const)
+    def _k_lds_buf(pp):  # K base of ping-pong slot ``pp`` (int or fx.Int32; folds when const)
         if isinstance(pp, int):
             pp = fx.Int32(pp)
-        return k_lds_base + pp * fx.Int32(k_blk_bytes)
+        return kv_lds_base + pp * fx.Int32(slot_bytes)
+
+    def _v_lds_buf(pp):  # V base of ping-pong slot ``pp`` (== K base + k_blk_bytes)
+        if isinstance(pp, int):
+            pp = fx.Int32(pp)
+        return kv_lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
 
     # ---- This WG's KV tiles span relative kv [0, kv_len_wg). kv_len_wg is the
     # WG's effective KV length. Non-causal: all kv tokens (== kv_len). Causal: only
@@ -471,17 +482,6 @@ def _core_attention(
         # harmless clamped load that is never consumed).
         rem = _max_i32(kv_len_wg - blk_row0, fx.Int32(0))
         return _min_i32(rem, fx.Int32(n_block))
-
-    # ---- V staging: own swizzle (transpose-load friendly), N_KV_PP ping-pong. ----
-    v_mgr = VManager16b(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
-    v_blk_bytes = v_mgr.get_lds_size_in_byte()
-    v_smem = smem.allocate(N_KV_PP * v_blk_bytes)
-    v_lds_base = fx.Int32(fx.ptrtoint(v_smem.peek().ptr))
-
-    def _v_lds_buf(pp):  # base of ping-pong buffer ``pp`` (int or fx.Int32; folds when const)
-        if isinstance(pp, int):
-            pp = fx.Int32(pp)
-        return v_lds_base + pp * fx.Int32(v_blk_bytes)
 
     # Prologue: bulk-load tile 0's K and V into ping-pong buffer 0 — this is the
     # ONLY use of the full-block ``async_load_vram_to_lds`` (issued once per wave).
@@ -658,19 +658,22 @@ def _core_attention(
     )
     o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
 
-    # O staging reuses the (now-dead) K LDS region; barrier so all waves finished
-    # the last tile's K reads before the accumulator overwrites it.
+    # O staging rings through the NON-CURRENT K|V slot: iteration t prefetches tile
+    # t+1 into slot (t+1)%N_KV_PP, so the last iter leaves a dead prefetch in slot
+    # n_tiles%N_KV_PP that no wave consumes. Writing O there is per-warp/intra-wave, so
+    # it needs no threadgroup barrier -- only the async drain below so the dead prefetch
+    # can't land after O's LDS write.
     o_mgr = OManager16b(v_hdim=v_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES)
-    rocdl.s_wait_asynccnt(0)  # drain the last (dead) tile prefetch before LDS reuse
-    gpu.barrier()
-    # Stride convention (matches host wrappers + gfx1250 fmha family): Q/K/V strides
-    # are in BYTES (load managers add token*stride straight to a byte pointer), but
-    # O strides are in ELEMENTS — exactly what OManager wants (it multiplies
-    # off_elems by _BF16_BYTES itself), so pass stride_o_* straight through.
-    # OManager redirects mask-dropped rows to byte offset 0x7FFFFFFF, so o_rsrc MUST
-    # bound below that (max_size=True would make the drop land in-bounds and fault).
-    # This WG only writes tokens in [q_start, q_start+q_len); every valid byte offset
-    # is < (q_start+q_len)*stride_o_seq*_BF16_BYTES, and 0x7FFFFFFF sits far past it.
+    assert o_mgr.get_lds_size_in_byte() <= slot_bytes, (
+        f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
+    )
+    non_cur_pp = fx.Int32(n_tiles) % fx.Int32(N_KV_PP)
+    rocdl.s_wait_asynccnt(0)  # drain the last (dead) tile prefetch before slot reuse
+    # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself), unlike the
+    # BYTE strides the K/V load path uses -- pass stride_o_* straight through. OManager
+    # redirects mask-dropped rows to offset 0x7FFFFFFF, so o_rsrc must bound below that
+    # (max_size=True would make the drop land in-bounds and fault); every valid write is
+    # < (q_start+q_len)*stride_o_seq bytes, far below 0x7FFFFFFF.
     o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
@@ -686,7 +689,7 @@ def _core_attention(
         block_x=block_x,
         warp_idx=warp_idx,
         lane_idx=lane_idx,
-        ptr_lds=k_lds_base,
+        ptr_lds=_k_lds_buf(non_cur_pp),
         o_frags=o_norm,
     )
 
