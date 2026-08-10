@@ -24,6 +24,12 @@ Avg per call: 2.503 us
 """
 
 
+def _dtype_dir(config_name: str) -> str:
+    """Nested-layout directory for a config family:
+    ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
+    return config_name.lower().replace("-", "_")
+
+
 def _load_config_file(
     cache_dict: dict,
     cache_key: str,
@@ -60,9 +66,9 @@ def _get_gemm_config_cached(
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
 
-    Resolves from ``<arch>/<backend>/gemm/`` (prefix-less filenames) first;
-    ``backend=None`` tries triton then gluon. Falls back to the legacy flat
-    ``gemm/`` layout (arch-prefixed) for unmigrated configs.
+    Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
+    default named ``DEFAULT.json``) first; ``backend=None`` tries triton then
+    gluon. Falls back to the legacy flat ``gemm/`` layout (arch-prefixed) for unmigrated configs.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -80,14 +86,15 @@ def _get_gemm_config_cached(
     dev = arch_info.get_arch()
     cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
 
-    # New layout <arch>/<backend>/gemm/ (no prefix) first, then legacy flat
-    # gemm/ (arch-prefixed) for unmigrated configs.
+    # Nested layout <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default
+    # named DEFAULT.json) first, then legacy flat gemm/ (arch-prefixed) for unmigrated configs.
     # TODO(satya): drop the legacy dirs once all configs are migrated.
+    dtype_dir = _dtype_dir(config_name)
     arch_prefix = f"{dev}-"
     if backend is None:
         candidate_dirs = [
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/gemm", ""),
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm", ""),
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/gemm/{dtype_dir}", ""),
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm/{dtype_dir}", ""),
             (
                 f"{AITER_TRITON_CONFIGS_PATH}/gemm",
                 arch_prefix,
@@ -95,7 +102,7 @@ def _get_gemm_config_cached(
         ]
     else:
         candidate_dirs = [
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/gemm", ""),
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/gemm/{dtype_dir}", ""),
             (
                 f"{AITER_TRITON_CONFIGS_PATH}/gemm/{backend}",
                 arch_prefix,
@@ -106,16 +113,19 @@ def _get_gemm_config_cached(
             ),  # TODO(satya): legacy, remove
         ]
     cfg_dir, name_prefix = candidate_dirs[-1]
+    default_stem = f"{name_prefix}{config_name}"
     for _dir, _prefix in candidate_dirs:
-        if os.path.exists(f"{_dir}/{_prefix}{config_name}.json"):
-            cfg_dir, name_prefix = _dir, _prefix
+        # Nested dirs (empty prefix) name their default DEFAULT.json.
+        _stem = f"{_prefix}{config_name}" if _prefix else "DEFAULT"
+        if os.path.exists(f"{_dir}/{_stem}.json"):
+            cfg_dir, name_prefix, default_stem = _dir, _prefix, _stem
             break
 
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{cfg_dir}/{name_prefix}{config_name}.json"
+        fpath = f"{cfg_dir}/{default_stem}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
@@ -139,7 +149,7 @@ def _get_gemm_config_cached(
             config_dict_key = spec_key
 
     elif N is not None and K is not None:
-        # Try B-specialized config first: {dev}-{config_name}-B={B}-N={N}-K={K}.json
+        # Try B-specialized config first: {config_name}-B={B}-N={N}-K={K}.json
         if B is not None:
             bnk_key = f"{B}_{N}_{K}"
             if bnk_key not in _get_gemm_config_cached._config_cache[cache_key]:
@@ -209,10 +219,10 @@ def get_gemm_config(
 
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
-    1. Load default config file: {arch}-{config_name}.json
-    2. If B, N and K are provided, try B-specialized config: {arch}-{config_name}-B={B}-N={N}-K={K}.json
-    3. If N and K are provided, try to load specialized config: {arch}-{config_name}-N={N}-K={K}.json
-       Or if specialized_filename is provided, use: {arch}-{config_name}-{specialized_filename}.json
+    1. Load default config file: <d_type>/DEFAULT.json (legacy: {arch}-{config_name}.json)
+    2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
+    3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
+       Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
     4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match

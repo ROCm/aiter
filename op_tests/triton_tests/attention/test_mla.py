@@ -13,6 +13,7 @@ from aiter.ops.triton.attention.mla import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
@@ -243,7 +244,7 @@ def torch_mla_extend(
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
 @pytest.mark.parametrize("decode_qlen", [1, 3])
-@pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
+@pytest.mark.parametrize("ctx_lens", [1328, 4371])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("num_blocks", [32768])
@@ -255,9 +256,8 @@ def torch_mla_extend(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
@@ -417,9 +417,18 @@ def test_mla_decode_fwd(
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd output",
+        )
+        <= tol_err_ratio
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1])

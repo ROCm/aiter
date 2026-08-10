@@ -162,9 +162,12 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             const bool valid_route = token < token_num && slot < topk;
             if(valid_route)
             {
-                a_base = static_cast<int32_t>(
-                    static_cast<int64_t>(token) * kargs.stride_a_t +
-                    static_cast<int64_t>(slot) * kargs.stride_a_k);
+                a_base = kargs.stride_a_k == 0
+                             ? static_cast<int32_t>(
+                                   static_cast<int64_t>(row) * kargs.stride_a_t)
+                             : static_cast<int32_t>(
+                                   static_cast<int64_t>(token) * kargs.stride_a_t +
+                                   static_cast<int64_t>(slot) * kargs.stride_a_k);
                 weight = (kargs.sorted_weights == nullptr) ? 1.0f : kargs.sorted_weights[row];
                 if constexpr(T::DIRECT_ATOMIC_OUT)
                     route_row = static_cast<int32_t>(token);
@@ -1212,9 +1215,9 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     const uint8_t* __restrict__ w2 = kargs.w2_fp4;
     const uint8_t* __restrict__ a2_scale = kargs.a2_scale_e8m0;
     const uint8_t* __restrict__ w2_scale = kargs.w2_scale_e8m0;
-    const unsigned int a_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(token_num) *
-                                  static_cast<unsigned long long>(kargs.stride_a_t));
+    const unsigned int a_size_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.stride_a_k == 0 ? sorted_rows : token_num) *
+        static_cast<unsigned long long>(kargs.stride_a_t));
     const unsigned int a_scale_size_bytes =
         static_cast<unsigned int>(static_cast<unsigned long long>(kargs.a_scale_rows) *
                                   static_cast<unsigned long long>(kargs.stride_a_scale_route));

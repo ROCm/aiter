@@ -41,13 +41,15 @@ def ptr_rsrc(ptr):
     return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
-def ptr_arg(t: torch.Tensor):
+def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+    if dtype is None:
+        dtype = fx.Uint8
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_c_void_p(fx.Uint8, 0)
-    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        return flyc.from_c_void_p(dtype, 0)
+    return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
 def _run_compiled(exe, *args):

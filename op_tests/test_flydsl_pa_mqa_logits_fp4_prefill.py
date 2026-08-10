@@ -187,7 +187,7 @@ def run_case(
     warmup=10,
 ):
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
     )
 
@@ -494,7 +494,7 @@ def run_varqlen_case(
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
         compute_varqlen_windows,
     )

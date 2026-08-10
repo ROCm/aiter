@@ -31,7 +31,6 @@ from opus_moe_common import (
     STAGE2_A8W4_KERNELS,
     STAGE2_BF16_KERNELS,
     opus_a8w4_decode_kid,
-    opus_a8w4_stage1_instance_requires_bias,
     opus_a8w4_stage1_shape_requirements,
 )
 
@@ -452,24 +451,16 @@ def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> 
     return "".join(lines)
 
 
-def _stage1_cpp_activation(activation: str) -> str:
-    act = str(activation).strip().lower()
-    if act == "silu":
-        return "Stage1Activation::Silu"
-    if act == "swiglu":
-        return "Stage1Activation::Swiglu"
-    raise ValueError(f"unsupported Opus A8W4 stage1 activation: {activation}")
-
-
 def _stage1_cpp_shape(inst) -> str:
     policy_args = (
         inst.gate_up_group_split,
         inst.k_wave,
         inst.min_blocks_per_cu_override,
         inst.quant_group_blocks,
-        _stage1_cpp_activation(inst.activation),
         inst.block_threads,
         inst.weight_load_stream,
+        inst.weight_load_reverse,
+        inst.sparse_epilogue,
         inst.k_loop_swizzle_colors,
         inst.route_affinity_window,
         inst.route_affinity_phase_period,
@@ -570,15 +561,6 @@ def _emit_stage1_a8w4_meta_header() -> str:
         )
     lines.append("    default: return false;\n    }\n")
     lines.append("}\n\n")
-
-    lines.append(
-        "constexpr bool stage1_a8w4_kid_requires_bias(int kid)\n"
-        "{\n    switch(kid)\n    {\n"
-    )
-    for inst in kernels:
-        if opus_a8w4_stage1_instance_requires_bias(inst):
-            lines.append(f"    case {inst.kid}: return true;\n")
-    lines.append("    default: return false;\n    }\n}\n\n")
 
     lines.append(
         "constexpr const char* stage1_a8w4_kid_name(int kid)\n"

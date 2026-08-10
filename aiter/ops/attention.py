@@ -823,6 +823,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    causal: bool = True,
 ) -> None: ...
 
 
@@ -847,7 +848,7 @@ def mla_decode_v4_asm(
     kv_page_indices: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
     # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
     # tensor; there is no nullable-sink convention on the C ABI. Pass
     # torch.full((num_heads,), float("-inf")) for "no sink" math.
@@ -1169,6 +1170,12 @@ def get_mla_metadata_info_v1(
         and packed_qo_len >= 64
         and num_head_qo <= 64
         and (packed_qo_len < 128 or num_head_qo == 48)
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and (num_head_qo == 32)
+        and (effective_seqlen_qo == 3)
     ):
         if num_head_qo * 2 > 64:
             # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
@@ -1505,7 +1512,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
@@ -1824,3 +1831,28 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
+
+
+@compile_ops("module_ds32_mla", develop=True)
+def mla_decode_stage1_opus_fwd_ds32(
+    q_nope: torch.Tensor,  # [B, H, D_NOPE]          fp8
+    q_rope: torch.Tensor,  # [B, H, D_ROPE]          bf16
+    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]  fp8
+    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]  bf16
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
+    out: torch.Tensor,  # final [B, H, D_NOPE] bf16
+    final_lse: torch.Tensor,
+    q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
+    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
+) -> None: ...

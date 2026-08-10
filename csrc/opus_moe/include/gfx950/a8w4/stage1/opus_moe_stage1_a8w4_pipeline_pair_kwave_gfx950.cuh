@@ -106,10 +106,14 @@ static __device__ void process_tile(
             a_payload_base_stage1(kargs, route, k_byte);
     }
     bool fragment_active[T::M_MFMA_PER_WAVE];
+    bool fragment_full[T::M_MFMA_PER_WAVE];
     opus::static_for<T::M_MFMA_PER_WAVE>([&](auto mi_id) {
         constexpr int mi = mi_id.value;
-        fragment_active[mi] =
-            __builtin_amdgcn_ballot_w64(a_route_valid[mi]) != 0ull;
+        const uint64_t valid_mask =
+            __builtin_amdgcn_ballot_w64(a_route_valid[mi]);
+        fragment_active[mi] = valid_mask != 0ull;
+        if constexpr(T::SPARSE_EPILOGUE)
+            fragment_full[mi] = valid_mask == ~0ull;
     });
     #pragma unroll
     for(int mp = 0; mp < T::M_SCALE_PACKS; ++mp)
@@ -210,7 +214,8 @@ static __device__ void process_tile(
     quant_epilogue<T>(
         kargs, g_out, g_out_scale, tile, expert_id, u_c_m, u_c_n,
         v_c, smem_route,
-        reinterpret_cast<float*>(smem_scratch), fragment_active);
+        reinterpret_cast<float*>(smem_scratch),
+        fragment_active, fragment_full);
 }
 
 #endif // __HIP_DEVICE_COMPILE__

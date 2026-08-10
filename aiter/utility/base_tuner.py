@@ -42,7 +42,13 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
-        "timeout": None,  # 100s timeout for per test
+        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
+        # fault leaves its in-flight task unresolvable; with no timeout the whole
+        # run hangs. A generous default lets the existing reaping path drop the
+        # lost task and restart the pool, while staying comfortably above any
+        # legitimate shape-group tuning time so healthy tasks are never falsely
+        # reaped. Override with --timeout for tighter/looser bounds.
+        "timeout": 1800,
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
@@ -194,7 +200,9 @@ class TunerCommon:
             "--timeout",
             type=int,
             default=defaults["timeout"],
-            help="timeout for task group",
+            help="per-task watchdog in seconds; a lost task (dead worker) is "
+            "reaped and the pool restarted after this many seconds. Defaults "
+            "generous so healthy shape groups are never falsely reaped.",
         )
         self.parser.add_argument(
             "--run_config",

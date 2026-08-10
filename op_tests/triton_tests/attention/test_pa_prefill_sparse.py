@@ -408,3 +408,62 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
     )
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("T", [1024, 16384])
+@pytest.mark.parametrize("H", [64])
+@pytest.mark.parametrize("D", [512])
+@pytest.mark.parametrize("prefix_len", [255, 512])
+def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    if DEVICE_ARCH not in ("gfx950",):
+        pytest.skip("this case targets the gfx950 single-source branch")
+
+    total_pages = max(T * prefix_len, 1)
+
+    (
+        q,
+        ukv,
+        p_idx,
+        p_indptr,
+        kv,
+        e_idx,
+        e_indptr,
+        sink,
+        scale,
+    ) = _make_inputs(
+        T,
+        H,
+        D,
+        prefix_len,
+        0,  # extend_len — single-source path
+        total_pages,
+        1,
+    )
+
+    ref = _sparse_prefill_attn_torch(
+        q,
+        ukv,
+        p_idx,
+        p_indptr,
+        kv,
+        e_idx,
+        e_indptr,
+        sink,
+        scale,
+    )
+    out = pa_prefill_sparse(
+        q,
+        ukv,
+        p_idx,
+        p_indptr,
+        None,  # kv                — no extend source
+        None,  # kv_indices_extend
+        None,  # kv_indptr_extend
+        sink,
+        scale,
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

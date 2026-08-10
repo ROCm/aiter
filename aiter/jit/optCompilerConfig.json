@@ -591,6 +591,11 @@
             "'-ffast-math'",
             "'-mllvm -enable-post-misched=1'"
         ],
+        "flags_extra_hip_per_source": {
+            "*pa_sparse_prefill_opus_kernels.cu": [
+                "-mllvm -amdgpu-early-inline-all=false"
+            ]
+        },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -1674,6 +1679,22 @@
             "'ComposableKernel'"
         ],
         "is_experimental": "True"
+    },
+    "module_ds32_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     },
     "module_topk_plain": {
         "srcs": [

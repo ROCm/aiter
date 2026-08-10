@@ -158,6 +158,7 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shuffle", [True, False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+@pytest.mark.parametrize("inargs", ["triton", "gluon"])
 def test_fused_rms_quant(
     M: int,
     N1: int,
@@ -168,11 +169,14 @@ def test_fused_rms_quant(
     dtype,
     shuffle: bool,
     scale_shuffle_padding: bool,
+    inargs: str,
 ):
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    torch.manual_seed(0)
+    if inargs == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
@@ -202,6 +206,7 @@ def test_fused_rms_quant(
             shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=True,
+            inargs=inargs,
         )
     )
 

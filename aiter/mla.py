@@ -16,6 +16,162 @@ from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
+_FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
+_FLYDSL_MLA_REDUCE_TARGET_H = 16
+_FLYDSL_MLA_REDUCE_TARGET_DV = 512
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_mla_reduce_available() -> bool:
+    """Whether the optional FlyDSL package is available on this device."""
+    try:
+        from aiter.ops.flydsl import is_flydsl_available
+
+        return is_flydsl_available()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _flydsl_mla_reduce_supported(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+) -> bool:
+    """Whether a single-token decode reduction is within FlyDSL's scope."""
+    if (
+        get_gfx() not in _FLYDSL_MLA_REDUCE_TARGET_GFX
+        or isinstance(max_seqlen_q, bool)
+        or max_seqlen_q != 1
+    ):
+        return False
+    tensors = (partial_output, partial_lse, final_output)
+    if not all(
+        isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        return False
+    if (
+        partial_output.dtype != dtypes.fp32
+        or partial_lse.dtype != dtypes.fp32
+        or partial_output.device != final_output.device
+        or partial_lse.device != final_output.device
+    ):
+        return False
+    if (
+        partial_output.ndim != 4
+        or partial_output.size(1) != 1
+        or partial_lse.ndim != 4
+        or tuple(partial_lse.shape)
+        != (
+            partial_output.size(0),
+            1,
+            partial_output.size(-2),
+            1,
+        )
+    ):
+        return False
+    if final_output.ndim != 3:
+        return False
+    if (
+        partial_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
+        or partial_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
+        or tuple(final_output.shape[1:])
+        != (_FLYDSL_MLA_REDUCE_TARGET_H, _FLYDSL_MLA_REDUCE_TARGET_DV)
+    ):
+        return False
+    if final_output.dtype not in (dtypes.bf16, dtypes.fp16):
+        return False
+    return (
+        isinstance(num_kv_splits, int)
+        and not isinstance(num_kv_splits, bool)
+        and (num_kv_splits == 0 or num_kv_splits <= get_cu_num())
+    )
+
+
+def _flydsl_mla_reduce_enabled() -> bool:
+    """Opt-in gate for the FlyDSL MLA reduce port.
+
+    Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
+    Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
+    The opt-in scope is H=16, Dv=512 single-token decode. MTP decode and prefill
+    use the HIP path; the latter is routed directly by its caller rather than
+    inferred from ``max_seqlen_q``. Calls outside the permitted ABI and shape scope
+    use the HIP path.
+    Not memoized, so the env var can be toggled at runtime; only the optional
+    package availability probe above is cached.
+    """
+    try:
+        from flydsl.utils.env import EnvManager, OptBool
+
+        class _Env(EnvManager):
+            enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
+
+        if not _Env().enabled:
+            return False
+        return _flydsl_mla_reduce_available()
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _mla_decode_reduce_v1_dispatch(
+    partial_output,
+    partial_lse,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    max_seqlen_q,
+    num_kv_splits,
+    final_output,
+    final_lse,
+):
+    """Dispatch a decode MLA reduction to HIP (default) or FlyDSL (opt-in).
+
+    Signature mirrors ``aiter.mla_reduce_v1`` (num_kv_splits at slot 7, between
+    max_seqlen_q and final_output) so it is a drop-in swap. The HIP kernel uses
+    max(SM_count, num_kv_splits); 0 means "auto" (SM_count). FlyDSL derives its
+    regular launch grid from num_cu + CSR width and uses num_kv_splits as the
+    split-K engagement budget.
+
+    The FlyDSL device-adaptive split-K gate (``actual_max_splits`` = the true
+    ``max_t(n_splits)`` over active tiles) is resolved inside the FlyDSL wrapper
+    from ``reduce_indptr`` via a capture-safe warmup cache, so this seam does not
+    thread it. The HIP path ignores it entirely.
+    """
+    if _flydsl_mla_reduce_enabled() and _flydsl_mla_reduce_supported(
+        partial_output,
+        partial_lse,
+        final_output,
+        max_seqlen_q,
+        num_kv_splits,
+    ):
+        from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+        flydsl_mla_reduce_v1(
+            partial_output.view(partial_output.size(0), *partial_output.shape[-2:]),
+            partial_lse.view(partial_lse.size(0), -1),
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_q,
+            final_output,
+            final_lse,
+            num_kv_splits=num_kv_splits,
+        )
+        return
+    aiter.mla_reduce_v1(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        final_output,
+        final_lse,
+    )
+
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -267,6 +423,103 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
     return bs < max_batch
 
 
+def mla_decode_fwd_ds32(
+    q_nope_buffer,  # [total_s, H, D_NOPE]          fp8
+    q_rope_buffer,  # [total_s, H, D_ROPE]          bf16
+    kv_nope_buffer,  # [total_tokens, D_NOPE]  fp8
+    kv_rope_buffer,  # [total_tokens, D_ROPE]  bf16
+    o,  # [total_s, H, D_NOPE] bf16 (allocated if None)
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    page_size=1,
+    nhead_kv=1,
+    sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
+    # aiter persistent metadata (generated by the caller) -- ds_32 reuses it.
+    num_kv_splits=None,
+    work_meta_data=None,  # accepted for API parity; unused by ds_32 stage1
+    work_indptr=None,
+    work_info_set=None,
+    reduce_indptr=None,
+    reduce_final_map=None,
+    reduce_partial_map=None,
+    intra_batch_mode=False,  # accepted for API parity; unused
+    q_scale=None,  # [total_s, H, D_SCALE]         E8M0 uint8 or float factors
+    kv_scale=None,  # [total_tokens, D_SCALE] E8M0 uint8 or float factors
+    return_lse=False,
+):
+    """DSA v3.2 (ds_32) MLA decode fp8 (OpFoundry opus_attn/dsa_v32), gfx950 only.
+
+    Reuses aiter's metadata (work_indptr/work_info_set) and reduce (mla_reduce_v1):
+    stage1 writes per-split partials to logits/attn_lse (or the final o for no-split
+    work items), then mla_reduce_v1 combines the splits. NoPE is per-block
+    E8M0-scaled fp8; RoPE is bf16; V is the NoPE part.
+    """
+    assert get_gfx() == "gfx950", "mla_decode_fwd_ds32 is only supported on gfx950"
+    device = q_nope_buffer.device
+    total_s, H, d_nope = q_nope_buffer.shape
+    d_rope = q_rope_buffer.shape[-1]
+    nhead, v_head_dim = H, d_nope
+
+    if sm_scale is None:
+        sm_scale = 1.0 / ((d_nope + d_rope) ** 0.5)
+    if o is None:
+        o = torch.empty((total_s, H, d_nope), dtype=dtypes.bf16, device=device)
+
+    num_partials = reduce_partial_map.size(0)
+    logits = torch.empty(
+        (num_partials * max_seqlen_q, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (num_partials * max_seqlen_q, 1, nhead, 1), dtype=dtypes.fp32, device=device
+    )
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else torch.empty(0, dtype=dtypes.fp32, device=device)
+    )
+
+    aiter.mla_decode_stage1_opus_fwd_ds32(
+        q_nope_buffer,
+        q_rope_buffer,
+        kv_nope_buffer,
+        kv_rope_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        page_size,
+        nhead_kv,
+        sm_scale,
+        logits,
+        attn_lse,
+        o,
+        final_lse,
+        q_scale,
+        kv_scale,
+    )
+
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        o,
+        final_lse if return_lse else None,
+    )
+    return o, (final_lse if return_lse else None)
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -301,6 +554,7 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    causal=True,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -437,6 +691,7 @@ def mla_decode_fwd(
             cp_rank,
             valid_split_count,
             use_valid_split_count_reduce,
+            causal,
         )
 
         if num_kv_splits == 1 and (
@@ -530,18 +785,7 @@ def mla_decode_fwd(
                 get_gfx() == "gfx950"
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and (
-                    (nhead == 32 and max_seqlen_q >= 4)
-                    or (nhead == 64)
-                    or (nhead == 128)
-                )
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 32
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 2
+                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
             )
             or (
                 get_gfx() == "gfx950"
@@ -558,15 +802,8 @@ def mla_decode_fwd(
                 and max_seqlen_q == 2
             )
             or (
-                get_gfx() in ("gfx942", "gfx950")
+                get_gfx() == "gfx942"
                 and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 32
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 1
@@ -679,9 +916,10 @@ def mla_decode_fwd(
                 cp_rank,
                 None,
                 0,
+                causal,
             )
 
-        aiter.mla_reduce_v1(
+        _mla_decode_reduce_v1_dispatch(
             logits,
             attn_lse,
             reduce_indptr,

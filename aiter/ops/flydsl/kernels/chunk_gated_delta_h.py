@@ -16,19 +16,13 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .tensor_shim import GTensor, _to_raw
+from .tensor_shim import GTensor
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 _LLVM_GEP_DYNAMIC = -2147483648
-
-
-def _llvm_lds_ptr_ty():
-    return ir.Type.parse("!llvm.ptr<3>")
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -292,12 +286,13 @@ def compile_chunk_gated_delta_h(
         # -- ds_read_b64_tr_b16 helper (gfx950) --
         v4bf16_type = T.vec(4, T.bf16)
 
+        lds_ptr_ty = lds_h_ptr.type
+
         def _ds_read_tr_bf16x4(lds_byte_offset):
-            byte_i64 = fx.Int64(lds_byte_offset).ir_value()
-            ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), byte_i64).result
+            # Raw int LDS byte offset -> bf16 shared ptr; fx resolves the
+            # backend address space (-> !llvm.ptr<3>) for the ds_read intrinsic.
+            ptr = fx.to_llvm_ptr(fx.inttoptr(lds_ptr_ty, fx.Int64(lds_byte_offset)))
             raw = rocdl.ds_read_tr16_b64(v4bf16_type, ptr).result
-            # Wrap as Vector so call-sites can use .shuffle()/.bitcast()
-            # method-style API instead of the bare vector.shuffle wrapper.
             return fx.Vector(raw, (4,), fx.BFloat16)
 
         # ds_read_b64_tr_b16 lane decomposition
@@ -404,9 +399,11 @@ def compile_chunk_gated_delta_h(
                 g_off = w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
                 w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
 
-        init_state = [_to_raw(v) for v in h_accs] + [
-            _to_raw(v) for v in w_prefetch_init
-        ]
+        # h_accs are fx.Vector, w_prefetch_init are raw buffer_load results;
+        # ``range(init=)`` runs each element through ``as_ir_value`` and the
+        # ``yield`` below through the scf-yield rewriter, so both fx values and
+        # raw ir.Values are accepted directly -- no manual _to_raw needed.
+        init_state = list(h_accs) + list(w_prefetch_init)
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
@@ -926,9 +923,10 @@ def compile_chunk_gated_delta_h(
                         (fx.Int64(w_next_prefetch_off[i_wp]),), LOAD_VEC_WIDTH
                     )
 
-            results = yield [_to_raw(v) for v in h_accs_in] + [
-                _to_raw(v) for v in w_next_prefetch
-            ]
+            # h_accs_in are fx.Vector, w_next_prefetch are raw buffer_load
+            # results; the scf-yield rewriter converts fx values via ir_value()
+            # and passes raw ir.Values through unchanged.
+            results = yield list(h_accs_in) + list(w_next_prefetch)
 
         h_accs_final = list(results[:NUM_H_ACCS])
 

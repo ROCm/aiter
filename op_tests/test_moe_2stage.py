@@ -6,14 +6,14 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.aot.flydsl.common import run_only_env
+from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -98,7 +98,6 @@ def test_fmoe(
     linear_beta=None,
     kernel_bench=False,
     disable_stage2_bias=False,
-    reference_intermediate_pad=0,
     ref_dtype="bf16",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -267,9 +266,19 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.bf16
+        and WQDType == dtypes.fp4x2
+        and actType == aiter.ActivationType.Situv2
+    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
+        # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
+        exp_bias1 = exp_bias2 = None
+        exp_bias1_aiter = exp_bias2_aiter = None
+    elif (
+        qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a8w4 (fp8 A) mxfp4
         exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
@@ -322,8 +331,11 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
+        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
+        _w1_gu = AQDType == dtypes.fp8
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
@@ -433,27 +445,15 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    ref_a2_qt = a2_qt
-    ref_w2_qt = w2_qt
-    ref_w2_scale = w2_scale
-    if reference_intermediate_pad:
-        effective_inter_dim = inter_dim - int(reference_intermediate_pad)
-        ref_a2_qt = a2_qt[..., :effective_inter_dim].contiguous()
-        if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
-            ref_w2_qt = w2_qt[..., : effective_inter_dim // 2].contiguous()
-            ref_w2_scale = w2_scale[..., : effective_inter_dim // 32].contiguous()
-        else:
-            ref_w2_qt = w2_qt[..., :effective_inter_dim].contiguous()
-
     out2_ref = torch_moe_stage2(
-        ref_a2_qt,
+        a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
-        ref_w2_qt,  # E, model_dim, inter_dim
+        w2_qt,  # E, model_dim, inter_dim
         topk_weights,
         topk_ids,
         dtype=dtype,
         quant_type=qType,
-        w2_scale=ref_w2_scale,
+        w2_scale=w2_scale,
         a2_scale=a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
@@ -712,7 +712,7 @@ parser.add_argument(
 parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
-    help="Skip validating flydsl shapes from tuned fmoe CSVs.",
+    help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
     "--csv-filter",
@@ -816,21 +816,6 @@ def _row_to_kwargs(row):
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
     inter_dim = int(row["inter_dim"])
-    reference_intermediate_pad = 0
-    kernel_name2 = str(row.get("kernelName2", "") or "")
-    if kernel_name2.startswith("opus_"):
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            opus_a8w4_shape_family_for_shape,
-        )
-
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=int(row["model_dim"]),
-            inter_dim=inter_dim,
-            expert=int(row["expert"]),
-            topk=int(row["topk"]),
-        )
-        if shape_family is not None:
-            reference_intermediate_pad = int(shape_family.inter_dim_pad)
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
@@ -851,7 +836,6 @@ def _row_to_kwargs(row):
         "hidden_pad": 0,
         "intermediate_pad": 0,
         "preshuffle": True,
-        "reference_intermediate_pad": reference_intermediate_pad,
         "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
@@ -859,7 +843,7 @@ def _row_to_kwargs(row):
 
 
 def _iter_csv_cases():
-    """Yield (kwargs, extras) for every row of every selected model csv."""
+    """Yield FlyDSL/Opus cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
@@ -870,7 +854,11 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+        if (
+            "flydsl_" not in kernel_name1
+            and "flydsl_" not in kernel_name2
+            and not kernel_name1.startswith("opus_moe1_")
+        ):
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -887,6 +875,11 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
+            kwargs["linear_beta"] = (
+                25.0 if args.linear_beta is None else float(args.linear_beta)
+            )
         # The reference path below uses the CSV q_dtype_a directly, while
         # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
         # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
@@ -923,9 +916,11 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
-        # configs have no pre-registered AOT cache entry).
-        kwargs["check_aot_cache"] = args.csv_filter is None
+        # Targeted configs and env-selected SiTUv2 modes have no pre-registered
+        # AOT cache entry, so let those cases compile on demand.
+        kwargs["check_aot_cache"] = (
+            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+        )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -953,10 +948,15 @@ def _situv2_beta_kwargs(act_type):
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
+    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
+    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
+    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+        return GateMode.SEPARATED.value
+    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
     # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
     # property (not a tuned-config key); request INTERLEAVE here for them.
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
@@ -1276,12 +1276,26 @@ def test_bm16_tiled_scale_boundary():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _iter_with_env(case_iter, **env_overrides):
+    """Keep temporary environment overrides active while cases are consumed."""
+    with ExitStack() as stack:
+        for name, value in env_overrides.items():
+            stack.enter_context(override_env(name, value))
+        yield from case_iter
+
+
 _case_iters = []
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     if not args.no_flydsl_csv:
-        _case_iters.append(_iter_csv_cases())
+        _case_iters.append(
+            _iter_with_env(
+                _iter_csv_cases(),
+                AITER_SITUV2_A8W4="1",
+                AITER_SITUV2_A4W4=None,
+            )
+        )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
     # SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
