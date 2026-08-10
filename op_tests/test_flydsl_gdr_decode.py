@@ -508,7 +508,7 @@ def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
 
     def run(state_dtype):
         torch.manual_seed(0)
-        kw = dict(dtype=act_dtype, device="cuda")
+        kw = {"dtype": act_dtype, "device": "cuda"}
         q, k, v = (torch.randn(B, Sq, H, D, **kw) for _ in range(3))
         a, b = (torch.randn(B, Sq, H, **kw) for _ in range(2))
         dt_bias = torch.rand(H, dtype=torch.float32, device="cuda") + 1.0
@@ -545,7 +545,7 @@ def test_fp32_activations_are_rejected():
     """The out store converts to fp16 for anything but bf16, so f32 must not
     reach the kernel and be silently narrowed."""
     B, Sq, H, D = 1, 1, 4, 128
-    kw = dict(dtype=torch.float32, device="cuda")
+    kw = {"dtype": torch.float32, "device": "cuda"}
     q, k, v = (torch.randn(B, Sq, H, D, **kw) for _ in range(3))
     a, b = (torch.randn(B, Sq, H, **kw) for _ in range(2))
 
