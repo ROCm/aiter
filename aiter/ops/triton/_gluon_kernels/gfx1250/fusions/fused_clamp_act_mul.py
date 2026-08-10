@@ -68,7 +68,16 @@ def _fused_clamp_silu_mul_kernel(
     NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
 
     # one 2d shared layout for ROWS_PER_PROGx2*N
-    shared_tdm_layout_2d: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    # padded instead of swizzled: 8 elements after every 2*BLOCK_SIZE_N-element
+    # tile row, which staggers consecutive buffers in the BLOCK_SIZE_M-deep
+    # allocation off each other's banks. Declared rank-2 over the descriptor's
+    # block_shape; the leading buffer dim of the allocation just repeats it
+    # (same pairing as tdm_shared_a in gemm/basic/gemm_a8w8_blockscale.py).
+    shared_tdm_layout_2d: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[2 * BLOCK_SIZE_N, 8]],
+        shape=[1, 2 * BLOCK_SIZE_N],
+        order=[1, 0],
+    )
     pid = gl.program_id(0)
     m_start = pid * ROWS_PER_PROG
 
