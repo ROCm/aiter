@@ -155,12 +155,12 @@ which wraps only when a **weight tensor exceeds ~8 GB** (`byte_offset > 2^33`). 
 shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still < 2^31 → safe.
 **Kimi-K3 does break:** E=896/H3584/I3072 (dword index 2.46e9 > 2^31, 9.85 GB tensor) gives
 **cos = 0.019** (`/tmp/repro_k3_addr.py`). So:
-- [~] **Add real-E regression cases** (DeepSeek-V3 E=256; Qwen-TP1 E=512) to the op_test to
+- [x] **Add real-E regression cases** (DeepSeek-V3 E=256; Qwen-TP1 E=512) to the op_test to
       lock in the verified-good behavior and give the first real ticket-shape tests (§8.2).
-      *(This is the only Phase-A item on the ticket's critical path.)* **DeepSeek-V3 E=256
-      done** — `test_gate_up_fp8_real_expert_count` + `test_down_reduce_fp8_real_expert_count`
-      (max-offset expert forced, compact per-(b,k) ref, HBM-guarded); both **pass** on gfx950.
-      Still TODO: Qwen-TP1 E=512.
+      *(This is the only Phase-A item on the ticket's critical path.)*
+      `test_gate_up_fp8_real_expert_count` + `test_down_reduce_fp8_real_expert_count` are now
+      **parametrized** over `REAL_E_CASES = {deepseek_v3_e256, qwen3next_tp1_e512}` (max-offset
+      expert forced, compact per-(b,k) ref, HBM-guarded); all **4 pass** on gfx950 (5.99 s).
 - [ ] **K3-scale addressing fix (deferred to the Kimi-K3 follow-on, not the ticket):** for
       weight tensors > ~8 GB, switch to **per-row i64 base resources**
       (`create_buffer_resource_from_addr(base_i64 + row_byte_off_i64, num_records_bytes=row_nb)`,
@@ -307,9 +307,9 @@ the phase bullets reference it rather than re-listing shapes.
 
 | Model | H | I | TOPK | E | Runnable? | Status / owning phase |
 |---|---|---|---|---|---|---|
-| DeepSeek-V3 | 7168 | 2048 | 8 | **256** | ✅ (kv16) | ⏳ **A** (real-E correctness = overflow repro) |
+| DeepSeek-V3 | 7168 | 2048 | 8 | **256** | ✅ (kv16) | ✅ **A** real-E correctness (both stages pass); ⏳ **B/F** perf |
 | MiniMax | 3072 | 1536 | 8 | **256** | ✅ (kv16/kv8) | ⏳ **B/F** (add correctness + perf rows) |
-| Qwen3Next TP1 | 2048 | 512 | 10 | **512** | ✅ (kv8) | ⏳ **B/F** (add correctness + perf rows) |
+| Qwen3Next TP1 | 2048 | 512 | 10 | **512** | ✅ (kv8) | ✅ **A** real-E correctness (both stages pass); ⏳ **B/F** perf |
 | Qwen3Next TP2 | 2048 | 256 | 10 | **512** | ⛔ | `INTER%512≠0`; needs short-INTER `kLanesPerOutput` path (see §6) |
 | Qwen3Next TP4 | 2048 | 128 | 10 | **512** | ⛔ | `INTER%512≠0`; same short-INTER gap |
 | Kimi-K3 (routed, latent MoE) | **3584** | 3072 | **16** | **896** | ✅ (gate_up kv8 / down kv16) | ⏳ **follow-on** (needs MXFP4 + FP8/MXFP8 act; E=896 max-stresses G1) |
