@@ -194,22 +194,41 @@ class AITER_CONFIG(object):
                 continue
 
             df = pd.read_csv(path)
-            if source_pairs:
-                base_path, base_df = source_pairs[0]
-                base_cols = [c for c in base_df.columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
-                    raise ValueError(
-                        f"Column mismatch between {base_path} and {path}, "
-                        f"{base_cols}, {new_cols}"
-                    )
-
             source_pairs.append((path, df))
 
         if not source_pairs:
             raise FileNotFoundError(
                 f"No existing config files found in '{file_path}' when merging '{merge_name}'."
             )
+
+        all_cols = list(source_pairs[0][1].columns)
+        for _, df in source_pairs[1:]:
+            for col in df.columns:
+                if col in all_cols:
+                    continue
+                if col == "gfx":
+                    all_cols.insert(0, col)
+                elif col == "_tag":
+                    all_cols.append(col)
+                else:
+                    insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
+                    all_cols.insert(all_cols.index(insert_before), col)
+
+        fill_defaults = {
+            "gfx": get_gfx(),
+            "xbf16": 0,
+            "flat": 0,
+            "run_1stage": 0,
+            "ksplit": 0,
+        }
+        aligned_pairs = []
+        for path, df in source_pairs:
+            df = df.copy()
+            for col in all_cols:
+                if col not in df.columns:
+                    df[col] = fill_defaults.get(col, 0)
+            aligned_pairs.append((path, df[all_cols]))
+        source_pairs = aligned_pairs
 
         merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns

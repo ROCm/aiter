@@ -5,6 +5,7 @@ import functools
 import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable, Optional
 
 import torch
 
@@ -1044,7 +1045,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            fuse_fp4_quant=_s1_fq,
+            fuse_quant="fp4" if _s1_fq else "",
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1307,7 +1308,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if metadata.fuse_fp4_quant else a2,
+        None if metadata.fuse_quant == "fp4" else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1317,7 +1318,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+    if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
