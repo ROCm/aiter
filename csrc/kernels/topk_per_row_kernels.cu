@@ -1483,17 +1483,26 @@ __device__ void last_filter_stable_scan(T const* in_buf,
         BlockScanT(scan_tmp).ExclusiveSum(packed, prefix, aggregate);
         __syncthreads(); // protect scan_tmp reuse next iteration
 
+        // Snapshot the carried tile bases before thread 0 advances them.  A
+        // block contains multiple wavefronts; without this barrier thread 0's
+        // wave can update running_{def,tie} while later waves are still
+        // reading the old bases.  That produces holes in out_idx even though
+        // the per-tile BlockScan itself is exact.
+        IdxT const tile_def_base = running_def;
+        IdxT const tile_tie_base = running_tie;
+        __syncthreads();
+
         IdxT const def_prefix = static_cast<IdxT>(prefix >> 16);
         IdxT const tie_prefix = static_cast<IdxT>(prefix & TIE_MASK);
-        IdxT const tie_rank   = running_tie + tie_prefix;
+        IdxT const tie_rank   = tile_tie_base + tie_prefix;
 
         bool const selected = definite || (tie && tie_rank < num_of_kth_needed);
         if(selected)
         {
             // #selected-ties strictly before me = min(ties-before-me, needed).
-            IdxT const ties_before     = running_tie + tie_prefix;
+            IdxT const ties_before     = tile_tie_base + tie_prefix;
             IdxT const sel_ties_before = ties_before < num_of_kth_needed ? ties_before : num_of_kth_needed;
-            IdxT const pos             = (running_def + def_prefix) + sel_ties_before;
+            IdxT const pos             = (tile_def_base + def_prefix) + sel_ties_before;
             if(pos < k) // guard against pathological over-count; normally pos<k always
             {
                 if(WRITE_TOPK_VALUES) { out[pos] = value; }
@@ -1503,8 +1512,8 @@ __device__ void last_filter_stable_scan(T const* in_buf,
 
         if(threadIdx.x == 0)
         {
-            running_def += static_cast<IdxT>(aggregate >> 16);
-            running_tie += static_cast<IdxT>(aggregate & TIE_MASK);
+            running_def = tile_def_base + static_cast<IdxT>(aggregate >> 16);
+            running_tie = tile_tie_base + static_cast<IdxT>(aggregate & TIE_MASK);
         }
         __syncthreads();
     }
@@ -1607,7 +1616,11 @@ __device__ void last_filter_stable_fast(
             BlockScanT(scan_tmp).ExclusiveSum(static_cast<int>(tie), prefix, aggregate);
             __syncthreads();
 
+            // Every wave must snapshot the same tile base before thread 0
+            // advances it for the next tile.  A memory fence is insufficient:
+            // this is an execution-order race between wavefronts in one block.
             IdxT const base = counter->out_back_cnt;
+            __syncthreads();
             IdxT const rank = base + static_cast<IdxT>(prefix & TIE_MASK);
             if(tie && rank < ties_needed)
                 out_idx[definite_expected + rank] = i;

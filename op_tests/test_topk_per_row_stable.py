@@ -83,6 +83,63 @@ def check_prefill(num_rows, seq, k, tie_level):
     return det and ok_order and ok_ref
 
 
+def check_prefill_many_tied_rows():
+    """Cover the cross-wave tile-base handoff in the stable emitters.
+
+    A 1024-thread block spans multiple wavefronts.  Before the tile-base
+    barrier was added, thread 0 could advance the shared base while a later
+    wave was still reading it, leaving output slots unwritten.  Repeating a
+    high-concurrency tied shape exercises different wave scheduling; the
+    negative sentinel makes any exact-cardinality failure immediately visible.
+    """
+    num_rows, seq, k = 512, 40000, 2048
+    logits = make_logits(num_rows, seq, "mild", seed=777)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_ends = torch.full((num_rows,), seq, dtype=torch.int32, device="cuda")
+
+    def run():
+        idx = torch.full(
+            (num_rows, k), -123456789, dtype=torch.int32, device="cuda"
+        )
+        top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            idx,
+            None,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            stable=True,
+        )
+        torch.cuda.synchronize()
+        return idx
+
+    a = run()
+    valid = bool(torch.all((a >= 0) & (a < seq)))
+    det = True
+    ascending = bool(torch.all(a[:, 1:] >= a[:, :-1]))
+    for _ in range(15):
+        b = run()
+        valid &= bool(torch.all((b >= 0) & (b < seq)))
+        det &= torch.equal(a, b)
+        ascending &= bool(torch.all(b[:, 1:] >= b[:, :-1]))
+    # Full CPU sorting of 512 x 40K is unnecessary; sample rows on both sides
+    # of the old concurrency boundary for bit-faithful reference coverage.
+    sample_rows = (0, 255, 256, num_rows - 1)
+    matches_ref = all(
+        a[r].cpu().tolist() == ref_stable_topk(logits[r], k)
+        for r in sample_rows
+    )
+    print(
+        "[prefill many tied rows] "
+        f"valid={valid} deterministic={det} ascending={ascending} "
+        f"matches_ref={matches_ref}"
+    )
+    return valid and det and ascending and matches_ref
+
+
 def check_decode(batch, ctx, k, next_n, tie_level):
     num_rows = batch * next_n
     seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
@@ -146,6 +203,7 @@ def main():
     for tie in ("none", "heavy"):
         all_ok &= check_prefill(2, 16384, 4096, tie)
         all_ok &= check_decode(2, 16384, 4096, 1, tie)
+    all_ok &= check_prefill_many_tied_rows()
     print("\nRESULT:", "ALL PASS" if all_ok else "FAILURES PRESENT")
     assert all_ok, "stable top_k_per_row correctness failed"
 
