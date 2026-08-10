@@ -38,6 +38,7 @@ import argparse
 import functools
 import importlib.util
 import os
+import random
 import sys
 import warnings
 from pathlib import Path
@@ -72,32 +73,50 @@ from utils.plot_perf import (
 
 # --------------------------------------------------------------------------- #
 # Preset shapes
-# (model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode)
 # gate_mode: "g" = scalar (GDN/Qwen3), "gk" = per-channel (KDA/Kimi-K3)
 # --------------------------------------------------------------------------- #
+# Shape tuple: (model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern)
+#
+# ``seq_pattern`` controls how the T_flat tokens are split across the N
+# sequences. Every N>1 shape already runs the varlen code path (cu_seqlens is
+# built for it), but with "equal" lengths -- which hides the load-balance
+# question entirely, because each CTA then does an identical number of chunks.
+# Under 1 CTA/CU the makespan is set by the longest sequence.
 PRESET_SHAPES: list[tuple] = [
     # KDA Kimi-K3 TP8  (H=12 is the primary serving shape from the ticket)
-    ("kda_tp8",     12, 12,  8192, 1, 128, 128, 64, "gk"),
-    ("kda_tp8",     12, 12, 32768, 1, 128, 128, 64, "gk"),
-    ("kda_tp8",     12, 12,  8192, 4, 128, 128, 64, "gk"),
-    ("kda_tp8",     12, 12, 32768, 4, 128, 128, 64, "gk"),
-    ("kda_tp8",     12, 12,  8192, 8, 128, 128, 64, "gk"),
-    ("kda_tp8",     12, 12, 32768, 8, 128, 128, 64, "gk"),
+    ("kda_tp8",     12, 12,  8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12,  8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12,  8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12, 32768, 8, 128, 128, 64, "gk", "equal"),
     # KDA Kimi-K3 TP4
-    ("kda_tp4",     24, 24,  8192, 1, 128, 128, 64, "gk"),
-    ("kda_tp4",     24, 24, 32768, 1, 128, 128, 64, "gk"),
-    ("kda_tp4",     24, 24,  8192, 8, 128, 128, 64, "gk"),
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk"),
+    ("kda_tp4",     24, 24,  8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4",     24, 24, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4",     24, 24,  8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "equal"),
     # GDN Qwen3-Next TP8
-    ("gdn_q3n_tp8",  4,  2,  8192, 8, 128, 128, 64, "g"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g"),
+    ("gdn_q3n_tp8",  4,  2,  8192, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g", "equal"),
     # GDN Qwen3-Next TP4
-    ("gdn_q3n_tp4",  8,  4,  8192, 4, 128, 128, 64, "g"),
-    ("gdn_q3n_tp4",  8,  4, 32768, 4, 128, 128, 64, "g"),
+    ("gdn_q3n_tp4",  8,  4,  8192, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp4",  8,  4, 32768, 4, 128, 128, 64, "g", "equal"),
     # GDN Qwen3.5-MoE TP1
-    ("gdn_q35_tp1", 16, 16,  8192, 1, 128, 128, 64, "g"),
-    ("gdn_q35_tp1", 32,  8,  8192, 1, 128, 128, 64, "g"),
-    ("gdn_q35_tp1", 32,  8, 32768, 1, 128, 128, 64, "g"),
+    ("gdn_q35_tp1", 16, 16,  8192, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_q35_tp1", 32,  8,  8192, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_q35_tp1", 32,  8, 32768, 1, 128, 128, 64, "g", "equal"),
+    # -- varlen / ragged batches -------------------------------------------
+    # Same (H, Hg, T_flat, N) as shapes 10 and 12, so the only difference from
+    # their "equal" counterparts is the sequence-length distribution; any delta
+    # is attributable to load imbalance rather than to shape.
+    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "ragged"),
+    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "bimodal"),
+    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g",  "ragged"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g",  "skew"),
+    # Control for dispatch order: identical length multiset to shape 20, but the
+    # long sequence is last. Only affects shapes whose grid exceeds the CU count.
+    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "skew_last"),
 ]
 
 _BENCH_TITLE = "GDN K5 inter-chunk state scan"
@@ -111,9 +130,63 @@ _BENCH_TITLE = "GDN K5 inter-chunk state scan"
 _USE_EXP2 = False
 
 
+def _make_seqlens(pattern: str, T_flat: int, N: int, BT: int = 64) -> list[int]:
+    """Per-sequence token counts for ``pattern``, summing exactly to ``T_flat``.
+
+    Deterministic, so a shape means the same thing across runs and machines.
+    Lengths are not rounded to a multiple of BT -- the ragged patterns should
+    exercise the padded tail chunk as well as the imbalance.
+
+    Patterns:
+      equal    every sequence the same length (the historical behaviour)
+      ragged   lengths drawn uniformly in [0.3, 1.7] x mean -- generic imbalance
+      bimodal  alternating short (0.35x) and long (1.65x) -- the serving mix of
+               short prompts interleaved with long ones
+      skew_last same as skew, but the long sequence is last in the batch
+      skew     one sequence holds ~half the tokens, the rest share the remainder.
+               Worst case for static CTA->sequence assignment: with 1 CTA/CU the
+               makespan is set by that one sequence while the others finish early.
+    """
+    if N <= 1:
+        return [T_flat]
+    if pattern == "equal":
+        per = T_flat // N
+        return [per] * (N - 1) + [T_flat - per * (N - 1)]
+    if pattern == "skew":
+        weights = [float(N - 1)] + [1.0] * (N - 1)
+    elif pattern == "skew_last":
+        # Same distribution as "skew" but the long sequence is last. Dispatch
+        # order is linear in the block id and sequence i_n owns a contiguous
+        # range, so this decides whether the long sequence's CTAs land in the
+        # first scheduling round or are deferred behind the short ones.
+        weights = [1.0] * (N - 1) + [float(N - 1)]
+    elif pattern == "bimodal":
+        weights = [0.35 if i % 2 == 0 else 1.65 for i in range(N)]
+    elif pattern == "ragged":
+        rng = random.Random(0x5EED + N)
+        weights = [rng.uniform(0.3, 1.7) for _ in range(N)]
+    else:
+        raise ValueError(
+            f"unknown seq_pattern {pattern!r}; expected one of "
+            "equal / ragged / bimodal / skew"
+        )
+    total = sum(weights)
+    lens = [max(BT, int(T_flat * w / total)) for w in weights[:-1]]
+    last = T_flat - sum(lens)
+    if last < BT:
+        raise ValueError(
+            f"seq_pattern {pattern!r} with T_flat={T_flat}, N={N} leaves a "
+            f"final sequence of {last} tokens (< BT={BT}); use a larger T_flat"
+        )
+    lens.append(last)
+    return lens
+
+
 def _shape_label(idx: int, shape: tuple) -> str:
-    model_tag, H, Hg, T_flat, N, K, V, BT, gate = shape
-    return f"Shape {idx}: {model_tag} H={H} Hg={Hg} T={T_flat} N={N} gate={gate}"
+    model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern = shape
+    varlen = "" if seq_pattern == "equal" else f" seqs={seq_pattern}"
+    return (f"Shape {idx}: {model_tag} H={H} Hg={Hg} T={T_flat} N={N} "
+            f"gate={gate}{varlen}")
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +205,7 @@ def _make_inputs(shape: tuple, device="cuda"):
         where w_hm/u_hm are head-major (kernel input) and w_tm is token-major
         (reference input). ``cu_seqlens`` is ``None`` when ``N == 1``.
     """
-    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode = shape
+    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode, seq_pattern = shape
     B = 1
     dtype = torch.bfloat16
 
@@ -152,12 +225,13 @@ def _make_inputs(shape: tuple, device="cuda"):
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
 
-    # cu_seqlens: split T_flat into N equal sequences (last absorbs remainder).
+    # cu_seqlens: split T_flat across N sequences per ``seq_pattern``.
     if N > 1:
-        per = T_flat // N
+        lens = _make_seqlens(seq_pattern, T_flat, N, BT)
         bounds = [0]
-        for i in range(N):
-            bounds.append(T_flat if i == N - 1 else bounds[-1] + per)
+        for length in lens:
+            bounds.append(bounds[-1] + length)
+        assert bounds[-1] == T_flat, (bounds[-1], T_flat)
         cu = torch.tensor(bounds, dtype=torch.int32, device=device)
     else:
         cu = None
@@ -198,7 +272,7 @@ def _auto_variant_for_shape(shape, cu) -> str | None:
     Lets the table show ``flydsl:auto(bv64)`` instead of a bare ``auto``, so a
     sweep records what actually ran. Returns None if it cannot be determined.
     """
-    _tag, H, Hg, T_flat, N, _K, V, _BT, _gate = shape
+    _tag, H, Hg, T_flat, N, _K, V, _BT, _gate, _pat = shape
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
 
@@ -404,7 +478,8 @@ def _load_ref():
 # TFLOPS
 # --------------------------------------------------------------------------- #
 def calculate_tflops(
-    N: int, H: int, T_flat: int, K: int, V: int, time_us: float, BT: int = 64
+    N: int, H: int, T_flat: int, K: int, V: int, time_us: float, BT: int = 64,
+    seq_lens: list[int] | None = None,
 ) -> float:
     """Total FLOPs for K5 = GEMM1 (w @ h^T) + GEMM2 (k^T @ v_new).
 
@@ -418,13 +493,14 @@ def calculate_tflops(
     sequence's final chunk out to BT and issues the full BT-wide MFMA work for
     it. That matches what the hardware actually executes: this formula
     reproduces SQ_INSTS_MFMA x 8192 exactly on the preset shapes.
+
+    ``seq_lens`` MUST be the actual per-sequence lengths -- with a ragged batch
+    the ceil() padding differs from the equal-split assumption, so deriving them
+    from T_flat//N here would misreport the ragged shapes.
     """
     if time_us <= 0:
         return float("nan")
-    # Mirrors the cu_seqlens split in _make_inputs: N-1 sequences of T_flat//N,
-    # with the last absorbing the remainder.
-    per = T_flat // N
-    lens = [per] * (N - 1) + [T_flat - per * (N - 1)]
+    lens = list(seq_lens) if seq_lens else [T_flat]
     n_chunks = sum(-(-length // BT) for length in lens)
     return 4 * H * n_chunks * BT * K * V / (time_us * 1e-6) / 1e12
 
@@ -484,7 +560,11 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification: str,
 
 def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> dict:
     """Time and verify all impls for one shape."""
-    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode = shape
+    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode, seq_pattern = shape
+    # actual per-sequence lengths: the ragged patterns pad a different
+    # number of tail chunks than an equal split would, so TFLOPs must use
+    # these rather than re-deriving T_flat//N.
+    _seq_lens_of_shape = _make_seqlens(seq_pattern, T_flat, N, BT)
     label = _shape_label(idx, shape)
 
     try:
@@ -565,7 +645,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
                 stats = _time_measure(closure, mode, cfg)
                 timing[mode] = stats
                 tflops_d[mode] = calculate_tflops(
-                    N, H, T_flat, K, V, stats.median_us, BT
+                    N, H, T_flat, K, V, stats.median_us, BT, seq_lens=_seq_lens_of_shape
                 )
             except EmptyGraphCaptureError as e:
                 timing[mode] = f"GRAPH-FAIL: {e}"
@@ -750,8 +830,9 @@ def main():
         print(f"{'#':>3}  {'label':<60}  gate")
         print("-" * 75)
         for i, s in enumerate(PRESET_SHAPES, 1):
-            model_tag, H, Hg, T_flat, N, K, V, BT, gate = s
-            label = f"{model_tag}  H={H} Hg={Hg} T={T_flat} N={N} K={K} V={V}"
+            model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern = s
+            _sp = "" if seq_pattern == "equal" else f"  seqs={seq_pattern}"
+            label = f"{model_tag}  H={H} Hg={Hg} T={T_flat} N={N} K={K} V={V}{_sp}"
             print(f"{i:>3}  {label:<60}  {gate}")
         return
 
