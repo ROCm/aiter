@@ -29,6 +29,7 @@ sync-scope, volatile, or non-temporal control, which these primitives require.
 """
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
 from flydsl.expr.typing import T
@@ -77,6 +78,28 @@ def store_i64_system(addr_i64, offset, val):
         ordering=_llvm_d.AtomicOrdering.release,
         syncscope="one-as",
     )
+
+
+def _is_gfx12():
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        return detect_gpu_arch().startswith("gfx12")
+    except Exception:
+        return False
+
+
+def waitcnt_all():
+    """Drain all outstanding memory counters (no cache management, unlike a
+    release fence). gpu.barrier/s_barrier only syncs wavefronts and does NOT
+    wait for in-flight memory ops, so this must precede a grid barrier when the
+    stores before it need to be complete. gfx12/gfx1250 split the legacy
+    s_waitcnt into per-kind counters."""
+    if _is_gfx12():
+        _rocdl_d.s_wait_storecnt(0)
+        _rocdl_d.s_wait_loadcnt(0)
+    else:
+        _rocdl_d.s_waitcnt(0)
 
 
 def fence_system_acquire():
@@ -157,6 +180,17 @@ def _spin(addr_i64, keep_waiting, *, width=32):
 def spin_until_eq_i64(addr_i64, val):
     """Spin until *addr (i64) == val."""
     return _spin(addr_i64, lambda cur: cur != fx.Int64(val), width=64)
+
+
+def spin_until_ge_i64(addr_i64, val):
+    """Spin until *addr (i64) >= val (signed).
+
+    For a MONOTONIC cross-device flag this is deadlock-safe under lapping: if a
+    faster peer overwrites the slot with a higher call count before a slow rank
+    reads it, `>=` still passes (whereas `==` would spin forever). It only
+    releases early when the peer is *ahead* — the safe direction for a
+    wait-for-peer barrier."""
+    return _spin(addr_i64, lambda cur: cur < fx.Int64(val), width=64)
 
 
 def spin_until_eq_i32(addr_i64, val):
