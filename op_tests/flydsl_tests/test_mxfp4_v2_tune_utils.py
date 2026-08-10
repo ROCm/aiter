@@ -8,7 +8,7 @@ from aiter import dtypes
 
 
 @pytest.mark.l2_device
-def test_q9_v2_data_uses_fp8_weights_and_e8m0_scales():
+def test_a8w8_v2_data_uses_fp8_weights_and_e8m0_scales():
     from aiter.ops.flydsl.mxfp4_v2_tune_utils import build_v2_inputs, gen
 
     with torch.device("cuda"):

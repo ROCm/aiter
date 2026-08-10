@@ -908,8 +908,8 @@ class FmoeTuner(TunerCommon):
             token_num=token,
             block_size=blockM,
         )
-        # q7's a_scale_one=True variant uses an unscaled bf16->fp8 cast. q9 uses
-        # the real per-1x32 payload and E8M0 scale instead.
+        # The a8w4 a_scale_one=True variant uses an unscaled bf16->fp8 cast.
+        # The a8w8 path uses the real per-1x32 payload and E8M0 scale instead.
         a1_qt_fp8_cast = (
             d["inp"].to(dtypes.fp8) if adtype == "fp8" and b_dtype == "fp4" else None
         )

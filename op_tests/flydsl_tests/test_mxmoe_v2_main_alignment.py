@@ -106,9 +106,9 @@ def test_v2_stage1_tuner_runner_returns_payload_only(monkeypatch):
 @pytest.mark.parametrize(
     "q_dtype_a,q_dtype_w",
     [
-        pytest.param(dtypes.fp4x2, dtypes.fp4x2, id="q4_a4w4"),
-        pytest.param(dtypes.fp8, dtypes.fp4x2, id="q7_a8w4"),
-        pytest.param(dtypes.fp8, dtypes.fp8, id="q9_a8w8"),
+        pytest.param(dtypes.fp4x2, dtypes.fp4x2, id="a4w4"),
+        pytest.param(dtypes.fp8, dtypes.fp4x2, id="a8w4"),
+        pytest.param(dtypes.fp8, dtypes.fp8, id="a8w8"),
     ],
 )
 def test_v2_stage1_real_kernel_payload_correctness(q_dtype_a, q_dtype_w):
