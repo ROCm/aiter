@@ -204,8 +204,6 @@ class AttentionConfig:
     NUM_QUERIES_PER_KV: gl.constexpr
     BLOCK_Q: gl.constexpr
     RCP_LN2: gl.constexpr
-    QK_SCALE: gl.constexpr
-    SOFTMAX_SCALE: gl.constexpr
     USE_SINKS: gl.constexpr
     WARP_SIZE: gl.constexpr
     NUM_WARPS: gl.constexpr
@@ -256,7 +254,6 @@ class AttentionConfig:
         NUM_QUERY_HEADS,
         NUM_KV_HEADS,
         SLIDING_WINDOW,
-        SCALE,
         USE_SINKS,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
@@ -287,8 +284,6 @@ class AttentionConfig:
         self.NUM_KV_BLOCKS = gl.constexpr(TILE_SIZE // BLOCK_SIZE)
         self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
-        self.QK_SCALE = gl.constexpr(self.RCP_LN2 * SCALE)
-        self.SOFTMAX_SCALE = gl.constexpr(SCALE)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
         self.ALL_DECODE = gl.constexpr(ALL_DECODE)
@@ -531,9 +526,10 @@ class AsyncKVLoader:
         # Wait for async K copy and load from shared memory
         if not skip_wait:
             gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.k_shared.index(buffer_id), self.cfg.k_layout
-        ).to(target_dtype)
+        # return gl.amd.cdna4.async_copy.load_shared_relaxed(
+        #     self.k_shared.index(buffer_id), self.cfg.k_layout
+        # ).to(target_dtype)
+        return self.k_shared.index(buffer_id).load(layout=self.cfg.k_layout).to(target_dtype)
 
     @gluon.jit
     def load_v_from_shared(
@@ -542,9 +538,10 @@ class AsyncKVLoader:
         # Wait for async V copy and load from shared memory
         if not skip_wait:
             gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.v_shared.index(buffer_id), self.cfg.v_layout
-        ).to(target_dtype)
+        # return gl.amd.cdna4.async_copy.load_shared_relaxed(
+        #     self.v_shared.index(buffer_id), self.cfg.v_layout
+        # ).to(target_dtype)
+        return self.v_shared.index(buffer_id).load(layout=self.cfg.v_layout).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -748,9 +745,10 @@ class AsyncGatherKVLoader:
     ):
         if not skip_wait:
             gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.k_shared.index(buffer_id), self.cfg.k_layout
-        ).to(target_dtype)
+        # return gl.amd.cdna4.async_copy.load_shared_relaxed(
+        #     self.k_shared.index(buffer_id), self.cfg.k_layout
+        # ).to(target_dtype)
+        return self.k_shared.index(buffer_id).load(layout=self.cfg.k_layout).to(target_dtype)
 
     @gluon.jit
     def load_v_from_shared(
@@ -758,9 +756,10 @@ class AsyncGatherKVLoader:
     ):
         if not skip_wait:
             gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.v_shared.index(buffer_id), self.cfg.v_layout
-        ).to(target_dtype)
+        # return gl.amd.cdna4.async_copy.load_shared_relaxed(
+        #     self.v_shared.index(buffer_id), self.cfg.v_layout
+        # ).to(target_dtype)
+        return self.v_shared.index(buffer_id).load(layout=self.cfg.v_layout).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -831,6 +830,7 @@ class AttentionProgram:
         k_descale_ptr,
         v_descale_ptr,
         out_scale_ptr,
+        SCALE,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
@@ -895,7 +895,7 @@ class AttentionProgram:
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
-        QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
+        QK_scale = cfg.RCP_LN2 * SCALE
 
         if q_descale_ptr is not None:
             QK_scale = QK_scale * gl.load(q_descale_ptr)
@@ -1321,7 +1321,7 @@ def _unified_attention_gluon_kernel(
     stride_v_cache_3: gl.constexpr,
     block_table_stride: gl.constexpr,
     num_seqs: tl.int32,
-    SCALE: gl.constexpr,
+    SCALE,
     NUM_QUERY_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
@@ -1368,7 +1368,6 @@ def _unified_attention_gluon_kernel(
         NUM_QUERY_HEADS,
         NUM_KV_HEADS,
         SLIDING_WINDOW,
-        SCALE,
         USE_SINKS,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
@@ -1471,6 +1470,7 @@ def _unified_attention_gluon_kernel(
         k_descale_ptr,
         v_descale_ptr,
         out_scale_ptr,
+        SCALE,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
