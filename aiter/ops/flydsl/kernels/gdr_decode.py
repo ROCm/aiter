@@ -50,6 +50,8 @@ def create_vk_gdr_decode_kernel(
     # Separate binaries, so "gdr" stays bit-identical to pre-847.
     assert gate_mode in ("gdr", "kda"), gate_mode
     PER_CHANNEL = gate_mode == "kda"
+    # The out store narrows anything that is not bf16 to f16.
+    assert dtype in ("f16", "bf16"), dtype
 
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
@@ -121,7 +123,8 @@ def create_vk_gdr_decode_kernel(
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
         width_i32 = _to_raw(fx.Int32(WARP_SIZE))
-        vec_t = T.vec(VALUES_PER_THREAD_K, dtype_)
+        # Follows the pool, not the activations: the two differ in KDA.
+        state_vec_t = T.vec(VALUES_PER_THREAD_K, state_dtype_)
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
         tidx = fx.thread_idx.x
@@ -474,7 +477,9 @@ def create_vk_gdr_decode_kernel(
                     if const_expr("f32" in state_dtype):
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                     else:
-                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
+                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(
+                            state_vec_t
+                        )
                     write_state_tensor.vec_store(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )

@@ -122,6 +122,11 @@ def flydsl_gdr_decode(
     ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
+    if dtype not in (torch.half, torch.bfloat16):
+        raise ValueError(
+            f"`query` must be fp16 or bf16; got {dtype}. The kernel converts its "
+            "output to one of the two, so a wider type is silently narrowed."
+        )
     for input in [key, value, a, b, out]:
         assert input.dtype == dtype
     assert state.dtype in [torch.float, torch.bfloat16]

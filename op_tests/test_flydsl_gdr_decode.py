@@ -496,6 +496,76 @@ def test_kda_tuned_rows_are_not_reachable_from_the_scalar_gate():
         assert lookup(B, "gdr") == fallback, f"scalar GDR at B={B} took a kda row"
 
 
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
+def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
+    """A bf16 pool must be written as bf16 whatever the activations are.
+
+    The store used to take its vector type from the activations, so fp16 ones
+    truncated to fp16 and landed in a bf16 pool: same width, other exponent.
+    bf16 activations hid it, both types agreeing by luck.
+    """
+    B, Sq, H, D = 2, 1, 4, 128
+
+    def run(state_dtype):
+        torch.manual_seed(0)
+        kw = dict(dtype=act_dtype, device="cuda")
+        q, k, v = (torch.randn(B, Sq, H, D, **kw) for _ in range(3))
+        a, b = (torch.randn(B, Sq, H, **kw) for _ in range(2))
+        dt_bias = torch.rand(H, dtype=torch.float32, device="cuda") + 1.0
+        A_log = torch.rand(H, dtype=torch.float32, device="cuda") * 4.0
+        indices = torch.arange(B, dtype=torch.int32, device="cuda")
+        torch.manual_seed(99)
+        state = torch.randn(B, H, D, D, dtype=torch.float32, device="cuda").to(
+            state_dtype
+        )
+        out = torch.zeros(B, Sq, H, D, **kw)
+        flydsl_ops.flydsl_gdr_decode(
+            q,
+            k,
+            v,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            indices,
+            state,
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+        return state.float()
+
+    ref = run(torch.float32)
+    got = run(torch.bfloat16)
+    # bf16 keeps 8 mantissa bits, so rounding alone stays well inside 5%.
+    assert (got - ref).abs().max() < 0.05 * ref.abs().max()
+
+
+def test_fp32_activations_are_rejected():
+    """The out store converts to fp16 for anything but bf16, so f32 must not
+    reach the kernel and be silently narrowed."""
+    B, Sq, H, D = 1, 1, 4, 128
+    kw = dict(dtype=torch.float32, device="cuda")
+    q, k, v = (torch.randn(B, Sq, H, D, **kw) for _ in range(3))
+    a, b = (torch.randn(B, Sq, H, **kw) for _ in range(2))
+
+    with pytest.raises(ValueError, match=r"`query` must be fp16 or bf16"):
+        flydsl_ops.flydsl_gdr_decode(
+            q,
+            k,
+            v,
+            a,
+            b,
+            torch.rand(H, dtype=torch.float32, device="cuda"),
+            torch.rand(H, dtype=torch.float32, device="cuda"),
+            torch.zeros(B, dtype=torch.int32, device="cuda"),
+            torch.randn(B, H, D, D, dtype=torch.float32, device="cuda"),
+            torch.zeros(B, Sq, H, D, **kw),
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+
+
 # CI runs each file as `python3 <file>`, which collects nothing on its own.
 if __name__ == "__main__":
     import sys
