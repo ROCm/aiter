@@ -25,7 +25,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 
 | # | Capability | Reference has | WIP has | Ticket priority |
 |---|---|---|---|---|
-| G1 | **i64-safe weight/activation offsets** (large E) | ✅ per-row i64 base | ❌ single i32 element offset | **correctness blocker** |
+| G1 | **i64-safe weight offsets** (only >8 GB tensors) | ✅ per-row i64 base | ✅ ticket shapes / ❌ >8 GB (K3) | **not a ticket blocker** (empirically verified 2026-08-10; K3-only) |
 | G2 | **MXFP4 / FP4 weights** (down + gate_up) | ✅ (down full; gate_up fp4) | ❌ | #1 remaining (ticket) |
 | G3 | **BF16-weight path** (`w_dtype="bf16"`) | ✅ (dot2 + scalar) | ❌ FP8-only | scaffold / gfx942 |
 | G4 | **gfx942 / scalar-f32 fallback** (`use_dot2=False`) | ✅ auto-arch | ❌ gfx950-only | portability |
@@ -134,7 +134,7 @@ All remain in force.
 | FP8→BF16 convert (ROCDL op) | ✅ shipped | `cvt_scalef32_pk_bf16_fp8` in WIP. |
 | FP4→BF16 convert (ROCDL op) | ⏳ verify | `cvt_scalef32_pk_bf16_fp4(src, scale, sel_index)` — confirm the 4-`sel` op form and e8m0 scale path on gfx950 (Phase A). |
 | `v_dot2_f32_bf16` ILP (no s_nop, 1 drain) | ⏳ verify | reference proves the pattern; re-validate exact vs torch in the WIP surface. |
-| i64 offset addressing in FlyDSL | ⏳ verify | reference uses `create_buffer_resource_from_addr(..., num_records_bytes=...)` with i64 base per row; confirm the WIP `buffer_ops` path (it accepts i64 base + i32 in-row offset). |
+| i64 offset addressing in FlyDSL | ✅ measured | WIP `fx.*` offsets are 64-bit-safe up to the **i32 dword-index limit** (`buffer_load` truncates offset to i32): correct for all ticket shapes (≤3.74 GB tensors), breaks only >8 GB (K3). Per-row i64 base is the K3 fix. |
 | e8m0 → f32 decode (`bitcast(shli(byte,23))`) | ⏳ verify | reference pattern; validate vs `aiter.utility.fp4_utils`. |
 
 ---
@@ -143,26 +143,30 @@ All remain in force.
 
 Status legend: [ ] todo · [~] in progress · [x] done
 
-### Phase A — i64-safe addressing (G1)  [ ]  ← correctness blocker, do first
-- [ ] Reproduce the overflow: run the op_test with a **real expert count** (E=256,
-      HIDDEN=7168, INTER=2048) and confirm FAIL / garbage (E=8 masks it today).
-- [ ] Convert the weight/activation offset math to **i64**, matching the reference:
-      either (a) per-row i64 base resources (`create_buffer_resource_from_addr(base_i64 +
-      row_byte_off_i64, num_records_bytes=row_nb)`) with in-row i32 offsets, or (b) keep the
-      whole-tensor resource but compute the element/byte offset in i64.
-      Root cause: `w_row * hidden` is i32; DeepSeek `(255*2048+2047)*7168 ≈ 3.76e9 > INT32_MAX`.
-- [ ] **`num_records` clamp — >4 GB weight tensors mandate option (a).**
-      `create_buffer_resource_from_addr` clamps `num_records` to **`0xFFFFFFFF` (4 GB)**, so a
-      whole-tensor resource (option (b)) **cannot address past 4 GB** even with an i64 offset —
-      the HW OOB check zeroes reads beyond it. Any expert weight tensor larger than 4 GB
-      therefore **requires the per-row i64 base approach (a)**, which sizes `num_records` per
-      row. This is already true for **Kimi-K3** (`896·3072·3584 ≈ 9.2 GB FP8 / 4.9 GB MXFP4`,
-      §8.2) and any comparably large E×dims. Prefer (a) as the default fix; treat (b) as a
-      convenience only for sub-4 GB tensors.
-- [ ] Add the **E=256 / E=512 correctness cases** to the op_test so this can't regress
-      (these are the first real ticket-shape tests; see the coverage matrix §8.2).
-- **Where:** both `build_gate_up_fp8_module` and `build_down_reduce_fp8_module`
-  (`x_word0`/`w_word0`/`a_word0`/`w_row` and the `_ptr_rsrc` calls).
+### Phase A — real-E regression tests + K3-scale addressing (G1)  [~]  ← NOT a ticket blocker
+**Empirically resolved (2026-08-10):** the WIP is **correct at real ticket expert counts**.
+Verified on gfx950 via `/tmp/repro_g1*.py`: gate_up **and** down at DeepSeek-V3
+(E=256, H7168/I2048), *with the max-offset expert 255 forced*, give **cos = 1.000000**
+(gate_up per-expert all 1.0; down cos 0.999999). The original "overflows at E≥73" premise
+was **wrong about the mechanism**: FlyDSL `fx.*` offset arithmetic is wider than i32 (the
+reference needed i64 casts only because it works in explicit-i32 `arith`). The real limit is
+the **i32 DWORD index** (`byte_offset/4`) that `buffer_load` truncates to i32 (`_to_i32_offset`),
+which wraps only when a **weight tensor exceeds ~8 GB** (`byte_offset > 2^33`). Among ticket
+shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still < 2^31 → safe.
+**Kimi-K3 does break:** E=896/H3584/I3072 (dword index 2.46e9 > 2^31, 9.85 GB tensor) gives
+**cos = 0.019** (`/tmp/repro_k3_addr.py`). So:
+- [ ] **Add real-E regression cases** (DeepSeek-V3 E=256; Qwen-TP1 E=512) to the op_test to
+      lock in the verified-good behavior and give the first real ticket-shape tests (§8.2).
+      *(This is the only Phase-A item on the ticket's critical path.)*
+- [ ] **K3-scale addressing fix (deferred to the Kimi-K3 follow-on, not the ticket):** for
+      weight tensors > ~8 GB, switch to **per-row i64 base resources**
+      (`create_buffer_resource_from_addr(base_i64 + row_byte_off_i64, num_records_bytes=row_nb)`,
+      in-row i32 offset small) — this fixes *both* the dword-index truncation *and* the 4 GB
+      `num_records` clamp (`0xFFFFFFFF`) that would otherwise OOB-zero reads past 4 GB. The
+      whole-tensor + i64-offset variant is insufficient (both the clamp and `buffer_load`'s
+      i32 offset bite), so per-row is the required form at K3 scale.
+- **Where:** `build_gate_up_fp8_module` / `build_down_reduce_fp8_module` (`_ptr_rsrc` +
+  `w_word0`/`a_word0`); only the K3-scale item touches kernel addressing.
 
 ### Phase B — MXFP4 / FP4 (G2)  [ ]  ← ticket #1 win
 - [ ] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
@@ -235,11 +239,13 @@ Status legend: [ ] todo · [~] in progress · [x] done
 
 ## 5. Ordering & rationale
 
-A (blocker) → B (biggest win) → C (portability/oracle) → D (occupancy) → E (scheduling)
-→ F (validation). **Phase A gates everything**: without i64 offsets the kernels are wrong
-at the ticket's real expert counts, and any perf number on E=8 is not representative of the
-production grid. B is sequenced before C/D because MXFP4 is the ticket's #1 item and it's the
-natural place to introduce the ILP dot2 (E/G7) once. Keep every phase behind the combined
+**Revised after the 2026-08-10 empirical check.** Phase A is **no longer a blocker** — the
+WIP is already correct at real ticket expert counts (verified), so Phase A shrinks to *adding
+regression tests*. **Phase B (MXFP4) is now the first substantive work** and the ticket's #1
+value item; it's also the natural place to introduce the ILP dot2 (E/G7) once. Order:
+**B → (A regression tests, cheap, fold in alongside) → C (portability/oracle) → D (occupancy)
+→ E (scheduling) → F (validation).** The K3-scale addressing fix (the surviving part of G1)
+rides with the Kimi-K3 follow-on, not the ticket. Keep every phase behind the combined
 op_test correctness gate before its perf A/B, and behind the **coverage gate** (§8.2): a
 phase does not close until its coverage-matrix rows are ✅.
 
@@ -311,8 +317,10 @@ experts run *on the latent*, so the warp-decode routed-expert GEMM uses **HIDDEN
 = 3584** (not 7168), INTER = 3072, E = 896, TOPK = 16. The dims are divisible for the
 current kernels (gate_up `3584 % 512 == 0` ⇒ kv8; down `3072 % 1024 == 0` ⇒ kv16, H2 ok),
 but K3 is **follow-on**: it needs MXFP4 weights (Phase B) + MXFP8 activations (follow-on),
-and its **E=896** is the harshest G1 overflow case (`895*3072*3584 ≈ 9.9e9 ≫ INT32_MAX`) —
-a good stress test once Phase A lands. The 2 **shared** experts run dense on the full 7168
+and — unlike every ticket shape — it **actually hits the addressing limit**: its 9.85 GB
+gate_up weight tensor gives a dword index 2.46e9 > 2^31, and the WIP is **measured broken**
+here (cos 0.019, `/tmp/repro_k3_addr.py`, 2026-08-10). So K3 additionally needs the per-row
+i64 base addressing fix (Phase A K3-scale item). The 2 **shared** experts run dense on the full 7168
 and are out of scope for the routed warp-decode path. Suggested by a colleague as a
 bench/tune target; verify against the shipped weights before publishing numbers.
 
@@ -340,12 +348,13 @@ bench/tune target; verify against the shipped weights before publishing numbers.
 
 ## 9. Open questions / risks
 
-- [blocker] **i32 offset overflow at real E** — assumed present from static analysis
-  (single whole-tensor i32 element offset; `w_row*hidden` overflows for E≥~73 at
-  H7168/I2048). Confirm empirically in Phase A before anything else.
-- [open] Does the WIP `buffer_ops.buffer_load` element→byte multiply stay i32 internally
-  even with an i64 base resource? If so, per-row i64 base resources (in-row offsets small)
-  are the safer fix than a whole-tensor i64 element offset.
+- [resolved, 2026-08-10] **i32 offset overflow** — the original "overflows at real E"
+  premise was **refuted empirically**. WIP `fx.*` offset math is 64-bit; the true limit is
+  `buffer_load`'s **i32 dword-index truncation**, which bites only for weight tensors >~8 GB.
+  All ticket shapes are safe (DeepSeek E=256 verified cos 1.0, max-offset expert forced);
+  **Kimi-K3 breaks** (cos 0.019, 9.85 GB / dword index 2.46e9 > 2^31). Fix = per-row i64 base
+  resources, deferred to the K3 follow-on. Repros: `/tmp/repro_g1.py`, `/tmp/repro_g1_down.py`,
+  `/tmp/repro_k3_addr.py`.
 - [open] FP4 gate_up **accuracy** (ticket gates FP4 gate_up on accuracy; MXFP4 mantissa is
   tiny). Measure cos-sim vs BF16-weight reference before claiming the win.
 - [open] Split-K / LDS pay only in the **occupancy-bound** regime (small-grid Qwen, low B);
@@ -370,7 +379,7 @@ bench/tune target; verify against the shipped weights before publishing numbers.
 - _Kimi-K3 shape (2026-08-10)_ — on a colleague's suggestion, confirmed K3's public dims
   (arXiv 2607.24653 / Moonshot model card): latent MoE, routed-expert contraction **3584**
   (not 7168), INTER 3072, E 896, TOPK 16, MXFP4+MXFP8. Added it to §8.2 as a **follow-on**
-  coverage row with   a mapping note; flagged E=896 as the harshest G1 overflow stress case.
+  coverage row with a mapping note; flagged E=896 as the harshest G1 overflow stress case.
   No `kimi`/`k3` shape preset existed in-repo; this is the first record of the dims.
 - _K3 faithful-op gaps (2026-08-10)_ — folded in three items surfaced by the K3 analysis:
   (1) Phase A now notes the **`num_records` 4 GB clamp** ⇒ >4 GB tensors (e.g. K3) **mandate**
@@ -379,3 +388,12 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   follow-on to **parameterize the gate_up activation and add SiTU-GLU** (kernels hardcode
   SiLU today) for a faithful K3 op. Bench/tune on K3 shapes still only needs Phases A+B; these
   three are for correctness-faithful K3.
+- _G1 empirically resolved (2026-08-10)_ — ran the WIP gate_up + down at real expert counts
+  on gfx950. **DeepSeek-V3 E=256 is correct** (cos 1.0 with max-offset expert 255 forced) —
+  the "overflows at real E" premise was **wrong**: `fx.*` offsets are 64-bit; the true limit
+  is `buffer_load`'s i32 dword-index truncation, hit only by >8 GB tensors. All ticket shapes
+  are safe; **Kimi-K3 breaks** (cos 0.019, 9.85 GB). Downgraded G1 from "correctness blocker"
+  to "not a ticket blocker; K3-only"; **re-ordered §5 so Phase B (MXFP4) is the first
+  substantive work**, Phase A reduced to regression tests + the deferred K3-scale per-row i64
+  fix. Updated §1/§3/§4/§8.2/§9. Repros in `/tmp/repro_g1.py`, `/tmp/repro_g1_down.py`,
+  `/tmp/repro_k3_addr.py`.
