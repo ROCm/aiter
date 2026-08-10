@@ -29,6 +29,8 @@ from aiter.ops.mha_v4 import (
     mxfp4_v_view,
     mxfp6_k_view,
     native_fp8_format,
+    quantize_fp8,
+    quantize_int8,
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
@@ -675,29 +677,12 @@ def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    quant_dtype = aiter.dtypes.fp8
-    q_quant, q_descale = aiter.per_tensor_quant(
-        q,
-        scale=torch.abs(q).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    k_quant, k_descale = aiter.per_tensor_quant(
-        k,
-        scale=torch.abs(k).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    v_quant, v_descale = aiter.per_tensor_quant(
-        v,
-        scale=torch.abs(v).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
+    q_quant, q_descale = quantize_fp8(q)
+    k_quant, k_descale = quantize_fp8(k)
+    v_quant, v_descale = quantize_fp8(v)
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
@@ -710,25 +695,10 @@ def i8fp8_quantize(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Quantize Q/K to int8, V to fp8 (Sage-style)."""
-    # Q -> int8
-    q_amax = torch.abs(q).max() * q_clip
-    q_scale = q_amax / 127.0
-    q_int8 = torch.clamp(torch.round(q / q_scale), -128, 127).to(torch.int8)
-    q_descale = q_scale.reshape(1).to(torch.float32)
-    # K -> int8
-    k_amax = torch.abs(k).max() * k_clip
-    k_scale = k_amax / 127.0
-    k_int8 = torch.clamp(torch.round(k / k_scale), -128, 127).to(torch.int8)
-    k_descale = k_scale.reshape(1).to(torch.float32)
-    # V -> fp8
-    quant_dtype = aiter.dtypes.fp8
-    v_quant, v_descale = aiter.per_tensor_quant(
-        v,
-        scale=torch.abs(v).max(),
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
+    """Quantize Q/K to INT8 and V to FP8 with production MHA v4 operators."""
+    q_int8, q_descale = quantize_int8(q, q_clip)
+    k_int8, k_descale = quantize_int8(k, k_clip)
+    v_quant, v_descale = quantize_fp8(v)
     return q_int8, k_int8, v_quant, q_descale, k_descale, v_descale
 
 
@@ -1013,27 +983,6 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
-
-        def _run_aiter_fp8():
-            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(
-                q_bshd,
-                k_bshd,
-                v_bshd,
-            )
-            return mha_v4_packed(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                q_ds,
-                k_ds,
-                v_ds,
-                fp8_format,
-                fp8_format,
-                fp8_format,
-                *fp8_scale_modes,
-                softmax_scale=softmax_scale,
-            )
-
         if args.e2e:
             return lambda: mha_v4(
                 q_bshd,
@@ -1067,28 +1016,6 @@ def make_kernel_runner(
     if args.kernel == "aiter_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
-
-        def _run_aiter_i8fp8():
-            q_i8, k_i8, v_fp8, q_ds, k_ds, v_ds = i8fp8_quantize(
-                q_bshd,
-                k_bshd,
-                v_bshd,
-                q_clip=q_clip,
-                k_clip=k_clip,
-            )
-            return mha_v4_packed(
-                q_i8,
-                k_i8,
-                v_fp8,
-                q_ds,
-                k_ds,
-                v_ds,
-                AttentionFormat.INT8,
-                AttentionFormat.INT8,
-                fp8_format,
-                *i8fp8_scale_modes,
-                softmax_scale=softmax_scale,
-            )
 
         if args.e2e:
             return lambda: mha_v4(
