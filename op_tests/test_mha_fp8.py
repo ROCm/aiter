@@ -10,8 +10,13 @@ import torch
 
 import aiter
 from aiter import dtypes, per_tensor_quant
-from aiter.ops.mha import flash_attn_fp8_pertensor_func, flash_attn_func
+from aiter.ops.mha import (
+    _flash_attn_forward,
+    flash_attn_fp8_pertensor_func,
+    flash_attn_func,
+)
 from aiter.test_common import run_perftest
+from aiter.test_mha_common import attention_ref
 
 benchmark = {}
 
@@ -25,8 +30,32 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    return_lse=False,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        if return_lse:
+            def run_fp8_lse():
+                out, lse, _, _ = _flash_attn_forward(
+                    q,
+                    k,
+                    v,
+                    0.0,
+                    q.shape[-1] ** -0.5,
+                    causal=causal,
+                    window_size_left=int(window_size[0]),
+                    window_size_right=int(window_size[1]),
+                    sink_size=0,
+                    bias=None,
+                    alibi_slopes=None,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_lse=True,
+                    return_softmax=False,
+                )
+                return out, lse
+
+            return run_perftest(run_fp8_lse)
         return run_perftest(
             flash_attn_fp8_pertensor_func,
             q,
@@ -92,6 +121,7 @@ def test_flash_attn_output(
     d_v,
     causal,
     local,
+    return_lse=False,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -121,7 +151,7 @@ def test_flash_attn_output(
     k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
     v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
-    out, us_quant_fwd = run_ck(
+    quant_result, us_quant_fwd = run_ck(
         q_quant,
         k_quant,
         v_quant,
@@ -130,7 +160,12 @@ def test_flash_attn_output(
         q_descale,
         k_descale,
         v_descale,
+        return_lse,
     )
+    if return_lse:
+        out, lse = quant_result
+    else:
+        out = quant_result
     out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
 
     abs_diff = (out - out_ref).abs()
@@ -145,6 +180,25 @@ def test_flash_attn_output(
     print(f"Output nrms: {nrms}")
     print(f"Output max diff: {max_diff}")
     assert max_diff < 0.055
+
+    if return_lse:
+        q_dequant = q_quant.float() * q_descale
+        k_dequant = k_quant.float() * k_descale
+        v_dequant = v_quant.float() * v_descale
+        _, _, lse_ref = attention_ref(
+            q_dequant,
+            k_dequant,
+            v_dequant,
+            causal=causal,
+            window_size=window_size,
+            upcast=True,
+        )
+        finite = torch.isfinite(lse_ref)
+        assert torch.equal(torch.isneginf(lse), torch.isneginf(lse_ref))
+        lse_max_diff = (lse[finite] - lse_ref[finite]).abs().max().item()
+        print(f"LSE max diff: {lse_max_diff}")
+        assert lse_max_diff < 0.01
+        benchmark["lse_max_diff"] = lse_max_diff
 
     fwd_flop = (
         batch_size
@@ -250,6 +304,11 @@ parser.add_argument(
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
+parser.add_argument(
+    "--lse",
+    action="store_true",
+    help="Request and verify log-sum-exp output.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -269,6 +328,7 @@ if __name__ == "__main__":
         d_v,
         args.causal,
         args.local,
+        args.lse,
     )
     collected.append(benchmark)
 
