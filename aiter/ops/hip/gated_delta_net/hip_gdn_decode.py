@@ -12,8 +12,6 @@ so the decode path runs without any per-step transpose overhead.
 Kernel parameters are specialized for Qwen3.5:
   K_heads=16, V_heads=32, K=128, V=128, bf16.
 
-pool_idx sorting for L2-cache-friendly state access is handled inside
-the C++ extension (configurable via HIP_GDN_SORT_IDX_BS env var).
 """
 
 from typing import Optional
@@ -43,13 +41,6 @@ def _load_extension():
         verbose=False,
     )
     return _ext
-
-
-def hip_gdn_decode_reset_sort_cache():
-    """Invalidate C++ sorted-index cache before a new decode/graph step."""
-    ext = _load_extension()
-    ext.hip_gdn_decode_reset_sort_cache()
-
 
 def hip_fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,

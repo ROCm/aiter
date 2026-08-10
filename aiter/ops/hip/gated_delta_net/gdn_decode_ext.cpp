@@ -1,35 +1,5 @@
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
-#include <cstdlib>
-
-static int gdn_sort_threshold() {
-    // BS=128 with sorted path under-saturates HBM (~1.62 TB/s -> 79us).
-    // The unsorted path at BS=128 hits ~2.16 TB/s -> 59us (-25% kernel time, +30% vs FlyDSL).
-    // Sort still helps at BS=256 (97us vs 103us). Setting threshold=192 keeps sort only for
-    // BS in [192, +inf), so BS=128 uses the faster unsorted kernel and BS=256 keeps sort.
-    static int t = []() {
-        const char* e = std::getenv("HIP_GDN_SORT_IDX_BS");
-        return e ? std::atoi(e) : 192;
-    }();
-    return t;
-}
-
-// Cache sorted indices + permutation across layers in a decode step.
-// All GDN layers in one step share the same indices tensor, so sorting
-// once and reusing is a ~64x reduction in sort overhead.
-static struct {
-    const void* last_ptr = nullptr;
-    int last_bs = 0;
-    torch::Tensor sorted_indices;
-    torch::Tensor perm_i32;
-} sort_cache;
-
-static void reset_sort_cache() {
-    sort_cache.last_ptr = nullptr;
-    sort_cache.last_bs = 0;
-    sort_cache.sorted_indices = torch::Tensor();
-    sort_cache.perm_i32 = torch::Tensor();
-}
 
 extern "C" {
 void launch_gdn_decode_iasm(
@@ -40,7 +10,6 @@ void launch_gdn_decode_iasm(
     int batch_size, int seq_length,
     int num_v_blocks, bool use_qk_l2norm, float scale,
     int num_k_heads, int num_v_heads,
-    const int* batch_perm,
     hipStream_t stream
 );
 
@@ -230,8 +199,6 @@ void hip_state_transpose_multi_layer(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hip_gdn_decode_reset_sort_cache", &reset_sort_cache,
-          "Invalidate cached sorted GDN decode indices");
     m.def("hip_gdn_decode_tuned_inplace", &hip_gdn_decode_tuned_inplace,
           "GDN decode TUNED kernel (state layout: [pool, HV, V, K])");
     m.def("hip_gdn_decode_tuned_kv_inplace", &hip_gdn_decode_tuned_kv_inplace,
@@ -297,38 +264,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto stream = at::hip::getCurrentHIPStream().stream();
         auto err_before = hipGetLastError();
 
-        const int* batch_perm_ptr = nullptr;
-        torch::Tensor sorted_indices, perm_i32;
-        int sort_thr = gdn_sort_threshold();
-        if (sort_thr > 0 && batch_size >= sort_thr &&
-            num_k_heads == 2 && num_v_heads == 8) {
-            const void* cur_ptr = indices.data_ptr();
-            if (sort_cache.last_ptr == cur_ptr &&
-                sort_cache.last_bs == batch_size) {
-                sorted_indices = sort_cache.sorted_indices;
-                perm_i32 = sort_cache.perm_i32;
-            } else {
-                auto perm_i64 = torch::argsort(indices, /*dim=*/int64_t(0), /*descending=*/false);
-                sorted_indices = indices.index_select(0, perm_i64);
-                perm_i32 = perm_i64.to(torch::kInt32);
-                sort_cache.last_ptr = cur_ptr;
-                sort_cache.last_bs = batch_size;
-                sort_cache.sorted_indices = sorted_indices;
-                sort_cache.perm_i32 = perm_i32;
-            }
-            batch_perm_ptr = perm_i32.data_ptr<int>();
-        }
-
         launch_gdn_decode_iasm(
             query.data_ptr(), key.data_ptr(), value.data_ptr(),
             a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
-            A_log.data_ptr(),
-            batch_perm_ptr ? sorted_indices.data_ptr() : indices.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
             state.data_ptr(), output.data_ptr(),
             batch_size, seq_length,
             num_v_blocks, use_qk_l2norm, scale,
-            num_k_heads, num_v_heads,
-            batch_perm_ptr, stream);
+            num_k_heads, num_v_heads, stream);
         auto err = hipGetLastError();
         TORCH_CHECK(err == hipSuccess,
             "hip_gdn_decode_asm_inplace launch failed: ", hipGetErrorString(err),
