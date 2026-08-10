@@ -46,7 +46,13 @@ from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from ..tensor_shim import _run_compiled
+
+# Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
+# explicitly here since _core_attention is a module-level helper (outside the
+# rewriter's @flyc.kernel scope), keeping side-effect guards free of raw scf.IfOp.
+scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
@@ -611,35 +617,42 @@ def _core_attention(
             o_acc=o_resc,
         )
 
-        # ---- Prefetch tile t+1 into (t+1) % N_KV_PP. The final (past-the-end)
-        # prefetch has kv_valid=0, so check_oob clamps every row in-bounds to a
-        # harmless load the loop never consumes. No runtime guard needed. ----
+        # ---- Prefetch tile t+1 into (t+1) % N_KV_PP, but ONLY when it exists.
+        # The last iteration (t == n_tiles-1) has no next tile; issuing its
+        # would-be prefetch drops a dead async load into slot n_tiles%N_KV_PP --
+        # exactly the slot the O epilogue reuses -- which races the epilogue's O
+        # write across waves. Skipping it leaves that slot idle so the epilogue
+        # needs no barrier. nxt_valid still clamps the causal partial tail. ----
         nxt = t + fx.Int32(1)
         nxt_pp = nxt % fx.Int32(N_KV_PP)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
-        k_mgr.async_load_vram_to_lds(
-            ptr_lds=_k_lds_buf(nxt_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + nxt_row0,
-            kv_valid=nxt_valid,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        v_mgr.async_load_vram_to_lds(
-            ptr_lds=_v_lds_buf(nxt_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + nxt_row0,
-            kv_valid=nxt_valid,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
+
+        def _prefetch_next_kv():
+            k_mgr.async_load_vram_to_lds(
+                ptr_lds=_k_lds_buf(nxt_pp),
+                ptr_K=ptr_K,
+                stride_k_seq=stride_k_seq,
+                stride_k_head=stride_k_head,
+                kv_head=kv_head,
+                kv_row0=kv_start + nxt_row0,
+                kv_valid=nxt_valid,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+            )
+            v_mgr.async_load_vram_to_lds(
+                ptr_lds=_v_lds_buf(nxt_pp),
+                ptr_V=ptr_V,
+                stride_v_seq=stride_v_seq,
+                stride_v_head=stride_v_head,
+                kv_head=kv_head,
+                kv_row0=kv_start + nxt_row0,
+                kv_valid=nxt_valid,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+            )
+
+        scf_if_dispatch(nxt < fx.Int32(n_tiles), _prefetch_next_kv)
 
         scf.yield_([_raw(m_new), _raw(d_new)] + [_raw(o) for o in o_new])
 
@@ -658,17 +671,19 @@ def _core_attention(
     )
     o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
 
-    # O staging rings through the NON-CURRENT K|V slot: iteration t prefetches tile
-    # t+1 into slot (t+1)%N_KV_PP, so the last iter leaves a dead prefetch in slot
-    # n_tiles%N_KV_PP that no wave consumes. Writing O there is per-warp/intra-wave, so
-    # it needs no threadgroup barrier -- only the async drain below so the dead prefetch
-    # can't land after O's LDS write.
+    # O staging reuses the NON-CURRENT K|V slot n_tiles%N_KV_PP. With the last
+    # iteration's dead prefetch now skipped, no wave ever writes that slot near
+    # the end: the last load into it was tile n_tiles-2 (issued at t=n_tiles-3,
+    # consumed at t=n_tiles-2), and the top-of-loop barrier at t=n_tiles-1 already
+    # synchronized every wave past that read. So the slot is idle here -- no
+    # cross-wave barrier needed. Keep s_wait_asynccnt(0) as a per-wave WAR guard:
+    # it retires any still-inflight async load into this slot before O's LDS write.
     o_mgr = OManager16b(v_hdim=v_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES)
     assert o_mgr.get_lds_size_in_byte() <= slot_bytes, (
         f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
     )
     non_cur_pp = fx.Int32(n_tiles) % fx.Int32(N_KV_PP)
-    rocdl.s_wait_asynccnt(0)  # drain the last (dead) tile prefetch before slot reuse
+    rocdl.s_wait_asynccnt(0)  # per-wave WAR: retire inflight async loads before slot reuse
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself), unlike the
     # BYTE strides the K/V load path uses -- pass stride_o_* straight through. OManager
     # redirects mask-dropped rows to offset 0x7FFFFFFF, so o_rsrc must bound below that
