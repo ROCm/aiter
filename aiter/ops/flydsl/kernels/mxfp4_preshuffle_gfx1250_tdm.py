@@ -65,6 +65,7 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
+    cluster_n: Constexpr[int] = 1,
 ):
     cache_tag = (
         K,
@@ -82,6 +83,7 @@ def launch_gemm_a8w4_tdm(
         TDM_DESCRIPTOR_VERSION,
         stage1_quant_out,
         quant_wmma_rep,
+        cluster_n,
     )
     _ = cache_tag
     WMMA_M = WMMA_N = 16
@@ -136,11 +138,12 @@ def launch_gemm_a8w4_tdm(
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
+    _cn = f"_cn{cluster_n}" if cluster_n > 1 else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cn}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -173,19 +176,39 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
-        # DeepGEMM contiguous-M swizzle
+        # DeepGEMM contiguous-M swizzle. A cluster's peers are cluster_n
+        # CONSECUTIVE block ids, and they must land on one m_tile and differ only
+        # in n_tile, so the swizzle runs on cluster granularity (N counted in
+        # units of cluster_n) and n_tile is reassembled from the cluster-local id.
+        # cluster_n is a Python constant, so each ternary picks its form at build
+        # time. A statement-level `if` cannot be used inside the kernel: the AST
+        # rewriter turns it into a traced branch whose assignments never escape.
         TILES_PER_GROUP = 16
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
-        blocks_per_group = total_n_tiles * TILES_PER_GROUP
-        group = bid_x // blocks_per_group
+        swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
+        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
+        n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
+        blocks_per_group = n_units * TILES_PER_GROUP
+        group = swz_id // blocks_per_group
         group_first_tile = group * TILES_PER_GROUP
-        in_group = bid_x - group * blocks_per_group
+        in_group = swz_id - group * blocks_per_group
         rem_tiles = total_m_tiles - group_first_tile
         group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
         m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
         blk_m = m_tile * tile_m
-        blk_n = (in_group // group_tiles) * tile_n
+        n_unit = in_group // group_tiles
+        blk_n = (
+            (n_unit * cluster_n + local_n) * tile_n
+            if cluster_n > 1
+            else n_unit * tile_n
+        )
+        # All peers of a 1D cluster share this tile's A rows (they only differ in
+        # n_tile), so one A load can serve the whole cluster. The peer set is the
+        # entire cluster, hence a constant all-ones mask -- no cluster-local id
+        # needed. Only A is broadcast: B and the B scale are indexed by n_tile,
+        # which is exactly what differs between peers.
+        a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 else 0
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
@@ -366,7 +389,7 @@ def launch_gemm_a8w4_tdm(
             def wave_sel(a, b, c, d):  # pick this wave's value (else B-scale)
                 return is_a.select(a, is_b.select(b, is_as.select(c, d)))
 
-            def make_dgroup1(inner, outer, stride0, elem_bytes, pad_iv, pad_am, oob):
+            def make_dgroup1(inner, outer, stride0, elem_bytes, pad_iv, pad_am, oob, wg_mask=0):
                 # GROUP1 (vec<8xi32>) for num_warps=1 (one whole tensor per wave):
                 # dim0=inner (innermost), dim1=outer (outermost). Same bit layout as
                 # tdm_ops.make_tensor_descriptor_2d.
@@ -376,7 +399,20 @@ def launch_gemm_a8w4_tdm(
                     pad_en = 1
                 else:
                     enc_iv, enc_am, pad_en = 0, 0, 0
-                g0 = fx.Int32((dsc << 16) | (pad_en << 20) | (enc_iv << 22) | (enc_am << 25))
+                # A non-zero workgroup_mask (bits [15:0]) switches this load from
+                # GLOBAL_LOAD_ASYNC to CLUSTER_LOAD_ASYNC, fanning one load out to
+                # every cluster peer's LDS. early_timeout (bit 21) lets GL1 re-broadcast
+                # to latecomers instead of holding early arrivals for a wider merge --
+                # only meaningful, and only set, when multicast is on.
+                early_timeout = 1 if wg_mask else 0
+                g0 = fx.Int32(
+                    (wg_mask & 0xFFFF)
+                    | (dsc << 16)
+                    | (pad_en << 20)
+                    | (early_timeout << 21)
+                    | (enc_iv << 22)
+                    | (enc_am << 25)
+                )
                 g1 = fx.Int32((inner & 0xFFFF) << 16)
                 if const_expr(oob is None):
                     g2 = fx.Int32(((inner >> 16) & 0xFFFF) | ((outer & 0xFFFF) << 16))
@@ -397,8 +433,13 @@ def launch_gemm_a8w4_tdm(
             glb_base = [fx.Int64(fx.ptrtoint(fx.get_iter(j.gt))) for j in jobs]  # tile byte base
             lds_within = [(j.lds_off * 4 if j.on_i32 else j.lds_off) for j in jobs]  # LDS byte off in slot
             k_bytes = [j.k_adv for j in jobs]  # per-k-tile global byte advance
+            # Per-job multicast mask (jobs order A, B, A-scale, B-scale). Only A and
+            # its scale are shared across a cluster's peers; B / B-scale differ by
+            # n_tile, so they stay per-workgroup (mask 0).
+            mcast = [a_mcast_mask, 0, a_mcast_mask, 0]
             dgroup1 = wave_sel(*[make_dgroup1(j.inner, j.outer, j.stride, 4 if j.on_i32 else 1,
-                                              j.pad_iv, j.pad_am, j.oob) for j in jobs])
+                                              j.pad_iv, j.pad_am, j.oob, wg_mask=mcast[t])
+                                 for t, j in enumerate(jobs)])
 
         def issue(s, kt):
             if const_expr(FOURW):
@@ -960,7 +1001,7 @@ def launch_gemm_a8w4_tdm(
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(
+    kargs = (
         arg_c,
         arg_a,
         arg_b,
@@ -972,7 +1013,23 @@ def launch_gemm_a8w4_tdm(
         i32_m,
         N,
         f32_swiglu_limit,
-    ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
+    )
+    grid = (m_tiles * n_tiles, 1, 1)
+    if cluster_n > 1:
+        # The cluster geometry must reach BOTH the kernel definition (value_attrs)
+        # and the launch site (cluster=): if only one carries it the cluster never
+        # forms and the TDM loads silently fall back to the slow per-load path.
+        kernel(
+            *kargs,
+            value_attrs={"rocdl.cluster_dims": f"{cluster_n},1,1"},
+        ).launch(
+            grid=grid,
+            block=(block, 1, 1),
+            stream=stream,
+            cluster=(cluster_n, 1, 1),
+        )
+    else:
+        kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
