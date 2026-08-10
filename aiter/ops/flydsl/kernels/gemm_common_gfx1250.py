@@ -70,6 +70,36 @@ def lds_addr_keepalive(*bases_idx):
     )
 
 
+def vgpr_keepalive(*raw_vals):
+    """Pin arbitrary VGPR *data* values live to this program point.
+
+    The data-register analogue of :func:`lds_addr_keepalive`. Where that pins ds
+    base *addresses*, this pins whole register values passed in raw, reading each
+    through a side-effecting no-op so its live range extends past this point and
+    the allocator cannot reuse its physical register(s) for an earlier def.
+
+    Motivating case (epilogue): store data is produced by a ``v_cvt`` batch into a
+    small VGPR window, then stored to LDS. Reusing that window across stores lets
+    the next cvt batch overwrite registers in-flight stores still read -- a WAR the
+    backend gates with ``s_wait_alu depctr_vm_vsrc(N)``. Pinning one batch across
+    the next forces fresh registers and the wait disappears. Needs VGPR headroom.
+
+    Args:
+        *raw_vals: raw ``ir.Value`` operands (e.g. ``vec<4xi32>`` store data).
+    """
+    vals = [_raw(v) for v in raw_vals]
+    if not vals:
+        return
+    llvm_dialect.InlineAsmOp(
+        res=None,
+        operands_=vals,
+        asm_string="; vgpr keepalive",
+        constraints=",".join(["v"] * len(vals)),
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
 def make_sgpr_opaque(val_i32):
     """Return ``val_i32`` unchanged but hidden from constant folding.
 
@@ -330,6 +360,7 @@ __all__ = [
     "fused_silu_swiglu_elem",
     "fused_situv2_elem",
     "make_lds_copy_ops",
+    "vgpr_keepalive",
     "pipeline_fence",
     "situv2_consts",
     "workgroup_barrier",

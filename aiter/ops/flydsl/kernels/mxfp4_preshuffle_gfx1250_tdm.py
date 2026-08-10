@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
     situv2_consts,
+    vgpr_keepalive,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -160,7 +161,9 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
-    C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
+    # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
+    # to break the ds_store bank conflict; reserve it so the padded tile fits.
+    C_STORE_B = ((tile_m * (tile_n + 16) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -869,10 +872,13 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     has_next = next_stage_on and j + 1 < num_buffers
-                    pipeline_fence(
-                        outstanding=TDM_PER
-                        * max(0, num_buffers - 1 - j - (1 if has_next else 0))
-                    )
+                    # The last drain tile needs no fence: the previous tile's
+                    # rotated fence already covers the only buffer it reads.
+                    if const_expr(j != num_buffers - 1):
+                        pipeline_fence(
+                            outstanding=TDM_PER
+                            * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                        )
                     next_stage_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
@@ -950,6 +956,11 @@ def launch_gemm_a8w4_tdm(
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
+            # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
+            # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
+            # them to 4-way, the b128 floor. Pad cols never reach global.
+            STORE_PAD = 16 if not stage1_act else 0
+            STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             is_situv2 = stage1_act == 3
@@ -1064,8 +1075,14 @@ def launch_gemm_a8w4_tdm(
                         alignment=2,
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+                # Ping-pong the b128 store data across VGPR banks: pinning the
+                # last rows' data across this row's cvts forces fresh registers.
+                STORE_PIPE_DEPTH = 4
+                STORE_PIN_STRIDE = 2
+                recent_hv_rows = []
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
+                    cur_hv_raws = []
                     for wn in range_constexpr(wmma_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
                         acc = Vec(accs[wm * wmma_n_rep + wn])
@@ -1107,11 +1124,23 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
+                            hv_i32 = hv.bitcast(fx.Int32).ir_value()
                             lds_store_b128(
                                 stC_idx,
-                                (row_rel * STORE_N + col_rel) * 2,
-                                hv.bitcast(fx.Int32).ir_value(),
+                                (row_rel * STORE_PITCH + col_rel) * 2,
+                                hv_i32,
                             )
+                            cur_hv_raws.append(hv_i32)
+                    if const_expr(not stage1_act):
+                        recent_hv_rows.append(cur_hv_raws)
+                        if const_expr(wm % STORE_PIN_STRIDE == STORE_PIN_STRIDE - 1):
+                            pin = [
+                                r
+                                for row in recent_hv_rows[-STORE_PIPE_DEPTH:]
+                                for r in row
+                            ]
+                            if pin:
+                                vgpr_keepalive(*pin)
 
             # -- Shared LDS -> TDM store to global --
             workgroup_barrier()
@@ -1128,15 +1157,30 @@ def launch_gemm_a8w4_tdm(
                 oc_store = oc
                 c_iter = fx.get_iter(arg_c)
             c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-            gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-            atomC = make_tdm_store(gtC, mn_oob, out_stride)
-            fx.copy(
-                atomC,
-                lds_view(
+            if const_expr(STORE_PAD == 0):
+                gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                src = lds_view(
                     fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)
-                ),
-                gtC,
-            )
+                )
+            else:
+                # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
+                # extent clamps the inner axis to STORE_N so the pad never lands.
+                gtC = global_view(
+                    c_iter, c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                )
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [mn_oob, STORE_N],
+                    strides=[out_stride, None],
+                    num_warps=num_waves,
+                )
+                src = lds_view(
+                    fx.recast_iter(oc_store, base_ptr),
+                    (tile_m, STORE_PITCH),
+                    (STORE_PITCH, 1),
+                )
+            fx.copy(atomC, src, gtC)
             tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
