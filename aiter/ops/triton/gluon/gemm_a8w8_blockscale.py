@@ -985,20 +985,23 @@ def _get_config_cached(
     N: int,
     K: int,
 ):
-    dev = arch_info.get_arch()
     if not arch_info.is_gluon_avail():
         raise ValueError(
             "Gluon implementation is not supported on this device (requires CDNA4)."
         )
+
+    dev = arch_info.get_arch()
+
+    # Try specialized config first.
     config_dict = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json",
-    )
-    specialized = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
         required=False,
     )
-    if specialized is not None:
-        config_dict = specialized
+    # Fall back to the general config (must exist).
+    if config_dict is None:
+        config_dict = load_config_json(
+            f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
+        )
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
