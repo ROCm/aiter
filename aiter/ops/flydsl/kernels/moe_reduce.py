@@ -24,7 +24,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
-from .mxfp4_gemm_common import FP8OUT_SCALE_BLK, fp8out_row_bytes
+from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_row_bytes, fp8out_scale_blk
 
 BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
@@ -204,6 +204,8 @@ def compile_moe_reduction(
     num_experts: int = 0,
     out_dtype_str: str | None = None,
     use_weight: bool = False,
+    scale_blk: int | None = None,
+    pitch_align: int | None = None,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
@@ -216,12 +218,13 @@ def compile_moe_reduction(
     gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
     out_tag = out_dtype_str or dtype_str
     if dtype_str == "fp8":
-        if FP8OUT_SCALE_BLK % FP8_VEC:
-            raise ValueError(
-                f"scale_blk {FP8OUT_SCALE_BLK} must be a multiple of {FP8_VEC}"
-            )
-        scale_blk = FP8OUT_SCALE_BLK
-        fp8_row_stride = fp8out_row_bytes(model_dim)
+        scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)
+        if scale_blk % FP8_VEC:
+            raise ValueError(f"scale_blk {scale_blk} must be a multiple of {FP8_VEC}")
+        align = FP8OUT_PITCH_ALIGN if pitch_align is None else int(pitch_align)
+        fp8_row_stride = fp8out_row_bytes(
+            model_dim, scale_blk=scale_blk, pitch_align=align
+        )
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 

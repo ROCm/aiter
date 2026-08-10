@@ -987,6 +987,10 @@ def _run_compiled(exe, args):
         raise
 
 
+_S2_LEGACY_FP8_SCALE_BLK = 8
+_S2_LEGACY_FP8_PITCH_ALIGN = 0
+
+
 def _run_moe_reduction(
     target,
     out,
@@ -998,6 +1002,8 @@ def _run_moe_reduction(
     stream=None,
     is_fp8=False,
     topk_weights=None,
+    fp8_scale_blk=None,
+    fp8_pitch_align=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1032,9 +1038,17 @@ def _run_moe_reduction(
     # X[tokens, topk, model_dim]. out_dtype_str is only used by the fp8 path.
     out_dtype_str = _reduce_dtype_str
     if is_fp8:
+        from .kernels.mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_scale_blk
+
         _reduce_dtype_str = "fp8"
         out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
         X = target
+        fp8_scale_blk = (
+            fp8out_scale_blk(model_dim) if fp8_scale_blk is None else int(fp8_scale_blk)
+        )
+        fp8_pitch_align = (
+            FP8OUT_PITCH_ALIGN if fp8_pitch_align is None else int(fp8_pitch_align)
+        )
     else:
         X = target.view(token_num, topk, model_dim)
     if use_mask:
@@ -1063,6 +1077,8 @@ def _run_moe_reduction(
         num_experts=num_experts,
         out_dtype_str=out_dtype_str,
         use_weight=use_weight,
+        scale_blk=fp8_scale_blk if is_fp8 else None,
+        pitch_align=fp8_pitch_align if is_fp8 else None,
     )
     _run_compiled(
         reduce_exe,
@@ -2025,13 +2041,19 @@ def _flydsl_moe_stage2_impl(
         if return_per_slot:
             target = out.view(-1)
         else:
-            # fp8 route-out stores uint8 rows: N value bytes + N/scale_blk e8m0
-            # scale bytes.
+            # fp8 route-out stores uint8 rows: N value bytes + N/8 e8m0 scale bytes.
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
 
             target = torch.empty(
                 (
-                    (token_num * topk, fp8out_row_bytes(model_dim))
+                    (
+                        token_num * topk,
+                        fp8out_row_bytes(
+                            model_dim,
+                            scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
+                            pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+                        ),
+                    )
                     if _s2_fp8_inter
                     else (token_num * topk * model_dim,)
                 ),
@@ -2116,6 +2138,8 @@ def _flydsl_moe_stage2_impl(
             expert_mask,
             topk_ids,
             is_fp8=_s2_fp8_inter,
+            fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
+            fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
     return out
 

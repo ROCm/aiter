@@ -216,15 +216,29 @@ def lds_acc_bytes_for(rows, BN):
 
 
 FP8OUT_SCALE_BLK = 32
+FP8OUT_SCALE_BLK_MIN = 8
 FP8OUT_PITCH_ALIGN = 64
 
 
-def fp8out_row_bytes(model_dim):
+def fp8out_scale_blk(model_dim):
     model_dim = int(model_dim)
-    if model_dim % FP8OUT_SCALE_BLK:
+    blk = FP8OUT_SCALE_BLK
+    while blk > FP8OUT_SCALE_BLK_MIN and model_dim % blk:
+        blk //= 2
+    if model_dim % blk:
         raise ValueError(
-            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK}"
+            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK_MIN}"
         )
-    pitch = model_dim + model_dim // FP8OUT_SCALE_BLK
-    align = FP8OUT_PITCH_ALIGN
+    return blk
+
+
+def fp8out_row_bytes(model_dim, scale_blk=None, pitch_align=FP8OUT_PITCH_ALIGN):
+    model_dim = int(model_dim)
+    scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)
+    if model_dim % scale_blk:
+        raise ValueError(f"model_dim {model_dim} must be a multiple of {scale_blk}")
+    pitch = model_dim + model_dim // scale_blk
+    align = int(pitch_align)
+    if align <= 0:
+        return pitch
     return ((pitch + align - 1) // align) * align

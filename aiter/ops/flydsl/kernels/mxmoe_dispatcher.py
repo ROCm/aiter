@@ -141,7 +141,7 @@ def compile_gemm2_a4w4_port(
     if BN not in (64, 128, 256, 512) or BK not in (128, 256):
         raise AssertionError(
             "mxfp4_moe_gemm2 supports only "
-            f"(BN in {{64,128,256}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
+            f"(BN in {{64,128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
@@ -532,6 +532,7 @@ def get_g2(
     g2_c_split=None,
     g2_defer_weight=None,
     g2_kstatic=None,
+    g2_scale_blk=None,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -563,7 +564,7 @@ def get_g2(
     from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
     g2_out_pitch_align = FP8OUT_PITCH_ALIGN
-    g2_scale_blk = FP8OUT_SCALE_BLK
+    g2_scale_blk = int(FP8OUT_SCALE_BLK if g2_scale_blk is None else g2_scale_blk)
     key = (
         BM,
         BN,
@@ -662,6 +663,7 @@ def mxfp4_moe_gemm2(
     g2_spart=None,
     g2_c_split=None,
     g2_defer_weight=None,
+    g2_scale_blk=None,
     stream=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
@@ -695,6 +697,10 @@ def mxfp4_moe_gemm2(
     _kstatic = D_INTER % BK == 0
     if _kstatic:
         INTER_MAX = D_INTER
+    if str(out_dtype).strip().lower() == "fp8" and g2_scale_blk is None:
+        from .mxfp4_gemm_common import fp8out_scale_blk
+
+        g2_scale_blk = fp8out_scale_blk(D_HIDDEN)
     launch = get_g2(
         BM,
         BN,
@@ -715,6 +721,7 @@ def mxfp4_moe_gemm2(
         g2_spart=g2_spart,
         g2_c_split=g2_c_split,
         g2_defer_weight=g2_defer_weight,
+        g2_scale_blk=g2_scale_blk,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

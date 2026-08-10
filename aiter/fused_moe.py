@@ -1951,21 +1951,27 @@ def _flydsl_v2_stage2_wrapper(
         epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
     _defer_w = _s2_fp8_inter and sorted_weights is not None and topk_weights is not None
+    _fp8_scale_blk = None
     if epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
-                FP8OUT_SCALE_BLK,
+                FP8OUT_SCALE_BLK_MIN,
                 fp8out_row_bytes,
+                fp8out_scale_blk,
             )
 
-            if model_dim_runtime % FP8OUT_SCALE_BLK != 0:
+            if model_dim_runtime % FP8OUT_SCALE_BLK_MIN != 0:
                 raise ValueError(
                     "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
-                    f"by {FP8OUT_SCALE_BLK}"
+                    f"by {FP8OUT_SCALE_BLK_MIN}"
                 )
+            _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
 
             target = torch.empty(
-                (token_num * topk, fp8out_row_bytes(model_dim_runtime)),
+                (
+                    token_num * topk,
+                    fp8out_row_bytes(model_dim_runtime, scale_blk=_fp8_scale_blk),
+                ),
                 dtype=torch.uint8,
                 device=out.device,
             )
@@ -2010,6 +2016,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_spart=cfg["spart"],
         g2_c_split=cfg["c_split"],
         g2_defer_weight=_defer_w,
+        g2_scale_blk=_fp8_scale_blk,
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if epilog == "reduce":
@@ -2025,6 +2032,7 @@ def _flydsl_v2_stage2_wrapper(
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
             topk_weights=topk_weights if _defer_w else None,
+            fp8_scale_blk=_fp8_scale_blk,
         )
     return out
 
@@ -3081,7 +3089,11 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
-    if stage2_func is _flydsl_v2_stage2_wrapper and not doweight_stage1:
+    if (
+        stage2_func is _flydsl_v2_stage2_wrapper
+        and not doweight_stage1
+        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    ):
         extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
