@@ -827,14 +827,17 @@ def _make_dualwave_swp_fp8_traits(
         assert block_m % gqa_group_size == 0, (
             f"block_m={block_m} must be divisible by gqa_group_size="
             f"{gqa_group_size} to pack the group into M")
-        # The split-K partial store and its combine index the workspace by a
-        # SCALAR q_head_idx (store_splitk_partial_o and the combine kernel),
-        # which does not exist under packing -- the head varies per M row. That
-        # is a real but separate change; refuse rather than write every head of
-        # the group into one head's workspace rows.
-        assert num_kv_splits <= 1, (
-            "gqa_pack_m with num_kv_splits > 1 is not implemented: the split-K "
-            "workspace is indexed by a scalar q_head_idx per workgroup")
+        # PROTOTYPE (packed + split-K): the split-K partial store used to index
+        # the workspace by a SCALAR q_head_idx, which does not exist under
+        # packing where the head varies per M row. store_splitk_partial_o /
+        # store_empty_split are now head-aware (they key by the per-M-row
+        # q_head_row, exactly as store_final_o does), and the combine kernel was
+        # already head-generic (it iterates every (batch, head, token) slot and
+        # reads the workspace by the output head), so the combination now builds.
+        # It is NOT auto-enabled: the default at :824 still yields unpacked for
+        # num_kv_splits > 1, so packed+split-K only occurs when a caller passes
+        # gqa_pack_m=True explicitly. GQA_PACK_M and NUM_KV_SPLITS both key the
+        # JIT cache, so this variant cannot alias the unpacked split-K binary.
         block_q = block_m // gqa_group_size
     else:
         block_q = block_m
@@ -2375,13 +2378,20 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
 
     def store_splitk_partial_o(self, v_o, m_row, l_row, q_row):
         split_z = self.batch_idx * self.traits.NUM_KV_SPLITS + self.split_idx
-        o_part_row_base = ((split_z * self.traits.NUM_HEADS_Q + self.q_head_idx) * self.seq_len_v + q_row) * (
+        # Head is per M row: q_head_idx is a valid scalar only unpacked, and is
+        # None under GQA_PACK_M where the head varies per lane. ctx_head_row()
+        # gives the per-M-row q-head in both modes (it equals q_head_idx when
+        # unpacked, so this is byte-identical there), the same index store_final_o
+        # and the combine kernel key the workspace on -- so packed partials land
+        # in the (head, token) row the combine reads.
+        head_row = self.ctx_head_row()
+        o_part_row_base = ((split_z * self.traits.NUM_HEADS_Q + head_row) * self.seq_len_v + q_row) * (
             self.traits.HEAD_DIM // 2
         )
         grid_z = fx.Index(gpu.grid_dim.z)
         mrow_base = grid_z * self.traits.NUM_HEADS_Q * self.seq_len_v * (self.traits.HEAD_DIM // 2)
         lrow_base = mrow_base + grid_z * self.traits.NUM_HEADS_Q * self.seq_len_v
-        ml_row_idx = (split_z * self.traits.NUM_HEADS_Q + self.q_head_idx) * self.seq_len_v + q_row
+        ml_row_idx = (split_z * self.traits.NUM_HEADS_Q + head_row) * self.seq_len_v + q_row
 
         @flyc.jit
         def _store_splitk_partial_if_qrow():
@@ -2418,15 +2428,27 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         @flyc.jit
         def _store_empty_split():
             if self.max_num_tiles < self.split_t0 + fx.Index(4):
-                q_row_e = self.q_start + self.wave_q_offset + self.lane_mod_32
+                # Runs outside the active guard, so init_q_row has not run for an
+                # empty split -- recompute the M row here. Under GQA_PACK_M the M
+                # row decomposes into (query position, head in group) exactly as
+                # _init_dualwave_q_row does; unpacked the two coincide and this is
+                # byte-identical to the previous q_head_idx form.
+                m_row_e = self.wave_q_offset + self.lane_mod_32
+                if const_expr(self.traits.GQA_PACK_M):
+                    g_e = fx.Index(self.traits.GQA_GROUP_SIZE)
+                    q_row_e = self.q_start + m_row_e // g_e
+                    head_row_e = self.q_head_base + m_row_e % g_e
+                else:
+                    q_row_e = self.q_start + m_row_e
+                    head_row_e = self.q_head_idx
                 split_z_e = self.batch_idx * self.traits.NUM_KV_SPLITS + self.split_idx
-                o_row_base_e = ((split_z_e * self.traits.NUM_HEADS_Q + self.q_head_idx) * self.seq_len_v + q_row_e) * (
+                o_row_base_e = ((split_z_e * self.traits.NUM_HEADS_Q + head_row_e) * self.seq_len_v + q_row_e) * (
                     self.traits.HEAD_DIM // 2
                 )
                 grid_z_e = fx.Index(gpu.grid_dim.z)
                 mrow_base_e = grid_z_e * self.traits.NUM_HEADS_Q * self.seq_len_v * (self.traits.HEAD_DIM // 2)
                 lrow_base_e = mrow_base_e + grid_z_e * self.traits.NUM_HEADS_Q * self.seq_len_v
-                ml_row_e = (split_z_e * self.traits.NUM_HEADS_Q + self.q_head_idx) * self.seq_len_v + q_row_e
+                ml_row_e = (split_z_e * self.traits.NUM_HEADS_Q + head_row_e) * self.seq_len_v + q_row_e
                 if q_row_e < self.seq_len_v:
                     c_zero_i = fx.Int32(0)
                     for dc in range_constexpr(self.traits.D_CHUNKS):
