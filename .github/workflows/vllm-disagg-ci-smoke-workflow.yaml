@@ -277,21 +277,6 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-          diagnostic_dir="${GITHUB_WORKSPACE}/vllm-disagg-role-logs"
-          case "${diagnostic_dir}" in
-            "${GITHUB_WORKSPACE}/"*)
-              if [[ -e "${diagnostic_dir}" ]]; then
-                chmod -R u+rwX "${diagnostic_dir}" 2>/dev/null || true
-                rm -rf -- "${diagnostic_dir}" 2>/dev/null || true
-                if [[ -e "${diagnostic_dir}" ]]; then
-                  sudo -n rm -rf -- "${diagnostic_dir}"
-                fi
-                test ! -e "${diagnostic_dir}"
-              fi
-              ;;
-            *) echo "Refusing to clean unexpected path: ${diagnostic_dir}" >&2; exit 1 ;;
-          esac
-
       - name: Checkout vLLM Buildkite 17 baseline
         run: |
           set -euo pipefail
