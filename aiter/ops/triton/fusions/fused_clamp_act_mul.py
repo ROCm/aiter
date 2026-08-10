@@ -220,10 +220,10 @@ def fused_clamp_act_mul(
             ROWS_PER_PROG = 1
             BLOCK_SIZE_M = 1
         elif (M*D*2*2+M*D*2 < 500):
-            ROWS_PER_PROG = 2
+            ROWS_PER_PROG = 1
             BLOCK_SIZE_M = 2
         else:
-            ROWS_PER_PROG = 2
+            ROWS_PER_PROG = 1
             BLOCK_SIZE_M = 2
 
         assert (

@@ -47,7 +47,7 @@ def _fused_clamp_silu_mul_kernel(
     weights_stride_m,    # weights row stride
     weights_stride_n,    # weights col stride
     swiglu_limit,        # clamp bound (used only when HAVE_SWIGLU_CLAMP)
-    ROWS_PER_PROG: gl.constexpr,    # ring buffers = rows per program = loop trips
+    ROWS_PER_PROG: gl.constexpr,    # BLOCK_SIZE_M-row tiles per program = loop trips
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     QUANT_BLOCK_SIZE: gl.constexpr,
@@ -66,29 +66,26 @@ def _fused_clamp_silu_mul_kernel(
 ):
     # constants
     NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
+    ROWS_PER_PROG_TOTAL: gl.constexpr = ROWS_PER_PROG * BLOCK_SIZE_M
 
-    # one 2d shared layout for ROWS_PER_PROGx2*N
+    # one 2d shared layout for BLOCK_SIZE_M x 2*N
     shared_tdm_layout_2d: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[2 * BLOCK_SIZE_N, 8]], [1, 2 * BLOCK_SIZE_N], [1, 0],
+        [[2 * BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, 2 * BLOCK_SIZE_N], [1, 0],
     )
     pid = gl.program_id(0)
-    m_start = pid * ROWS_PER_PROG
-
-    # gate + up
-    gate_up_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [BLOCK_SIZE_M, 1, 2 * BLOCK_SIZE_N], shared_tdm_layout_2d
-    ) # rows per prog tied to LDS, loop should be decoupled TODO
+    m_start = pid * ROWS_PER_PROG_TOTAL
 
     inp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=inp_ptr,
-        shape=[M, 2 * n_half], # could be M - m_start TODO
+        shape=[M, 2 * n_half],
         strides=[inp_stride_m, inp_stride_n],
-        block_shape=[1, 2 * BLOCK_SIZE_N],
+        block_shape=[BLOCK_SIZE_M, 2 * BLOCK_SIZE_N],
         layout=shared_tdm_layout_2d,
     )
 
-    # load both gate + up
-    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_up_smem)
+    smem = gl.allocate_shared_memory(
+        inp_desc.dtype, shape=inp_desc.block_shape, layout=shared_tdm_layout_2d
+    )
 
     gLayout2D: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
@@ -103,6 +100,7 @@ def _fused_clamp_silu_mul_kernel(
         order=[1, 0],
     )
     row_layout: gl.constexpr = gl.SliceLayout(0, gLayout2D)         # [BLOCK_SIZE_N] row slice
+    m_layout: gl.constexpr = gl.SliceLayout(1, gLayout2D)           # [BLOCK_SIZE_M] column of rows
     row_scale_layout: gl.constexpr = gl.SliceLayout(0, sLayout2D)   # [NUM_N_Q_GROUPS] scale slice
 
     # setup + setup store
@@ -110,16 +108,17 @@ def _fused_clamp_silu_mul_kernel(
     mask = offs < n_half
     num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)
     g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)
-    store_col_offs = (offs * out_stride_n).to(gl.int32)
+
+    m_ids = gl.arange(0, BLOCK_SIZE_M, layout=m_layout)              # [BLOCK_SIZE_M]
+    store_offs = (
+        m_ids[:, None] * out_stride_m + offs[None, :] * out_stride_n
+    ).to(gl.int32)                                                  # [BM, BN]
 
     # main loop
     for i in range(ROWS_PER_PROG):
-        row = m_start + i
+        row = m_start + i * BLOCK_SIZE_M   # first row of this trip's tile
 
-        # prefetch
-        if i + 1 < ROWS_PER_PROG: # turn this to epilogue TODO, remove dynamic
-            nxt = i + 1
-            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_up_smem.index(nxt))
+        gl.amd.gfx1250.tdm.async_load(inp_desc, [row, 0], smem)
 
         # weights load
         if HAVE_WEIGHTS:
@@ -153,15 +152,16 @@ def _fused_clamp_silu_mul_kernel(
         else:
             bs_offs = 0 # not needed
 
-        if i + 1 < ROWS_PER_PROG:
-            gl.amd.gfx1250.tdm.async_wait(1)
-        else:
-            gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
-        # reshape then slice
-        gate_up = gate_up_smem.index(i).reshape([2 * BLOCK_SIZE_N]) # index(i) -- issue TODO
-        gate = gate_up.slice(0, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
-        up = gate_up.slice(BLOCK_SIZE_N, BLOCK_SIZE_N, dim=0).load(row_layout).to(gl.float32)
+        gate_up = smem.load(gLayout2D).to(gl.float32)   # [BLOCK_SIZE_M, 2*BLOCK_SIZE_N]
+        gate, up = gl.split(
+            gl.reshape(gate_up, [BLOCK_SIZE_M, 2, BLOCK_SIZE_N]).permute(0, 2, 1)
+        )   # each [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+        # one buffer reused, rows_per_prog held to 1 for this test
+        if ROWS_PER_PROG > 1 and num_warps > 1:
+            gl.barrier()
 
         # clamp
         if HAVE_SWIGLU_CLAMP:
@@ -170,6 +170,9 @@ def _fused_clamp_silu_mul_kernel(
 
         # act(gate) * up
         out = _apply_activation_from_str(gate, ACTIVATION) * up
+
+        # convert to layout, testing if paddedsharedlayout still throws compiler issue
+        out = gl.convert_layout(out, gLayout2D)
 
         # apply weights
         if HAVE_WEIGHTS:
@@ -228,9 +231,10 @@ def _fused_clamp_silu_mul_kernel(
             result = out
 
         # buffer store for a bit of perf uplift
+        # 2D mask: row tail (this tile's rows past M) x col tail (cols past n_half)
         gl.amd.gfx1250.buffer_store(
             result.to(out_ptr.dtype.element_ty),
             out_ptr + row.to(gl.int64) * out_stride_m,
-            store_col_offs,
-            mask=mask & (row < M),
+            store_offs,
+            mask=((row + m_ids) < M)[:, None] & mask[None, :],
         )
