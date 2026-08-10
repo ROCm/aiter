@@ -119,3 +119,10 @@ def test_reference_reproduces_flydsl_scalar_decode(B, H, dt):
 
     torch.testing.assert_close(out.float(), ref_out.float(), atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(kernel_state, ref_state, atol=1e-4, rtol=1e-4)
+
+
+# CI runs each file as `python3 <file>`, which collects nothing on its own.
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

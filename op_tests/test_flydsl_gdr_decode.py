@@ -3,9 +3,11 @@
 
 """CI-visible tests for the FlyDSL GDR decode op: its export, and its numerics.
 
-CI collects only ``op_tests/test_*.py`` at depth 1 (see
-``.github/scripts/split_tests.sh``), so the in-package suite at
-``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never runs automatically.
+CI shards ``op_tests/test_*.py`` at depth 1 (``.github/scripts/split_tests.sh``)
+and runs each as ``python3 <file>`` (``.github/scripts/aiter_test.sh``), so the
+in-package suite at ``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never
+runs automatically, and a file without the ``__main__`` entry below collects
+nothing and still exits 0. Being listed is not the same as being run.
 
 The export checks matter on their own: importing from
 ``linear_attention_kernels`` keeps working if the export drops back out of
@@ -492,3 +494,10 @@ def test_kda_tuned_rows_are_not_reachable_from_the_scalar_gate():
 
     for B in tuned_batches:
         assert lookup(B, "gdr") == fallback, f"scalar GDR at B={B} took a kda row"
+
+
+# CI runs each file as `python3 <file>`, which collects nothing on its own.
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
