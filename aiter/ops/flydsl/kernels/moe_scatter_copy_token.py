@@ -38,56 +38,26 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
-from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
+from .buffer_view import (  # noqa: F401
+    make_buffer,
+    buffer_store,
+    buffer_load,
+)
+
+_make_buffer = make_buffer
+_buffer_store = buffer_store
+_buffer_load = buffer_load
+
 BLOCK_THREADS = 256
-
-
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
-# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
-# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
-# calling convention): fx.slice on the last coord reads/writes `width` contiguous
-# elements starting at `group_index`. The copy dtype (i32 for dword* ops, i8 for
-# the byte fallback) is baked into each buffer.
-# ---------------------------------------------------------------------------
-def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = Vec(fragment.load())
-    return value[0] if width == 1 else value
-
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def build_moe_scatter_copy_token_module(row_bytes: int):

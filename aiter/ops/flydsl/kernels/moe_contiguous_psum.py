@@ -17,52 +17,23 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
-from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
+from .buffer_view import (  # noqa: F401
+    make_buffer,
+    buffer_store,
+    buffer_load,
+)
+
+_make_buffer = make_buffer
+_buffer_store = buffer_store
+_buffer_load = buffer_load
+
 MAX_EXPERTS_PER_BLOCK = 512
-
-
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
-# buffer tensor built from a kernel-arg pointer's base. The layout uses stride
-# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
-# calling convention): fx.slice on the last coord reads/writes `width` contiguous
-# elements starting at `group_index`.
-# ---------------------------------------------------------------------------
-def _make_buffer(ptr, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(ptrtoint(ptr)))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = Vec(fragment.load())
-    return value[0] if width == 1 else value
-
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def _lds_slot_ptr(base_i64, elem_idx):

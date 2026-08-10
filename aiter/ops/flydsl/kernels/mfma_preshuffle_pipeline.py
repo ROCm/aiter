@@ -17,70 +17,16 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr import arith as _arith
 from flydsl.expr.typing import T, as_ir_value
-from flydsl.expr.typing import Vector as Vec
 
+from functools import partial
 
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored buffer_ops (rsrc, element_offset) shim: callers now
-# hand in a typed buffer tensor (built once, hoisted out of the K loop) instead
-# of a raw rsrc + an injected buffer_ops module. The layout uses stride (1, 1)
-# so `group_index` counts ELEMENTS (matching the shim's element-offset calling
-# convention): fx.slice on the last coord reads `width` contiguous elements
-# starting at `group_index`. An i32-typed buffer therefore reproduces the shim's
-# `buffer_load(rsrc, idx, dtype=T.i32)` byte math (idx * 4) exactly.
-# ---------------------------------------------------------------------------
-def make_buffer_addr(addr_i64, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    """Build a typed layout-API buffer tensor from a computed i64 base address.
+from .buffer_view import (  # noqa: F401
+    make_buffer,
+    make_buffer_addr,
+    buffer_load,
+)
 
-    The view uses stride ``(1, 1)`` so a slice on the last coord counts ELEMENTS
-    of ``elem_ty`` (the shim's element-offset convention). An i32-typed buffer
-    (``width`` covering the widest load, e.g. 4 for dwordx4) reproduces the old
-    ``buffer_load(rsrc, idx, dtype=T.i32)`` byte math exactly. Public so GEMM
-    callers can build ``b_buffer`` once (hoisted where the old rsrc was built)
-    without inlining the construction or re-vending the buffer_ops shim.
-    """
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    """Build a typed layout-API buffer tensor from a kernel-arg pointer or tensor.
-
-    A tensor is dereferenced via ``get_iter`` before ``ptrtoint``; a raw
-    ``!fly.ptr`` argument (the GEMM kernels' pointer args) is passed straight to
-    ``ptrtoint`` (matching the old ``ptr_buffer_resource`` byte-address math).
-    """
-    try:
-        addr = fx.ptrtoint(fx.get_iter(tensor))
-    except Exception:
-        addr = fx.ptrtoint(tensor)
-    return make_buffer_addr(
-        fx.Int64(addr),
-        elem_ty,
-        width,
-        max_size=max_size,
-        num_records_bytes=num_records_bytes,
-    )
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = Vec(fragment.load())
-    # Scalar loads return a raw ir.Value (matching the old buffer_ops.buffer_load,
-    # whose result feeds raw arith.* ops e.g. in extract_bf16_scale); width>1
-    # returns the vector for callers that index / bitcast it.
-    return as_ir_value(value[0]) if width == 1 else value
+_buffer_load = partial(buffer_load, raw=True)
 
 
 def crd2idx(crd, layout):

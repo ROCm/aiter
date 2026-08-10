@@ -94,6 +94,18 @@ from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
 
+from functools import partial
+
+from .buffer_view import (  # noqa: F401
+    make_buffer,
+    buffer_store,
+    buffer_load,
+)
+
+_make_buffer = make_buffer
+_buffer_store = buffer_store
+_buffer_load = partial(buffer_load, raw=True)
+
 
 def _velem(vec, i):
     """Element *i* of *vec* as a raw ir.Value (this kernel feeds raw MLIR ops)."""
@@ -131,53 +143,6 @@ def _max_raw(a, b):
     backend assume -inf never occurs and drop the guard -> corrupt results."""
     # BOUNDARY: non-fastmath maximumf over the -inf softmax accumulator.
     return fx.Float32(arith.maximumf(_to_raw(a), _to_raw(b)))
-
-
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored (rsrc, element_offset) buffer shim with a typed
-# buffer tensor built from the tensor's base pointer. The layout uses stride
-# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
-# calling convention): fx.slice on the last coord reads/writes `width` contiguous
-# elements starting at `group_index`. An i8-typed buffer therefore makes
-# `group_index` a byte offset, covering the old offset_is_bytes=True stores.
-#
-# A buffer bakes in (elem_ty, width); build one per (tensor, dtype, width) used.
-# Loads/stores return / accept raw ir.Values, matching the old shim contract so
-# the raw-MLIR call sites in this kernel need no rewrapping.
-# ---------------------------------------------------------------------------
-def _make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = fx.Vector(fragment.load())
-    return _to_raw(value[0]) if width == 1 else _to_raw(value)
-
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(
-        fx.Vector.from_elements([value], elem_ty)
-        if width == 1
-        else fx.Vector(value)
-    )
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def _make_rsrc(tensor, max_size=True):

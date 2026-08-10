@@ -8,49 +8,24 @@ import torch
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
 
+from aiter.ops.flydsl.kernels.buffer_view import (  # noqa: F401
+    make_buffer,
+    buffer_store,
+    buffer_load,
+)
+
+_make_buffer = make_buffer
+_buffer_store = buffer_store
+_buffer_load = buffer_load
+
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int32
-    from flydsl.expr.typing import Vector as Vec
 
     _FLYDSL_AVAILABLE = True
 except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
     _FLYDSL_AVAILABLE = False
-
-
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API), replacing the vendored buffer_ops
-# (rsrc, element_offset) shim. The layout stride is (1, 1) so the slice index
-# counts ELEMENTS, matching the shim's element-offset calling convention.
-# ---------------------------------------------------------------------------
-def _make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def _buffer_load(buffer, index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, index)), fragment)
-    value = Vec(fragment.load())
-    return value[0] if width == 1 else value
-
-
-def _buffer_store(buffer, index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
-    fx.copy(atom, fragment, fx.slice(buffer, (None, index)))
 
 
 PAD_SLOT_ID = -1

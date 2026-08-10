@@ -85,42 +85,15 @@ from .mfma_preshuffle_pipeline import (
     tile_chunk_coord_i32,
 )
 
+from functools import partial
 
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
-# buffer tensor built from the tensor's base pointer. The layout uses stride
-# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
-# calling convention): fx.slice on the last coord reads/writes `width`
-# contiguous elements starting at `group_index`. An i8-typed buffer therefore
-# makes `group_index` a byte offset. `make_buffer`/`make_buffer_addr` (shared
-# with the preshuffle pipeline) build the descriptor once, hoisted where the old
-# rsrc was built; raw ROCDL ops obtain their rsrc via
-# `fx.rocdl.get_buffer_rsrc(fx.get_iter(buffer))`.
-# ---------------------------------------------------------------------------
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = fx.Vector(fragment.load())
-    # Return a raw ir.Value for the scalar case (matches the old buffer_ops
-    # buffer_load, whose result feeds the file's raw arith.* / rocdl.* ops);
-    # width>1 keeps the vector for callers that index it.
-    return as_ir_value(value[0]) if width == 1 else value
+from .buffer_view import (  # noqa: F401
+    buffer_store,
+    buffer_load,
+)
 
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(
-        fx.Vector.from_elements([value], elem_ty) if width == 1 else fx.Vector(value)
-    )
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
+_buffer_store = buffer_store
+_buffer_load = partial(buffer_load, raw=True)
 
 
 @contextmanager

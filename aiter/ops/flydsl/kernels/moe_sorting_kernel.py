@@ -35,6 +35,16 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
+from .buffer_view import (  # noqa: F401
+    make_buffer,
+    buffer_store,
+    buffer_load,
+)
+
+_make_buffer = make_buffer
+_buffer_store = buffer_store
+_buffer_load = buffer_load
+
 BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
 WARP_SIZE = get_warp_size()
@@ -51,46 +61,6 @@ DPP_ROW_SHR_4 = 0x114
 DPP_ROW_SHR_8 = 0x118
 DPP_ROW_MASK = 0xF
 DPP_BANK_MASK = 0xF
-
-
-# ---------------------------------------------------------------------------
-# Buffer helpers (FlyDSL layout API).
-#
-# These replace the vendored buffer_ops (rsrc, element_offset) shim with a typed
-# buffer tensor built from the tensor's base pointer. The layout uses stride
-# (1, 1) so `group_index` counts ELEMENTS (matching the shim's element-offset
-# calling convention, not the (width, width) group-stride form): fx.slice on the
-# last coord reads/writes `width` contiguous elements starting at `group_index`.
-# An i8-typed buffer therefore makes `group_index` a byte offset, covering the
-# old offset_is_bytes=True stores.
-# ---------------------------------------------------------------------------
-def _make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
-    )
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = Vec(fragment.load())
-    return value[0] if width == 1 else value
-
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def _unwrap_val(v):
