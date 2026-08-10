@@ -609,10 +609,8 @@ def launch_gemm_a8w4_tdm(
         # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
         MMA_GROUP_WITH_ACT = 4
         MMA_GROUP_NO_ACT = 4
-        # Fraction of the slots that carry the prefetch reads; the rest close the
-        # region on pure MFMA, covering the next k128's REUSE fence.
-        FENCE_READ_FRONT = 1
-        # WMMA reserved as that closing group.
+        # WMMA held back as a closing pure-MFMA group, covering the next k128's
+        # REUSE fence; the prefetch reads interleave evenly over the rest.
         FENCE_COVER_MMA = 8
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
@@ -783,16 +781,9 @@ def launch_gemm_a8w4_tdm(
                     else 1
                 )
                 schedule_slots = mma_total // mma_group
-                # Front-load the reads so trailing slots stay pure MFMA; an even
-                # spread leaves one read beside the fence's s_wait_dscnt(0).
-                ds_slots = (
-                    max(1, int(schedule_slots * FENCE_READ_FRONT))
-                    if (tail_mfma > 0)
-                    else schedule_slots
-                )
                 future_schedule = spread(
-                    STATE_DS if has_next else 0, ds_slots
-                ) + [0] * (schedule_slots - ds_slots)
+                    STATE_DS if has_next else 0, schedule_slots
+                )
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
