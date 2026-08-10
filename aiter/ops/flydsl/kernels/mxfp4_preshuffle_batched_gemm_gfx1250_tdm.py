@@ -259,12 +259,13 @@ def launch_gemm_a8w4_tdm(
             )
             gSB_h.append(gsb)
             atomSB_h.append(_tdm1(gsb, None, SB_OUTER_STRIDE, b_mask))
-        _adv = fx.rocdl.advance_tdm_atom
         base_i32 = fx.recast_iter(fx.Int32, base_ptr)
 
-        def _wcopy(w, atom, gt, lv):
+        # flydsl 0.3.0 dropped rocdl.advance_tdm_atom; the K-tile step is now an
+        # imm_offset on the copy itself (same lowering, no per-tile atom rebuild).
+        def _wcopy(w, atom, off, gt, lv):
             if wave == w:
-                fx.copy(atom, gt, lv)
+                fx.copy(atom, gt, lv, imm_offset=fx.Int64(off))
 
         def issue(s, kt):
             pa = _buf_ptr(s)
@@ -272,7 +273,8 @@ def launch_gemm_a8w4_tdm(
             for h in range_constexpr(2):
                 _wcopy(
                     W_A[h],
-                    _adv(atomA_h[h], kt * A_ROW_B),
+                    atomA_h[h],
+                    kt * A_ROW_B,
                     gA_h[h],
                     _lv(
                         fx.add_offset(pa, h * HM * A_LDS_ROW),
@@ -282,7 +284,8 @@ def launch_gemm_a8w4_tdm(
                 )
                 _wcopy(
                     W_B[h],
-                    _adv(atomB_h[h], kt * (PACK_TK * 16)),
+                    atomB_h[h],
+                    kt * (PACK_TK * 16),
                     gB_h[h],
                     _lv(
                         fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW),
@@ -292,7 +295,8 @@ def launch_gemm_a8w4_tdm(
                 )
                 _wcopy(
                     W_SA[h],
-                    _adv(atomSA_h[h], kt * (SC_INNER * 4)),
+                    atomSA_h[h],
+                    kt * (SC_INNER * 4),
                     gSA_h[h],
                     _lv(
                         fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER),
@@ -302,7 +306,8 @@ def launch_gemm_a8w4_tdm(
                 )
                 _wcopy(
                     W_SB[h],
-                    _adv(atomSB_h[h], kt * (SC_INNER * 4)),
+                    atomSB_h[h],
+                    kt * (SC_INNER * 4),
                     gSB_h[h],
                     _lv(
                         fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER),
@@ -458,19 +463,21 @@ def launch_gemm_a8w4_tdm(
             )
             compute_ktile(buf, None)
 
-        accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
+        accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+        oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
         # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
+        # flydsl 0.3.0 dropped fx.trunc_f / fx.vector; the f32->out_elem narrowing
+        # and the 8xout_elem -> 4xi32 reinterpret are Vec methods now.
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
-                i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
+                hv = Vec(accs[wm * wmma_n_rep + wn]).to(oc)
+                i32v = hv.bitcast(fx.Int32).ir_value()
                 lds_store_b128(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
         workgroup_barrier(use_cluster=False)
-        oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
         atomC = _tdm(
