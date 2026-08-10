@@ -277,23 +277,11 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Cancel superseded 5-8-only Slurm job
-        run: |
-          set -euo pipefail
-          stale_job_id=4182
-          stale_job="$(scontrol show job "${stale_job_id}" 2>/dev/null || true)"
-          if [[ -z "${stale_job}" ]]; then
-            echo "Superseded Slurm job ${stale_job_id} is no longer present"
-            exit 0
-          fi
-          if ! grep -qE 'JobName=vllm-disagg-pd([[:space:]]|$)' <<< "${stale_job}" || \
-             ! grep -qE "UserId=$(whoami)([[:space:]]|$)" <<< "${stale_job}"; then
-            echo "Refusing to cancel Slurm job ${stale_job_id}: ownership or job name does not match" >&2
-            echo "${stale_job}" >&2
-            exit 1
-          fi
-          echo "Cancelling superseded Slurm job ${stale_job_id} from run 31383654024"
-          scancel "${stale_job_id}"
+          diagnostic_dir="${GITHUB_WORKSPACE}/vllm-disagg-role-logs"
+          case "${diagnostic_dir}" in
+            "${GITHUB_WORKSPACE}/"*) rm -rf -- "${diagnostic_dir}" ;;
+            *) echo "Refusing to clean unexpected path: ${diagnostic_dir}" >&2; exit 1 ;;
+          esac
 
       - name: Checkout vLLM Buildkite 17 baseline
         run: |
