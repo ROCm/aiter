@@ -151,6 +151,26 @@ def test_fp8_mqa_logits(
     assert diff < 1e-3, f"{diff=}"
 
 
+@pytest.mark.parametrize(
+    ("gfx", "expected"),
+    [
+        ("gfx942", True),
+        ("gfx950", True),
+        ("gfx1250", True),
+        ("gfx1100", False),
+        ("gfx1151", False),
+        ("gfx1200", False),
+        ("gfx1201", False),
+    ],
+)
+def test_gluon_paged_mqa_logits_arch_gate(gfx: str, expected: bool) -> None:
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        _is_gluon_pa_mqa_logits_supported,
+    )
+
+    assert _is_gluon_pa_mqa_logits_supported(gfx) is expected
+
+
 @pytest.mark.parametrize("context_len", [128, 1024])
 @torch.inference_mode()
 def test_fp8_paged_mqa_logits_page_size_one(context_len: int) -> None:

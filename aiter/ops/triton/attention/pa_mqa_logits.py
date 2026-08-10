@@ -79,6 +79,13 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
+_GLUON_PA_MQA_LOGITS_ARCHS = frozenset(("gfx942", "gfx950", "gfx1250"))
+
+
+def _is_gluon_pa_mqa_logits_supported(gfx: str) -> bool:
+    return gfx in _GLUON_PA_MQA_LOGITS_ARCHS
+
+
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -257,7 +264,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
+    assert _is_gluon_pa_mqa_logits_supported(gfx_version)
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
         if Preshuffle:
@@ -516,7 +523,9 @@ def deepgemm_fp8_paged_mqa_logits(
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
 
-    use_gluon = enable_gluon_pa_mqa_logits and get_gfx() != "gfx1201"
+    use_gluon = enable_gluon_pa_mqa_logits and _is_gluon_pa_mqa_logits_supported(
+        get_gfx()
+    )
     if use_gluon:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
