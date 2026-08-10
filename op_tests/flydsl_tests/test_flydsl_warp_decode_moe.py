@@ -438,6 +438,85 @@ def test_down_reduce_fp8(case):
 
 
 # -------------------------------------------------------------------------
+# Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
+# -------------------------------------------------------------------------
+# GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
+# weight-row offset. These two cases run the real DeepSeek-V3 expert count
+# (E=256, H7168/I2048/TOPK8) and force the *max-id* expert (E-1, the largest
+# weight-row offset) into the routing, locking in offset-arithmetic
+# correctness at production expert counts. Verified cos=1.0 on gfx950; the
+# only FlyDSL addressing limit (buffer_load's i32 dword index) is reached
+# solely by >8 GB weight tensors, far above any ticket shape (see the plan's
+# Phase A / ?9). References are computed for the routed (b,k) rows only, so
+# HBM use is dominated by the ~3.5 GB FP8 weight tensors (guarded below).
+_DEEPSEEK_REAL_E = dict(B=1, HIDDEN=7168, INTER=2048, E=256, TOPK=8)
+_REAL_E_MIN_FREE_GB = 16.0
+
+
+def _skip_if_low_hbm():
+    free_bytes, _ = torch.cuda.mem_get_info()
+    free_gb = free_bytes / 1e9
+    if free_gb < _REAL_E_MIN_FREE_GB:
+        pytest.skip(
+            f"needs >= {_REAL_E_MIN_FREE_GB:.0f} GB free HBM for the E=256 weight "
+            f"tensors (have {free_gb:.1f} GB)"
+        )
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_gate_up_fp8_real_expert_count():
+    """gate_up at real E=256 with the max-offset expert forced (G1 regression)."""
+    _skip_if_low_hbm()
+    d = _DEEPSEEK_REAL_E
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        d["B"], d["HIDDEN"], d["INTER"], d["E"], d["TOPK"], "pertensor"
+    )
+    router_ids[0, 0] = d["E"] - 1  # largest weight-row offset
+    out = flydsl_warp_decode_gate_up(
+        x, w_gate, w_up, router_ids, wgs, wus, w_scale_mode="pertensor"
+    ).float()
+    torch.cuda.synchronize()
+    # Compact reference: only the routed (b,k) rows (avoid materialising the
+    # whole [E, INTER, HIDDEN] weight tensor in fp32).
+    xf = x.float()
+    worst_cos = 1.0
+    for b in range(d["B"]):
+        for k in range(d["TOPK"]):
+            e = int(router_ids[b, k])
+            g = (xf[b] @ w_gate[e].float().T) * float(wgs[0])
+            u = (xf[b] @ w_up[e].float().T) * float(wus[0])
+            ref = (g / (1.0 + torch.exp(-g))) * u
+            cos = _cosine(ref, out[b, k])
+            worst_cos = min(worst_cos, cos)
+    print(f"[real-E gate_up] E={d['E']} worst per-(b,k) cos={worst_cos:.6f}")
+    assert worst_cos >= 0.999
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_down_reduce_fp8_real_expert_count():
+    """down_reduce at real E=256 with the max-offset expert forced (G1 regression)."""
+    _skip_if_low_hbm()
+    d = _DEEPSEEK_REAL_E
+    inter, w_down, router_ids, router_wts, wds = _gen_down(
+        d["B"], d["INTER"], d["HIDDEN"], d["E"], d["TOPK"], "pertensor"
+    )
+    router_ids[0, 0] = d["E"] - 1  # largest weight-row offset
+    out = flydsl_warp_decode_down_reduce(
+        inter, w_down, router_ids, router_wts, wds, w_scale_mode="pertensor"
+    ).float()
+    torch.cuda.synchronize()
+    ref = torch.zeros(d["B"], d["HIDDEN"], device=inter.device)
+    for b in range(d["B"]):
+        for k in range(d["TOPK"]):
+            e = int(router_ids[b, k])
+            dot = inter[b, k].float() @ w_down[e].float().T
+            ref[b] += float(router_wts[b, k]) * float(wds[0]) * dot
+    cos = _cosine(ref, out)
+    print(f"[real-E down] E={d['E']} cos={cos:.6f}")
+    assert cos >= 0.999
+
+
+# -------------------------------------------------------------------------
 # Perf sweep -- combined correctness + benchmark (SILOTIGER-667 ?2 standard)
 # -------------------------------------------------------------------------
 # Realistic decode shapes (weights >> last-level cache). B, HIDDEN, INTER, E,
