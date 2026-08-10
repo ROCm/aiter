@@ -35,6 +35,7 @@ from .intranode_kernels import (
     make_combine,
     make_combine_scatter,
     make_combine_fused_reduce,
+    make_combine_fused_sync,
     make_convert_dispatch_output,
     make_convert_combine_input,
     make_local_expert_count,
@@ -578,6 +579,13 @@ class EpDispatchCombineOp:
         else:
             dispatch_specs = [(cfg.dispatch_block_num, cfg.dispatch_warp_num_per_block)]
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
+        # Fused combine splits the cross-device barrier into its own 1-block
+        # kernel so the reduce grid is unconstrained (see below). On by default;
+        # SCATTER_COMB_SPLIT=0 restores the single-kernel variant. Read here
+        # because it also decides the combine geometry.
+        _fused_split = os.environ.get("SCATTER_COMB_SPLIT", "1") not in (
+            "0", "", "false", "False",
+        )
         if cfg.is_scatter:
             # Scatter combine hits an all-block grid barrier mid-kernel (Stage 1
             # write -> barrier -> Stage 3 read). With the gather-tuned (block=80,
@@ -591,15 +599,24 @@ class EpDispatchCombineOp:
             if _bw:
                 _b, _w = (int(x) for x in _bw.split(","))
                 combine_specs = [(_b, _w)]
+            elif cfg.is_fused and _fused_split:
+                # Fused combine = cross-device barrier + a light topk sum. With the
+                # barrier split out into its own kernel (below) the reduce grid is
+                # free, and 512x16 measured best-or-tied at every token count from
+                # 16 to 8192 (worst case ~0.9% off at 16 tokens, which is inside
+                # run-to-run noise; up to 1.7% ahead at 8192). So no tier table
+                # here: one geometry, one compiled variant.
+                combine_specs = [(512, 16)]
             elif cfg.is_fused:
-                # The fused combine is an xdb barrier + a light topk sum. Only the
-                # first npes lanes now touch the system-scope xdb flag, so additional
-                # waves are useful bandwidth workers instead of multiplying barrier
-                # traffic. Re-tuned after that change: keep 8 blocks through 32
-                # tokens (16 regresses at bs8), then 16/32/64 blocks win through
-                # 256/1024/larger counts. The next doubling is flat at 128 and
-                # regresses at 512/2048 because comb_bar starts dominating again.
-                # Override via SCATTER_COMB_BW for other token/hidden shapes.
+                # Unsplit fallback: the in-kernel barrier punishes wide grids (every
+                # block must be resident and clear the poll before any reduce work
+                # starts), so this path stays token-adaptive. Kept bit-identical to
+                # the pre-split default so SCATTER_COMB_SPLIT=0 is a clean A/B
+                # baseline: 8 blocks through 32 tokens (16 regresses at bs8), then
+                # 16/32/64 through 256/1024/larger. The next doubling is flat at 128
+                # and regresses at 512/2048 as the barrier starts dominating again.
+                # 64 is also the ceiling worth having: the single-kernel variant
+                # indexes its flag array by block id, so block_num <= xdb_flag_slots.
                 self._fused_comb_tiers = [
                     (32, (8, 16)),
                     (256, (16, 16)),
@@ -643,6 +660,18 @@ class EpDispatchCombineOp:
         if cfg.is_fused:
             # gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp;
             # combine only barriers (wait for peers' writes) + sums the topk slots.
+            # Split path: a separate 1-block cross-device sync kernel + a reduce
+            # with no barrier in it. The in-kernel barrier is what caps the
+            # single-kernel grid (every block must be resident and clear the poll
+            # before any reduce work starts), which is why the unsplit variant
+            # regresses past ~64 blocks while the split one keeps improving to 512.
+            #
+            # The two paths are mutually EXCLUSIVE within a run, not a per-call
+            # choice: the sync kernel keeps its phase in xdb_flag[0] only, while
+            # the single-kernel variant keeps one counter per block, so mixing
+            # them would let a block read a stale counter and clear its barrier
+            # without waiting. Hence only one set of variants is compiled.
+            self._fused_split = _fused_split
             self._combine_variants = {
                 (b, w): make_combine_fused_reduce(
                     rank=cfg.rank,
@@ -656,9 +685,16 @@ class EpDispatchCombineOp:
                     off_comb_inp=arena.offset("comb_inp"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     slot_stride_nbytes=cfg.comb_inp_slot_nbytes,
+                    include_sync=not self._fused_split,
                 )
                 for (b, w) in combine_specs
             }
+            if self._fused_split:
+                self._combine_sync = make_combine_fused_sync(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    off_xdb_mem=arena.offset("cross_device_barrier"),
+                )
         elif cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
@@ -1077,9 +1113,9 @@ class EpDispatchCombineOp:
         barrier (wait for peers' writes) + sum the topk slots per origin token."""
         stream = fx.Stream(torch.cuda.current_stream())
         count = routing.cur_rank_num_token
-        # Token-adaptive geometry: few blocks (barrier-bound) at low token counts,
-        # more blocks (sum/BW-bound) at high token counts. Falls back to _pick when
-        # a single spec is compiled (e.g. SCATTER_COMB_BW pinned).
+        # Split path compiles a single geometry for every token count, so _pick
+        # just returns it. The unsplit fallback stays token-adaptive because its
+        # in-kernel barrier makes wide grids counterproductive at low counts.
         _tiers = getattr(self, "_fused_comb_tiers", None)
         if _tiers is not None:
             comb_spec = _tiers[-1][1]
@@ -1091,6 +1127,16 @@ class EpDispatchCombineOp:
             _, comb_spec = self._pick(count)
         # The kernel overwrites every element of each active token's hidden row.
         # Unlike comb_inp, there are no dropped slots that require a zero sentinel.
+        if self._fused_split:
+            # 1-block cross-device barrier, then the barrier-free reduce on the
+            # same stream (the kernel boundary is what gives the reduce its
+            # visibility, so no in-kernel fence is needed).
+            self._combine_sync(
+                self.arena.handle,
+                self.cross_device_flag.data_ptr(),
+                self.cfg.rank,
+                stream,
+            )
         self._combine_variants[comb_spec](
             self.arena.handle,
             self.arena.local_ptr("comb_inp"),
