@@ -36,6 +36,7 @@ from aiter import (
     dtypes,
     fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
     fused_qk_norm_rope_cache_pts_quant_shuffle,
+    logger,
 )
 
 AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", "0")) == 1
@@ -1696,6 +1697,26 @@ class DualChunkRotaryEmbedding(nn.Module):
         return s
 
 
+def _get_rope_param(rope_scaling, key, default, scaling_type):
+    """Get a parameter from rope_scaling dict, warn if missing.
+
+    In transformers v5, config.rope_scaling is an alias for rope_parameters
+    which may be non-None even for models with no actual scaling (rope_type=default).
+    When a required key is missing, this logs a warning instead of silently
+    defaulting, to make config mismatches easier to debug.
+    """
+    if key in rope_scaling:
+        return rope_scaling[key]
+    logger.warning(
+        "rope_scaling (type=%s) missing key '%s', defaulting to %s. "
+        "This may indicate a v5 config issue — check model accuracy.",
+        scaling_type,
+        key,
+        default,
+    )
+    return default
+
+
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 
@@ -1869,7 +1890,12 @@ def get_rope(
                 **extra_kwargs,
             )
         elif scaling_type == "deepseek_yarn":
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
             # assert max_position == original_max_position * scaling_factor
             extra_kwargs = {
                 k: v
