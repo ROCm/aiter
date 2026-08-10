@@ -369,14 +369,40 @@ def flydsl_unified_attention(
     # q-block and this collapses to num_kv_heads * num_seqs; a mixed batch's
     # chunk sequence contributes ceil(chunk_len / BLOCK_Q) blocks.
     #
-    # cu_seqlens_q lives on device; summing per-sequence block counts forces one
-    # host sync per call. It is a single dispatch-time reduction, not in the
-    # kernel, and only on the fp8/gfx950 path that reaches here.
+    # The exact packed block sum needs the per-sequence query lengths, which live
+    # on cu_seqlens_q (device); reading them back with .item() forces a host sync
+    # (~29us) into the dispatch critical path. Avoid it wherever the branch can be
+    # decided from host-side scalars alone, which is every case except a genuine
+    # low-chunk mix:
+    #  - All-decode (max_seqlen_q == 1): every query length is 1, so each sequence
+    #    is exactly one q-block and the sum is num_seqs -- host-exact, no read.
+    #    This is the shallow split-K regime where the sync dominated kernel time.
+    #  - Otherwise a host-side lower bound on the sum is
+    #    max(num_seqs, ceil(total_q / BLOCK_Q)): each sequence is at least one
+    #    q-block, and the ceilings sum to at least ceil(total_q / BLOCK_Q). When
+    #    even that lower bound already fills the machine the launch is single-pass
+    #    regardless of the exact count (a real prefill chunk or high-chunk mix),
+    #    so the read is skipped there too.
+    #  - Only when the lower bound leaves the machine underfilled (a low-chunk mix)
+    #    is the exact per-sequence sum needed to pick the split count, and only
+    #    then is the device read taken.
+    # Every dispatch decision is identical to the exact-sum form; the read is
+    # removed from the paths where the exact value cannot change the outcome.
     num_kv_splits = 1
     if max_seqlen_k > _PAGE_SIZE * 8 and sinks is None:
         block_q = _BLOCK_M // num_queries_per_kv
-        seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        num_q_blocks = int(((seqlens_q + (block_q - 1)) // block_q).sum().item())
+        if max_seqlen_q == 1:
+            num_q_blocks = num_seqs
+        else:
+            total_q = q.shape[0]
+            lower_bound = max(num_seqs, (total_q + block_q - 1) // block_q)
+            if num_kv_heads * lower_bound >= _TARGET_NUM_PRGMS:
+                # Provably full at single-pass; exact value only gates <target.
+                num_q_blocks = lower_bound
+            else:
+                seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                num_q_blocks = int(
+                    ((seqlens_q + (block_q - 1)) // block_q).sum().item())
         num_2d_prgms = num_kv_heads * num_q_blocks
         if num_2d_prgms < _TARGET_NUM_PRGMS:
             num_kv_splits = _split_count(num_2d_prgms)
