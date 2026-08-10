@@ -32,11 +32,6 @@ constexpr int kCtdmLayoutTileN = 0;
 constexpr int kCtdmLayoutTileM = 1;
 }  // namespace opus_gfx1250
 
-// log2 of a power-of-2 (B_K is always a power of 2 here).
-__host__ __device__ constexpr inline int opus_ctdm_log2_i(int x) {
-    int r = 0; while (x > 1) { x >>= 1; ++r; } return r;
-}
-
 #ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
 #define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
 // Indirection slot for the split-K fp32 workspace pointer. Captured HIP
@@ -194,17 +189,13 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static_assert(kTileM * kTileN == kNumConsumerWaves,
                   "consumer waves must equal kTileM*kTileN");
 
-    // ── TDM / tdm_window pad parameters (all B_K-derived) ──────────────────
-    // One +kPadElems(=8) bf16 pad per B_K row -> conflict-free 16-row b128 reads.
-    // PadInterval is the DWORD interval that yields exactly one pad per row:
-    //   row = B_K bf16 = B_K/2 DWORD; pad every 2^(PadInterval+1) DWORD ->
-    //   PadInterval = log2(B_K/2) - 1 = log2(B_K) - 2.
-    static_assert((kBlockK & (kBlockK - 1)) == 0, "B_K must be a power of 2 (PadInterval formula)");
-    static constexpr int kLdsPadEn   = 1;
-    static constexpr int kPadInterval = opus_ctdm_log2_i(kBlockK) - 2;
-    static constexpr int kPadAmount  = 3;                        // +16B = +8 bf16
-    static constexpr int kPadElems   = 8;                        // bf16 elems added per row
-    static_assert(kPadElems * (int)sizeof(DataA) == 16, "kPadAmount=3 encodes +16B; kPadElems must match");
+    // ── TDM LDS padding (all B_K-derived) ──────────────────────────────────
+    // One +kPadElems(=8) bf16 pad per B_K row -> conflict-free 16-row b128 reads,
+    // i.e. exactly one 16-byte ds_read vector of pad after every written row.
+    // The D# encodes the interval as a power-of-two byte count, so B_K must be one.
+    static_assert((kBlockK & (kBlockK - 1)) == 0, "B_K must be a power of 2 (D# pad interval is 8 << enc bytes)");
+    static constexpr int kPadReadVecBytes = 16;                  // one b128 ds_read
+    static constexpr int kPadElems   = kPadReadVecBytes / (int)sizeof(DataA);   // 8 bf16
     static constexpr int kSmemPitch  = kBlockK + kPadElems;      // padded row pitch
 
     static constexpr int kARows = kBlockM;                       // w0 loads all A rows
@@ -248,8 +239,6 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
                   kClusterWgM * kClusterWgN <= 16,
                   "cluster dims must be 1..5 per side (TDM multicast <= 5 WGs) "
                   "and kClusterWgM*kClusterWgN <= 16 (16-bit workgroup_mask)");
-    static constexpr int kSlotBytesA = kSlotElemsA * (int)sizeof(DataA);
-    static constexpr int kSlotBytesB = kSlotElemsB * (int)sizeof(DataB);
 
     static constexpr int kSegBytesA = kNumSlots * kSlotElemsA * (int)sizeof(DataA);
     static constexpr int kSegBytesB = kNumSlots * kSlotElemsB * (int)sizeof(DataB);
@@ -293,15 +282,22 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kSchedWmmaCount = kExpM * kExpN * kExpKHalf;
 
 #if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
-    // tdm_window types live only where tdm_window is available (gfx1250 device
+    // The TDM window types live only where opus::tdm is available (gfx1250 device
     // pass + host pass, clang>=22). Non-gfx1250 device passes and clang-20
-    // (ROCm 7.1) CI never reference them -- opus::tdm_window is gated identically.
-    using WindowA = opus::tdm_window<DataA, kTdmK, kARows, 0, 0, 0,
-                                       1, 0, 0, 0, 1, 0, 0, 0, 0,
-                                       kLdsPadEn, kPadInterval, kPadAmount, opus::seq<>>;
-    using WindowB = opus::tdm_window<DataB, kTdmK, kBRows, 0, 0, 0,
-                                       1, 0, 0, 0, 1, 0, 0, 0, 0,
-                                       kLdsPadEn, kPadInterval, kPadAmount, opus::seq<>>;
+    // (ROCm 7.1) CI never reference them -- opus::tdm is gated identically.
+    //
+    // The tile is [B_K x rows] in D# order (dim0 = K, contiguous), and the only
+    // policy either operand varies is the LDS write padding, which is the same
+    // for both: padding_auto puts one read vector of pad after each B_K row.
+    // Multicast is a runtime mask (set_workgroup_mask) rather than a tag, since
+    // the peer set depends on this workgroup's position in the cluster.
+    using PaddingAB = opus::tdm_traits::padding_auto<DataA, kBlockK, kPadReadVecBytes>;
+    using WindowA   = opus::tdm<DataA, opus::seq<kTdmK, kARows>, PaddingAB>;
+    using WindowB   = opus::tdm<DataB, opus::seq<kTdmK, kBRows>, PaddingAB>;
+    // The D# pad and the LDS pitch the consumer reads with are two spellings of
+    // one layout; padding exports its own pitch so they cannot drift apart.
+    static_assert(PaddingAB::pitch_elements == kSmemPitch,
+                  "kSmemPitch must equal the D# padded row pitch");
 #endif
 };
 

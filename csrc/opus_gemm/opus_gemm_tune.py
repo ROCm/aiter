@@ -386,7 +386,10 @@ def _gfx1250_select_candidates(
     # tiles x occupancy-fit split_k x {baseline, max A-multicast n_cluster} x ws),
     # instead of dumping all ~1.4k fuse kids (which explodes to ~900 candidates for
     # wide-N small-M shapes). kid_rejects_shape still prunes any residual invalids.
-    sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
+    # Set OPUS_TUNE_NO_FUSE=1 to sweep only plain + clusterlaunch, which keeps the
+    # compile set to the 496 non-fuse kids (the fuse family adds ~1.4k more).
+    if os.environ.get("OPUS_TUNE_NO_FUSE") != "1":
+        sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
     # clusterlaunch_tdm_splitk_ws kids are RE-ENABLED: the feasibility filter
     # above (cwm<=2, degenerate-only cwm==1|cwn==1 2D lockout, exact cluster
     # fill) already keeps the sweep to the hang-free subset. (Previously the
