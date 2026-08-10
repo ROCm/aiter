@@ -734,9 +734,11 @@ def launch_gemm_a8w4_tdm(
                     # hoisted out of the wn loop (alias analysis would otherwise
                     # re-read it for every wn subtile).
                     _wf_rows = [
-                        lds_load_b32_raw(
-                            rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4
-                        )[0].bitcast(fx.Float32)
+                        fx.Int32(
+                            lds_load_b32_raw(
+                                rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4
+                            )
+                        ).bitcast(fx.Float32)
                         for wm in range_constexpr(wmma_m_rep)
                     ]
                 for wm in range_constexpr(wmma_m_rep):
@@ -847,7 +849,7 @@ def launch_gemm_a8w4_tdm(
                                 dstp = fx.Int32(
                                     lds_load_b32_raw(
                                         rowmap_lds_idx, arith.index(r * 8)
-                                    )[0]
+                                    )
                                 )
                                 pe = dstp // fx.Int32(ep_slot_stride)
                                 slot = dstp % fx.Int32(ep_slot_stride)
