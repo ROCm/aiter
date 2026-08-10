@@ -342,7 +342,6 @@ def flydsl_flash_attn_batch_func(
         and bias is None
         and alibi_slopes is None
         and sink is None
-        and not deterministic
         and not return_attn_probs
     )
     if not supported:
