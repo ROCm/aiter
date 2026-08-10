@@ -719,8 +719,6 @@ def launch_gemm_a8w4_tdm(
                                    else (0, bases1, 0))
                             pf_step(ksl % 2, nxt)
 
-                    pipeline_fence(outstanding=0)
-
                     # The drain is fully unrolled, so its slot index is a
                     # compile-time constant and slot*PITCH is a constant the
                     # backend fuses into every ds_load byte offset -- that
@@ -742,6 +740,9 @@ def launch_gemm_a8w4_tdm(
                         )
 
                     for j in range_constexpr(num_buffers):
+                        if const_expr(j != num_buffers - 1):
+                            pipeline_fence(outstanding=TDM_PER * (num_buffers - j - 2))
+
                         kt = n_steady + j
                         s = kt % num_buffers
                         bases = bases_of(drain_buf_idx(s))
