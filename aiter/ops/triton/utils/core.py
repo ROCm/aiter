@@ -13,12 +13,16 @@ USE_LRU_CACHE = True
 
 
 @functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
-def load_config_json(fpath: str, required: bool = False) -> dict | None:
+def load_config_json(fpath: str, required: bool = True) -> dict | None:
     """Load a config JSON file, cached per path (including negative results —
     add config files before process start, or call
-    ``load_config_json.cache_clear()``). Returns None if the file doesn't
-    exist; with required=True raises FileNotFoundError instead, consistently
-    on every call (exceptions are never cached)."""
+    ``load_config_json.cache_clear()``). Raises FileNotFoundError if the file
+    doesn't exist, consistently on every call (exceptions are never cached);
+    pass required=False for probe/fallback lookups to get None instead.
+
+    The returned dict is the shared cached object — copy before mutating:
+    a shallow ``.copy()`` suffices for flat bucket dicts (scalar values),
+    ``copy.deepcopy`` when nested sub-dicts will be mutated."""
     try:
         with open(fpath, "r") as file:
             return json.load(file)

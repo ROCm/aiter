@@ -322,7 +322,7 @@ def _fwd_kernel(
 def _get_config(HEAD_SIZE, dtype):
     dev = arch_info.get_arch()
     config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json", required=True
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json"
     )
 
     # HEAD_SIZE 192 = 128 head and 64 pe head dim

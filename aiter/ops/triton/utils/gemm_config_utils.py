@@ -91,7 +91,7 @@ def _get_gemm_config_cached(
 
     # Load default config (must exist)
     default_fpath = f"{cfg_dir}/{default_stem}.json"
-    config_dict = load_config_json(default_fpath)
+    config_dict = load_config_json(default_fpath, required=False)
     if config_dict is None:
         raise AssertionError(f"Required config file doesn't exist: {default_fpath}")
 
@@ -109,7 +109,7 @@ def _get_gemm_config_cached(
     is_tuned = False
     for suffix in specialized_suffixes:
         specialized_config = load_config_json(
-            f"{cfg_dir}/{name_prefix}{config_name}-{suffix}.json"
+            f"{cfg_dir}/{name_prefix}{config_name}-{suffix}.json", required=False
         )
         if specialized_config is not None:
             config_dict, is_tuned = specialized_config, True

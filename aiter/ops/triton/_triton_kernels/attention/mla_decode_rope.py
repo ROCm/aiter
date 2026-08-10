@@ -406,5 +406,4 @@ def _get_config():
     dev = arch_info.get_arch()
     return load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MLA_DECODE_ROPE-DEFAULT.json",
-        required=True,
     )

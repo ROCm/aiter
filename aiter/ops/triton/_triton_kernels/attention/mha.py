@@ -953,9 +953,7 @@ def _get_config(
     head_dim_v: int | None = None,
 ):
     dev = arch_info.get_arch()
-    config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json", required=True
-    )
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned

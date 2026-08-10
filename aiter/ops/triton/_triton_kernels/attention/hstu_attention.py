@@ -873,7 +873,6 @@ def _get_fwd_config(
     dev = arch_info.get_arch()
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json",
-        required=True,
     )
 
     if AUTOTUNE_Z < 512:
@@ -893,7 +892,6 @@ def _get_bwd_config(
     dev = arch_info.get_arch()
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json",
-        required=True,
     )
 
     if AUTOTUNE_Z < 512:

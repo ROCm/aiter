@@ -1769,7 +1769,5 @@ def bwd_kernel_noncausal(
 @functools.lru_cache(maxsize=1024)
 def _get_config():
     dev = arch_info.get_arch()
-    config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json", required=True
-    )
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
     return config["bkwd_onekernel"]

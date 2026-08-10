@@ -54,7 +54,7 @@ def get_moe_configs(dtype: str | None) -> dict[int, Any] | None:
     dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_arch()
     configs = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json", required=False
     )
     if configs is not None:
         return configs

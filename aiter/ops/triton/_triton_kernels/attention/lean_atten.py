@@ -32,7 +32,7 @@ def _get_config():
     # caching the .copy() would hand every caller the same mutable object.
     dev = arch_info.get_arch()
     config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json", required=True
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
     )
     return config["any"].copy()  # fresh copy per call — safe for callers to mutate
 

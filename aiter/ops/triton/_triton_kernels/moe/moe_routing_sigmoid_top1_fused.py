@@ -129,7 +129,6 @@ def _get_config(M, N, K):
     dev = arch_info.get_arch()
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json",
-        required=True,
     )
 
     n_key = "N16" if N <= 16 else "N128"

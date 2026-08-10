@@ -65,7 +65,7 @@ def _get_conv_config_cached(
     """Three-tier walk: literal shape entry -> M_LEQ bucket -> 'any'."""
     dev = arch_info.get_arch()
     config_dict = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json", required=True
+        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
     )
 
     # Tier 1: literal shape key.

@@ -19,7 +19,9 @@ _FALLBACK_DEV = "gfx942"
 def _load_with_fallback(dev: str, fname: str, required: bool = False) -> dict | None:
     """Load ``{dev}-{fname}``, falling back to the gfx942 copy for arches
     without tuned MHC configs (may be suboptimal)."""
-    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{fname}")
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{fname}", required=False
+    )
     if config is None:
         config = load_config_json(
             f"{AITER_TRITON_CONFIGS_PATH}/{_FALLBACK_DEV}-{fname}", required=required
@@ -137,9 +139,7 @@ def get_mhc_post_config(M: int, C: int) -> dict:
     Picks the largest ``C_<value> <= C``, else ``"default"``.
     """
     dev = arch_info.get_arch()
-    cfg = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json", required=True
-    )
+    cfg = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json")
 
     c_thresholds = sorted(
         int(k[2:]) for k in cfg if k.startswith("C_") and k[2:].isdigit()

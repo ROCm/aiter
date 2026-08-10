@@ -31,7 +31,10 @@ def _get_a8w4_dispatch(arch: str) -> dict:
     """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
     tuned file is shipped for this arch (caller uses the safe-default fallback).
     Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    return load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json") or {}
+    dispatch = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json", required=False
+    )
+    return dispatch if dispatch is not None else {}
 
 
 def can_overflow_int32(tensor: torch.Tensor):

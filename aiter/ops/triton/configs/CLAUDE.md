@@ -119,9 +119,6 @@ Consequences to keep in mind:
   (missing files). Adding a config file at runtime therefore has no effect;
   restart the process (tooling may call `load_config_json.cache_clear()`
   instead).
-- `.github/scripts/select_triton_tests.py` only globs the legacy flat
-  `configs/gemm/` — configs in the nested layout are invisible to CI test
-  selection until it learns the `<d_type>/` layout.
 
 Direct-path loaders bypass the resolver's directory probe. Grep for
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —

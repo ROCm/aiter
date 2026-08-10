@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -66,6 +67,9 @@ def gemm_a16w16_atomic_(
         config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
+    # Caller-supplied configs may omit NUM_KSPLIT/cache_modifier; backfill
+    # with the canonical defaults (the shipped JSONs always carry both).
+    add_default_gemm_config_params(config)
 
     if y is None:
         # atomic add requires 0 tensor

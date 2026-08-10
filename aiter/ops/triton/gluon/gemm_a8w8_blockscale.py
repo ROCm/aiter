@@ -992,10 +992,10 @@ def _get_config_cached(
         )
     config_dict = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json",
-        required=True,
     )
     specialized = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
+        f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
+        required=False,
     )
     if specialized is not None:
         config_dict = specialized
@@ -1031,7 +1031,7 @@ def _get_config(
     # Fresh copy per call, outside the lru boundary — the caller writes
     # derived fields (SPLITK_BLOCK_SIZE here, GROUP_K/GROUP_N at the call
     # site) into the returned dict.
-    config = dict(_get_config_cached(M, N, K))
+    config = _get_config_cached(M, N, K).copy()
 
     block_size_k = config["BLOCK_SIZE_K"]
     num_k_blocks = triton.cdiv(K, block_size_k)
