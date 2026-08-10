@@ -34,6 +34,11 @@ from ..utils.op import exp
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
 NUM_STAGES_FWD = [2, 3] if IS_AMD else [2, 3, 4]
+# ``gated_delta_rule_autotune_configs`` keeps only the first entry unless
+# GATED_DELTA_RULE_TRITON_AUTOTUNE is enabled.  On CDNA3, BV=32 is the best
+# default among the supported tiles for the common D=128 GatedDeltaNet shapes;
+# keep every candidate available for an explicit autotune sweep.
+VK_BV_CANDIDATES = [32, 16, 64] if IS_AMD else [16, 32, 64]
 
 
 @triton.jit
@@ -979,7 +984,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
-            for BV in [16, 32, 64]
+            for BV in VK_BV_CANDIDATES
         ]
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
