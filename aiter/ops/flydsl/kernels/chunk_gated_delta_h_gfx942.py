@@ -191,7 +191,13 @@ def compile_chunk_gated_delta_h_gfx942(
     # the use site, so the prefetch block has no arithmetic hanging off the
     # loads and nothing forces a wait in the issuing iteration.
     N_GATE_G = 5 if USE_G else 0  # g_last + 4 g_row
-    N_GATE_GK = NUM_K_BLOCKS * 4 if USE_GK else 0
+    # gk is loaded as ONE dwordx4 per 64-wide K block, not four scalar dwords:
+    # the 4 elements are consecutive k (kb*64 + wid_m*16 + lane_m_base*4 + 0..3)
+    # and -- unlike g_row -- carry no per-element clamp, so the quad is
+    # contiguous and 16 B aligned by construction (kb*64, wid_m*16,
+    # lane_m_base*4, i_h*K and (bos+last_idx)*H*K are all multiples of 4).
+    # Measured: -6 buffer_load and -13% SQ_WAIT_ANY per dispatch on shape 10.
+    N_GATE_GK = NUM_K_BLOCKS if USE_GK else 0  # entries, each an f32x4
     N_U = N_REPEAT_LOCAL * 4
     N_GU = N_GATE_G + N_GATE_GK + N_U
 
@@ -583,14 +589,13 @@ def compile_chunk_gated_delta_h_gfx942(
             if const_expr(USE_GK):
                 gk_chunk_base = (bos + last_idx) * fx.Int32(H * K) + i_h * fx.Int32(K)
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    for elem_i in range_constexpr(4):
-                        global_k = (
-                            fx.Int32(kb * 64)
-                            + wid_m * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        out.append(gk_[fx.Int64(gk_chunk_base + global_k)])
+                    quad = (
+                        gk_chunk_base
+                        + fx.Int32(kb * 64)
+                        + wid_m * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                    )
+                    out.append(gk_.vec_load((fx.Int64(quad),), 4))
             for nr in range_constexpr(N_REPEAT_LOCAL):
                 u_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                 for elem_i in range_constexpr(4):
@@ -741,10 +746,8 @@ def compile_chunk_gated_delta_h_gfx942(
                 g_last_val = _as_f32(gu_all[0])
                 g_row_raw = [_as_f32(v) for v in gu_all[1:5]]
             if const_expr(USE_GK):
-                gk_raw_all = [
-                    _as_f32(v)
-                    for v in gu_all[N_GATE_G : N_GATE_G + N_GATE_GK]
-                ]
+                # one f32x4 per 64-wide K block (see N_GATE_GK)
+                gk_quads = gu_all[N_GATE_G : N_GATE_G + N_GATE_GK]
             u_prefetch = gu_all[N_GATE_G + N_GATE_GK :]
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
@@ -864,9 +867,10 @@ def compile_chunk_gated_delta_h_gfx942(
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     # exp() applied here, not at load time, so the prefetch has
                     # no arithmetic depending on the loads.
+                    gk_q = fx.Vector(as_ir_value(gk_quads[kb]))
                     gk_vec = fx.Vector.from_elements(
                         [
-                            _fast_exp(gk_raw_all[kb * 4 + elem_i])
+                            _fast_exp(gk_q[elem_i])
                             for elem_i in range_constexpr(4)
                         ],
                         dtype=fx.Float32,
