@@ -123,10 +123,10 @@ def compile_gemm2_a4w4_port(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
             f"got (BM={BM}, epilog={epilog})"
         )
-    if BN not in (64, 128, 256, 512) or BK not in (128, 256):
+    if BN not in (128, 256, 512) or BK not in (128, 256):
         raise AssertionError(
             "mxfp4_moe_gemm2 supports only "
-            f"(BN in {{64,128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
+            f"(BN in {{128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
@@ -600,8 +600,8 @@ def mxfp4_moe_gemm2(
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
-    if BN <= 0 or BN % 128 != 0:
-        raise AssertionError(f"BN must be a positive multiple of 128, got {BN}")
+    if BN not in (128, 256, 512):
+        raise AssertionError(f"BN must be one of (128, 256, 512), got {BN}")
     if BK not in (128, 256):
         raise AssertionError(f"BK must be one of (128, 256), got {BK}")
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
