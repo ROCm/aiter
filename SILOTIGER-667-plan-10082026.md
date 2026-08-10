@@ -212,7 +212,16 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       (§6, needs INTER%1024/%2048), hoist the E8M0 load, and land the **s_nop-free
       4-accumulator single-drain** dot2 (G7) + prefetch (G8). Correct + wired + tested now;
       the perf uplift is an optimization task, not a correctness gap.
-- [ ] **gate_up FP4** (apply the down recipe; gate on accuracy).
+- [x] **gate_up FP4** (applied the down recipe). **Builder** `build_gate_up_fp4_module`
+      (separate; kVector=8 default, `n_wwords=kVector/8`, `w_word=ipair//4`, `sel=ipair%4`;
+      gate/up have *separate* E8M0 scale tensors, each applied **in the convert**; single
+      gate/up dot accumulator across iterations then one reduce each; `silu(gate)*up`
+      epilogue unchanged). **Entry point** `flydsl_warp_decode_gate_up_fp4` (`w_gate`/`w_up`
+      uint8 `[E, INTER, HIDDEN//2]` + two E8M0 scale tensors, `scale_block=(1,32)`,
+      `kvector` via `pick_kvector_fp4(HIDDEN)`, cached via `_get_gate_up_fp4`). **op_test**
+      `test_gate_up_fp4` (`GATE_UP_FP4_CASES`, dequant ref, max-offset expert) — 2 pass; full
+      file **22 passed**. Accuracy: cos ≥ 0.99 holds through the SiLU on these shapes. Perf
+      A/B deferred to Phase D/E with the `down` levers (kVector 16/32, G7 ILP, G8 prefetch).
 - [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
       natural home for the ILP scheme (plan §2).
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
