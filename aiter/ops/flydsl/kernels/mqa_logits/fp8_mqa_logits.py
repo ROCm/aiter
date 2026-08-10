@@ -26,7 +26,7 @@ from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .tensor_shim import GTensor, _run_compiled
+from ..tensor_shim import GTensor, _run_compiled
 
 Vec = fx.Vector
 

@@ -413,7 +413,6 @@ def compile_one_config(**job):
                 contiguous=contiguous,
             )
         elapsed = time.time() - t0
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:  # noqa: BLE001
         # Catch everything and return cleanly with compile_time=None: the AOT pool
