@@ -27,6 +27,7 @@ from .utils import (
     _raw,
     _udiv,
     _umod,
+    mma_bf16,
 )
 
 # gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
@@ -538,26 +539,7 @@ def _gemm2_body_a16w4(
     else:
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
 
-    def _bf16_frag(v8):
-        t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        t.store(v8)
-        return t
-
-    def _bf16_frag4(v8, half):
-        t = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-        t.store(
-            fx.Vector.from_elements(
-                [_raw(v8[half * 4 + j]) for j in range_constexpr(4)], fx.BFloat16
-            )
-        )
-        return t
-
-    def _mma(acc, a8, b8):
-        if const_expr(use_k16):
-            for h in range_constexpr(2):
-                fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
-        else:
-            fx.gemm(mma_atom, acc, _bf16_frag(a8), _bf16_frag(b8), acc)
+    _mma = functools.partial(mma_bf16, mma_atom, use_k16)
 
     for kt in range_constexpr(K_TILES_TOTAL):
         base_k = fx.Int32(kt * TILE_K)

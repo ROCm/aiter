@@ -10,7 +10,7 @@ upconvert, index math) used by both stage1 (:mod:`gemm1`) and stage2
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -177,3 +177,28 @@ def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
         return col_bytes
     rem = row & fx.Int32(k_blocks16 - 1)
     return col_bytes ^ (rem * fx.Int32(16))
+
+
+def _bf16_frag8(v8):
+    t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+    t.store(v8)
+    return t
+
+
+def _bf16_frag4(v8, half):
+    t = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    t.store(
+        fx.Vector.from_elements(
+            [_raw(v8[half * 4 + j]) for j in range_constexpr(4)], fx.BFloat16
+        )
+    )
+    return t
+
+
+def mma_bf16(mma_atom, use_k16, acc, a8, b8):
+    """One K32 MFMA from v8bf16 A/B fragments; gfx942 (use_k16) splits it into 2x K16."""
+    if const_expr(use_k16):
+        for h in range_constexpr(2):
+            fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
+    else:
+        fx.gemm(mma_atom, acc, _bf16_frag8(a8), _bf16_frag8(b8), acc)
