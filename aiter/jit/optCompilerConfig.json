@@ -591,6 +591,11 @@
             "'-ffast-math'",
             "'-mllvm -enable-post-misched=1'"
         ],
+        "flags_extra_hip_per_source": {
+            "*pa_sparse_prefill_opus_kernels.cu": [
+                "-mllvm -amdgpu-early-inline-all=false"
+            ]
+        },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
