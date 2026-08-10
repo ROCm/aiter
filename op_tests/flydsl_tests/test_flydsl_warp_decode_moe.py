@@ -670,6 +670,17 @@ DOWN_PERF_SHAPES = [
     (1, 2048, 7168, 8, 8, "block2d", (128, 128)),
     (1, 1024, 4096, 8, 8, "pertensor", None),
 ]
+# MXFP4 down A/B sweep: B in {1,2,4,8} tests the FP4-vs-FP8 crossover (expect
+# ~1.2-1.5x at B>=2, neutral at B=1). INTER must be a multiple of 512 (FP4 fast
+# path). B, INTER, HIDDEN, E, TOPK.  DeepSeek-V3 down is the headline.
+DOWN_FP4_PERF_SHAPES = [
+    (1, 2048, 7168, 8, 8),
+    (2, 2048, 7168, 8, 8),
+    (4, 2048, 7168, 8, 8),
+    (8, 2048, 7168, 8, 8),
+    (1, 1536, 3072, 8, 8),  # MiniMax
+    (1, 512, 2048, 512, 10),  # Qwen3Next-TP1 (E=512, TOPK=10)
+]
 
 
 def _timing_kwargs(timing: str) -> dict:
@@ -818,6 +829,56 @@ def bench_down(
     }
 
 
+@benchmark()
+def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
+    inter, w_down, w_scale, router_ids, router_wts, w_deq = _gen_down_fp4(
+        B, INTER, HIDDEN, E, TOPK
+    )
+    out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=inter.device)
+    ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)  # not timed
+
+    outputs = B * HIDDEN
+    flops = 2 * INTER * TOPK * outputs  # identical to FP8: TOPK dots x 2 (mul+add)
+    # FP4 down streams 0.5 B/elt of weights + the E8M0 scale bytes (INTER/32/row).
+    wbytes = outputs * TOPK * INTER // 2 + outputs * TOPK * (INTER // _MXFP4_BK)
+
+    fn = lambda: flydsl_warp_decode_down_reduce_fp4(  # noqa: E731
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        w_scale,
+        scale_block=(1, _MXFP4_BK),
+        out=out,
+    )
+    got, us = run_perftest(
+        fn,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=_rotate_for(inter, w_down, w_scale),
+        **_timing_kwargs(timing),
+    )
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        tol_err_ratio=0.1,
+        msg="down fp4",
+        printLog=False,
+    )
+    assert _cosine(ref, got) >= 0.99, "down fp4: correctness regression"
+    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    return {
+        "gfx": get_gfx(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
+        "TB/s": tbs,
+        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "err": err,
+    }
+
+
 def _fmt_table(rows) -> str:
     """Markdown table when ``tabulate`` is available; plain text otherwise."""
     df = pd.DataFrame(rows)
@@ -851,6 +912,17 @@ def _run_perf_sweeps(args) -> None:
         _fmt_table(down_rows),
     )
 
+    down_fp4_rows = [
+        bench_down_fp4(B, INTER, HIDDEN, E, TOPK, **timing_kw)
+        for (B, INTER, HIDDEN, E, TOPK) in args.down_fp4_shapes
+    ]
+    aiter.logger.info(
+        "warp-decode down_reduce MXFP4 perf (%s timing) "
+        "[A/B vs FP8 at matching B/INTER/HIDDEN]:\n%s",
+        args.timing,
+        _fmt_table(down_fp4_rows),
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -876,6 +948,7 @@ def main() -> int:
     # Fixed realistic shapes (weights >> LLC); not swept via CLI for now.
     args.gate_up_shapes = GATE_UP_PERF_SHAPES
     args.down_shapes = DOWN_PERF_SHAPES
+    args.down_fp4_shapes = DOWN_FP4_PERF_SHAPES
 
     print("=" * 78)
     print("[flydsl] warp-decode MoE primitives (Phase 1)")
