@@ -155,9 +155,12 @@ which wraps only when a **weight tensor exceeds ~8 GB** (`byte_offset > 2^33`). 
 shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still < 2^31 → safe.
 **Kimi-K3 does break:** E=896/H3584/I3072 (dword index 2.46e9 > 2^31, 9.85 GB tensor) gives
 **cos = 0.019** (`/tmp/repro_k3_addr.py`). So:
-- [ ] **Add real-E regression cases** (DeepSeek-V3 E=256; Qwen-TP1 E=512) to the op_test to
+- [~] **Add real-E regression cases** (DeepSeek-V3 E=256; Qwen-TP1 E=512) to the op_test to
       lock in the verified-good behavior and give the first real ticket-shape tests (§8.2).
-      *(This is the only Phase-A item on the ticket's critical path.)*
+      *(This is the only Phase-A item on the ticket's critical path.)* **DeepSeek-V3 E=256
+      done** — `test_gate_up_fp8_real_expert_count` + `test_down_reduce_fp8_real_expert_count`
+      (max-offset expert forced, compact per-(b,k) ref, HBM-guarded); both **pass** on gfx950.
+      Still TODO: Qwen-TP1 E=512.
 - [ ] **K3-scale addressing fix (deferred to the Kimi-K3 follow-on, not the ticket):** for
       weight tensors > ~8 GB, switch to **per-row i64 base resources**
       (`create_buffer_resource_from_addr(base_i64 + row_byte_off_i64, num_records_bytes=row_nb)`,
