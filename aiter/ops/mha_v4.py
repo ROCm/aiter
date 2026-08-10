@@ -288,8 +288,8 @@ def mha_v4_packed(
     q_scale_mode: AttentionScaleMode,
     k_scale_mode: AttentionScaleMode,
     v_scale_mode: AttentionScaleMode,
-    softmax_scale: Optional[float] = None,
-    out: Optional[Tensor] = None,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
 ) -> Tensor:
     """Launch a dense, non-causal MHA v4 kernel over pre-quantized BSHD operands."""
@@ -798,8 +798,8 @@ def mha_v4(
     q_format: AttentionFormat,
     k_format: AttentionFormat,
     v_format: AttentionFormat,
-    softmax_scale: Optional[float] = None,
-    out: Optional[Tensor] = None,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
 ) -> Tensor:
     """Quantize BF16 BSHD operands and run dense, non-causal MHA v4."""
