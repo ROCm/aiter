@@ -177,10 +177,16 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `shl 23 + bitcast` decode is **bit-exact vs `fp4_utils.e8m0_to_f32`** (normal range).
       Gotcha: `src_sel_index` is an `I32Attr` → must be a compile-time constant (unroll the 4
       `sel` calls; a `for sel in range(4)` becomes an `scf.for` and fails with `bad_cast`).
-- [ ] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
-      128-bit FP4 load → `cvt_scalef32_pk_bf16_fp4` (4 `sel` per i32) → dot2. **e8m0 per-block
-      scale** (`block_k=32` covers the lane's 8-elt chunk) applied after the dot; router_wt
-      folded per expert. Reuse the H2 two-outputs/wave structure.
+- [~] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
+      FP4 load → `cvt_scalef32_pk_bf16_fp4` (4 `sel` per i32) → dot2. **e8m0 per-block
+      scale** (`block_k=32` covers the lane's `kVector`-elt chunk) applied **in the convert**
+      (uniform over the chunk ⇒ ≡ scaling the partial dot); router_wt folded per expert.
+      Reuses the H2 two-outputs/wave structure. **Builder landed** as a *separate*
+      `build_down_reduce_fp4_module` (kVector=8 default: 1 i32 = 8 FP4 = one weight
+      dword/lane/iter, `n_wwords = kVector/8`, `w_word = ipair//4`, `sel = ipair%4`; E8M0 byte
+      loaded via `dtype=T.i8()` → `e8m0_byte_to_f32`). **Correctness PASS** on gfx950
+      (`/tmp/repro_down_fp4.py`, cos 0.999999 at H1/H2, incl. max-offset expert). Still TODO:
+      entry-point `w_dtype`/`flydsl_warp_decode_down_reduce` wiring + op_test + A/B perf.
 - [ ] **gate_up FP4** (apply the down recipe; gate on accuracy).
 - [ ] Adopt the **s_nop-free 4-accumulator + single-drain** dot2 here (G7) — it's the
       natural home for the ILP scheme (plan §2).
