@@ -184,10 +184,7 @@ def _kda_reference(args, initial_state):
 def test_kda_per_channel_gate_matches_torch_reference(
     B, H, dt, shuffle, padded, first_index, indices_stride
 ):
-    """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x).
-
-    Heads are 1:1 with the k heads here, unlike the GQA shapes above.
-    """
+    """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x)."""
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index, padded, shuffle, indices_stride=indices_stride
     )
