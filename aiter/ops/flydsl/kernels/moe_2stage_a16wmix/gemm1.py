@@ -116,7 +116,16 @@ def _gemm1_body_a16w4(
     # decode/mid row (t{16}x{16,32,64,128}x{...}) and BM>=32 only for large-M rows, so
     # BM==16 cleanly selects the regime that wins from rolling. Compile-time predicate
     # (kernel is compiled per tile config); mxfp4/bf16 never roll (byte-identical to main).
-    _roll_k = _is_int4 and BM <= 16
+    #
+    # KNOWN-BAD combo excluded: the rolled loop produces WRONG results for
+    # k_wave==1 (num_n_waves==4) + num_acc_n==1 + TILE_K>=256 (e.g. t16x64x256), while
+    # the unrolled path is correct there and every other rolled combo (kw2/kw4-tk256,
+    # kw1-tk128, kw1-tk256-tn128 num_acc_n==2) is correct. Root cause is in the rolled
+    # scf.for's iter-arg/A-DMA interaction at this narrow shape; no production CSV row
+    # uses it (kw1-tk256 in prod is only BM=32, which is unrolled). Fall back to the
+    # correct unrolled body rather than roll it -- a correctness guard, not a perf choice.
+    _roll_bad = (k_wave == 1) and (num_acc_n == 1) and (TILE_K >= 256)
+    _roll_k = _is_int4 and BM <= 16 and not _roll_bad
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
     # Per-k-group A-LDS region (single region at k_wave=1).
