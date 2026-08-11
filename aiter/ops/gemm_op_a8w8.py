@@ -888,7 +888,13 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
+    # Must mirror the real signature (incl. out=): the abstract_impl forwards the
+    # out= kwarg here at trace time. When out is given the real fn returns it, so
+    # the fake returns it too (preserves tensor identity for mutation/aliasing).
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
