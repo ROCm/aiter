@@ -524,8 +524,7 @@ class DeviceMoEPipeline:
                 grouped_a8w4_tdm_moe_push_scatter,
             )
 
-            # No per-layer comb_inp zero: we guarantee no token drop (cap never
-            # overflows), so gemm2 writes every (token,k) slot each layer.
+            self.op.zero_fused_staging()
             ep = self.op.ep_scatter_params()
             pg = self.op.push_group_moe_inputs()
             grouped_a8w4_tdm_moe_push_scatter(
