@@ -30,6 +30,7 @@ def gated_rmsnorm_fp8_group_quant(
     epsilon: float,
     group_size: int,
     transpose_scale: bool = False,
+    gemm_out_zero_init: Tensor | None = None,
 ) -> None:
     """
     HIP kernel for fused Gated RMSNorm + FP8 group quantization.

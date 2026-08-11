@@ -14,7 +14,7 @@
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int, bool);
 
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 

@@ -446,7 +446,17 @@ def per_group_quant_hip(
     num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
+    gemm_out_zero_init: "Tensor | None" = None,
 ) -> "tuple[Tensor, Tensor]":
+    """Per-group dynamic FP8 (or i8/fp4) quant.
+
+    When `gemm_out_zero_init` is provided, the kernel will additionally write
+    zeros over the entire byte range of that tensor as a side effect, so a
+    downstream SplitK GEMM can be invoked with `y_is_zeroed=True` and skip
+    its own `Y.zero_()` ATen launch.  The buffer's total byte size must be a
+    multiple of 16 (the kernel writes 16-byte vectors).  Only honored on the
+    fp32-scale fp8 per-group (per_1x128 / per_1x64 / per_1x32) path.
+    """
     shape = x.shape
     device = x.device
     if scale is None:
@@ -462,6 +472,12 @@ def per_group_quant_hip(
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale_type == dtypes.fp8_e8m0:
+        # dynamic_per_group_scaled_quant has no zero-init prologue, and silently
+        # dropping the request would leave the GEMM output unzeroed while the
+        # caller passes y_is_zeroed=True.
+        assert (
+            gemm_out_zero_init is None
+        ), "gemm_out_zero_init is not supported with e8m0 scales"
         dynamic_per_group_scaled_quant(
             y,
             x,
@@ -479,6 +495,7 @@ def per_group_quant_hip(
             shuffle_scale=transpose_scale,
             num_rows=num_rows,
             num_rows_factor=num_rows_factor,
+            gemm_out_zero_init=gemm_out_zero_init,
         )
     return y, scale
 
@@ -760,6 +777,7 @@ def dynamic_per_token_scaled_quant(
     shuffle_scale: bool = False,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    gemm_out_zero_init: torch.Tensor | None = None,
 ) -> None: ...
 
 
