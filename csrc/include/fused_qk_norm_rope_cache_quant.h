@@ -228,6 +228,7 @@ void fused_qk_norm_rope_group_quant(
     // are addressed either by swa_block_tables[bid, pos/swa_block_size] (paged)
     // or by swa_dest_row[token] (rows the caller computed itself, for a window
     // whose layout this kernel need not know). Pass exactly one of the two.
+    // Either way a token with a negative position is skipped.
     // batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     std::optional<aiter_tensor_t> swa_nope_scale_buff = std::nullopt,
     std::optional<aiter_tensor_t> swa_rope_buff = std::nullopt,

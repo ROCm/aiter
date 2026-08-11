@@ -343,6 +343,8 @@ def _fused_qk_norm_rope_group_quant_kernel(
     # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
     # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
     # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
     # batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,
@@ -385,6 +387,8 @@ def fused_qk_norm_rope_group_quant(
     # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
     # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
     # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
     # batch_id_per_token maps token->seq (-1 = skip).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,

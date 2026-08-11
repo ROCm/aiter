@@ -378,6 +378,7 @@ def _build_kernel(
         batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
+        swa_num_rows: Int32,  # rows in the SWA pool; bounds the final row
         swa_cache_size: Int32,  # ring slot count
         num_tokens: Int32,  # valid tokens in this launch chunk (for tail clamp)
     ):
@@ -816,22 +817,57 @@ def _build_kernel(
                     bid_i32 = buffer_ops.buffer_load(
                         bid_rsrc, bid_t, vec_width=1, dtype=i32
                     )
-                    do_swa = ArithValue(bid_i32) >= 0
+                    # A stale token carries a negative position. `divsi`/`remsi`
+                    # truncate toward zero, so pos=-300 with block_size=128 gives
+                    # blk=-2 and in_blk=-44: the block index passes an upper-bound
+                    # test, reads the PREVIOUS request's table entry, and lands
+                    # the write 44 rows before that block. The C++ sibling's first
+                    # gate is `bid < 0 || pos < 0`; match it, in both modes.
+                    pos_ok = ArithValue(pos_i32) >= 0
+                    do_swa = arith.andi(
+                        _to_raw(ArithValue(bid_i32) >= 0), _to_raw(pos_ok)
+                    )
                     bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
+                    pos_safe = arith.select(
+                        _to_raw(pos_ok), pos_i32, arith.constant(0, type=i32)
+                    )
                     if const_expr(paged):
-                        blk = arith.divsi(pos_i32, _to_raw(swa_cache_size))
+                        blk = arith.divsi(pos_safe, _to_raw(swa_cache_size))
+                        # The other two gates the C++ sibling applies (see
+                        # `swa_row_for_token`): a position past the table's last
+                        # block would read the NEXT request's entry, and `-1`
+                        # marks a block outside the window. Clamp for the load,
+                        # gate the store on the unclamped test. The wrapper pins
+                        # stride(0) == max_blocks, so the row stride is both the
+                        # table width and the distance between two requests' rows.
+                        blk_ok = ArithValue(blk) < ArithValue(swa_slot_stride)
+                        blk_safe = arith.select(
+                            _to_raw(blk_ok), _to_raw(blk), arith.constant(0, type=i32)
+                        )
                         bt_off = ArithValue(bid_safe) * ArithValue(
                             swa_slot_stride
-                        ) + ArithValue(blk)
+                        ) + ArithValue(blk_safe)
                         bt_rsrc = _ptr_buffer_resource(swa_index)
                         phys = buffer_ops.buffer_load(
                             bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
                         )
-                        in_blk = arith.remsi(pos_i32, _to_raw(swa_cache_size))
+                        in_blk = arith.remsi(pos_safe, _to_raw(swa_cache_size))
                         row = ArithValue(phys) * ArithValue(
                             swa_cache_size
                         ) + ArithValue(in_blk)
-                        row_safe = _to_raw(row)
+                        # Bound the final row against the pool, as the C++ does:
+                        # a phys id left over from a larger pool would otherwise
+                        # write past the end of swa_kv.
+                        row_ok = arith.andi(
+                            arith.andi(_to_raw(blk_ok), _to_raw(ArithValue(phys) >= 0)),
+                            _to_raw(ArithValue(row) < ArithValue(swa_num_rows)),
+                        )
+                        do_swa = arith.andi(do_swa, row_ok)
+                        # Clamp too: a negative row would move the descriptor
+                        # base backwards, out of this tensor entirely.
+                        row_safe = arith.select(
+                            row_ok, _to_raw(row), arith.constant(0, type=i32)
+                        )
                     else:
                         # Direct: the caller already resolved this token's row.
                         # A `-1` row means "skip", same as a `-1` batch id --
@@ -841,8 +877,16 @@ def _build_kernel(
                         row = buffer_ops.buffer_load(
                             row_rsrc, bid_t, vec_width=1, dtype=i32
                         )
-                        do_swa = arith.andi(do_swa, ArithValue(row) >= 0)
-                        row_safe = arith.maxsi(row, arith.constant(0, type=i32))
+                        # Bounded against the pool as well: the caller owns the
+                        # row, but a stale entry must not write past swa_kv.
+                        dest_ok = arith.andi(
+                            _to_raw(ArithValue(row) >= 0),
+                            _to_raw(ArithValue(row) < ArithValue(swa_num_rows)),
+                        )
+                        do_swa = arith.andi(do_swa, dest_ok)
+                        row_safe = arith.select(
+                            dest_ok, _to_raw(row), arith.constant(0, type=i32)
+                        )
                     # The row index fits 32 bits; `row * D * 2` does not. A
                     # unified V4 pool runs to ~150M rows, so a 32-bit byte
                     # offset wraps 3% of the way in, and the sliding windows
@@ -902,6 +946,7 @@ def _build_kernel(
         batch_id_per_token: fx.Pointer,
         swa_slot_stride: fx.Int32,
         swa_pos_stride: fx.Int32,
+        swa_num_rows: fx.Int32,
         swa_cache_size: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
@@ -932,6 +977,7 @@ def _build_kernel(
             batch_id_per_token,
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
             num_tokens,
         )
@@ -1129,7 +1175,23 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             )
         if swa_block_tables.dim() != 2 or swa_block_tables.dtype != torch.int32:
             raise TypeError("swa_block_tables must be 2-D [bs, max_blocks] int32")
+        # The kernel indexes the table as `bid * stride(0) + blk` and bounds
+        # `blk` against stride(0). For that bound to be the table WIDTH (what
+        # the C++ sibling checks, via size(1)) and not merely the distance
+        # between rows, the table must be dense: a `full[:, :n]` view would
+        # leave stride(0) > n, letting a far-future position read a stale
+        # padding column instead of being skipped.
+        if swa_block_tables.stride(1) != 1:
+            raise ValueError("swa_block_tables must be contiguous in the last dim")
+        if swa_block_tables.stride(0) != swa_block_tables.shape[1]:
+            raise ValueError(
+                "swa_block_tables must be densely packed "
+                f"(stride(0)={swa_block_tables.stride(0)} != "
+                f"max_blocks={swa_block_tables.shape[1]}); a padded view would "
+                "widen the in-kernel block-index bound past the real table"
+            )
         swa_slot_stride = swa_block_tables.stride(0)
+        swa_num_rows = swa_kv.shape[0]
         swa_pos_stride = swa_kv.stride(0)
         swa_cache_size = swa_block_size
         swa_kv_arg = swa_kv
@@ -1152,6 +1214,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             )
         swa_slot_stride = 0
         swa_pos_stride = swa_kv.stride(0)
+        swa_num_rows = swa_kv.shape[0]
         swa_cache_size = 1
         swa_kv_arg = swa_kv
         ssm_arg = swa_dest_rows
@@ -1159,6 +1222,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     else:
         swa_slot_stride = 0
         swa_pos_stride = 0
+        swa_num_rows = 0
         swa_cache_size = 1
         swa_kv_arg = kv_out  # bf16 dummy
         ssm_arg = q.new_empty(1, dtype=torch.int32)
@@ -1229,6 +1293,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
             n,
             _stream_arg(),

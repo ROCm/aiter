@@ -4356,8 +4356,13 @@ namespace aiter {
     // Destination row for one token's fused SWA write, or -1 to skip it.
     // Skipped: CG-pad tokens (bid < 0), stale positions, out-of-window sentinel
     // blocks (phys < 0), rows the caller marked -1, and any row the pool does
-    // not have. Shared by the QK and K-only kernels so the two addressing modes
-    // are written down once.
+    // not have. Shared by the coarse and fine-grained QK kernels so the two
+    // addressing modes are written down once. (The K-only entry point does not
+    // expose an SWA write at all.)
+    //
+    // Note the `pos < 0` gate applies in BOTH modes: a direct-mode caller owns
+    // the row but not the staleness test, so a negative position still skips
+    // even when swa_dest_row[token] names a valid row.
     template <typename params_t>
     __device__ __forceinline__ int64_t swa_row_for_token(
         const params_t& params,
@@ -4820,7 +4825,8 @@ namespace aiter {
         const int64_t out_rope_offset =
             static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
         // Optional fused SWA scatter (decode-only): write the same post-norm/rope
-        // K row into the SWA pool, ring- or block-table-addressed.
+        // K row into the SWA pool, block-table-addressed (paged) or at a row the
+        // caller resolved (direct). See `swa_row_for_token`.
         bool write_swa = false;
         int64_t swa_cache_offset = 0, swa_rope_offset = 0;
         if (swa_nope != nullptr) {
@@ -5208,8 +5214,8 @@ namespace aiter {
         compute_rope_ptrs(cos_ptr, sin_ptr);
 
         // Optional fused SWA scatter (decode-only): mirror this post-norm/rope K row
-        // (nope fp8 + inline dup e8m0 scale, and rope bf16) into the SWA pool, ring-
-        // or block-table-addressed.
+        // (nope fp8 + inline dup e8m0 scale, and rope bf16) into the SWA pool,
+        // block-table-addressed (paged) or at a caller-resolved row (direct).
         // Only the K wave scatters (the SWA pool is K-only); Q waves never reach here.
         cache_t*  ptr_swa_o    = nullptr;
         scalar_t* swa_out_rope = nullptr;
@@ -5781,9 +5787,11 @@ void fused_qk_norm_rope_group_quant(
     AITER_CHECK(swa_block_tables.has_value() != swa_dest_row.has_value(),
                 "SWA write needs exactly one of swa_block_tables (paged) or "
                 "swa_dest_row (caller-supplied rows), not both and not neither");
+    // swa_block_size is checked in the paged branch only; direct mode never
+    // divides by it.
     AITER_CHECK(swa_rope_buff.has_value() && batch_id_per_token.has_value(),
-                "SWA write requires swa_nope_scale_buff, swa_rope_buff, "
-                "swa_block_size, and batch_id_per_token");
+                "SWA write requires swa_nope_scale_buff, swa_rope_buff, and "
+                "batch_id_per_token");
     AITER_CHECK(swa_nope_scale_buff->dtype() == k_nope_scale_buff.dtype(),
                 "swa_nope_scale_buff dtype must match k_nope_scale_buff");
     AITER_CHECK(swa_rope_buff->dtype() == k_rope_buff.dtype(),

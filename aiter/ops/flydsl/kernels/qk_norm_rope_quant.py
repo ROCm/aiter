@@ -296,6 +296,7 @@ def _build_kernel(
         batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
+        swa_num_rows: Int32,  # rows in the SWA pool; bounds the final row
         swa_cache_size: Int32,  # ring slot count
     ):
         f32 = T.f32
@@ -637,16 +638,35 @@ def _build_kernel(
                             32,
                         )
                     )
-                    do_swa = bid_i32 >= fx.Int32(0)
+                    # A stale token carries a negative position. `divsi`/`remsi`
+                    # truncate toward zero, so pos=-300 with block_size=128 gives
+                    # blk=-2 and in_blk=-44: the block index passes an upper-bound
+                    # test, reads the PREVIOUS request's table entry, and lands the
+                    # write 44 rows before that block. The C++ sibling's first gate
+                    # is `bid < 0 || pos < 0`; match it, in both modes.
+                    pos_ok = pos_i32 >= fx.Int32(0)
+                    do_swa = (bid_i32 >= fx.Int32(0)) & pos_ok
                     bid_safe = (bid_i32 >= fx.Int32(0)).select(bid_i32, fx.Int32(0))
+                    pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
                         # paged / content-addressed SWA (DeepSeek-V4 #1417):
                         # swa_kv is the FLAT [num_pages, D] pool; `swa_index` is
                         # block_tables[bs, max_blocks], swa_slot_stride=max_blocks,
                         # swa_cache_size=block_size, swa_pos_stride=D. Physical row
                         # = block_tables[bid, pos//bs]*bs + pos%bs.
-                        blk = pos_i32 // swa_cache_size
-                        bt_off = bid_safe * swa_slot_stride + blk
+                        blk = pos_safe // swa_cache_size
+                        # The other two gates the C++ sibling applies (see
+                        # `swa_row_for_token`): a position past the table's last
+                        # block would read the NEXT request's entry, and `-1`
+                        # marks a block outside the window. Clamp for the load,
+                        # gate the store on the unclamped test. The wrapper
+                        # pins stride(0) == max_blocks, so the row stride is
+                        # both the table width and the distance between two
+                        # requests' rows.
+                        blk_ok = blk < swa_slot_stride
+                        bt_off = bid_safe * swa_slot_stride + blk_ok.select(
+                            blk, fx.Int32(0)
+                        )
                         phys = fx.Int32(
                             _scalar_load(
                                 fx.Int64(ptrtoint(swa_index)),
@@ -655,8 +675,18 @@ def _build_kernel(
                                 32,
                             )
                         )
-                        in_blk = pos_i32 % swa_cache_size
-                        row = phys * swa_cache_size + in_blk
+                        in_blk = pos_safe % swa_cache_size
+                        row_raw = phys * swa_cache_size + in_blk
+                        # Bound the final row against the pool, as the C++ does:
+                        # a phys id left over from a larger pool would otherwise
+                        # write past the end of swa_kv.
+                        row_ok = (
+                            blk_ok & (phys >= fx.Int32(0)) & (row_raw < swa_num_rows)
+                        )
+                        do_swa = do_swa & row_ok
+                        # Clamp too: a negative row would move the descriptor
+                        # base backwards, out of this tensor entirely.
+                        row = row_ok.select(row_raw, fx.Int32(0))
                     else:
                         # Direct: the caller already resolved this token's row.
                         # A -1 row means "skip", same as a -1 batch id -- a caller
@@ -670,8 +700,11 @@ def _build_kernel(
                                 32,
                             )
                         )
-                        do_swa = do_swa & (dest >= fx.Int32(0))
-                        row = (dest >= fx.Int32(0)).select(dest, fx.Int32(0))
+                        # Bounded against the pool as well: the caller owns the
+                        # row, but a stale entry must not write past swa_kv.
+                        dest_ok = (dest >= fx.Int32(0)) & (dest < swa_num_rows)
+                        do_swa = do_swa & dest_ok
+                        row = dest_ok.select(dest, fx.Int32(0))
                     # Fold the row's byte offset into the base ptr; the per-token
                     # row is then a plain (1, D) tiled-copy store like kv_out.
                     # Widen BEFORE the element product: a unified V4 pool runs to
@@ -717,6 +750,7 @@ def _build_kernel(
         batch_id_per_token: fx.Pointer,
         swa_slot_stride: fx.Int32,
         swa_pos_stride: fx.Int32,
+        swa_num_rows: fx.Int32,
         swa_cache_size: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
@@ -740,6 +774,7 @@ def _build_kernel(
             batch_id_per_token,
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
         )
         k.launch(
@@ -1028,8 +1063,24 @@ def flydsl_qk_norm_rope_quant(
             )
         if swa_block_tables.dim() != 2 or swa_block_tables.dtype != torch.int32:
             raise TypeError("swa_block_tables must be 2-D [bs, max_blocks] int32")
-        swa_slot_stride = swa_block_tables.stride(0)  # = max_blocks
+        # The kernel indexes the table as `bid * stride(0) + blk` and bounds
+        # `blk` against stride(0). For that bound to be the table WIDTH (what
+        # the C++ sibling checks, via size(1)) and not merely the distance
+        # between rows, the table must be dense: a `full[:, :n]` view would
+        # leave stride(0) > n, letting a far-future position read a stale
+        # padding column instead of being skipped.
+        if swa_block_tables.stride(1) != 1:
+            raise ValueError("swa_block_tables must be contiguous in the last dim")
+        if swa_block_tables.stride(0) != swa_block_tables.shape[1]:
+            raise ValueError(
+                "swa_block_tables must be densely packed "
+                f"(stride(0)={swa_block_tables.stride(0)} != "
+                f"max_blocks={swa_block_tables.shape[1]}); a padded view would "
+                "widen the in-kernel block-index bound past the real table"
+            )
+        swa_slot_stride = swa_block_tables.stride(0)  # == max_blocks
         swa_pos_stride = swa_kv.stride(0)  # = D (flat pool row stride)
+        swa_num_rows = swa_kv.shape[0]
         swa_cache_size = swa_block_size
         swa_kv_arg = swa_kv
         ssm_arg = swa_block_tables
@@ -1051,6 +1102,7 @@ def flydsl_qk_norm_rope_quant(
             )
         swa_slot_stride = 0
         swa_pos_stride = swa_kv.stride(0)
+        swa_num_rows = swa_kv.shape[0]
         swa_cache_size = 1
         swa_kv_arg = swa_kv
         ssm_arg = swa_dest_rows
@@ -1059,6 +1111,7 @@ def flydsl_qk_norm_rope_quant(
         # 1-elem dummies so the kernel param binding has valid pointers.
         swa_slot_stride = 0
         swa_pos_stride = 0
+        swa_num_rows = 0
         swa_cache_size = 1
         swa_kv_arg = kv_out  # bf16 dummy
         ssm_arg = q.new_empty(1, dtype=torch.int32)
@@ -1113,6 +1166,7 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
             n,
             fx_stream,
