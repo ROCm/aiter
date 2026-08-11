@@ -7,7 +7,10 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+from aiter.ops.triton.attention.pa_decode_sparse import (
+    _addressable_bytes,
+    pa_decode_sparse,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import checkAllclose
 
@@ -534,3 +537,24 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_addressable_bytes():
+    """Span must come from the strides, not nelement().
+
+    Metadata only, on ``meta`` -- the strided case describes a 63 GiB span and
+    a real allocation would commit it.
+    """
+
+    def meta(*shape):
+        return torch.empty(*shape, dtype=torch.uint8, device="meta")
+
+    # Contiguous: span == logical, so a 1.64 GiB cache keeps buffer_load.
+    c = meta(47233, 64, 584)
+    assert _addressable_bytes(c) == c.nelement() <= 2**31 - 2
+
+    # Same nelement() as a view of a larger allocation at 38.4x the block
+    # pitch, but a 63 GiB span.
+    v = meta(1435968 * 47232 + 64 * 584).as_strided((47233, 64, 584), (1435968, 584, 1))
+    assert v.nelement() == c.nelement()
+    assert _addressable_bytes(v) == 67823677952 > 2**31 - 2
