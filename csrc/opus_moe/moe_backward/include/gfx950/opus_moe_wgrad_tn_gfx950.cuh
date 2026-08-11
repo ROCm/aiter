@@ -517,6 +517,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 opus_wgtn_fixed_tr_fragment<96>(smem, tr_layout);
             }
             opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+            __builtin_amdgcn_s_setprio(1);
             opus::static_for<4>([&](auto sm) {
                 constexpr int a_reg = 96 + (sm.value & 1) * 4;
                 if constexpr(sm.value + 1 < 4)
@@ -545,6 +546,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 if constexpr(sm.value + 1 < 4)
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             });
+            __builtin_amdgcn_s_setprio(0);
             if(has_next && kpack == 1)
             {
                 store_stage(cur ^ 1, 0, next);
