@@ -328,6 +328,52 @@ __global__ void add_rmsnorm_quant_kernel(
         core_loop(std::false_type{});
     }
 
+template <typename DTYPE_I, int NumRows>
+__global__ void add_rmsnorm_n64_kernel(
+    DTYPE_I* out,
+    DTYPE_I* residual_out,
+    const DTYPE_I* input,
+    const DTYPE_I* residual_in,
+    const DTYPE_I* weight,
+    double epsilon,
+    bool gemma_norm,
+    int m,
+    int input_stride,
+    int residual_in_stride,
+    int residual_out_stride,
+    int out_stride)
+{
+    const int tid = threadIdx.x;
+    int row = blockIdx.x * NumRows;
+    const float weight_value =
+        static_cast<float>(weight[tid]) + (gemma_norm ? 1.0f : 0.0f);
+    auto sum_f = [](float a, float b) { return a + b; };
+
+    #pragma nounroll
+    for(int r = 0; r < NumRows && row < m; ++r, ++row)
+    {
+        const int64_t input_offset =
+            row * static_cast<int64_t>(input_stride) + tid;
+        const int64_t residual_in_offset =
+            row * static_cast<int64_t>(residual_in_stride) + tid;
+        const int64_t residual_out_offset =
+            row * static_cast<int64_t>(residual_out_stride) + tid;
+        const int64_t out_offset =
+            row * static_cast<int64_t>(out_stride) + tid;
+
+        const float value = static_cast<float>(input[input_offset]) +
+                            static_cast<float>(residual_in[residual_in_offset]);
+        residual_out[residual_out_offset] = static_cast<DTYPE_I>(value);
+
+        const float square_sum =
+            block_reduce<float, decltype(sum_f), WARP_SIZE, true>(
+                value * value, sum_f);
+        const float inv_rms = rsqrtf(square_sum / 64.0f + epsilon);
+        out[out_offset] =
+            static_cast<DTYPE_I>(value * inv_rms * weight_value);
+    }
+}
+
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, NUM_ROWS) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
@@ -364,6 +410,22 @@ __global__ void add_rmsnorm_quant_kernel(
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
     ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, 1)
+
+#define ADD_RMSNORM_N64_KERNEL_IMPL(NUM_ROWS) \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "add_rmsnorm_n64_kernel", [&] { \
+    using DTYPE_I = typename hip2opus<scalar_t>::type; \
+    constexpr int num_row_per_block = NUM_ROWS; \
+    dim3 grid((m + num_row_per_block - 1) / num_row_per_block); \
+    dim3 block(WARP_SIZE); \
+    add_rmsnorm_n64_kernel<DTYPE_I, num_row_per_block><<<grid, block, 0, stream>>>( \
+        reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
+        epsilon, gemma_norm, m, input_stride, residual_in_stride, \
+        residual_out_stride, out_stride); \
+    });
 
 #define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
@@ -527,8 +589,12 @@ __global__ void add_rmsnorm_quant_kernel(
 
     
 #define ADD_RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
-    if (n == 64 && m >= cu_num * 32) { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT, 8); \
+    if (n == 64) { \
+        if (m >= cu_num * 32) { \
+            ADD_RMSNORM_N64_KERNEL_IMPL(8); \
+        } else { \
+            ADD_RMSNORM_N64_KERNEL_IMPL(1); \
+        } \
     } else if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 1024) { \
