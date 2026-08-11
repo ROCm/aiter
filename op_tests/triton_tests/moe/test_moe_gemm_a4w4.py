@@ -70,8 +70,7 @@ def init_compute_data(
     has_y_gammas,
     device="cuda",
 ):
-    # TODO: Uncomment after pytorch adds support for manual_seed
-    # torch.manual_seed(0)
+    torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
@@ -256,8 +255,7 @@ def test_op(
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
-    # TODO: Uncomment after pytorch adds support for manual_seed
-    # torch.manual_seed(0)
+    torch.manual_seed(0)
 
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
@@ -309,7 +307,6 @@ def test_op(
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
-    x_static_scale = None
     out_dtype = torch.bfloat16
     maxtol = None
     rmstol = None
@@ -324,8 +321,6 @@ def test_op(
         w_tri,
         x_mx_scales_tri,
         w_scale_tri,
-        x_static_scale,
-        None,
         bias_tri,
         rdata,
         gindx,
