@@ -1,8 +1,10 @@
 name: FFM Aiter UT
 
-run-name: FFM aiter UT on ${{ inputs.runner }}
+run-name: FFM aiter UT on ${{ inputs.runner || 'build-only-aiter' }}
 
 on:
+  pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       runner:
@@ -25,20 +27,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'build-only-aiter' }}
   cancel-in-progress: true
 
 env:
-  FFM_IMAGE: ${{ inputs.docker_image }}
-  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref }}
+  FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
+  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
   FFM_TEST: op_tests/triton_tests
   FFM_SHARD_COUNT: 5
   FFM_TRITON_COMMIT: 6cf030fe7bffce12a5712e20fb507a51d5123f10
 
 jobs:
   ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner }}) / Shard ${{ matrix.shard }}
-    runs-on: ${{ inputs.runner }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'ci:gfx1250-ffm' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    name: FFM Aiter UT (${{ inputs.runner || 'build-only-aiter' }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.runner || 'build-only-aiter' }}
     timeout-minutes: 7200
     strategy:
       fail-fast: false
@@ -49,7 +58,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Load reduced FFM Triton test suite
