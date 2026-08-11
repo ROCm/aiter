@@ -48,6 +48,7 @@ def _opus_moe_stage1_a8w4_fwd_raw(
     num_valid_ids: Tensor,
     out: Tensor,
     out_scale: Tensor,
+    topk: int,
     block_m: int,
     kernelName: str,
     inter_dim_pad: int,
@@ -96,6 +97,7 @@ def opus_moe_stage1_a8w4_fwd(
     bias: Tensor | None = None,
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
+    output_sorted: bool = False,
     swiglu_limit: float | None = None,
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
@@ -109,8 +111,19 @@ def opus_moe_stage1_a8w4_fwd(
         )
     inter_dim = int(w1.shape[1]) // 2
     if out is None:
+        out_shape = (
+            (
+                max(
+                    int(sorted_token_ids.numel()),
+                    int(sorted_expert_ids.numel()) * block_m,
+                ),
+                inter_dim,
+            )
+            if output_sorted
+            else (hidden_states.shape[0], int(topk), inter_dim)
+        )
         out = torch.empty(
-            (hidden_states.shape[0], int(topk), inter_dim),
+            out_shape,
             dtype=torch.float8_e4m3fn,
             device=hidden_states.device,
         )
@@ -133,6 +146,7 @@ def opus_moe_stage1_a8w4_fwd(
         _contiguous(num_valid_ids),
         _contiguous(out),
         _contiguous(out_scale),
+        int(topk),
         int(block_m),
         kernelName,
         int(inter_dim_pad),

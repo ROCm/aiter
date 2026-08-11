@@ -10,7 +10,7 @@ Out of scope, do not touch without an explicit request: `configs/conv/`,
 of `configs/`. They have their own loaders and are unaffected by anything here.
 
 The tree is **mid-migration** from a flat, arch-prefixed layout to a nested
-`<arch>/<backend>/<op>/` layout. Both layouts are live, but **the legacy flat
+`<arch>/<backend>/<op>/<d_type>/` layout. Both layouts are live, but **the legacy flat
 layout is deprecated and will be removed** — treat it as read-only history, not
 as a place to add things.
 
@@ -32,7 +32,8 @@ family and the worked reference — copy its shape when in doubt.
 ### Target layout (use for all new configs)
 
 ```
-configs/<arch>/<backend>/<op>/<CONFIG_NAME>[-<suffix>].json
+configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
+configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 ```
 
 | Segment     | Values                                                    |
@@ -40,13 +41,14 @@ configs/<arch>/<backend>/<op>/<CONFIG_NAME>[-<suffix>].json
 | `<arch>`    | `gfx942`, `gfx950`, `gfx1250`, `gfx1151`, `gfx1200`, `gfx1201` |
 | `<backend>` | `triton` or `gluon`                                        |
 | `<op>`      | `gemm` or `moe`                                            |
-| filename    | **no arch prefix** — the arch is the directory             |
+| `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform lives in `gemm_config_utils._dtype_dir()` |
+| filename    | **no arch prefix** — the arch is the directory. The default is literally `DEFAULT.json`; specialized files keep the `<CONFIG_NAME>-` stem |
 
 ```
-configs/gfx950/triton/gemm/GEMM-AFP4WFP4.json
-configs/gfx950/triton/gemm/GEMM-AFP4WFP4-N=8192-K=8192.json
-configs/gfx950/gluon/gemm/GEMM-AFP4WFP4.json
-configs/gfx1250/gluon/gemm/GEMM-AFP4WFP4.json
+configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json
+configs/gfx950/triton/gemm/gemm_afp4wfp4/GEMM-AFP4WFP4-N=8192-K=8192.json
+configs/gfx950/gluon/gemm/gemm_afp4wfp4/DEFAULT.json
+configs/gfx1250/gluon/gemm/gemm_afp4wfp4/DEFAULT.json
 ```
 
 The `<arch>/<backend>/moe/` directories exist but are empty, held open with
@@ -76,18 +78,19 @@ legacy candidates are dropped from `gemm_config_utils.py` will stop resolving.
 ## 2. GEMM resolution order — `get_gemm_config()`
 
 `utils/gemm_config_utils.py` picks a directory by probing for the *default*
-config file (`<CONFIG_NAME>.json`) in order and taking the first hit.
-Specialized files are then read from that same directory.
+config file (`DEFAULT.json` in the nested layout, `<arch>-<CONFIG_NAME>.json`
+in legacy) in order and taking the first hit. Specialized files are then read
+from that same directory.
 
 **`backend=None`** (what every caller uses today):
 
-1. `configs/<arch>/triton/gemm/<CONFIG_NAME>.json`
-2. `configs/<arch>/gluon/gemm/<CONFIG_NAME>.json`
+1. `configs/<arch>/triton/gemm/<d_type>/DEFAULT.json`
+2. `configs/<arch>/gluon/gemm/<d_type>/DEFAULT.json`
 3. `configs/gemm/<arch>-<CONFIG_NAME>.json`  *(legacy)*
 
 **`backend="triton"|"gluon"`**:
 
-1. `configs/<arch>/<backend>/gemm/<CONFIG_NAME>.json`
+1. `configs/<arch>/<backend>/gemm/<d_type>/DEFAULT.json`
 2. `configs/gemm/<backend>/<arch>-<CONFIG_NAME>.json`  *(legacy)*
 3. `configs/gemm/<arch>-<CONFIG_NAME>.json`  *(legacy)*
 
@@ -99,23 +102,30 @@ scheduled for deletion. Do not write new code that depends on them resolving.
 
 Consequences to keep in mind:
 
-- **A directory is chosen as a unit.** Splitting a config family across
-  `<arch>/triton/gemm/` and legacy `configs/gemm/` silently drops the
-  specialized files in whichever directory loses the probe. Move a family
-  wholesale or not at all.
+- **A directory is chosen as a unit.** The unit is the family's `<d_type>/`
+  directory. Splitting a config family across `<arch>/triton/gemm/<d_type>/`
+  and legacy `configs/gemm/` silently drops the specialized files in whichever
+  directory loses the probe. Move a family wholesale or not at all. Worse: a
+  `<d_type>/` directory with specialized files but **no `DEFAULT.json` is
+  invisible** — the probe keys only on `DEFAULT.json` and falls through to
+  legacy, ignoring everything in the directory.
 - **`backend=None` prefers `triton` over `gluon`.** On an arch with only a
   gluon default (currently gfx1250 `GEMM-AFP4WFP4`), lookup falls through to
-  gluon. Adding `configs/gfx1250/triton/gemm/GEMM-AFP4WFP4.json` later would
-  change which file gfx1250 resolves to — verify that is intended.
-- Results are cached per `(arch, config_name, backend)` via
-  `functools.lru_cache` plus `_config_cache`. Adding a file at runtime after a
-  lookup has happened has no effect; restart the process.
+  gluon. Adding `configs/gfx1250/triton/gemm/gemm_afp4wfp4/DEFAULT.json` later
+  would change which file gfx1250 resolves to — verify that is intended.
+- Results are cached twice: `functools.lru_cache` on the full argument
+  tuple, plus a per-path cache of parsed JSON
+  (`utils/core.py::load_config_json`) that also caches negative results
+  (missing files). Adding a config file at runtime therefore has no effect;
+  restart the process (tooling may call `load_config_json.cache_clear()`
+  instead).
 
-Direct-path loaders bypass all of this. Grep for
-`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything — `gluon/gemm_a8w8.py`
-and `gluon/gemm_a8w8_blockscale.py` still build legacy `gemm/gluon/` paths by
-hand and must be edited when their configs move. `gluon/gemm_afp4wfp4.py` was
-already updated to the nested path.
+Direct-path loaders bypass the resolver's directory probe. Grep for
+`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —
+`gluon/gemm_a8w8_blockscale.py` still builds legacy `gemm/gluon/` paths by
+hand (via `load_config_json`) and must be edited when its configs move.
+`gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
+`get_gemm_config(backend="gluon")` and need no changes.
 
 ---
 
@@ -132,9 +142,9 @@ Required top-level shape:
 ```
 
 - `M_LEQ_x` is searched ascending over `STANDARD_M_BOUNDS =
-  (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`, then `M_GEQ_x`
-  descending, then `any`. A caller may override with `bounds=(...)`, which must
-  be strictly increasing positive ints.
+  (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`, then
+  `M_GEQ_x` descending, then `any`. A caller may override with
+  `bounds=(...)`, which must be strictly increasing positive ints.
 - `any` must exist unless every reachable `M` is covered by an explicit bound.
 - The deprecated `{"large": ..., "small": ...}` shape must not be introduced.
 - A `KeyError` at lookup time means no bound matched — usually a missing `any`.
@@ -175,13 +185,17 @@ had tuned, and made the effective config un-inspectable from the JSON.
 
 | Kind              | Target layout                                   | Legacy layout                                        |
 | ----------------- | ----------------------------------------------- | ---------------------------------------------------- |
-| Default           | `GEMM-A16W16.json`                               | `gfx950-GEMM-A16W16.json`                             |
-| N/K specialized   | `GEMM-A16W16-N=256-K=7168.json`                  | `gfx950-GEMM-A16W16-N=256-K=7168.json`                |
-| Batched (B, N, K) | `BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json`     | `gfx1250-BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json`  |
-| Custom suffix     | `FUSED-GEMM-AFP4WFP4-A16W16-N4=512-N16=256-K=7168.json` | same, arch-prefixed                           |
+| Default           | `gemm_a16w16/DEFAULT.json`                       | `gfx950-GEMM-A16W16.json`                             |
+| N/K specialized   | `gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`      | `gfx950-GEMM-A16W16-N=256-K=7168.json`                |
+| Batched (B, N, K) | `batched_gemm_a16w16/BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json` | `gfx1250-BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json` |
+| Custom suffix     | `fused_gemm_afp4wfp4_a16w16/FUSED-GEMM-AFP4WFP4-A16W16-N4=512-N16=256-K=7168.json` | same, arch-prefixed         |
+
+The `<d_type>` directory name is `config_name.lower().replace("-", "_")`.
+Dashes, underscores, and case all fold together, so new config names must stay
+distinct under that transform — `GEMM-FOO-BAR` and `GEMM-FOO_BAR` would collide.
 
 Config-name patterns: `GEMM-A{x}W{y}`, `BATCHED_GEMM-A{x}W{y}`,
-`GEMM_PREQUANT-...`, `FUSED-GEMM-{op}`, `FF-A{x}W{y}-fused`; variant suffixes
+`FUSED-GEMM-{op}`, `FF-A{x}W{y}-fused`; variant suffixes
 `_PRESHUFFLED`, `_BLOCKSCALE`.
 
 **`K` in AFP4WFP4 filenames is the logical K, i.e. `2 * K_bytes`.** The kernel
@@ -239,16 +253,23 @@ on `<op>`:
 ```python
 def resolve_config_dir(op: str, config_name: str, backend: str | None = None,
                        legacy_dir: str | None = None) -> tuple[str, str]:
-    """Return (cfg_dir, name_prefix) for the first candidate that has
-    <cfg_dir>/<name_prefix><config_name>.json. Falls back to the last
-    candidate so the missing-file assertion names a legacy path."""
+    """Return (cfg_dir, name_prefix) for the first candidate whose default
+    file exists: DEFAULT.json when name_prefix is empty (the nested layout,
+    dir from _dtype_dir()), else <name_prefix><config_name>.json. Falls back
+    to the last candidate so the missing-file assertion names a legacy path."""
 ```
 
 Candidates for `op="moe"`, mirroring §2:
 
-- `backend=None` → `<arch>/triton/moe/`, `<arch>/gluon/moe/`, then legacy
-  `configs/moe/` with the `<arch>-` prefix
-- `backend=...` → `<arch>/<backend>/moe/`, then legacy `configs/moe/` prefixed
+- `backend=None` → `<arch>/triton/moe/<d_type>/DEFAULT.json`,
+  `<arch>/gluon/moe/<d_type>/DEFAULT.json`, then legacy `configs/moe/` with
+  the `<arch>-` prefix
+- `backend=...` → `<arch>/<backend>/moe/<d_type>/DEFAULT.json`, then legacy
+  `configs/moe/` prefixed
+
+`<d_type>` comes from the unprefixed stem via the same transform:
+`MOE-FP8_W8A8` → `moe_fp8_w8a8`, `A8W4` → `a8w4`,
+`MOE_ROUTING_SIGMOID_TOPK1` → `moe_routing_sigmoid_topk1`.
 
 `gemm_config_utils.py` is then refactored onto the same helper with `op="gemm"`
 and `legacy_dir="gemm"` — behaviour-identical, and the legacy candidates stay
@@ -305,13 +326,18 @@ legacy form if a step is ambiguous.
 2. **Find every reader.** Grep for the config name and for
    `AITER_TRITON_CONFIGS_PATH` in `aiter/ops/triton/`. Hand-built paths must be
    rewritten; `get_gemm_config()` callers need no change.
-3. **Move with `git mv`** so the change reviews as a rename, and strip the
-   `<arch>-` prefix:
+3. **Move with `git mv`** so the change reviews as a rename. Strip the
+   `<arch>-` prefix; the default file becomes `DEFAULT.json`, specialized
+   files keep the `<CONFIG_NAME>-` stem:
    ```
+   git mv configs/gemm/gfx950-GEMM-FOO.json \
+          configs/gfx950/triton/gemm/gemm_foo/DEFAULT.json
    git mv configs/gemm/gfx950-GEMM-FOO-N=1-K=2.json \
-          configs/gfx950/triton/gemm/GEMM-FOO-N=1-K=2.json
+          configs/gfx950/triton/gemm/gemm_foo/GEMM-FOO-N=1-K=2.json
    ```
-   Create `<arch>/<backend>/{gemm,moe}/` with a `.gitkeep` if absent.
+   `mkdir` the `<d_type>/` directory first; it needs no `.gitkeep` (it is
+   created populated). Create `<arch>/<backend>/{gemm,moe}/` with a `.gitkeep`
+   if absent.
 4. **Do not edit contents in the same commit.** Keep renames at 100% similarity;
    content changes go in a follow-up commit.
 5. **Update docs.** `aiter/ops/triton/README.md` ("How config selection works",
@@ -329,7 +355,9 @@ legacy form if a step is ambiguous.
 ### Adding a *new* tuned config (no migration)
 
 - **GEMM**, new arch/backend combination or a family already migrated →
-  target layout, unprefixed filename.
+  target layout, inside the family's `<d_type>/` directory (`DEFAULT.json`
+  for the default; specialized files keep the config-name stem, no arch
+  prefix).
 - **GEMM**, family still in `configs/gemm/` → add to `configs/gemm/` with the
   arch prefix, and consider migrating the whole family in the same PR. Never
   create a lone nested file for a family whose default lives in legacy; the
@@ -340,7 +368,8 @@ legacy form if a step is ambiguous.
 ### Do not
 
 - Rename or delete `.gitkeep` placeholder directories.
-- Put an arch prefix on a file inside `<arch>/...`.
+- Put an arch prefix on a file inside `<arch>/...`, or name a nested default
+  anything other than `DEFAULT.json`.
 - Put tuning values in `.py` files — no `setdefault`, no inline dicts, no
   arch-conditional constants, no hardcoded fallback configs.
 - Mix the GEMM `M_LEQ_x`/`M_GEQ_y` scheme with the MOE
