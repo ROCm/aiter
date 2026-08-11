@@ -795,9 +795,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "CustomAllreduce should be attached to a non-NCCL group."
-        )
+        assert (
+            dist.get_backend(group) != dist.Backend.NCCL
+        ), "CustomAllreduce should be attached to a non-NCCL group."
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -1051,10 +1051,16 @@ class CustomAllreduce:
         # Create IPC buffer pool and allocate all named buffers.
         self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
         self._pool.create("meta", meta_size, uncached=True)
-        # Cached raw hipMalloc (not torch.empty): the input pool is IPC-exported
-        # via hipIpcGetMemHandle, which fails on PyTorch expandable-segment pool
-        # pointers (issue #4174). A plain hipMalloc allocation stays exportable.
-        self._pool.create("input", max_size, raw_cached=True)
+        # The input pool is IPC-exported via hipIpcGetMemHandle. That fails on
+        # PyTorch expandable-segment pool pointers (issue #4174), so when
+        # expandable_segments is on we back the pool with a plain (cached)
+        # hipMalloc allocation, which stays exportable. Otherwise keep the
+        # default torch.empty allocation so the pool remains tracked by the
+        # PyTorch caching allocator (its memory accounting is what downstream
+        # consumers profile against). Gated on the same condition as the
+        # capture copy-in path above; _init_ipc only runs for non-VMM.
+        raw_cached = _expandable_segments_enabled()
+        self._pool.create("input", max_size, raw_cached=raw_cached)
 
         handles, offsets = self._pool.get_ipc_meta("meta")
         self._ptr = self._ops_init_custom_ar(
