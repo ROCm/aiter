@@ -17,7 +17,11 @@ QKV_DIM = 6144
 __all__ = ["gdr_decode_packed_bf16"]
 
 
-@compile_ops("module_gdr_decode_packed_bf16", fc_name="gdr_decode_packed_bf16")
+@compile_ops(
+    "module_gdr_decode_packed_bf16",
+    fc_name="gdr_decode_packed_bf16",
+    develop=True,
+)
 def _gdr_decode_packed_bf16(
     mixed_qkv: Tensor,
     a: Tensor,

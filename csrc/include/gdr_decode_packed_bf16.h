@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
 namespace aiter {
 
-void gdr_decode_packed_bf16(const torch::Tensor& mixed_qkv,
-                            const torch::Tensor& a,
-                            const torch::Tensor& b,
-                            const torch::Tensor& dt_bias,
-                            const torch::Tensor& A_log,
-                            const torch::Tensor& indices,
-                            torch::Tensor& state,
-                            torch::Tensor& out,
-                            double scale);
+void gdr_decode_packed_bf16(aiter_tensor_t& mixed_qkv,
+                            aiter_tensor_t& a,
+                            aiter_tensor_t& b,
+                            aiter_tensor_t& dt_bias,
+                            aiter_tensor_t& A_log,
+                            aiter_tensor_t& indices,
+                            aiter_tensor_t& state,
+                            aiter_tensor_t& out,
+                            float scale);
 
 } // namespace aiter
