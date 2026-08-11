@@ -313,7 +313,15 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
   switch inside the existing builders); entry-point `w_dtype` arg.
 
 ### Phase C — BF16 weights + gfx942 fallback (G3, G4)  [ ]
-- [ ] `w_dtype="bf16"` path (BF16×BF16 dot2) as a scaffold + non-fp8 correctness oracle.
+- [x] `w_dtype="bf16"` path (BF16×BF16 dot2) as a scaffold + non-fp8 correctness oracle
+      **(2026-08-11).** Added dedicated `build_gate_up_bf16_module` / `build_down_reduce_bf16_module`
+      (mirror the FP8 builders; a bf16 weight dword *is* a dot2 operand, so **no scaled convert
+      and no weight scale** — down folds only `router_wt`, gate_up keeps the silu-GLU epilogue).
+      Wired `flydsl_warp_decode_gate_up_bf16` / `flydsl_warp_decode_down_reduce_bf16` (5-ptr
+      kernels, no scale tensor) + `lru_cache` getters. Op_test adds `BF16_GATE_UP_CASES` /
+      `BF16_DOWN_CASES` over small + real **E=256** shapes; all pass at **cos ≈ 1.0** (only bf16
+      dot2 rounding, no quant error) — **32/32 suite**. This is the unquantized oracle that
+      isolates dequant bugs from reduce/routing bugs, and the scaffold for the gfx942 scalar path.
 - [ ] `use_dot2=False` scalar-f32 path (bitshift widen + FMA) for gfx942 portability;
       auto-select by arch (`get_gfx`), mirroring the reference's `_is_gfx950`.
 - [ ] Extend the op_test arch guard to exercise the scalar path where available.
@@ -473,7 +481,7 @@ bench/tune target; verify against the shipped weights before publishing numbers.
 |---|---|---|
 | **Batch B** | 1, 2, 4, 8, 32 | ✅ 1,4 · ⏳ **F** adds 2, 8, 32 |
 | **Scale layout** | pertensor, pertoken, block2d | ✅ all three (both stages) |
-| **Weight dtype** | FP8, MXFP4, BF16 | ✅ FP8 · ⏳ MXFP4 **B** · ⏳ BF16 **C** |
+| **Weight dtype** | FP8, MXFP4, BF16 | ✅ FP8 · ✅ MXFP4 **B** · ✅ BF16 **C** (oracle) |
 | **Activation** | BF16, FP8 | ✅ BF16 · ⏳ FP8 (follow-on) |
 | **Arch** | gfx950, gfx942 | ✅ gfx950 · ⏳ gfx942 scalar **C** |
 
