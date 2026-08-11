@@ -1007,6 +1007,223 @@ def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     }
 
 
+# -------------------------------------------------------------------------
+# Cold-HBM E=256 harness (SILOTIGER-667 ?2): the FP4 BW win only shows when the
+# weight pool >> MALL and successive decodes route to *different* experts, so a
+# steady-state launch actually streams weights from HBM.  At E=8 the touched
+# weights (TOPK experts) fit in MALL and stay warm; here we allocate the full
+# E-expert pool once and rotate a tiny router-id set across disjoint expert
+# groups so each launch reads a fresh slice of the (multi-GB) pool.
+# -------------------------------------------------------------------------
+# B, INTER, HIDDEN, E, TOPK.  DeepSeek-V3 down at **E=128** (FP4 pool ~0.94 GB,
+# FP8 ~1.88 GB -- both >> the ~256 MB MALL, so router-rotated reads are cold).
+# NOTE: true E=256 overflows the kernel's i32 weight offset (w_row*inter =
+# 255*7168*2048 ~= 3.76e9 > 2^31) and faults; it needs the K3 i64/per-expert-base
+# addressing follow-on.  E=128 (E*HIDDEN*INTER = 1.88e9 < 2^31) is the largest
+# safe cold pool and still answers the BW question.
+COLD_DOWN_SHAPES = [
+    (1, 2048, 7168, 128, 8),
+    (2, 2048, 7168, 128, 8),
+    (4, 2048, 7168, 128, 8),
+    (8, 2048, 7168, 128, 8),
+]
+# Largest E*HIDDEN*INTER the FP4/FP8 down kernels can address in i32 (byte offset
+# for FP8, dword*8 for FP4 both derive from w_row*inter, which must stay < 2^31).
+_COLD_I32_LIMIT = 2**31
+
+
+def _router_group_list(B, E, TOPK, device, n_route):
+    """`n_route` router-id sets, each selecting a *disjoint* contiguous block of
+    TOPK experts (group g -> experts [g*TOPK, (g+1)*TOPK)), wrapping mod E.  All
+    B tokens in a set share the group so the union of reads across the list
+    sweeps the whole pool (n_route*TOPK experts)."""
+    rid_list = []
+    for g in range(n_route):
+        base = (g * TOPK) % E
+        experts = [(base + j) % E for j in range(TOPK)]
+        rid = torch.tensor(experts, dtype=torch.int32, device=device)
+        rid_list.append(rid.view(1, TOPK).expand(B, TOPK).contiguous())
+    return rid_list
+
+
+def _dequant_down_expert_fp4(w_down_e, w_scale_e, lut):
+    """Unpack + dequantize one expert's FP4 down weights on the fly (fp32
+    [HIDDEN, INTER]); used only for the touched experts of the correctness gate,
+    so the full E-pool fp32 (~15 GB at E=256) is never materialized."""
+    lo = (w_down_e & 0x0F).to(torch.long)
+    hi = (w_down_e >> 4).to(torch.long)
+    HIDDEN, half = w_down_e.shape
+    INTER = half * 2
+    codes = torch.empty(HIDDEN, INTER, dtype=torch.long, device=w_down_e.device)
+    codes[:, 0::2] = lo
+    codes[:, 1::2] = hi
+    blk = torch.pow(2.0, w_scale_e.float() - 127.0)
+    return lut[codes] * blk.repeat_interleave(_MXFP4_BK, dim=1)
+
+
+def _gen_down_fp4_pool(B, INTER, HIDDEN, E, TOPK, n_route):
+    """Full E-expert MXFP4 down pool (packed uint8 weights + E8M0 scales) built
+    directly in packed form (no per-element int32/fp32 pool), plus a rotating
+    router-id list.  Returns (inter, w_down, w_scale, rid_list, rwt)."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    rows = E * HIDDEN
+    scale_cols = INTER // _MXFP4_BK
+    # Packed FP4 (2 nibbles/byte) straight to uint8 -> 0.5 B/elt, no int32 pool.
+    w_down = torch.randint(
+        0, 256, (E, HIDDEN, INTER // 2), generator=gen, device=device, dtype=torch.uint8
+    ).contiguous()
+    # E8M0 bytes in a moderate power-of-two range (2^-4..2^4) => exact dequant.
+    w_scale = torch.randint(
+        123, 132, (rows, scale_cols), generator=gen, device=device, dtype=torch.uint8
+    ).contiguous()
+    inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    rwt = torch.rand((B, TOPK), generator=gen, device=device).float()
+    rwt = rwt / rwt.sum(dim=1, keepdim=True)
+    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    return inter, w_down, w_scale, rid_list, rwt
+
+
+def _ref_down_fp4_pool(inter, w_down, w_scale, rid, rwt, HIDDEN):
+    B, TOPK, INTER = inter.shape
+    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=inter.device)
+    interf = inter.float()
+    y = torch.zeros(B, HIDDEN, device=inter.device)
+    cache = {}
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(rid[b, k])
+            if e not in cache:
+                sc = w_scale[e * HIDDEN : (e + 1) * HIDDEN]
+                cache[e] = _dequant_down_expert_fp4(w_down[e], sc, lut)
+            y[b] += float(rwt[b, k]) * (interf[b, k] @ cache[e].T)
+    return y.to(torch.bfloat16)
+
+
+def _gen_down_fp8_pool(B, INTER, HIDDEN, E, TOPK, n_route):
+    """Full E-expert FP8 (e4m3) down pool + PerTensor scale + rotating router
+    list, matching :func:`_gen_down_fp4_pool` (same inter/rwt RNG stream)."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    w_down = (
+        ((torch.rand((E, HIDDEN, INTER), generator=gen, device=device) * 2 - 1) * 0.25)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    w_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+    inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    rwt = torch.rand((B, TOPK), generator=gen, device=device).float()
+    rwt = rwt / rwt.sum(dim=1, keepdim=True)
+    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    return inter, w_down, w_scale, rid_list, rwt
+
+
+def _ref_down_fp8_pool(inter, w_down, w_scale, rid, rwt, HIDDEN):
+    B, TOPK, _ = inter.shape
+    interf = inter.float()
+    scale = float(w_scale[0])
+    y = torch.zeros(B, HIDDEN, device=inter.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(rid[b, k])
+            y[b] += float(rwt[b, k]) * (interf[b, k] @ w_down[e].float().T) * scale
+    return y.to(torch.bfloat16)
+
+
+def _time_rotating(entry_fn, rid_list, num_iters, num_warmup, timing):
+    """Time `entry_fn(router_ids)` while cycling `rid_list` across launches so
+    steady-state reads sweep the whole cold pool (weights are captured by the
+    closure -> not deep-copied, so no OOM)."""
+    state = {"i": 0}
+
+    def fn():
+        rid = rid_list[state["i"] % len(rid_list)]
+        state["i"] += 1
+        return entry_fn(rid)
+
+    got, us = run_perftest(
+        fn,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,  # rotate content via the closure, not arg deep-copies
+        **_timing_kwargs(timing),
+    )
+    return got, us
+
+
+@benchmark()
+def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
+    """Cold-HBM A/B: FP4 vs FP8 `down` at real E, router rotated over the pool.
+
+    Returns one merged row (FP4 + FP8 side by side).  ``wbytes`` counts only the
+    weights a single launch reads (TOPK experts' rows) -- the effective cold read
+    per launch -- so TB/s reflects real HBM bandwidth, not the whole pool.
+    """
+    device = torch.device("cuda")
+    n_route = max(1, E // TOPK)
+    outputs = B * HIDDEN
+    flops = 2 * INTER * TOPK * outputs
+    # Guard the K3 i32 weight-offset limit (w_row*inter must stay < 2^31).
+    assert (
+        E * HIDDEN * INTER < _COLD_I32_LIMIT
+    ), f"E*HIDDEN*INTER={E*HIDDEN*INTER} overflows i32 weight offset (needs K3 i64)"
+
+    # ---- FP4 ----
+    inter, w_down, w_scale, rid_list, rwt = _gen_down_fp4_pool(
+        B, INTER, HIDDEN, E, TOPK, n_route
+    )
+    out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
+    ref4 = _ref_down_fp4_pool(inter, w_down, w_scale, rid_list[0], rwt, HIDDEN)
+    entry4 = lambda rid, inter=inter, w_down=w_down, w_scale=w_scale, out=out: flydsl_warp_decode_down_reduce_fp4(  # noqa: E731
+        inter, w_down, rid, rwt, w_scale, scale_block=(1, _MXFP4_BK), out=out
+    )
+    got4 = entry4(rid_list[0])
+    torch.cuda.synchronize()
+    cos4 = _cosine(ref4, got4)
+    assert cos4 >= 0.99, f"down fp4 cold: correctness regression (cos={cos4:.4f})"
+    _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
+    wbytes4 = outputs * TOPK * INTER // 2 + outputs * TOPK * (INTER // _MXFP4_BK)
+    tbs4 = wbytes4 / us4 / 1e6 if us4 > 0 else 0.0
+    del inter, w_down, w_scale, out
+    torch.cuda.empty_cache()
+
+    # ---- FP8 (PerTensor) ----
+    inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
+        B, INTER, HIDDEN, E, TOPK, n_route
+    )
+    out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
+    ref8 = _ref_down_fp8_pool(inter8, w_down8, w_scale8, rid_list8[0], rwt8, HIDDEN)
+    entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
+        inter8, w_down8, rid, rwt8, w_scale8, w_scale_mode="pertensor", out=out8
+    )
+    got8 = entry8(rid_list8[0])
+    torch.cuda.synchronize()
+    cos8 = _cosine(ref8, got8)
+    assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
+    _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
+    wbytes8 = outputs * TOPK * INTER  # 1 B/elt FP8 weights
+    tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
+    del inter8, w_down8, w_scale8, out8
+    torch.cuda.empty_cache()
+
+    return {
+        "gfx": get_gfx(),
+        "B": B,
+        "E": E,
+        "fp4_us": us4,
+        "fp8_us": us8,
+        "fp4/fp8": us4 / us8 if us8 > 0 else 0.0,
+        "fp4_TB/s": tbs4,
+        "fp8_TB/s": tbs8,
+        "fp4_cos": cos4,
+        "TFLOPS_fp4": flops / us4 / 1e6 if us4 > 0 else 0.0,
+    }
+
+
 def _fmt_table(rows) -> str:
     """Markdown table when ``tabulate`` is available; plain text otherwise."""
     df = pd.DataFrame(rows)
@@ -1051,6 +1268,19 @@ def _run_perf_sweeps(args) -> None:
         _fmt_table(down_fp4_rows),
     )
 
+    if getattr(args, "cold", False):
+        cold_rows = [
+            bench_down_cold(B, INTER, HIDDEN, E, TOPK, **timing_kw)
+            for (B, INTER, HIDDEN, E, TOPK) in args.cold_down_shapes
+        ]
+        aiter.logger.info(
+            "warp-decode down_reduce COLD-HBM E=%d A/B FP4-vs-FP8 (%s timing, "
+            "router rotated over the pool):\n%s",
+            args.cold_down_shapes[0][3],
+            args.timing,
+            _fmt_table(cold_rows),
+        )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1072,11 +1302,18 @@ def main() -> int:
     )
     parser.add_argument("--num-iters", type=int, default=_PERF_NUM_ITERS)
     parser.add_argument("--num-warmup", type=int, default=_PERF_NUM_WARMUP)
+    parser.add_argument(
+        "--cold",
+        action="store_true",
+        help="also run the cold-HBM E=256 FP4-vs-FP8 down A/B (allocates multi-GB "
+        "weight pools; router-id rotated so steady-state reads miss MALL)",
+    )
     args = parser.parse_args()
     # Fixed realistic shapes (weights >> LLC); not swept via CLI for now.
     args.gate_up_shapes = GATE_UP_PERF_SHAPES
     args.down_shapes = DOWN_PERF_SHAPES
     args.down_fp4_shapes = DOWN_FP4_PERF_SHAPES
+    args.cold_down_shapes = COLD_DOWN_SHAPES
 
     print("=" * 78)
     print("[flydsl] warp-decode MoE primitives (Phase 1)")
