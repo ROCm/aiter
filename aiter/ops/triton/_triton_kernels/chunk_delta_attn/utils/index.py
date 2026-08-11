@@ -7,7 +7,12 @@
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+    tensor_cache,
+)
 
+
+@tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
@@ -15,8 +20,13 @@ def prepare_chunk_indices(
     """
     Prepare chunk indices for variable-length sequences.
 
+    The ``.tolist()`` below is a D2H sync, so this is cached on the identity of
+    ``cu_seqlens``: callers must pass the ORIGINAL metadata tensor rather than a
+    freshly sliced view, otherwise every call misses. One forward runs this once
+    per layer with the same tensor, which is what the cache is for.
+
     Args:
-        cu_seqlens: Cumulative sequence lengths [N+1]
+        cu_seqlens: Cumulative sequence lengths [N+1] (original, unsliced)
         chunk_size: Size of each chunk
 
     Returns:

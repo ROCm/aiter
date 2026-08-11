@@ -11,6 +11,7 @@ import os
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 
+import itertools
 import math
 
 import pytest
@@ -28,10 +29,17 @@ except (ImportError, ModuleNotFoundError):
     HAS_FLA = False
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_fwd import _gluon_delta_h
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils import l2norm_fwd
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
+    prepare_chunk_indices,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
 )
 
 device = "cuda"
@@ -101,7 +109,6 @@ def cumsum_inputs(request):
 
 
 class TestChunkGateCumsum:
-
     def test_softplus_no_bias(self, cumsum_inputs):
         g, A_log, B, T, H, S = cumsum_inputs
         ref = _ref_gate_cumsum_softplus(g, A_log, 32)
@@ -168,7 +175,6 @@ class TestChunkGateCumsum:
 
 
 class TestChunkDeltaAttnFwdSmoke:
-
     @pytest.mark.parametrize(
         "B,T,H,HV,K,V",
         [
@@ -439,7 +445,6 @@ class TestStateVFirst:
 
 @pytest.mark.skipif(not HAS_FLA, reason="flash-linear-attention not available")
 class TestChunkDeltaAttnFwdVsFLA:
-
     @pytest.mark.parametrize(
         "B,T,H,K,V",
         [
@@ -495,3 +500,252 @@ class TestChunkDeltaAttnFwdVsFLA:
             rtol=1e-2,
             msg=f"Output mismatch for B={B} T={T} H={H} K={K} V={V}",
         )
+
+
+class TestOptVsBaseline:
+    """Compare optimized (DA_TRITON_OPT=1) vs baseline (DA_TRITON_OPT=0) output."""
+
+    def _run(self, q, k, v, g, beta, A_log, dt_bias, scale, env_overrides):
+        old_env = {}
+        for key, val in env_overrides.items():
+            old_env[key] = os.environ.get(key)
+            os.environ[key] = val
+        try:
+            o, fs, *_ = chunk_delta_attn_fwd(
+                q=q.clone(),
+                k=k.clone(),
+                v=v.clone(),
+                g=g.clone(),
+                beta=beta.clone(),
+                scale=scale,
+                initial_state=None,
+                output_final_state=True,
+                chunk_size=64,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=-5.0,
+                safe_gate=True,
+            )
+        finally:
+            for key, val in old_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+        return o.float(), fs.float()
+
+    @pytest.mark.parametrize(
+        "B,T,H,K,V",
+        [
+            (1, 64, 4, 64, 64),
+            (2, 128, 8, 64, 64),
+            (1, 256, 64, 128, 128),
+            (1, 256, 128, 128, 128),
+        ],
+    )
+    def test_triton_opt_matches_baseline(self, B, T, H, K, V):
+        """DA_TRITON_OPT=1 must match DA_TRITON_OPT=0."""
+        HV = H
+        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
+
+        o_base, s_base = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "0", "DA_USE_GLUON": "0"},
+        )
+        o_opt, s_opt = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "0"},
+        )
+
+        torch.testing.assert_close(
+            o_opt,
+            o_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"triton_opt output mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+        torch.testing.assert_close(
+            s_opt,
+            s_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"triton_opt state mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+
+    @pytest.mark.parametrize(
+        "B,T,H,K,V",
+        [
+            (1, 64, 4, 64, 64),
+            (1, 256, 64, 128, 128),
+            (1, 256, 128, 128, 128),
+        ],
+    )
+    def test_gluon_matches_baseline(self, B, T, H, K, V):
+        """DA_USE_GLUON=1 must match DA_USE_GLUON=0 (on eligible hardware)."""
+        HV = H
+        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
+
+        o_base, s_base = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "0"},
+        )
+        o_gluon, s_gluon = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "1"},
+        )
+
+        torch.testing.assert_close(
+            o_gluon,
+            o_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"Gluon output mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+        torch.testing.assert_close(
+            s_gluon,
+            s_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"Gluon state mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+
+
+def _is_cdna4():
+    if not torch.cuda.is_available():
+        return False
+    return "gfx95" in getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+
+
+@pytest.mark.skipif(not _is_cdna4(), reason="Gluon kernels are CDNA4-only")
+class TestGluonDeltaH:
+    """The Gluon inter-chunk recurrence against the Triton one, kernel to kernel.
+
+    Comparing ``h`` and ``v_new`` directly is what makes a mishandled tail chunk
+    visible: end to end its error lands in rows a decaying gate has already
+    shrunk, so it hides inside the output tolerance while still being wrong by
+    orders of magnitude here.
+    """
+
+    BT = 64
+
+    @staticmethod
+    def _starts(seqlens):
+        return [0] + torch.tensor(seqlens).cumsum(0).tolist()
+
+    def _inputs(self, B, T, H, K, V, seqlens):
+        torch.manual_seed(0)
+        kg = torch.randn(B, T, H, K, device=device, dtype=dtype) * 0.3
+        w = torch.randn(B, T, H, K, device=device, dtype=dtype) * 0.3
+        u = torch.randn(B, T, H, V, device=device, dtype=dtype) * 0.3
+        # gk is a chunk-local cumsum in log2 space: non-positive, and decreasing
+        # within a chunk. Feeding the kernel anything else lets the inter-chunk
+        # decay grow instead of shrink, which drowns real differences in noise.
+        gk = -torch.rand(B, T, H, K, device=device, dtype=torch.float32) * 0.05
+        starts = self._starts(seqlens) if seqlens else [b * T for b in range(B + 1)]
+        flat = gk.view(-1, H, K)
+        for s, e in itertools.pairwise(starts):
+            for t0 in range(s, e, self.BT):
+                t1 = min(t0 + self.BT, e)
+                flat[t0:t1] = flat[t0:t1].cumsum(0)
+        return kg, w, u, gk
+
+    def _compare(self, B, T, H, K, V, seqlens=None):
+        kg, w, u, gk = self._inputs(B, T, H, K, V, seqlens)
+        if seqlens is None:
+            cu_seqlens = chunk_indices = None
+        else:
+            cu_seqlens = torch.tensor(
+                self._starts(seqlens), device=device, dtype=torch.int32
+            )
+            chunk_indices = prepare_chunk_indices(cu_seqlens, self.BT)
+
+        h_gluon, v_gluon, _ = _gluon_delta_h(
+            kg,
+            w,
+            u,
+            gk,
+            self.BT,
+            False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        h_triton, v_triton, _ = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=gk,
+            initial_state=None,
+            output_final_state=False,
+            chunk_size=self.BT,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+
+        assert torch.isfinite(h_gluon).all(), "Gluon h has inf/nan"
+        assert torch.isfinite(v_gluon).all(), "Gluon v_new has inf/nan"
+        # Both kernels run the same recurrence in the same order, so anything
+        # short of equality is a real difference and not accumulated rounding.
+        torch.testing.assert_close(h_gluon, h_triton, atol=0, rtol=0)
+        torch.testing.assert_close(v_gluon, v_triton, atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "B,T",
+        [
+            (1, 256),
+            (2, 256),
+            pytest.param(2, 200, id="2-200-ragged"),
+            pytest.param(1, 65, id="1-65-ragged"),
+            pytest.param(1, 63, id="1-63-shorter-than-chunk"),
+            pytest.param(3, 130, id="3-130-ragged"),
+        ],
+    )
+    def test_fixed_length(self, B, T):
+        """A batch without ``cu_seqlens`` is ragged too when T is not a multiple of
+        the chunk size, and there the tail runs off the end of the tensor rather
+        than into a neighbouring sequence."""
+        self._compare(B, T, 8, 128, 128)
+
+    @pytest.mark.parametrize(
+        "seqlens",
+        [
+            pytest.param([128, 256, 64], id="chunk-aligned"),
+            pytest.param([100, 37, 195, 1], id="ragged"),
+            pytest.param([13], id="single-partial-chunk"),
+            pytest.param([1, 2, 3, 65, 127, 129], id="tiny-and-straddling"),
+            pytest.param([3, 256], id="short-then-long"),
+        ],
+    )
+    def test_varlen(self, seqlens):
+        self._compare(1, sum(seqlens), 8, 128, 128, seqlens=seqlens)

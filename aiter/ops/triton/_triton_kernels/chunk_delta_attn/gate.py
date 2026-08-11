@@ -15,7 +15,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import autotune_cache_kwargs, exp, input_guard, softplus
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+    autotune_cache_kwargs,
+    exp,
+    input_guard,
+    softplus,
+)
 
 _BETA_SIGMOID_BLOCK_SIZE = 2048
 _BETA_SIGMOID_NUM_WARPS = 8
