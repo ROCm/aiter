@@ -527,7 +527,8 @@ def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
 def _buffer_load_lds_128(
     src_div, lds_byte_addr, src_elem, soffset_elems, _dma_atom, _lds_ptr_ty
 ):
-    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is scaled by the atom."""
+    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is
+    scaled by the atom."""
     lds_ptr = fx.inttoptr(_lds_ptr_ty, fx.Int32(lds_byte_addr))
     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
     src = fx.slice(src_div, (None, fx.Int32(src_elem)))
@@ -1294,7 +1295,8 @@ class DualwaveFp8KernelContext:
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-        # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are byte-addressed.
+        # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are
+        # byte-addressed.
         self.lds_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, 2, traits.DMA_BYTES)
         self.bf16_mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fx.BFloat16))
         self.v_fp8_load64_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
@@ -1373,7 +1375,8 @@ class DualwaveFp8KernelContext:
             )
         else:
             max_num_tiles = num_kv_tiles
-        # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
+        # Pipeline needs an EVEN tile count >= 4; extra tiles read 0
+        # (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
         max_num_tiles = fx.Index(
             (max_num_tiles < fx.Index(4)).select(fx.Index(4), max_num_tiles)

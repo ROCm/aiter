@@ -3,25 +3,18 @@
 
 """Chunked-prefill (cross-attention) correctness of the vendored fp8 kernel.
 
-The production unified-attention call is chunked prefill: a chunk of new Q
-tokens attends against a KV cache that already holds the earlier context, so
-Skv > Sq and the causal mask is BOTTOM-RIGHT aligned. aiter's own reference
-`ref_paged_attn` encodes this as
+The production call is chunked prefill: new Q attends a KV cache holding
+earlier context, so Skv > Sq and the causal mask is BOTTOM-RIGHT aligned
+(`ref_paged_attn`: `triu(ones(q_len, kv_len), diagonal=kv_len - q_len + 1)`).
+The square case (kv_len == q_len, diagonal=1) never exercises this, which is
+why the misalignment went unnoticed. A kernel that top-left aligns instead
+still produces finite, plausible output and passes every square test, so this
+gate pins the correct alignment where nothing else in the suite would catch it.
 
-    torch.triu(ones(q_len, kv_len), diagonal=kv_len - q_len + 1)
+Reference is `ref_paged_attn`, fed the identical scrambled page pool/block
+table the kernel is fed.
 
-When kv_len == q_len that degenerates to diagonal=1, the square case the
-benchmark used to measure exclusively -- which is why this path was never
-exercised.
-
-This gate pins the alignment. A kernel that top-left aligns instead (i.e.
-ignores the kv_len - q_len delta) still produces finite, plausible output and
-still passes every square test, so nothing else in the suite would catch it.
-
-The reference is `ref_paged_attn`, fed the identical scrambled page pool and
-block table the kernel is fed.
-
-Clear ~/.flydsl/cache before trusting a run after a kernel edit.
+See _common for the ~/.flydsl/cache caveat.
 """
 
 from __future__ import annotations

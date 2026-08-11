@@ -3,25 +3,21 @@
 
 """Split-K path of the vendored fp8 attention kernel (gfx950).
 
-Split-K partitions the KV axis across workgroups; each writes a partial plus its
-(m, l) to a workspace, and a combine kernel forms sum(w*l*O)/sum(w*l) with
+Split-K partitions the KV axis across workgroups; each writes a partial plus
+its (m, l) to a workspace, and a combine kernel forms sum(w*l*O)/sum(w*l) with
 w = exp2(m_i - m_max).
 
-The sharp signal is BAD ROWS, not aggregate cosine. The original defect dropped
-every split but the largest-m one, which left rows needing a single KV range
-exactly correct while rows needing two or more were wrong -- at S=1024 causal
-that is a clean 512/1024 split, and the aggregate cosine still read 0.94.
-
-Non-causal is the strictest case: every row needs every split range, so a
-combine that discards partials fails on all rows rather than half.
+The sharp signal is BAD ROWS, not aggregate cosine: the original defect
+dropped every split but the largest-m one, so rows needing a single KV range
+stayed exact while rows needing two or more were wrong (a clean 512/1024
+split at S=1024 causal, yet aggregate cosine still read 0.94). Non-causal is
+the strictest case since every row needs every split range.
 
 The dense cases feed contiguous KV with no block table, which `ref_paged_attn`
 cannot express, so this file keeps its own fp32 reference for a single
 consistent oracle across dense and paged cases.
 
-Clear ~/.flydsl/cache before trusting a run after editing kernel helper classes:
-the JIT cache key does not resolve methods reached through instance attributes,
-so an edit to a helper method hits a stale binary under an unchanged key.
+See _common for the ~/.flydsl/cache caveat.
 """
 
 from __future__ import annotations

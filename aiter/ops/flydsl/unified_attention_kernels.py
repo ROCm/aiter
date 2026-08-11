@@ -5,31 +5,27 @@
 
 Adapts the vendored ``flash_attn_dualwave_swp`` fp8 kernel
 (``kernels/flash_attn_fp8_gfx950.py``) to the ``unified_attention`` calling
-convention that vLLM and SGLang import directly, so a supported gfx950 fp8
-paged call routes here instead of Triton.
+convention vLLM/SGLang import directly, so a supported gfx950 fp8 paged call
+routes here instead of Triton.
 
-Dispatch follows the in-tree convention for a new backend competing for an
-existing op: a pure code predicate that returns ``None`` when it cannot serve
-the configuration, letting the caller fall through to Triton unchanged (see
-``flydsl_flash_attn_varlen_func`` in ``fmha_kernels.py`` and the flydsl branch
-in ``ops/gemm_op_a8w8.py``). The dispatch decision itself takes no environment
-variable -- aiter already carries 19 undocumented backend-gate vars, and this
-path is arch- and shape-scoped, so a code gate states the choice more honestly.
-To force the Triton path for comparison, set ``_FLYDSL_UNIFIED_ATTN_ARCH`` to
-``False`` in the Triton module. The one tuning knob is the split-count cap,
+Dispatch is a pure predicate returning ``None`` when it can't serve the
+config, falling through to Triton unchanged (matches
+``flydsl_flash_attn_varlen_func`` / the flydsl branch in
+``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var, since a code gate
+states an arch/shape-scoped choice more honestly than another undocumented
+backend flag. Force Triton by setting ``_FLYDSL_UNIFIED_ATTN_ARCH`` to ``False`` in
+the Triton module. The one tuning knob is the split-count cap,
 ``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``).
 
-Two tiers, chosen at call time from the machine-fill deficit (see
-``_split_count`` and the gate in ``flydsl_unified_attention``), not from
-whether the batch is all-decode. A launch whose base workgroup count leaves
-the machine underfilled -- a handful of workgroups each serially scanning the
-full KV depth while most CUs sit idle -- takes packed + split-K, which
-partitions each sequence's KV across split workgroups and combines the
-partials; a full-pass batch (a real prefill chunk or high-chunk mix) stays on
-the single-pass packed kernel. This is why split-K also serves the low-chunk
-mixed case, not just all-decode: the combine kernel rebases its O write on
-``cu_seqlens_q`` (``DualwaveSplitKCombineContext.init_descriptors``), so a
-varlen batch with unequal query lengths combines correctly.
+Two tiers chosen at call time from the machine-fill deficit (``_split_count``
+and the gate in ``flydsl_unified_attention``), not from all-decode-ness: an
+underfilled launch (few workgroups each serially scanning full KV depth)
+takes packed + split-K, partitioning each sequence's KV across split
+workgroups and combining partials; a full-pass batch stays on the
+single-pass packed kernel. Split-K also serves the low-chunk mixed case
+because the combine rebases its O write on ``cu_seqlens_q``
+(``DualwaveSplitKCombineContext.init_descriptors``), so unequal query
+lengths combine correctly.
 """
 
 from __future__ import annotations
@@ -93,12 +89,11 @@ def _env_max_kv_splits(default: int = 16) -> int:
     return n if n >= 1 else default
 
 
-# Cap on the auto-dispatched split count. Default 16: benchmarked no-regression
-# across tested decode shapes while capturing most of the long-context win. >16
-# (up to 32-64) helps only very long contexts and regresses short ones, because
-# _split_count keys on machine fill, not KV depth; all counts are verified
-# correct to 128. Raise via AITER_UNIFIED_ATTN_MAX_KV_SPLITS for long-context
-# workloads.
+# Cap on the auto-dispatched split count. Default 16: no regression across
+# tested decode shapes while capturing most of the long-context win. >16
+# helps only very long contexts and regresses short ones, since _split_count
+# keys on machine fill, not KV depth (counts are verified correct to 128).
+# Raise via AITER_UNIFIED_ATTN_MAX_KV_SPLITS for long-context workloads.
 _MAX_SEGMENTS = _env_max_kv_splits(16)
 
 # block_m, and with it the largest GQA group that can pack into the M dimension.
@@ -125,24 +120,22 @@ def _get_kernel(
 ):
     """Build (and cache) the paged+varlen fp8 launcher.
 
-    Keyed on the head counts, the mask mode, the output dtype and the split
-    count. Every other builder argument is either pinned by the support gate
-    (head_dim, dtype, varlen, paged) or left at its default.
+    Keyed on head counts, mask mode, output dtype, and split count; every
+    other builder argument is pinned by the support gate or left at default.
 
-    ``num_kv_splits`` selects the tier. At 1 the builder auto-enables
+    ``num_kv_splits`` selects the tier: at 1, the builder auto-enables
     M-dimension packing for GQA > 1:1 (``gqa_pack_m=None``) and builds the
-    single-pass kernel. At > 1 packing must be forced on explicitly:
-    ``gqa_pack_m`` defaults to unpacked for split-K, so the decode tier passes it
-    True to get the packed+split-K binary. ``GQA_PACK_M`` and ``NUM_KV_SPLITS``
-    both key the JIT cache, so the two binaries cannot alias.
+    single-pass kernel; at > 1, ``gqa_pack_m`` defaults to unpacked, so the
+    decode tier passes True explicitly to get the packed+split-K binary.
+    ``GQA_PACK_M`` and ``NUM_KV_SPLITS`` both key the JIT cache so the two
+    binaries cannot alias.
 
-    ``causal``, ``out_dtype_str`` and ``use_sinks`` are runtime-selectable, so
-    each must key the cache: they change compiled code (the mask path, the store
-    packer, and the sink init/epilogue term).
+    ``causal``, ``out_dtype_str``, ``use_sinks`` key the cache too since each
+    changes compiled code (mask path, store packer, sink init/epilogue).
 
-    Do not key on batch/seqlen/device: ``_run_compiled`` memoizes the compiled
-    function on the returned closure, so a finer key would defeat that cache and
-    recompile per shape.
+    Do not key on batch/seqlen/device: ``_run_compiled`` memoizes the
+    compiled function on the returned closure, so a finer key would defeat
+    that cache and recompile per shape.
     """
     return build_flash_attn_dualwave_swp_fp8_module(
         num_heads=num_heads,
@@ -194,14 +187,13 @@ def _strides_ok(
     # num_records bounds (init_descriptors), so Q and O must agree on it.
     if q.stride(0) != out.stride(0):
         return False
-    # `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`. Those
-    # bake the tensor's full memref (shape+strides) into the FlyDSL kernel
-    # cache signature, so a genuinely padded (non-flattenable) layout would
-    # make reshape return a silent COPY: the kernel writes the copy and the
-    # caller's real `out` buffer is never touched. Requiring stride(0) to
-    # equal the flattened row size restricts acceptance to exactly the
-    # layouts where reshape(-1) is a view, not a copy. Padded layouts decline
-    # here and fall through to the Triton path, which handles them correctly.
+    # `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`, baking
+    # the tensor's full memref into the kernel cache signature. A padded
+    # (non-flattenable) layout would make reshape return a silent COPY --
+    # the kernel writes the copy, the caller's real `out` stays untouched.
+    # Requiring stride(0) == flattened row size restricts acceptance to
+    # layouts where reshape(-1) is a view; padded layouts decline and fall
+    # through to Triton.
     if q.stride(0) != num_query_heads * head_size:
         return False
     if out.stride(0) != num_query_heads * head_size:
@@ -377,19 +369,17 @@ def _scaled_q_descale(q_descale: torch.Tensor, softmax_scale: float, head_size: 
 
     The kernel takes no runtime softmax scale: init_descale bakes in
     ``rsqrt(head_dim) * log2e`` and multiplies it by ``q_descale * k_descale``
-    to form ``c_logit_scale``. Because that is a product, scaling q_descale by
-    ``softmax_scale / rsqrt(head_dim)`` yields exactly the requested scale with
-    no kernel change.
+    to form ``c_logit_scale``. Since that's a product, scaling q_descale by
+    ``softmax_scale / rsqrt(head_dim)`` yields the requested scale with no
+    kernel change.
 
-    This is sound only while q_descale reaches c_logit_scale and nothing else.
-    That holds today (the loaded scalar has exactly two uses: the load and the
-    multiply), and c_logit_scale is only ever applied to a DIFFERENCE of logits,
-    which is what a softmax scale is. The V descale is loaded separately and
-    cannot be affected. A test guards the invariant.
+    Sound only while q_descale reaches c_logit_scale and nothing else (holds
+    today: exactly two uses, load and multiply) and c_logit_scale is applied
+    only to a logit DIFFERENCE, which is what a softmax scale is. A test
+    guards the invariant.
 
-    For the near-universal ``softmax_scale == 1/sqrt(head_size)`` the ratio is
-    exactly 1 and the tensor passes through untouched, so the common path costs
-    nothing.
+    For the near-universal ``softmax_scale == 1/sqrt(head_size)`` the ratio
+    is exactly 1 and the tensor passes through untouched.
     """
     ratio = float(softmax_scale) * math.sqrt(head_size)
     if abs(ratio - 1.0) <= 1e-6:
@@ -469,49 +459,34 @@ def flydsl_unified_attention(
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
 
     # Tier selection. Split-K fires when ALL hold; otherwise single-pass.
-    #  - max_seqlen_k > _PAGE_SIZE * 20 (1280): just below the measured single-pass
-    #    <-> split-K crossover; shallower KV does not amortize the combine pass.
-    #  - num_2d_prgms < target: the machine is underfilled, which is the only
-    #    regime split-K helps. A full launch would only add combine overhead. A
-    #    high-chunk mixed batch (a long prefill) fills the machine on its own and
-    #    fails this test, so it stays single-pass -- only LOW-chunk mixes and
+    #  - max_seqlen_k > _PAGE_SIZE * 20 (1280): below this the combine pass
+    #    isn't amortized (measured crossover).
+    #  - num_2d_prgms < target: the machine is underfilled, the only regime
+    #    split-K helps -- a high-chunk mixed batch (long prefill) fills the
+    #    machine on its own and stays single-pass; only low-chunk mixes and
     #    all-decode route to split-K.
     #  - sinks is None: split-K + sinks is refused by the builder (exp(sink)
-    #    would be counted once per split in the combine denominator).
-    #
-    # The former max_seqlen_q == 1 (all-decode) condition is gone: the combine
-    # kernel now rebases its O write on cu_seqlens_q (init_descriptors), so a
-    # varlen batch with unequal query lengths is combined correctly. The dense
-    # workspace format is unchanged -- an all-decode batch is byte-identical.
+    #    would be double-counted across split combines).
+    # The combine rebases its O write on cu_seqlens_q, so varlen batches with
+    # unequal query lengths combine correctly under the same dense workspace.
     #
     # num_2d_prgms is the single-pass base workgroup count: num_kv_heads *
-    # sum_i ceil(query_len_i / BLOCK_Q), the packed per-sequence work count (not
-    # the dense grid, which over-counts the masked padding blocks of the short
-    # sequences). BLOCK_Q is the packed q-block span: block_m divided by the GQA
-    # group, since GQA_PACK_M rides num_queries_per_kv heads in the M dimension.
-    # For all-decode every query_len is 1, so each sequence contributes one
-    # q-block and this collapses to num_kv_heads * num_seqs; a mixed batch's
-    # chunk sequence contributes ceil(chunk_len / BLOCK_Q) blocks.
+    # sum_i ceil(query_len_i / BLOCK_Q) (packed per-sequence work, not the
+    # dense grid which over-counts padding). BLOCK_Q is block_m / GQA group.
     #
-    # The exact packed block sum needs the per-sequence query lengths, which live
-    # on cu_seqlens_q (device); reading them back with .item() forces a host sync
-    # (~29us) into the dispatch critical path. Avoid it wherever the branch can be
-    # decided from host-side scalars alone, which is every case except a genuine
-    # low-chunk mix:
-    #  - All-decode (max_seqlen_q == 1): every query length is 1, so each sequence
-    #    is exactly one q-block and the sum is num_seqs -- host-exact, no read.
-    #    This is the shallow split-K regime where the sync dominated kernel time.
-    #  - Otherwise a host-side lower bound on the sum is
-    #    max(num_seqs, ceil(total_q / BLOCK_Q)): each sequence is at least one
-    #    q-block, and the ceilings sum to at least ceil(total_q / BLOCK_Q). When
-    #    even that lower bound already fills the machine the launch is single-pass
-    #    regardless of the exact count (a real prefill chunk or high-chunk mix),
-    #    so the read is skipped there too.
-    #  - Only when the lower bound leaves the machine underfilled (a low-chunk mix)
-    #    is the exact per-sequence sum needed to pick the split count, and only
-    #    then is the device read taken.
-    # Every dispatch decision is identical to the exact-sum form; the read is
-    # removed from the paths where the exact value cannot change the outcome.
+    # The exact sum needs per-sequence query lengths on cu_seqlens_q (device);
+    # reading via .item() forces a ~29us host sync into the dispatch path, so
+    # it's avoided wherever the branch can be decided from host scalars alone:
+    #  - all-decode (max_seqlen_q == 1): sum is exactly num_seqs, no read
+    #    needed -- this is the shallow split-K regime where the sync used to
+    #    dominate kernel time.
+    #  - otherwise, a host-side lower bound max(num_seqs, ceil(total_q /
+    #    BLOCK_Q)) already fills the machine for a real prefill/high-chunk
+    #    mix, so single-pass is decided without a read.
+    #  - only a genuine low-chunk mix, where that lower bound underfills,
+    #    needs the exact per-sequence sum and takes the device read.
+    # Every branch matches the exact-sum decision; the read is skipped only
+    # where it cannot change the outcome.
     num_kv_splits = 1
     if max_seqlen_k > _PAGE_SIZE * 20 and sinks is None:
         block_q = _BLOCK_M // num_queries_per_kv
@@ -552,14 +527,9 @@ def flydsl_unified_attention(
 
     with torch.cuda.device(q.device.index):
         kernel(
-            # .reshape(-1) here relies on _strides_ok having already restricted
-            # Q/O to genuinely flattenable layouts (q.stride(0) == out.stride(0)
-            # == num_query_heads * head_size). For an accepted call this is
-            # always a view over the original data pointer, never a copy --
-            # `_run_compiled` bakes the reshaped tensor's memref into the
-            # FlyDSL kernel cache signature, so a copy would silently write
-            # results nobody reads. Padded (non-flattenable) layouts are
-            # declined by _strides_ok and fall through to the Triton path.
+            # .reshape(-1) relies on _strides_ok already restricting Q/O to
+            # flattenable layouts (see _strides_ok), so this is always a
+            # view here, never the silent copy that would occur otherwise.
             _as_i8(q).reshape(-1),
             _as_i8(k).reshape(-1),
             _as_i8(v).reshape(-1),

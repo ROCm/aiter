@@ -18,6 +18,12 @@ it omits the `clamp(min=1e-4)` scale floor the hand-rolled copies apply, so it
 produces a materially different scale for near-zero tensors (verified
 2026-08-11: 3.9e-9 vs 2.2e-7 on a 1e-6-scale random tensor). `q8` below keeps
 the hand-rolled implementation for that reason.
+
+Clear ~/.flydsl/cache before trusting a run after editing a kernel helper
+class: the JIT cache key walks the launcher's closure for function
+dependencies and does not resolve methods reached through instance
+attributes, so an edit to a helper method hits a stale binary under an
+unchanged key. Editing the kernel body directly does invalidate the key.
 """
 
 from __future__ import annotations

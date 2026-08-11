@@ -44,24 +44,17 @@ PAGE = 64
 HEAD_DIM = 128
 DEV = "cuda"
 
-# Project numeric gate for this kernel is `err < 1e-1, cos > 0.99, bad_rows == 0`
-# against an fp32 reference, where bad_rows counts rows whose own worst error
-# exceeds the threshold (an aggregate cosine stays high even when whole
-# sequences are wrong, so the per-row count is what catches that).
+# Project numeric gate is `err < 1e-1, cos > 0.99, bad_rows == 0` against an
+# fp32 reference; bad_rows catches whole-sequence failures an aggregate
+# cosine would hide.
 #
-# The absolute 1e-1 is calibrated for softmax_scale = 1/sqrt(d). fp8 rounding
-# error scales with output magnitude, and a larger scale sharpens the softmax
-# and grows the outputs, so the same kernel measures 0.06 abs error at 1x and
-# 0.19 at 4x while its cosine *improves* (0.99983 -> 0.99993). Thresholding on
-# error relative to the reference's own magnitude keeps one number meaningful
-# across the scale sweep.
-#
-# Calibrated 2026-08-07 by sweeping every regime this file covers (GQA 1:1 and
-# 16:1, 16k prefill, 64-way decode, mixed batch, ragged, and a 4x softmax
-# scale): worst observed relative error 0.0478, on the 64-way decode; cosine
-# never fell below 0.99965. 8e-2 leaves ~1.7x headroom over that worst case,
-# which a 5e-2 bound did not -- it landed exactly on the boundary and failed
-# intermittently. Anything near 8e-2 is a real regression, not noise.
+# Error is thresholded relative to the reference's own magnitude rather than
+# absolute, because fp8 rounding error scales with output magnitude: a larger
+# softmax_scale sharpens the softmax and grows outputs, so the same kernel
+# measures 0.06 abs error at 1x scale and 0.19 at 4x while cosine *improves*.
+# 8e-2 gives ~1.7x headroom over the worst observed relative error (0.0478,
+# 64-way decode) across GQA ratios, prefill/decode/mixed/ragged shapes, and a
+# 4x softmax scale; a 5e-2 bound sat on that boundary and failed intermittently.
 MAX_REL_ERR = 8e-2
 MIN_COS = 0.99
 

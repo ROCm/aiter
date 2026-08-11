@@ -4,22 +4,21 @@
 """Packed + split-K decode path of the vendored fp8 kernel (gfx950).
 
 The committed split-K path was welded to the UNPACKED M factoring (gqa_pack_m
-auto-off for num_kv_splits > 1). This test forces gqa_pack_m=True together with
-num_kv_splits>1 -- the true Triton-3d analog the build refusal used to forbid --
-and checks it against a torch reference.
+auto-off for num_kv_splits > 1). This test forces gqa_pack_m=True together
+with num_kv_splits>1 -- the true Triton-3d analog the build refusal used to
+forbid -- and checks it against a torch reference.
 
-Decode-only shapes: Sq=1 against a long KV context, GQA 16:1 so
-packing is actually exercised (16 q-heads ride in M per kv head). Both non-paged
-and paged (the production decode configuration).
+Decode-only shapes: Sq=1 against a long KV context, GQA 16:1 so packing is
+actually exercised (16 q-heads ride in M per kv head). Both non-paged and
+paged (the production decode configuration).
 
-Bad-row count is the signal, not aggregate cosine: the original split-K defect
-left single-range rows exactly right and multi-range rows wrong, a binary split
+Bad-row count is the signal, not aggregate cosine: the original defect left
+single-range rows exactly right and multi-range rows wrong, a binary split
 the aggregate cosine hides. The dense cases feed contiguous KV with no block
-table, which `ref_paged_attn` cannot express, so this file keeps its own fp32
-reference for a single consistent oracle across dense and paged cases.
+table, which `ref_paged_attn` cannot express, so this file keeps its own
+fp32 reference for a single consistent oracle across dense and paged cases.
 
-Clear ~/.flydsl/cache before trusting a run after a kernel edit -- the JIT cache
-key does not resolve helper-class methods reached through instance attributes.
+See _common for the ~/.flydsl/cache caveat.
 """
 
 from __future__ import annotations

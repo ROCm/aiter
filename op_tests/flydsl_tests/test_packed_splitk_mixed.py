@@ -5,23 +5,23 @@
 
 This is the case the old ``max_seqlen_q == 1`` split-K gate forbade: a batch
 mixing a short PREFILL CHUNK (q > 1) with several DECODES (q == 1), so query
-lengths are UNEQUAL. The dense-q combine addressed O at ``batch_idx *
-max_seqlen_q`` and would miscombine such a batch; the combine now rebases its O
-write on cu_seqlens_q (init_descriptors), so the ragged pack is written to the
-right rows.
+lengths are UNEQUAL. The dense-q combine addressed O at
+``batch_idx * max_seqlen_q`` and would miscombine such a batch; it now rebases
+on cu_seqlens_q (init_descriptors) so the ragged pack lands on the right rows.
 
-Shape: one seq q=128 kv=16384 plus 8 seqs q=1 kv=varying, GQA 16:1, splits 2/4/8,
-paged and dense, vs a per-sequence torch reference. Bad-row count is the signal.
+Shape: one seq q=128 kv=16384 plus 8 seqs q=1 kv=varying, GQA 16:1, splits
+2/4/8, paged and dense, vs a per-sequence torch reference. Bad-row count is
+the signal.
 
-The workspace is dense (sized for max_seqlen_q q-slots per batch/head/split); the
-decode sequences fill only slot 0 and the combine's per-sequence num_records
-bound drops the padding rows the grid launches past their length. So this also
+The workspace is dense (max_seqlen_q q-slots per batch/head/split); decode
+sequences fill only slot 0, and the combine's per-sequence num_records bound
+drops the padding rows the grid launches past their length -- so this also
 exercises that OOB guard, not just the ragged O offset.
 
 The dense cases feed contiguous KV with no block table, which `ref_paged_attn`
 cannot express, so this file keeps its own fp32 reference.
 
-Clear ~/.flydsl/cache before trusting a run after a kernel edit.
+See _common for the ~/.flydsl/cache caveat.
 """
 
 from __future__ import annotations

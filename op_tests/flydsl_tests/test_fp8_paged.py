@@ -3,26 +3,20 @@
 
 """Paged-KV correctness of the vendored fp8 attention kernel (gfx950).
 
-Paged addressing is only meaningfully tested when the page order is SCRAMBLED.
-With an identity block table (page i holds tile i) the page pool is bit-identical
-to a contiguous cache, so a kernel that ignored page ids entirely would pass.
-Every case here permutes the pages, and one case is run twice under different
-permutations of the same logical KV to confirm the output does not move.
+Paged addressing is only meaningfully tested when the page order is SCRAMBLED:
+an identity block table makes the page pool bit-identical to a contiguous
+cache, so a kernel ignoring page ids entirely would pass. Every case here
+permutes the pages; one case is run twice under different permutations of the
+same logical KV to confirm the output does not move.
 
-The reference is `ref_paged_attn`, the same fp32 paged reference the Triton
-unified-attention suite uses, fed the identical scrambled page pool and block
-table. Comparing against the pre-quantization bf16 input would measure
-quantization error, not kernel error.
+Reference is `ref_paged_attn` (same as the Triton suite), fed the identical
+scrambled page pool/block table -- comparing against pre-quantization bf16
+would measure quantization error, not kernel error. Also covers paged +
+varlen (the production prefill configuration) and paged + varlen + non-causal.
+Not comparable against upstream FlyDSL, which rejects fp8 + paged at the
+interface.
 
-Also covers paged + varlen (the production prefill configuration) and paged +
-varlen + non-causal.
-
-Not comparable against upstream FlyDSL: it rejects fp8 + paged at the interface.
-
-Clear ~/.flydsl/cache before trusting a run after editing kernel helper classes:
-the JIT cache key walks the launcher's closure for function dependencies and does
-not resolve methods reached through instance attributes, so an edit to a helper
-method hits a stale binary under an unchanged key.
+See _common for the ~/.flydsl/cache caveat.
 """
 
 from __future__ import annotations

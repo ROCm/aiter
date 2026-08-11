@@ -445,21 +445,15 @@ def test_fp16_output_with_packed_splitk():
 
 def test_padded_q_stride_declines_to_triton():
     """`_strides_ok` must decline a padded Q/O outer stride (e.g.
-    ``q.stride(0) != num_query_heads * head_size``, even when ``q.stride(1)
-    == head_size`` and ``q.stride(2) == 1``).
+    ``q.stride(0) != num_query_heads * head_size``, even with stride(1)/(2)
+    contiguous).
 
-    `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`, and those
-    bake the reshaped tensor's full memref into the FlyDSL kernel cache
-    signature. For a genuinely padded (non-flattenable) layout, `reshape(-1)`
-    silently returns a COPY rather than a view: the kernel would write into
-    that copy and the caller's real `out` buffer would stay untouched. So the
-    only safe choice is to decline padded layouts to the Triton path, which
-    handles them correctly. Build a Q/O pair with a few unused head slots per
-    row (a padded, non-flattenable layout) and confirm it both fails
-    `_supported` and routes to Triton instead of FlyDSL.
-
-    Regression guard for the padded-layout silent-corruption fix: this must
-    fail `_supported` and never reach the FlyDSL launch.
+    `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`, which
+    bakes the reshaped memref into the kernel cache signature. For a padded,
+    non-flattenable layout, `reshape(-1)` silently returns a COPY: the kernel
+    writes into that copy and the caller's real `out` stays untouched. So
+    padded layouts must decline to Triton, which handles them correctly.
+    Regression guard for that silent-corruption fix.
     """
     import aiter.ops.flydsl.unified_attention_kernels as uak
     from aiter.ops.flydsl.unified_attention_kernels import _supported
