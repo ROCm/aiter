@@ -123,6 +123,24 @@ __device__ inline void opus_wgtn_ds_read_b64_tr_b16(uint32_t smem_ptr)
                  : "memory");
 }
 
+template<int GPR_START, int BYTE_OFFSET>
+__device__ inline void opus_wgtn_ds_read_b64_tr_b16_offset(uint32_t smem_ptr)
+{
+    asm volatile("ds_read_b64_tr_b16 v[%0:%1], %2 offset:%3"
+                 :
+                 : "n"(GPR_START), "n"(GPR_START + 1), "v"(smem_ptr),
+                   "n"(BYTE_OFFSET)
+                 : "memory");
+}
+
+template<int GPR_START, int BYTE_OFFSET, int SECOND_OFFSET>
+__device__ inline void opus_wgtn_fixed_tr_fragment_offset(uint32_t smem_ptr)
+{
+    opus_wgtn_ds_read_b64_tr_b16_offset<GPR_START, BYTE_OFFSET>(smem_ptr);
+    opus_wgtn_ds_read_b64_tr_b16_offset<GPR_START + 2,
+                                        BYTE_OFFSET + SECOND_OFFSET>(smem_ptr);
+}
+
 template<int A, int B, int D>
 __device__ inline void opus_wgtn_mfma_zero()
 {
@@ -509,6 +527,19 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     __syncthreads();
 
     const auto tr_layout = opus_wgtn_make_tr_layout(lane, LD);
+    const auto tr_offsets = opus::layout_to_offsets<4>(tr_layout);
+    auto tr_base = [&](auto* ptr) {
+        auto smem = opus::make_smem(ptr);
+        return static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(
+            smem.ptr + tr_offsets[0] * sizeof(__bf16)));
+    };
+    const uint32_t a_base[2] = {
+        tr_base(&As[0][0][wm * 128]), tr_base(&As[1][0][wm * 128])};
+    const uint32_t b_base[2] = {
+        tr_base(&Bs[0][0][wn * 64]), tr_base(&Bs[1][0][wn * 64])};
+    constexpr int KPACK_BYTES = 16 * LD * sizeof(__bf16);
+    constexpr int SUBTILE_BYTES = 32 * sizeof(__bf16);
+    constexpr int TR_SECOND_BYTES = 4 * LD * sizeof(__bf16);
     for(int stage = 0; stage < num_k_stages; ++stage)
     {
         const int cur = stage & 1;
@@ -527,37 +558,38 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
             if constexpr(kpack.value == 0)
             {
                 opus::static_for<2>([&](auto sn) {
-                    auto smem = opus::make_smem(
-                        &Bs[cur][0][wn * 64 + sn.value * 32]);
-                    opus_wgtn_fixed_tr_fragment<b_reg + sn.value * 4>(
-                        smem, tr_layout);
+                    opus_wgtn_fixed_tr_fragment_offset<
+                        b_reg + sn.value * 4,
+                        sn.value * SUBTILE_BYTES,
+                        TR_SECOND_BYTES>(b_base[cur]);
                 });
-                auto smem = opus::make_smem(&As[cur][0][wm * 128]);
-                opus_wgtn_fixed_tr_fragment<96>(smem, tr_layout);
+                opus_wgtn_fixed_tr_fragment_offset<
+                    96, 0, TR_SECOND_BYTES>(a_base[cur]);
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             }
             opus::static_for<4>([&](auto sm) {
                 constexpr int a_reg = 96 + (sm.value & 1) * 4;
                 if constexpr(sm.value + 1 < 4)
                 {
-                    auto smem = opus::make_smem(
-                        &As[cur][kpack * 16][wm * 128 + (sm.value + 1) * 32]);
-                    opus_wgtn_fixed_tr_fragment<96 + ((sm.value + 1) & 1) * 4>(
-                        smem, tr_layout);
+                    opus_wgtn_fixed_tr_fragment_offset<
+                        96 + ((sm.value + 1) & 1) * 4,
+                        kpack.value * KPACK_BYTES +
+                            (sm.value + 1) * SUBTILE_BYTES,
+                        TR_SECOND_BYTES>(a_base[cur]);
                 }
                 if constexpr(sm.value == 3 && kpack.value + 1 < 4)
                 {
                     constexpr int next_b_reg = 104 + ((kpack.value + 1) & 1) * 8;
                     opus::static_for<2>([&](auto sn) {
-                        auto smem = opus::make_smem(
-                            &Bs[cur][(kpack.value + 1) * 16]
-                                    [wn * 64 + sn.value * 32]);
-                        opus_wgtn_fixed_tr_fragment<next_b_reg + sn.value * 4>(
-                            smem, tr_layout);
+                        opus_wgtn_fixed_tr_fragment_offset<
+                            next_b_reg + sn.value * 4,
+                            (kpack.value + 1) * KPACK_BYTES +
+                                sn.value * SUBTILE_BYTES,
+                            TR_SECOND_BYTES>(b_base[cur]);
                     });
-                    auto smem = opus::make_smem(
-                        &As[cur][(kpack.value + 1) * 16][wm * 128]);
-                    opus_wgtn_fixed_tr_fragment<96>(smem, tr_layout);
+                    opus_wgtn_fixed_tr_fragment_offset<
+                        96, (kpack.value + 1) * KPACK_BYTES,
+                        TR_SECOND_BYTES>(a_base[cur]);
                 }
                 if(stage == 0 && kpack.value == 0)
                 {
