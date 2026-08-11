@@ -16,6 +16,8 @@ Important Note:
     These implementations are optimized for inference and forward-only operations.
 """
 
+from collections.abc import Sequence
+
 import torch
 import triton
 
@@ -25,6 +27,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -356,11 +359,62 @@ def chunk_gated_delta_rule_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Optimized forward-only GDN prefill with state layout [N, H, V, K].
 
     This mirrors the aiter main high-level API and also supports SGLang's
     pool-indexed state contract via initial_state_indices.
+    Same fused kernels as chunk_gated_delta_rule_opt, but with
+    transposed hidden state layout [V, K] instead of [K, V].
+
+    The signature mirrors
+    ``aiter.ops.flydsl.linear_attention_prefill_kernels.flydsl_gdr_prefill`` so
+    the two can be used interchangeably as drop-in backends, including the
+    optional in-place ``o`` buffer and the ``num_decodes`` /
+    ``num_decode_tokens`` decode-prefix arguments.
+
+    Args:
+        q (torch.Tensor): queries of shape `[B, T, H, K]`.
+        k (torch.Tensor): keys of shape `[B, T, H, K]`.
+        v (torch.Tensor): values of shape `[B, T, H, V]`.
+        o (torch.Tensor, optional): pre-allocated `[B, T, H, V]` output buffer
+            written in place by K6. If None, a fresh buffer is allocated.
+        g (torch.Tensor): g (decays in log space) of shape `[B, T, H]`.
+        beta (torch.Tensor): betas of shape `[B, T, H]`.
+        scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
+        initial_state (torch.Tensor, optional):
+            Initial state of shape `[N, H, V, K]` — note transposed layout.
+        output_final_state (bool): Whether to output final state `[N, H, V, K]`.
+        use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
+        cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
+        use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
+        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
+            Mutually exclusive with ``use_chunk_hip``.
+        state_dtype (torch.dtype, optional): Initial/final state dtype
+            (`fp32` or `bf16`), supported by both the HIP and Triton paths.
+        use_exp2 (bool): Use exp2 instead of exp for gate computation.
+        num_decodes (int): number of leading decode-only sequences to skip in
+            ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
+            cache-stable ``cu_seqlens`` (decode prefix included) and the data
+            tensors (`q/k/v/g/beta/o`) pre-sliced to the prefill region; the
+            offsets are rebased internally by the cached prologue helpers, so
+            the chunk-index / offset builds stay cache-warm across forward
+            calls (no per-forward `.tolist()` D2H).
+        num_decode_tokens (int): number of leading decode tokens stripped from
+            the data tensors; subtracted from the rebased offsets.
+        seq_lens_cpu: Original sequence lengths on the host, including any
+            leading decode-only sequences. When supplied, one shared metadata
+            schedule is built for K1--K6 without reading device values.
+        prefill_metadata: Reusable schedule created by
+            ``build_gated_delta_rule_prefill_metadata``. Prefer this over
+            ``seq_lens_cpu`` when several GDR layers process the same batch.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor | None]:
+            - o: Outputs of shape `[B, T, H, V]`.
+            - final_state: `[N, H, V, K]` if `output_final_state=True` else `None`.
     """
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -415,5 +469,7 @@ def chunk_gated_delta_rule_opt_vk(
         o=o,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        seq_lens_cpu=seq_lens_cpu,
+        prefill_metadata=prefill_metadata,
     )
     return o.to(q.dtype), final_state
