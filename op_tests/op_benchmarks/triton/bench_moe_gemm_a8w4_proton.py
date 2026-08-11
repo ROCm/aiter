@@ -195,18 +195,10 @@ def pin_routed_experts_mask(n_tokens, n_expts_tot, n_routed, n_expts_act, dev):
     n_pinned = min(n_routed, n_tokens * n_expts_act)
     pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
 
-    # Coverage: pool slot i is claimed by token i % n_tokens. n_pinned <=
-    # n_tokens * n_expts_act bounds any one token's claims by n_expts_act, and
-    # each slot is claimed once, so no token claims the same expert twice.
-    claimed = torch.arange(n_pinned, device=dev) % n_tokens == torch.arange(
-        n_tokens, device=dev
-    ).unsqueeze(1)
-
-    # Rank the pool per token -- claims first, then a random order over the
-    # rest -- and keep the top n_expts_act: every claim survives, and whatever
-    # slots are left over come out random.
-    rank = torch.rand((n_tokens, n_pinned), device=dev) + claimed
-    keep = pool[rank.topk(n_expts_act, dim=-1).indices]
+    slot = torch.arange(n_pinned, device=dev)
+    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score[slot % n_tokens, slot] += 1.0
+    keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
     drop = torch.ones((n_tokens, n_expts_tot), dtype=torch.bool, device=dev)
     drop.scatter_(1, keep, False)
