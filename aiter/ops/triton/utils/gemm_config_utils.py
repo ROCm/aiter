@@ -1,53 +1,25 @@
 import copy
 import functools
 import itertools
-import json
 import os
 
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_CONFIGS_PATH,
+    USE_LRU_CACHE,
+    load_config_json,
+)
 
 # Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
-STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-
-# This flag should be set to True, unless it is being used for debugging
-USE_LRU_CACHE = True
-"""
-Cold start: 290.8928 ms
-LRU Cache: ENABLED
-Avg per call: 0.110 us
-vs
-LRU Cache: DISABLED
-Avg per call: 2.503 us
-"""
+STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 def _dtype_dir(config_name: str) -> str:
     """Nested-layout directory for a config family:
     ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
     return config_name.lower().replace("-", "_")
-
-
-def _load_config_file(
-    cache_dict: dict,
-    cache_key: str,
-    fpath: str,
-    config_key: str,
-    fpath_should_exist: bool = False,
-) -> bool:
-    """
-    Helper function to load a config file and cache it.
-    """
-    if os.path.exists(fpath):
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        cache_dict[cache_key][config_key] = config
-        return True
-    elif fpath_should_exist:
-        raise AssertionError(f"Required config file doesn't exist: {fpath}")
-    return False
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -80,11 +52,7 @@ def _get_gemm_config_cached(
         and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
-    if not hasattr(_get_gemm_config_cached, "_config_cache"):
-        _get_gemm_config_cached._config_cache = {}
-
     dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
 
     # Nested layout <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default
     # named DEFAULT.json) first, then legacy flat gemm/ (arch-prefixed) for unmigrated configs.
@@ -121,65 +89,31 @@ def _get_gemm_config_cached(
             cfg_dir, name_prefix, default_stem = _dir, _prefix, _stem
             break
 
-    if cache_key not in _get_gemm_config_cached._config_cache:
-        _get_gemm_config_cached._config_cache[cache_key] = {}
+    # Load default config (must exist)
+    default_fpath = f"{cfg_dir}/{default_stem}.json"
+    config_dict = load_config_json(default_fpath, required=False)
+    if config_dict is None:
+        raise AssertionError(f"Required config file doesn't exist: {default_fpath}")
 
-        # Load default config (must exist)
-        fpath = f"{cfg_dir}/{default_stem}.json"
-        _load_config_file(
-            _get_gemm_config_cached._config_cache,
-            cache_key,
-            fpath,
-            "default",
-            fpath_should_exist=True,
-        )
-
-    config_dict_key = "default"
-
-    # Handle custom specialized filename (for fused kernels with multiple N dims)
+    # Specialized configs override the default; the first existing file wins.
+    # A custom specialized_filename (fused kernels with multiple N dims)
+    # bypasses the B/N/K candidates.
+    specialized_suffixes = []
     if specialized_filename is not None:
-        spec_key = specialized_filename
-        if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{cfg_dir}/{name_prefix}{config_name}-{specialized_filename}.json"
-            if _load_config_file(
-                _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
-            ):
-                config_dict_key = spec_key
-        else:
-            config_dict_key = spec_key
-
+        specialized_suffixes = [specialized_filename]
     elif N is not None and K is not None:
-        # Try B-specialized config first: {config_name}-B={B}-N={N}-K={K}.json
         if B is not None:
-            bnk_key = f"{B}_{N}_{K}"
-            if bnk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-                fpath = f"{cfg_dir}/{name_prefix}{config_name}-B={B}-N={N}-K={K}.json"
-                if _load_config_file(
-                    _get_gemm_config_cached._config_cache,
-                    cache_key,
-                    fpath,
-                    bnk_key,
-                ):
-                    config_dict_key = bnk_key
-            else:
-                config_dict_key = bnk_key
+            specialized_suffixes.append(f"B={B}-N={N}-K={K}")
+        specialized_suffixes.append(f"N={N}-K={K}")
 
-        # Fall back to N/K-specialized config
-        if config_dict_key == "default":
-            nk_key = f"{N}_{K}"
-            if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-                fpath = f"{cfg_dir}/{name_prefix}{config_name}-N={N}-K={K}.json"
-                if _load_config_file(
-                    _get_gemm_config_cached._config_cache,
-                    cache_key,
-                    fpath,
-                    nk_key,
-                ):
-                    config_dict_key = nk_key
-            else:
-                config_dict_key = nk_key
-
-    config_dict = _get_gemm_config_cached._config_cache[cache_key][config_dict_key]
+    is_tuned = False
+    for suffix in specialized_suffixes:
+        specialized_config = load_config_json(
+            f"{cfg_dir}/{name_prefix}{config_name}-{suffix}.json", required=False
+        )
+        if specialized_config is not None:
+            config_dict, is_tuned = specialized_config, True
+            break
 
     # use standard bounds unless custom bounds are passed
     search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
@@ -188,19 +122,20 @@ def _get_gemm_config_cached(
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
-            return dict(config_dict[key]), config_dict_key != "default"
+            return dict(config_dict[key]), is_tuned
 
     # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
-            return dict(config_dict[key]), config_dict_key != "default"
+            return dict(config_dict[key]), is_tuned
 
     if "any" in config_dict:
         return dict(config_dict["any"]), False
 
     raise KeyError(
-        f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
+        f"No matching configuration found for M={M}, N={N}, K={K}, B={B}, "
+        f"specialized_filename={specialized_filename!r} in config '{config_name}'."
     )
 
 
