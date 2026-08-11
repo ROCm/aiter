@@ -1861,12 +1861,7 @@ class FmoeTuner(TunerCommon):
             ref1_bf16 = ref1
             a2_a16w_sorted = None  # a16w-mix stage2 pre-sorted input (set below)
 
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                # a16wi4: bf16 passthrough, no inter-stage quant
-                a2_qt = ref1
-                a2_scale = None
-                a2_scale_mxfp4_sort = None
-            elif q_type == QuantType.per_1x128:
+            if q_type == QuantType.per_1x128:
                 ref1, ref_scale = aiter.pertoken_quant(
                     ref1.view(ref1.shape[0], -1, 128), quant_dtype=q_dtype_a
                 )
@@ -1888,12 +1883,17 @@ class FmoeTuner(TunerCommon):
             elif (
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
-                and q_dtype_w == dtypes.fp4x2
+                and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
             ):
-                # a16w4 mxfp4: the abf16 stage2 consumes the bf16 intermediate
-                # directly -- no inter-stage activation quant (a2_scale=None). The
-                # kernel wants it in SORTED [max_sorted, inter] layout; build that
-                # once here (untimed) so run_flydsl_stage2_out stays kernel-only.
+                # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
+                # bf16 intermediate directly -- no inter-stage activation quant
+                # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
+                # layout; build that once here (untimed) so run_flydsl_stage2_out stays
+                # kernel-only. Without this a16wi4 falls through to the generic
+                # per_1x32 torch_quant below, which hands stage2 a packed
+                # [token, topk, inter/32] tensor -- every candidate then dies on
+                # "requires D_INTER (K) % 64 == 0, got D_INTER=8" and stage2 is
+                # effectively untuned.
                 a2_qt = ref1
                 a2_scale = None
                 a2_scale_mxfp4_sort = None
@@ -4247,11 +4247,15 @@ class FmoeTuner(TunerCommon):
             return tasks_flydsl
 
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        # bf16 -> "bf16" (not "fp16"): a16wi4 IS the a16w-mix bf16-activation path, and
+        # a_dtype_str is what selects the SORTED bf16 intermediate ("a2_a16w_sorted")
+        # for the stage2 candidates below. Mapping it to "fp16" fed stage2 the packed
+        # a2_qt instead, so every stage2 candidate raised and none was ever timed.
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
-            dtypes.bf16: "fp16",
+            dtypes.bf16: "bf16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
 
@@ -4279,7 +4283,13 @@ class FmoeTuner(TunerCommon):
                     k_tiles = k_per_batch // kparams["tile_k"]
                     if k_tiles < 4 or k_tiles % 2 != 0:
                         continue
-                # Int4 kernels: no fuse_fp4_quant
+                # Int4 kernels: no fuse_fp4_quant. a16wi4 is the a16w-mix port, whose
+                # stage1 returns a SORTED [max_sorted, inter] intermediate, so it must
+                # be scored against the SORTED reference (same as the mxfp4 a16w4 arm
+                # in gen_flydsl_2stages_task). Against the unsorted run_torch_moe_stage1
+                # every candidate scored ~84% err and the whole shape was rejected
+                # ("stage1 and stage2 should be valid together"), so stage1 was never
+                # actually tuned.
                 ref_args_extra = (
                     [
                         "a1_qt",
@@ -4287,11 +4297,10 @@ class FmoeTuner(TunerCommon):
                         "w2_qt",
                         "topk_weights",
                         "topk_ids",
-                        "a1_scale",
                         "w1_scale",
                         "sorted_ids",
+                        "sorted_expert_ids",
                         "num_valid_ids",
-                        "bias",
                     ],
                     dtype,
                     act_type,
@@ -4299,6 +4308,7 @@ class FmoeTuner(TunerCommon):
                     doweight_stage1,
                     topk,
                     blockM,
+                    inter_dim,
                 )
                 tasks_flydsl.append(
                     (
@@ -4342,13 +4352,13 @@ class FmoeTuner(TunerCommon):
                             act_type,
                         ),
                         {},
-                        FmoeTuner.run_torch_moe_stage1,
+                        FmoeTuner.run_a16w_stage1_sorted_ref,
                         ref_args_extra,
                         {},
                         (None),
                         0.01,
                         0.01,
-                        True,
+                        _a16w_sorted_cos,
                     )
                 )
 
