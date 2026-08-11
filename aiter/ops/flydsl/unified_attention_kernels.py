@@ -72,8 +72,9 @@ def _target_num_prgms() -> int:
 
 _TARGET_NUM_PRGMS = _target_num_prgms()
 
-# The prototype only measured split counts in {2, 4, 8}; do not emit 16+ on
-# unmeasured shapes.
+# Cap on the auto-dispatched split count. >8 is verified correct (16 and 32
+# splits, causal and non-causal) but not perf-measured; only {2, 4, 8} are, so
+# auto-dispatch stays capped at 8 until larger counts are tuned.
 _MAX_SEGMENTS = 8
 
 # block_m, and with it the largest GQA group that can pack into the M dimension.
@@ -107,10 +108,9 @@ def _get_kernel(
     ``num_kv_splits`` selects the tier. At 1 the builder auto-enables
     M-dimension packing for GQA > 1:1 (``gqa_pack_m=None``) and builds the
     single-pass kernel. At > 1 packing must be forced on explicitly:
-    ``gqa_pack_m`` defaults to unpacked for split-K (the committed default kept
-    the packed+split-K prototype off), so the decode tier passes it True to get
-    the packed+split-K binary. ``GQA_PACK_M`` and ``NUM_KV_SPLITS`` both key the
-    JIT cache, so the two binaries cannot alias.
+    ``gqa_pack_m`` defaults to unpacked for split-K, so the decode tier passes it
+    True to get the packed+split-K binary. ``GQA_PACK_M`` and ``NUM_KV_SPLITS``
+    both key the JIT cache, so the two binaries cannot alias.
 
     ``causal``, ``out_dtype_str`` and ``use_sinks`` are runtime-selectable, so
     each must key the cache: they change compiled code (the mask path, the store
