@@ -32,7 +32,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 | G5 | **Split-K** (`k_batch`) + zero-init fusion | ✅ (gate_up 2-phase, down) | ❌ | ticket lever |
 | G6 | **LDS cooperative caching** (`n_waves`) | ✅ (down; gate_up dead) | ❌ | ticket lever |
 | G7 | **s_nop-free / independent-accumulator dot2 (ILP)** | ✅ (fp8/fp4) | ❌ serialized `s_nop 2` | perf (deferred) |
-| G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2) | ❌ | perf (B=1 fp4) |
+| G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2; fp4 `down` flag) | ❌ default (knob) | **perf: ~5% B=1 fp4**, neutral B≥4 |
 | G9 | **CK-Tile cross-benchmark harness** | ✅ (`ck_bench_*.cpp` + compare) | ❌ | validation |
 | G10 | **Package public API registration** (`__init__.py`) | ✅ | ❌ | integration |
 
@@ -333,10 +333,26 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
 ### Phase E — Perf scheduling: ILP dot2 + prefetch (G7, G8)  [ ]
 - [ ] Land the **s_nop-free independent-accumulator dot2 + single drain** as a selectable
       inner-loop form; A/B vs the serialized `s_nop 2` baseline on FP8 (methodology §2).
-- [ ] **Software-pipelined weight prefetch** (issue next K-step loads while computing the
-      current step via `scf.for` iter-args carrying loaded VGPRs) — evaluate for B=1 FP4
-      down (MLP-bound) and the BF16 dot2 path; the reference found it *slower* for FP8, so
-      gate it behind a variant flag and measure.
+- [x] **Software-pipelined weight prefetch** — evaluated on FP4 `down` (2026-08-11).
+      Implemented as a `prefetch` build flag on `build_down_reduce_fp4_module` (wired through
+      `flydsl_warp_decode_down_reduce_fp4(..., prefetch=)`): hoists *every* activation/weight/
+      E8M0-scale load for the expert up front (all outstanding before any convert), rather than
+      the per-iter load→convert→append interleave. Both variants **cos 1.000** (26/26 op_tests
+      pass). Cold-HBM E=256 A/B (`prefetch/base` µs ratio, 3 trials):
+
+      | B | prefetch/base | verdict |
+      |---|---------------|---------|
+      | 1 | **0.944–0.955** | **~5% faster** (latency-bound MLP decode) |
+      | 2 | 0.979 | ~2% faster |
+      | 4 | 1.02 | ~neutral/slightly slower |
+      | 8 | 0.99–1.02 | neutral (within noise) |
+
+      So prefetch is a **clear ~5% win at B=1** and neutral above — matching the reference's
+      "slower for FP8" note (holding all loads live inflates VGPR pressure, which bites once the
+      grid is occupancy-bound at higher B). Because the flag is baked at **build** time while B is
+      a runtime grid dim (one cached kernel can't switch per-B), it's kept **default off** and
+      exposed as a tuning knob; **recommend `prefetch=True` for B≤2 decode**. Not yet ported to
+      the FP8 or gate_up builders (gate_up is already occupancy-bound, cf. G7).
 
 ### Phase F — Validation + integration (G9, G10)  [ ]
 - [ ] **CK-Tile side-by-side:** build the CK bench (`tickets/667/harness/build_ck_bench.sh`,
