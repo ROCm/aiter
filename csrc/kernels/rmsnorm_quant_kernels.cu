@@ -328,14 +328,14 @@ __global__ void add_rmsnorm_quant_kernel(
         core_loop(std::false_type{});
     }
 
-#define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, NUM_ROWS) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
     using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
     AITER_CHECK(group_size >= 0 && (group_size % thread_data_size == 0 && group_size <= WARP_SIZE * thread_data_size), __func__, " group_size not support: ", group_size); \
     int reduce_thread_size = group_size / thread_data_size; \
     AITER_CHECK(group_size == 0 || (reduce_thread_size & (reduce_thread_size - 1)) == 0, __func__, " reduce_thread_size is not power of 2"); \
-    const int num_row_per_block = 1; \
+    constexpr int num_row_per_block = NUM_ROWS; \
     dim3 grid((m + num_row_per_block - 1) / num_row_per_block); \
     dim3 block(BlockSize); \
     add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
@@ -347,20 +347,23 @@ __global__ void add_rmsnorm_quant_kernel(
                                                                                                      epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale); \
                                                                                                      });
 
-#define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, NUM_ROWS) \
     if constexpr((thread_data_size > 8)) { \
         if constexpr(FUSE_QUANT) { \
             if (group_size == 0) { \
-                ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true); \
+                ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true, NUM_ROWS); \
             } else { \
-                ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, false); \
+                ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, false, NUM_ROWS); \
             } \
         } else { \
-            ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true); \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true, NUM_ROWS); \
         } \
     } else { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true); \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true, NUM_ROWS); \
     }
+
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, 1)
 
 #define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
@@ -524,7 +527,9 @@ __global__ void add_rmsnorm_quant_kernel(
 
     
 #define ADD_RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
-    if (n <= 512) { \
+    if (n == 64 && m >= cu_num * 32) { \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL_ROWS(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT, 8); \
+    } else if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 1024) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 128, 8, ADD_RESIDUAL, FUSE_QUANT); \
