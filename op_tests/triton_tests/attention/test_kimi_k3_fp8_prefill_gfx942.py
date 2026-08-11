@@ -75,6 +75,7 @@ def test_static_per_head_quant_fp8_uses_supplied_descales_and_out() -> None:
         device="cuda",
     )[None, :]
     out = torch.empty_like(value, dtype=types.e4m3_dtype)
+    out.fill_(float("nan"))
     out_ptr = out.data_ptr()
 
     actual = static_per_head_quant_fp8(
@@ -87,8 +88,10 @@ def test_static_per_head_quant_fp8_uses_supplied_descales_and_out() -> None:
 
     assert actual is out
     assert actual.data_ptr() == out_ptr
+    assert not torch.isnan(actual.float()).any()
     mismatch_rate = (actual != expected).float().mean().item()
     assert mismatch_rate < 5e-3
+    assert torch.equal(actual.flatten()[-256:], expected.flatten()[-256:])
 
 
 def test_static_per_head_quant_fp8_hip_graph_replay() -> None:
@@ -102,6 +105,7 @@ def test_static_per_head_quant_fp8_hip_graph_replay() -> None:
         device="cuda",
     )[None, :]
     out = torch.empty_like(value, dtype=types.e4m3_dtype)
+    out.fill_(float("nan"))
 
     static_per_head_quant_fp8(value, descale, types.e4m3_dtype, out=out)
     torch.cuda.synchronize()
@@ -123,8 +127,10 @@ def test_static_per_head_quant_fp8_hip_graph_replay() -> None:
     expected = _static_quantize_reference(value, descale)
     assert graph_out is out
     assert not torch.equal(graph_out, captured_output)
+    assert not torch.isnan(graph_out.float()).any()
     mismatch_rate = (graph_out != expected).float().mean().item()
     assert mismatch_rate < 5e-3
+    assert torch.equal(graph_out.flatten()[-256:], expected.flatten()[-256:])
 
 
 def test_kimi_k3_fp8_prefill_reports_all_requirements(monkeypatch) -> None:

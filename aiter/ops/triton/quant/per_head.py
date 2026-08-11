@@ -79,7 +79,7 @@ def _per_head_quantize(
     fp8_max: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    element = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    element = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     token = element // (num_heads * head_dim)
     head_dim_offset = element % (num_heads * head_dim)
     head = head_dim_offset // head_dim
@@ -97,7 +97,7 @@ def static_per_head_quant_fp8(
     descale: torch.Tensor,
     fp8_dtype: torch.dtype,
     out: torch.Tensor | None = None,
-    validate: bool = True,
+    validate: bool = False,
 ) -> torch.Tensor:
     """Quantize ``[tokens, heads, dim]`` data with supplied per-head descales."""
     if value.ndim != 3:
