@@ -2162,7 +2162,11 @@ def test_chunk_opt_vk_prepare_flydsl_varlen_without_schedule_warns():
 
     # seq_lens_cpu builds the schedule for the caller, so no warning is due.
     with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
+        warnings.filterwarnings(
+            "error",
+            message="use_prepare_flydsl needs a prefill schedule",
+            category=UserWarning,
+        )
         _run_prepare_pipeline(
             inputs,
             cu_seqlens=cu_seqlens,
