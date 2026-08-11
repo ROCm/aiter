@@ -285,13 +285,13 @@
         "block_n": 256,
         "block_k": 512,
         "num_buffers": 1,
-        "num_warps": 4
+        "num_warps": 2
     },
     "bm16_n6144_k7168_xlarge": {
         "block_n": 256,
         "block_k": 512,
         "num_buffers": 1,
-        "num_warps": 4
+        "num_warps": 2
     },
     "bm16_n7168_k3072_large": {
         "block_n": 256,

@@ -1048,20 +1048,36 @@ def _moe_gemm_a8w4_decode(
         layout=SHARED_LAYOUT_W_SCALES,
     )
 
-    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
-        reg_bases=[],
-        instr_shape=[16, 16, 128],
-    )
-    WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
-        reg_bases=[],
-        instr_shape=[16, 16, 64],
-    )
+    if num_warps == 2:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1]],
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1]],
+            reg_bases=[],
+            instr_shape=[16, 16, 64],
+        )
+    else:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1], [0, 2]],
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1], [0, 2]],
+            reg_bases=[],
+            instr_shape=[16, 16, 64],
+        )
 
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, k_width=16)
     DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT_PACKED, k_width=16)
