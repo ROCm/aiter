@@ -128,9 +128,26 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     constexpr int smem_b_bytes = T::SMEM_B_BYTES;
     constexpr int stage_bytes = smem_a_bytes + smem_b_bytes;
 
-    const int col_base = static_cast<int>(blockIdx.y) * BN;
+    const int n_tiles = model_dim / BN;
+    const int linear_block = static_cast<int>(blockIdx.x);
+    int route_tile;
+    int output_n_tile;
+    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    {
+        constexpr int cohort = T::ROUTE_COHORT_TILES;
+        const int blocks_per_cohort = cohort * n_tiles;
+        const int cohort_id = linear_block / blocks_per_cohort;
+        const int within_cohort = linear_block % blocks_per_cohort;
+        output_n_tile = within_cohort / cohort;
+        route_tile = cohort_id * cohort + within_cohort % cohort;
+    }
+    else
+    {
+        route_tile = linear_block;
+        output_n_tile = static_cast<int>(blockIdx.y);
+    }
+    const int col_base = output_n_tile * BN;
     const int valid_rows = kargs.route.num_valid_ids[0];
-    const int route_tile = static_cast<int>(blockIdx.x);
     const int route_base = route_tile * BM;
     if(route_base >= valid_rows)
         return;
@@ -458,9 +475,23 @@ inline void route_dx_launch_gfx950(const RouteDxKargs& kargs,
     AITER_CHECK(kargs.model_dim % T::B_N == 0,
                 "route_dx: D must be divisible by ",
                 T::B_N);
-    const dim3 grid(
-        static_cast<unsigned int>(kargs.route.sorted_block_capacity),
-        static_cast<unsigned int>(kargs.model_dim / T::B_N));
+    const unsigned int n_tiles =
+        static_cast<unsigned int>(kargs.model_dim / T::B_N);
+    dim3 grid;
+    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    {
+        constexpr int cohort = T::ROUTE_COHORT_TILES;
+        const int padded_route_tiles =
+            ((kargs.route.sorted_block_capacity + cohort - 1) / cohort) *
+            cohort;
+        grid = dim3(static_cast<unsigned int>(padded_route_tiles) * n_tiles);
+    }
+    else
+    {
+        grid = dim3(
+            static_cast<unsigned int>(kargs.route.sorted_block_capacity),
+            n_tiles);
+    }
     constexpr int target_d = 2048;
     constexpr int target_i = 384;
     constexpr int target_topk = 4;

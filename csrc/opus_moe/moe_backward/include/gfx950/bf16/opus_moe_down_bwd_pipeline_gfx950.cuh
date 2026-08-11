@@ -186,8 +186,24 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     constexpr int tile_storage_bytes =
         gemm_smem_bytes > ds_bytes ? gemm_smem_bytes : ds_bytes;
 
-    const int part = static_cast<int>(blockIdx.y);
-    const int route_tile = static_cast<int>(blockIdx.x);
+    const int parts = inter_dim / BN;
+    const int linear_block = static_cast<int>(blockIdx.x);
+    int part;
+    int route_tile;
+    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    {
+        constexpr int cohort = T::ROUTE_COHORT_TILES;
+        const int blocks_per_cohort = cohort * parts;
+        const int cohort_id = linear_block / blocks_per_cohort;
+        const int within_cohort = linear_block % blocks_per_cohort;
+        part = within_cohort / cohort;
+        route_tile = cohort_id * cohort + within_cohort % cohort;
+    }
+    else
+    {
+        part = static_cast<int>(blockIdx.y);
+        route_tile = linear_block;
+    }
     const int route_base = route_tile * ROUTE_M;
     const int valid_rows = kargs.route.num_valid_ids[0];
     if(route_base >= valid_rows)
@@ -709,9 +725,22 @@ inline void down_bwd_launch_gfx950(const DownBwdKargs& kargs, hipStream_t stream
                 kargs.d_scores_parts);
 
     const dim3 block(T::BLOCK_SIZE);
-    const dim3 grid(
-        static_cast<unsigned int>(kargs.route.sorted_block_capacity),
-        static_cast<unsigned int>(expected_parts));
+    dim3 grid;
+    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    {
+        constexpr int cohort = T::ROUTE_COHORT_TILES;
+        const int padded_route_tiles =
+            ((kargs.route.sorted_block_capacity + cohort - 1) / cohort) *
+            cohort;
+        grid = dim3(static_cast<unsigned int>(padded_route_tiles) *
+                    static_cast<unsigned int>(expected_parts));
+    }
+    else
+    {
+        grid = dim3(
+            static_cast<unsigned int>(kargs.route.sorted_block_capacity),
+            static_cast<unsigned int>(expected_parts));
+    }
     constexpr int target_d = 2048;
     constexpr int target_i = 384;
     constexpr int target_topk = 4;

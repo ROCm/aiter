@@ -158,9 +158,37 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert(BM == 64 && BN == 128 && BK == 32);
     static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
-    const int expert = static_cast<int>(blockIdx.x);
-    const int output_m_base = static_cast<int>(blockIdx.y) * BM;
-    const int output_n_base = static_cast<int>(blockIdx.z) * BN;
+    int expert;
+    int output_m_base;
+    int output_n_base;
+    if constexpr(T::EXPERT_COHORT > 0)
+    {
+        // Keep a bounded cohort of experts resident in the dispatch stream.
+        // M tiles vary first so gathered X rows are reused immediately; the
+        // complete per-expert dZ/X working set is then reused across N tiles
+        // while it is still in L2.  Interleaving a few experts retains load
+        // balance when routing counts differ.
+        constexpr int cohort = T::EXPERT_COHORT;
+        const int m_tiles = kargs.output_m / BM;
+        const int n_tiles = kargs.output_n / BN;
+        const int tiles_per_expert = m_tiles * n_tiles;
+        const int blocks_per_cohort = cohort * tiles_per_expert;
+        const int linear_block = static_cast<int>(blockIdx.x);
+        const int cohort_id = linear_block / blocks_per_cohort;
+        const int within_cohort = linear_block % blocks_per_cohort;
+        const int output_tile = within_cohort / cohort;
+        expert = cohort_id * cohort + within_cohort % cohort;
+        if(expert >= kargs.route.num_experts)
+            return;
+        output_m_base = (output_tile % m_tiles) * BM;
+        output_n_base = (output_tile / m_tiles) * BN;
+    }
+    else
+    {
+        expert = static_cast<int>(blockIdx.x);
+        output_m_base = static_cast<int>(blockIdx.y) * BM;
+        output_n_base = static_cast<int>(blockIdx.z) * BN;
+    }
     const int route_start = kargs.route.expert_offsets[expert];
     const int route_end = kargs.route.expert_offsets[expert + 1];
     const int route_count = route_end - route_start;
@@ -363,9 +391,32 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert(BM == 64 && BN == 64 && BK == 64);
     static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
-    const int expert = static_cast<int>(blockIdx.x);
-    const int output_m_base = static_cast<int>(blockIdx.y) * BM;
-    const int output_n_base = static_cast<int>(blockIdx.z) * BN;
+    int expert;
+    int output_m_base;
+    int output_n_base;
+    if constexpr(T::EXPERT_COHORT > 0)
+    {
+        constexpr int cohort = T::EXPERT_COHORT;
+        const int m_tiles = kargs.output_m / BM;
+        const int n_tiles = kargs.output_n / BN;
+        const int tiles_per_expert = m_tiles * n_tiles;
+        const int blocks_per_cohort = cohort * tiles_per_expert;
+        const int linear_block = static_cast<int>(blockIdx.x);
+        const int cohort_id = linear_block / blocks_per_cohort;
+        const int within_cohort = linear_block % blocks_per_cohort;
+        const int output_tile = within_cohort / cohort;
+        expert = cohort_id * cohort + within_cohort % cohort;
+        if(expert >= kargs.route.num_experts)
+            return;
+        output_m_base = (output_tile % m_tiles) * BM;
+        output_n_base = (output_tile / m_tiles) * BN;
+    }
+    else
+    {
+        expert = static_cast<int>(blockIdx.x);
+        output_m_base = static_cast<int>(blockIdx.y) * BM;
+        output_n_base = static_cast<int>(blockIdx.z) * BN;
+    }
     const int route_start = kargs.route.expert_offsets[expert];
     const int route_end = kargs.route.expert_offsets[expert + 1];
     const int route_count = route_end - route_start;
@@ -591,10 +642,23 @@ inline void dw1_launch_gfx950(const Dw1Kargs& kargs, hipStream_t stream)
     args.stride_b_row = kargs.stride_x_t;
     args.stride_c_expert = kargs.stride_dw1_e;
     args.stride_c_m = kargs.stride_dw1_i;
-    const dim3 grid(
-        static_cast<unsigned int>(kargs.route.num_experts),
-        static_cast<unsigned int>(args.output_m / T::B_M),
-        static_cast<unsigned int>(args.output_n / T::B_N));
+    dim3 grid;
+    if constexpr(T::EXPERT_COHORT > 0)
+    {
+        constexpr int cohort = T::EXPERT_COHORT;
+        const int padded_experts =
+            ((kargs.route.num_experts + cohort - 1) / cohort) * cohort;
+        const int output_tiles = (args.output_m / T::B_M) *
+                                 (args.output_n / T::B_N);
+        grid = dim3(static_cast<unsigned int>(padded_experts * output_tiles));
+    }
+    else
+    {
+        grid = dim3(
+            static_cast<unsigned int>(kargs.route.num_experts),
+            static_cast<unsigned int>(args.output_m / T::B_M),
+            static_cast<unsigned int>(args.output_n / T::B_N));
+    }
     hipLaunchKernelGGL((weight_bwd_swizzled_k32_kernel_gfx950<T>),
                        grid,
                        dim3(T::BLOCK_SIZE),
@@ -624,10 +688,23 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     args.stride_b_row = kargs.stride_a_scaled_r;
     args.stride_c_expert = kargs.stride_dw2_e;
     args.stride_c_m = kargs.stride_dw2_d;
-    const dim3 grid(
-        static_cast<unsigned int>(kargs.route.num_experts),
-        static_cast<unsigned int>(args.output_m / T::B_M),
-        static_cast<unsigned int>(args.output_n / T::B_N));
+    dim3 grid;
+    if constexpr(T::EXPERT_COHORT > 0)
+    {
+        constexpr int cohort = T::EXPERT_COHORT;
+        const int padded_experts =
+            ((kargs.route.num_experts + cohort - 1) / cohort) * cohort;
+        const int output_tiles = (args.output_m / T::B_M) *
+                                 (args.output_n / T::B_N);
+        grid = dim3(static_cast<unsigned int>(padded_experts * output_tiles));
+    }
+    else
+    {
+        grid = dim3(
+            static_cast<unsigned int>(kargs.route.num_experts),
+            static_cast<unsigned int>(args.output_m / T::B_M),
+            static_cast<unsigned int>(args.output_n / T::B_N));
+    }
     hipLaunchKernelGGL((weight_bwd_swizzled_kernel_gfx950<T>),
                        grid,
                        dim3(T::BLOCK_SIZE),

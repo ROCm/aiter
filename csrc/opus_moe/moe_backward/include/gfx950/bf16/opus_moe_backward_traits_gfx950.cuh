@@ -39,6 +39,7 @@ struct Bf16Traits
 struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
     : Bf16Traits<Family::DownBwd, 32, 128, 64, 256, 2, false>
 {
+    static constexpr int ROUTE_COHORT_TILES = 0;
     static constexpr int ROUTE_M = 32;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -76,10 +77,21 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
     static_assert(SMEM_B_GROUPS == 16);
 };
 
+struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort4
+    : DownBwdBf16Gfx950Bm32Bn128Bk64Padded
+{
+    static constexpr int ROUTE_COHORT_TILES = 4;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>
 {
+    // The legacy two-dimensional launch walks all route tiles before the
+    // next output-N tile.  Derived instances can bound that reuse domain to
+    // a small route cohort: route tiles remain fastest within each N tile so
+    // they share W1, while dZ is revisited after only one cohort.
+    static constexpr int ROUTE_COHORT_TILES = 0;
     static constexpr int ROUTE_M = 32;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -115,6 +127,12 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
     static_assert(SMEM_B_GROUP_DATA_BYTES == 1024);
     static_assert(SMEM_B_GROUPS == 16);
+};
+
+struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStoreCohort4
+    : RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
+{
+    static constexpr int ROUTE_COHORT_TILES = 4;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128
@@ -202,6 +220,11 @@ struct BiasBwdVarlenBf16Gfx950Bm32Bn16R16
 struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     : Bf16Traits<Family::Dw1, 64, 128, 32, 256, 2, false>
 {
+    // Zero preserves the original (expert-fastest) 3-D grid.  Positive
+    // values group a small expert cohort while walking all output tiles,
+    // shortening the L2 reuse distance without serializing the whole grid by
+    // expert.  Tuning candidates inherit this trait and override the policy.
+    static constexpr int EXPERT_COHORT = 0;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -234,10 +257,17 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4
+    : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
+{
+    static constexpr int EXPERT_COHORT = 4;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
 {
+    static constexpr int EXPERT_COHORT = 0;
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
     static constexpr int T_K = 1;
@@ -268,6 +298,12 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     static constexpr int CACHECTL_A = 0;
     static constexpr int CACHECTL_B = 0;
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
+struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4
+    : Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
+{
+    static constexpr int EXPERT_COHORT = 4;
 };
 
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled

@@ -114,6 +114,89 @@ inline void invoke(Launcher launcher, const Kargs& kargs, hipStream_t stream, Fa
         launcher(kargs, stream);
 }
 
+inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
+                                            int requested_kernel_id)
+{
+    if(requested_kernel_id != kKernelAuto)
+        return requested_kernel_id;
+
+    constexpr int legacy_kid = 5;
+    constexpr int cohort4_kid = 6;
+    constexpr int output_n_tile = 128;
+    // A cohort is useful only when there are enough route and N tiles to
+    // trade a bounded amount of W1 reuse for much shorter dZ reuse distance.
+    // The policy depends on launch geometry and reusable sorting metadata,
+    // not on an exact model tuple.  Keep the legacy layout for degenerate
+    // grids and for contracts without expert offsets.
+    if(kargs.route.expert_offsets == nullptr ||
+       kargs.route.sorted_block_capacity < 4 ||
+       kargs.model_dim <= output_n_tile)
+        return legacy_kid;
+    return cohort4_kid;
+}
+
+inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
+                                       int requested_kernel_id)
+{
+    if(requested_kernel_id != kKernelAuto)
+        return requested_kernel_id;
+
+    constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr int legacy_kid = 2;
+    constexpr int cohort4_kid = 3;
+    const uint64_t z_bytes =
+        static_cast<uint64_t>(kargs.route.sorted_capacity) *
+        2ull * static_cast<uint64_t>(kargs.inter_dim) *
+        sizeof(hip_bfloat16);
+    if(kargs.d_scores_parts <= 1 || z_bytes <= l2_friendly_bytes)
+        return legacy_kid;
+    return cohort4_kid;
+}
+
+inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
+                                      int requested_kernel_id)
+{
+    if(requested_kernel_id != kKernelAuto)
+        return requested_kernel_id;
+
+    // The legacy expert-fastest grid is best while all K4 sources fit in a
+    // conservative share of gfx950 L2.  Beyond that point a four-expert
+    // cohort sharply shortens the dZ/X reuse distance.  This policy depends
+    // only on the runtime working set, not on an exact model shape.
+    constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr int legacy_kid = 5;
+    constexpr int cohort4_kid = 6;
+    if(kargs.route.num_experts < 4)
+        return legacy_kid;
+    const uint64_t source_row_elements =
+        2ull * static_cast<uint64_t>(kargs.inter_dim) +
+        static_cast<uint64_t>(kargs.model_dim);
+    const uint64_t source_bytes =
+        static_cast<uint64_t>(kargs.route.sorted_capacity) *
+        source_row_elements * sizeof(hip_bfloat16);
+    return source_bytes > l2_friendly_bytes ? cohort4_kid : legacy_kid;
+}
+
+inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
+                                      int requested_kernel_id)
+{
+    if(requested_kernel_id != kKernelAuto)
+        return requested_kernel_id;
+
+    constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr int legacy_kid = 3;
+    constexpr int cohort4_kid = 4;
+    if(kargs.route.num_experts < 4)
+        return legacy_kid;
+    const uint64_t source_row_elements =
+        static_cast<uint64_t>(kargs.model_dim) +
+        static_cast<uint64_t>(kargs.inter_dim);
+    const uint64_t source_bytes =
+        static_cast<uint64_t>(kargs.route.sorted_capacity) *
+        source_row_elements * sizeof(hip_bfloat16);
+    return source_bytes > l2_friendly_bytes ? cohort4_kid : legacy_kid;
+}
+
 } // namespace detail
 
 void launch_down_bwd_bf16(const DownBwdKargs& kargs,
@@ -145,7 +228,10 @@ void launch_down_bwd_bf16(const DownBwdKargs& kargs,
             kargs.stride_ds_workspace_r, "stride_ds_workspace_r", family);
 
     detail::check_gfx950_or_fail();
-    detail::invoke(gfx950::dispatch_down_bwd(kernel_id), kargs, stream, family);
+    const int selected_kernel_id =
+        detail::select_fixed_down_kernel_id(kargs, kernel_id);
+    detail::invoke(
+        gfx950::dispatch_down_bwd(selected_kernel_id), kargs, stream, family);
 }
 
 void launch_route_dx_bf16(const RouteDxKargs& kargs,
@@ -163,7 +249,10 @@ void launch_route_dx_bf16(const RouteDxKargs& kargs,
     detail::check_stride(kargs.stride_dx_route_r, "stride_dx_route_r", family);
 
     detail::check_gfx950_or_fail();
-    detail::invoke(gfx950::dispatch_route_dx(kernel_id), kargs, stream, family);
+    const int selected_kernel_id =
+        detail::select_fixed_route_dx_kernel_id(kargs, kernel_id);
+    detail::invoke(
+        gfx950::dispatch_route_dx(selected_kernel_id), kargs, stream, family);
 }
 
 void launch_route_reduce_bf16(const RouteReduceKargs& kargs,
@@ -286,7 +375,10 @@ void launch_dw1_bf16(const Dw1Kargs& kargs,
             kargs.stride_workspace_split, "stride_workspace_split", family);
 
     detail::check_gfx950_or_fail();
-    detail::invoke(gfx950::dispatch_dw1(kernel_id), kargs, stream, family);
+    const int selected_kernel_id =
+        detail::select_fixed_dw1_kernel_id(kargs, kernel_id);
+    detail::invoke(
+        gfx950::dispatch_dw1(selected_kernel_id), kargs, stream, family);
 }
 
 void launch_dw2_bf16(const Dw2Kargs& kargs,
@@ -315,7 +407,10 @@ void launch_dw2_bf16(const Dw2Kargs& kargs,
             kargs.stride_workspace_split, "stride_workspace_split", family);
 
     detail::check_gfx950_or_fail();
-    detail::invoke(gfx950::dispatch_dw2(kernel_id), kargs, stream, family);
+    const int selected_kernel_id =
+        detail::select_fixed_dw2_kernel_id(kargs, kernel_id);
+    detail::invoke(
+        gfx950::dispatch_dw2(selected_kernel_id), kargs, stream, family);
 }
 
 namespace detail
@@ -336,11 +431,13 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                                   hipStream_t stream)
 {
     check_gfx950_or_fail();
-    invoke(gfx950::dispatch_down_bwd(down_kernel_id),
+    invoke(gfx950::dispatch_down_bwd(
+               select_fixed_down_kernel_id(down, down_kernel_id)),
            down,
            stream,
            Family::DownBwd);
-    invoke(gfx950::dispatch_route_dx(route_dx_kernel_id),
+    invoke(gfx950::dispatch_route_dx(
+               select_fixed_route_dx_kernel_id(route_dx, route_dx_kernel_id)),
            route_dx,
            stream,
            Family::RouteDx);
@@ -348,8 +445,16 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
            route_reduce,
            stream,
            Family::RouteReduce);
-    invoke(gfx950::dispatch_dw1(dw1_kernel_id), dw1, stream, Family::Dw1);
-    invoke(gfx950::dispatch_dw2(dw2_kernel_id), dw2, stream, Family::Dw2);
+    invoke(gfx950::dispatch_dw1(
+               select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
+           dw1,
+           stream,
+           Family::Dw1);
+    invoke(gfx950::dispatch_dw2(
+               select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+           dw2,
+           stream,
+           Family::Dw2);
 }
 
 } // namespace detail
