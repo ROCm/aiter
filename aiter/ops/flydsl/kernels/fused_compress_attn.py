@@ -91,7 +91,11 @@ from aiter.utility.mx_types import (
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    block_base_bytes_i64,
+    emit_group_fp8_nm_asm_scatter,
+    state_slot_byte_offset,
+)
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
 
@@ -512,9 +516,22 @@ def _build_kernel(
             # Buffer resources reused across K iters.
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # State descriptors are rebased onto THIS program's slot. A buffer
+            # offset is a 32-bit byte offset, so one descriptor can only reach
+            # 4 GiB from its base; a state tensor whose slot stride is a
+            # per-request arena entry (rather than the field's own size) spans
+            # far more than that across all slots. Folding the slot term into
+            # the base — 64-bit pointer arithmetic, done once per program —
+            # leaves the offset covering a single entry.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -561,15 +578,14 @@ def _build_kernel(
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
 
+                # Slot term already folded into the descriptor base.
                 base_kv_off = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
                 base_sc_off = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
@@ -932,9 +948,10 @@ def _build_kernel(
                     # BF16 paged write. kv_cache layout: [NB, k_per_block, D].
                     # cache_addr = physical_block * block_stride + slot_in_block * token_stride + tid*VEC
                     # (strides are in bf16 elements; caller passes elements.)
+                    # The block term rides on the descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
-                        + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                        ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
                         + tid_x_vec
                     )
                     # Build a per-block GTensor and store VEC bf16 via dword path.
@@ -943,7 +960,11 @@ def _build_kernel(
                     raw_vec = vector.from_elements(vecVf32, out_lane)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 2
+                        ),
                     )
                     # cache_off is in bf16 elements; convert to dword for the i32-vec store.
                     cache_off_dw = ArithValue(cache_off) >> arith.constant(1, type=i32)
@@ -960,12 +981,14 @@ def _build_kernel(
                 elif const_expr(nm_asm):
                     # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope bf16
                     # -> separate k_rope_buff. Shared emitter (byte-identical to HCA). --
-                    _nm_cache_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-                    _nm_krope_base = ArithValue(physical_block) * ArithValue(
-                        krope_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                    # The block term rides on each descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
+                    _nm_cache_base = ArithValue(slot_in_block) * ArithValue(
+                        kv_cache_token_stride
+                    )
+                    _nm_krope_base = ArithValue(slot_in_block) * ArithValue(
+                        krope_token_stride
+                    )
                     emit_group_fp8_nm_asm_scatter(
                         normed_lane=normed_lane,
                         rotated_lane=rotated_lane,
@@ -973,11 +996,19 @@ def _build_kernel(
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
                         out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache, max_size=True
+                            kv_cache,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, kv_cache_block_stride, 1
+                            ),
                         ),
                         krope_base=_to_raw(_nm_krope_base),
                         krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff, max_size=True
+                            k_rope_buff,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, krope_block_stride, 2
+                            ),
                         ),
                         VEC=VEC,
                         NOPE=NOPE,
@@ -1107,19 +1138,20 @@ def _build_kernel(
                         dword = (p0, p1)
 
                     # Compute store address (in BYTES from kv_cache base).
-                    # Both layouts use the same base (= phys * block_stride);
-                    # the offset within the block differs.
+                    # Both layouts share the same block base, which rides on
+                    # the descriptor rather than the 32-bit offset -- see
+                    # `block_base_bytes_i64`. Only the in-block offset differs.
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
-                    block_byte_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 1
+                        ),
                     )
 
                     if const_expr(preshuffle):
                         # MFMA 16x16 tile layout
-                        # offset = block_base
-                        #        + token_tile_id * (TILE * D)
+                        # offset = token_tile_id * (TILE * D)
                         #        + col_tile_id * (TILE * TILE)
                         #        + token_in_tile * TILE
                         #        + col_in_tile
@@ -1141,12 +1173,13 @@ def _build_kernel(
                             + ArithValue(col_in_tile)
                         )
                     else:
-                        # Linear layout: phys * block_stride + slot * D + tid * VEC
+                        # Linear layout: slot * D + tid * VEC (block base folded
+                        # into the descriptor above).
                         in_block_off = ArithValue(slot_in_block) * arith.constant(
                             D, type=i32
                         ) + ArithValue(tid) * arith.constant(VEC, type=i32)
 
-                    byte_off = block_byte_base + in_block_off
+                    byte_off = in_block_off
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
@@ -1173,15 +1206,19 @@ def _build_kernel(
                             offset_is_bytes=True,
                         )
 
-                    # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
+                    # (f) lane-0 writes fp32 scale at cache_scale[phys, slot].
+                    # Block term on the descriptor base, as above.
                     if tid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, cache_scale_block_stride, 4
+                            ),
                         )
-                        cs_off = fx.Int32(physical_block) * fx.Int32(
-                            cache_scale_block_stride
-                        ) + fx.Int32(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        buffer_ops.buffer_store(
+                            scale_v, cs_rsrc, fx.Int32(slot_in_block)
+                        )
                 else:
                     # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
@@ -1243,15 +1280,24 @@ def _build_kernel(
                         for i in range_constexpr(VEC)
                     ]
 
+                    # The block term rides on the descriptor's base, not on the
+                    # 32-bit offset -- see `block_base_bytes_i64`. Both fp4
+                    # layouts pack a block into a compile-time constant number
+                    # of bytes, so the base is that constant times the block.
+                    _fp4_block_bytes = (
+                        K_TILES * 4 * KVBS * 16
+                        if preshuffle
+                        else k_per_block * (D // 2)
+                    )
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, _fp4_block_bytes, 1
+                        ),
                     )
                     # packed byte index within the row = (tid*VEC) / 2.
                     packed_start = ArithValue(tid_x_vec) >> arith.constant(1, type=i32)
-                    # flat paged slot (for the linear fallback).
-                    flat_slot = ArithValue(physical_block) * arith.constant(
-                        k_per_block, type=i32
-                    ) + ArithValue(slot_in_block)
                     for b in range_constexpr(PACKED_BYTES):
                         byte_val = ArithValue(nibs[2 * b]) | (
                             ArithValue(nibs[2 * b + 1]) << c4_i32
@@ -1264,9 +1310,7 @@ def _build_kernel(
                             group4 = arith.divsi(rem, c16_i32)
                             sub16 = arith.remui(rem, c16_i32)
                             byte_off = (
-                                ArithValue(physical_block)
-                                * arith.constant(K_TILES * 4 * KVBS * 16, type=i32)
-                                + ArithValue(k_tile)
+                                ArithValue(k_tile)
                                 * arith.constant(4 * KVBS * 16, type=i32)
                                 + ArithValue(group4)
                                 * arith.constant(KVBS * 16, type=i32)
@@ -1274,7 +1318,7 @@ def _build_kernel(
                                 + ArithValue(sub16)
                             )
                         else:
-                            byte_off = ArithValue(flat_slot) * arith.constant(
+                            byte_off = ArithValue(slot_in_block) * arith.constant(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
                         buffer_ops.buffer_store(
@@ -1287,8 +1331,19 @@ def _build_kernel(
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(tid_x_vec, c32_i32)
                     if tid % NTG == 0:
+                        # Block term on the descriptor base, as above; the u8
+                        # scale plane packs a block into a constant byte count.
+                        _fp4_scale_block_bytes = (
+                            K_TILES * 4 * KVBS
+                            if preshuffle
+                            else k_per_block * (D // _FP4_GROUP_SIZE)
+                        )
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, _fp4_scale_block_bytes, 1
+                            ),
                         )
                         if const_expr(preshuffle):
                             # scale [NB, k_tiles, 4, kvbs] u8, with the slot axis
@@ -1306,15 +1361,13 @@ def _build_kernel(
                                 arith.divsi(_to_raw(slot_in_block), c16_i32)
                             )
                             cs_off = (
-                                ArithValue(physical_block)
-                                * arith.constant(K_TILES * 4 * KVBS, type=i32)
-                                + ArithValue(k_tile_s)
+                                ArithValue(k_tile_s)
                                 * arith.constant(4 * KVBS, type=i32)
                                 + ArithValue(group4_s) * arith.constant(KVBS, type=i32)
                                 + sflat
                             )
                         else:
-                            cs_off = ArithValue(flat_slot) * arith.constant(
+                            cs_off = ArithValue(slot_in_block) * arith.constant(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
                         buffer_ops.buffer_store(
@@ -1622,9 +1675,16 @@ def _build_kernel_ksplit(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -1725,15 +1785,14 @@ def _build_kernel_ksplit(
                 s_safe = arith.select(is_pad, c_zero_i32, s)
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
+                # Slot term already folded into the descriptor base.
                 base_kv = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
                 base_sc = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
@@ -1989,16 +2048,21 @@ def _build_kernel_ksplit(
                 )
 
                 if const_expr(not quant):
+                    # The block term rides on the descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
-                        + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                        ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
                         + lid_x_vec
                     )
                     out_vec_t = T.vec(VEC, T.bf16)
                     raw_vec = vector.from_elements(vecVf32, out_lane)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 2
+                        ),
                     )
                     cache_off_dw = ArithValue(cache_off) >> c_one_i32
                     dwords = (VEC + 1) // 2
@@ -2014,12 +2078,14 @@ def _build_kernel_ksplit(
                     # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope
                     # bf16 -> separate k_rope_buff. Shared emitter, byte-identical
                     # to the legacy single-wave / HCA paths (lane == wave-0 lid). --
-                    _nm_cache_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-                    _nm_krope_base = ArithValue(physical_block) * ArithValue(
-                        krope_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                    # The block term rides on each descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
+                    _nm_cache_base = ArithValue(slot_in_block) * ArithValue(
+                        kv_cache_token_stride
+                    )
+                    _nm_krope_base = ArithValue(slot_in_block) * ArithValue(
+                        krope_token_stride
+                    )
                     emit_group_fp8_nm_asm_scatter(
                         normed_lane=normed_lane,
                         rotated_lane=rotated_lane,
@@ -2027,11 +2093,19 @@ def _build_kernel_ksplit(
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
                         out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache, max_size=True
+                            kv_cache,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, kv_cache_block_stride, 1
+                            ),
                         ),
                         krope_base=_to_raw(_nm_krope_base),
                         krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff, max_size=True
+                            k_rope_buff,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, krope_block_stride, 2
+                            ),
                         ),
                         VEC=VEC,
                         NOPE=NOPE,
@@ -2136,11 +2210,14 @@ def _build_kernel_ksplit(
                         )
                         dword = (p0, p1)
 
+                    # Block base on the descriptor, not on the 32-bit offset
+                    # -- see `block_base_bytes_i64`.
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
-                    block_byte_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 1
+                        ),
                     )
 
                     if const_expr(preshuffle):
@@ -2165,7 +2242,7 @@ def _build_kernel_ksplit(
                             D, type=i32
                         ) + ArithValue(lid) * arith.constant(VEC, type=i32)
 
-                    byte_off = block_byte_base + in_block_off
+                    byte_off = in_block_off
 
                     if const_expr(VEC == 2):
                         if (lid & 1) == 0:
@@ -2184,15 +2261,19 @@ def _build_kernel_ksplit(
                             store_vec, out_rsrc, byte_off, offset_is_bytes=True
                         )
 
-                    # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
+                    # (f) lane-0 writes fp32 scale at cache_scale[phys, slot].
+                    # Block term on the descriptor base, as above.
                     if lid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, cache_scale_block_stride, 4
+                            ),
                         )
-                        cs_off = fx.Int32(physical_block) * fx.Int32(
-                            cache_scale_block_stride
-                        ) + fx.Int32(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        buffer_ops.buffer_store(
+                            scale_v, cs_rsrc, fx.Int32(slot_in_block)
+                        )
                 else:
                     # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
@@ -2248,15 +2329,23 @@ def _build_kernel_ksplit(
                         for i in range_constexpr(VEC)
                     ]
 
+                    # Block term on the descriptor base, not on the 32-bit
+                    # offset -- see `block_base_bytes_i64`.
+                    _fp4_block_bytes = (
+                        K_TILES * 4 * KVBS * 16
+                        if preshuffle
+                        else k_per_block * (D // 2)
+                    )
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, _fp4_block_bytes, 1
+                        ),
                     )
                     packed_start = ArithValue(lid_x_vec_i) >> arith.constant(
                         1, type=i32
                     )
-                    flat_slot = ArithValue(physical_block) * arith.constant(
-                        k_per_block, type=i32
-                    ) + ArithValue(slot_in_block)
                     for b in range_constexpr(PACKED_BYTES):
                         byte_val = ArithValue(nibs[2 * b]) | (
                             ArithValue(nibs[2 * b + 1]) << c4_i32
@@ -2268,9 +2357,7 @@ def _build_kernel_ksplit(
                             group4 = arith.divsi(rem, c16_i32)
                             sub16 = arith.remui(rem, c16_i32)
                             byte_off = (
-                                ArithValue(physical_block)
-                                * arith.constant(K_TILES * 4 * KVBS * 16, type=i32)
-                                + ArithValue(k_tile)
+                                ArithValue(k_tile)
                                 * arith.constant(4 * KVBS * 16, type=i32)
                                 + ArithValue(group4)
                                 * arith.constant(KVBS * 16, type=i32)
@@ -2278,7 +2365,7 @@ def _build_kernel_ksplit(
                                 + ArithValue(sub16)
                             )
                         else:
-                            byte_off = ArithValue(flat_slot) * arith.constant(
+                            byte_off = ArithValue(slot_in_block) * arith.constant(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
                         buffer_ops.buffer_store(
@@ -2291,8 +2378,18 @@ def _build_kernel_ksplit(
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(lid_x_vec_i, c32_i32)
                     if lid % NTG == 0:
+                        # Block term on the descriptor base, as above.
+                        _fp4_scale_block_bytes = (
+                            K_TILES * 4 * KVBS
+                            if preshuffle
+                            else k_per_block * (D // _FP4_GROUP_SIZE)
+                        )
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, _fp4_scale_block_bytes, 1
+                            ),
                         )
                         if const_expr(preshuffle):
                             # scale [NB, k_tiles, 4, kvbs] u8, slot axis
@@ -2308,15 +2405,13 @@ def _build_kernel_ksplit(
                                 arith.divsi(_to_raw(slot_in_block), c16_i32)
                             )
                             cs_off = (
-                                ArithValue(physical_block)
-                                * arith.constant(K_TILES * 4 * KVBS, type=i32)
-                                + ArithValue(k_tile_s)
+                                ArithValue(k_tile_s)
                                 * arith.constant(4 * KVBS, type=i32)
                                 + ArithValue(group4_s) * arith.constant(KVBS, type=i32)
                                 + sflat
                             )
                         else:
-                            cs_off = ArithValue(flat_slot) * arith.constant(
+                            cs_off = ArithValue(slot_in_block) * arith.constant(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
                         buffer_ops.buffer_store(
@@ -2696,8 +2791,13 @@ def flydsl_fused_compress_attn(
         raise ValueError("score_state shape != kv_state")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
-    if not (kv_state.is_contiguous() and score_state.is_contiguous()):
-        raise ValueError("kv_state/score_state must be contiguous")
+    # Slot and ring strides are passed to the kernel and the descriptor is
+    # rebased per slot, so the states may be strided views — a per-request
+    # arena hands out a view whose slot stride is a whole entry. Only the
+    # innermost dim must be unit stride: the kernel addresses it as
+    # `col_off + lane`.
+    if kv_state.stride(-1) != 1 or score_state.stride(-1) != 1:
+        raise ValueError("kv_state/score_state inner stride must be 1")
     if ape.shape != (ratio, dim_full) or ape.dtype != torch.float32:
         raise ValueError(
             f"ape shape {tuple(ape.shape)} dtype {ape.dtype} != ({ratio}, {dim_full}) f32"
@@ -2776,6 +2876,33 @@ def flydsl_fused_compress_attn(
             if preshuffle and k_per_block % _PRESHUFFLE_TILE != 0:
                 raise ValueError(
                     f"fp4 preshuffle requires k_per_block%16==0, got {k_per_block}"
+                )
+            # The fp4 scatter derives its per-block byte base from these shape
+            # constants, not from the caller's stride (see `_fp4_block_bytes` in
+            # the kernel), so a pool whose blocks are NOT packed back-to-back --
+            # e.g. the V4 envelope layout that interleaves layers within a block
+            # -- would have every write land in the wrong block. Enforce the
+            # assumption instead of leaving it in a comment.
+            _blk_bytes = (
+                (head_dim // _FP4_K_TILE) * 4 * k_per_block * _PRESHUFFLE_TILE
+                if preshuffle
+                else k_per_block * (head_dim // 2)
+            )
+            if kv_cache.stride(0) != _blk_bytes:
+                raise ValueError(
+                    f"fp4 kv_cache block stride {kv_cache.stride(0)} != packed "
+                    f"{_blk_bytes} bytes/block; the fp4 scatter assumes blocks "
+                    "are contiguous in the pool"
+                )
+            _scale_blk = (
+                (head_dim // _FP4_K_TILE) * 4 * k_per_block
+                if preshuffle
+                else k_per_block * (head_dim // _FP4_GROUP_SIZE)
+            )
+            if cache_scale.stride(0) != _scale_blk:
+                raise ValueError(
+                    f"fp4 cache_scale block stride {cache_scale.stride(0)} != "
+                    f"packed {_scale_blk} bytes/block"
                 )
 
     # cos/sin row stride must equal RD/2 (caller's [max_pos, ..., RD/2] view).

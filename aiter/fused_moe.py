@@ -1132,7 +1132,6 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
-                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1

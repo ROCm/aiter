@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 impo
     _get_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
@@ -63,6 +64,8 @@ def fused_gemm_afp4wfp4_a16w16(
     _LOGGER.info(
         f"FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp4={tuple(x_fp4.shape)} w_fp4={tuple(w_fp4.shape)} x_fp4_scale={tuple(x_fp4_scale.shape)} w_fp4_scale={tuple(w_fp4_scale.shape)} x_bf16={tuple(x_bf16.shape)} w_bf16={tuple(w_bf16.shape)}"
     )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x_fp4.shape
     N_fp4, K = w_fp4.shape

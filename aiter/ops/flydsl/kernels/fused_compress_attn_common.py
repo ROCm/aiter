@@ -51,6 +51,60 @@ def group_fp8_mx_dtype():
     return _MxD.FP8_E4M3_FNUZ if get_rocm_arch() == "gfx942" else _MxD.FP8_E4M3
 
 
+def state_slot_byte_offset(slot, slot_stride_f32_elems):
+    """`slot * slot_stride` in bytes, computed in 64 bits.
+
+    All four compress-attn kernels (CSA and HCA, wave64 and gfx1250) rebase
+    their `kv_state` / `score_state` buffer descriptors onto the program's own
+    slot instead of carrying the slot term in the load offset, so a caller may
+    hand any of them a strided per-request arena view. A buffer offset is a
+    32-bit BYTE offset, so one
+    descriptor reaches at most 4 GiB from its base — which the slot term
+    alone can exceed once the caller's state tensor is a view whose slot
+    stride is a whole per-request arena entry rather than the field's own
+    size. `get_element_ptr` adds this in 64-bit pointer arithmetic, so only
+    the multiply needs widening, and the remaining offset covers one entry.
+    """
+    slot_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot))
+    stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot_stride_f32_elems))
+    return arith.muli(
+        arith.muli(slot_i64, stride_i64),
+        arith.constant(4, type=T.i64),  # sizeof(f32)
+    )
+
+
+def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
+    """Byte offset of one physical block, computed in 64 bits.
+
+    A buffer descriptor addresses through a 32-bit offset inside a 32-bit
+    ``num_records`` window, so one fixed base cannot reach past 4 GiB: the
+    offset wraps at 2 GiB and the hardware drops the access at 4 GiB, both
+    silently. Shifting the descriptor's BASE per block instead leaves the
+    32-bit field holding one block's worth of offset, which no layout makes big.
+
+    How soon that mattered scales with how many layers a block spans.
+    DeepSeek-V4's envelope layout puts every layer's rows for one block
+    together, so consecutive blocks sit 708 KB apart and block 3,031 wraps; the
+    layer-major predecessor still wrapped at block 65,536 for a CSA layer, well
+    inside a pool that routinely holds 150,000.
+
+    ``block_stride`` is in elements of the cache's own dtype and may be either
+    a runtime value (the caller passed the tensor's stride) or a Python int
+    (the packed fp4/preshuffle layouts derive it from compile-time shape
+    constants). ``elem_bytes`` converts: 1 for the fp8/uint8 entry caches, 2
+    for a bf16 one, 4 for the fp32 per-token scale.
+    """
+    blk_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(physical_block))
+    if isinstance(block_stride, int):
+        stride_i64 = arith.constant(block_stride, type=T.i64)
+    else:
+        stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(block_stride))
+    base = arith.muli(blk_i64, stride_i64)
+    if elem_bytes == 1:
+        return base
+    return arith.muli(base, arith.constant(elem_bytes, type=T.i64))
+
+
 def emit_group_fp8_nm_asm_scatter(
     *,
     normed_lane,  # list[VEC] f32: post-norm nope values (this lane's slice)

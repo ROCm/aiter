@@ -327,8 +327,17 @@ def _sparse_attn_prefill_kernel(
         in_range = k_pos < kv_len
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
+        # 64-bit before the multiply, same as the decode kernel: a slot index
+        # fits 32 bits (the index buffer is int32 by ABI) but `slot *
+        # kv_stride_n` does not once the unified V4 pool runs to ~150M rows.
+        # The wrapped offset still lands inside the same allocation, so the
+        # bad read is silent.
+        slot_off = slot.to(tl.int64)
+
         kv = tl.load(
-            kv_ptr + slot[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d,
+            kv_ptr
+            + slot_off[:, None] * kv_stride_n
+            + dim_offsets[None, :] * kv_stride_d,
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )

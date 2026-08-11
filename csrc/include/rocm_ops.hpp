@@ -2004,6 +2004,7 @@ namespace py = pybind11;
           py::arg("swa_nope_scale_buff") = std::nullopt,               \
           py::arg("swa_rope_buff")       = std::nullopt,               \
           py::arg("swa_block_tables")    = std::nullopt,               \
+          py::arg("swa_dest_row")        = std::nullopt,               \
           py::arg("swa_block_size")      = 0,                          \
           py::arg("batch_id_per_token")  = std::nullopt);               \
     m.def("fused_kv_norm_rope_group_quant",                            \
@@ -2176,37 +2177,42 @@ namespace py = pybind11;
     m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
-#define TOP_K_PER_ROW_PYBIND                    \
-    m.def("top_k_per_row_prefill",              \
-          &top_k_per_row_prefill,               \
-          py::arg("logits"),                    \
-          py::arg("rowStarts"),                 \
-          py::arg("rowEnds"),                   \
-          py::arg("indices"),                   \
-          py::arg("values"),                    \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("stride1"),                   \
-          py::arg("k")         = 2048,          \
-          py::arg("workspace") = std::nullopt); \
-    m.def("top_k_per_row_decode",               \
-          &top_k_per_row_decode,                \
-          py::arg("logits"),                    \
-          py::arg("next_n"),                    \
-          py::arg("seqLens"),                   \
-          py::arg("indices"),                   \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("stride1"),                   \
-          py::arg("k")         = 2048,          \
-          py::arg("workspace") = std::nullopt); \
-    m.def("topk_mb_workspace_size",             \
-          &topk_mb_workspace_size,              \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("k"),                         \
-          py::arg("is_decode"));                \
-    m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
+#define TOP_K_PER_ROW_PYBIND                     \
+    m.def("top_k_per_row_prefill",               \
+          &top_k_per_row_prefill,                \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("stable")    = false);         \
+    m.def("top_k_per_row_decode",                \
+          &top_k_per_row_decode,                 \
+          py::arg("logits"),                     \
+          py::arg("next_n"),                     \
+          py::arg("seqLens"),                    \
+          py::arg("indices"),                    \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("stable")    = false);         \
+    m.def("topk_mb_workspace_size",              \
+          &topk_mb_workspace_size,               \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("is_decode"));                 \
+    m.def("topk_use_mulblocks",                  \
+          &topk_use_mulblocks,                   \
+          py::arg("numRows"),                    \
+          py::arg("stride0"));
 
 #define MLA_METADATA_PYBIND                                 \
     m.def("get_mla_metadata_v1",                            \
@@ -2538,6 +2544,20 @@ namespace py = pybind11;
           py::arg("scale"),                                           \
           py::arg("use_qk_l2norm_in_kernel"),                         \
           py::arg("output"));
+
+#define GDR_DECODE_PACKED_BF16_PYBIND                  \
+    m.def("gdr_decode_packed_bf16",                    \
+          &aiter::gdr_decode_packed_bf16,               \
+          "gfx950 packed BF16 GDR decode (HIP).",      \
+          py::arg("mixed_qkv"),                        \
+          py::arg("a"),                                \
+          py::arg("b"),                                \
+          py::arg("dt_bias"),                          \
+          py::arg("A_log"),                            \
+          py::arg("indices"),                          \
+          py::arg("state"),                            \
+          py::arg("out"),                              \
+          py::arg("scale"));
 
 #define MXFP4_MOE_AUX_PYBIND                  \
     m.def("mxfp4_moe_sort_quant",             \

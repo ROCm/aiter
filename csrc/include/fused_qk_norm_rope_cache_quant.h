@@ -224,12 +224,16 @@ void fused_qk_norm_rope_group_quant(
     // (Q mirrors K: nope fp8 + inline scale in q_nope_scale_buff, PE bf16 here). Unused for bf16 Q.
     std::optional<aiter_tensor_t> q_rope_buff = std::nullopt,
     // --- Optional fused SWA write (decode-only) ---
-    // swa_nope_scale_buff [num_rows, entry] and swa_rope_buff
-    // [num_rows, pe_dim] are addressed by swa_block_tables[bid, pos/swa_block_size].
+    // swa_nope_scale_buff [num_rows, entry] and swa_rope_buff [num_rows, pe_dim]
+    // are addressed either by swa_block_tables[bid, pos/swa_block_size] (paged)
+    // or by swa_dest_row[token] (rows the caller computed itself, for a window
+    // whose layout this kernel need not know). Pass exactly one of the two.
+    // Either way a token with a negative position is skipped.
     // batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     std::optional<aiter_tensor_t> swa_nope_scale_buff = std::nullopt,
     std::optional<aiter_tensor_t> swa_rope_buff = std::nullopt,
     std::optional<aiter_tensor_t> swa_block_tables = std::nullopt,
+    std::optional<aiter_tensor_t> swa_dest_row = std::nullopt,
     int64_t swa_block_size = 0,
     std::optional<aiter_tensor_t> batch_id_per_token = std::nullopt);
 

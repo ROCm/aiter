@@ -4323,16 +4323,71 @@ namespace aiter {
         int compress_ratio;
         int block_table_seq_stride;
         // --- Fused SWA write (decode-only, QK kernel) ---
-        // Paged SWA (M2): dest row is content-addressed through the SWA block table:
-        //   blk  = pos / swa_block_size
-        //   phys = swa_block_tables[bid, blk]
-        //   row  = phys*swa_block_size + pos%swa_block_size
-        //   swa_*[row*swa_*_row_stride + :]
-        // Strides are in element units (cache_t for nope, scalar_t for rope). Unused
-        // (0) when SWA pointers are null. Ignored by the K-only kernel.
+        // Two addressing modes, selected by which of the two index tensors the
+        // host passed:
+        //   direct (swa_dest_row != nullptr):
+        //     row = swa_dest_row[token_idx]
+        //   paged  (swa_block_tables != nullptr):
+        //     blk = pos/swa_block_size
+        //     row = swa_block_tables[bid, blk]*swa_block_size + pos%swa_block_size
+        // then swa_*[row*swa_*_row_stride + :].
+        //
+        // The direct mode exists because a caller's window need not be
+        // expressible here at all. ATOM's DeepSeek-V4 pool interleaves each
+        // request's window rows across a shared row space, by a stride that
+        // depends on the layer's compress class -- it computes the row where it
+        // owns that layout and hands the result over per token, so a change to
+        // it never reaches this file. It is also strictly more general than the
+        // ring it replaced (`slot*cache_size + pos%cache_size`), which a
+        // degenerate paged table could not emulate either: `blk` grows with
+        // position, so a long context ran past swa_block_tables_blocks and the
+        // write was silently skipped.
+        //
+        // Strides are in element units (cache_t for nope, scalar_t for rope).
+        // Unused (0) when SWA pointers are null. Ignored by the K-only kernel.
         int swa_block_size, swa_block_tables_stride, swa_block_tables_blocks;
         int swa_nope_row_stride, swa_rope_row_stride;
+        // Rows in the SWA pool. Both modes bound the final row against this --
+        // paged only ever checked the block index, and a ring has no equivalent
+        // of that check at all, so a stale slot would scatter anywhere.
+        int swa_num_rows;
     };
+
+    // Destination row for one token's fused SWA write, or -1 to skip it.
+    // Skipped: CG-pad tokens (bid < 0), stale positions, out-of-window sentinel
+    // blocks (phys < 0), rows the caller marked -1, and any row the pool does
+    // not have. Shared by the coarse and fine-grained QK kernels so the two
+    // addressing modes are written down once. (The K-only entry point does not
+    // expose an SWA write at all.)
+    //
+    // Note the `pos < 0` gate applies in BOTH modes: a direct-mode caller owns
+    // the row but not the staleness test, so a negative position still skips
+    // even when swa_dest_row[token] names a valid row.
+    template <typename params_t>
+    __device__ __forceinline__ int64_t swa_row_for_token(
+        const params_t& params,
+        const int32_t* __restrict__ swa_block_tables,
+        const int32_t* __restrict__ swa_dest_row,
+        int64_t token_idx,
+        int32_t bid,
+        int64_t pos)
+    {
+      if (bid < 0 || pos < 0) return -1;
+      int64_t row;
+      if (swa_dest_row != nullptr) {
+        row = static_cast<int64_t>(swa_dest_row[token_idx]);
+        if (row < 0) return -1;
+      } else {
+        const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
+        if (blk >= params.swa_block_tables_blocks) return -1;
+        const int32_t phys = swa_block_tables[
+            static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
+        if (phys < 0) return -1;
+        row = static_cast<int64_t>(phys) * params.swa_block_size +
+              (pos % params.swa_block_size);
+      }
+      return (row < params.swa_num_rows) ? row : -1;
+    }
 
 
     // ============================================================================
@@ -4692,6 +4747,7 @@ namespace aiter {
         cache_t*  __restrict__ swa_nope = nullptr,           // nope+scale pool, mirrors kv_cache
         scalar_t* __restrict__ swa_rope = nullptr,           // rope bf16 pool, mirrors k_pe_out
         const int32_t* __restrict__ swa_block_tables = nullptr,    // [bs, max_blocks] paged SWA table
+        const int32_t* __restrict__ swa_dest_row = nullptr,        // [T] plane row per token
         const int32_t* __restrict__ batch_id_per_token = nullptr   // [T] token->seq, -1 = skip
     ) {
       // ---- All compile-time constants ----
@@ -4768,28 +4824,19 @@ namespace aiter {
             static_cast<int64_t>(token_idx) * params.token_stride;
         const int64_t out_rope_offset =
             static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
-        // Optional fused SWA scatter (decode-only): write the same post-norm/rope K
-        // row into the paged SWA pool using swa_block_tables. CG-pad tokens (bid < 0),
-        // stale/OOB positions, and window-outside sentinel blocks (phys < 0) are skipped.
+        // Optional fused SWA scatter (decode-only): write the same post-norm/rope
+        // K row into the SWA pool, block-table-addressed (paged) or at a row the
+        // caller resolved (direct). See `swa_row_for_token`.
         bool write_swa = false;
         int64_t swa_cache_offset = 0, swa_rope_offset = 0;
         if (swa_nope != nullptr) {
-          const int32_t bid = batch_id_per_token[token_idx];
-          if (bid >= 0) {
-            const int64_t pos = positions[token_idx];
-            const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
-            if (pos >= 0 && blk >= 0 && blk < params.swa_block_tables_blocks) {
-              const int32_t phys =
-                  swa_block_tables[static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
-              if (phys >= 0) {
-                const int32_t off = static_cast<int32_t>(pos % params.swa_block_size);
-                const int64_t dst_row =
-                    static_cast<int64_t>(phys) * params.swa_block_size + off;
-                write_swa = true;
-                swa_cache_offset = dst_row * params.swa_nope_row_stride;
-                swa_rope_offset  = dst_row * params.swa_rope_row_stride;
-              }
-            }
+          const int64_t dst_row =
+              swa_row_for_token(params, swa_block_tables, swa_dest_row, token_idx,
+                                batch_id_per_token[token_idx], positions[token_idx]);
+          if (dst_row >= 0) {
+            write_swa = true;
+            swa_cache_offset = dst_row * params.swa_nope_row_stride;
+            swa_rope_offset  = dst_row * params.swa_rope_row_stride;
           }
         }
         if (swa_nope != nullptr) {
@@ -5091,6 +5138,7 @@ namespace aiter {
         cache_t*  __restrict__ swa_nope = nullptr,           // nope+scale pool, mirrors kv_cache
         scalar_t* __restrict__ swa_rope = nullptr,           // rope bf16 pool, mirrors k_pe_out
         const int32_t* __restrict__ swa_block_tables = nullptr,    // [bs, max_blocks] paged SWA table
+        const int32_t* __restrict__ swa_dest_row = nullptr,        // [T] plane row per token
         const int32_t* __restrict__ batch_id_per_token = nullptr   // [T] token->seq, -1 = skip
     ) {
       // ---- compile-time constants (identical to the coarse kernel) ----
@@ -5166,30 +5214,20 @@ namespace aiter {
         compute_rope_ptrs(cos_ptr, sin_ptr);
 
         // Optional fused SWA scatter (decode-only): mirror this post-norm/rope K row
-        // (nope fp8 + inline dup e8m0 scale, and rope bf16) into the paged SWA pool
-        // addressed by swa_block_tables[bid, pos/block_size]. CG-pad tokens (bid < 0),
-        // stale/OOB positions, and window-outside sentinel blocks (phys < 0) are skipped.
+        // (nope fp8 + inline dup e8m0 scale, and rope bf16) into the SWA pool,
+        // block-table-addressed (paged) or at a caller-resolved row (direct).
         // Only the K wave scatters (the SWA pool is K-only); Q waves never reach here.
         cache_t*  ptr_swa_o    = nullptr;
         scalar_t* swa_out_rope = nullptr;
         bool write_swa = false;
         if (swa_nope != nullptr) {
-          const int32_t bid = batch_id_per_token[token_idx];
-          if (bid >= 0) {
-            const int64_t pos = positions[token_idx];
-            const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
-            if (pos >= 0 && blk >= 0 && blk < params.swa_block_tables_blocks) {
-              const int32_t phys =
-                  swa_block_tables[static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
-              if (phys >= 0) {
-                const int32_t off = static_cast<int32_t>(pos % params.swa_block_size);
-                const int64_t dst_row =
-                    static_cast<int64_t>(phys) * params.swa_block_size + off;
-                write_swa    = true;
-                ptr_swa_o    = swa_nope + dst_row * params.swa_nope_row_stride + nope_offset;
-                swa_out_rope = swa_rope + dst_row * params.swa_rope_row_stride;
-              }
-            }
+          const int64_t dst_row =
+              swa_row_for_token(params, swa_block_tables, swa_dest_row, token_idx,
+                                batch_id_per_token[token_idx], positions[token_idx]);
+          if (dst_row >= 0) {
+            write_swa    = true;
+            ptr_swa_o    = swa_nope + dst_row * params.swa_nope_row_stride + nope_offset;
+            swa_out_rope = swa_rope + dst_row * params.swa_rope_row_stride;
           }
         }
         auto buffer_swa_o = opus::make_gmem<cache_t>(
@@ -5469,6 +5507,7 @@ namespace aiter {
         cache_t*  __restrict__ swa_nope = nullptr,
         scalar_t* __restrict__ swa_rope = nullptr,
         const int32_t* __restrict__ swa_block_tables = nullptr,
+        const int32_t* __restrict__ swa_dest_row = nullptr,
         const int32_t* __restrict__ batch_id_per_token = nullptr
     ) {
       constexpr int HEADS_PER_BLOCK = TOKENS_PER_BLOCK;
@@ -5482,7 +5521,7 @@ namespace aiter {
             Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
             cos_cache, sin_cache, eps, params, token_idx, combined_head_idx, tid, \
-            swa_nope, swa_rope, swa_block_tables, batch_id_per_token)
+            swa_nope, swa_rope, swa_block_tables, swa_dest_row, batch_id_per_token)
       if (is_neox) { DISPATCH_NEOX_FG(true); }
       else         { DISPATCH_NEOX_FG(false); }
       #undef DISPATCH_NEOX_FG
@@ -5514,6 +5553,7 @@ namespace aiter {
         cache_t*  __restrict__ swa_nope = nullptr,
         scalar_t* __restrict__ swa_rope = nullptr,
         const int32_t* __restrict__ swa_block_tables = nullptr,
+        const int32_t* __restrict__ swa_dest_row = nullptr,
         const int32_t* __restrict__ batch_id_per_token = nullptr
     ) {
       #define DISPATCH_NEOX(NEOX) \
@@ -5521,7 +5561,7 @@ namespace aiter {
             Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
             cos_cache, sin_cache, eps, params, \
-            swa_nope, swa_rope, swa_block_tables, batch_id_per_token)
+            swa_nope, swa_rope, swa_block_tables, swa_dest_row, batch_id_per_token)
 
       if (is_neox) { DISPATCH_NEOX(true); }
       else         { DISPATCH_NEOX(false); }
@@ -5558,6 +5598,7 @@ namespace aiter {
                  reinterpret_cast<CACHE_T*>(swa_nope_ptr),                                               \
                  reinterpret_cast<KV_T*>(swa_rope_ptr),                                                  \
                  reinterpret_cast<const int32_t*>(swa_block_tables_ptr),                                 \
+                 reinterpret_cast<const int32_t*>(swa_dest_row_ptr),                                    \
                  reinterpret_cast<const int32_t*>(swa_bid_ptr));
 
 // Fine-grained launcher (1 wave / (token,head); grid=(num_tokens,num_heads+1), block=64).
@@ -5584,6 +5625,7 @@ namespace aiter {
                  reinterpret_cast<CACHE_T*>(swa_nope_ptr),                                               \
                  reinterpret_cast<KV_T*>(swa_rope_ptr),                                                  \
                  reinterpret_cast<const int32_t*>(swa_block_tables_ptr),                                 \
+                 reinterpret_cast<const int32_t*>(swa_dest_row_ptr),                                    \
                  reinterpret_cast<const int32_t*>(swa_bid_ptr));
 
 namespace aiter {
@@ -5606,12 +5648,14 @@ void fused_qk_norm_rope_group_quant(
     const std::string& scale_dtype,
     std::optional<aiter_tensor_t> q_rope_buff,
     // --- Optional fused SWA write (decode-only) ---
-    // Paged mode: swa_nope_scale_buff [num_swa_rows, entry] and swa_rope_buff
-    // [num_swa_rows, pe_dim] are addressed by swa_block_tables[bid, pos/block_size].
-    // Tokens with batch_id < 0 (CG-pad) are skipped.
+    // swa_nope_scale_buff [num_swa_rows, entry] and swa_rope_buff
+    // [num_swa_rows, pe_dim] are addressed either by swa_dest_row[token] or by
+    // swa_block_tables[bid, pos/block_size]. Tokens with batch_id < 0 (CG-pad)
+    // are skipped.
     std::optional<aiter_tensor_t> swa_nope_scale_buff,
     std::optional<aiter_tensor_t> swa_rope_buff,
     std::optional<aiter_tensor_t> swa_block_tables,
+    std::optional<aiter_tensor_t> swa_dest_row,
     int64_t swa_block_size,
     std::optional<aiter_tensor_t> batch_id_per_token)
 {
@@ -5735,12 +5779,19 @@ void fused_qk_norm_rope_group_quant(
   void* swa_nope_ptr     = nullptr;
   void* swa_rope_ptr     = nullptr;
   void* swa_block_tables_ptr = nullptr;
+  void* swa_dest_row_ptr     = nullptr;
   void* swa_bid_ptr      = nullptr;
   if (has_swa) {
-    AITER_CHECK(swa_rope_buff.has_value() && batch_id_per_token.has_value()
-                && swa_block_tables.has_value(),
-                "SWA write requires swa_nope_scale_buff, swa_rope_buff, "
-                "swa_block_tables, swa_block_size, and batch_id_per_token");
+    // Exactly one index tensor picks the addressing mode. Both would be
+    // ambiguous; neither leaves the destination undefined.
+    AITER_CHECK(swa_block_tables.has_value() != swa_dest_row.has_value(),
+                "SWA write needs exactly one of swa_block_tables (paged) or "
+                "swa_dest_row (caller-supplied rows), not both and not neither");
+    // swa_block_size is checked in the paged branch only; direct mode never
+    // divides by it.
+    AITER_CHECK(swa_rope_buff.has_value() && batch_id_per_token.has_value(),
+                "SWA write requires swa_nope_scale_buff, swa_rope_buff, and "
+                "batch_id_per_token");
     AITER_CHECK(swa_nope_scale_buff->dtype() == k_nope_scale_buff.dtype(),
                 "swa_nope_scale_buff dtype must match k_nope_scale_buff");
     AITER_CHECK(swa_rope_buff->dtype() == k_rope_buff.dtype(),
@@ -5749,24 +5800,37 @@ void fused_qk_norm_rope_group_quant(
                 "batch_id_per_token must be int32");
     AITER_CHECK(batch_id_per_token->size(0) >= num_tokens,
                 "batch_id_per_token length must be >= num_tokens");
-    // Paged SWA pool is flat: [num_swa_blocks * block_size, entry/pe_dim].
+    // Either way the pool is flat: [num_rows, entry/pe_dim]; only who computes
+    // a row differs.
     AITER_CHECK(swa_nope_scale_buff->dim() == 2 && swa_rope_buff->dim() == 2,
-                "paged SWA buffers must be 2D [num_rows, entry/pe_dim]");
+                "SWA buffers must be 2D [num_rows, entry/pe_dim]");
     AITER_CHECK(swa_nope_scale_buff->size(0) == swa_rope_buff->size(0),
-                "paged swa_nope_scale_buff and swa_rope_buff must share num_rows");
-    AITER_CHECK(swa_block_tables->dim() == 2 && swa_block_tables->dtype() == AITER_DTYPE_i32,
-                "swa_block_tables must be 2D [bs, max_blocks] int32");
-    AITER_CHECK(swa_block_tables->stride(1) == 1,
-                "swa_block_tables must be contiguous in last dim (stride(1) == 1)");
+                "swa_nope_scale_buff and swa_rope_buff must share num_rows");
     AITER_CHECK(swa_nope_scale_buff->stride(1) == 1 && swa_rope_buff->stride(1) == 1,
-                "paged SWA buffers must be contiguous in last dim (stride(1) == 1)");
-    AITER_CHECK(swa_block_size > 0, "swa_block_size must be > 0 for paged SWA");
+                "SWA buffers must be contiguous in last dim (stride(1) == 1)");
+    if (swa_block_tables.has_value()) {
+      AITER_CHECK(swa_block_size > 0, "paged SWA write needs swa_block_size > 0");
+      AITER_CHECK(swa_block_tables->dim() == 2 && swa_block_tables->dtype() == AITER_DTYPE_i32,
+                  "swa_block_tables must be 2D [bs, max_blocks] int32");
+      AITER_CHECK(swa_block_tables->stride(1) == 1,
+                  "swa_block_tables must be contiguous in last dim (stride(1) == 1)");
+      mla_params.swa_block_tables_stride = static_cast<int>(swa_block_tables->stride(0));
+      mla_params.swa_block_tables_blocks = static_cast<int>(swa_block_tables->size(1));
+      swa_block_tables_ptr = swa_block_tables->data_ptr();
+    } else {
+      AITER_CHECK(swa_dest_row->dim() == 1 && swa_dest_row->dtype() == AITER_DTYPE_i32,
+                  "swa_dest_row must be 1D [num_tokens] int32");
+      AITER_CHECK(swa_dest_row->stride(0) == 1, "swa_dest_row must be contiguous");
+      // Indexed by token, not by request: with speculation a request writes
+      // several positions in one launch, and they do not share a row.
+      AITER_CHECK(swa_dest_row->size(0) >= num_tokens,
+                  "swa_dest_row length must be >= num_tokens");
+      swa_dest_row_ptr = swa_dest_row->data_ptr();
+    }
     mla_params.swa_block_size = static_cast<int>(swa_block_size);
-    mla_params.swa_block_tables_stride = static_cast<int>(swa_block_tables->stride(0));
-    mla_params.swa_block_tables_blocks = static_cast<int>(swa_block_tables->size(1));
+    mla_params.swa_num_rows = static_cast<int>(swa_nope_scale_buff->size(0));
     mla_params.swa_nope_row_stride = static_cast<int>(swa_nope_scale_buff->stride(0));
     mla_params.swa_rope_row_stride = static_cast<int>(swa_rope_buff->stride(0));
-    swa_block_tables_ptr = swa_block_tables->data_ptr();
     swa_nope_ptr     = swa_nope_scale_buff->data_ptr();
     swa_rope_ptr     = swa_rope_buff->data_ptr();
     swa_bid_ptr      = batch_id_per_token->data_ptr();

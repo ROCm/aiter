@@ -871,8 +871,12 @@ static constexpr int nextPow2(unsigned int num)
             using output_dtype = input_dtype;                                                     \
             AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                         \
                 vec_size,                                                                         \
-                aiter::                                                                           \
-                    act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE, HAS_LIMIT_VAL, GROUP_NT> \
+                aiter::act_and_mul_kernel<input_dtype,                                            \
+                                          output_dtype,                                           \
+                                          KERNEL<input_dtype>,                                    \
+                                          VEC_SIZE,                                               \
+                                          HAS_LIMIT_VAL,                                          \
+                                          GROUP_NT>                                               \
                 <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),     \
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),    \
                                              d, limit_val);)                                      \

@@ -318,9 +318,25 @@ __device__ __forceinline__ floatx4 zero_floatx4()
     return {0.0f, 0.0f, 0.0f, 0.0f};
 }
 
+__device__ __forceinline__ int mma_row_group(const int lane_id)
+{
+    const int physical_row_group = lane_id >> 4;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // Wave64 WMMA maps physical lane groups 0..3 to result rows 0, 2, 1, 3.
+    return ((physical_row_group & 1) << 1) |
+           ((physical_row_group & 2) >> 1);
+#else
+    return physical_row_group;
+#endif
+}
+
 __device__ __forceinline__ floatx4 mfma16x16x16_bf16(const _B16x4& a, const _B16x4& b, const floatx4& c)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12(a, b, c);
+#else
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+#endif
 }
 
 template <bool USE_EXP2>
@@ -668,6 +684,12 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
         }
     }
 
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __syncthreads();
+#endif
+
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
     float g_scale[4];
@@ -728,7 +750,7 @@ __device__ __forceinline__ void run_gemm2_fulltile_bvp(
 {
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
     const float decay = gated_exp(g_last, use_exp2);
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
 
     for (int round = 0; round < K_DIM / (MFMA_M * WAVE_COUNT); ++round) {
         floatx4 gacc[NUM_BV_TILES];
@@ -873,7 +895,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     int64_t g_stride_t = 0)
 {
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
     const int v_idx = lane_id & 15;
     const bf16_t zero_val = float_to_bf16(0.0f);
     const bf16_t* w_chunk = overlap2_w_ptr<IS_VARLEN>(w_bf16, i_n, H, i_h, T_flat, token_base);
@@ -927,6 +949,12 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
         }
     }
     write_k_panels_to_lds(k_data, k_panel0, k_panel1);
+
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __syncthreads();
+#endif
 
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
@@ -1080,7 +1108,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     __shared__ bf16_t h_transpose_buf[BV_P * K_DIM];
 
     const int v_idx = lane_id & 15;
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
     const int h_row_base_lo = wave_id * MFMA_M + row_group * 4;
     const int h_row_base_hi = h_row_base_lo + 64;
     float h_reg[8 * NUM_BV_TILES];

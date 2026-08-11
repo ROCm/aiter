@@ -3461,8 +3461,12 @@ void reshape_and_cache_flash(
 
 // Macro to dispatch the kernel based on the data type.
 #define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                                   \
-    aiter::                                                                                       \
-        indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, blockDimx, blockDimy, vec_size> \
+    aiter::indexer_k_quant_and_cache_kernel<KV_T,                                                 \
+                                            CACHE_T,                                              \
+                                            KV_DTYPE,                                             \
+                                            blockDimx,                                            \
+                                            blockDimy,                                            \
+                                            vec_size>                                             \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),                       \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
                                      reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                            \
