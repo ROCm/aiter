@@ -307,3 +307,7 @@ def test_validation_errors(
     kwargs.update(mutation(inputs))
     with pytest.raises(ValueError):
         gdr_decode_packed_bf16(**kwargs)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
