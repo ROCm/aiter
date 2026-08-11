@@ -44,7 +44,6 @@ numerics use test_mla_persistent.py at page_size=1, nhead=64, fp8/fp8.
 import sys
 import torch
 
-import aiter
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.mla import mla_decode_fwd
 from aiter.jit.utils.chip_info import get_gfx
