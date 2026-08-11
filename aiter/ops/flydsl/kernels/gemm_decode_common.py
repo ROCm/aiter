@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import torch
 
-from flydsl.runtime.device import get_rocm_arch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 CACHE_POLICY_DEFAULT = 0
 CACHE_POLICY_NON_TEMPORAL = 0x2
@@ -39,6 +39,7 @@ def validate_gemm_decode_tensors(
     M: int,
     N: int,
     K: int,
+    arch: str | None = None,
 ) -> None:
     """Validate the packed real-tensor ABI shared by both kernel families."""
     tensors = {"A": A, "B": B, "C": C}
@@ -52,8 +53,8 @@ def validate_gemm_decode_tensors(
         if tensor.device.type != "cuda":
             raise ValueError(f"{name} must be on a CUDA/ROCm device")
 
-    if not (1 <= M <= 4):
-        raise ValueError("decode GEMM supports M in [1, 4]")
+    if not (1 <= M <= 5):
+        raise ValueError("decode GEMM supports exact M in [1, 5]")
     if N <= 0 or K <= 0:
         raise ValueError("decode GEMM requires positive N and K")
     if A.device != B.device or A.device != C.device:
@@ -72,6 +73,6 @@ def validate_gemm_decode_tensors(
 
     if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
-    gfx = get_rocm_arch()
+    gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):
         raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")

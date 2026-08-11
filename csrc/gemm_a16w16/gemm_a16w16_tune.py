@@ -11,6 +11,8 @@ hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
 
 import argparse
 import functools
+import hashlib
+import importlib
 import os
 import sys
 from functools import lru_cache
@@ -22,7 +24,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
@@ -40,12 +42,128 @@ try:
             flydsl_hgemm,
             get_flydsl_splitk_hgemm_kernels,
         )
+        from aiter.ops.flydsl.kernels.gemm_decode import (
+            gemm_decode_bf16_configured,
+        )
+        from aiter.ops.flydsl.kernels.gemm_decode_config import (
+            gemm_decode_kernel_name,
+            iter_gemm_decode_configs,
+        )
+        from aiter.ops.flydsl.kernels.small_m_hgemm import (
+            iter_small_m_registry_configs,
+            small_m_kernel_name,
+        )
+        import flydsl.expr as fx
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
     get_flydsl_splitk_hgemm_kernels = None
+    gemm_decode_bf16_configured = None
+    gemm_decode_kernel_name = None
+    iter_gemm_decode_configs = None
+    iter_small_m_registry_configs = None
+    small_m_kernel_name = None
     FLYDSL_TUNE_ERROR = str(exc)
+
+
+def _sha256_file(path):
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _registered_wvsplitk_schema(op):
+    overload = getattr(op, "default", op)
+    schema = getattr(overload, "_schema", None)
+    if schema is None:
+        raise ValueError("registered _rocm_C.wvSplitK op has no inspectable schema")
+    schema_text = str(schema)
+    expected = (
+        "Tensor in_a",
+        "Tensor in_b",
+        "Tensor? in_bias",
+        "int CuCount",
+        "-> Tensor",
+    )
+    if not all(fragment in schema_text for fragment in expected):
+        raise ValueError(f"unexpected _rocm_C.wvSplitK schema: {schema_text}")
+    return schema_text
+
+
+def resolve_vllm_wvsplitk(library=None):
+    """Resolve vLLM wvSplitK only for the explicit opt-in tuner path."""
+    metadata = {
+        "status": "unavailable",
+        "source": None,
+        "path": os.path.abspath(library) if library else None,
+        "sha256": _sha256_file(library),
+        "schema": None,
+        "reason": None,
+    }
+    if library:
+        if not os.path.isfile(library):
+            metadata["reason"] = f"library does not exist: {library}"
+            return None, metadata
+        try:
+            torch.ops.load_library(os.path.abspath(library))
+            op = torch.ops._rocm_C.wvSplitK
+            schema = _registered_wvsplitk_schema(op)
+            metadata.update(
+                status="callable",
+                source="torch.ops._rocm_C.wvSplitK",
+                schema=schema,
+            )
+            return (
+                lambda weight, activation, bias, cu_count: op(
+                    weight, activation, bias, cu_count
+                )
+            ), metadata
+        except Exception as error:
+            metadata["reason"] = f"{type(error).__name__}: {error}"
+            return None, metadata
+
+    try:
+        module = importlib.import_module("vllm._custom_ops")
+        wrapper = getattr(module, "wvSplitK", None)
+        if callable(wrapper):
+            module_path = getattr(module, "__file__", None)
+            metadata.update(
+                status="callable",
+                source="vllm._custom_ops.wvSplitK",
+                path=module_path,
+                sha256=_sha256_file(module_path),
+                schema="wvSplitK(weight, activation, cu_count, bias=None) -> Tensor",
+            )
+            return (
+                lambda weight, activation, bias, cu_count: wrapper(
+                    weight, activation, cu_count, bias
+                )
+            ), metadata
+    except Exception as error:
+        metadata["reason"] = f"public wrapper unavailable: {type(error).__name__}: {error}"
+
+    try:
+        op = torch.ops._rocm_C.wvSplitK
+        schema = _registered_wvsplitk_schema(op)
+        metadata.update(
+            status="callable",
+            source="torch.ops._rocm_C.wvSplitK",
+            schema=schema,
+            reason=None,
+        )
+        return (
+            lambda weight, activation, bias, cu_count: op(
+                weight, activation, bias, cu_count
+            )
+        ), metadata
+    except Exception as error:
+        metadata["reason"] = f"registered op unavailable: {type(error).__name__}: {error}"
+        return None, metadata
 
 OPUS_TUNE_ERROR = None
 try:
@@ -88,6 +206,11 @@ try:
 except Exception as _hipb_exc:
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
+
+
+_VLLM_WVSPLITK_OP = None
+_VLLM_WVSPLITK_METADATA = None
+_VLLM_WVSPLITK_FINITE_CHECKED = set()
 
 # ---------------------------------------------------------------------------
 # Tolerance helpers
@@ -299,7 +422,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
+        block_k_warps=config.get("block_k_warps", 1),
         n_tile_repeat=config.get("n_tile_repeat", 1),
         persistent_n_tiles=config.get("persistent_n_tiles", 1),
         waves_per_eu=config.get("waves_per_eu", 0),
@@ -310,12 +433,140 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
+        lds_staging=config.get("lds_staging", "direct"),
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
+
+
+def vllm_wvsplitk_eligibility(
+    m,
+    n,
+    k,
+    indtype,
+    outdtype,
+    has_bias=False,
+    scaleAB=False,
+    is_shuffle=False,
+):
+    if indtype != dtypes.bf16 or outdtype != dtypes.bf16:
+        return False, "requires BF16 input, weight, and output"
+    if not 1 <= int(m) <= 5:
+        return False, "supports exact M=1..5"
+    if int(n) <= 0:
+        return False, "requires N > 0"
+    if int(k) <= 0 or int(k) % 8:
+        return False, "requires K > 0 and K divisible by 8"
+    if scaleAB:
+        return False, "does not support scaled tuner inputs"
+    if is_shuffle:
+        return False, "requires contiguous, non-preshuffled weights"
+    if has_bias:
+        return True, "eligible with contiguous BF16 row bias"
+    return True, "eligible"
+
+
+def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
+    if _VLLM_WVSPLITK_OP is None:
+        raise RuntimeError("vLLM wvSplitK was not resolved")
+    if not input.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("vLLM wvSplitK requires contiguous activation and weight")
+    if bias is not None and (
+        bias.dtype != torch.bfloat16
+        or not bias.is_contiguous()
+        or bias.ndim != 1
+        or bias.numel() != weight.shape[0]
+    ):
+        raise ValueError("vLLM wvSplitK bias must be contiguous BF16 [N]")
+    out = _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
+    expected_shape = (input.shape[0], weight.shape[0])
+    if (
+        not isinstance(out, torch.Tensor)
+        or tuple(out.shape) != expected_shape
+        or out.dtype != (otype or input.dtype)
+    ):
+        raise RuntimeError(
+            "vLLM wvSplitK returned an invalid output; expected "
+            f"Tensor{expected_shape} dtype={otype or input.dtype}"
+        )
+    finite_key = (
+        input.data_ptr(),
+        weight.data_ptr(),
+        None if bias is None else bias.data_ptr(),
+        tuple(input.shape),
+        tuple(weight.shape),
+    )
+    if finite_key not in _VLLM_WVSPLITK_FINITE_CHECKED:
+        if not torch.isfinite(out).all():
+            raise RuntimeError("vLLM wvSplitK returned NaN or Inf")
+        _VLLM_WVSPLITK_FINITE_CHECKED.add(finite_key)
+    return out
+
+
+_flydsl_decode_graphs = {}
+FLYDSL_DECODE_TUNE_GRAPH_REPEATS = 10
+
+
+def run_flydsl_decode_bf16(input, weight, output, otype, arch, config):
+    """Run one exact-shape unified decode candidate for the shared tuner."""
+    if gemm_decode_bf16_configured is None:
+        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
+    if otype != dtypes.bf16:
+        raise ValueError("FlyDSL decode candidates require BF16 output")
+    m, k = input.shape
+    n = weight.shape[0]
+    key = (
+        input.data_ptr(),
+        weight.data_ptr(),
+        output.data_ptr(),
+        arch,
+        m,
+        n,
+        k,
+        config,
+    )
+    graph = _flydsl_decode_graphs.get(key)
+    if graph is None:
+        # mp_tuner evaluates candidates serially within one shape group. Keep
+        # only the active capture so exhaustive registries do not retain one
+        # graph allocation per configuration.
+        _flydsl_decode_graphs.clear()
+        current = torch.cuda.current_stream()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(current)
+        gemm_decode_bf16_configured(
+            input,
+            weight,
+            output,
+            m,
+            n,
+            k,
+            config,
+            fx.Stream(stream),
+            arch=arch,
+        )
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(FLYDSL_DECODE_TUNE_GRAPH_REPEATS):
+                gemm_decode_bf16_configured(
+                    input,
+                    weight,
+                    output,
+                    m,
+                    n,
+                    k,
+                    config,
+                    fx.Stream(stream),
+                    arch=arch,
+                )
+        current.wait_stream(stream)
+        _flydsl_decode_graphs[key] = graph
+    graph.replay()
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +617,9 @@ ALL_LIBTYPES = [
     "hipblaslt",
     "triton",
     "flydsl",
+    "flydsl_decode",
+    "flydsl_small_m",
+    "vllm_wvsplitk",
     "torch",
     "skinny",
     "opus",
@@ -438,8 +692,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, torch, skinny, opus. "
-            "hipblaslt requires --with-hipblaslt.",
+            help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
+            "flydsl_decode, flydsl_small_m, vllm_wvsplitk, torch, skinny, opus. "
+            "hipblaslt and comparison-only vllm_wvsplitk require their opt-in flags.",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -448,6 +703,21 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="with_hipblaslt",
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+        )
+        self.parser.add_argument(
+            "--with-vllm-wvsplitk",
+            action="store_true",
+            default=False,
+            dest="with_vllm_wvsplitk",
+            help="Include comparison-only vLLM wvSplitK measurements. "
+            "These rows are written to --profile_file but never promoted.",
+        )
+        self.parser.add_argument(
+            "--vllm-wvsplitk-library",
+            type=str,
+            default=None,
+            dest="vllm_wvsplitk_library",
+            help="Optional shared library registering _rocm_C::wvSplitK.",
         )
 
     def _clear_op_caches(self):
@@ -588,11 +858,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        if (scaleAB or K % 64 != 0 or indtype != dtypes.bf16) and get_gfx() == "gfx942":
+        if (
+            scaleAB or K % 64 != 0 or indtype != dtypes.bf16
+        ) and get_gfx_runtime() == "gfx942":
             return []
         if (
             scaleAB or K % 64 != 0 or N % 64 != 0 or indtype != dtypes.bf16
-        ) and get_gfx() == "gfx950":
+        ) and get_gfx_runtime() == "gfx950":
             return []
         asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
         asm_kernels = get_asm_kernels(asm_kernel_list_csv, is_shuffle)
@@ -771,6 +1043,228 @@ class GemmA16W16Tuner(GemmCommonTuner):
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
         return tasks
 
+    def _get_flydsl_decode_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        if (
+            gemm_decode_bf16_configured is None
+            or iter_gemm_decode_configs is None
+            or gemm_decode_kernel_name is None
+        ):
+            logger.warning(f"FlyDSL decode not available, skip. reason: {FLYDSL_TUNE_ERROR}")
+            return []
+        M, N, K = map(int, info_keys[2:5])
+        if (
+            not 1 <= M <= 5
+            or has_bias
+            or scaleAB
+            or is_shuffle
+            or indtype != dtypes.bf16
+            or outdtype != dtypes.bf16
+        ):
+            return []
+        arch = str(info_keys[0])
+        runtime_arch = get_gfx_runtime()
+        if arch != runtime_arch:
+            raise ValueError(
+                f"FlyDSL decode tuner row targets {arch}, "
+                f"but the runtime device is {runtime_arch}"
+            )
+        tasks = []
+        decode_run_kwargs = dict(run_kwargs)
+        # PyTorch profiler timing does not observe FlyDSL's direct HIP launch.
+        # Keep the existing mp_tuner flow but use its CUDA/HIP-event backend.
+        decode_run_kwargs["use_cuda_event"] = True
+        # One graph replay contains ten kernel launches, so a short event
+        # screen still averages 30 launches per candidate. The
+        # fastest candidates receive a separate rotating-weight confirmation.
+        decode_run_kwargs["num_warmup"] = 1
+        decode_run_kwargs["num_iters"] = 3
+        # Decode has a deliberately stricter absolute/relative correctness gate
+        # than the general GEMM catalog. Every candidate is rejected independently.
+        for solidx, config in enumerate(
+            iter_gemm_decode_configs(M, N, K, arch)
+        ):
+            kernel_name = gemm_decode_kernel_name(arch, M, N, K, config)
+            info = (
+                info_keys,
+                solidx,
+                0,
+                kernel_name,
+                "flydsl_decode",
+                False,
+            )
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, indtype, outdtype, False, False, 0, False),
+                    run_flydsl_decode_bf16,
+                    (["inp", "weights", "out_asm"], outdtype, arch, config),
+                    decode_run_kwargs,
+                    get_gemm_ref,
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        indtype,
+                        outdtype,
+                    ),
+                    {},
+                    None,
+                    0.01,
+                    0.125,
+                    None,
+                    None,
+                    ("out_asm",),
+                    FLYDSL_DECODE_TUNE_GRAPH_REPEATS,
+                )
+            )
+        logger.info(
+            f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: "
+            f"{len(tasks)}"
+        )
+        return tasks
+
+    def _get_flydsl_small_m_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        if (
+            flydsl_hgemm is None
+            or iter_small_m_registry_configs is None
+            or small_m_kernel_name is None
+        ):
+            logger.warning(f"FlyDSL small-M unavailable: {FLYDSL_TUNE_ERROR}")
+            return []
+        M, N, K = map(int, info_keys[2:5])
+        if (
+            not 1 <= M <= 16
+            or scaleAB
+            or is_shuffle
+            or indtype != dtypes.bf16
+            or outdtype != dtypes.bf16
+        ):
+            return []
+        arch = str(info_keys[0])
+        runtime_arch = get_gfx_runtime()
+        if arch != runtime_arch:
+            raise ValueError(
+                f"FlyDSL small-M tuner row targets {arch}, "
+                f"but the runtime device is {runtime_arch}"
+            )
+        configs = list(
+            iter_small_m_registry_configs("bf16", "bf16", m=M, n=N, k=K)
+        )
+        tasks = []
+        small_m_run_kwargs = dict(run_kwargs)
+        small_m_run_kwargs["use_cuda_event"] = True
+        for solidx, config in enumerate(configs):
+            config = dict(config)
+            config["block_k_warps"] = 1
+            kernel_name = small_m_kernel_name(
+                arch,
+                "bf16",
+                M,
+                N,
+                K,
+                tile_n=config["tile_n"],
+                tile_k=config["tile_k"],
+                split_k=config["split_k"],
+                block_n_warps=config["block_n_warps"],
+                n_tile_repeat=config["n_tile_repeat"],
+                persistent_n_tiles=config["persistent_n_tiles"],
+                waves_per_eu=config["waves_per_eu"],
+                b_to_lds_unroll=config["b_to_lds_unroll"],
+                b_to_lds=config["b_to_lds"],
+                has_bias=has_bias,
+                lds_staging=config["lds_staging"],
+            )
+            info = (
+                info_keys,
+                solidx,
+                config["split_k"],
+                kernel_name,
+                "flydsl_small_m",
+                False,
+            )
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, indtype, outdtype, False, False, 0, has_bias),
+                    run_flydsl_gemm_bf16,
+                    (["inp", "weights", "bias"], outdtype, config),
+                    small_m_run_kwargs,
+                    get_gemm_ref,
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        indtype,
+                        outdtype,
+                    ),
+                    {},
+                    None,
+                    0.01,
+                    0.125,
+                )
+            )
+        logger.info(
+            f"FlyDSL small-M candidate count for M={M}, N={N}, K={K}: "
+            f"{len(tasks)}"
+        )
+        return tasks
+
+    def _get_vllm_wvsplitk_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        M, N, K = map(int, info_keys[2:5])
+        eligible, reason = vllm_wvsplitk_eligibility(
+            M,
+            N,
+            K,
+            indtype,
+            outdtype,
+            has_bias,
+            scaleAB,
+            is_shuffle,
+        )
+        if not eligible:
+            logger.info(f"vLLM wvSplitK N/A for M={M}, N={N}, K={K}: {reason}")
+            return []
+        if _VLLM_WVSPLITK_OP is None:
+            reason = (_VLLM_WVSPLITK_METADATA or {}).get(
+                "reason", "backend was not resolved"
+            )
+            logger.warning(f"vLLM wvSplitK unavailable: {reason}")
+            return []
+        info = (
+            info_keys,
+            0,
+            0,
+            "vllm_wvsplitk_compare_v1",
+            "vllm_wvsplitk",
+            False,
+        )
+        vllm_run_kwargs = dict(run_kwargs)
+        vllm_run_kwargs["use_cuda_event"] = True
+        return [
+            (
+                info,
+                generate_data,
+                (M, N, K, indtype, outdtype, False, False, 0, has_bias),
+                run_vllm_wvsplitk_bf16,
+                (["inp", "weights", "bias"], outdtype),
+                vllm_run_kwargs,
+                get_gemm_ref,
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    indtype,
+                    outdtype,
+                ),
+                {},
+                None,
+                0.01,
+                0.125,
+            )
+        ]
+
     def _get_skinny_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
@@ -911,8 +1405,29 @@ class GemmA16W16Tuner(GemmCommonTuner):
     # -------------------------------------------------------------------
 
     def tune(self, untunedf, tunedf, args):
+        global _VLLM_WVSPLITK_OP, _VLLM_WVSPLITK_METADATA
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
+        with_vllm_wvsplitk = getattr(args, "with_vllm_wvsplitk", False)
+        _VLLM_WVSPLITK_FINITE_CHECKED.clear()
+        if "vllm_wvsplitk" in libtype and not with_vllm_wvsplitk:
+            logger.warning(
+                "vllm_wvsplitk requested without --with-vllm-wvsplitk; skipping"
+            )
+        if with_vllm_wvsplitk:
+            _VLLM_WVSPLITK_OP, _VLLM_WVSPLITK_METADATA = resolve_vllm_wvsplitk(
+                getattr(args, "vllm_wvsplitk_library", None)
+            )
+            meta = _VLLM_WVSPLITK_METADATA
+            logger.info(
+                "vLLM wvSplitK provenance: "
+                f"status={meta['status']} source={meta['source']} "
+                f"path={meta['path']} sha256={meta['sha256']} schema={meta['schema']} "
+                f"reason={meta['reason']}"
+            )
+        else:
+            _VLLM_WVSPLITK_OP = None
+            _VLLM_WVSPLITK_METADATA = None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         run_kwargs = {"num_warmup": 10, "num_iters": 101}
@@ -957,6 +1472,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_asm_tasks(*common))
             if "all" in libtype or "flydsl" in libtype:
                 task.extend(self._get_flydsl_tasks(*common))
+            if "all" in libtype or "flydsl_decode" in libtype:
+                task.extend(self._get_flydsl_decode_tasks(*common))
+            if "all" in libtype or "flydsl_small_m" in libtype:
+                task.extend(self._get_flydsl_small_m_tasks(*common))
+            if with_vllm_wvsplitk and (
+                "all" in libtype or "vllm_wvsplitk" in libtype
+            ):
+                task.extend(self._get_vllm_wvsplitk_tasks(*common))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
@@ -994,6 +1517,25 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
 
         return ret + hipblaslt_rets
+
+    def post_process(self, rets, args, topk=-1, fast_mode=False):
+        """Write comparison rows to profiles but never promote them to tuned CSV."""
+        rets = list(rets)
+        promotable = [
+            result for result in rets if result[0][4] != "vllm_wvsplitk"
+        ]
+        profile_file = args.profile_file
+        if profile_file:
+            profiledf = self.result_to_df(sorted(rets, key=lambda result: result[0]))
+            if os.path.exists(profile_file):
+                old_df = pd.read_csv(profile_file)
+                profiledf = pd.concat([old_df, profiledf], ignore_index=True)
+            profiledf.to_csv(profile_file, index=False, na_rep="Null")
+            args.profile_file = ""
+        try:
+            return super().post_process(promotable, args, topk, fast_mode)
+        finally:
+            args.profile_file = profile_file
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)

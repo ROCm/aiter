@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .small_m_hgemm import compile_small_m_hgemm_kernel
+from .small_m_hgemm import LDS_STAGING_DIRECT, compile_small_m_hgemm_kernel
 from .splitk_hgemm import compile_hgemm_kernel
 
 KERNEL_FAMILY_HGEMM = "hgemm"
@@ -14,6 +14,8 @@ def compile_flydsl_hgemm_kernel(
     n: int,
     k: int,
     *,
+    m: Optional[int] = None,
+    target_gfx: Optional[str] = None,
     kernel_family: Optional[str] = None,
     tile_m: int = 128,
     tile_n: int = 128,
@@ -33,6 +35,7 @@ def compile_flydsl_hgemm_kernel(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
+    lds_staging: str = LDS_STAGING_DIRECT,
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 
@@ -42,6 +45,11 @@ def compile_flydsl_hgemm_kernel(
         if b_preshuffle:
             raise ValueError(
                 "Generic FlyDSL HGEMM does not support `b_preshuffle=True`"
+            )
+        if lds_staging != LDS_STAGING_DIRECT:
+            raise ValueError(
+                "Generic FlyDSL HGEMM only implements the direct global-to-LDS "
+                f"staging form, got lds_staging={lds_staging!r}"
             )
         return compile_hgemm_kernel(
             dtype,
@@ -60,10 +68,14 @@ def compile_flydsl_hgemm_kernel(
         )
 
     if kernel_family == KERNEL_FAMILY_SMALL_M:
+        if m is None:
+            raise ValueError("small-M compilation requires an exact M")
         return compile_small_m_hgemm_kernel(
             dtype,
             n,
             k,
+            EXPECTED_M=m,
+            ARCH=target_gfx,
             TILE_N=tile_n,
             TILE_K=tile_k,
             SPLIT_K=split_k,
@@ -74,6 +86,7 @@ def compile_flydsl_hgemm_kernel(
             B_TO_LDS_UNROLL=b_to_lds_unroll,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
+            LDS_STAGING=lds_staging,
         )
 
     raise ValueError(

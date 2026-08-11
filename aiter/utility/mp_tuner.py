@@ -33,6 +33,7 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    timing_divisor=1,
 ):
     from aiter.test_common import run_perftest
 
@@ -58,7 +59,6 @@ def worker(
         us = float("inf")
         try:
             res, us = run_perftest(func, *args, **kwargs)
-            us = round(us, 4)
 
         except (RuntimeError, ValueError) as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
@@ -73,6 +73,8 @@ def worker(
             retry_count += 1
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
+        if us > 0:
+            us = round(us / timing_divisor, 4)
         torch.cuda.synchronize()
         if us == -1 or res is None:
             return info, us, round(max_err_ratio, 4)
@@ -248,6 +250,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             # Optional rest[3]: explicit max_abs_delta for catastrophic error detection.
             # Optional rest[4]: output_keys -- names of output tensors to NaN-init.
+            # Optional rest[5]: timing divisor for one callable that deliberately
+            # replays multiple kernel launches (for dispatch-overhead amortization).
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
             compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
@@ -257,6 +261,13 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 if len(rest) > 4 and isinstance(rest[4], (list, tuple))
                 else None
             )
+            timing_divisor = (
+                rest[5]
+                if len(rest) > 5 and isinstance(rest[5], (int, float))
+                else 1
+            )
+            if timing_divisor <= 0:
+                raise ValueError("timing_divisor must be positive")
             arg_key_list = list(args[0]) if gen_data is not None else None
 
             work_args = (
@@ -274,6 +285,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                timing_divisor,
             )
 
             # Run worker with explicit GPU ID

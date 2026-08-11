@@ -38,6 +38,8 @@ schedule than the generic HGEMM kernel.
 from __future__ import annotations
 
 import functools
+import re
+from itertools import product
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -50,8 +52,12 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+
 from .splitk_hgemm import (
+    SPLIT_K_SEMAPHORE_MAX_LEN,
     OnlineScheduler,
+    WmmaHalf_m16n16k16,
     WmmaHalf_m16n16k32,
     swizzle_xor16,
 )
@@ -60,7 +66,14 @@ from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
 __all__ = [
     "compile_small_m_hgemm_kernel",
     "iter_small_m_registry_configs",
+    "small_m_arch_params",
+    "small_m_lds_bytes",
+    "small_m_max_lds_bytes",
+    "LDS_STAGING_DIRECT",
+    "LDS_STAGING_OPTIONS",
+    "LDS_STAGING_VGPR",
     "SMALL_M_KERNEL_MAX",
+    "parse_small_m_kernel_name",
     "small_m_kernel_name",
 ]
 
@@ -71,12 +84,28 @@ STAGES = 2
 WARP_SIZE = 64
 DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
-MAX_LDS_BYTES = 163840
+DEFAULT_MAX_LDS_BYTES = 65536
+
+# Global-to-LDS staging policy. `direct` issues `buffer_load_* ... lds`, which
+# needs no staging VGPR and no explicit DS write but is limited to the widest
+# LDS-DMA transfer the target supports (4 B on gfx942, 16 B on gfx950).
+# `vgpr` issues a wide `global_load_dwordx4` into registers and then writes LDS
+# with `ds_write_b128`: fewer VMEM instructions, more VGPR lifetime and DS
+# traffic. Neither is assumed to win; both are compiled from the same tile,
+# stage, workgroup, and MFMA mapping so they can be measured against each other.
+LDS_STAGING_DIRECT = "direct"
+LDS_STAGING_VGPR = "vgpr"
+LDS_STAGING_OPTIONS = (LDS_STAGING_DIRECT, LDS_STAGING_VGPR)
 
 # Expand the original small-M catalog with the additional cases that proved
 # useful during the deeper exhaustive search, instead of maintaining separate
 # compact/exhaustive modes.
-SMALL_M_TILE_K_OPTIONS = (32, 64, 96, 128, 160, 192, 256)
+#
+# The shared XOR-16 LDS swizzle only permutes within a row when the row is a
+# power-of-two number of 16-byte blocks, so TILE_K is restricted to the widths
+# where `TILE_K * 2 / 16` is a power of two. Wider non-power-of-two widths
+# (96, 160, 192, 224) map some columns outside the row and are not emitted.
+SMALL_M_TILE_K_OPTIONS = (32, 64, 128, 256)
 SMALL_M_MAX_SPLIT_K = 32
 SMALL_M_TILE_N_OPTIONS = (
     32,
@@ -105,12 +134,79 @@ SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
 SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
 
 
+# gfx942 tiles are 16-wide so output widths that are a multiple of 16 but not
+# of 32 (for example 6288) have a legal, non-truncating tile instead of being
+# silently unsupported.
+SMALL_M_GFX942_EXTRA_TILE_N_OPTIONS = (16,)
+
+
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
 def _align_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
+
+
+def small_m_tile_k_is_swizzle_safe(tile_k: int) -> bool:
+    """True when the XOR-16 LDS swizzle is a valid permutation for `tile_k`.
+
+    `swizzle_xor16` XORs a byte column with `(row % k_blocks16) * 16`. That maps
+    the row onto itself only when `k_blocks16 = tile_k * 2 / 16` is a power of
+    two; otherwise some columns land outside the staged row.
+    """
+    if tile_k < 32 or tile_k % 32 != 0:
+        return False
+    k_blocks16 = tile_k * DTYPE_BYTES // 16
+    return k_blocks16 > 0 and (k_blocks16 & (k_blocks16 - 1)) == 0
+
+
+def small_m_max_lds_bytes(arch: str) -> int:
+    """LDS capacity the small-M kernel may use on `arch`."""
+    return SMEM_CAPACITY_MAP.get(arch, DEFAULT_MAX_LDS_BYTES)
+
+
+def small_m_arch_params(arch: str) -> dict:
+    """Architecture-specific MFMA atom and LDS-DMA width.
+
+    gfx942 has no `16x16x32` BF16 MFMA and no wide LDS DMA, so it uses the
+    native `16x16x16` atom twice per logical K32 step and a 4-byte direct
+    global-to-LDS transfer. gfx950 keeps its existing `16x16x32` / 16-byte form.
+    """
+    if arch == "gfx942":
+        return {
+            "wmma_cls": WmmaHalf_m16n16k16,
+            "mfma_per_warp_k": 2,
+            "direct_dma_bytes": 4,
+        }
+    return {
+        "wmma_cls": WmmaHalf_m16n16k32,
+        "mfma_per_warp_k": 1,
+        "direct_dma_bytes": 16,
+    }
+
+
+def _small_m_tile_n_options(arch: str) -> tuple[int, ...]:
+    if arch == "gfx942":
+        return tuple(
+            sorted(SMALL_M_GFX942_EXTRA_TILE_N_OPTIONS + SMALL_M_TILE_N_OPTIONS)
+        )
+    return SMALL_M_TILE_N_OPTIONS
+
+
+def small_m_lds_bytes(*, tile_n: int, tile_k: int, b_to_lds: bool) -> int:
+    """Static LDS footprint of one small-M config, in bytes.
+
+    Mirrors the allocator arithmetic in `compile_small_m_hgemm_kernel`: the A
+    staging buffer is aliased with the C reshape buffer, and B staging (when
+    enabled) is appended 16-byte aligned.
+    """
+    a_lds_bytes = max(
+        STAGES * TILE_M * tile_k * DTYPE_BYTES, TILE_M * tile_n * DTYPE_BYTES
+    )
+    if not b_to_lds:
+        return a_lds_bytes
+    return _align_up(a_lds_bytes, 16) + STAGES * tile_n * tile_k * DTYPE_BYTES
 
 
 def _small_m_tile_k_options(k: int) -> tuple[int, ...]:
@@ -132,8 +228,26 @@ def _small_m_split_k_options(k: int, tile_k: int) -> tuple[int, ...]:
     )
 
 
+_SMALL_M_KERNEL_RE = re.compile(
+    r"^flydsl_small_m_v1"
+    r"_a(?P<arch>gfx\d+)_d(?P<dtype>[a-z0-9]+)"
+    r"_m(?P<m>\d+)_n(?P<n>\d+)_k(?P<k>\d+)"
+    r"_tm(?P<tile_m>\d+)_tn(?P<tile_n>\d+)_tk(?P<tile_k>\d+)"
+    r"_s(?P<stages>\d+)_sk(?P<split_k>\d+)"
+    r"_bmw(?P<block_m_warps>\d+)_bnw(?P<block_n_warps>\d+)"
+    r"_nr(?P<n_tile_repeat>\d+)_pn(?P<persistent_n_tiles>\d+)"
+    r"_wpe(?P<waves_per_eu>\d+)_bl(?P<b_to_lds>[01])"
+    r"_ur(?P<b_to_lds_unroll>\d+)_lds(?P<lds_staging>direct|vgpr)"
+    r"_bias(?P<has_bias>[01])$"
+)
+
+
 def small_m_kernel_name(
+    arch: str,
     dtype: str,
+    m: int,
+    n: int,
+    k: int,
     *,
     tile_n: int,
     tile_k: int,
@@ -145,26 +259,91 @@ def small_m_kernel_name(
     b_to_lds_unroll: int,
     b_to_lds: bool,
     has_bias: bool,
+    lds_staging: str = LDS_STAGING_DIRECT,
 ) -> str:
-    name = (
-        f"smallm_hgemm_{dtype}_{TILE_M}x{tile_n}x{tile_k}_S{STAGES}TN_AS"
-        f"_BNW{block_n_warps}"
+    if lds_staging not in LDS_STAGING_OPTIONS:
+        raise ValueError(f"unrecognized LDS staging policy: {lds_staging!r}")
+    return (
+        f"flydsl_small_m_v1_a{arch}_d{dtype}"
+        f"_m{m}_n{n}_k{k}"
+        f"_tm{TILE_M}_tn{tile_n}_tk{tile_k}_s{STAGES}_sk{split_k}"
+        f"_bmw{BLOCK_M_WARPS}_bnw{block_n_warps}"
+        f"_nr{n_tile_repeat}_pn{persistent_n_tiles}"
+        f"_wpe{waves_per_eu}_bl{int(b_to_lds)}"
+        f"_ur{b_to_lds_unroll}_lds{lds_staging}_bias{int(has_bias)}"
     )
-    if n_tile_repeat > 1:
-        name += f"_NR{n_tile_repeat}"
-    if persistent_n_tiles > 1:
-        name += f"_PN{persistent_n_tiles}"
-    if split_k > 1:
-        name += f"_SPK{split_k}"
-    if b_to_lds:
-        name += "_BS"
-        if waves_per_eu > 0:
-            name += f"_WPE{waves_per_eu}"
-        if b_to_lds_unroll > 0:
-            name += f"_UR{b_to_lds_unroll}"
-    if has_bias:
-        name += "_BIAS"
-    return name
+
+
+def parse_small_m_kernel_name(name: str):
+    """Parse and validate a versioned exact-shape small-M kernel identity."""
+    match = _SMALL_M_KERNEL_RE.fullmatch(name)
+    if match is None:
+        raise ValueError(f"unrecognized FlyDSL small-M kernel name: {name!r}")
+    values = match.groupdict()
+    arch = values.pop("arch")
+    dtype = values.pop("dtype")
+    lds_staging = values.pop("lds_staging")
+    integer_values = {key: int(value) for key, value in values.items()}
+    m = integer_values.pop("m")
+    n = integer_values.pop("n")
+    k = integer_values.pop("k")
+    has_bias = bool(integer_values.pop("has_bias"))
+    b_to_lds = bool(integer_values.pop("b_to_lds"))
+    if dtype != "bf16":
+        raise ValueError(f"small-M kernel name requires bf16, got {dtype!r}")
+    if arch not in {"gfx942", "gfx950"}:
+        raise ValueError(f"unsupported small-M architecture: {arch!r}")
+    if integer_values.pop("tile_m") != TILE_M:
+        raise ValueError("small-M kernel name has an unsupported tile-M")
+    if integer_values.pop("stages") != STAGES:
+        raise ValueError("small-M kernel name has an unsupported stage count")
+    if integer_values.pop("block_m_warps") != BLOCK_M_WARPS:
+        raise ValueError("small-M kernel name has an unsupported M-wave count")
+    if arch != "gfx942" and lds_staging != LDS_STAGING_DIRECT:
+        raise ValueError(
+            f"LDS staging {lds_staging!r} is not supported for {arch}"
+        )
+    config = {
+        "kernel_family": "small_m",
+        "stage": STAGES,
+        "tile_m": TILE_M,
+        "tile_n": integer_values["tile_n"],
+        "tile_k": integer_values["tile_k"],
+        "split_k": integer_values["split_k"],
+        "block_m_warps": BLOCK_M_WARPS,
+        "block_n_warps": integer_values["block_n_warps"],
+        "block_k_warps": 1,
+        "n_tile_repeat": integer_values["n_tile_repeat"],
+        "persistent_n_tiles": integer_values["persistent_n_tiles"],
+        "waves_per_eu": integer_values["waves_per_eu"],
+        "b_to_lds_unroll": integer_values["b_to_lds_unroll"],
+        "async_copy": True,
+        "b_to_lds": b_to_lds,
+        "b_preshuffle": False,
+        "lds_staging": lds_staging,
+        "c_to_lds": False,
+        "dtype": dtype,
+        "out_dtype": dtype,
+        "target_gfx": arch,
+        "has_bias": has_bias,
+    }
+    _validate_small_m_registry_config(
+        m,
+        n,
+        k,
+        tile_n=config["tile_n"],
+        tile_k=config["tile_k"],
+        split_k=config["split_k"],
+        block_n_warps=config["block_n_warps"],
+        n_tile_repeat=config["n_tile_repeat"],
+        persistent_n_tiles=config["persistent_n_tiles"],
+        waves_per_eu=config["waves_per_eu"],
+        b_to_lds_unroll=config["b_to_lds_unroll"],
+        b_to_lds=config["b_to_lds"],
+        lds_staging=config["lds_staging"],
+        arch=arch,
+    )
+    return arch, m, n, k, config
 
 
 def _validate_small_m_registry_config(
@@ -181,12 +360,16 @@ def _validate_small_m_registry_config(
     waves_per_eu: int,
     b_to_lds_unroll: int,
     b_to_lds: bool,
+    lds_staging: str = LDS_STAGING_DIRECT,
+    arch: str,
 ) -> None:
     del waves_per_eu
 
+    if lds_staging not in LDS_STAGING_OPTIONS:
+        raise ValueError
     if not (1 <= m < SMALL_M_KERNEL_MAX):
         raise ValueError
-    if tile_n < 1 or tile_k < 32 or tile_k % 32 != 0:
+    if tile_n < 1 or not small_m_tile_k_is_swizzle_safe(tile_k):
         raise ValueError
     if block_n_warps < 1 or split_k < 1:
         raise ValueError
@@ -216,13 +399,15 @@ def _validate_small_m_registry_config(
     if ks < tile_k or ks % tile_k != 0:
         raise ValueError
 
-    a_lds_bytes = max(2 * TILE_M * tile_k * DTYPE_BYTES, TILE_M * tile_n * DTYPE_BYTES)
-    lds_bytes = (
-        a_lds_bytes
-        if not b_to_lds
-        else _align_up(a_lds_bytes, 16) + 2 * tile_n * tile_k * DTYPE_BYTES
-    )
-    if lds_bytes > MAX_LDS_BYTES:
+    if split_k > 1:
+        # One split-K counter pair per (M block, N tile); the shared workspace
+        # is fixed-size, so configs that would overrun it are not emitted.
+        required_counters = _ceil_div(m, TILE_M) * (n // tile_n)
+        if required_counters > SPLIT_K_SEMAPHORE_MAX_LEN:
+            raise ValueError
+
+    lds_bytes = small_m_lds_bytes(tile_n=tile_n, tile_k=tile_k, b_to_lds=b_to_lds)
+    if lds_bytes > small_m_max_lds_bytes(arch):
         raise ValueError
 
 
@@ -326,17 +511,25 @@ def iter_small_m_registry_configs(
         return
 
     gpu_arch = get_rocm_arch()
-    if gpu_arch == "gfx942" or not (1 <= m < SMALL_M_KERNEL_MAX):
+    if not (1 <= m < SMALL_M_KERNEL_MAX):
         return
 
+    # gfx950 has only ever been generated and tuned with the direct
+    # global-to-LDS form, so the staging axis is enumerated on gfx942 only.
+    staging_options = (
+        LDS_STAGING_OPTIONS if gpu_arch == "gfx942" else (LDS_STAGING_DIRECT,)
+    )
+
     seen_configs = set()
-    for tile_n in SMALL_M_TILE_N_OPTIONS:
+    for tile_n in _small_m_tile_n_options(gpu_arch):
         for tile_k in _small_m_tile_k_options(k):
             split_k_options = _small_m_split_k_options(k, tile_k)
             if not split_k_options:
                 continue
             for split_k in split_k_options:
-                for variant in _small_m_registry_variants():
+                for variant, lds_staging in product(
+                    _small_m_registry_variants(), staging_options
+                ):
                     config = {
                         "kernel_family": "small_m",
                         "stage": STAGES,
@@ -352,6 +545,7 @@ def iter_small_m_registry_configs(
                         "b_to_lds_unroll": variant["b_to_lds_unroll"],
                         "async_copy": True,
                         "b_to_lds": variant["b_to_lds"],
+                        "lds_staging": lds_staging,
                         "c_to_lds": False,
                         "dtype": dtype,
                         "out_dtype": out_dtype,
@@ -371,6 +565,8 @@ def iter_small_m_registry_configs(
                             waves_per_eu=config["waves_per_eu"],
                             b_to_lds_unroll=config["b_to_lds_unroll"],
                             b_to_lds=config["b_to_lds"],
+                            lds_staging=config["lds_staging"],
+                            arch=gpu_arch,
                         )
                     except ValueError:
                         continue
@@ -388,6 +584,8 @@ def compile_small_m_hgemm_kernel(
     n: int,
     k: int,
     *,
+    EXPECTED_M: int = 1,
+    ARCH: str | None = None,
     TILE_N: int = 128,
     TILE_K: int = 64,
     SPLIT_K: int = 1,
@@ -398,25 +596,50 @@ def compile_small_m_hgemm_kernel(
     B_TO_LDS_UNROLL: int = 0,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
+    LDS_STAGING: str = LDS_STAGING_DIRECT,
 ):
     if dtype != "bf16":
         raise ValueError(f"`small_m_hgemm.py` only supports bf16, got {dtype!r}")
+    if not 1 <= EXPECTED_M < SMALL_M_KERNEL_MAX:
+        raise ValueError(
+            f"small-M exact specialization requires M=1..16, got {EXPECTED_M}"
+        )
     if SPLIT_K < 1:
         raise ValueError(f"SPLIT_K must be >= 1, got {SPLIT_K}")
+    if LDS_STAGING not in LDS_STAGING_OPTIONS:
+        raise ValueError(
+            f"LDS_STAGING must be one of {LDS_STAGING_OPTIONS}, got {LDS_STAGING!r}"
+        )
 
-    GPU_ARCH = get_rocm_arch()
-    if GPU_ARCH == "gfx942":
-        raise ValueError("small-M kernel currently targets the async-copy bf16 path")
+    GPU_ARCH = get_rocm_arch() if ARCH is None else ARCH
+    ARCH_PARAMS = small_m_arch_params(GPU_ARCH)
+    if GPU_ARCH != "gfx942" and LDS_STAGING != LDS_STAGING_DIRECT:
+        raise ValueError(
+            f"LDS_STAGING={LDS_STAGING!r} is only implemented for gfx942; "
+            f"{GPU_ARCH} keeps the direct global-to-LDS path"
+        )
 
-    WMMA_IMPL = WmmaHalf_m16n16k32(dtype)
-    DMA_BYTES = 16
-    MFMA_PER_WARP_K = 1
+    WMMA_IMPL = ARCH_PARAMS["wmma_cls"](dtype)
+    MFMA_PER_WARP_K = ARCH_PARAMS["mfma_per_warp_k"]
+    DIRECT_TO_LDS = LDS_STAGING == LDS_STAGING_DIRECT
+    DMA_BYTES = ARCH_PARAMS["direct_dma_bytes"]
+    MAX_LDS_BYTES = small_m_max_lds_bytes(GPU_ARCH)
     BLOCK_K = TILE_K
     IS_SPLIT_K = SPLIT_K > 1
-    assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
+    if not small_m_tile_k_is_swizzle_safe(BLOCK_K):
+        raise ValueError(
+            f"TILE_K={TILE_K} is not supported: the LDS swizzle requires "
+            "TILE_K * 2 to be a power-of-two number of 16-byte blocks "
+            "(32, 64, 128, 256, ...)"
+        )
+    if k % SPLIT_K != 0:
+        raise ValueError(f"K={k} is not divisible by SPLIT_K={SPLIT_K}")
     ks = k // SPLIT_K
-    assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
-    assert BLOCK_K >= 32
+    if ks < BLOCK_K or ks % BLOCK_K != 0:
+        raise ValueError(
+            f"K/SPLIT_K={ks} is not a positive multiple of TILE_K={BLOCK_K}; "
+            "this shape has no legal small-M K schedule"
+        )
 
     WMMA_M = WMMA_IMPL.WMMA_M
     WMMA_N = WMMA_IMPL.WMMA_N
@@ -442,7 +665,15 @@ def compile_small_m_hgemm_kernel(
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
     assert BLOCK_M == TILE_M
-    assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
+    if n < BLOCK_N or n % BLOCK_N != 0:
+        # The kernel has no predicated N tail, so an inexact tile would drop
+        # output columns. Reject instead, and let the caller pick a tile that
+        # divides N exactly (gfx942 offers a 16-wide tile for this reason).
+        raise ValueError(
+            f"N={n} is not a positive multiple of the block-N width {BLOCK_N} "
+            f"(TILE_N={TILE_N}, BLOCK_N_WARPS={BLOCK_N_WARPS}); choose a tile "
+            "that divides N exactly"
+        )
     BLOCK_N_TILES = n // BLOCK_N
     if N_TILE_REPEAT > 1:
         if B_TO_LDS:
@@ -486,6 +717,7 @@ def compile_small_m_hgemm_kernel(
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
+    LDG_B_X_THREADS = BLOCK_K // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
     assert BLOCK_MK_SIZE % LDG_VEC_SIZE == 0
     assert BLOCK_NK_SIZE % LDG_VEC_SIZE == 0
@@ -510,7 +742,15 @@ def compile_small_m_hgemm_kernel(
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    assert SMEM_USE <= MAX_LDS_BYTES
+    if SMEM_USE > MAX_LDS_BYTES:
+        raise ValueError(
+            f"small-M config needs {SMEM_USE} B of LDS but {GPU_ARCH} provides "
+            f"{MAX_LDS_BYTES} B (TILE_N={TILE_N}, TILE_K={TILE_K}, "
+            f"B_TO_LDS={B_TO_LDS})"
+        )
+    assert SMEM_USE == small_m_lds_bytes(
+        tile_n=TILE_N, tile_k=TILE_K, b_to_lds=B_TO_LDS
+    )
 
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
@@ -522,8 +762,27 @@ def compile_small_m_hgemm_kernel(
     LDG_REG_A_COUNT_AS = _ceil_div(LDG_A_TOTAL_VECS_AS, BLOCK_THREADS)
     LDG_REG_B_COUNT_AS = _ceil_div(LDG_B_TOTAL_VECS_AS, BLOCK_THREADS)
 
+    # Per-stage instruction budget of the selected staging form, used by the
+    # hot-loop schedulers so both variants get an accurate issue model.
+    STAGE_VMEM_A_COUNT = LDG_REG_A_COUNT_AS if DIRECT_TO_LDS else LDG_REG_A_COUNT
+    STAGE_VMEM_B_COUNT = LDG_REG_B_COUNT_AS if DIRECT_TO_LDS else LDG_REG_B_COUNT
+    STAGE_DSWR_A_COUNT = 0 if DIRECT_TO_LDS else LDG_REG_A_COUNT
+    STAGE_DSWR_B_COUNT = 0 if DIRECT_TO_LDS else LDG_REG_B_COUNT
+
+    if MFMA_PER_WARP_K not in (1, 2):
+        raise ValueError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} is not supported")
+    if MFMA_PER_WARP_K == 2 and WMMA_A_FRAG_VALUES * DTYPE_BYTES != 8:
+        raise ValueError(
+            "the split-K MFMA path assumes 8-byte native fragments, got "
+            f"{WMMA_A_FRAG_VALUES * DTYPE_BYTES} bytes"
+        )
+
     KERNEL_NAME = small_m_kernel_name(
+        GPU_ARCH,
         dtype,
+        EXPECTED_M,
+        n,
+        k,
         tile_n=TILE_N,
         tile_k=TILE_K,
         split_k=SPLIT_K,
@@ -534,6 +793,7 @@ def compile_small_m_hgemm_kernel(
         b_to_lds_unroll=EFFECTIVE_B_TO_LDS_UNROLL if const_expr(B_TO_LDS) else 0,
         b_to_lds=B_TO_LDS,
         has_bias=HAS_BIAS,
+        lds_staging=LDS_STAGING,
     )
 
     @flyc.kernel
@@ -651,8 +911,22 @@ def compile_small_m_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    c_g.vec_store(
-                        (row_idx, tile_n_offset + n_local_idx), init_vec, LDG_VEC_SIZE
+                    # The split-K accumulation that follows is device-scope, so
+                    # the zero/bias initialisation has to be device-coherent
+                    # too; a plain store can linger in a non-coherent cache and
+                    # overwrite another block's atomic contribution.
+                    bytes_offset = c_g.linear_offset(
+                        (row_idx, tile_n_offset + n_local_idx)
+                    )
+                    c_ptr = get_llvm_ptr(
+                        C, arith.index_cast(T.i32, bytes_offset), DTYPE_BYTES
+                    )
+                    llvm.InlineAsmOp(
+                        None,
+                        [c_ptr, init_vec],
+                        "global_store_dwordx4 $0, $1, off sc0 sc1",
+                        "v,v",
+                        has_side_effects=True,
                     )
                     scf.YieldOp([])
 
@@ -918,17 +1192,46 @@ def compile_small_m_hgemm_kernel(
                 scf.YieldOp([zero_b_frag] * B_FRAGS_LEN)
             return list(load_if.results)
 
+        def split_mfma_k_halves(frag):
+            """Split one K32 fragment into the two native K16 MFMA operands.
+
+            Both halves keep the lane's own K elements, so the pair of
+            `16x16x16` MFMAs sums over exactly the same 32 reduction elements
+            the single `16x16x32` atom would have consumed.
+            """
+            pair = vector.bitcast(T.i64x2, frag)
+            halves = []
+            for half in range_constexpr(2):
+                part = vector.extract(
+                    pair, static_position=[half], dynamic_position=[]
+                )
+                halves.append(
+                    vector.bitcast(
+                        T.f16x4, vector.from_elements(T.vec(1, T.i64), [part])
+                    )
+                )
+            return halves
+
         def block_mma_sync(a_frags, b_frags, c_frags):
             c_frags_new = [cx for cx in c_frags]
             for kk in range_constexpr(WARP_K_STEPS):
                 for ii in range_constexpr(WARP_M_STEPS):
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
+                    if const_expr(MFMA_PER_WARP_K == 2):
+                        a_halves = split_mfma_k_halves(a_frag)
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[kk * WARP_N_STEPS + jj]
                         c_idx = ii * WARP_N_STEPS + jj
-                        c_frags_new[c_idx] = WMMA_IMPL(
-                            a_frag, b_frag, c_frags_new[c_idx]
-                        )
+                        if const_expr(MFMA_PER_WARP_K == 2):
+                            b_halves = split_mfma_k_halves(b_frag)
+                            acc = c_frags_new[c_idx]
+                            for half in range_constexpr(2):
+                                acc = WMMA_IMPL(a_halves[half], b_halves[half], acc)
+                            c_frags_new[c_idx] = acc
+                        else:
+                            c_frags_new[c_idx] = WMMA_IMPL(
+                                a_frag, b_frag, c_frags_new[c_idx]
+                            )
             return c_frags_new
 
         def store_split_k_tile(c_tensor, c_g, c_s, tile_n_offset):
@@ -1091,6 +1394,56 @@ def compile_small_m_hgemm_kernel(
                         )
                         scf.YieldOp([])
 
+            def ldg_b(k_offset, tile_n_offset):
+                vecs = []
+                for i in range_constexpr(LDG_REG_B_COUNT):
+                    global_tid = BLOCK_THREADS * i + tid
+                    n_local_idx = global_tid // LDG_B_X_THREADS
+                    k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
+                    row_idx = tile_n_offset + fx.Index(n_local_idx)
+                    col_idx = fx.Index(k_offset + k_local_idx)
+                    slot_valid = arith.cmpi(
+                        arith.CmpIPredicate.ult,
+                        fx.Index(global_tid),
+                        fx.Index(LDG_B_TOTAL_VECS),
+                    )
+                    load_if = scf.IfOp(
+                        slot_valid,
+                        results_=[T.vec(LDG_VEC_SIZE, dtype_)],
+                        has_else=True,
+                    )
+                    with ir.InsertionPoint(load_if.then_block):
+                        scf.YieldOp([B_.vec_load((row_idx, col_idx), LDG_VEC_SIZE)])
+                    with ir.InsertionPoint(load_if.else_block):
+                        scf.YieldOp([zero_a_vec])
+                    vecs.append(load_if.results[0])
+                return vecs
+
+            def sts_b(bs_s, vecs, lds_stage):
+                for i in range_constexpr(LDG_REG_B_COUNT):
+                    global_tid = BLOCK_THREADS * i + tid
+                    n_local_idx = global_tid // LDG_B_X_THREADS
+                    k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
+                    col_in_bytes = k_local_idx * DTYPE_BYTES
+                    col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
+                    slot_valid = arith.cmpi(
+                        arith.CmpIPredicate.ult,
+                        fx.Index(global_tid),
+                        fx.Index(LDG_B_TOTAL_VECS),
+                    )
+                    store_if = scf.IfOp(slot_valid, results_=[], has_else=False)
+                    with ir.InsertionPoint(store_if.then_block):
+                        bs_s.vec_store(
+                            (
+                                fx.Index(lds_stage),
+                                n_local_idx,
+                                col_in_bytes // DTYPE_BYTES,
+                            ),
+                            vecs[i],
+                            LDG_VEC_SIZE,
+                        )
+                        scf.YieldOp([])
+
             def lds_matrix_b(bs_s, lds_stage):
                 s = fx.Index(lds_stage)
                 b_frags = [0] * B_FRAGS_LEN
@@ -1110,29 +1463,52 @@ def compile_small_m_hgemm_kernel(
                         b_frags[kk * WARP_N_STEPS + ii] = vec
                 return b_frags
 
+            def stage_ab_load(k_offset, tile_n_offset):
+                """Issue the global side of one A+B stage.
+
+                The direct form has no global-side registers: the DMA is the
+                whole transfer and is issued by `stage_ab_commit`.
+                """
+                if const_expr(DIRECT_TO_LDS):
+                    return None
+                return (ldg_a(k_offset), ldg_b(k_offset, tile_n_offset))
+
+            def stage_ab_commit(regs, k_offset, lds_stage, tile_n_offset):
+                if const_expr(DIRECT_TO_LDS):
+                    ldg_sts_a_async(k_offset, lds_stage)
+                    ldg_sts_b_async(bs_, k_offset, lds_stage, tile_n_offset)
+                else:
+                    sts_a(regs[0], lds_stage)
+                    sts_b(bs_, regs[1], lds_stage)
+
             def run_b_to_lds_tile(tile_n_offset, tile_signal_idx):
                 c_frags_local = [acc_init] * C_FRAGS_LEN
                 if const_expr(IS_SPLIT_K):
                     prepare_split_k_tile(C_, BIAS_, tile_n_offset, tile_signal_idx)
 
-                ldg_sts_a_async(ks_begin, 0)
-                ldg_sts_b_async(bs_, ks_begin, 0, tile_n_offset)
+                stage_ab_commit(
+                    stage_ab_load(ks_begin, tile_n_offset),
+                    ks_begin,
+                    0,
+                    tile_n_offset,
+                )
                 gpu.barrier()
 
                 def hot_loop_scheduler():
                     MFMA_TOTAL = (
                         WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                     )
-                    LDG_TOTAL = LDG_REG_A_COUNT_AS + LDG_REG_B_COUNT_AS
+                    LDG_TOTAL = STAGE_VMEM_A_COUNT + STAGE_VMEM_B_COUNT
+                    DS_WRITE_TOTAL = STAGE_DSWR_A_COUNT + STAGE_DSWR_B_COUNT
                     if const_expr(WIDE_N_B_TO_LDS):
                         for _ in range_constexpr(WARP_K_STEPS * WARP_M_STEPS):
                             rocdl.sched_dsrd(1)
                         for _ in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
                             rocdl.sched_dsrd(1)
-                        for _ in range_constexpr(LDG_REG_A_COUNT_AS):
+                        for _ in range_constexpr(STAGE_VMEM_A_COUNT):
                             rocdl.sched_vmem(1)
                             rocdl.sched_mfma(2)
-                        for _ in range_constexpr(LDG_REG_B_COUNT_AS):
+                        for _ in range_constexpr(STAGE_VMEM_B_COUNT):
                             rocdl.sched_vmem(1)
                             rocdl.sched_mfma(2)
                         remaining = max(MFMA_TOTAL - LDG_TOTAL * 2, 0)
@@ -1149,6 +1525,11 @@ def compile_small_m_hgemm_kernel(
                         remaining = max(MFMA_TOTAL - LDG_TOTAL * 2, 0)
                         for _ in range_constexpr(remaining):
                             rocdl.sched_mfma(1)
+                    # The VGPR-staged form ends the iteration with explicit LDS
+                    # writes; keep them in their own group so they are not
+                    # interleaved back into the MFMA stream.
+                    for _ in range_constexpr(DS_WRITE_TOTAL):
+                        rocdl.sched_dswr(1)
                     rocdl.sched_barrier(0)
 
                 UNROLL = EFFECTIVE_B_TO_LDS_UNROLL
@@ -1173,13 +1554,29 @@ def compile_small_m_hgemm_kernel(
                             next_stage = 1 - current_stage
                             a_frags = lds_matrix_a(current_stage)
                             b_frags = lds_matrix_b(bs_, current_stage)
-                            ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-                            ldg_sts_b_async(
-                                bs_, k_offset + BLOCK_K, next_stage, tile_n_offset
+                            stage_regs = stage_ab_load(
+                                k_offset + BLOCK_K, tile_n_offset
                             )
+                            if const_expr(DIRECT_TO_LDS):
+                                stage_ab_commit(
+                                    stage_regs,
+                                    k_offset + BLOCK_K,
+                                    next_stage,
+                                    tile_n_offset,
+                                )
                             c_frags_new = block_mma_sync(
                                 a_frags, b_frags, c_frags_local
                             )
+                            if const_expr(not DIRECT_TO_LDS):
+                                # Wide global loads were issued before the MFMA
+                                # block; commit them to LDS afterwards so the
+                                # load latency overlaps the matrix work.
+                                stage_ab_commit(
+                                    stage_regs,
+                                    k_offset + BLOCK_K,
+                                    next_stage,
+                                    tile_n_offset,
+                                )
                             hot_loop_scheduler()
                             gpu.barrier()
                             k_offset_next = k_offset + fx.Int32(BLOCK_K)
@@ -1244,7 +1641,7 @@ def compile_small_m_hgemm_kernel(
                     * MFMA_PER_WARP_K
                 )
                 LDG_TOTAL = (
-                    LDG_REG_A_COUNT_AS + N_TILE_REPEAT * WARP_K_STEPS * WARP_N_STEPS
+                    STAGE_VMEM_A_COUNT + N_TILE_REPEAT * WARP_K_STEPS * WARP_N_STEPS
                 )
                 avg_mfma_count = (MFMA_TOTAL + LDG_TOTAL - 1) // LDG_TOTAL
                 mfma_sched = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
@@ -1252,6 +1649,8 @@ def compile_small_m_hgemm_kernel(
                 for _ in range_constexpr(LDG_TOTAL):
                     rocdl.sched_vmem(ldg_sched.consume(1))
                     rocdl.sched_mfma(mfma_sched.consume(avg_mfma_count))
+                for _ in range_constexpr(STAGE_DSWR_A_COUNT):
+                    rocdl.sched_dswr(1)
                 rocdl.sched_barrier(0)
 
             TOTAL_C_FRAGS_LEN = C_FRAGS_LEN * N_TILE_REPEAT
@@ -1275,7 +1674,11 @@ def compile_small_m_hgemm_kernel(
                     + A_FRAGS_LEN
                     + TOTAL_B_FRAGS_LEN
                 ]
-                ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                if const_expr(DIRECT_TO_LDS):
+                    a_stage_regs = None
+                    ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                else:
+                    a_stage_regs = ldg_a(k_offset + BLOCK_K)
                 b_frags_next = []
                 c_frags_next = []
                 for tile_i in range_constexpr(N_TILE_REPEAT):
@@ -1296,6 +1699,8 @@ def compile_small_m_hgemm_kernel(
                         )
                     )
                 c_frags = c_frags_next
+                if const_expr(not DIRECT_TO_LDS):
+                    sts_a(a_stage_regs, next_stage)
                 hot_loop_scheduler()
                 gpu.barrier()
                 a_frags_next = lds_matrix_a(next_stage)

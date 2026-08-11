@@ -9,8 +9,10 @@ from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 import functools
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import enum
+import json
+import multiprocessing
 import os
 from typing import Any, Callable, Iterator
 
@@ -47,9 +49,28 @@ class JobLabel:
 
     kind: OpKind
     kernel_name: str
+    architecture: str | None = None
 
     def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
+        arch = self.architecture or "architecture-neutral"
+        return f"{self.kind.name} {self.kernel_name} ({arch})"
+
+
+@dataclass
+class AotSequentialRun:
+    """Deferred package-AOT plan executed one architecture at a time."""
+
+    partitions: tuple[
+        tuple[str | None, tuple[tuple[OpKind, dict[str, Any]], ...]], ...
+    ]
+    worker: Callable[[OpKind, dict[str, Any]], tuple[OpKind, dict[str, Any]]]
+    global_worker_cap: int
+    results: list[tuple[OpKind, dict[str, Any], JobLabel]] = field(
+        default_factory=list
+    )
+    partition_order: list[str] = field(default_factory=list)
+    partition_job_counts: dict[str, int] = field(default_factory=dict)
+    peak_live_workers: int = 0
 
 
 _CU_NUM_TO_ARCH = {
@@ -252,7 +273,10 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
         from .chunk_gdn_h import compile_one_config
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return kind, compile_one_config(**job)
+    result = compile_one_config(**job)
+    result["_aot_worker_pid"] = os.getpid()
+    result["_aot_worker_arch"] = _job_architecture(job)
+    return kind, result
 
 
 def _affinity_aware_cpu_count() -> int:
@@ -282,6 +306,78 @@ def _resolve_max_workers(num_jobs: int) -> int:
     else:
         max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
     return max(min(max_workers, num_jobs), 1)
+
+
+def _job_architecture(job: dict[str, Any]) -> str | None:
+    """Return explicit compile architecture, or None for neutral jobs."""
+    for field in ("arch", "target_gfx", "gpu_arch", "gfx"):
+        value = job.get(field)
+        if isinstance(value, str) and value.startswith("gfx"):
+            return value
+    cu_num = int(job.get("cu_num", 0) or 0)
+    return _CU_NUM_TO_ARCH.get(cu_num)
+
+
+def _partition_aot_jobs_by_architecture(
+    jobs: list[tuple[OpKind, dict[str, Any]]],
+) -> dict[str | None, list[tuple[OpKind, dict[str, Any]]]]:
+    partitions: dict[str | None, list[tuple[OpKind, dict[str, Any]]]] = {}
+    for kind, job in jobs:
+        partitions.setdefault(_job_architecture(job), []).append((kind, job))
+    return partitions
+
+
+def _apply_package_aot_filter(
+    jobs: list[tuple[OpKind, dict[str, Any]]],
+) -> list[tuple[OpKind, dict[str, Any]]]:
+    """Apply an opt-in exact selector file for package-path integration runs."""
+    selector_file = os.environ.get("AITER_FLYDSL_AOT_FILTER_FILE")
+    if not selector_file:
+        return jobs
+    with open(selector_file, encoding="utf-8") as stream:
+        selectors = json.load(stream)["jobs"]
+    selected = []
+    unmatched = []
+    for selector in selectors:
+        matches = [
+            (kind, job)
+            for kind, job in jobs
+            if kind.name == selector["op_kind"]
+            and str(job.get("kernel_name", "?")) == selector["kernel_name"]
+            and _job_architecture(job) == selector.get("architecture")
+            and all(
+                job.get(axis) == selector.get(axis) for axis in ("m", "n", "k")
+            )
+        ]
+        if len(matches) != 1:
+            unmatched.append((selector, len(matches)))
+        else:
+            selected.append(matches[0])
+    if unmatched:
+        raise ValueError(f"FlyDSL package-AOT selectors must match once: {unmatched}")
+    return selected
+
+
+def _make_sequential_aot_run(
+    jobs: list[tuple[OpKind, dict[str, Any]]],
+    worker: Callable[[OpKind, dict[str, Any]], tuple[OpKind, dict[str, Any]]],
+) -> AotSequentialRun | None:
+    """Build a deferred run with one sequential pool per architecture."""
+    if not jobs:
+        return None
+    partitions = _partition_aot_jobs_by_architecture(jobs)
+    ordered = tuple(
+        (architecture, tuple(partitions[architecture]))
+        for architecture in sorted(
+            partitions,
+            key=lambda value: (value is None, value or ""),
+        )
+    )
+    return AotSequentialRun(
+        partitions=ordered,
+        worker=worker,
+        global_worker_cap=_resolve_max_workers(len(jobs)),
+    )
 
 
 def run_jobs_parallel(
@@ -316,11 +412,12 @@ def run_jobs_parallel(
 
 def start_aot(
     cache_dir: str,
-) -> tuple[ProcessPoolExecutor | None, dict[Future, JobLabel]]:
+) -> tuple[AotSequentialRun | None, dict[Future, JobLabel]]:
     """Start FlyDSL AOT compilation in background processes.
 
-    Submits one task per kernel (across all OpKind members) to a single
-    shared ProcessPoolExecutor. Pool size is configurable via env:
+    Builds a deferred plan whose architecture-isolated process pools execute
+    sequentially in ``wait_aot``. Architecture-neutral jobs use their own
+    explicit partition. Pool size is configurable via env:
 
       AITER_FLYDSL_AOT_WORKERS -- explicit worker count. Non-integer
                                  values raise ValueError; "0" / negatives
@@ -330,9 +427,8 @@ def start_aot(
                                  aware count capped at the module
                                  constant.
 
-    Returns (pool, futures_dict) -- caller must call ``wait_aot``
-    to collect results and raise on failure. If there are no jobs to
-    compile, returns (None, {}) and ``wait_aot`` becomes a no-op.
+    Returns (run, {}) -- caller must call ``wait_aot`` to execute and collect
+    results. If there are no jobs, returns (None, {}).
     """
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
@@ -341,19 +437,18 @@ def start_aot(
     for kind in OpKind:
         for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
+    all_jobs = _apply_package_aot_filter(all_jobs)
 
     if not all_jobs:
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return None, {}
 
-    max_workers = _resolve_max_workers(len(all_jobs))
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
+        f"({'+'.join(k.name for k in OpKind)}), cache: {cache_dir}"
     )
 
-    # Default fork start method is fine here: _compile_one immediately
+    # Explicit fork is safe here: _compile_one immediately
     # delegates to compile_one_config, which shells out to the FlyDSL
     # compiler subprocess. The child never re-enters torch / FlyDSL /
     # sccache-client Python in a way that would acquire an inherited
@@ -361,63 +456,88 @@ def start_aot(
     # thread holds lock at fork time -> child tries to acquire same lock
     # -> deadlock) doesn't apply. Validated empirically at 64 workers
     # (test job 299597), no hangs.
-    pool = ProcessPoolExecutor(max_workers=max_workers)
-    futures: dict[Future, JobLabel] = {}
-    for kind, job in all_jobs:
-        f = pool.submit(_compile_one, kind, job)
-        futures[f] = JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?")))
-    return pool, futures
+    return _make_sequential_aot_run(all_jobs, _compile_one), {}
 
 
-def wait_aot(pool: ProcessPoolExecutor | None, futures: dict[Future, JobLabel]) -> None:
-    """Wait for FlyDSL AOT workers and raise on any failure.
-
-    Aggregates per-kernel results back to per-kind tallies for log
-    parity with the previous run_aot_worker output."""
-    if pool is None or not futures:
+def wait_aot(
+    pool: AotSequentialRun | None,
+    futures: dict[Future, JobLabel],
+) -> None:
+    """Execute sequential architecture pools and raise on first partition failure."""
+    del futures
+    if pool is None:
         return
-    try:
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for future in futures:
-            label = futures[future]
-            try:
-                kind, result = future.result()
-                if result.get("compile_time") is not None:
-                    ok_by_kind[kind] += 1
-                else:
-                    fail_by_kind[kind] += 1
-                    # A None compile_time means compile_one_config returned
-                    # cleanly but didn't produce a kernel -- still a
-                    # failure that the original wait_aot raised on.
-                    errors.append(f"FlyDSL {label} produced no kernel")
-            except Exception as worker_err:
-                # Use the JobLabel's kind directly -- no string parsing,
-                # so a future OpKind addition won't silently misattribute.
-                fail_by_kind[label.kind] += 1
-                errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
-        for kind in OpKind:
-            print(
-                f"[aiter] FlyDSL {kind.name} AOT: "
-                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
-            )
-        if errors:
-            # Dedupe before truncating: a BrokenProcessPool cascades to
-            # every remaining future.result() call with the SAME message,
-            # which would otherwise fill the cap with copies of one
-            # symptom and bury the actual first crash.
-            seen: set[str] = set()
-            unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
-            head = unique_errors[:_MAX_ERRORS_IN_MSG]
-            suffix = ""
-            if len(unique_errors) > _MAX_ERRORS_IN_MSG:
-                suffix = (
-                    f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
+    ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+    fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+    for architecture, arch_jobs in pool.partitions:
+        arch_label = architecture or "architecture-neutral"
+        workers = min(pool.global_worker_cap, len(arch_jobs))
+        pool.partition_order.append(arch_label)
+        pool.partition_job_counts[arch_label] = len(arch_jobs)
+        pool.peak_live_workers = max(pool.peak_live_workers, workers)
+        print(
+            f"[aiter] FlyDSL AOT pool {arch_label}: "
+            f"{len(arch_jobs)} kernels, {workers} workers"
+        )
+        # Python 3.14 defaults POSIX ProcessPoolExecutor to forkserver. Package
+        # AOT is launched from setup.py, so forkserver would re-import setup.py
+        # in workers and repeat its build-time side effects. Explicit fork is
+        # safe here because workers immediately delegate compilation to a
+        # subprocess and do not acquire inherited torch/FlyDSL locks.
+        architecture_pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("fork"),
+        )
+        submitted: dict[Future, JobLabel] = {}
+        partition_results: list[tuple[OpKind, dict[str, Any], JobLabel]] = []
+        failed = False
+        try:
+            for kind, job in arch_jobs:
+                future = architecture_pool.submit(pool.worker, kind, job)
+                submitted[future] = JobLabel(
+                    kind=kind,
+                    kernel_name=str(job.get("kernel_name", "?")),
+                    architecture=architecture,
                 )
+            for future in as_completed(submitted):
+                label = submitted[future]
+                try:
+                    kind, result = future.result()
+                except BaseException as worker_err:
+                    failed = True
+                    for pending in submitted:
+                        if pending is not future:
+                            pending.cancel()
+                    raise RuntimeError(
+                        f"FlyDSL {label} AOT worker crashed: {worker_err}"
+                    ) from worker_err
+                partition_results.append((kind, result, label))
+        finally:
+            architecture_pool.shutdown(wait=True, cancel_futures=failed)
+
+        errors = []
+        for kind, result, label in partition_results:
+            pool.results.append((kind, result, label))
+            if result.get("compile_time") is not None:
+                ok_by_kind[kind] += 1
+            else:
+                fail_by_kind[kind] += 1
+                errors.append(f"FlyDSL {label} produced no kernel")
+        if errors:
+            # Stop before starting the next architecture partition.
             tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
+            head = errors[:_MAX_ERRORS_IN_MSG]
+            suffix = ""
+            if len(errors) > _MAX_ERRORS_IN_MSG:
+                suffix = f"; ... ({len(errors) - _MAX_ERRORS_IN_MSG} more)"
             raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
+                f"[aiter] FlyDSL AOT failures ({tally}): "
+                + "; ".join(head)
+                + suffix
             )
-    finally:
-        pool.shutdown(wait=False)
+
+    for kind in OpKind:
+        print(
+            f"[aiter] FlyDSL {kind.name} AOT: "
+            f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
+        )

@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
@@ -126,7 +126,7 @@ def get_GEMM_A16W16_config(
     cu_num = get_cu_num()
     padded_M = M
     config = None
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -155,6 +155,61 @@ def get_GEMM_A16W16_config(
                             f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
                             "recognized by the current catalog; falling back to next candidate."
                         )
+                        config = None
+                else:
+                    config = None
+            elif config["libtype"] == "flydsl_decode":
+                if padded_M != M:
+                    # Decode kernels are exact-M specializations. Never reuse a
+                    # padded CSV row or introduce a runtime M-tail.
+                    config = None
+                elif is_flydsl_available():
+                    try:
+                        from aiter.ops.flydsl.kernels.gemm_decode_config import (
+                            parse_gemm_decode_kernel_name,
+                        )
+
+                        name_arch, name_m, name_n, name_k, _ = (
+                            parse_gemm_decode_kernel_name(config["kernelName"])
+                        )
+                        if (name_arch, name_m, name_n, name_k) != (
+                            gfx,
+                            M,
+                            N,
+                            K,
+                        ):
+                            logger.warning(
+                                "FlyDSL decode tuned row does not match the "
+                                "runtime architecture/exact shape; ignoring it."
+                            )
+                            config = None
+                    except (ImportError, ValueError):
+                        config = None
+                else:
+                    config = None
+            elif config["libtype"] == "flydsl_small_m":
+                if padded_M != M or not 1 <= M <= 16:
+                    config = None
+                elif is_flydsl_available():
+                    try:
+                        from aiter.ops.flydsl.kernels.small_m_hgemm import (
+                            parse_small_m_kernel_name,
+                        )
+
+                        name_arch, name_m, name_n, name_k, name_config = (
+                            parse_small_m_kernel_name(config["kernelName"])
+                        )
+                        if (
+                            (name_arch, name_m, name_n, name_k)
+                            != (gfx, M, N, K)
+                            or name_config["has_bias"] != bias
+                        ):
+                            logger.warning(
+                                "FlyDSL small-M tuned row does not match the "
+                                "runtime architecture/exact shape/bias; ignoring it."
+                            )
+                            config = None
+                    except (ImportError, ValueError):
                         config = None
                 else:
                     config = None
@@ -498,6 +553,113 @@ def flydsl_gemm(
     return out
 
 
+def flydsl_decode_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
+    config: Optional[dict] = None,
+):
+    """Launch an exact-shape unified decode kernel selected by the BF16 CSV."""
+    del solidx
+    if config is None or not config.get("kernelName"):
+        raise ValueError("FlyDSL decode dispatch requires kernelName")
+    if bias is not None:
+        raise ValueError("FlyDSL decode does not support fused bias")
+    if any(scale is not None for scale in (scale_a, scale_b, scale_c)):
+        raise ValueError("FlyDSL decode does not support scaling")
+    if bpreshuffle:
+        raise ValueError("FlyDSL decode does not support preshuffled weights")
+    if (otype or inp.dtype) != torch.bfloat16:
+        raise ValueError("FlyDSL decode requires BF16 output")
+    from aiter.ops.flydsl.kernels.gemm_decode import (
+        launch_gemm_decode_kernel_name,
+    )
+
+    output = torch.empty(
+        (inp.shape[0], weights.shape[0]),
+        dtype=torch.bfloat16,
+        device=inp.device,
+    )
+    return launch_gemm_decode_kernel_name(
+        inp,
+        weights,
+        output,
+        config["kernelName"],
+    )
+
+
+def flydsl_small_m_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
+    config: Optional[dict] = None,
+):
+    """Launch an exact-shape small-M kernel selected by the BF16 CSV."""
+    del solidx
+    if config is None or not config.get("kernelName"):
+        raise ValueError("FlyDSL small-M dispatch requires kernelName")
+    if any(scale is not None for scale in (scale_a, scale_b, scale_c)):
+        raise ValueError("FlyDSL small-M does not support scaling")
+    if bpreshuffle:
+        raise ValueError("FlyDSL small-M requires non-preshuffled weights")
+    if inp.dtype != torch.bfloat16 or weights.dtype != torch.bfloat16:
+        raise ValueError("FlyDSL small-M requires BF16 inputs")
+    if (otype or inp.dtype) != torch.bfloat16:
+        raise ValueError("FlyDSL small-M requires BF16 output")
+    from aiter.ops.flydsl.kernels.small_m_hgemm import (
+        parse_small_m_kernel_name,
+    )
+
+    arch, m, n, k, kernel_config = parse_small_m_kernel_name(
+        config["kernelName"]
+    )
+    runtime_shape = (inp.shape[0], weights.shape[0], inp.shape[1])
+    if runtime_shape != (m, n, k) or weights.shape[1] != k:
+        raise ValueError(
+            f"FlyDSL small-M kernel expects {(m, n, k)}, got {runtime_shape}"
+        )
+    if arch != get_gfx_runtime():
+        raise ValueError(
+            f"FlyDSL small-M kernel targets {arch}, runtime is {get_gfx_runtime()}"
+        )
+    if kernel_config["has_bias"] != (bias is not None):
+        raise ValueError("FlyDSL small-M kernel bias identity does not match launch")
+    return aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+        inp,
+        weights,
+        bias=bias,
+        kernel_family="small_m",
+        tile_m=kernel_config["tile_m"],
+        tile_n=kernel_config["tile_n"],
+        tile_k=kernel_config["tile_k"],
+        split_k=kernel_config["split_k"],
+        block_m_warps=kernel_config["block_m_warps"],
+        block_n_warps=kernel_config["block_n_warps"],
+        block_k_warps=1,
+        n_tile_repeat=kernel_config["n_tile_repeat"],
+        persistent_n_tiles=kernel_config["persistent_n_tiles"],
+        waves_per_eu=kernel_config["waves_per_eu"],
+        b_to_lds_unroll=kernel_config["b_to_lds_unroll"],
+        stages=kernel_config["stage"],
+        async_copy=True,
+        b_to_lds=kernel_config["b_to_lds"],
+        c_to_lds=False,
+        lds_staging=kernel_config["lds_staging"],
+    )
+
+
 def opus_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -575,6 +737,8 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
+    "flydsl_decode": flydsl_decode_gemm,
+    "flydsl_small_m": flydsl_small_m_gemm,
     "opus": opus_gemm,
 }
 

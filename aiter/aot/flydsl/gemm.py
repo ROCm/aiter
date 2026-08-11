@@ -13,6 +13,8 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_gemm2_*``           split-K HGEMM kernels
   - ``flydsl_bpreshuflle_*``     a8w8 preshuffle GEMM kernels
+  - ``flydsl_decode_v1_*``       exact-M BF16 decode GEMM kernels
+  - ``flydsl_small_m_v1_*``      exact-shape BF16 small-M HGEMM kernels
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -52,6 +54,11 @@ from aiter.ops.flydsl.gemm_kernels import (
     get_flydsl_splitk_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from aiter.ops.flydsl.kernels.gemm_decode import compile_gemm_decode_bf16
+from aiter.ops.flydsl.kernels.gemm_decode_config import (
+    parse_gemm_decode_kernel_name,
+)
+from aiter.ops.flydsl.kernels.small_m_hgemm import parse_small_m_kernel_name
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -137,7 +144,18 @@ def parse_csv(csv_path: str):
         for row in reader:
             kernel_name = row.get("kernelName", "").strip()
             libtype = row.get("libtype", "").strip()
-            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
+            supported_libtypes = {
+                "flydsl",
+                "flydsl_decode",
+                "flydsl_small_m",
+            }
+            if libtype not in supported_libtypes:
+                continue
+            if not kernel_name.startswith("flydsl_"):
+                if libtype == "flydsl_small_m":
+                    raise ValueError(
+                        f"unrecognized flydsl_small_m CSV row: {kernel_name!r}"
+                    )
                 continue
 
             m = int(row["M"])
@@ -145,7 +163,49 @@ def parse_csv(csv_path: str):
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
 
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
+            if libtype in {"flydsl_decode", "flydsl_small_m"}:
+                if libtype == "flydsl_decode":
+                    arch, name_m, name_n, name_k, config = (
+                        parse_gemm_decode_kernel_name(kernel_name)
+                    )
+                    kind = "decode"
+                else:
+                    arch, name_m, name_n, name_k, config = (
+                        parse_small_m_kernel_name(kernel_name)
+                    )
+                    kind = "small_m"
+                if (name_m, name_n, name_k) != (m, n, k):
+                    raise ValueError(
+                        f"{kind} kernel name shape does not match CSV row: {kernel_name}"
+                    )
+                csv_arch = row.get("gfx", "").strip()
+                cu_arch = cu_num_to_arch(cu_num, default="")
+                if not csv_arch or not cu_arch:
+                    raise ValueError(
+                        f"{kind} AOT rows require recognized gfx and cu_num metadata"
+                    )
+                if len({arch, csv_arch, cu_arch}) != 1:
+                    raise ValueError(
+                        f"{kind} kernel architecture metadata mismatch: "
+                        f"name={arch}, csv={csv_arch}, cu_num={cu_num} ({cu_arch})"
+                    )
+                params = {
+                    "kind": kind,
+                    "arch": arch,
+                    "config": config,
+                }
+                if kind == "small_m":
+                    if config["has_bias"] != _parse_bool(row.get("bias")):
+                        raise ValueError(
+                            "small-M kernel bias identity does not match CSV row"
+                        )
+                    params = {
+                        **config,
+                        "stages": config["stage"],
+                        "kind": kind,
+                        "arch": arch,
+                    }
+            elif kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_gemm"):
                 params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
@@ -230,6 +290,7 @@ def _compile_hgemm_to_cache(
     target_gfx: str,
     kernel_family: str = "hgemm",
     has_bias: bool = False,
+    lds_staging: str = "direct",
     **kwargs,
 ):
     del kwargs, out_dtype
@@ -259,6 +320,8 @@ def _compile_hgemm_to_cache(
         dtype,
         n,
         k,
+        m=m,
+        target_gfx=target_gfx,
         kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -277,6 +340,7 @@ def _compile_hgemm_to_cache(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        lds_staging=lds_staging,
     )
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.
@@ -355,13 +419,58 @@ def _compile_preshuffle_to_cache(
     )
 
 
+def _compile_decode_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    arch: str,
+    config,
+    cu_num: int,
+    **kwargs,
+):
+    del kwargs
+    import torch
+
+    device = torch.device("cpu")
+    a = torch.empty((m, k), device=device, dtype=torch.bfloat16)
+    b = torch.empty((n, k), device=device, dtype=torch.bfloat16)
+    c = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    launcher = compile_gemm_decode_bf16(
+        m,
+        n,
+        k,
+        config,
+        arch=arch,
+        num_cus=cu_num,
+    )
+    _compile_executable_to_cache(
+        launcher,
+        a,
+        b,
+        c,
+        fx.Stream(0),
+    )
+
+
 def compile_one_config(
     kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    requested_arch = kwargs.get("arch")
+    if kind in {"decode", "small_m"}:
+        cu_arch = cu_num_to_arch(cu_num, default="")
+        if not requested_arch or not cu_arch or requested_arch != cu_arch:
+            raise ValueError(
+                f"{kind} AOT compile architecture does not match CU metadata: "
+                f"arch={requested_arch!r}, cu_num={cu_num} ({cu_arch or 'unknown'})"
+            )
+    aot_arch = requested_arch or cu_num_to_arch(
+        cu_num,
+        default=GEMM_AOT_ARCH_DEFAULT,
+    )
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -381,8 +490,21 @@ def compile_one_config(
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            elif kind == "small_m":
+                hgemm_kwargs = dict(kwargs)
+                hgemm_kwargs.pop("arch", None)
+                hgemm_kwargs["target_gfx"] = aot_arch
+                _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "decode":
+                _compile_decode_to_cache(
+                    m=m,
+                    n=n,
+                    k=k,
+                    cu_num=cu_num,
+                    **kwargs,
+                )
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
@@ -424,7 +546,8 @@ def main():
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
-
+    decode_jobs = [j for j in all_jobs if j["kind"] == "decode"]
+    small_m_jobs = [j for j in all_jobs if j["kind"] == "small_m"]
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
     print("=" * 72)
@@ -432,6 +555,8 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  Decode jobs:      {len(decode_jobs)}")
+    print(f"  Small-M jobs:     {len(small_m_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print("  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
@@ -442,8 +567,23 @@ def main():
 
     # HGEMM and preshuffle kernels are independent compiles, so they share
     # one pool for maximum fan-out instead of two serial passes.
-    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle) ---")
-    results = run_jobs_parallel(compile_one_config, hgemm_jobs + preshuffle_jobs)
+    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle + decode) ---")
+    # FlyDSL's backend target is process-local and initialized lazily. Never
+    # reuse one worker process across architectures: a gfx950 job followed by
+    # gfx942 can otherwise emit a cache key whose frozen target disagrees with
+    # the per-job FLYDSL_GPU_ARCH override.
+    jobs_by_arch = {}
+    for job in hgemm_jobs + preshuffle_jobs + decode_jobs + small_m_jobs:
+        job_arch = job.get("arch") or cu_num_to_arch(
+            job.get("cu_num", 0),
+            default=GEMM_AOT_ARCH_DEFAULT,
+        )
+        jobs_by_arch.setdefault(job_arch, []).append(job)
+    results = []
+    for job_arch in sorted(jobs_by_arch):
+        arch_jobs = jobs_by_arch[job_arch]
+        print(f"\n--- Isolated {job_arch} pool: {len(arch_jobs)} jobs ---")
+        results.extend(run_jobs_parallel(compile_one_config, arch_jobs))
 
     total_elapsed = time.time() - total_t0
 

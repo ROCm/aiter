@@ -22,6 +22,7 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from .kernels.small_m_hgemm import LDS_STAGING_DIRECT
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -659,6 +660,9 @@ def get_flydsl_splitk_hgemm_kernels(
             kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
     # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
+    # Before re-enabling it, `flydsl_kernel_name` must also encode the small-M
+    # `lds_staging` axis; otherwise the two gfx942 staging variants collapse onto
+    # one name and the catalog silently keeps whichever was generated last.
     #
     # if m is not None and n is not None and k is not None:
     #     for config in (
@@ -758,6 +762,7 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
+    lds_staging: str = LDS_STAGING_DIRECT,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -807,6 +812,8 @@ def _compile_flydsl_hgemm(
         dtype,
         n,
         k,
+        m=m,
+        target_gfx=get_rocm_arch(),
         kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -826,6 +833,7 @@ def _compile_flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        lds_staging=lds_staging,
     )
 
     def launcher(
@@ -846,6 +854,11 @@ def _compile_flydsl_hgemm(
             )
         launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
+        if kernel_family == KERNEL_FAMILY_SMALL_M and runtime_m != m:
+            raise ValueError(
+                f"small-M launcher is specialized for M={m}, "
+                f"but received M={runtime_m}"
+            )
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
         semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
@@ -889,6 +902,7 @@ def flydsl_hgemm(
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
     kernel_family: Optional[str] = None,
+    lds_staging: str = LDS_STAGING_DIRECT,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
@@ -944,6 +958,7 @@ def flydsl_hgemm(
         c_to_lds=c_to_lds,
         kernel_family=resolved_kernel_family,
         has_bias=bias is not None,
+        lds_staging=lds_staging,
     )
 
     launcher(out, a, b, bias=bias, stream=launch_stream)

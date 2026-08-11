@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import json
 import os
 import shutil
 import subprocess
@@ -14,6 +15,49 @@ OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.
 PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.2.2"
+
+
+def _run_flydsl_aot_only() -> None:
+    """Run the package AOT entry point without setup/build side effects."""
+    os.environ["AITER_AOT_IMPORT"] = "1"
+    from aiter.aot.flydsl.common import start_aot, wait_aot
+
+    flydsl_cache_dir = os.environ.get(
+        "AITER_FLYDSL_AOT_CACHE_DIR",
+        os.path.join(this_dir, "aiter", "jit", "flydsl_cache"),
+    )
+    run, futures = start_aot(flydsl_cache_dir)
+    wait_aot(run, futures)
+    evidence_file = os.environ.get("AITER_FLYDSL_AOT_EVIDENCE_FILE")
+    if evidence_file and run is not None:
+        architectures_by_pid = {}
+        for _, result, _ in run.results:
+            architectures_by_pid.setdefault(result["_aot_worker_pid"], set()).add(
+                result["_aot_worker_arch"]
+            )
+        evidence = {
+            "successful_compile_count": sum(
+                result.get("compile_time") is not None
+                for _, result, _ in run.results
+            ),
+            "partition_order": run.partition_order,
+            "partition_job_counts": run.partition_job_counts,
+            "global_worker_cap": run.global_worker_cap,
+            "peak_live_workers": run.peak_live_workers,
+            "architectures_by_pid": {
+                str(pid): sorted(architectures)
+                for pid, architectures in architectures_by_pid.items()
+            },
+        }
+        with open(evidence_file, "w", encoding="utf-8") as stream:
+            json.dump(evidence, stream, indent=2)
+            stream.write("\n")
+
+
+if __name__ == "__main__" and os.environ.get("AITER_FLYDSL_AOT_ONLY") == "1":
+    _run_flydsl_aot_only()
+    sys.exit(0)
+
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
