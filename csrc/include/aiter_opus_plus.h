@@ -4,10 +4,20 @@
 
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-// todo: remove this to use aiterTensor dtype
+#include <hip/hip_bf16.h>
+
+// The only torch dependency in this header is the t2opus mapping for torch
+// scalar types, which exists so kernels dispatched through AT_DISPATCH_* can
+// name their opus equivalent. Consumers built without torch -- anything using
+// the aiter_tensor_t entry points and the *_rmTorch dispatch macros -- define
+// AITER_TORCH_EXCLUDE, matching the torch_exclude build argument, and get the
+// rest of this header with no c10 include.
+//
+// todo: retire this entirely once t2opus callers move to aiter_tensor_t dtypes.
+#ifndef AITER_TORCH_EXCLUDE
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
-#include <hip/hip_bf16.h>
+#endif
 
 namespace aiter {
 using namespace opus;
@@ -842,6 +852,7 @@ struct t2opus<float>
 {
     using type = float;
 };
+#ifndef AITER_TORCH_EXCLUDE
 template <>
 struct t2opus<c10::Half>
 {
@@ -852,6 +863,7 @@ struct t2opus<c10::BFloat16>
 {
     using type = opus::bf16_t;
 };
+#endif
 template <>
 struct t2opus<int32_t>
 {
