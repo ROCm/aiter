@@ -83,7 +83,7 @@ def persistent_lean_attention(
         f"LEAN_ATTEN: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
     )
     if config is None:
-        config = _get_config(causal=causal, batch_size=batch_size)
+        config = _get_config()
     sm_count = arch_info.get_num_sms()
     total_programs = (
         program_count
