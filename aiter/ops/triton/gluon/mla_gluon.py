@@ -46,7 +46,9 @@
 # isort and black disagree here: isort wants two blank lines after this block,
 # black folds them back to one because the `# fmt: off` below starts a
 # formatting-disabled region. black is the one CI enforces, so it wins.
-import torch  # noqa: I001
+import os
+
+import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -54,6 +56,22 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
+# M-pack (MFMA M-dim packing) for MTP: pack the qlen query positions into the MFMA
+# M dimension by reusing bh64's BLOCK_H=64 / warps_per_cta=[4,1] layouts (regime
+# 'bh16mpack'). Each M-row is a (q_pos, head) pair (BLOCK_H_PER_Q=16 rows per
+# q_pos), KV is loaded once per (batch, split) WG and shared across the packed
+# rows, and each of the 4 warps owns a [16, 512] acc slice (baseline VGPRs, no
+# spill). BLOCK_H=64 packs 4 q_pos; for qlen>4 the positions tile over cdiv(qlen,4)
+# "qblocks" on grid axis 2, so KV is re-read cdiv(qlen,4)x instead of qlen times
+# (the grid-axis MTP path). M-pack wins when batch*qlen is large: the grid-axis
+# path is then split-starved (NUM_KV_SPLITS collapses to 1) and re-reads each
+# sequence's KV qlen times, while M-pack reads it once.
+#
+# AITER_MLA_GLUON_MPACK: "auto" (default) enables M-pack only in its winning
+# regime (batch*qlen large, or large-ctx large-qlen); "1" forces it on for any
+# supported MTP shape; "0" forces off.
+_MPACK_MODE = os.environ.get("AITER_MLA_GLUON_MPACK", "auto").lower()
 
 # fmt: off
 @gluon.jit
@@ -129,6 +147,16 @@ def _mla_gluon(
         split_kv_id = gl.program_id(1)
         cur_head_id = gl.program_id(2) % NUM_M_BLOCKS
         q_pos = gl.program_id(2) // NUM_M_BLOCKS
+
+    # M-pack: pack QPOS_PER_BLOCK query positions into the MFMA M dimension
+    # (BLOCK_H_PER_Q=16 rows per q_pos). Grid axis 2 then carries the qblock index,
+    # so a packed row's absolute q_pos is mpack_qpos_base + row // BLOCK_H_PER_Q.
+    # For nhead <= 16 bh16mpack has NUM_M_BLOCKS==1, so cur_head_id==0 and q_pos
+    # (above) is the qblock index. Non-M-pack regimes leave mpack_qpos_base unused.
+    M_PACK: gl.constexpr = REGIME == 'bh16mpack'
+    BLOCK_H_PER_Q: gl.constexpr = 16
+    QPOS_PER_BLOCK: gl.constexpr = BLOCK_H // BLOCK_H_PER_Q
+    mpack_qpos_base = q_pos * QPOS_PER_BLOCK
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -337,7 +365,8 @@ def _mla_gluon(
 
     # linear_v: each regime has unique warp/reg mapping (bh64 has degenerate warp_bases,
     # bh16bn128 has an extra K reg base for the 128-wide K, bh16bn64 has the bh16 warp layout at 64-wide K).
-    if REGIME == 'bh64':
+    # bh16mpack reuses bh64's BLOCK_H=64 / [4,1] layout, so it shares bh64's linear_v.
+    if REGIME == 'bh64' or REGIME == 'bh16mpack':
         linear_v: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
             lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
@@ -373,24 +402,56 @@ def _mla_gluon(
         buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
     # load q_nope
+    # M-pack: M-row -> (q_pos = mpack_qpos_base + row // BLOCK_H_PER_Q,
+    # head = row % BLOCK_H_PER_Q); rows with q_pos>=QLEN or head>=NHEAD are masked.
+    # Non-M-pack: row -> head, q_pos comes from the grid.
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
-    cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
-    offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+    row_m_qn = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
+    cur_head = cur_head_id * BLOCK_H + row_m_qn
     ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
+    if M_PACK:
+        qpos_qn = mpack_qpos_base + row_m_qn // BLOCK_H_PER_Q
+        head_qn = row_m_qn % BLOCK_H_PER_Q
+        offs_q_nope = cur_batch * stride_q_nope_bs + qpos_qn[:, None] * stride_q_nope_s + head_qn[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+        mask_qn = ((qpos_qn < QLEN) & (head_qn < NHEAD))[:, None]
+    else:
+        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+        mask_qn = (cur_head < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask=mask_qn)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
     if HAS_PE:
         offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
-        cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
-        offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
+        row_m_qpe = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
+        cur_head_qpe = cur_head_id * BLOCK_H + row_m_qpe
+        if M_PACK:
+            qpos_qpe = mpack_qpos_base + row_m_qpe // BLOCK_H_PER_Q
+            head_qpe = row_m_qpe % BLOCK_H_PER_Q
+            offs_q_pe = cur_batch * stride_q_pe_bs + qpos_qpe[:, None] * stride_q_pe_s + head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+            mask_qpe = ((qpos_qpe < QLEN) & (head_qpe < NHEAD))[:, None]
+        else:
+            offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+            mask_qpe = (cur_head_qpe < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask=mask_qpe)
         gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
     acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
+
+    # M-pack per-row causal bound: each M-row maps to q_pos = mpack_qpos_base +
+    # row // BLOCK_H_PER_Q, so its valid-KV upper bound is min(split_kv_end,
+    # seq_len - QLEN + q_pos + 1). Built as a [BLOCK_H] vector in the M (row)
+    # reduction layout so the score mask below is per-row (vs the scalar score_end
+    # used by the grid-axis path, where q_pos is a single grid value).
+    if M_PACK:
+        row_m_se = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+        qpos_se = mpack_qpos_base + row_m_se // BLOCK_H_PER_Q
+        if QLEN > 1:
+            score_end_m = gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + qpos_se + 1)
+        else:
+            score_end_m = qpos_se * 0 + split_kv_end
 
     # Fold KV dequant scale into the QK temperature. For fp8 KV the real
     # logits are (Q @ K_fp8^T) * kv_scale * sm_scale; softmax is shift- but
@@ -557,7 +618,10 @@ def _mla_gluon(
         #### dot, softmax, dot (part1)
         qk *= qk_scale
         offs_n_qk = split_kv_start + i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        if M_PACK:
+            qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         LOG2E: gl.constexpr = 1.4426950408889634
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
@@ -631,7 +695,10 @@ def _mla_gluon(
             qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
         qk *= qk_scale
         offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        if M_PACK:
+            qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
         p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
@@ -664,7 +731,10 @@ def _mla_gluon(
         qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
     qk *= qk_scale
     offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-    qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+    if M_PACK:
+        qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+    else:
+        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
     re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
     p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
@@ -682,9 +752,20 @@ def _mla_gluon(
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
-    cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+    # M-pack: M-row -> (q_pos = mpack_qpos_base + row // BLOCK_H_PER_Q,
+    # head = row % BLOCK_H_PER_Q), so the O/lse store address uses per-row q_pos
+    # and head, masked to valid (q_pos < QLEN, head < NHEAD). Non-M-pack: row ->
+    # head, q_pos from the grid.
+    row_o = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+    cur_head_o = cur_head_id * BLOCK_H + row_o
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
-    offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
+    if M_PACK:
+        qpos_o = mpack_qpos_base + row_o // BLOCK_H_PER_Q
+        head_o = row_o % BLOCK_H_PER_Q
+        valid_o = (qpos_o < QLEN) & (head_o < NHEAD)
+        offs_o = cur_batch * stride_o_b + qpos_o[:, None] * stride_o_s + head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
+    else:
+        offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
 
     if HAS_ATTN_SINK:
         # Fold the optional per-head sink into the softmax denom (no V contribution).
@@ -702,29 +783,46 @@ def _mla_gluon(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-    if NHEAD % BLOCK_H != 0:
+    if M_PACK:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=valid_o[:, None])
+    elif NHEAD % BLOCK_H != 0:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
 
     ### store lse
     blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
-    cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
+    row_lse = gl.arange(0, BLOCK_H, layout=blocked_lse)
+    cur_head_lse = cur_head_id * BLOCK_H + row_lse
+    if M_PACK:
+        qpos_lse = mpack_qpos_base + row_lse // BLOCK_H_PER_Q
+        head_lse = row_lse % BLOCK_H_PER_Q
+        valid_lse = (qpos_lse < QLEN) & (head_lse < NHEAD)
     if RETURN_LSE and NUM_KV_SPLITS == 1:
         # split==1: single split is the whole sequence, so its lse is the final lse.
-        offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
+        if M_PACK:
+            offs_final_lse = cur_batch * stride_final_lse_b + qpos_lse * stride_final_lse_s + head_lse * stride_final_lse_h
+        else:
+            offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD % BLOCK_H != 0:
+        if M_PACK:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=valid_lse)
+        elif NHEAD % BLOCK_H != 0:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
-        offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+        if M_PACK:
+            offs_mid_lse = cur_batch * stride_mid_lse_b + qpos_lse * stride_mid_lse_s + head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+        else:
+            offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD % BLOCK_H != 0:
+        if M_PACK:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=valid_lse)
+        elif NHEAD % BLOCK_H != 0:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
@@ -840,9 +938,12 @@ def mla_gluon(
     [batch, qlen, nhead, dim]. qlen is a runtime value (one compiled kernel
     serves any qlen). Each query position q_pos attends KV [0, seq_len-qlen+q_pos]
     (causal tail). The plain-decode 3-D path ([batch, nhead, dim], qlen=1) is
-    unchanged. Implementation: q_pos is an extra grid axis, so KV is currently
-    re-read per q_pos, but those re-reads are mostly served from L2/MALL cache so
-    the path is efficient at ctx<=16384.
+    unchanged. Implementation: q_pos is an extra grid axis, so KV is re-read per
+    q_pos, but those re-reads are mostly served from L2/MALL cache so the path is
+    efficient at ctx<=16384. For bf16-KV MTP with small nhead the M-pack regime
+    (bh16mpack) instead packs the q_pos into the MFMA M dimension, reading KV once
+    per (batch, split) WG; it is auto-selected when batch*qlen is large (see
+    AITER_MLA_GLUON_MPACK) and wins there because the grid-axis path is split-starved.
 
     return_lse=False (default): returns (o, None).
 
@@ -887,8 +988,38 @@ def mla_gluon(
     if attn_sink is None:
         attn_sink = torch.empty(1, device=o.device, dtype=torch.float32)  # dummy ptr
 
-    # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path:
-    # q_pos is grid axis 2, so each query position is a separate program.
+    # M-pack (bf16-KV MTP, small nhead): pack the qlen query positions into the
+    # MFMA M dimension (regime 'bh16mpack') instead of the grid-axis path. Wins when
+    # batch*qlen is large (grid-axis is split-starved and re-reads KV qlen times) or
+    # at large ctx with large qlen. Supported for nhead<=16, bf16 KV, qlen in [2,17].
+    mpack_supported = (
+        (1 <= nhead <= 16) and (kv_c.dtype == torch.bfloat16) and (2 <= qlen <= 17)
+    )
+    if _MPACK_MODE == "1":
+        use_mpack = mpack_supported
+    elif _MPACK_MODE == "0":
+        use_mpack = False
+    else:  # "auto": only the regime where M-pack beats the grid-axis path.
+        # (1) batch*qlen >= 256: grid-axis is split-starved (NUM_KV_SPLITS=1) and
+        #     multi-wave -> M-pack wins regardless of ctx. ==256: gate on ctx>=2048.
+        # (2) Small-batch large-qlen large-ctx: grid-axis re-reads KV qlen times;
+        #     once the KV working set no longer fits cache AND qlen amplifies the
+        #     re-reads, M-pack (cdiv(qlen,4)x) wins even though batch*qlen<256.
+        #     Conservative floor (batch decides cache residency; b1 never wins):
+        #     ctx>=12288 with (b>=4 & q>=5) or (b>=2 & q>=12).
+        use_mpack = mpack_supported and (
+            batch_size * qlen > 256
+            or (batch_size * qlen == 256 and min_kv_seq_len >= 2048)
+            or (
+                min_kv_seq_len >= 12288
+                and (
+                    (batch_size >= 4 and qlen >= 5) or (batch_size >= 2 and qlen >= 12)
+                )
+            )
+        )
+
+    # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path unless
+    # M-pack is selected (bh16mpack), which packs q_pos into the MFMA M dimension.
     if nhead in (64, 128):
         REGIME = "bh64"
     elif 1 <= nhead <= 96:
@@ -896,7 +1027,9 @@ def mla_gluon(
         # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
         # nhead > 16 (e.g. 96) adds head-block programs. A partial last block
         # (nhead % 16 != 0) masks OOB heads on Q load / O store.
-        if kv_c.dtype == torch.bfloat16:
+        if use_mpack:
+            REGIME = "bh16mpack"
+        elif kv_c.dtype == torch.bfloat16:
             REGIME = "bh16bn64"
         elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
             REGIME = "bh16bn128"
@@ -910,6 +1043,14 @@ def mla_gluon(
         )
 
     PAGE_SIZE = 1
+
+    # M-pack packs QPOS_PER_BLOCK=4 query positions into the MFMA M dimension (grid
+    # axis 2 then carries the qblock index cdiv(qlen,4), not the raw q_pos). Keep
+    # MPACK_QPOS_PER_BLOCK in sync with BLOCK_H // BLOCK_H_PER_Q (=16) in the kernel.
+    MPACK_QPOS_PER_BLOCK = 4
+    split_qlen = (
+        triton.cdiv(qlen, MPACK_QPOS_PER_BLOCK) if REGIME == "bh16mpack" else qlen
+    )
 
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
@@ -931,6 +1072,31 @@ def mla_gluon(
         assert (
             min_kv_seq_len > min_kv_seq_len_required
         ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
+        assert (
+            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        assert (
+            kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
+        ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
+    elif REGIME == "bh16mpack":
+        # M-pack: BLOCK_H=64 packs QPOS_PER_BLOCK=4 query positions into the MFMA M
+        # dimension (16 rows/q_pos), reusing bh64's [4,1] warp layout so each warp
+        # keeps a [16,512] acc (baseline VGPRs, no spill). For qlen>4 the positions
+        # tile over cdiv(qlen,4) qblocks on grid axis 2, so KV is re-read cdiv(qlen,4)x
+        # (vs qlen times for the grid-axis path). Keeping BLOCK_H=64 (vs a single
+        # BLOCK_H=128 block) preserves occupancy.
+        BLOCK_H = 64
+        BLOCK_N = 64
+        NUM_XCDS = 1  # unused by 2-D split grid mapping
+        # Fill ~256 WGs (total WGs = batch * split_qlen(qblocks) * NUM_KV_SPLITS),
+        # bounded by the shortest seq's block count so every split holds >= 1 block.
+        NUM_KV_SPLITS = max(
+            1,
+            min(
+                256 // (batch_size * split_qlen),
+                triton.cdiv(min_kv_seq_len, BLOCK_N),
+            ),
+        )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -1051,9 +1217,10 @@ def mla_gluon(
         )
     else:
         # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
-        # times qlen query positions. For nhead <= 16 this is just qlen (one head
-        # block), i.e. the original grid-axis MTP mapping.
-        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
+        # times split_qlen. For the grid-axis path split_qlen == qlen (one program
+        # per q_pos); for M-pack (bh16mpack) split_qlen == cdiv(qlen, 4) qblocks and
+        # cdiv(nhead, BLOCK_H) == 1 (nhead <= 16, BLOCK_H=64), so axis 2 is the qblock.
+        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * split_qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_gluon[grid](
