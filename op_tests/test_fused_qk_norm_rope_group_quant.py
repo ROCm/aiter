@@ -59,9 +59,19 @@ _FP8_MX_DTYPE = (
     MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
 )
 _DEV = "cuda"
+# Positive allow-list: an unknown new card must not silently run an unbuilt
+# kernel. The fused SWA scatter rides the same HIP op, so no extra gate.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 PE_BYTE_OFFSET = 464
 # MI355X HBM3e peak. Used only for the "%peak" perf column.
 _PEAK_BW_GBPS = 8000.0
+# Pin the arg-rotation count. Left to itself, run_perftest derives it from
+# `free_memory` at call time, so two candidates timed in one process rotate a
+# different number of times, land in different L2 states, and their `us`
+# columns stop being comparable -- on a box whose VRAM is mostly held by other
+# processes this reached 1.4x of pure artefact between the paged and direct
+# SWA modes, whose real GPU-side durations are within 4% of each other.
+_ROTATE = 4
 
 
 # ============================================================================
@@ -221,6 +231,7 @@ def test_fused_qk_norm_rope_group_quant(
         k_rope_buff=k_rope_buff,
         quant_group_size=G,
         scale_dtype="e8m0",
+        num_rotate_args=_ROTATE,
     )
 
     # --- Accuracy ---
@@ -334,6 +345,7 @@ def test_fused_qk_norm_rope_group_quant(
                 quant=q_fp8,
                 quant_group_size=(G if q_fp8 else None),
                 scale_dtype=("e8m0" if q_fp8 else "fp32"),
+                num_rotate_args=_ROTATE,
             )
         except Exception:  # noqa: BLE001
             fly_us = float("nan")
@@ -383,10 +395,15 @@ def test_fused_qk_norm_rope_group_quant(
 #   swa_rope[row, :] = k_rope_buff[t]         (rope bf16)
 # batch_id == -1 (CG-pad) or phys == -1 (outside SWA window) skips.
 #
+# The same scatter also has a DIRECT mode, where the caller resolves the row itself
+# and passes swa_dest_row[t] instead of a block table (row == -1 skips that token).
+#
 # Verification strategy: run the kernel, then REPLAY the scatter in python from the
 # kernel's own main K outputs and compare byte-exact to the SWA pool. This validates
 # the paged addressing + the verbatim entry copy (incl. the duplicated scale + pad)
 # independently of the quant math (which the main test above already checks vs ref).
+# Direct mode is then fed the rows paged mode just computed and must land the same
+# bytes, plus one token dropped via -1 to cover the per-token skip.
 
 
 def _build_swa_batch(T, block_size):
@@ -467,7 +484,38 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     swa_nope = torch.zeros(num_rows, entry, dtype=_FP8, device=_DEV)
     swa_rope = torch.zeros(num_rows, RD, dtype=torch.bfloat16, device=_DEV)
 
-    (q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff), us = run_perftest(
+    # Correctness and perf are measured SEPARATELY. The SWA pools are written
+    # in place, and run_perftest rotates its args across deep copies of every
+    # tensor -- the pool inspected below would then be written by some subset
+    # of the iterations while the returned buffers come from another, which
+    # makes the byte-exact comparison intermittently fail. One untimed launch
+    # owns correctness; the timed launches below scatter into scratch pools and
+    # their outputs are discarded.
+    q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff = (
+        aiter.fused_qk_norm_rope_group_quant(
+            q,
+            kv,
+            kw,
+            pos,
+            cos,
+            sin,
+            eps,
+            is_neox=is_neox,
+            q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
+            q_nope_scale_buff=q_nope_scale_buff,
+            q_rope_buff=q_rope_buff,
+            k_nope_scale_buff=k_nope_scale_buff,
+            k_rope_buff=k_rope_buff,
+            quant_group_size=G,
+            scale_dtype="e8m0",
+            swa_nope_scale_buff=swa_nope,
+            swa_rope_buff=swa_rope,
+            swa_block_tables=swa_block_tables,
+            swa_block_size=block_size,
+            batch_id_per_token=bid,
+        )
+    )
+    _, us = run_perftest(
         aiter.fused_qk_norm_rope_group_quant,
         q,
         kv,
@@ -478,17 +526,18 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         eps,
         is_neox=is_neox,
         q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
-        q_nope_scale_buff=q_nope_scale_buff,
-        q_rope_buff=q_rope_buff,
-        k_nope_scale_buff=k_nope_scale_buff,
-        k_rope_buff=k_rope_buff,
+        q_nope_scale_buff=torch.empty_like(q_nope_scale_buff),
+        q_rope_buff=(None if q_rope_buff is None else torch.empty_like(q_rope_buff)),
+        k_nope_scale_buff=torch.empty_like(k_nope_scale_buff),
+        k_rope_buff=torch.empty_like(k_rope_buff),
         quant_group_size=G,
         scale_dtype="e8m0",
-        swa_nope_scale_buff=swa_nope,
-        swa_rope_buff=swa_rope,
+        swa_nope_scale_buff=torch.zeros_like(swa_nope),
+        swa_rope_buff=torch.zeros_like(swa_rope),
         swa_block_tables=swa_block_tables,
         swa_block_size=block_size,
         batch_id_per_token=bid,
+        num_rotate_args=_ROTATE,
     )
 
     # --- Main K cache still correct (sanity vs reference) ---
@@ -549,6 +598,99 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         msg="SWA rope bf16 (exact)",
     )
 
+    # --- Direct mode (swa_dest_row) must reproduce the paged result ---
+    # Same batch, but the host resolves each token's row itself -- exactly the
+    # row paged mode just computed -- and hands it over per token. The two
+    # addressing modes must put identical bytes in identical places. One
+    # otherwise-valid token is then marked -1 to exercise the per-token skip,
+    # which paged mode cannot express at all (its only skip is per block).
+    dest_cpu = [-1] * T
+    for t in range(T):
+        b = bid_cpu[t]
+        if b < 0:
+            continue
+        phys = int(block_tables_cpu[b, pos_cpu[t] // block_size])
+        if phys < 0:
+            continue
+        dest_cpu[t] = phys * block_size + pos_cpu[t] % block_size
+    written_ts = [t for t in range(T) if dest_cpu[t] >= 0]
+    skipped_t = written_ts[-1] if written_ts else -1
+    skipped_row = dest_cpu[skipped_t] if skipped_t >= 0 else -1
+    if skipped_t >= 0:
+        dest_cpu[skipped_t] = -1
+    dest_row = torch.tensor(dest_cpu, dtype=torch.int32, device=_DEV)
+
+    swa_nope_d = torch.zeros_like(swa_nope)
+    swa_rope_d = torch.zeros_like(swa_rope)
+    # Untimed launch owns the byte-exact comparison (see the paged call above
+    # for why rotation and an in-place pool cannot share one launch).
+    aiter.fused_qk_norm_rope_group_quant(
+        q,
+        kv,
+        kw,
+        pos,
+        cos,
+        sin,
+        eps,
+        is_neox=is_neox,
+        q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
+        q_nope_scale_buff=torch.zeros_like(q_nope_scale_buff),
+        q_rope_buff=(None if q_rope_buff is None else torch.empty_like(q_rope_buff)),
+        k_nope_scale_buff=torch.zeros_like(k_nope_scale_buff),
+        k_rope_buff=torch.empty_like(k_rope_buff),
+        quant_group_size=G,
+        scale_dtype="e8m0",
+        swa_nope_scale_buff=swa_nope_d,
+        swa_rope_buff=swa_rope_d,
+        swa_dest_row=dest_row,
+        batch_id_per_token=bid,
+    )
+    _, us_direct = run_perftest(
+        aiter.fused_qk_norm_rope_group_quant,
+        q,
+        kv,
+        kw,
+        pos,
+        cos,
+        sin,
+        eps,
+        is_neox=is_neox,
+        q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
+        q_nope_scale_buff=torch.zeros_like(q_nope_scale_buff),
+        q_rope_buff=(None if q_rope_buff is None else torch.empty_like(q_rope_buff)),
+        k_nope_scale_buff=torch.zeros_like(k_nope_scale_buff),
+        k_rope_buff=torch.empty_like(k_rope_buff),
+        quant_group_size=G,
+        scale_dtype="e8m0",
+        swa_nope_scale_buff=torch.zeros_like(swa_nope_d),
+        swa_rope_buff=torch.zeros_like(swa_rope_d),
+        swa_dest_row=dest_row,
+        batch_id_per_token=bid,
+        num_rotate_args=_ROTATE,
+    )
+    # The collision-free layout gives each row at most one writer, so dropping
+    # one token means exactly one row reverts to zero.
+    exp_nope_d, exp_rope_d = exp_nope.clone(), exp_rope.clone()
+    if skipped_row >= 0:
+        exp_nope_d[skipped_row] = 0
+        exp_rope_d[skipped_row] = 0
+    err_swa_direct = max(
+        checkAllclose(
+            swa_nope_d.view(torch.uint8).float(),
+            exp_nope_d.view(torch.uint8).float(),
+            atol=0.0,
+            rtol=0.0,
+            msg="SWA nope+scale, direct rows (byte-exact)",
+        ),
+        checkAllclose(
+            swa_rope_d.float(),
+            exp_rope_d.float(),
+            atol=0.0,
+            rtol=0.0,
+            msg="SWA rope bf16, direct rows (exact)",
+        ),
+    )
+
     # --- flydsl bf16 paged-SWA write comparison ---
     # flydsl's fused SWA scatter is BF16-only (fp8+SWA is rejected), so this is the
     # only apples-ish "both fuse the SWA write" comparison: flydsl writes the full KV
@@ -577,29 +719,43 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
                 batch_id_per_token=bid,
                 swa_block_tables=swa_block_tables,
                 swa_block_size=block_size,
+                num_rotate_args=_ROTATE,
             )
         except Exception:  # noqa: BLE001
             fly_us = float("nan")
-    ratio = (
-        (us / fly_us)
-        if fly_us == fly_us and fly_us > 0  # noqa: PLR0124
-        else float("nan")
-    )
+    # RMSNorm ~4 flop/elem + GPT-J RoPE ~3 flop/elem over the RD tail, on the Q
+    # and K rows alike. Bytes: read q+kv, write the fp8 entry (+dup e8m0) and
+    # the bf16 rope buffer, plus the scattered SWA rows.
+    rows = T * H + T
+    flops = rows * D * 4 + rows * RD * 3
+    nbytes = rows * D * 2 + rows * entry + rows * RD * 2 + n_written * (entry + RD * 2)
+
+    def _tf(u):
+        return round(flops / u / 1e6, 2) if u == u and u > 0 else None  # noqa: PLR0124
+
+    def _tb(u):
+        return round(nbytes / u / 1e6, 3) if u == u and u > 0 else None  # noqa: PLR0124
 
     return {
-        "hip_us": round(us, 3),
-        "flydsl_bf16_us": (
-            round(fly_us, 3) if fly_us == fly_us else None  # noqa: PLR0124
-        ),
-        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
+        "gfx": get_gfx(),
         "bs": bs,
         "num_phys_blocks": num_phys_blocks,
         "n_pad": n_pad,
         "n_written": n_written,
+        "hip_paged us": round(us, 3),
+        "hip_paged TFLOPS": _tf(us),
+        "hip_paged TB/s": _tb(us),
+        "hip_direct us": round(us_direct, 3),
+        "hip_direct TFLOPS": _tf(us_direct),
+        "hip_direct TB/s": _tb(us_direct),
+        "flydsl_bf16 us": (
+            round(fly_us, 3) if fly_us == fly_us else None  # noqa: PLR0124
+        ),
         "err_k": err_k,
         "err_kpe": err_kpe,
         "err_swa_nope": err_swa_nope,
         "err_swa_rope": err_swa_rope,
+        "err_swa_direct": err_swa_direct,
     }
 
 
@@ -607,98 +763,109 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
 # argparse + matrix sweep
 # ============================================================================
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="aiter test for fused_qk_norm_rope_group_quant (V4, token-contiguous, no cache).",
-)
-parser.add_argument(
-    "-T",
-    "--T",
-    type=int,
-    nargs="*",
-    default=[4, 16, 64, 256, 1024, 4096, 16384],
-    help="token-count sweep. e.g. -T 4 64 1024",
-)
-parser.add_argument(
-    "--H",
-    type=int,
-    nargs="*",
-    default=[16, 128],
-    help="num-Q-heads-per-rank sweep. e.g. --H 16 128",
-)
-parser.add_argument("--D", type=int, default=512, help="head_dim (kernel MVP: 512)")
-parser.add_argument("--RD", type=int, default=64, help="rope_head_dim (RoPE tail size)")
-parser.add_argument(
-    "--G",
-    type=int,
-    nargs="*",
-    default=[32, 64],
-    choices=[32, 64],
-    help="Q quant_group_size sweep (K is always 64). e.g. --G 64",
-)
-parser.add_argument(
-    "--neox", action="store_true", help="also sweep is_neox=True (default: GPT-J only)."
-)
-parser.add_argument(
-    "--no-flydsl", action="store_true", help="skip the flydsl perf comparison."
-)
-parser.add_argument(
-    "--q-bf16", action="store_true", help="use bf16 Q (default: fp8 Q)."
-)
-parser.add_argument(
-    "--swa",
-    action="store_true",
-    help="run ONLY the fused paged-SWA write test (decode-only).",
-)
-parser.add_argument(
-    "--no-swa",
-    action="store_true",
-    help="skip the fused paged-SWA write test.",
-)
-args = parser.parse_args()
 
-if not args.no_flydsl and _FLYDSL_IMPORT_ERROR is not None:
-    aiter.logger.warning(
-        "flydsl comparison disabled: %s. Use --no-flydsl to silence this warning.",
-        _FLYDSL_IMPORT_ERROR,
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused_qk_norm_rope_group_quant unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="aiter test for fused_qk_norm_rope_group_quant (V4, token-contiguous, no cache).",
     )
+    parser.add_argument(
+        "-T",
+        "--T",
+        type=int,
+        nargs="*",
+        default=[4, 16, 64, 256, 1024, 4096, 16384],
+        help="token-count sweep. e.g. -T 4 64 1024",
+    )
+    parser.add_argument(
+        "--H",
+        type=int,
+        nargs="*",
+        default=[16, 128],
+        help="num-Q-heads-per-rank sweep. e.g. --H 16 128",
+    )
+    parser.add_argument("--D", type=int, default=512, help="head_dim (kernel MVP: 512)")
+    parser.add_argument(
+        "--RD", type=int, default=64, help="rope_head_dim (RoPE tail size)"
+    )
+    parser.add_argument(
+        "--G",
+        type=int,
+        nargs="*",
+        default=[32, 64],
+        choices=[32, 64],
+        help="Q quant_group_size sweep (K is always 64). e.g. --G 64",
+    )
+    parser.add_argument(
+        "--neox",
+        action="store_true",
+        help="also sweep is_neox=True (default: GPT-J only).",
+    )
+    parser.add_argument(
+        "--no-flydsl", action="store_true", help="skip the flydsl perf comparison."
+    )
+    parser.add_argument(
+        "--q-bf16", action="store_true", help="use bf16 Q (default: fp8 Q)."
+    )
+    parser.add_argument(
+        "--swa",
+        action="store_true",
+        help="run ONLY the fused paged-SWA write test (decode-only).",
+    )
+    parser.add_argument(
+        "--no-swa",
+        action="store_true",
+        help="skip the fused paged-SWA write test.",
+    )
+    args = parser.parse_args()
 
-neox_modes = [False, True] if args.neox else [False]
+    if not args.no_flydsl and _FLYDSL_IMPORT_ERROR is not None:
+        aiter.logger.warning(
+            "flydsl comparison disabled: %s. Use --no-flydsl to silence this warning.",
+            _FLYDSL_IMPORT_ERROR,
+        )
 
-rows = []
-q_fp8 = not args.q_bf16
-if not args.swa:
-    for G, H, neox in itertools.product(args.G, args.H, neox_modes):
-        for T in args.T:
-            rows.append(
-                test_fused_qk_norm_rope_group_quant(
-                    T,
-                    H,
-                    args.D,
-                    args.RD,
-                    is_neox=neox,
-                    q_fp8=q_fp8,
-                    G=G,
-                    GK=64,
-                    compare_flydsl=not args.no_flydsl,
+    neox_modes = [False, True] if args.neox else [False]
+
+    rows = []
+    q_fp8 = not args.q_bf16
+    if not args.swa:
+        for G, H, neox in itertools.product(args.G, args.H, neox_modes):
+            for T in args.T:
+                rows.append(
+                    test_fused_qk_norm_rope_group_quant(
+                        T,
+                        H,
+                        args.D,
+                        args.RD,
+                        is_neox=neox,
+                        q_fp8=q_fp8,
+                        G=G,
+                        GK=64,
+                        compare_flydsl=not args.no_flydsl,
+                    )
                 )
-            )
 
-    df = pd.DataFrame(rows)
-    aiter.logger.info(
-        "fused_qk_norm_rope_group_quant (V4) summary (markdown):\n%s",
-        df.to_markdown(index=False),
-    )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "fused_qk_norm_rope_group_quant (V4) summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
-# --- SWA fused paged-cache write sweep (decode-only; small T to stay off the
-# fine-grained xlarge path which does not carry the SWA scatter) ---
-if args.swa or not args.no_swa:
-    # cap T to the decode/med range (<= 1024) so the coarse kernel (shared K-wave
-    # body) runs; the fine-grained xlarge path asserts out SWA by design.
-    swa_T = [t for t in args.T if t <= 1024] or [16, 64, 256]
-    swa_rows = []
-    for G, H, neox in itertools.product(args.G, args.H, neox_modes):
-        for T in swa_T:
+    # --- SWA fused paged-cache write sweep (decode-only; small T to stay off the
+    # fine-grained xlarge path which does not carry the SWA scatter) ---
+    if args.swa or not args.no_swa:
+        # cap T to the decode/med range (<= 1024) so the coarse kernel (shared K-wave
+        # body) runs; the fine-grained xlarge path asserts out SWA by design.
+        swa_T = [t for t in args.T if t <= 1024] or [16, 64, 256]
+        swa_rows = []
+        for G, H, neox, T in itertools.product(args.G, args.H, neox_modes, swa_T):
             swa_rows.append(
                 test_fused_qk_norm_rope_group_quant_swa(
                     T,
@@ -711,8 +878,12 @@ if args.swa or not args.no_swa:
                     GK=64,
                 )
             )
-    swa_df = pd.DataFrame(swa_rows)
-    aiter.logger.info(
-        "fused_qk_norm_rope_group_quant paged-SWA write summary (markdown):\n%s",
-        swa_df.to_markdown(index=False),
-    )
+        swa_df = pd.DataFrame(swa_rows)
+        aiter.logger.info(
+            "fused_qk_norm_rope_group_quant paged-SWA write summary (markdown):\n%s",
+            swa_df.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()
