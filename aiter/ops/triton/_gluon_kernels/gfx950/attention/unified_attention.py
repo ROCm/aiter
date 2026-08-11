@@ -1020,10 +1020,11 @@ class AttentionProgram:
 
     @gluon.jit
     def softmax_part0_cdna4(self, S, M):
-        S = S * self.QK_scale
-        m_ij = gl.maximum(M, gl.max(S, axis=1))
+        # QK_scale > 0, so scaling the reduced vector is equivalent to scaling the tile.
+        # Delaying the scaling fixes certain compilation issues
+        m_ij = gl.maximum(M, gl.max(S, axis=1) * self.QK_scale)
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S - m_ij[:, None])
+        p = gl.exp2(S * self.QK_scale - m_ij[:, None])
         alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
 
