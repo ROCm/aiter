@@ -427,8 +427,14 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     constexpr int BM = 256;
     constexpr int BN = 256;
     constexpr int BK = 64;
-    __shared__ __align__(16) opus::bf16_t As[2][BK][BM];
-    __shared__ __align__(16) opus::bf16_t Bs[2][BK][BN];
+    // A 256-bf16 row is a 512-byte multiple of the LDS bank period, so every
+    // transpose read aliases the same bank phase.  Shift successive K rows by
+    // 64 bytes; this cuts the measured ds_read bank conflicts without changing
+    // the global-load or MFMA fragment layouts.
+    constexpr int LDS_PAD = 32;
+    constexpr int LD = BM + LDS_PAD;
+    __shared__ __align__(16) opus::bf16_t As[2][BK][LD];
+    __shared__ __align__(16) opus::bf16_t Bs[2][BK][LD];
 
     const int tid = threadIdx.x;
     const int lane = tid % 64;
@@ -474,7 +480,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     auto store_stage = [&](int buf, int half, const load_regs& x) {
         auto as = opus::make_smem(&As[buf][0][0]);
         auto bs = opus::make_smem(&Bs[buf][0][0]);
-        const int os = (half * 32 + load_k) * BM + load_f;
+        const int os = (half * 32 + load_k) * LD + load_f;
         as.template store<8>(x.a0, os);
         as.template store<8>(x.a1, os + 8);
         bs.template store<8>(x.b0, os);
@@ -492,7 +498,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     __syncthreads();
 
-    const auto tr_layout = opus_wgtn_make_tr_layout(lane, BM);
+    const auto tr_layout = opus_wgtn_make_tr_layout(lane, LD);
     for(int stage = 0; stage < num_k_stages; ++stage)
     {
         const int cur = stage & 1;
