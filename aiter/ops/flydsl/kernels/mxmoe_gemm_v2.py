@@ -219,6 +219,7 @@ def gemm2_body_v2(
     INTER_MAX,
     g2_kstatic=False,
     aStages,
+    a_slot_alias=False,
     a_dtype,
     use_reduce=False,
     topk=1,
@@ -585,6 +586,8 @@ def gemm2_body_v2(
                 gpu.barrier()
             issue_a_ds_read(fx.Int32(kt % aStages))
             if const_expr(kt + kStages < KT):
+                if const_expr(a_slot_alias):
+                    gpu.barrier()  # prefetch rewrites the slot just ds_read
                 issue_a_load_lds(
                     fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
                 )
@@ -694,6 +697,8 @@ def gemm2_body_v2(
             gpu.barrier()
             issue_a_ds_read(kt_rt % fx.Int32(aStages))
             nxt_a = kt_rt + fx.Int32(kStages)
+            if const_expr(a_slot_alias):
+                gpu.barrier()  # outside the runtime if: barriers must be uniform
             if nxt_a < K_TILES_RT:
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
             if const_expr(g2_ascale_pf):

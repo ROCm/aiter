@@ -22,7 +22,13 @@ from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override
 from aiter.jit.core import AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+# moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
+# glob misses gets no AOT job at all and JITs on the first inference call.
+DEFAULT_CSVS = sorted(
+    set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+    | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv"))
+    | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv"))
+)
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
@@ -48,6 +54,8 @@ def _job_key(job: dict) -> tuple:
             job["cu_num"] if job["persist"] else 0,
             job["has_pad"],
             job["out_dtype"],
+            job.get("g2_spart"),
+            job.get("g2_bf16_lds"),
         )
     if job["stage"] == 1:
         return (
@@ -162,6 +170,10 @@ def parse_csv(csv_path: str):
                         "model_dim_pad": model_dim_pad,
                         "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
                         "out_dtype": out_dtype,
+                        # In the compiled kernel tag: must match the runtime
+                        # wrapper or the AOT entry is keyed differently.
+                        "g2_spart": v2_g2["spart"],
+                        "g2_bf16_lds": v2_g2["bf16_lds"],
                     }
                 )
             elif _is_mxfp4_kname(kn2):
@@ -319,6 +331,8 @@ def _compile_v2_stage2(job):
         inter_dim_pad=job["inter_dim_pad"],
         model_dim_pad=job["model_dim_pad"],
         out_dtype=job["out_dtype"],
+        g2_spart=job.get("g2_spart"),
+        g2_bf16_lds=job.get("g2_bf16_lds"),
         stream=0,
     )
     if job["epilog"] == "reduce":

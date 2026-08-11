@@ -163,8 +163,15 @@ def compile_gemm2_a4w4_port(
     g2_bf16_lds = bool(g2_bf16_lds)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    aStages = 2 if g2_bf16_lds else 3
     c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
+    # aStages must exceed kStages: the K-loop ds_reads slot kt%aStages then
+    # prefetches kt+kStages into (kt+kStages)%aStages, so equal counts make that
+    # DMA rewrite the slot being read (cross-wave: waves DMA their own rows but
+    # ds_read all BM rows). Only bump to 3 when the C region already covers it,
+    # so lds_bytes and occupancy are unchanged; otherwise keep 2 and let
+    # a_slot_alias fence the prefetch instead.
+    aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
+    a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
@@ -281,6 +288,7 @@ def compile_gemm2_a4w4_port(
                 INTER_MAX=INTER_MAX,
                 g2_kstatic=g2_kstatic,
                 aStages=aStages,
+                a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
