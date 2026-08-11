@@ -82,6 +82,30 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "flydsl_warp_decode_down_reduce": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce",
+    ),
+    "flydsl_warp_decode_down_reduce_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_bf16",
+    ),
+    "flydsl_warp_decode_down_reduce_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_fp4",
+    ),
+    "flydsl_warp_decode_gate_up": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up",
+    ),
+    "flydsl_warp_decode_gate_up_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_bf16",
+    ),
+    "flydsl_warp_decode_gate_up_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_fp4",
+    ),
 }
 
 __all__ = [
@@ -104,6 +128,12 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "flydsl_warp_decode_down_reduce",
+    "flydsl_warp_decode_down_reduce_bf16",
+    "flydsl_warp_decode_down_reduce_fp4",
+    "flydsl_warp_decode_gate_up",
+    "flydsl_warp_decode_gate_up_bf16",
+    "flydsl_warp_decode_gate_up_fp4",
 ]
 
 

@@ -34,7 +34,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 | G7 | **s_nop-free / independent-accumulator dot2 (ILP)** | ✅ (fp8/fp4) | ❌ serialized `s_nop 2` | perf (deferred) |
 | G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2; fp4 `down` flag) | ❌ default (knob) | **perf: ~5% B=1 fp4**, neutral B≥4 |
 | G9 | **CK-Tile cross-benchmark harness** | ✅ (`ck_bench_*.cpp` + compare) | ❌ | validation |
-| G10 | **Package public API registration** (`__init__.py`) | ✅ | ❌ | integration |
+| G10 | **Package public API registration** (`__init__.py`) | ✅ | ✅ (2026-08-11; all 6 entry points) | integration |
 
 FP8/MXFP8 **activation** input is missing from *both* (both take BF16 activations).
 Not a WIP-specific gap, but an unaddressed ticket datatype target — tracked as follow-on.
@@ -393,8 +393,10 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `ck_bench_warp_decode.cpp`), run both, join via `compare_bart.py`, and record a
       FlyDSL/CK ratio table for DeepSeek-V3 / MiniMax / Qwen3Next at B∈{1,2,4,8}. This is the
       original plan's last open Phase-4 item.
-- [ ] **Register** `flydsl_warp_decode_gate_up` / `flydsl_warp_decode_down_reduce` in
-      `aiter/ops/flydsl/__init__.py` (behind `is_flydsl_available()`), add to `__all__`.
+- [x] **Register** the warp-decode entry points in `aiter/ops/flydsl/__init__.py` (behind
+      `is_flydsl_available()`, added to `__all__`) — 2026-08-11. All **six** public entry points
+      exported: `flydsl_warp_decode_{gate_up,down_reduce}` (FP8) + `_fp4` (MXFP4, ticket #1) +
+      `_bf16` (unquantized oracle). Verified import + `__all__` membership in `flydsl_venv`.
 - [ ] Extend the op_test perf sweep to **B∈{1,2,4,8,32}** across MiniMax + Qwen3Next-TP1 and
       all shipped dtypes, closing the coverage matrix (§8.2); feed the same shapes to CK.
 
@@ -585,3 +587,11 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   decode is bit-exact vs `fp4_utils.e8m0_to_f32` (normal range). Recorded the `src_sel_index`
   `I32Attr` compile-time-constant gotcha. Marked the §3 feasibility rows ✅ measured and added
   a Phase B "primitives de-risked" checkbox. **Next substantive step: `build_down_reduce_fp4_module`.**
+- _G5 split-K closed as a no-win (2026-08-11)_ — implemented + CU-gated down split-K, but the
+  Step 3 A/B (kernel-only + end-to-end) showed no decode win (≤1.03×, k8 regresses; ~2× end-to-end
+  via v1 zeros+finalize) because B=1 warp-decode is launch/memory-latency-floor bound. Gated off by
+  default; live impl archived on `samaario/warp-decode-moe-splitk-attic`. See the Split-K sub-plan.
+- _G10 done — public API registered (2026-08-11)_ — exported all six warp-decode entry points
+  (FP8 + MXFP4 + BF16, both stages) from `aiter/ops/flydsl/__init__.py` behind `is_flydsl_available()`
+  and added to `__all__`; verified import + membership in `flydsl_venv`. **Remaining Phase F: G9 CK
+  side-by-side + widen the perf sweep (§8.2).**
