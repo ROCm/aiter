@@ -2,8 +2,9 @@
 
 Two layouts: THD packed [total_tokens, H, D] with variable-length sequences
 via cu_seqlens, and batched BSHD [B, S, H, D] with a uniform seq_len. Covers
-causal, non-causal, sq!=sk, seqlen_k==0, mixed zero/nonzero batches, GQA, and
-return_lse. Both suites run by default; --varlen or --batch runs just one.
+causal, non-causal, sq!=sk, seqlen_k==0, mixed zero/nonzero batches, GQA,
+attention sink, and return_lse. Both suites run by default; --varlen or --batch
+runs just one.
 
 Usage:
     python op_tests/test_mha_flydsl.py
@@ -73,7 +74,24 @@ def _causal_mask(sq, sk, device):
     )
 
 
-def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
+def _make_sink(nheads_q, device):
+    """Per-head fp32 sink logits in the scaled-score domain (one extra virtual
+    zero-value KV column in the softmax denominator). Spread so some heads' sink
+    dominates the running max and some are negligible."""
+    return torch.linspace(-2.0, 5.0, nheads_q, dtype=torch.float32, device=device)
+
+
+def _apply_sink(qk, sink):
+    """Append the per-head virtual sink column to scaled scores ``qk``
+    ([H_q, sq, sk]) so softmax/logsumexp pick it up. Returns qk unchanged when
+    ``sink`` is None."""
+    if sink is None:
+        return qk
+    sink_col = sink.to(qk.dtype).view(-1, 1, 1).expand(qk.shape[0], qk.shape[1], 1)
+    return torch.cat([qk, sink_col], dim=-1)
+
+
+def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False, sink=None):
     """PyTorch reference for varlen THD layout, per-batch."""
     B = len(cu_q) - 1
     gqa = q.shape[1] // k.shape[1]  # q head h reads kv head h // gqa
@@ -89,11 +107,14 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
         if causal:
             mask = _causal_mask(sq, sk, qk.device)
             qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
+        qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
         if return_lse:
-            lse_b = torch.logsumexp(qk, dim=-1)
+            lse_b = torch.logsumexp(qk_aug, dim=-1)
             lses.append(lse_b)
-        p = torch.softmax(qk, dim=-1)
+        p = torch.softmax(qk_aug, dim=-1)
         p = torch.nan_to_num(p, nan=0.0)  # all-masked rows: softmax(-inf)=NaN → 0
+        if sink is not None:
+            p = p[..., :-1]  # drop virtual sink column (zero-value → 0 contribution)
         ob = torch.bmm(p, vb.permute(1, 0, 2))
         outs.append(ob.permute(1, 0, 2))
     if return_lse:
@@ -110,6 +131,7 @@ def run_varlen_test(
     d_v=HEAD_DIM_V,
     causal=False,
     return_lse=False,
+    sink=False,
     warmup=1,
     repeat=5,
 ):
@@ -132,6 +154,8 @@ def run_varlen_test(
     v = torch.randn(total_k, H_kv, d_v, dtype=torch.bfloat16, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
+    # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
+    sink_t = _make_sink(H_q, device) if sink else None
 
     cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
     cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
@@ -148,6 +172,7 @@ def run_varlen_test(
             softmax_scale=scale,
             causal=causal,
             return_lse=return_lse,
+            sink_ptr=sink_t,
         )
 
     avg_ms = _time_fn(_run, warmup, repeat)
@@ -165,7 +190,7 @@ def run_varlen_test(
     seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
     tag = (
         f"thd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} seqs={seqs} "
-        f"causal={causal} lse={return_lse}"
+        f"causal={causal} lse={return_lse} sink={sink}"
     )
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
@@ -178,6 +203,7 @@ def run_varlen_test(
         scale,
         causal=causal,
         return_lse=return_lse,
+        sink=sink_t,
     )
     if return_lse:
         ref, ref_lses = ref_result
@@ -234,6 +260,7 @@ def run_varlen_test(
         "seqs_k": [cu_k[i + 1] - cu_k[i] for i in range(B)],
         "causal": causal,
         "lse": return_lse,
+        "sink": sink,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -241,7 +268,7 @@ def run_varlen_test(
     return passed, ret
 
 
-def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False):
+def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False, sink=None):
     """PyTorch reference for batched BSHD layout, per-batch.
 
     Loops over the batch so peak scratch stays at one [H_q, sq, sk] score
@@ -260,10 +287,13 @@ def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False):
         if causal:
             mask = _causal_mask(sq, sk, qk.device)
             qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
+        qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
         if return_lse:
-            lses.append(torch.logsumexp(qk, dim=-1))  # [H_q, sq]
-        p = torch.softmax(qk, dim=-1)
+            lses.append(torch.logsumexp(qk_aug, dim=-1))  # [H_q, sq]
+        p = torch.softmax(qk_aug, dim=-1)
         p = torch.nan_to_num(p, nan=0.0)
+        if sink is not None:
+            p = p[..., :-1]  # drop virtual sink column (zero-value → 0 contribution)
         outs.append(torch.bmm(p, vb).permute(1, 0, 2))  # [sq, H_q, d_v]
     out = torch.stack(outs, dim=0)
     if return_lse:
@@ -281,6 +311,7 @@ def run_batch_test(
     d_v=128,
     causal=False,
     return_lse=False,
+    sink=False,
     warmup=1,
     repeat=5,
 ):
@@ -297,6 +328,8 @@ def run_batch_test(
     v = torch.randn(B, sk, H_kv, d_v, dtype=torch.bfloat16, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
+    # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
+    sink_t = _make_sink(H_q, device) if sink else None
 
     def _run():
         return flash_attn_func(
@@ -306,11 +339,12 @@ def run_batch_test(
             softmax_scale=scale,
             causal=causal,
             return_lse=return_lse,
+            sink_ptr=sink_t,
         )
 
     tag = (
         f"bshd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} sq={sq} sk={sk} "
-        f"causal={causal} lse={return_lse}"
+        f"causal={causal} lse={return_lse} sink={sink}"
     )
 
     avg_ms = _time_fn(_run, warmup, repeat)
@@ -327,7 +361,9 @@ def run_batch_test(
 
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
-    ref_result = _ref_mha_batch(q, k, v, scale, causal=causal, return_lse=return_lse)
+    ref_result = _ref_mha_batch(
+        q, k, v, scale, causal=causal, return_lse=return_lse, sink=sink_t
+    )
     if return_lse:
         ref, ref_lse = ref_result
     else:
@@ -362,6 +398,7 @@ def run_batch_test(
         "seqs_k": [sk] * B,
         "causal": causal,
         "lse": return_lse,
+        "sink": sink,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -530,6 +567,15 @@ if __name__ == "__main__":
         help="Return LSE: true/false. Default runs both.\ne.g.: -l false",
     )
     parser.add_argument(
+        "-s",
+        "--sink",
+        type=str,
+        default=None,
+        help="Attention sink: true/false. Default runs both.\n"
+        "Only the m16x8 (d_qk=d_v=128) path supports sink; skipped elsewhere.\n"
+        "e.g.: -s true",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=2,
@@ -610,6 +656,7 @@ if __name__ == "__main__":
 
     causal_filter = _parse_bool(args.causal)
     lse_filter = _parse_bool(args.return_lse)
+    sink_filter = _parse_bool(args.sink)
     single_shape = all(
         x is not None
         for x in [args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k]
@@ -748,6 +795,13 @@ if __name__ == "__main__":
 
     causal_list = [causal_filter] if causal_filter is not None else [False, True]
     lse_list = [lse_filter] if lse_filter is not None else [False, True]
+    sink_list = [sink_filter] if sink_filter is not None else [False, True]
+
+    # Attention sink is served only by the m16x8 (d_qk=d_v=128) kernel; skip the
+    # sink=True axis for any other head-dim so we don't test a config that falls
+    # through to CK (which would drop the sink term for this path).
+    def _sink_axis(d_qk, d_v):
+        return sink_list if (d_qk, d_v) == (128, 128) else [s for s in sink_list if not s]
 
     tests = []
     if run_thd:
@@ -757,9 +811,21 @@ if __name__ == "__main__":
                 H_kv = shape[3] if len(shape) > 3 else H
                 for causal in causal_list:
                     for return_lse in lse_list:
-                        tests.append(
-                            ("thd", cu_q, cu_k, H, H_kv, d_qk, d_v, causal, return_lse)
-                        )
+                        for sink in _sink_axis(d_qk, d_v):
+                            tests.append(
+                                (
+                                    "thd",
+                                    cu_q,
+                                    cu_k,
+                                    H,
+                                    H_kv,
+                                    d_qk,
+                                    d_v,
+                                    causal,
+                                    return_lse,
+                                    sink,
+                                )
+                            )
     if run_bshd:
         for d_qk, d_v in args.batch_d_qk_v:
             for shape in batch_shapes:
@@ -767,20 +833,22 @@ if __name__ == "__main__":
                 H_kv = shape[4] if len(shape) > 4 else H
                 for causal in causal_list:
                     for return_lse in lse_list:
-                        tests.append(
-                            (
-                                "bshd",
-                                bs,
-                                sq_i,
-                                sk_i,
-                                H,
-                                H_kv,
-                                d_qk,
-                                d_v,
-                                causal,
-                                return_lse,
+                        for sink in _sink_axis(d_qk, d_v):
+                            tests.append(
+                                (
+                                    "bshd",
+                                    bs,
+                                    sq_i,
+                                    sk_i,
+                                    H,
+                                    H_kv,
+                                    d_qk,
+                                    d_v,
+                                    causal,
+                                    return_lse,
+                                    sink,
+                                )
                             )
-                        )
 
     if args.cmp_triton:
         from aiter.ops.triton.attention.mha import (
@@ -790,10 +858,10 @@ if __name__ == "__main__":
     n_pass = 0
     collected = []
     for case in tests:
-        causal, return_lse = case[-2], case[-1]
+        causal, return_lse, sink = case[-3], case[-2], case[-1]
         try:
             if case[0] == "thd":
-                _, cu_q, cu_k, H, H_kv, d_qk, d_v, _, _ = case
+                _, cu_q, cu_k, H, H_kv, d_qk, d_v, _, _, _ = case
                 ok, ret = run_varlen_test(
                     cu_q,
                     cu_k,
@@ -803,6 +871,7 @@ if __name__ == "__main__":
                     d_v=d_v,
                     causal=causal,
                     return_lse=return_lse,
+                    sink=sink,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
@@ -844,7 +913,7 @@ if __name__ == "__main__":
                     ret["triton_tflops"] = round(_tflops(fwd_flop, tri_ms), 2)
                     ret["speedup"] = round(tri_ms / ret["avg_us"] * 1000, 2)
             else:
-                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, _, _ = case
+                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, _, _, _ = case
                 ok, ret = run_batch_test(
                     bs,
                     sq_i,
@@ -855,6 +924,7 @@ if __name__ == "__main__":
                     d_v=d_v,
                     causal=causal,
                     return_lse=return_lse,
+                    sink=sink,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
@@ -862,7 +932,10 @@ if __name__ == "__main__":
             if ok:
                 n_pass += 1
         except Exception as e:
-            print(f"  [{case[:-2]} causal={causal} lse={return_lse}] ERROR: {e}")
+            print(
+                f"  [{case[:-3]} causal={causal} lse={return_lse} sink={sink}] "
+                f"ERROR: {e}"
+            )
             import traceback
 
             traceback.print_exc()

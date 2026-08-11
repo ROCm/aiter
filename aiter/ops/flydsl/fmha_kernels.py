@@ -250,6 +250,9 @@ def flydsl_flash_attn_varlen_func(
     # m16x8 kernel, gated behind AITER_ENABLE_EXPERIMENTAL.
     qk_hdim = q.shape[-1]
     _allowed_hdim = (192, 128) if is_experimental_enabled() else (192,)
+    # Attention sink is supported only by the m16x8 (qk_hdim==128) path; the d192
+    # kernel has no sink handling, so it still falls through to CK when sink given.
+    _sink_ok = sink is None or qk_hdim == 128
     supported = (
         get_gfx() == "gfx1250"
         and qk_hdim in _allowed_hdim
@@ -260,7 +263,7 @@ def flydsl_flash_attn_varlen_func(
         and block_table is None
         and bias is None
         and alibi_slopes is None
-        and sink is None
+        and _sink_ok
         and not deterministic
         and not return_attn_probs
     )
@@ -285,6 +288,7 @@ def flydsl_flash_attn_varlen_func(
             causal=causal,
             out=out,
             return_lse=return_lse,
+            sink=sink,
         )
 
     # D_qk=192 D_v=128
@@ -341,7 +345,6 @@ def flydsl_flash_attn_batch_func(
         and tuple(window_size[:2]) == (-1, -1)
         and bias is None
         and alibi_slopes is None
-        and sink is None
         and not return_attn_probs
     )
     if not supported:
@@ -355,4 +358,5 @@ def flydsl_flash_attn_batch_func(
         causal=causal,
         out=out,
         return_lse=return_lse,
+        sink=sink,
     )

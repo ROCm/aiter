@@ -123,6 +123,19 @@ def _load_seqlen_pair(ptr_tensor, idx):
     return fx.Int32(pair[0]), fx.Int32(pair[1])
 
 
+def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
+    """Load this lane's per-head sink logit ``sink[q_head_idx]`` from the 1-D
+    ``[num_heads_q]`` fp32 ``sink`` — one extra ``exp(sink)`` term in the softmax
+    denominator, in the scaled-score domain (same units as S)."""
+    sink_rsrc = buffer_ops.create_buffer_resource(
+        ptr_sink, num_records_bytes=arith.unwrap(num_heads_q * fx.Int32(4))
+    )
+    val = buffer_ops.buffer_load(
+        sink_rsrc, arith.unwrap(q_head_idx), vec_width=1, dtype=fx.Float32
+    )
+    return fx.Float32(val)
+
+
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
     """Map this lane's row in the packed ``(seq, q_head_in_group)`` tile to global
     indices; returns ``(kv_head, q_head_idx, seq_idx)`` (all ``fx.Int32``).
@@ -380,12 +393,14 @@ def _core_attention(
     n_block,  # compile-time KV block width (columns of one QK GEMM tile)
     is_causal,
     return_lse,
+    has_sink,  # compile-time: fold a per-head sink logit into the softmax denom
     gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
     ptr_O,
     ptr_Q,
     ptr_K,
     ptr_V,
     ptr_LSE,
+    ptr_sink,  # [nheads_q] fp32 per-head sink logits; read only when has_sink
     softmax_scale,
     stride_q_seq,
     stride_k_seq,
@@ -532,14 +547,27 @@ def _core_attention(
     # accumulators. Seed m=-inf, d=0, O=0: tile 0's corr=exp2(m_prev-m_new)=0
     # zeroes the (already-zero) O before its PV adds in — the standard flash seed.
     #
+    # Attention sink (compile-time): the sink is one extra ``exp(sink)`` term in the
+    # softmax denominator. Fold it in by seeding m=sink[q_head] and d=1.0 (=exp(sink-
+    # sink)); the rescales carry that d seed to exactly exp(sink - m_final), the sink
+    # denom term. (Without a sink, m=-inf makes tile 0's corr zero the d seed, so d=1
+    # would be identical to d=0 — the no-sink path keeps d=0 to stay byte-for-byte.)
+    #
     # TODO(perf): replace the end-of-body bulk async_load with per-write-tile
     # async_load_vram_to_lds_wr_tile interleaved between QK/softmax/PV (order
     # tuned by thread trace) so the tile t+1 fetch overlaps tile t's compute.
     # ========================================================================
     d_tiles = v_hdim // WMMA_M
+    if has_sink:
+        num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
+        m_seed = _load_sink_logit(ptr_sink, q_head_idx, num_heads_q)
+        d_seed = fx.Float32(1.0)
+    else:
+        m_seed = fx.Float32(float("-inf"))
+        d_seed = fx.Float32(0.0)
     _init = [
-        _raw(fx.Float32(float("-inf"))),
-        _raw(fx.Float32(0.0)),
+        _raw(m_seed),
+        _raw(d_seed),
     ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
     n_tiles = arith.ceildivui(
@@ -754,6 +782,7 @@ def build_fmha_fwd_prefill_m16x8(
     dtype_str: str = DEFAULT_DTYPE,
     is_causal: bool = False,
     return_lse: bool = False,
+    has_sink: bool = False,
     gqa_ratio: int = 1,
 ):
     """Build the m16x8 device kernel for a given layout + config.
@@ -777,6 +806,7 @@ def build_fmha_fwd_prefill_m16x8(
     N_BLOCK = int(n_block)
     CAUSAL = bool(is_causal)
     RET_LSE = bool(return_lse)
+    HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
 
     if layout == "thd":
@@ -788,6 +818,7 @@ def build_fmha_fwd_prefill_m16x8(
             ptr_K: fx.Pointer,
             ptr_V: fx.Pointer,
             ptr_LSE: fx.Pointer,
+            ptr_sink: fx.Pointer,
             ptr_cu_seqlens_q: fx.Pointer,
             ptr_cu_seqlens_k: fx.Pointer,
             softmax_scale: fx.Float32,
@@ -819,36 +850,44 @@ def build_fmha_fwd_prefill_m16x8(
             lse_base_elems = q_start * stride_lse_seq
             lse_num_records_bytes = (q_start + q_len) * stride_lse_seq * fx.Int32(4)
 
-            _core_attention(
-                qk_hdim=QK_HDIM,
-                v_hdim=V_HDIM,
-                n_block=N_BLOCK,
-                is_causal=CAUSAL,
-                return_lse=RET_LSE,
-                gqa_ratio=GQA_RATIO,
-                ptr_O=ptr_O,
-                ptr_Q=ptr_Q,
-                ptr_K=ptr_K,
-                ptr_V=ptr_V,
-                ptr_LSE=ptr_LSE,
-                softmax_scale=softmax_scale,
-                stride_q_seq=stride_q_seq,
-                stride_k_seq=stride_k_seq,
-                stride_v_seq=stride_v_seq,
-                stride_o_seq=stride_o_seq,
-                stride_q_head=stride_q_head,
-                stride_k_head=stride_k_head,
-                stride_v_head=stride_v_head,
-                stride_o_head=stride_o_head,
-                stride_lse_seq=stride_lse_seq,
-                stride_lse_head=stride_lse_head,
-                lse_base_elems=lse_base_elems,
-                lse_num_records_bytes=lse_num_records_bytes,
-                q_start=q_start,
-                q_len=q_len,
-                kv_start=kv_start,
-                kv_len=kv_len,
-            )
+            # An empty batch (no queries OR no keys) must NOT enter the core:
+            # kv_len==0 gives an empty softmax denom (d=0) and the epilogue would
+            # write O/0 = NaN to that batch's query rows; q_len==0 has no rows to
+            # write. Self-attn's kv_len==0 implies q_len==0, so this only skips
+            # genuinely empty work. (varlen may carry a per-batch kv_len==0 tail.)
+            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+                _core_attention(
+                    qk_hdim=QK_HDIM,
+                    v_hdim=V_HDIM,
+                    n_block=N_BLOCK,
+                    is_causal=CAUSAL,
+                    return_lse=RET_LSE,
+                    has_sink=HAS_SINK,
+                    gqa_ratio=GQA_RATIO,
+                    ptr_O=ptr_O,
+                    ptr_Q=ptr_Q,
+                    ptr_K=ptr_K,
+                    ptr_V=ptr_V,
+                    ptr_LSE=ptr_LSE,
+                    ptr_sink=ptr_sink,
+                    softmax_scale=softmax_scale,
+                    stride_q_seq=stride_q_seq,
+                    stride_k_seq=stride_k_seq,
+                    stride_v_seq=stride_v_seq,
+                    stride_o_seq=stride_o_seq,
+                    stride_q_head=stride_q_head,
+                    stride_k_head=stride_k_head,
+                    stride_v_head=stride_v_head,
+                    stride_o_head=stride_o_head,
+                    stride_lse_seq=stride_lse_seq,
+                    stride_lse_head=stride_lse_head,
+                    lse_base_elems=lse_base_elems,
+                    lse_num_records_bytes=lse_num_records_bytes,
+                    q_start=q_start,
+                    q_len=q_len,
+                    kv_start=kv_start,
+                    kv_len=kv_len,
+                )
 
         return kn_fmha_fwd_prefill_m16x8_thd
 
@@ -859,6 +898,7 @@ def build_fmha_fwd_prefill_m16x8(
         ptr_K: fx.Pointer,
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
+        ptr_sink: fx.Pointer,
         softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
@@ -893,12 +933,14 @@ def build_fmha_fwd_prefill_m16x8(
             n_block=N_BLOCK,
             is_causal=CAUSAL,
             return_lse=RET_LSE,
+            has_sink=HAS_SINK,
             gqa_ratio=GQA_RATIO,
             ptr_O=ptr_O,
             ptr_Q=ptr_Q,
             ptr_K=ptr_K,
             ptr_V=ptr_V,
             ptr_LSE=ptr_LSE,
+            ptr_sink=ptr_sink,
             softmax_scale=softmax_scale,
             stride_q_seq=stride_q_seq,
             stride_k_seq=stride_k_seq,
@@ -931,12 +973,13 @@ def build_fmha_fwd_prefill_m16x8(
 _launch_fns = {}  # {(layout, is_causal, return_lse, gqa_ratio): @flyc.jit launch fn}
 
 
-def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
-    key = ("thd", bool(is_causal), bool(return_lse), int(gqa_ratio))
+def _ensure_thd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ratio: int):
+    key = ("thd", bool(is_causal), bool(return_lse), bool(has_sink), int(gqa_ratio))
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m16x8(
-        layout="thd", is_causal=is_causal, return_lse=return_lse, gqa_ratio=gqa_ratio
+        layout="thd", is_causal=is_causal, return_lse=return_lse,
+        has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
     @flyc.jit
@@ -946,6 +989,7 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
         ptr_K: fx.Pointer,
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
+        ptr_sink: fx.Pointer,
         ptr_cu_seqlens_q: fx.Pointer,
         ptr_cu_seqlens_k: fx.Pointer,
         softmax_scale: fx.Float32,
@@ -983,6 +1027,7 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
             ptr_K,
             ptr_V,
             ptr_LSE,
+            ptr_sink,
             ptr_cu_seqlens_q,
             ptr_cu_seqlens_k,
             softmax_scale,
@@ -1008,12 +1053,13 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
     _launch_fns[key] = _launch
 
 
-def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
-    key = ("bshd", bool(is_causal), bool(return_lse), int(gqa_ratio))
+def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ratio: int):
+    key = ("bshd", bool(is_causal), bool(return_lse), bool(has_sink), int(gqa_ratio))
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m16x8(
-        layout="bshd", is_causal=is_causal, return_lse=return_lse, gqa_ratio=gqa_ratio
+        layout="bshd", is_causal=is_causal, return_lse=return_lse,
+        has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
     @flyc.jit
@@ -1023,6 +1069,7 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
         ptr_K: fx.Pointer,
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
+        ptr_sink: fx.Pointer,
         softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
@@ -1059,6 +1106,7 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
             ptr_K,
             ptr_V,
             ptr_LSE,
+            ptr_sink,
             softmax_scale,
             stride_q_seq,
             stride_k_seq,
@@ -1095,11 +1143,17 @@ def flash_attn_varlen_m16x8(
     causal=False,
     out=None,
     return_lse=False,
+    sink=None,
+    lse=None,
 ):
     """Host entry — varlen THD, qk_hdim=v_hdim=128, bf16.
 
-    v1 scaffold: builds and launches the empty THD kernel and returns the
-    (unwritten) output tensor.
+    ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
+    scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
+    Presence is baked into the kernel at compile time (``has_sink``).
+
+    ``lse`` (optional): caller-provided ``[total_q, nheads_q]`` fp32 output buffer,
+    used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.shape[-1] == 128, f"Expected qk_hdim=128, got {q.shape[-1]}"
@@ -1111,6 +1165,15 @@ def flash_attn_varlen_m16x8(
     nheads_k = k.shape[1]
     gqa = nheads_q // nheads_k
 
+    has_sink = sink is not None
+    if has_sink:
+        assert sink.dtype == torch.float32, f"sink must be fp32, got {sink.dtype}"
+        assert sink.dim() == 1 and sink.shape[0] == nheads_q, (
+            f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        )
+    # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
+    sink_ptr = sink if has_sink else q
+
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
 
@@ -1119,13 +1182,17 @@ def flash_attn_varlen_m16x8(
             (total_q_tokens, nheads_q, 128), dtype=torch.bfloat16, device=q.device
         )
     if return_lse:
-        lse = torch.empty(
-            (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
-        )
+        if lse is None:
+            lse = torch.empty(
+                (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
+            )
+        lse_ptr = lse
+        stride_lse_seq = lse.stride(0)
+        stride_lse_head = lse.stride(1)
     else:
-        lse = torch.empty(
-            (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
-        )
+        lse_ptr = q
+        stride_lse_seq = 0
+        stride_lse_head = 0
 
     # Byte strides for Q/K/V, element strides for O — matches the gfx1250 fmha
     # family convention; revisit when the clean kernel body is implemented.
@@ -1138,24 +1205,17 @@ def flash_attn_varlen_m16x8(
     stride_k_head = k.stride(1) * bpp
     stride_v_head = v.stride(1) * bpp
     stride_o_head = out.stride(1)
-    # LSE (element strides). When return_lse it is [total_q, nheads_q]; otherwise a
-    # scratch tensor that the kernel never writes, so 0 strides are harmless.
-    if return_lse:
-        stride_lse_seq = lse.stride(0)
-        stride_lse_head = lse.stride(1)
-    else:
-        stride_lse_seq = 0
-        stride_lse_head = 0
 
-    _ensure_thd_kernel(bool(causal), bool(return_lse), gqa)
+    _ensure_thd_kernel(bool(causal), bool(return_lse), has_sink, gqa)
 
     _run_compiled(
-        _launch_fns[("thd", bool(causal), bool(return_lse), gqa)],
+        _launch_fns[("thd", bool(causal), bool(return_lse), has_sink, gqa)],
         out,
         q,
         k,
         v,
-        lse,
+        lse_ptr,
+        sink_ptr,
         cu_seqlens_q,
         cu_seqlens_k,
         softmax_scale,
@@ -1189,14 +1249,20 @@ def flash_attn_batch_m16x8(
     causal=False,
     out=None,
     return_lse=False,
+    sink=None,
+    lse=None,
 ):
     """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim=v_hdim=128, bf16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.
 
-    v1 scaffold: builds and launches the empty BSHD kernel and returns the
-    (unwritten) output tensor.
+    ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
+    scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
+    Presence is baked into the kernel at compile time (``has_sink``).
+
+    ``lse`` (optional): caller-provided ``[B, nheads_q, S_q]`` fp32 output buffer,
+    used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
@@ -1208,6 +1274,15 @@ def flash_attn_batch_m16x8(
     nheads_k = k.shape[2]
     gqa = nheads_q // nheads_k
 
+    has_sink = sink is not None
+    if has_sink:
+        assert sink.dtype == torch.float32, f"sink must be fp32, got {sink.dtype}"
+        assert sink.dim() == 1 and sink.shape[0] == nheads_q, (
+            f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        )
+    # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
+    sink_ptr = sink if has_sink else q
+
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
 
@@ -1215,10 +1290,26 @@ def flash_attn_batch_m16x8(
         out = torch.empty(
             (batch, seq_len_q, nheads_q, 128), dtype=torch.bfloat16, device=q.device
         )
-    # LSE is [B, H, S_q] (scratch when return_lse is False).
-    lse = torch.empty(
-        (batch, nheads_q, seq_len_q), dtype=torch.float32, device=q.device
-    )
+    if return_lse:
+        if lse is None:
+            lse = torch.empty(
+                (batch, nheads_q, seq_len_q), dtype=torch.float32, device=q.device
+            )
+        lse_ptr = lse
+        stride_lse_seq = lse.stride(2)
+        stride_lse_head = lse.stride(1)
+        stride_lse_batch = lse.stride(0)
+    else:
+        lse_ptr = q
+        stride_lse_seq = 0
+        stride_lse_head = 0
+        stride_lse_batch = 0
+
+    # Empty tensor (no queries or no keys) — skip the launch entirely. seq_len_q/
+    # seq_len_k are host-known dims (no device sync), so the kernel never sees an
+    # empty batch (kv_len==0 would give an empty softmax denom -> O/0 = NaN).
+    if seq_len_q == 0 or seq_len_k == 0:
+        return (out, lse) if return_lse else out
 
     # Byte strides for Q/K/V, element strides for O. BSHD: seq is dim 1, head
     # dim 2 — the per-batch base is derived in-kernel as batch_idx * seq_len.
@@ -1231,20 +1322,17 @@ def flash_attn_batch_m16x8(
     stride_k_head = k.stride(2) * bpp
     stride_v_head = v.stride(2) * bpp
     stride_o_head = out.stride(2)
-    # LSE is [B, nheads_q, seq_q] (element strides; batch stride bounds the resource).
-    stride_lse_seq = lse.stride(2)
-    stride_lse_head = lse.stride(1)
-    stride_lse_batch = lse.stride(0)
 
-    _ensure_bshd_kernel(bool(causal), bool(return_lse), gqa)
+    _ensure_bshd_kernel(bool(causal), bool(return_lse), has_sink, gqa)
 
     _run_compiled(
-        _launch_fns[("bshd", bool(causal), bool(return_lse), gqa)],
+        _launch_fns[("bshd", bool(causal), bool(return_lse), has_sink, gqa)],
         out,
         q,
         k,
         v,
-        lse,
+        lse_ptr,
+        sink_ptr,
         softmax_scale,
         stride_q_seq,
         stride_k_seq,
