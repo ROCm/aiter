@@ -98,9 +98,7 @@ def check_prefill_many_tied_rows():
     row_ends = torch.full((num_rows,), seq, dtype=torch.int32, device="cuda")
 
     def run():
-        idx = torch.full(
-            (num_rows, k), -123456789, dtype=torch.int32, device="cuda"
-        )
+        idx = torch.full((num_rows, k), -123456789, dtype=torch.int32, device="cuda")
         top_k_per_row_prefill(
             logits,
             row_starts,
@@ -129,8 +127,7 @@ def check_prefill_many_tied_rows():
     # of the old concurrency boundary for bit-faithful reference coverage.
     sample_rows = (0, 255, 256, num_rows - 1)
     matches_ref = all(
-        a[r].cpu().tolist() == ref_stable_topk(logits[r], k)
-        for r in sample_rows
+        a[r].cpu().tolist() == ref_stable_topk(logits[r], k) for r in sample_rows
     )
     print(
         "[prefill many tied rows] "
