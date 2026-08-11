@@ -200,16 +200,13 @@ def compile_gemm2_a4w4_port(
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
     dw_tag = "_dw" if g2_defer_weight else ""
     kst_tag = "_kst" if g2_kstatic else ""
-    g2_apreload = kStages
-    apre_tag = "" if g2_apreload == kStages else f"_apre{g2_apreload}"
-    g2_adma = g2_apreload
     pitch_tag = (
         f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
     )
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{apre_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -246,7 +243,7 @@ def compile_gemm2_a4w4_port(
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(g2_adma):
+            for slot in range_constexpr(kStages):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -263,7 +260,7 @@ def compile_gemm2_a4w4_port(
                 )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
-        def run_unit(unit_bx, mn_idx=None, e_idx=None, pipe_next=None):
+        def run_unit(unit_bx, mn_idx=None):
             gemm2_body_v2(
                 lds_base_i32,
                 arg_ascale,
@@ -290,7 +287,6 @@ def compile_gemm2_a4w4_port(
                 INTER_MAX=INTER_MAX,
                 g2_kstatic=g2_kstatic,
                 aStages=aStages,
-                g2_apreload=g2_apreload,
                 a_dtype=a_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
@@ -305,8 +301,6 @@ def compile_gemm2_a4w4_port(
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
                 mn_idx=mn_idx,
-                e_idx=e_idx,
-                pipe_next=pipe_next,
             )
 
         if const_expr(not persist and g2_spart <= 0):

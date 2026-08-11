@@ -36,7 +36,9 @@ def _lds_base_ptr3(lds_view):
 
 
 def _gep3(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(base_ptr, byte_offset=byte_off_i32, elem_type=T.i8)
+    return buffer_ops.get_element_ptr(
+        base_ptr, byte_offset=byte_off_i32, elem_type=T.i8
+    )
 
 
 def _global_base_ptr1(addr_i64):
@@ -45,7 +47,9 @@ def _global_base_ptr1(addr_i64):
 
 
 def _gep1(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(base_ptr, byte_offset=byte_off_i32, elem_type=T.i8)
+    return buffer_ops.get_element_ptr(
+        base_ptr, byte_offset=byte_off_i32, elem_type=T.i8
+    )
 
 
 def _global_ptr1(arg, byte_off_i32):

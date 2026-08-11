@@ -219,14 +219,12 @@ def gemm2_body_v2(
     INTER_MAX,
     g2_kstatic=False,
     aStages,
-    g2_apreload=None,
     a_dtype,
     use_reduce=False,
     topk=1,
     has_pad=False,
     SBM=None,
     mn_idx=None,
-    e_idx=None,
     g2_kstages=2,
     g2_bhoist=True,
     g2_ascale_pf=True,
@@ -235,18 +233,10 @@ def gemm2_body_v2(
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
-    pipe_next=None,
 ):
     # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     if g2_kstages not in (1, 2):
         raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
-    if g2_apreload is None:
-        g2_apreload = kStages
-    g2_apreload = int(g2_apreload)
-    if not (kStages <= g2_apreload <= aStages):
-        raise AssertionError(
-            f"g2_apreload must be in [{kStages}, {aStages}], got {g2_apreload}"
-        )
     # SBM (sort padding unit) >= BM (compute tile); SBM==BM default byte-identical.
     if SBM is None:
         SBM = BM
@@ -294,9 +284,7 @@ def gemm2_body_v2(
         n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
     m_row = m_block_idx * BM
-    if const_expr(e_idx is not None):
-        e = e_idx
-    elif const_expr(SBM == BM):
+    if const_expr(SBM == BM):
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
     else:
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
@@ -592,7 +580,7 @@ def gemm2_body_v2(
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
-        a_all_resident = const_expr(g2_apreload >= KT)
+        a_all_resident = const_expr(kStages >= KT)
         if const_expr(a_all_resident):
             gpu.barrier()
 
@@ -604,9 +592,9 @@ def gemm2_body_v2(
             if const_expr(not a_all_resident):
                 gpu.barrier()
             issue_a_ds_read(fx.Int32(kt % aStages))
-            if const_expr(kt + g2_apreload < KT):
+            if const_expr(kt + kStages < KT):
                 issue_a_load_lds(
-                    fx.Int32((kt + g2_apreload) % aStages), fx.Int32(kt + g2_apreload)
+                    fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
                 )
             if const_expr(g2_ascale_pf):
                 cur_saf = saf_slots[chunk_of[kt] % n_slots]
@@ -752,9 +740,6 @@ def gemm2_body_v2(
             rocdl.sched_barrier(0)
             results = yield yield_carry()
         store_carry(results)
-
-    if const_expr(pipe_next is not None):
-        pipe_next()
 
     accm_vecs = [
         [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
