@@ -1,10 +1,7 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
-import json
-import os
 import warnings
 
 import torch
@@ -25,21 +22,19 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 
-@functools.lru_cache
 def _get_a8w4_dispatch(arch: str) -> dict:
     """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
     tuned file is shipped for this arch (caller uses the safe-default fallback).
     Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json"
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            return json.load(f)
-    return {}
+    dispatch = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json", required=False
+    )
+    return dispatch if dispatch is not None else {}
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -247,7 +242,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
-def get_kernel_config_gluon(m, n, k, routing_data):
+def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
@@ -260,7 +255,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if k <= 768:
+        # The persistent decode kernel has no MXFP8 emit path (HAS_MX_OUT);
+        # route out_mx_quant to the non-persistent decode kernel.
+        if k <= 768 and not out_mx_quant:
             use_persistent = True
             persistent_iters = 3
             block_n = 128
@@ -396,7 +393,7 @@ def moe_gemm_a8w4(
         w_scales = w_scales.transpose(1, 2)
     # compute optimization flags
     if use_gluon:
-        config = get_kernel_config_gluon(M, N, K, routing_data)
+        config = get_kernel_config_gluon(M, N, K, routing_data, out_mx_quant)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
@@ -454,7 +451,7 @@ def moe_gemm_a8w4(
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
-        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
+        n_out = padded_N // reduction_n_matmul  # post-swiglu width
         assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
         m_out = y.shape[-2]
         y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
@@ -585,6 +582,10 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon:
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
