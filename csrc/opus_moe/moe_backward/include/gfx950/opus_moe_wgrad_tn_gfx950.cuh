@@ -426,7 +426,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
     constexpr int BM = 256;
     constexpr int BN = 256;
-    constexpr int BK = 32;
+    constexpr int BK = 64;
     __shared__ __align__(16) opus::bf16_t As[2][BK][BM];
     __shared__ __align__(16) opus::bf16_t Bs[2][BK][BN];
 
@@ -443,14 +443,19 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int nroute = r1 - r0;
     const int num_k_stages = (nroute + BK - 1) / BK;
 
-    // 512 threads x two bf16x8 vectors cover one 32x256 operand tile.
+    // Use a 64-route stage to halve workgroup barriers, but keep only one
+    // 32-route half-stage in registers.  The same load registers are reused for
+    // the second half after the first half has been written to the next buffer.
+    // This preserves the BK=32 register footprint while the two current-stage
+    // MFMA halves hide the corresponding global prefetches.
+    // 512 threads x two bf16x8 vectors cover one 32x256 half-stage.
     const int load_k = tid / 16;
     const int load_f = (tid % 16) * 16;
     struct load_regs {
         opus_bf16x8 a0, a1, b0, b1;
     };
-    auto load_global = [&](int stage, load_regs& x) {
-        const int route = r0 + stage * BK + load_k;
+    auto load_global = [&](int stage, int half, load_regs& x) {
+        const int route = r0 + stage * BK + half * 32 + load_k;
         x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
         if(route < r1)
         {
@@ -466,10 +471,10 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 a + static_cast<int64_t>(route) * Q + nf + 8);
         }
     };
-    auto store_stage = [&](int buf, const load_regs& x) {
+    auto store_stage = [&](int buf, int half, const load_regs& x) {
         auto as = opus::make_smem(&As[buf][0][0]);
         auto bs = opus::make_smem(&Bs[buf][0][0]);
-        const int os = load_k * BM + load_f;
+        const int os = (half * 32 + load_k) * BM + load_f;
         as.template store<8>(x.a0, os);
         as.template store<8>(x.a1, os + 8);
         bs.template store<8>(x.b0, os);
@@ -479,8 +484,10 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     if(num_k_stages > 0)
     {
         load_regs first;
-        load_global(0, first);
-        store_stage(0, first);
+        load_global(0, 0, first);
+        store_stage(0, 0, first);
+        load_global(0, 1, first);
+        store_stage(0, 1, first);
     }
     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     __syncthreads();
@@ -492,9 +499,9 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         const bool has_next = stage + 1 < num_k_stages;
         load_regs next;
         if(has_next)
-            load_global(stage + 1, next);
+            load_global(stage + 1, 0, next);
 
-        for(int kpack = 0; kpack < 2; ++kpack)
+        for(int kpack = 0; kpack < 4; ++kpack)
         {
             // B is reused by all four M subtiles. Keep it resident, then
             // ping-pong two A fragment slots so the next LDS transpose read
@@ -538,11 +545,16 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 if constexpr(sm.value + 1 < 4)
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             });
+            if(has_next && kpack == 1)
+            {
+                store_stage(cur ^ 1, 0, next);
+                load_global(stage + 1, 1, next);
+            }
         }
 
         if(has_next)
         {
-            store_stage(cur ^ 1, next);
+            store_stage(cur ^ 1, 1, next);
             opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             __syncthreads();
         }
