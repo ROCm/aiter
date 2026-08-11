@@ -61,18 +61,25 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
 
 ## 3. Steps (tracked)
 
-### Step 1 — down split-K, v1 zero-init  [ ]
-- [ ] Add `k_batch` to `build_down_reduce_fp8_module` (start with FP8; the simplest, most-used
-      path). Kernel derives `kb` from a grid dim, restricts its INTER range to
-      `[kb*chunk, (kb+1)*chunk)` (`num_iter/k_batch` iters), and swaps the lane-0 bf16 store for
-      an **FP32 atomic-fadd** into a caller-zeroed accumulator (reuse the `llvm.AtomicRMWOp`
-      pattern from `small_m_hgemm.py`).
-- [ ] Add an `atomic_add_f32` helper to `buffer_ops` (or a local kernel helper) if none is
-      directly reusable.
-- [ ] Entry point `flydsl_warp_decode_down_reduce(..., split_k=1)`: allocate FP32 `y` accum,
-      `zeros_` it, launch phase-1, then cast → bf16 `out` (finalize wave or small cast pass).
-- [ ] Correctness op_test: split_k∈{2,4} vs non-split on a Qwen short-INTER B=1 shape; assert
-      `cos ≥ 0.999` (tolerance for atomic non-determinism, not bit-exact).
+### Step 1 — down split-K, v1 zero-init  [x]  (2026-08-11)
+- [x] Added `k_batch` to `build_down_reduce_fp8_module`. Kernel derives `kb = bid % k_batch`
+      (grid `B·(HIDDEN/kh)·k_batch`), restricts each wave to `iters_per_kb = num_iter/k_batch`
+      INTER iterations (`k_base = (kb*iters_per_kb + i)*ktile_n + lane*kvector`), and swaps the
+      lane-0 bf16 store for an **FP32 atomic-fadd** under `const_expr(split_k)`. `k_batch==1` is
+      the unchanged bf16 direct-store path (kb≡0). Guard: `num_iter % k_batch == 0`.
+- [x] Added module-level `atomic_add_f32(ptr, elem_off, val_f32)` helper (the
+      `llvm.AtomicRMWOp(fadd, …, syncscope="agent", alignment=4)` pattern from the split-K GEMMs).
+- [x] Entry point `flydsl_warp_decode_down_reduce(..., split_k=1)`: for `split_k>1` allocates a
+      `torch.zeros` **FP32 accumulator**, launches with the `k_batch`-scaled grid, then
+      `out.copy_(accum)` finalizes → bf16 (v1; fold later per Step 6). Cache getter keys on
+      `k_batch`.
+- [x] Correctness op_test `test_down_reduce_split_k` (`DOWN_SPLITK_CASES`): split_k=2 (INTER=2048,
+      kv16→num_iter=2) and split_k=4 (INTER=4096→num_iter=4), each **cos 1.000000** vs both the
+      fp32 ref and the non-split baseline. **38/38 suite.**
+- Note: split granularity is the **iteration** (`ktile_n = 64·kvector`), so split_k needs
+      `num_iter = INTER/(64·kvector) ≥ k_batch`. The occupancy target is thus small-**HIDDEN**
+      (small grid) with INTER large enough to split (e.g. HIDDEN≤512, INTER≥2048), not the
+      INTER=512 shapes — refine the Step 3 shape list accordingly.
 
 ### Step 2 — trigger gate + autotune  [ ]
 - [ ] Query CU count (device props / `runtime.device`). Pick largest `k_batch ∈ {1,2,4,8}` with
@@ -120,5 +127,9 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
   load-bearing.
 
 ## 5. Status log
-- 2026-08-11 — plan drafted; no code yet. Feasibility confirmed (atomic-fadd + split-K patterns
-  already exist in `moe_gemm_2stage.py` / `splitk_hgemm.py` / `small_m_hgemm.py`).
+- 2026-08-11 — plan drafted; feasibility confirmed (atomic-fadd + split-K patterns already exist
+  in `moe_gemm_2stage.py` / `splitk_hgemm.py` / `small_m_hgemm.py`).
+- 2026-08-11 — **Step 1 done:** down FP8 split-K (iteration-granularity, FP32 atomic-add,
+  caller-zeroed accum, bf16 finalize). split_k=2/4 bit-faithful (cos 1.0 vs ref + non-split);
+  38/38 suite. Surfaced the `num_iter ≥ k_batch` granularity constraint → adjusted the Step 3
+  target shapes to small-HIDDEN / large-INTER.

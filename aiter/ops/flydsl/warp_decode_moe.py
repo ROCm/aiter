@@ -58,6 +58,7 @@ def _get_down_reduce(
     scale_bn,
     scale_bk,
     kh_per_warp,
+    k_batch,
 ):
     return build_down_reduce_fp8_module(
         inter,
@@ -69,6 +70,7 @@ def _get_down_reduce(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
+        k_batch=k_batch,
     )
 
 
@@ -347,6 +349,7 @@ def flydsl_warp_decode_down_reduce(
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     kh_per_warp: int | None = None,
+    split_k: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
@@ -370,6 +373,10 @@ def flydsl_warp_decode_down_reduce(
         scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
         kh_per_warp:  outputs per wave (memory-level parallelism / H-tiling). Defaults
             to 2 (H2, the FP8 best) when HIDDEN is even, else 1.
+        split_k:      Split-K factor (G5, occupancy lever). ``>1`` partitions INTER over
+            ``split_k`` waves per output that atomic-add FP32 partials into a caller-
+            zeroed accumulator (finalized to bf16); use only when the base grid under-
+            fills the CUs (small-grid Qwen, low B). Default 1 (BF16 direct-store path).
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -380,6 +387,7 @@ def flydsl_warp_decode_down_reduce(
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
     assert router_wts.dtype == torch.float32, "router_wts must be float32"
+    assert split_k >= 1, "split_k must be >= 1"
 
     B, TOPK, INTER = intermediate.shape
     E, HIDDEN, Ik = w_down.shape
@@ -412,8 +420,16 @@ def flydsl_warp_decode_down_reduce(
         scale_bn,
         scale_bk,
         kh_per_warp,
+        split_k,
     )
-    grid_x = B * (HIDDEN // kh_per_warp)
+    # Split-K writes FP32 partials via atomic-add into a caller-zeroed accumulator;
+    # the plain path stores bf16 directly to `out` (Locked decision, main plan ?1.2).
+    y_target = (
+        torch.zeros((B, HIDDEN), dtype=torch.float32, device=intermediate.device)
+        if split_k > 1
+        else out
+    )
+    grid_x = B * (HIDDEN // kh_per_warp) * split_k
     _run(
         launcher,
         (
@@ -422,11 +438,13 @@ def flydsl_warp_decode_down_reduce(
             ptr_arg(w_down_scale),
             ptr_arg(router_ids),
             ptr_arg(router_wts),
-            ptr_arg(out),
+            ptr_arg(y_target),
             grid_x,
             torch.cuda.current_stream(),
         ),
     )
+    if split_k > 1:
+        out.copy_(y_target)  # FP32 accumulator -> bf16 finalize (v1; fold later)
     return out
 
 
