@@ -215,16 +215,23 @@ def fused_clamp_act_mul(
             f"quant_block_size ({quant_block_size})"
         )
 
-        # Decide by MB moved.
-        if (M*D*2*2+M*D*2 < 20):
-            ROWS_PER_PROG = 1
-            BLOCK_SIZE_M = 1
-        elif (M*D*2*2+M*D*2 < 500):
-            ROWS_PER_PROG = 1
-            BLOCK_SIZE_M = 2
-        else:
-            ROWS_PER_PROG = 1
-            BLOCK_SIZE_M = 2
+        # BLOCK_SIZE_M is bounded by the LDS partition, not by taste. gfx1250 has
+        # 320KiB of LDS charged in 64KiB partitions, so resident workgroups per CU
+        # is 5 // ceil(lds_bytes / 64KiB) and every partition boundary costs a big
+        # step in memory-level parallelism.
+        #
+        # Padded tile bytes = BLOCK_SIZE_M * 2*BLOCK_SIZE_N * itemsize * (1 + 16/1024).
+        # The pad interval is already clamped to the TDM descriptor's maximum
+        # (256 dwords) in the kernel, so 1.5% is the floor for padding overhead —
+        # there is no cheaper padded layout, only a smaller tile.
+        #
+        # bf16, BLOCK_SIZE_N = 8192, one buffer:
+        #   BLOCK_SIZE_M = 2 -> 65536 data + 1024 pad = 66560 -> 2 partitions -> 2 wgs
+        #   BLOCK_SIZE_M = 1 -> 32768 data +  512 pad = 33280 -> 1 partition  -> 5 wgs
+        # The data alone at BLOCK_SIZE_M = 2 is exactly one 64KiB partition, so no
+        # padding at all fits there; 1 is the only value that keeps both.
+        ROWS_PER_PROG = 1
+        BLOCK_SIZE_M = 1
 
         assert (
             _is_gluon_available()
@@ -235,8 +242,12 @@ def fused_clamp_act_mul(
         )
 
         # compressed version only helpful if replicated 10 times, not two
+        # Each program covers ROWS_PER_PROG tiles of BLOCK_SIZE_M rows, matching
+        # the kernel's m_start = pid * ROWS_PER_PROG * BLOCK_SIZE_M. A no-op while
+        # BLOCK_SIZE_M == 1, but without it any BLOCK_SIZE_M > 1 launches
+        # BLOCK_SIZE_M x too many programs, the surplus running fully masked.
         _fused_clamp_silu_mul_gluon_kernel[
-            (triton.cdiv(M, ROWS_PER_PROG),)
+            (triton.cdiv(M, ROWS_PER_PROG * BLOCK_SIZE_M),)
         ](
             inp,
             out,
