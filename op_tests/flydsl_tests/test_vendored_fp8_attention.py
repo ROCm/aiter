@@ -29,6 +29,9 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close, q8
+from op_tests.flydsl_tests._common import build_fp8_gfx950 as _vendored_build
+from op_tests.flydsl_tests._common import dense_fp8_reference as torch_reference
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -46,14 +49,6 @@ DEV = "cuda"
 HEAD_DIM = 128
 SEED = 123
 REF_MAX_S = 8192  # above this the S x S torch reference will not fit
-
-
-def _vendored_build():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build
 
 
 # (label, B, S, H, HKV, causal)
@@ -83,33 +78,12 @@ VARLEN_CASES = [
 ]
 
 
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
-
-
 def make_inputs(b, s, h, hkv, d, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     mk = lambda n: torch.randn(
         b, s, n, d, generator=g, device=DEV, dtype=torch.bfloat16
     )
     return q8(mk(h)), q8(mk(hkv)), q8(mk(hkv))
-
-
-def torch_reference(qf, qs, kf, ks, vf, vs, causal, d):
-    """Reference from the dequantized fp8 tensors -- what the kernel is fed."""
-    q, k, v = qf.float() * qs, kf.float() * ks, vf.float() * vs
-    _b, s, h, _ = q.shape
-    rep = h // k.shape[2]
-    kt = k.repeat_interleave(rep, 2).transpose(1, 2)
-    vt = v.repeat_interleave(rep, 2).transpose(1, 2)
-    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d**0.5)
-    if causal:
-        m = torch.triu(torch.ones(s, s, device=DEV, dtype=torch.bool), 1)
-        att = att.masked_fill(m, float("-inf"))
-    out = (att.softmax(-1) @ vt).transpose(1, 2)
-    del att
-    return out
 
 
 def torch_reference_sinks(qf, qs, kf, ks, vf, vs, causal, d, sink):
@@ -209,8 +183,7 @@ def test_dense_correctness(label, b, s, h, hkv, causal):
     cos = torch.nn.functional.cosine_similarity(
         ov.float().flatten(), ref.flatten(), dim=0
     ).item()
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(err, cos)
     torch.cuda.empty_cache()
 
 
@@ -276,9 +249,7 @@ def test_varlen(seqs):
         of.flatten(), ref.flatten(), dim=0
     ).item()
     bad = int(((of - ref).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(err, cos, bad)
     torch.cuda.empty_cache()
 
 
@@ -318,8 +289,7 @@ def test_fp16_output(label, b, s, h, hkv, causal):
     cos = torch.nn.functional.cosine_similarity(
         ov.float().flatten(), ref.float().flatten(), dim=0
     ).item()
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(err, cos)
     torch.cuda.empty_cache()
 
 

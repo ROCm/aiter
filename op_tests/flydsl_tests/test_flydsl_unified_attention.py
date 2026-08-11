@@ -21,6 +21,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close
+from op_tests.flydsl_tests._common import q8 as _q8
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
@@ -62,12 +64,6 @@ DEV = "cuda"
 # intermittently. Anything near 8e-2 is a real regression, not noise.
 MAX_REL_ERR = 8e-2
 MIN_COS = 0.99
-
-
-def _q8(x):
-    """Quantize to fp8 with a per-tensor scale, returning (fp8, descale)."""
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(FP8), s.reshape(1).float().to(DEV)
 
 
 def _build(query_lens, kv_lens, num_heads, num_kv_heads, seed=0):
@@ -185,9 +181,7 @@ def _check(got, want):
     # Per-row worst error, matching the project's standing gates: an aggregate
     # cosine stays high even when whole sequences or trailing pages are wrong.
     bad_rows = int((diff.amax(dim=-1) > MAX_REL_ERR * scale).sum().item())
-    assert bad_rows == 0, f"{bad_rows} rows over threshold (rel err {rel:.4g})"
-    assert rel < MAX_REL_ERR, f"max rel err {rel:.4g}"
-    assert cos > MIN_COS, f"cosine {cos:.6f}"
+    assert_attn_close(rel, cos, bad_rows, max_err=MAX_REL_ERR, min_cos=MIN_COS)
 
 
 def test_build_is_deterministic():

@@ -35,6 +35,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close, q8
+from op_tests.flydsl_tests._common import build_fp8_gfx950_with_ws_elems as _build_mods
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -68,22 +70,6 @@ MIXED_SEQS = [
     (1, 512),
 ]
 SPLITS = (2, 4, 8)
-
-
-def _build_mods():
-    from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
-        dualwave_splitk_workspace_elems as ws_elems,
-    )
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build, ws_elems
-
-
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
 
 
 def reference_mixed(qf, qs, kf, ks, vf, vs, cu_q, cu_kv, causal, d):
@@ -221,7 +207,5 @@ def test_packed_splitk_mixed(causal, splits, paged):
     """Low-chunk mixed prefill+decode batch, gqa_pack_m forced with split-K."""
     build, ws_elems = _build_mods()
     err, cos, bad = _run_mixed(build, ws_elems, splits, paged, causal, D, SEED)
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(err, cos, bad)
     torch.cuda.empty_cache()

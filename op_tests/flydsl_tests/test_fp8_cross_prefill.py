@@ -35,6 +35,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close, q8
+from op_tests.flydsl_tests._common import build_fp8_gfx950 as _build_module
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
@@ -65,19 +67,6 @@ CASES = [
     ([256, 512], [1024, 2048], "ragged, both cross"),
     ([256] + [1] * 4, [1024] + [1024] * 4, "chunk + 4 decodes"),
 ]
-
-
-def _build_module():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build
-
-
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
 
 
 def make_pages(kf, vf, seqs, seed):
@@ -175,7 +164,5 @@ def test_cross_prefill(q_lens, kv_lens, label):
     # before the active guard existed. A bottom-right/top-left mask confusion is
     # exactly that kind of failure.
     bad = int((got - want).abs().amax(dim=(1, 2)).gt(1e-1).sum().item())
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(err, cos, bad)
     torch.cuda.empty_cache()

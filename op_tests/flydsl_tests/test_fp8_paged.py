@@ -36,6 +36,9 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close as _check
+from op_tests.flydsl_tests._common import build_fp8_gfx950 as _build_module
+from op_tests.flydsl_tests._common import q8
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
@@ -80,19 +83,6 @@ PAGED_VARLEN_CASES = [
     [1, 3, 31, 33, 63, 65],  # all << BLOCK_M, sharpest active-guard test
     [2048, 512, 1024],
 ]
-
-
-def _build_module():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build
-
-
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
 
 
 def to_pages(kf, npages_per_seq, perm, hkv, d):
@@ -264,12 +254,6 @@ def _run_paged_varlen(build, seqs, d, seed, causal=True):
     ).item()
     bad = int(((of - want).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
     return err, cos, bad
-
-
-def _check(err, cos, bad):
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
 
 
 @pytest.mark.parametrize("label,b,s,hkv,causal", CASES, ids=[c[0] for c in CASES])

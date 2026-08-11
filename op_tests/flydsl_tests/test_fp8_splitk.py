@@ -35,6 +35,10 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close as _check
+from op_tests.flydsl_tests._common import build_fp8_gfx950_with_ws_elems as _build_mods
+from op_tests.flydsl_tests._common import dense_fp8_reference as reference
+from op_tests.flydsl_tests._common import q8
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -74,37 +78,6 @@ PAGED_CASES = [
     (512, 4, 2),
     (768, 2, 4),
 ]
-
-
-def _build_mods():
-    from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
-        dualwave_splitk_workspace_elems as ws_elems,
-    )
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build, ws_elems
-
-
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
-
-
-def reference(qf, qs, kf, ks, vf, vs, causal, d):
-    q, k, v = qf.float() * qs, kf.float() * ks, vf.float() * vs
-    _b, s, h, _ = q.shape
-    rep = h // k.shape[2]
-    kt = k.repeat_interleave(rep, 2).transpose(1, 2)
-    vt = v.repeat_interleave(rep, 2).transpose(1, 2)
-    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d**0.5)
-    if causal:
-        m = torch.triu(torch.ones(s, s, device=DEV, dtype=torch.bool), 1)
-        att = att.masked_fill(m, float("-inf"))
-    out = (att.softmax(-1) @ vt).transpose(1, 2)
-    del att
-    return out
 
 
 def _run(build, ws_elems, S, splits, causal, d, seed, b=1, paged=False):
@@ -170,12 +143,6 @@ def _run(build, ws_elems, S, splits, causal, d, seed, b=1, paged=False):
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     del ref
     return err, cos, bad
-
-
-def _check(err, cos, bad):
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
 
 
 @pytest.mark.parametrize(

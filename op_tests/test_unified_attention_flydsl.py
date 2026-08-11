@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import aiter.ops.triton.attention.unified_attention as ua
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close
 from op_tests.flydsl_tests.test_flydsl_unified_attention import _build
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
@@ -140,8 +141,7 @@ def _assert_close(got, want, tol=1.5e-1):
         got.reshape(-1), want.reshape(-1), dim=0
     ).item()
     assert torch.isfinite(got).all()
-    assert rel < tol, f"rel err {rel:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
+    assert_attn_close(rel, cos, max_err=tol, min_cos=0.99)
 
 
 # --- 1. routing actually happens ---------------------------------------------

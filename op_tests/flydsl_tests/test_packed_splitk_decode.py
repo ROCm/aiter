@@ -33,6 +33,9 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests._common import assert_attn_close as _check
+from op_tests.flydsl_tests._common import build_fp8_gfx950_with_ws_elems as _build_mods
+from op_tests.flydsl_tests._common import q8
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -74,22 +77,6 @@ for _b in (7, 8, 9):
     for _sp in (2, 4, 8):
         RAGGED_CASES.append((_b, _sp, False))
         RAGGED_CASES.append((_b, _sp, True))
-
-
-def _build_mods():
-    from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
-        dualwave_splitk_workspace_elems as ws_elems,
-    )
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
-
-    return build, ws_elems
-
-
-def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(DEV)
 
 
 def reference(qf, qs, kf, ks, vf, vs, d):
@@ -274,12 +261,6 @@ def _run_ragged(build, ws_elems, b, splits, paged, d, seed, packed):
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     del ref
     return err, cos, bad
-
-
-def _check(err, cos, bad):
-    assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
-    assert err < 1e-1, f"max err {err:.4g}"
-    assert cos > 0.99, f"cosine {cos:.6f}"
 
 
 @pytest.mark.parametrize(
