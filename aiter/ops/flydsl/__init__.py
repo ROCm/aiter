@@ -58,6 +58,14 @@ if is_flydsl_available():
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from .warp_decode_moe import (
+        flydsl_warp_decode_down_reduce,
+        flydsl_warp_decode_down_reduce_bf16,
+        flydsl_warp_decode_down_reduce_fp4,
+        flydsl_warp_decode_gate_up,
+        flydsl_warp_decode_gate_up_bf16,
+        flydsl_warp_decode_gate_up_fp4,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -75,5 +83,11 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_warp_decode_down_reduce",
+        "flydsl_warp_decode_down_reduce_bf16",
+        "flydsl_warp_decode_down_reduce_fp4",
+        "flydsl_warp_decode_gate_up",
+        "flydsl_warp_decode_gate_up_bf16",
+        "flydsl_warp_decode_gate_up_fp4",
         # "flydsl_gdr_decode",
     ]
