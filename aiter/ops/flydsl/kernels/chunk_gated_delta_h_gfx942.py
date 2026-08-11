@@ -138,6 +138,20 @@ def compile_chunk_gated_delta_h_gfx942(
     )
     NUM_K_BLOCKS = K // 64
 
+    # -- Chiplet (XCD) remap --------------------------------------
+    # The grid is (GRID_V, grid_nh) with grid_nh = N*H. For a fixed head (i_nh)
+    # the GRID_V V-tiles all read the same k/w/g/gk slices (only v/v_new differ
+    # by V-tile). Under the HW default (flat block `xy` runs on XCD `xy % 8`)
+    # those V-tiles scatter across XCDs, so k/w/g get pulled into up to nXCD
+    # separate private L2 caches. The chiplet re-map applies the HipKittens
+    # inverse shuffle with chunk size = GRID_V, forcing each head's whole
+    # V-tile run on a single XCD. Hence, k/w/g are fetched into one L2 and reused.
+    #
+    # GRID_V is a compile-time constant (V and BV are both build-time known), so
+    # the whole remap collapses to integer math on the flat block id.
+    GRID_V = (V + BV - 1) // BV
+    NXCD = 8
+
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
 
     WARP_SIZE = 64
@@ -358,8 +372,37 @@ def compile_chunk_gated_delta_h_gfx942(
         T_flat: fx.Int32,
         N_val: fx.Int32,
     ):
-        i_v = fx.block_idx.x
-        i_nh = fx.block_idx.y
+        if const_expr(NXCD > 0):
+            # HipKittens remap algorithm: Flatten the HW-assigned 2D block id the way 
+            # the AMD dispatcher does (xy = x + gridDim.x * y), invert the round-robin
+            # such that runs of CHUNK = GRID_V consecutive logical ids land on one XCD, 
+            # then unflatten back to (i_v, i_nh). Head runs are already GRID_V-contiguous
+            # in logical order, so CHUNK = GRID_V co-locates each head's V-tiles.
+            #
+            # Enabled by default on gfx942 (nXCD=8). 
+            # The tail guard below makes any grid_nh better or equal to the round-robin 
+            # baseline: every full nXCD*CHUNK cycle is cleanly co-located, and the remaining
+            # tail (when grid_nh is not a multiple of nXCD) passes through unchanged, i.e., 
+            # it gets the default mapping.
+            grid_nh_rt = N_val * fx.Int32(H)
+            grid_total = fx.Int32(GRID_V) * grid_nh_rt
+            xy = fx.block_idx.x + fx.Int32(GRID_V) * fx.block_idx.y
+            xcd = xy % fx.Int32(NXCD)
+            # Tail guard: ids past the last full nXCD*CHUNK cycle pass through
+            # unchanged (remapping them would collide / go out of range).
+            cycle = fx.Int32(NXCD) * fx.Int32(GRID_V)
+            last_full = (grid_total // cycle) * cycle
+            local_id = xy // fx.Int32(NXCD)
+            chunk_idx = local_id // fx.Int32(GRID_V)
+            pos = local_id % fx.Int32(GRID_V)
+            remapped = chunk_idx * cycle + xcd * fx.Int32(GRID_V) + pos
+            logical = (xy < last_full).select(remapped, xy)
+            i_v = logical % fx.Int32(GRID_V)
+            i_nh = logical // fx.Int32(GRID_V)
+        else:
+            i_v = fx.block_idx.x
+            i_nh = fx.block_idx.y
+
         i_n = i_nh // fx.Int32(H)
         i_h = i_nh % fx.Int32(H)
 

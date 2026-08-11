@@ -396,9 +396,9 @@ def _get_or_compile(
                 **_compile_kwargs
             )
         elif _ARCH == "gfx942":
-            # NR_SPLIT = waves / (BT/16); BT/16 = 4 waves is the historical block.
             _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
-                **_compile_kwargs, NR_SPLIT=num_waves // (BT // 16)
+                **_compile_kwargs,
+                NR_SPLIT=num_waves // (BT // 16),
             )
         else:
             raise ValueError(
