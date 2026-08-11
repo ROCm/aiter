@@ -92,6 +92,75 @@ def _per_head_quantize(
     tl.store(output + element, quantized, mask=mask)
 
 
+def static_per_head_quant_fp8(
+    value: torch.Tensor,
+    descale: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    out: torch.Tensor | None = None,
+    validate: bool = True,
+) -> torch.Tensor:
+    """Quantize ``[tokens, heads, dim]`` data with supplied per-head descales."""
+    if value.ndim != 3:
+        raise ValueError(f"expected rank-3 input, got {value.shape}")
+    if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"unsupported input dtype {value.dtype}")
+    if fp8_dtype not in _FP8_DTYPES:
+        raise TypeError(f"unsupported FP8 output dtype {fp8_dtype}")
+
+    _, num_heads, head_dim = value.shape
+    if descale.shape != (1, num_heads):
+        raise ValueError(
+            f"expected descale shape (1, {num_heads}), got {tuple(descale.shape)}"
+        )
+    if descale.dtype != torch.float32:
+        raise TypeError(f"expected descale dtype torch.float32, got {descale.dtype}")
+    if descale.device != value.device:
+        raise ValueError(f"expected descale on {value.device}, got {descale.device}")
+    if not descale.is_contiguous():
+        raise ValueError("descale must be contiguous")
+
+    if out is None:
+        out = torch.empty(value.shape, dtype=fp8_dtype, device=value.device)
+    else:
+        if out.shape != value.shape:
+            raise ValueError(
+                f"expected out shape {tuple(value.shape)}, got {tuple(out.shape)}"
+            )
+        if out.device != value.device:
+            raise ValueError(f"expected out on {value.device}, got {out.device}")
+        if out.dtype != fp8_dtype:
+            raise TypeError(f"expected out dtype {fp8_dtype}, got {out.dtype}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if validate:
+        valid_descales = torch.all(torch.isfinite(descale) & (descale > 0))
+        invalid_descale_message = "descale must contain only finite positive values"
+        if descale.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            torch._assert_async(valid_descales, invalid_descale_message)
+        elif not bool(valid_descales):
+            raise ValueError(invalid_descale_message)
+
+    quant_block = 1024
+    total_elements = value.numel()
+    fp8_max = torch.finfo(fp8_dtype).max
+    _per_head_quantize[(triton.cdiv(total_elements, quant_block),)](
+        value,
+        out,
+        descale,
+        total_elements,
+        num_heads,
+        head_dim,
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        fp8_max,
+        BLOCK=quant_block,
+        num_warps=4,
+    )
+    return out
+
+
 def dynamic_per_head_quant_fp8(
     value: torch.Tensor,
     fp8_dtype: torch.dtype,

@@ -6,7 +6,10 @@ import torch
 
 import aiter
 from aiter.ops.triton.attention.mha import kimi_k3_fp8_prefill_gfx942
-from aiter.ops.triton.quant.per_head import dynamic_per_head_quant_fp8
+from aiter.ops.triton.quant.per_head import (
+    dynamic_per_head_quant_fp8,
+    static_per_head_quant_fp8,
+)
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton import arch_info
 
@@ -25,6 +28,15 @@ def _quantize_reference(
     return quantized.to(types.e4m3_dtype), descale[None, :].contiguous()
 
 
+def _static_quantize_reference(
+    value: torch.Tensor,
+    descale: torch.Tensor,
+) -> torch.Tensor:
+    maximum = torch.finfo(types.e4m3_dtype).max
+    quantized = (value.float() / descale[:, :, None]).clamp(-maximum, maximum)
+    return quantized.to(types.e4m3_dtype)
+
+
 def test_dynamic_per_head_quant_fp8() -> None:
     torch.manual_seed(7)
     value = torch.randn((257, 12, 192), dtype=torch.bfloat16, device="cuda")
@@ -39,6 +51,80 @@ def test_dynamic_per_head_quant_fp8_rejects_non_fp8_output() -> None:
     value = torch.empty((1, 1, 1), dtype=torch.float32)
     with pytest.raises(TypeError, match="unsupported FP8 output dtype"):
         dynamic_per_head_quant_fp8(value, torch.float16)
+
+
+def test_static_per_head_quant_fp8_uses_supplied_descales_and_out() -> None:
+    torch.manual_seed(17)
+    value = torch.randn((257, 12, 192), dtype=torch.bfloat16, device="cuda")
+    descale = torch.tensor(
+        [
+            0.0625,
+            0.125,
+            0.25,
+            0.5,
+            0.75,
+            1.25,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            8.0,
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )[None, :]
+    out = torch.empty_like(value, dtype=types.e4m3_dtype)
+    out_ptr = out.data_ptr()
+
+    actual = static_per_head_quant_fp8(
+        value,
+        descale,
+        types.e4m3_dtype,
+        out=out,
+    )
+    expected = _static_quantize_reference(value, descale)
+
+    assert actual is out
+    assert actual.data_ptr() == out_ptr
+    mismatch_rate = (actual != expected).float().mean().item()
+    assert mismatch_rate < 5e-3
+
+
+def test_static_per_head_quant_fp8_hip_graph_replay() -> None:
+    torch.manual_seed(23)
+    value = torch.randn((65, 12, 192), dtype=torch.bfloat16, device="cuda")
+    descale = torch.linspace(
+        0.125,
+        2.875,
+        value.shape[1],
+        dtype=torch.float32,
+        device="cuda",
+    )[None, :]
+    out = torch.empty_like(value, dtype=types.e4m3_dtype)
+
+    static_per_head_quant_fp8(value, descale, types.e4m3_dtype, out=out)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = static_per_head_quant_fp8(
+            value,
+            descale,
+            types.e4m3_dtype,
+            out=out,
+        )
+
+    captured_output = graph_out.clone()
+    value.copy_(torch.randn_like(value))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = _static_quantize_reference(value, descale)
+    assert graph_out is out
+    assert not torch.equal(graph_out, captured_output)
+    mismatch_rate = (graph_out != expected).float().mean().item()
+    assert mismatch_rate < 5e-3
 
 
 def test_kimi_k3_fp8_prefill_reports_all_requirements(monkeypatch) -> None:
