@@ -470,6 +470,45 @@ def test_down_reduce_split_k(case):
     assert cos_base >= 0.999, f"split_k {name}: cos_vs_base={cos_base:.6f}"
 
 
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_down_reduce_split_k_auto():
+    """split_k='auto' must match the non-split path regardless of the CU gate's pick.
+
+    Small grid (B=1, HIDDEN=128 -> base_grid=64 with kh=2) should trigger a >1
+    factor; we don't assert the exact k (it's CU-count dependent) but do assert
+    the auto path is numerically faithful to the plain bf16 store."""
+    from aiter.ops.flydsl.warp_decode_moe import _auto_split_k_down, _cu_count
+
+    B, INTER, HIDDEN, E, TOPK = 1, 2048, 128, 8, 2
+    inter, w_down, rid, rwt, wds = _gen_down(B, INTER, HIDDEN, E, TOPK, "pertensor")
+    base = flydsl_warp_decode_down_reduce(
+        inter, w_down, rid, rwt, wds, w_scale_mode="pertensor"
+    )
+    got = flydsl_warp_decode_down_reduce(
+        inter, w_down, rid, rwt, wds, w_scale_mode="pertensor", split_k="auto"
+    )
+    torch.cuda.synchronize()
+    cos_base = _cosine(base, got)
+    picked = _auto_split_k_down(B, HIDDEN, 2, INTER, 16, 0)
+    print(
+        f"[splitk auto] picked_k={picked} cu={_cu_count(0)} cos_vs_base={cos_base:.6f}"
+    )
+    assert cos_base >= 0.999, f"split_k auto: cos_vs_base={cos_base:.6f}"
+
+
+def test_auto_split_k_gate_logic():
+    """Unit-test the CU-count gate: divisibility + base_grid*k <= CuCount, else 1."""
+    from aiter.ops.flydsl.warp_decode_moe import _auto_split_k_down
+
+    # base_grid = B*(HIDDEN/kh) = 1*(128/2) = 64; num_iter = 2048/(64*16) = 2.
+    # -> only k=2 divides num_iter; picked iff 64*2 <= CuCount (true on gfx950).
+    assert _auto_split_k_down(1, 128, 2, 2048, 16, 0) in (1, 2)
+    # Saturated grid: base_grid huge (DeepSeek-like) must stay at 1 (off).
+    assert _auto_split_k_down(1, 7168, 2, 2048, 16, 0) == 1
+    # num_iter=2 not divisible by 4 or 8, so only 2 is ever a candidate here.
+    assert _auto_split_k_down(1, 8, 2, 2048, 16, 0) in (1, 2)
+
+
 # -------------------------------------------------------------------------
 # Phase B -- down_reduce MXFP4 (BF16 intermediate, FP4 e2m1 + E8M0 block scale)
 # -------------------------------------------------------------------------
