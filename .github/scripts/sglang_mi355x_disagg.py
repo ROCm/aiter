@@ -56,7 +56,7 @@ def patch_launcher(args: argparse.Namespace) -> None:
         """MODEL_MOUNT_ARGS=""
 MODEL_DOWNLOAD_MOUNT_ARGS=""
 for mount_root in ${MODEL_MOUNT_ROOTS:-/it-share /data /models}; do
-    if [[ -d "$mount_root" ]]; then
+    if [[ "$mount_root" == /data || -d "$mount_root" ]]; then
         MODEL_MOUNT_ARGS+=" -v $mount_root:$mount_root:ro"
         MODEL_DOWNLOAD_MOUNT_ARGS+=" -v $mount_root:$mount_root:rw"
     fi
