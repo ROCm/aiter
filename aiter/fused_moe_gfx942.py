@@ -84,6 +84,8 @@ def _get_compiled_kernel(
     E,
     act_quant_type_str=None,
     BLOCK_TILE_SIZE_K=None,
+    activation_str="silu",
+    swiglu_limit=None,
 ):
     """Cache-compiled flydsl kernel via compile_gemm."""
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_gemm
@@ -102,6 +104,8 @@ def _get_compiled_kernel(
         E=E,
         USE_ATOMIC_WRITE=True,
         act_quant_type=act_quant_type_str,
+        activation=activation_str,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -157,6 +161,7 @@ def fused_moe_gfx942(
     num_local_tokens: Any,
     moe_sorting_dispatch_policy: int,
     config_string: str,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor | None:
 
     # decode kernel configs from kernel name
@@ -166,7 +171,7 @@ def fused_moe_gfx942(
     if (
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
-        or activation != ActivationType.Silu
+        or activation not in (ActivationType.Silu, ActivationType.Swiglu)
         or w1.dtype != torch.float8_e4m3fnuz
         or w2.dtype != torch.float8_e4m3fnuz
     ):
@@ -176,6 +181,9 @@ def fused_moe_gfx942(
         raise RuntimeError(f"Unsupported quant_type: {quant_type}")
 
     qtype_str = "ptpc" if quant_type == QuantType.per_Token else "per_tensor"
+    activation_str = (
+        "swiglu" if activation == ActivationType.Swiglu else "silu"
+    )
 
     E, N1, K1 = w1.shape
     N2, K2 = w2.shape[1], w2.shape[2]
@@ -249,6 +257,8 @@ def fused_moe_gfx942(
             alg="prefill_1x4",
             E=E,
             act_quant_type_str=act_quant_type_str,
+            activation_str=activation_str,
+            swiglu_limit=swiglu_limit,
         )
         task_num = int(sorted_expert_ids.shape[0])
 
@@ -355,6 +365,8 @@ def fused_moe_gfx942(
             stage="gateup",
             alg="batch1",
             E=None,
+            activation_str=activation_str,
+            swiglu_limit=swiglu_limit,
         )
         _launch(
             gateup_batch1,
@@ -430,6 +442,8 @@ def fused_moe_gfx942(
             stage="gateup",
             alg="splitk",
             E=E,
+            activation_str=activation_str,
+            swiglu_limit=swiglu_limit,
         )
         _launch(
             gateup_kernel,

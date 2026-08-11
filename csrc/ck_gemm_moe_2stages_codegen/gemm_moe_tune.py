@@ -5835,17 +5835,33 @@ class FmoeTuner(TunerCommon):
 
         results_base = self.run_config(args)
         better_kernels = {}
+        tuned_keys = (
+            set(self.tunedf[self.keys].apply(tuple, axis=1))
+            if self.tunedf is not None
+            and not self.tunedf.empty
+            and all(col in self.tunedf.columns for col in self.keys)
+            else set()
+        )
 
         for i in range(len(self.untunedf)):
             e2e_us = results_base[i]["e2e_us"]
             err_ratio = results_base[i].get("err_ratio", 0)
+            status = results_base[i].get("status", "")
             row = self.untunedf.iloc[i]
-            keyname = " ".join(map(str, row[self.keys].values))
+            row_key = tuple(row[col] for col in self.keys)
+            keyname = " ".join(map(str, row_key))
+            has_exact_tuned = row_key in tuned_keys
+            baseline_valid = status == "ok" and e2e_us > 0
             better_kernels[i] = {
                 "name": keyname,
                 "row": row,
                 "kernel_name": None,
-                "e2e_us": e2e_us,
+                # An activation fallback is useful at runtime, but it is not a
+                # tuned result for this exact key. Force the first valid gfx942
+                # candidate to establish an explicit baseline for new shapes.
+                "e2e_us": (
+                    e2e_us if has_exact_tuned and baseline_valid else float("inf")
+                ),
                 "err_ratio": err_ratio,
                 "e2e_us_base": e2e_us,
                 "err_ratio_base": err_ratio,
@@ -5868,6 +5884,7 @@ class FmoeTuner(TunerCommon):
             moe_sorting_dispatch_policy=0,
             dtype=None,
             config_string="",
+            swiglu_limit=None,
         ):
             return fused_moe_gfx942(
                 hidden_states,
@@ -5883,6 +5900,7 @@ class FmoeTuner(TunerCommon):
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
                 config_string=config_string,
+                swiglu_limit=swiglu_limit,
             )
 
         GREEN = "\033[0;32m"
@@ -5957,7 +5975,9 @@ class FmoeTuner(TunerCommon):
         for i, k in better_kernels.items():
             if k["kernel_name"] is None:
                 continue
-            tune_results.append([*k["row"].values, *k["results"]])
+            tune_results.append(
+                [*[k["row"][col] for col in self.keys], *k["results"]]
+            )
             print(
                 f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%) {END} {k['kernel_name']}"
             )

@@ -30,6 +30,8 @@ def compile_gemm(
     USE_ATOMIC_WRITE=True,
     act_quant_type=None,
     tile_k=None,
+    activation="silu",
+    swiglu_limit=None,
 ):
 
     TILE_K = 64
@@ -60,6 +62,12 @@ def compile_gemm(
         "ptpc",
         "per_tensor",
     ], "act_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+    assert activation in [
+        "silu",
+        "swiglu",
+    ], "activation must be either 'silu' or 'swiglu'"
+    if activation == "swiglu":
+        swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
     # Supported native-fp8 prefill (weight, act) combos: weight ptpc requires act ptpc;
     # weight per_tensor allows act ptpc or per_tensor.
     if weight_dtype == "fp8" and alg == "prefill_1x4":
@@ -368,7 +376,21 @@ def compile_gemm(
             crd = fx.idx2crd(i, layout)
             dst_tensor[crd] = vec[i]
 
-    def _apply_scale_silu_bf16(c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale):
+    def _clamp_gateup(gate, up):
+        neg_limit = fx.Float32(-swiglu_limit)
+        gate = -((-gate).maximumf(neg_limit))
+        up = (-((-up).maximumf(neg_limit))).maximumf(neg_limit)
+        return gate, up
+
+    def _swiglu_oai(gate, up):
+        gate, up = _clamp_gateup(gate, up)
+        neg_alpha_log2e = -1.702 * 1.4426950408889634
+        tmp = rocdl.exp2(T.f32, _raw(gate * neg_alpha_log2e))
+        return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
+
+    def _apply_scale_gateup_bf16(
+        c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
+    ):
         # The reduce makes gate/up adjacent (2i, 2i+1).
         v_reps = fx.size(fx.get_shape(c_frag)[0]).to_py_value()
         m_reps = fx.size(fx.get_shape(c_frag)[1]).to_py_value()
@@ -414,7 +436,7 @@ def compile_gemm(
                 scale = arg_p_scale[0]
                 c_frag.store(c_frag.load() * scale)
 
-        # c_frag_bf16 stores the silu result (half the N dimension since gate+up -> 1 output)
+        # c_frag_bf16 stores the gateup activation result (N/2 outputs).
         n_half = n_reps // 2
         if const_expr(v_reps == 1):
             # v_reps==1 (TILE_N=32): flat value mode with stride 0 to avoid
@@ -430,15 +452,19 @@ def compile_gemm(
                 fx.BFloat16,
             )
 
-        log2_exp1 = -1.4426950408889634
         for i in range_constexpr(n_reps // 2):
             gate = c_frag[None, None, 2 * i + 0].load()
             up = c_frag[None, None, 2 * i + 1].load()
-            gate_log2 = gate * log2_exp1
             acc = []
-            for j in range_constexpr(gate.numel):
-                tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
-                acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
+            if const_expr(activation == "swiglu"):
+                for j in range_constexpr(gate.numel):
+                    acc.append(_swiglu_oai(gate[j], up[j]))
+            else:
+                log2_exp1 = -1.4426950408889634
+                gate_log2 = gate * log2_exp1
+                for j in range_constexpr(gate.numel):
+                    tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
+                    acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
             acc = Vec.from_elements(acc, fx.Float32)
             round_bit = fx.Uint32(0x8000)
             acc = (
@@ -495,16 +521,16 @@ def compile_gemm(
         )
         return c_frag_bf16
 
-    def _silu_pair_bf16(
+    def _gateup_pair_bf16(
         gate_frag, up_frag, gate_scale=None, up_scale=None, a_scale=None
     ):
-        # silu(gate) * up, element-wise over identically-laid-out gate/up fragments.
+        # Apply the selected activation over identically-laid-out gate/up fragments.
         # Used by the 4-wave compute path where gate (left N-half) and up (right N-half)
         # land in separate quadrant fragments with matching layout. Iterate (m, n)
         # explicitly so the result keeps the fragment's [v, m, n] positions. Optional
         # per-N-channel fp8 weight scales (shape [value, rep_n]) and an optional per-row
         # fp8 activation scale (a_scale[m], one per C M-row) are folded into the read so
-        # native-fp8 dequant happens before the non-linear silu.
+        # native-fp8 dequant happens before the non-linear activation.
         log2_exp1 = -1.4426950408889634
         round_bit = fx.Uint32(0x8000)
         out_bf16 = fx.make_fragment_like(gate_frag, dtype=fx.BFloat16)
@@ -529,8 +555,11 @@ def compile_gemm(
                     if const_expr(a_scale is not None):
                         g = g * a_sc
                         u = u * a_sc
-                    tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
-                    acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
+                    if const_expr(activation == "swiglu"):
+                        acc.append(_swiglu_oai(g, u))
+                    else:
+                        tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
+                        acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
                 acc = (
                     ((acc.bitcast(fx.Uint32) + round_bit) >> 16)
@@ -1443,7 +1472,7 @@ def compile_gemm(
                 splitk_waves=4,
             )
 
-            c_frag_bf16 = _apply_scale_silu_bf16(
+            c_frag_bf16 = _apply_scale_gateup_bf16(
                 c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
             )
 
@@ -1633,7 +1662,7 @@ def compile_gemm(
             a_with_index=False,
         )
 
-        c_frag_bf16 = _apply_scale_silu_bf16(
+        c_frag_bf16 = _apply_scale_gateup_bf16(
             c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
         )
 
@@ -1815,7 +1844,7 @@ def compile_gemm(
                     p_a_scale,
                 )
 
-            c_out_bf16 = _silu_pair_bf16(c_gate_frag, c_up_frag)
+            c_out_bf16 = _gateup_pair_bf16(c_gate_frag, c_up_frag)
 
             # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
             # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
