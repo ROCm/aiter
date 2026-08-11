@@ -445,9 +445,6 @@ KV_K = 0
 KV_V = 1
 KV_NONE = 2
 BARRIER_SIGNAL_AHEAD = 0
-DSWAIT_OCCUPY_WHOLE_WMMA = 1
-WAIT_DSCNT0 = 0
-QK_WMMA_INTERLEAVE = 1
 TDM_LOADS_PER_STAGE = 2
 
 # LDS layout (byte offsets)
@@ -1389,14 +1386,7 @@ class Softmax:
         # for PART2 in practice. This gives p2_budget_2=14 instead of 12 per MSB, which
         # provides 2 extra WMMAs of PART2 coverage in lds_done=True of stage 2, eliminating
         # the 3-WMMA naked cluster at the end of stage 2.
-        if const_expr(part0_left > 0):
-            p0c = min(part0_left, ALU_PER_STAGE[2] // NUM_MSB)
-            for m in range_constexpr(NUM_MSB):
-                rid_budget[2][m] = p0c
-            part0_left -= p0c
-            remaining_budget = ALU_PER_STAGE[2] - p0c * NUM_MSB
-        else:
-            remaining_budget = ALU_PER_STAGE[2]
+        remaining_budget = ALU_PER_STAGE[2]
         # fallback in case stage 1 left some
         rid_budget[2][4] = min(PART1_INSTS, remaining_budget)
         # Do NOT subtract PART1 from remaining_budget: PART1 is typically done in stage 1,
@@ -2287,7 +2277,7 @@ def gemm1_interleaved_stage(
 
         # DS wait at 1/4 point (mandatory, non-scheduled)
         sched_barrier(0)
-        if const_expr(gemm_idx == GEMM_INST_COUNT // 4 - 1 and not WAIT_DSCNT0):
+        if const_expr(gemm_idx == GEMM_INST_COUNT // 4 - 1):
             Atom.s_wait_dscnt(ds_issued)
         sched_barrier(0)
 
@@ -2358,10 +2348,7 @@ def gemm1_interleaved_stage(
         # DS wait at end of stage (mandatory, non-scheduled)
         sched_barrier(0)
         if const_expr(gemm_idx == GEMM_INST_COUNT - 1):
-            if const_expr(WAIT_DSCNT0):
-                Atom.s_wait_dscnt(0)
-            else:
-                Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
+            Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
         sched_barrier(0)
 
         # Phase 2: second half of row
@@ -2503,7 +2490,7 @@ def gemm2_interleaved_stage(
                 sched_barrier(0)
 
         sched_barrier(0)
-        if const_expr(gemm_idx == PV_GEMM_INST_COUNT // 4 - 1 and not WAIT_DSCNT0):
+        if const_expr(gemm_idx == PV_GEMM_INST_COUNT // 4 - 1):
             Atom.s_wait_dscnt(ds_issued)
         sched_barrier(0)
 
@@ -2571,10 +2558,7 @@ def gemm2_interleaved_stage(
 
         sched_barrier(0)
         if const_expr(gemm_idx == PV_GEMM_INST_COUNT - 1):
-            if const_expr(WAIT_DSCNT0):
-                Atom.s_wait_dscnt(0)
-            else:
-                Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
+            Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
         sched_barrier(0)
 
         # --- Phase 2 (cycle23=0) ---
