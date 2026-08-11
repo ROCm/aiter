@@ -342,6 +342,95 @@ namespace py = pybind11;
           py::arg("topk"),                                                          \
           py::arg("block_n") = -1)
 
+#define OPUS_MOE_BWD_PYBIND \
+    m.def("opus_moe_wgrad_bf16", \
+          &opus_moe_wgrad_bf16, \
+          "MoE K-grouped weight-gradient (BF16 operands -> FP32), naive M1", \
+          py::arg("dy"), \
+          py::arg("a"), \
+          py::arg("expert_offsets"), \
+          py::arg("dW")); \
+    m.def("opus_moe_dgrad_bf16", \
+          &opus_moe_dgrad_bf16, \
+          "MoE M-grouped data-gradient (BF16), naive M2", \
+          py::arg("dy"), \
+          py::arg("w"), \
+          py::arg("row_expert"), \
+          py::arg("dh")); \
+    m.def("opus_moe_dgrad_mfma_bf16", \
+          &opus_moe_dgrad_mfma_bf16, \
+          "MoE fused MFMA grouped dgrad (BF16, compact)", \
+          py::arg("dy"), \
+          py::arg("w"), \
+          py::arg("sorted_expert_ids"), \
+          py::arg("block_m_start"), \
+          py::arg("block_m_end"), \
+          py::arg("dh")); \
+    m.def("opus_moe_wgrad_mfma_bf16", \
+          &opus_moe_wgrad_mfma_bf16, \
+          "MoE fused MFMA grouped wgrad (BF16->FP32, transposed+padded)", \
+          py::arg("dyT"), \
+          py::arg("aT"), \
+          py::arg("pad_offs"), \
+          py::arg("dW")); \
+    m.def("opus_moe_transpose_pad_bf16", \
+          &opus_moe_transpose_pad_bf16, \
+          "MoE fused compact->feature-major pad+transpose (BF16)", \
+          py::arg("src"), \
+          py::arg("col_to_m"), \
+          py::arg("dst")); \
+    m.def("opus_moe_wgrad_tn_bf16", \
+          &opus_moe_wgrad_tn_bf16, \
+          "MoE full-TN grouped wgrad (BF16->FP32, natural compact, no transpose)", \
+          py::arg("dy"), \
+          py::arg("a"), \
+          py::arg("offs"), \
+          py::arg("dW")); \
+    m.def("opus_moe_act_bwd_bf16", \
+          &opus_moe_act_bwd_bf16, \
+          "MoE elementwise activation backward (g1u1, BF16)", \
+          py::arg("dh"), \
+          py::arg("act_input"), \
+          py::arg("d_act_input"), \
+          py::arg("act"), \
+          py::arg("swiglu_limit")); \
+    m.def("opus_moe_combine_bwd_bf16", \
+          &opus_moe_combine_bwd_bf16, \
+          "MoE combine backward (dy + dp)", \
+          py::arg("dout"), \
+          py::arg("gather"), \
+          py::arg("p"), \
+          py::arg("y"), \
+          py::arg("dy"), \
+          py::arg("dp")); \
+    m.def("opus_moe_scatter_add_bf16", \
+          &opus_moe_scatter_add_bf16, \
+          "MoE dx scatter-add (routes->token)", \
+          py::arg("src"), \
+          py::arg("gather"), \
+          py::arg("dst")); \
+    m.def("opus_moe_gather_sum_bf16", \
+          &opus_moe_gather_sum_bf16, \
+          "MoE dx gather-sum (deterministic, no atomics)", \
+          py::arg("src"), \
+          py::arg("token_routes"), \
+          py::arg("dst")); \
+    m.def("opus_moe_router_bwd_bf16", \
+          &opus_moe_router_bwd_bf16, \
+          "MoE router backward (softmax-over-topk Jacobian)", \
+          py::arg("dp"), \
+          py::arg("topk_w"), \
+          py::arg("topk_ids"), \
+          py::arg("dlogits")); \
+    m.def("opus_moe_router_bwd_sigmoid_bf16", \
+          &opus_moe_router_bwd_sigmoid_bf16, \
+          "MoE router backward (sigmoid scoring + optional renorm)", \
+          py::arg("dp"), \
+          py::arg("logits"), \
+          py::arg("topk_ids"), \
+          py::arg("dlogits"), \
+          py::arg("renorm"))
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \

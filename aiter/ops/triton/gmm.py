@@ -109,6 +109,7 @@ def gmm(
     work_stealing: bool = False,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
+    trans_rhs: bool | None = None,
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
@@ -165,6 +166,11 @@ def gmm(
         Optional override for GRID_DIM config. It's useful to override it while doing performance
         experiments or launching the GMM kernel in parallel with a comms kernel (reserve some CUs
         for comms).
+    trans_rhs : bool or None, optional
+        Explicitly select whether the RHS is interpreted as transposed. By default the
+        interpretation is inferred from shape and stride. An explicit value is required for a
+        square contiguous RHS because its non-transposed and transposed-layout-2 metadata are
+        identical when K == N.
 
     Returns
     -------
@@ -210,7 +216,25 @@ def gmm(
         existing_out=existing_out,
     )
 
-    trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
+    if trans_rhs is None:
+        trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
+    else:
+        rhs_stride = rhs.stride()
+        if trans_rhs:
+            valid_rhs_layout = (
+                (rhs.shape[1:] == (K, N) and rhs_stride == (K * N, 1, K))
+                or (rhs.shape[1:] == (N, K) and rhs_stride == (K * N, K, 1))
+            )
+        else:
+            valid_rhs_layout = rhs.shape[1:] == (K, N) and rhs_stride == (
+                K * N,
+                N,
+                1,
+            )
+        assert valid_rhs_layout, (
+            f"RHS shape {tuple(rhs.shape)} and stride {rhs_stride} are not valid for "
+            f"trans_rhs={trans_rhs}."
+        )
 
     if config is None:
         config = get_config("gmm", M, K, N, G)
