@@ -290,10 +290,21 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       (FP4 0.94 GB / FP8 1.88 GB) ≫ MALL and reads are cold, **halving the weight bytes wins,
       and the win grows with B** (more cold weight traffic per launch). FP8 still shows higher
       raw TB/s (5.5→7.5 vs FP4 3.6→6.1, FP4 pays convert overhead) but moves 2× the bytes, so
-      FP4 finishes first. **Blocker for true E=256:** the kernels' i32 weight offset
-      (`w_row*inter`) overflows 2^31 above E≈146 and faults, so the harness caps at **E=128**
-      (guarded); real E=256 needs the **K3 i64 / per-expert-base addressing** follow-on. This
-      validates the ticket's headline claim; remaining upside is G8 prefetch + the K3 fix.
+      FP4 finishes first. FP8 still shows higher raw TB/s (5.5→7.5 vs FP4 3.6→6.1) but moves 2×
+      the bytes, so FP4 finishes first.
+    - **K3 Tier-1 fix landed (2026-08-11) — FP4 now runs at the real E=256.** The i32 weight
+      offset used to overflow because it computed `(w_row*DIM + k_base)//WPACK`, and the
+      `w_row*DIM` element product wrapped 2^31 at E≈146. Restructured to the algebraic identity
+      `w_row*(DIM//WPACK) + k_base//WPACK` (both terms divisible by WPACK, so bit-exact — 26/26
+      op_tests still pass, incl. new E=256 correctness cases). This drops the intermediate product
+      so FP4's limiting quantity becomes the hardware **byte** offset `w_row*INTER/2`, which fits
+      i32 up to `E*H*I < 2^32`; E=256 (`3.76e9`, byte offset 1.88 GB) now runs. Cold E=256 FP4
+      `down` (pool 1.88 GB ≫ MALL): B=1 17.5 µs / B=2 26.4 / B=4 42.9 / B=8 80.8, **cos 1.000, no
+      fault** — matches the E=128 timings (per-launch reads are E-independent), so the 1.26–1.54×
+      FP4-vs-FP8 ratios above hold at true E=256. **FP8 E=256 still deferred:** its byte offset is
+      `w_row*INTER` (2× FP4), overflows 2^31, needs the **K3 Tier-2 per-expert i64 base**; the cold
+      harness auto-skips the FP8 leg above 2^31 and reports it n/a. Remaining upside: G8 prefetch +
+      K3 Tier-2 (unlocks FP8 E=256 + Kimi-K3 9.85 GB).
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
