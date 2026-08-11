@@ -155,8 +155,9 @@ __device__ inline void async_load_range(Mem& g, void* smem_base, const LayoutG& 
     }
 }
 
-// >4GiB KV: buffer async_load uses a 32-bit byte soffset. Fold absolute element offsets
-// into the resource base (high 32 bits of the byte address) and pass the low part as s_os.
+// >4GiB KV: a descriptor's num_records is 32-bit, so one descriptor cannot span the whole
+// K/V row. Each tile gets its own descriptor based at the tile start (folded into the 64-bit
+// resource base), with num_records covering the rest of this (b, h_kv) head from that start.
 template<typename D_ATTN>
 __device__ inline unsigned kv_num_records_bytes(int64_t abs_elem_off, int64_t head_end_elem) {
     const int64_t remain_elems = head_end_elem - abs_elem_off;
@@ -554,27 +555,24 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     auto v_abs_elem = [&](int ti) {
         return v_gmem_offset + static_cast<int64_t>(ti) * T::KV_TILE_SIZE * kargs.stride_v_n;
     };
+    // The whole tile offset goes into the resource base and soffset stays 0, so num_records
+    // and the offsets the hardware range-checks share one origin (the tile start). Splitting
+    // the offset across base and soffset instead would leave the soffset distance outside the
+    // bound -- soffset is excluded from range checking -- and still cap reach at 4GiB.
     auto k_gmem_at = [&](int ti) {
         const int64_t abs = k_abs_elem(ti);
-        const int64_t byte_off = abs * static_cast<int64_t>(sizeof(D_ATTN));
-        const char* rsrc_base = reinterpret_cast<const char*>(kargs.ptr_k) + (byte_off & ~0xffffffffLL);
-        const int s_os = static_cast<int>((byte_off & 0xffffffffu) / static_cast<unsigned>(sizeof(D_ATTN)));
-        auto g = make_gmem(reinterpret_cast<const D_ATTN*>(rsrc_base),
-                           kv_num_records_bytes<D_ATTN>(abs, k_head_end_elem));
-        return opus::make_tuple(g, s_os);
+        return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + abs,
+                         kv_num_records_bytes<D_ATTN>(abs, k_head_end_elem));
     };
     auto load_k_async = [&](void* smem, const auto& u_gk, const auto& u_sk, int ti) {
-        auto [g, s_os] = k_gmem_at(ti);
-        async_load<T::VEC_KV>(g, smem, u_gk, u_sk, s_os);
+        auto g = k_gmem_at(ti);
+        async_load<T::VEC_KV>(g, smem, u_gk, u_sk, 0);
     };
     auto load_v_async = [&](void* smem, const auto& u_gv, const auto& u_sv, int ti) {
         const int64_t abs = v_abs_elem(ti);
-        const int64_t byte_off = abs * static_cast<int64_t>(sizeof(D_ATTN));
-        const char* rsrc_base = reinterpret_cast<const char*>(kargs.ptr_v) + (byte_off & ~0xffffffffLL);
-        const int s_os = static_cast<int>((byte_off & 0xffffffffu) / static_cast<unsigned>(sizeof(D_ATTN)));
-        auto g = make_gmem(reinterpret_cast<const D_ATTN*>(rsrc_base),
+        auto g = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + abs,
                            kv_num_records_bytes<D_ATTN>(abs, v_head_end_elem));
-        async_load<T::VEC_KV>(g, smem, u_gv, u_sv, s_os);
+        async_load<T::VEC_KV>(g, smem, u_gv, u_sv, 0);
     };
 
     // Shared memory: double-buffered K(192) and V(128) tiles; s_q aliases the V region
@@ -800,11 +798,12 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // last K tile instead of faulting) → constant in-flight vmcnt, no tail branch.
             v_v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv);
             const int k_pf_ti = tile_idx(min(t + 2, max_num_tiles - 1));
+            // One descriptor per prefetched K tile; stage6 reuses it for the remaining chunks.
+            auto g_k_pf = k_gmem_at(k_pf_ti);
             if constexpr(STAGGER) {
-                auto [g_k_pf, s_os_k_pf] = k_gmem_at(k_pf_ti);
-                async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, s_os_k_pf);
+                async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
             } else {
-                load_k_async(s_k[cur].ptr, u_gk, u_sk, k_pf_ti);
+                async_load<T::VEC_KV>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
             }
             __builtin_amdgcn_sched_barrier(0);
             if constexpr (T::CAUSAL) {
@@ -846,8 +845,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // stage6 [mem]: read V(t-1) su1; (stagger only) issue the remaining 2 K(t+2) d-chunks.
             v_v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv + V_SU1_OFF);
             if constexpr(STAGGER) {
-                auto [g_k_pf, s_os_k_pf] = k_gmem_at(k_pf_ti);
-                async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, s_os_k_pf);
+                async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
             }
             s_waitcnt_lgkmcnt(0_I);
             s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
