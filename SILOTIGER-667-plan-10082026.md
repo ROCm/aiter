@@ -270,6 +270,30 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       This kills the "raise kVector" lever from the original FP4-win hypothesis — the remaining
       lever is **real E=256 cold-HBM measurement** (where 0.5 B/elt finally dominates) + G8
       prefetch, not bigger tiles.
+- [x] **Cold-HBM large-E harness landed — FP4 CONFIRMS the ticket's BW win (1.26–1.54×).**
+      New `bench_down_cold` (behind `--cold`) allocates the *full* E-expert down pool once and
+      **rotates a tiny router-id set over disjoint expert groups** (`_router_group_list`), so
+      steady-state launches stream fresh weights from HBM instead of re-reading the TOPK experts
+      warm in MALL (the artifact that made the earlier E=8 sweep misleading). Pools are built in
+      packed form (`_gen_down_fp4_pool` / `_gen_down_fp8_pool`) and the correctness gate
+      dequantizes only the *touched* experts (`_dequant_down_expert_fp4`) so the ~15 GB fp32
+      E-pool is never materialized; router rotation drives content via a stateful closure
+      (weights captured, not deep-copied → no OOM). **A/B (GPU 6, gfx950, 50 iters, DeepSeek
+      I2048/H7168, E=128, cos 1.0):**
+      | B | FP4 µs | FP8 µs | FP4/FP8 | speedup |
+      |---|--------|--------|---------|---------|
+      | 1 | 17.1 | 21.5 | 0.795 | **1.26×** |
+      | 2 | 26.3 | 35.2 | 0.746 | **1.34×** |
+      | 4 | 43.1 | 66.1 | 0.651 | **1.54×** |
+      | 8 | 81.8 | 126.0 | 0.649 | **1.54×** |
+      Complete reversal of the warm E=8 result (FP4 was 1.58× *slower* at B=1): once the pool
+      (FP4 0.94 GB / FP8 1.88 GB) ≫ MALL and reads are cold, **halving the weight bytes wins,
+      and the win grows with B** (more cold weight traffic per launch). FP8 still shows higher
+      raw TB/s (5.5→7.5 vs FP4 3.6→6.1, FP4 pays convert overhead) but moves 2× the bytes, so
+      FP4 finishes first. **Blocker for true E=256:** the kernels' i32 weight offset
+      (`w_row*inter`) overflows 2^31 above E≈146 and faults, so the harness caps at **E=128**
+      (guarded); real E=256 needs the **K3 i64 / per-expert-base addressing** follow-on. This
+      validates the ticket's headline claim; remaining upside is G8 prefetch + the K3 fix.
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
