@@ -1945,8 +1945,7 @@ def _mxfp4_scale_u8(scale):
 
 
 def _flydsl_stage2_fp8_enabled():
-    kstatic_default = os.environ.get("MXFP4_G2_KSTATIC", "1")
-    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", kstatic_default) == "1"
+    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _flydsl_v2_stage2_wrapper(

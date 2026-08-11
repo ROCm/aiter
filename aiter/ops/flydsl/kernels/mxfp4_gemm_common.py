@@ -3,9 +3,7 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -13,7 +11,6 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from . import dpp_utils
 
-_PTR3 = "!llvm.ptr<3>"
 kStages = 2
 kBS_stride_k0_dw = 64
 
@@ -29,29 +26,26 @@ def _udiv(x, d):
 
 
 def _lds_ptr3(base_i32, byte_off_i32):
-    addr_i64 = fx.Int64(base_i32 + byte_off_i32)
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
+    ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(base_i32 + byte_off_i32)))
 
 
 def _lds_base_ptr3(lds_view):
     base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32)))
+    return _lds_ptr3(base_i32, fx.Int32(0))
 
 
 def _gep3(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
+    return buffer_ops.get_element_ptr(base_ptr, byte_offset=byte_off_i32, elem_type=T.i8)
 
 
 def _global_base_ptr1(addr_i64):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
+    ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(addr_i64)))
 
 
 def _gep1(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
+    return buffer_ops.get_element_ptr(base_ptr, byte_offset=byte_off_i32, elem_type=T.i8)
 
 
 def _global_ptr1(arg, byte_off_i32):
@@ -60,7 +54,7 @@ def _global_ptr1(arg, byte_off_i32):
 
 def _buffer_rsrc(addr_i64, num_records_bytes):
     return buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(addr_i64)), num_records_bytes=num_records_bytes
+        fx.Int64(addr_i64), num_records_bytes=num_records_bytes
     )
 
 
@@ -87,7 +81,7 @@ def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):
 def global_typed_ptr(arg, elem_ty, align=4):
     """Typed global fx.Pointer over a raw i64 device address; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
-    return fx.inttoptr(ptr_ty, _raw(fx.Int64(arg)))
+    return fx.inttoptr(ptr_ty, fx.Int64(arg))
 
 
 def lds_typed_ptr(base_i32, elem_ty, align=4):
@@ -114,7 +108,7 @@ def flat_buffer_view(
     """Flat buffer-tensor view over a RAW i64 addr; fold=True folds wave-uniform base to a VGPR voffset, fold=False keeps per-lane offset + num_records_bytes for OOB-zero."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
     if fold:
-        base = fx.Uint32(fx.rocdl.readfirstlane(T.i32, _raw(base_elems)))
+        base = fx.Uint32(fx.rocdl.readfirstlane(T.i32, base_elems))
         off_i64 = fx.Uint64(base)
         base_iter = fx.inttoptr(
             ptr_ty,
@@ -133,25 +127,25 @@ def _fabs_f32(x):
 
 
 def _e8m0_roundup(amax_f32):
-    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+    wi = (amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
-    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
-    return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
+    lt = fx.Uint32(bexp) < fx.Uint32(254)
+    return lt.select(bexp, fx.Int32(254))
 
 
 def _e8m0_from_amax(amax_f32):
     e8m0 = _e8m0_roundup(amax_f32)
-    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
+    qscale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, qscale
 
 
 def _umax_i32(a, b):
-    is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _raw(a), _raw(b))
-    return fx.Int32(arith.select(is_gt, _raw(a), _raw(b)))
+    is_gt = fx.Uint32(a) > fx.Uint32(b)
+    return is_gt.select(a, b)
 
 
 def _dpp_umax_step(a32, dpp_ctrl):
-    swapped = dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), dpp_ctrl, 0xF, 0xF, True)
+    swapped = dpp_utils.update_dpp_i32(a32, a32, dpp_ctrl, 0xF, 0xF, True)
     return _umax_i32(a32, fx.Int32(swapped))
 
 
