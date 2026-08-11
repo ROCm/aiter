@@ -555,7 +555,9 @@ def fused_recurrent_kda_packed_decode_kernel(
                         q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
                     )
             else:
-                raw = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE)
+                raw = _fetch_token(
+                    q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
+                )
                 q_p += H * K
                 k_p += H * K
                 v_p += HV * V
@@ -593,13 +595,20 @@ def fused_recurrent_kda_packed_decode_kernel(
 
             if IS_CONTINUOUS_BATCHING:
                 if INPLACE_FINAL_STATE:
-                    out_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + t).to(
-                        gl.int32
-                    )
+                    out_slot = gl.load(
+                        state_indices_ptr + i_n * stride_indices_seq + t
+                    ).to(gl.int32)
                 else:
                     out_slot = bos + t
                 row_out = _state_row(
-                    out_slot, stride_state_out_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
+                    out_slot,
+                    stride_state_out_slot_rows,
+                    i_hv,
+                    i_v,
+                    K,
+                    V,
+                    BV,
+                    STATE_V_FIRST,
                 )
                 if CACHE_STATE_UPDATES:
                     if t == 0:
@@ -611,7 +620,8 @@ def fused_recurrent_kda_packed_decode_kernel(
                     else:
                         r_p = (
                             state_out_ptr
-                            + out_slot.to(gl.int64) * (stride_state_out_slot_rows * ROWLEN)
+                            + out_slot.to(gl.int64)
+                            * (stride_state_out_slot_rows * ROWLEN)
                             + i_hv * V * K
                             + i_v * (2 * K + BV)
                         )
