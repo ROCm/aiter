@@ -190,6 +190,84 @@ def _strides_ok(
     return block_table.stride(1) == 1
 
 
+def _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce) -> bool:
+    """Paged, full-window, non-shuffle, non-reduce. The reduce/shuffle flags
+    belong to Triton layouts this kernel does not read; the paged path is the
+    only one wired here. (Causal and non-causal are both built.)"""
+    return (
+        window_size[0] < 0
+        and block_table is not None
+        and not shuffled_kv_cache
+        and not skip_reduce
+    )
+
+
+def _page_geometry_ok(block_size, max_seqlen_k) -> bool:
+    """Structural page shape, not tunable: fixed page size, KV within the staged
+    block-table window."""
+    return (
+        block_size == _PAGE_SIZE
+        and (max_seqlen_k + _PAGE_SIZE - 1) // _PAGE_SIZE <= _MAX_KV_TILES
+    )
+
+
+def _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
+    """fp8 QKV, bf16/f16 output (both pack to 2 bytes), int32 index tensors."""
+    return (
+        q.dtype == _FP8_DTYPE
+        and k.dtype == _FP8_DTYPE
+        and v.dtype == _FP8_DTYPE
+        and out.dtype in (torch.bfloat16, torch.float16)
+        and cu_seqlens_q.dtype == torch.int32
+        and seqused_k.dtype == torch.int32
+        and block_table.dtype == torch.int32
+    )
+
+
+def _descales_ok(q_descale, k_descale, v_descale) -> bool:
+    """Per-tensor fp8 descales are mandatory: the kernel reads all three to form
+    c_logit_scale and the V dequant."""
+    return all(
+        d is not None and d.dtype == torch.float32 and d.numel() == 1
+        for d in (q_descale, k_descale, v_descale)
+    )
+
+
+def _geometry_ok(
+    head_size, num_query_heads, num_kv_heads, num_queries_per_kv, cu_seqlens_q, num_seqs
+) -> bool:
+    """Fixed head dim; GQA group divides block_m for M-packing; cu_seqlens covers
+    every sequence."""
+    return (
+        head_size == _HEAD_DIM
+        and num_query_heads % num_kv_heads == 0
+        and _BLOCK_M % num_queries_per_kv == 0
+        and cu_seqlens_q.numel() == num_seqs + 1
+    )
+
+
+def _no_unsupported_features(
+    softcap, alibi_slopes, qq_bias, q_scales, output_scale
+) -> bool:
+    """Features the kernel has no path for; declining beats silently dropping."""
+    return (
+        softcap == 0
+        and alibi_slopes is None
+        and qq_bias is None
+        and q_scales is None
+        and output_scale is None
+    )
+
+
+def _sinks_ok(sinks, num_query_heads) -> bool:
+    """Sinks (per-head [num_query_heads] fp32) are served only single-split; the
+    dispatch gate refuses split-K when sinks is set, so an accepted call always
+    lands single-split."""
+    return sinks is None or (
+        sinks.dtype == torch.float32 and sinks.numel() == num_query_heads
+    )
+
+
 def _supported(
     q,
     k,
@@ -226,56 +304,22 @@ def _supported(
     num_query_heads = q.shape[1]
 
     return (
-        # Dispatch mode. Both causal and non-causal are built (causal keys the
-        # kernel cache); the paged path is the only one wired here, and the two
-        # "reduce"/shuffle flags belong to Triton layouts we do not read.
-        window_size[0] < 0
-        and block_table is not None
-        and not shuffled_kv_cache
-        and not skip_reduce
-        # Page geometry. Both are structural, not tunable.
-        and block_size == _PAGE_SIZE
-        and (max_seqlen_k + _PAGE_SIZE - 1) // _PAGE_SIZE <= _MAX_KV_TILES
-        # Dtypes. Output packs via cvt_pk_bf16_f32 (bf16) or cvt_pkrtz (f16);
-        # both store 2 bytes, so the store layout is identical.
-        and q.dtype == _FP8_DTYPE
-        and k.dtype == _FP8_DTYPE
-        and v.dtype == _FP8_DTYPE
-        and out.dtype in (torch.bfloat16, torch.float16)
-        and cu_seqlens_q.dtype == torch.int32
-        and seqused_k.dtype == torch.int32
-        and block_table.dtype == torch.int32
-        # Per-tensor fp8 descales are mandatory on this path -- the kernel reads
-        # all three unconditionally to form c_logit_scale and the V dequant.
-        and q_descale is not None
-        and k_descale is not None
-        and v_descale is not None
-        and q_descale.dtype == torch.float32
-        and k_descale.dtype == torch.float32
-        and v_descale.dtype == torch.float32
-        and q_descale.numel() == 1
-        and k_descale.numel() == 1
-        and v_descale.numel() == 1
-        # Geometry. The GQA group must divide block_m for M-dimension packing.
-        and head_size == _HEAD_DIM
-        and num_query_heads % num_kv_heads == 0
-        and _BLOCK_M % num_queries_per_kv == 0
-        and cu_seqlens_q.numel() == num_seqs + 1
-        # Features with no kernel support. Declining beats silently dropping.
-        and softcap == 0
-        and alibi_slopes is None
-        and qq_bias is None
-        and q_scales is None
-        and output_scale is None
-        # Sinks are served (per-head [num_query_heads] fp32) but only on the
-        # single-split path -- exp(sink) would be counted once per split in the
-        # combine denominator otherwise. The dispatch gate in
-        # flydsl_unified_attention refuses split-K whenever sinks is not None,
-        # so an accepted sinks call always lands single-split.
-        and (
-            sinks is None
-            or (sinks.dtype == torch.float32 and sinks.numel() == num_query_heads)
+        _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce)
+        and _page_geometry_ok(block_size, max_seqlen_k)
+        and _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+        and _descales_ok(q_descale, k_descale, v_descale)
+        and _geometry_ok(
+            head_size,
+            num_query_heads,
+            num_kv_heads,
+            num_queries_per_kv,
+            cu_seqlens_q,
+            num_seqs,
         )
+        and _no_unsupported_features(
+            softcap, alibi_slopes, qq_bias, q_scales, output_scale
+        )
+        and _sinks_ok(sinks, num_query_heads)
         and _strides_ok(
             q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
         )

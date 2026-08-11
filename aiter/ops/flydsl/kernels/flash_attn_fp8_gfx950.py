@@ -82,21 +82,21 @@ def build_flash_attn_dualwave_swp_fp8_module(
             f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
         )
     if head_dim != 128:
-        raise RuntimeError(
+        raise ValueError(
             f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}"
         )
     # dtype_str is the INPUT/COMPUTE (QKV) dtype. This builder is genuinely
     # fp8-only: the traits factory hardcodes DTYPE_STR="fp8", so a non-fp8 value
     # here would silently build an fp8 kernel. Reject it rather than mislead.
     if dtype_str != "fp8":
-        raise RuntimeError(
+        raise ValueError(
             f"flash_attn_dualwave_swp_fp8 builds fp8 QKV only, got dtype={dtype_str}"
         )
     # out_dtype_str is the OUTPUT store dtype, independent of the fp8 QKV compute.
     # Both are 2-byte, so every address, num_records bound and store packet is
     # unchanged; only the f32->out conversion at the store sites differs.
     if out_dtype_str not in ("bf16", "f16"):
-        raise RuntimeError(
+        raise ValueError(
             f"flash_attn_dualwave_swp_fp8 output supports bf16/f16 only, got out_dtype={out_dtype_str}"
         )
     # fp8 always builds the BN128 deep-pipeline path: the shallow path's PV
@@ -393,14 +393,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
             def _ring_wrap(x):
                 return (x >= NPF_I).select(x - NPF_I, x)
 
-            # The ring prefetches two iterations ahead unconditionally, so the
-            # last iterations fetch tiles past t_end -- a fixed 4-tile overshoot
-            # however long the range is. This is free: the kernel is
-            # latency-bound, not bandwidth-bound, at every measured size, so the
-            # overshoot is already absorbed by ring slack.
-            def _pf_tile(x):
-                return x
-
             init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
             loop_results = init_args
             for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
@@ -468,8 +460,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # barrier is what separates them; issuing later in the body than
                 # before only widens that margin.
                 v_v_a = kv_lds_to_regs.load_v(a_buf)
-                pf_a = _pf_tile(j + fx.Index(4))
-                pf_b = _pf_tile(j + fx.Index(5))
+                # The ring prefetches two iterations ahead unconditionally, so
+                # the last iterations fetch tiles past t_end -- a fixed 4-tile
+                # overshoot, left unclamped: the kernel is latency-bound, so the
+                # overshoot is absorbed by ring slack.
+                pf_a = j + fx.Index(4)
+                pf_b = j + fx.Index(5)
                 # Resolve both prefetch page ids under ONE lgkmcnt(0) drain, and
                 # reuse them for the V half at C6. K and V for a given tile
                 # resolve the SAME page id, so batching the lookups avoids
@@ -712,6 +708,90 @@ def build_flash_attn_dualwave_swp_fp8_module(
         },
     }
 
+    def _normalize_launch_args(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_len,
+        stride_kv_n,
+        stride_q_n,
+        head_dim_runtime,
+        debug_counts,
+        seq_len_kv,
+        workspace,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_descale,
+        k_descale,
+        v_descale,
+        block_table,
+        block_table_stride,
+        sink,
+        stream,
+    ):
+        """Fill the None defaults shared by _launch and _compile and return the
+        positional argument tuple for launch_flash_attn_dualwave_swp.
+
+        Unused tensor slots (cu_seqlens, descales, block_table, sink) pass O as a
+        placeholder; the kernel only reads each under its const_expr gate."""
+        if stride_kv_n is None:
+            stride_kv_n = DEFAULT_STRIDE_KV_N
+        if stride_q_n is None:
+            stride_q_n = DEFAULT_STRIDE_Q_N
+        if head_dim_runtime is None:
+            head_dim_runtime = HEAD_DIM
+        # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
+        if seq_len_kv is None:
+            seq_len_kv = seq_len
+        if SPLITK:
+            if workspace is None:
+                raise ValueError(
+                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
+                )
+            debug_counts = workspace
+        if debug_counts is None:
+            debug_counts = O
+        if cu_seqlens_q is None:
+            cu_seqlens_q = O
+        if cu_seqlens_kv is None:
+            cu_seqlens_kv = O
+        if q_descale is None:
+            q_descale = O
+        if k_descale is None:
+            k_descale = O
+        if v_descale is None:
+            v_descale = O
+        if block_table is None:
+            block_table = O
+        if block_table_stride is None:
+            block_table_stride = 0
+        if sink is None:
+            sink = O
+        return (
+            Q,
+            K,
+            V,
+            O,
+            debug_counts,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            sink,
+            batch_size,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+            fx.Stream(stream),
+        )
+
     def _launch(
         Q,
         K,
@@ -736,70 +816,31 @@ def build_flash_attn_dualwave_swp_fp8_module(
         sink=None,
         stream=None,
     ):
-        if stride_kv_n is None:
-            stride_kv_n = DEFAULT_STRIDE_KV_N
-        if stride_q_n is None:
-            stride_q_n = DEFAULT_STRIDE_Q_N
-        if head_dim_runtime is None:
-            head_dim_runtime = HEAD_DIM
-        # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
-        if seq_len_kv is None:
-            seq_len_kv = seq_len
-        if SPLITK:
-            if workspace is None:
-                raise ValueError(
-                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
-                )
-            debug_counts = workspace
-        if debug_counts is None:
-            debug_counts = O
-        # Dense launches still pass valid tensors for the (unused) cu_seqlens slots;
-        # the kernel only reads them under const_expr(VARLEN). Use O as a placeholder.
-        if cu_seqlens_q is None:
-            cu_seqlens_q = O
-        if cu_seqlens_kv is None:
-            cu_seqlens_kv = O
-        # Per-tensor fp8 descales (shape-[1] fp32). The kernel only reads them on
-        # the fp8 path; bf16/f16 launches pass O as an unused placeholder.
-        if q_descale is None:
-            q_descale = O
-        if k_descale is None:
-            k_descale = O
-        if v_descale is None:
-            v_descale = O
-        # BlockTable is only read under const_expr(PAGED); use O as a placeholder
-        # otherwise. block_table_stride defaults to 0 (unused without paging).
-        if block_table is None:
-            block_table = O
-        if block_table_stride is None:
-            block_table_stride = 0
-        # Sink is only read under const_expr(USE_SINKS); use O as a placeholder.
-        if sink is None:
-            sink = O
+        args = _normalize_launch_args(
+            Q,
+            K,
+            V,
+            O,
+            batch_size,
+            seq_len,
+            stride_kv_n,
+            stride_q_n,
+            head_dim_runtime,
+            debug_counts,
+            seq_len_kv,
+            workspace,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            block_table_stride,
+            sink,
+            stream,
+        )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return _run_compiled(
-                launch_flash_attn_dualwave_swp,
-                Q,
-                K,
-                V,
-                O,
-                debug_counts,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                q_descale,
-                k_descale,
-                v_descale,
-                block_table,
-                sink,
-                batch_size,
-                seq_len,
-                seq_len_kv,
-                stride_q_n,
-                stride_kv_n,
-                head_dim_runtime,
-                block_table_stride,
-                fx.Stream(stream),
-            )
+            return _run_compiled(launch_flash_attn_dualwave_swp, *args)
 
     def _compile(
         Q,
@@ -825,62 +866,31 @@ def build_flash_attn_dualwave_swp_fp8_module(
         sink=None,
         stream=None,
     ):
-        if stride_kv_n is None:
-            stride_kv_n = DEFAULT_STRIDE_KV_N
-        if stride_q_n is None:
-            stride_q_n = DEFAULT_STRIDE_Q_N
-        if head_dim_runtime is None:
-            head_dim_runtime = HEAD_DIM
-        if seq_len_kv is None:
-            seq_len_kv = seq_len
-        if SPLITK:
-            if workspace is None:
-                raise ValueError(
-                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
-                )
-            debug_counts = workspace
-        if debug_counts is None:
-            debug_counts = O
-        if cu_seqlens_q is None:
-            cu_seqlens_q = O
-        if cu_seqlens_kv is None:
-            cu_seqlens_kv = O
-        if q_descale is None:
-            q_descale = O
-        if k_descale is None:
-            k_descale = O
-        if v_descale is None:
-            v_descale = O
-        if block_table is None:
-            block_table = O
-        if block_table_stride is None:
-            block_table_stride = 0
-        if sink is None:
-            sink = O
+        args = _normalize_launch_args(
+            Q,
+            K,
+            V,
+            O,
+            batch_size,
+            seq_len,
+            stride_kv_n,
+            stride_q_n,
+            head_dim_runtime,
+            debug_counts,
+            seq_len_kv,
+            workspace,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            block_table_stride,
+            sink,
+            stream,
+        )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return flyc.compile(
-                launch_flash_attn_dualwave_swp,
-                Q,
-                K,
-                V,
-                O,
-                debug_counts,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                q_descale,
-                k_descale,
-                v_descale,
-                block_table,
-                sink,
-                batch_size,
-                seq_len,
-                seq_len_kv,
-                stride_q_n,
-                stride_kv_n,
-                head_dim_runtime,
-                block_table_stride,
-                fx.Stream(stream),
-            )
+            return flyc.compile(launch_flash_attn_dualwave_swp, *args)
 
     _launch.compile = _compile
 
