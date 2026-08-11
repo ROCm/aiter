@@ -232,9 +232,6 @@ def gemm2_body_v2(
     g2_ascale_pf=True,
     g2_bf16_lds=False,
     route_out_fp8=False,
-    g2_c_disjoint=False,
-    g2_c_pad=0,
-    g2_c_split=1,
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
@@ -308,10 +305,7 @@ def gemm2_body_v2(
     lane_mod_16 = lane % 16
 
     s_aq_base = lds_base_i32
-    if const_expr(g2_c_disjoint):
-        lds_acc_base = lds_base_i32 + fx.Int32(aStages * slot_bytes)
-    else:
-        lds_acc_base = lds_base_i32
+    lds_acc_base = lds_base_i32
     mma_atoms = scale_mma_atoms(a_dtype)
 
     aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
@@ -784,9 +778,6 @@ def gemm2_body_v2(
         SBM=SBM,
         g2_bf16_lds=g2_bf16_lds,
         route_out_fp8=route_out_fp8,
-        g2_c_disjoint=g2_c_disjoint,
-        g2_c_pad=g2_c_pad,
-        g2_c_split=g2_c_split,
         g2_defer_weight=g2_defer_weight,
         g2_out_pitch_align=g2_out_pitch_align,
         g2_scale_blk=g2_scale_blk,
@@ -814,25 +805,16 @@ def atomic_bf16_epilog(
     SBM=None,
     g2_bf16_lds=False,
     route_out_fp8=False,
-    g2_c_disjoint=False,
-    g2_c_pad=0,
-    g2_c_split=1,
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
 ):
     if SBM is None:
         SBM = BM
-    BN_P = BN + g2_c_pad
     EPI_LANES = _G2_EPI_LANES
     EPI_ROWS = 256 // EPI_LANES
     M_REPS = BM // EPI_ROWS
     ROUTE_VEC = 256 // EPI_LANES
-
-    c_split = int(g2_c_split or 1)
-    if BM % c_split or (BM // c_split) % 16 or M_REPS % c_split:
-        c_split = 1
-    ROWS_PP = BM // c_split
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -886,47 +868,39 @@ def atomic_bf16_epilog(
         if const_expr(not defer_w):
             weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 
-    # pre-store fence+barrier (HIP run_one __syncthreads() before the epilog).
-    def cshuffle_pass(p):
-        if const_expr(p > 0 or not g2_c_disjoint):
-            gpu.barrier()
-
-        lo = p * (ROWS_PP // 16)
-        hi = lo + (ROWS_PP // 16)
-        if const_expr(g2_bf16_lds):
-            for i in range_constexpr(lo, hi):
-                row_base = fx.Int32(i * 16) + lane_div_16 * 4
-                lds_row = fx.Int32(i * 16 - p * ROWS_PP) + lane_div_16 * 4
-                w_row = (
-                    None
-                    if const_expr(defer_w)
-                    else [
-                        load_scalar(load_f32, sweights, m_row + row_base + v, Float32)
-                        for v in range_constexpr(4)
-                    ]
-                )
-                for J in range_constexpr(numAccN):
-                    col = wave * wave_n + J * 16 + lane_mod_16
-                    vec = Vec(accm[i][J])
-                    for v in range_constexpr(4):
-                        idx = (lds_row + v) * BN_P + col
-                        if const_expr(defer_w):
-                            lds_base_bf16[idx] = fx.BFloat16(fx.Float32(vec[v]))
-                        else:
-                            lds_base_bf16[idx] = fx.BFloat16(
-                                fx.Float32(vec[v]) * fx.Float32(w_row[v])
-                            )
-        else:
-            for i in range_constexpr(lo, hi):
-                lds_row = fx.Int32(i * 16 - p * ROWS_PP) + lane_div_16 * 4
-                for J in range_constexpr(numAccN):
-                    col = wave * wave_n + J * 16 + lane_mod_16
-                    vec = Vec(accm[i][J])
-                    for v in range_constexpr(4):
-                        idx = (lds_row + v) * BN_P + col
-                        lds_base_fptr[idx] = fx.Float32(vec[v])
-
-        gpu.barrier()
+    gpu.barrier()
+    if const_expr(g2_bf16_lds):
+        for i in range_constexpr(BM // 16):
+            row_base = fx.Int32(i * 16) + lane_div_16 * 4
+            w_row = (
+                None
+                if const_expr(defer_w)
+                else [
+                    load_scalar(load_f32, sweights, m_row + row_base + v, Float32)
+                    for v in range_constexpr(4)
+                ]
+            )
+            for J in range_constexpr(numAccN):
+                col = wave * wave_n + J * 16 + lane_mod_16
+                vec = Vec(accm[i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + v) * BN + col
+                    if const_expr(defer_w):
+                        lds_base_bf16[idx] = fx.BFloat16(fx.Float32(vec[v]))
+                    else:
+                        lds_base_bf16[idx] = fx.BFloat16(
+                            fx.Float32(vec[v]) * fx.Float32(w_row[v])
+                        )
+    else:
+        for i in range_constexpr(BM // 16):
+            row_base = fx.Int32(i * 16) + lane_div_16 * 4
+            for J in range_constexpr(numAccN):
+                col = wave * wave_n + J * 16 + lane_mod_16
+                vec = Vec(accm[i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + v) * BN + col
+                    lds_base_fptr[idx] = fx.Float32(vec[v])
+    gpu.barrier()
 
     # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]);
     # token_id<i32_M gates padding at runtime. At small/mid M the block-sparse sort floor is
@@ -935,8 +909,8 @@ def atomic_bf16_epilog(
     # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Always gate; reduce already gated via
     # use_reduce. (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
 
-    def store_one_mr(mr, p=0):
-        row_in_block = fx.Int32(mr * EPI_ROWS - p * ROWS_PP) + m_lane
+    def store_one_mr(mr):
+        row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if const_expr(use_reduce):
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
@@ -964,9 +938,8 @@ def atomic_bf16_epilog(
                     col_g0 = n_block_idx * BN + col_lane8
                     vals = []
                     for q in range_constexpr(route_vec):
-                        idx_q = row_in_block * BN_P + col_lane8 + fx.Int32(q)
+                        idx_q = row_in_block * BN + col_lane8 + fx.Int32(q)
                         if const_expr(g2_bf16_lds):
-                            # bf16 LDS already has routing weight baked in at write time.
                             vals.append(fx.Float32(lds_base_bf16[idx_q]))
                         elif const_expr(defer_w):
                             vals.append(fx.Float32(lds_base_fptr[idx_q]))
@@ -1038,7 +1011,7 @@ def atomic_bf16_epilog(
         else:
             for s in range_constexpr(BN // store_group_n):
                 # adjacent ee=0,1 contiguous -> one 2-wide load.
-                idx0 = row_in_block * BN_P + col_start + s * store_group_n
+                idx0 = row_in_block * BN + col_start + s * store_group_n
                 if const_expr(g2_bf16_lds):
                     pk = Vec(
                         lds_vec_load(
@@ -1073,15 +1046,12 @@ def atomic_bf16_epilog(
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
-    mr_pp = M_REPS // c_split
-    for p in range_constexpr(c_split):
-        cshuffle_pass(p)
-        for mr in range_constexpr(p * mr_pp, (p + 1) * mr_pp):
-            token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+    for mr in range_constexpr(M_REPS):
+        token_id = packed[mr] & fx.Int32(0x00FFFFFF)
 
-            @flyc.jit
-            def store_if_valid(token_id, mr, p=p):
-                if token_id < i32_M:
-                    store_one_mr(mr, p)
+        @flyc.jit
+        def store_if_valid(token_id, mr):
+            if token_id < i32_M:
+                store_one_mr(mr)
 
-            store_if_valid(token_id, mr)
+        store_if_valid(token_id, mr)

@@ -20,7 +20,7 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?"
-    r"(?P<bf16lds>_bf16lds)?(?:_cs(?P<cs>\d+))?(?:_sp(?P<sp>\d+))?$"
+    r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?$"
 )
 
 
@@ -110,7 +110,6 @@ def parse_flydsl_v2_gemm2_kernel(name):
         "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
         "bf16_lds": True if m.group("bf16lds") else None,
         "spart": int(m.group("sp")) if m.group("sp") else None,
-        "c_split": int(m.group("cs")) if m.group("cs") else None,
     }
 
 

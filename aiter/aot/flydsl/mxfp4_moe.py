@@ -26,9 +26,12 @@ DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-# V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
-# own default behavior in moe.py.
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+# V2 GEMM2 enables fp8 route-out with static K; the legacy MoE AOT path keeps
+# its own default behavior in moe.py.
+_G2_KSTATIC = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+_STAGE2_FP8_ROUTE_OUT = (
+    os.environ.get("AITER_FLYDSL_STAGE2_FP8", "1" if _G2_KSTATIC else "0") == "1"
+)
 
 
 def _job_key(job: dict) -> tuple:
@@ -274,10 +277,12 @@ def _compile_v2_stage2(job):
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
     if job["epilog"] == "reduce":
         if is_fp8_route_out:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
             target = torch.empty(
                 (
                     job["BM"] * job["topk"],
-                    job["N_OUT"] + job["N_OUT"] // 8,
+                    fp8out_row_bytes(job["N_OUT"]),
                 ),
                 dtype=torch.uint8,
                 device="cpu",
@@ -334,6 +339,7 @@ def _compile_v2_stage2(job):
             topk_ids=None,
             stream=0,
             is_fp8=is_fp8_route_out,
+            topk_weights=d if is_fp8_route_out else None,
         )
 
 
