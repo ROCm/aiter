@@ -387,6 +387,54 @@ __global__ void opus_moe_combine_bwd_bf16_kernel(const hip_bfloat16* __restrict_
         dp[m] = sm[0];
 }
 
+// Vectorized fast path: one wave per route, four routes per 256-thread block.
+// Each lane streams bf16x8 chunks and the route-score dot product stays within
+// the wave, eliminating the shared-memory reduction and its block barriers.
+__global__ void opus_moe_combine_bwd_bf16_wave_kernel(
+    const __bf16* __restrict__ dout,  // [T,H]
+    const int32_t* __restrict__ gather,
+    const float* __restrict__ p,
+    const __bf16* __restrict__ y,     // [M,H]
+    __bf16* __restrict__ dy,          // [M,H]
+    float* __restrict__ dp,
+    int M,
+    int H)
+{
+    constexpr int WAVE = 64;
+    constexpr int WAVES_PER_BLOCK = 4;
+    const int lane = threadIdx.x % WAVE;
+    const int wave = threadIdx.x / WAVE;
+    const int m = blockIdx.x * WAVES_PER_BLOCK + wave;
+    if(m >= M)
+        return;
+
+    const int t = gather[m];
+    const __bf16* drow = dout + static_cast<int64_t>(t) * H;
+    const __bf16* yrow = y + static_cast<int64_t>(m) * H;
+    __bf16* dyrow = dy + static_cast<int64_t>(m) * H;
+    const float pv = p[m];
+    float acc = 0.0f;
+    for(int h = lane * 8; h < H; h += WAVE * 8)
+    {
+        const opus_bf16x8 dv = *reinterpret_cast<const opus_bf16x8*>(drow + h);
+        const opus_bf16x8 yv = *reinterpret_cast<const opus_bf16x8*>(yrow + h);
+        opus_bf16x8 dyv;
+#pragma unroll
+        for(int i = 0; i < 8; ++i)
+        {
+            const float d = static_cast<float>(dv[i]);
+            dyv[i] = static_cast<__bf16>(d * pv);
+            acc = fmaf(d, static_cast<float>(yv[i]), acc);
+        }
+        *reinterpret_cast<opus_bf16x8*>(dyrow + h) = dyv;
+    }
+#pragma unroll
+    for(int offset = WAVE / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset, WAVE);
+    if(lane == 0)
+        dp[m] = acc;
+}
+
 void opus_moe_combine_bwd_bf16(aiter_tensor_t& dout,   // [T,H] bf16
                                aiter_tensor_t& gather, // [M] i32
                                aiter_tensor_t& p,      // [M] fp32
@@ -398,6 +446,22 @@ void opus_moe_combine_bwd_bf16(aiter_tensor_t& dout,   // [T,H] bf16
     const int H = static_cast<int>(dy.size(1));
     if(M == 0)
         return;
+    if(H % 8 == 0)
+    {
+        constexpr int WAVES_PER_BLOCK = 4;
+        constexpr int BLOCK = WAVES_PER_BLOCK * 64;
+        const int grid = (M + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
+        opus_moe_combine_bwd_bf16_wave_kernel<<<
+            dim3(grid), dim3(BLOCK), 0, aiter::getCurrentHIPStream()>>>(
+            reinterpret_cast<const __bf16*>(dout.data_ptr()),
+            reinterpret_cast<const int32_t*>(gather.data_ptr()),
+            reinterpret_cast<const float*>(p.data_ptr()),
+            reinterpret_cast<const __bf16*>(y.data_ptr()),
+            reinterpret_cast<__bf16*>(dy.data_ptr()),
+            reinterpret_cast<float*>(dp.data_ptr()),
+            M, H);
+        return;
+    }
     opus_moe_combine_bwd_bf16_kernel<<<dim3(M), dim3(256), 0, aiter::getCurrentHIPStream()>>>(
         reinterpret_cast<const hip_bfloat16*>(dout.data_ptr()),
         reinterpret_cast<const int32_t*>(gather.data_ptr()),
