@@ -47,8 +47,12 @@ env:
 
 jobs:
   build_aiter_wheel:
-    name: Build gfx950 Aiter wheel (disabled for stock-image A/B)
-    if: ${{ false }}
+    name: Build gfx950 Aiter wheel
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: build-only-aiter
     steps:
       - name: Checkout AITER
@@ -243,7 +247,7 @@ jobs:
 
   vllm-disagg-smoke:
     name: ${{ matrix.case_name }}
-    needs: [select_vllm_cases]
+    needs: [build_aiter_wheel, select_vllm_cases]
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -264,6 +268,12 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
+      - name: Download AITER wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
+
       - name: Show runner and Slurm state
         run: |
           set -euo pipefail
@@ -289,6 +299,59 @@ jobs:
           test "$(git rev-parse HEAD)" = "${VLLM_BASELINE_SHA}"
           echo "VLLM_BASE_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
           echo "VLLM_TEST_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
+
+      - name: Add offline AITER wheel overlay to the upstream case
+        run: |
+          set -euo pipefail
+          artifact_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
+          mapfile -d '' wheels < <(find "${artifact_dir}" -type f -name '*.whl' -print0)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one AITER wheel in ${artifact_dir}, found ${#wheels[@]}" >&2
+            find "${artifact_dir}" -type f -printf '%P\n' >&2 || true
+            exit 1
+          fi
+
+          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
+          test -d "${disagg_dir}"
+          rm -rf "${disagg_dir}/aiter_overlay"
+          mkdir -p "${disagg_dir}/aiter_overlay"
+          # Extract the wheel on the login runner so compute nodes never invoke
+          # pip or PyPI and only consume the staged AITER overlay.
+          python3 -m zipfile -e "${wheels[0]}" "${disagg_dir}/aiter_overlay"
+          test -f "${disagg_dir}/aiter_overlay/aiter/__init__.py"
+
+          cat > "${disagg_dir}/aiter_cluster_env.sh" <<'SH'
+          #!/usr/bin/env bash
+          overlay_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aiter_overlay"
+          source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
+          export GPU_ARCHS=gfx950
+          export PYTHONPATH="${overlay_root}${PYTHONPATH:+:${PYTHONPATH}}"
+          python3 - "${overlay_root}" <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import sys
+          import aiter
+          import flydsl
+
+          root = Path(sys.argv[1]).resolve()
+          loaded = Path(aiter.__file__).resolve()
+          print(
+              f"[aiter-overlay] loaded {loaded}; "
+              f"flydsl={version('flydsl')} at {flydsl.__file__}"
+          )
+          if root not in loaded.parents:
+              raise SystemExit(f"AITER was not loaded from {root}")
+          PY
+          SH
+          chmod +x "${disagg_dir}/aiter_cluster_env.sh"
+
+          du -sh "${disagg_dir}/aiter_overlay"
+          grep -n "aiter-overlay" "${disagg_dir}/aiter_cluster_env.sh"
+          grep -n 'CLUSTER_ENV_IN=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          grep -n 'export CLUSTER_ENV=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          git -C "${GITHUB_WORKSPACE}/vllm" diff --exit-code -- \
+            .buildkite/amd-disagg/vllm_disagg.sh \
+            .buildkite/amd-disagg/run_xPyD_disagg.slurm
 
       - name: Configure Spur node pool for topology
         run: |
@@ -337,7 +400,7 @@ jobs:
             echo
             echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
             echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
-            echo "- AITER runtime: \`stock pinned image (no AITER overlay)\`"
+            echo "- AITER gfx950 wheel overlay: \`PREBUILD_KERNELS=0 (offline, no compute-node pip)\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
@@ -464,6 +527,7 @@ jobs:
             VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
+            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
             bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
           wrapper_rc=${PIPESTATUS[0]}
           touch "${stream_done}"
