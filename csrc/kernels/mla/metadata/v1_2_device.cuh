@@ -478,7 +478,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail       = opus::max(batch_tail, 0);
+                        batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                         work_info.kv_end = opus::min(work_info.kv_start +
                                                          (remain_kv_blocks * params.kv_granularity),
                                                      curr_kv_end - batch_tail);
@@ -631,7 +631,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail       = opus::max(batch_tail, 0);
+                            batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                             work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
