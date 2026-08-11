@@ -94,6 +94,19 @@ void opus_moe_combine_bwd_token8_h2048_bf16(aiter_tensor_t& dout,
                                              aiter_tensor_t& dy,
                                              aiter_tensor_t& dp);
 
+// Exact Sonic-parity combine + softmax-router backward. In addition to sharing
+// dout[t,:] across the token's eight routes, the route-dot reductions are
+// consumed in the same CTA to produce the BF16 [T,64] router-logit gradient.
+void opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
+    aiter_tensor_t& dout,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& y,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& dy,
+    aiter_tensor_t& dlogits);
+
 // dx scatter-add (M5). dst[gather[m],:] += src[m,:] (topk routes -> token).
 // src [M,H] bf16, gather [M] i32, dst [T,H] fp32 (pre-zeroed).
 void opus_moe_scatter_add_bf16(aiter_tensor_t& src,

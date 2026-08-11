@@ -604,6 +604,124 @@ void opus_moe_combine_bwd_token8_h2048_bf16(
         reinterpret_cast<float*>(dp.data_ptr()));
 }
 
+// Exact parity path: consume each route's dot product inside the token CTA and
+// write the softmax Jacobian directly. This removes the compact->token scatter,
+// the standalone router kernel, and the dlogits memset from the timed backward.
+__global__ __launch_bounds__(512, 1)
+void opus_moe_combine_router_bwd_token8_h2048_e64_bf16_kernel(
+    const __bf16* __restrict__ dout,          // [T,2048]
+    const int32_t* __restrict__ token_routes, // [T,8]
+    const float* __restrict__ p,              // [M], compact route order
+    const __bf16* __restrict__ y,             // [M,2048]
+    const int64_t* __restrict__ order,        // [M], compact -> token-major slot
+    const int64_t* __restrict__ topk_ids,     // [T,8]
+    __bf16* __restrict__ dy,                  // [M,2048]
+    __bf16* __restrict__ dlogits)             // [T,64]
+{
+    constexpr int H = 2048;
+    constexpr int TOPK = 8;
+    constexpr int E = 64;
+    constexpr int VEC = 8;
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+
+    __shared__ __align__(16) __bf16 dout_shared[H];
+    __shared__ int32_t routes[TOPK];
+    __shared__ float scores[TOPK];
+    __shared__ float dp_rank[TOPK];
+    __shared__ float score_rank[TOPK];
+
+    if(tid < E)
+        dlogits[static_cast<int64_t>(t) * E + tid] = static_cast<__bf16>(0.0f);
+    if(tid < TOPK)
+    {
+        const int32_t route = token_routes[static_cast<int64_t>(t) * TOPK + tid];
+        routes[tid] = route;
+        scores[tid] = p[route];
+    }
+    if(tid < H / VEC)
+    {
+        const int h = tid * VEC;
+        *reinterpret_cast<opus_bf16x8*>(dout_shared + h) =
+            *reinterpret_cast<const opus_bf16x8*>(
+                dout + static_cast<int64_t>(t) * H + h);
+    }
+    __syncthreads();
+
+    const int32_t route = routes[wave];
+    const float score = scores[wave];
+    float acc = 0.0f;
+    for(int h = lane * VEC; h < H; h += 64 * VEC)
+    {
+        const int64_t offset = static_cast<int64_t>(route) * H + h;
+        const opus_bf16x8 dv =
+            *reinterpret_cast<const opus_bf16x8*>(dout_shared + h);
+        const opus_bf16x8 yv = *reinterpret_cast<const opus_bf16x8*>(y + offset);
+        opus_bf16x8 dyv;
+#pragma unroll
+        for(int i = 0; i < VEC; ++i)
+        {
+            const float d = static_cast<float>(dv[i]);
+            dyv[i] = static_cast<__bf16>(d * score);
+            acc = fmaf(d, static_cast<float>(yv[i]), acc);
+        }
+        *reinterpret_cast<opus_bf16x8*>(dy + offset) = dyv;
+    }
+
+#pragma unroll
+    for(int delta = 32; delta > 0; delta >>= 1)
+        acc += __shfl_down(acc, delta, 64);
+    if(lane == 0)
+    {
+        const int rank = static_cast<int>(order[route] & (TOPK - 1));
+        dp_rank[rank] = acc;
+        score_rank[rank] = score;
+    }
+    __syncthreads();
+
+    if(tid == 0)
+    {
+        float dot = 0.0f;
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+            dot = fmaf(dp_rank[k], score_rank[k], dot);
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+        {
+            const int64_t expert = topk_ids[static_cast<int64_t>(t) * TOPK + k];
+            dlogits[static_cast<int64_t>(t) * E + expert] =
+                static_cast<__bf16>(score_rank[k] * (dp_rank[k] - dot));
+        }
+    }
+}
+
+void opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
+    aiter_tensor_t& dout,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& y,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& dy,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(dout.size(0));
+    if(T == 0)
+        return;
+    opus_moe_combine_router_bwd_token8_h2048_e64_bf16_kernel<<<
+        dim3(T), dim3(512), 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(dout.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(p.data_ptr()),
+        reinterpret_cast<const __bf16*>(y.data_ptr()),
+        reinterpret_cast<const int64_t*>(order.data_ptr()),
+        reinterpret_cast<const int64_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<__bf16*>(dy.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()));
+}
+
 // dx scatter-add (M5 R6): sum each route's dA back to its token via atomicAdd
 // (topk routes -> one token). dst must be pre-zeroed. Replaces torch index_add_.
 __global__ void opus_moe_scatter_add_bf16_kernel(const hip_bfloat16* __restrict__ src, // [M,H]

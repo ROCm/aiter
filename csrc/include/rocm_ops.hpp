@@ -421,6 +421,17 @@ namespace py = pybind11;
           py::arg("y"), \
           py::arg("dy"), \
           py::arg("dp")); \
+    m.def("opus_moe_combine_router_bwd_token8_h2048_e64_bf16", \
+          &opus_moe_combine_router_bwd_token8_h2048_e64_bf16, \
+          "MoE token-major combine + router backward (topk=8, H=2048, E=64)", \
+          py::arg("dout"), \
+          py::arg("token_routes"), \
+          py::arg("p"), \
+          py::arg("y"), \
+          py::arg("order"), \
+          py::arg("topk_ids"), \
+          py::arg("dy"), \
+          py::arg("dlogits")); \
     m.def("opus_moe_scatter_add_bf16", \
           &opus_moe_scatter_add_bf16, \
           "MoE dx scatter-add (routes->token)", \

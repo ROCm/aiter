@@ -404,6 +404,23 @@ def _opus_moe_combine_bwd_token8_h2048_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_combine_router_bwd_token8_h2048_e64_bf16",
+    develop=True,
+)
+def _opus_moe_combine_router_bwd_token8_h2048_e64_bf16_raw(
+    dout: Tensor,
+    token_routes: Tensor,
+    p: Tensor,
+    y: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+    dy: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_scatter_add_bf16", develop=True)
 def _opus_moe_scatter_add_bf16_raw(
     src: Tensor, gather: Tensor, dst: Tensor
@@ -442,6 +459,34 @@ def opus_moe_combine_bwd_token8_h2048_bf16(
         dp,
     )
     return dy, dp
+
+
+def opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
+    dout: Tensor,
+    token_routes: Tensor,
+    p_sorted: Tensor,
+    y: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+):
+    """Exact Sonic-parity combine + softmax router backward specialization."""
+    assert dout.shape[1] == 2048 and token_routes.shape[1] == 8
+    assert topk_ids.shape == (dout.shape[0], 8)
+    assert p_sorted.dtype == torch.float32
+    M, H = y.shape
+    dy = torch.empty(M, H, device=y.device, dtype=torch.bfloat16)
+    dlogits = torch.empty(dout.shape[0], 64, device=y.device, dtype=torch.bfloat16)
+    _opus_moe_combine_router_bwd_token8_h2048_e64_bf16_raw(
+        dout.contiguous(),
+        token_routes,
+        p_sorted.contiguous(),
+        y.contiguous(),
+        order.contiguous(),
+        topk_ids.contiguous(),
+        dy,
+        dlogits,
+    )
+    return dy, dlogits
 
 
 def opus_moe_scatter_add_bf16(src: Tensor, gather: Tensor, T: int) -> Tensor:
@@ -581,6 +626,8 @@ class OpusMoERefFunc(torch.autograd.Function):
         seid, bms, bme = ctx.dgrad_meta
         offs = ctx.offs
         w1t, w2t, w2_ref = ctx.w1t, ctx.w2t, ctx.w2_ref
+        order = ctx.saved_tensors[8]
+        topk_ids = ctx.saved_tensors[10]
 
         def dgrad_prepared(dy_op, w, lens):
             wt = w2t if w is w2_ref else w1t
@@ -608,11 +655,33 @@ class OpusMoERefFunc(torch.autograd.Function):
             return _opus_actbwd(dgrad_prepared(dy_op, w, lens), act_input, act_type)
 
         def combine_bwd_prepared(dout, gather, p_sorted, y):
+            if (
+                ctx.dims == (32768, 2048, 64, 1024, 8)
+                and ctx.uniform_m is not None
+            ):
+                return opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
+                    dout,
+                    ctx.token_routes,
+                    p_sorted,
+                    y,
+                    order,
+                    topk_ids,
+                )
             if dout.shape[1] == 2048 and ctx.token_routes.shape[1] == 8:
                 return opus_moe_combine_bwd_token8_h2048_bf16(
                     dout, ctx.token_routes, p_sorted, y
                 )
             return opus_moe_combine_bwd_bf16(dout, gather, p_sorted, y)
+
+        def router_bwd_prepared(dp_sorted, order, topk_ids, topk_w,
+                                T, topk, E):
+            # The exact combine specialization returns its already-computed
+            # [T,E] router gradient in this payload slot.
+            if dp_sorted.ndim == 2:
+                return dp_sorted
+            return opus_moe_router_bwd_bf16(
+                dp_sorted, order, topk_ids, topk_w, T, topk, E
+            )
 
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
@@ -641,7 +710,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         return _moe_ref_backward_impl(
             ctx, dout, dgrad_prepared, wgrad_prepared, _opus_actbwd,
             combine_bwd=combine_bwd_prepared, dx_scatter=dx_gather_sum,
-            router_bwd=opus_moe_router_bwd_bf16,
+            router_bwd=router_bwd_prepared,
             dgrad_actbwd=dgrad_actbwd_prepared,
             stage2_wgrad_start=stage2_wgrad_start,
             stage2_wgrad_finish=stage2_wgrad_finish)
