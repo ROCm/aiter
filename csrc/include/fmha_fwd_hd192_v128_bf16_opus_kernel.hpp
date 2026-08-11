@@ -555,24 +555,55 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     auto v_abs_elem = [&](int ti) {
         return v_gmem_offset + static_cast<int64_t>(ti) * T::KV_TILE_SIZE * kargs.stride_v_n;
     };
-    // The whole tile offset goes into the resource base and soffset stays 0, so num_records
-    // and the offsets the hardware range-checks share one origin (the tile start). Splitting
-    // the offset across base and soffset instead would leave the soffset distance outside the
-    // bound -- soffset is excluded from range checking -- and still cap reach at 4GiB.
-    auto k_gmem_at = [&](int ti) {
-        const int64_t abs = k_abs_elem(ti);
-        return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + abs,
-                         kv_num_records_bytes<D_ATTN>(abs, k_head_end_elem));
+    // Two ways to address a KV tile, picked at compile time per buffer by the host
+    // (T::LARGE_K for K, T::LARGE_V for V -- K's rows are 1.5x wider, so it can need the
+    // large form while V does not):
+    //
+    //   !LARGE: one descriptor per (b, h_kv) based at the head start with num_records
+    //   spanning the whole head, tile offset in soffset. Base and num_records are loop
+    //   invariant, so the descriptor is built once and hoisted out of the pipeline. Needs
+    //   the head extent to fit the 32-bit num_records.
+    //
+    //   LARGE: one descriptor per tile, based at the tile start with num_records covering
+    //   the rest of the head, soffset 0. num_records and the offsets the hardware
+    //   range-checks then share the tile-start origin, which lifts the 4GiB limit at the cost
+    //   of rebuilding base + num_records every tile. Splitting the offset across base and
+    //   soffset instead leaves those two origins mismatched and reads garbage.
+    const unsigned int k_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_k_n);
+    const unsigned int v_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_v_n);
+    const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;
+    const int v_tile_stride = T::KV_TILE_SIZE * kargs.stride_v_n;
+
+    auto k_gmem_at = [&]([[maybe_unused]] int ti) {
+        if constexpr (T::LARGE_K) {
+            const int64_t abs = k_abs_elem(ti);
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + abs,
+                             kv_num_records_bytes<D_ATTN>(abs, k_head_end_elem));
+        } else {
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_gmem_offset,
+                             k_head_records);
+        }
     };
+    auto v_gmem_at = [&]([[maybe_unused]] int ti) {
+        if constexpr (T::LARGE_V) {
+            const int64_t abs = v_abs_elem(ti);
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + abs,
+                             kv_num_records_bytes<D_ATTN>(abs, v_head_end_elem));
+        } else {
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_gmem_offset,
+                             v_head_records);
+        }
+    };
+    auto k_tile_soffset = [&](int ti) { return T::LARGE_K ? 0 : ti * k_tile_stride; };
+    auto v_tile_soffset = [&](int ti) { return T::LARGE_V ? 0 : ti * v_tile_stride; };
+
     auto load_k_async = [&](void* smem, const auto& u_gk, const auto& u_sk, int ti) {
         auto g = k_gmem_at(ti);
-        async_load<T::VEC_KV>(g, smem, u_gk, u_sk, 0);
+        async_load<T::VEC_KV>(g, smem, u_gk, u_sk, k_tile_soffset(ti));
     };
     auto load_v_async = [&](void* smem, const auto& u_gv, const auto& u_sv, int ti) {
-        const int64_t abs = v_abs_elem(ti);
-        auto g = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + abs,
-                           kv_num_records_bytes<D_ATTN>(abs, v_head_end_elem));
-        async_load<T::VEC_KV>(g, smem, u_gv, u_sv, 0);
+        auto g = v_gmem_at(ti);
+        async_load<T::VEC_KV>(g, smem, u_gv, u_sv, v_tile_soffset(ti));
     };
 
     // Shared memory: double-buffered K(192) and V(128) tiles; s_q aliases the V region
@@ -798,12 +829,14 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // last K tile instead of faulting) → constant in-flight vmcnt, no tail branch.
             v_v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv);
             const int k_pf_ti = tile_idx(min(t + 2, max_num_tiles - 1));
-            // One descriptor per prefetched K tile; stage6 reuses it for the remaining chunks.
+            // Descriptor + soffset for the prefetched K tile; stage6 reuses both for the
+            // remaining chunks (under !LARGE_K the descriptor is loop invariant).
             auto g_k_pf = k_gmem_at(k_pf_ti);
+            const int k_pf_os = k_tile_soffset(k_pf_ti);
             if constexpr(STAGGER) {
-                async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
+                async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
             } else {
-                async_load<T::VEC_KV>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
+                async_load<T::VEC_KV>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
             }
             __builtin_amdgcn_sched_barrier(0);
             if constexpr (T::CAUSAL) {
@@ -845,7 +878,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // stage6 [mem]: read V(t-1) su1; (stagger only) issue the remaining 2 K(t+2) d-chunks.
             v_v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv + V_SU1_OFF);
             if constexpr(STAGGER) {
-                async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, 0);
+                async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
             }
             s_waitcnt_lgkmcnt(0_I);
             s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
