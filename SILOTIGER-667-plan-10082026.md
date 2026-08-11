@@ -252,6 +252,24 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       nothing while the extra accumulators/drain adds cost a little. **Decision:** default
       gate_up to the serialized path; keep the `dot2_acc` knob wired to re-test once kVector
       16/32 lengthens each stream's independent-pair count (may flip the balance).
+- [x] **kVector 16/32 evaluated — NEGATIVE, kept default kVector=8.** Generalized
+      `pick_kvector_fp4` (temporarily) to pick the largest that tiles the contraction and added
+      a `kvector=` override to both FP4 entry points; the builders already handle kVector 16/32
+      (`n_pairs=8/16`, `n_wwords=2/4`, one 64/128-bit weight load, `scale_bk=32` still a
+      multiple). Correctness holds at 8/16/32 for both stages (added explicit-kVector op_test
+      cases; **24 passed**). **A/B (GPU 6, gfx950, 100 iters, DeepSeek I2048/H7168/E8):**
+      *down* (dot2_acc=4) µs B1 **kV8 13.96 / kV16 13.45 / kV32 14.61**, B2 20.4/21.0/24.4,
+      B4 36.0/38.7/43.5, B8 70.9/74.6/85.9; *gate_up* (dot2_acc=1) B1 **kV8 20.2 / kV16 21.7**,
+      B2 37.2/37.8, B4 70.0/71.5, B8 132/134. So **kVector=8 is best or tied-best everywhere**
+      except a marginal ~4% at *down* B=1 (kV16); kV16/32 regress B≥2 and gate_up, kV32 is
+      uniformly worse. **Root cause:** warp-decode is one-wave-per-output, so a lane's VGPR
+      footprint gates occupancy; larger kVector inflates live activation/weight dwords (and
+      pairs held through the G7 drain), and the lost occupancy outweighs the fewer-iterations
+      saving. **Decision:** `pick_kvector_fp4` stays at **8** (reverted the auto-scale); the
+      `kvector` override remains for tuning (e.g. a *down*-B=1-only deployment could pick 16).
+      This kills the "raise kVector" lever from the original FP4-win hypothesis — the remaining
+      lever is **real E=256 cold-HBM measurement** (where 0.5 B/elt finally dominates) + G8
+      prefetch, not bigger tiles.
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8

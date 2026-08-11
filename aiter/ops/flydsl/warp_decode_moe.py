@@ -111,17 +111,26 @@ def _get_down_reduce_fp4(
     )
 
 
-def pick_kvector_fp4(inter: int) -> int:
-    """FP4 fast path: kVector=8 (one i32 = 8 FP4 = one weight dword/lane/iter).
+def pick_kvector_fp4(contraction: int) -> int:
+    """Default FP4 kVector = **8** (one i32 = 8 FP4 = one weight dword/lane/iter).
 
-    Requires INTER divisible by 64*8=512 (true for the ticket down shapes:
-    DeepSeek 2048, MiniMax 1536, Qwen-TP1 512).
+    We deliberately do *not* auto-scale to 16/32 even when the contraction dim
+    allows it: warp-decode runs one wave per output scalar, so a lane's VGPR
+    footprint gates wave occupancy, and the larger kVector's extra live
+    activation/weight dwords (and more pairs held through the G7 drain) cut
+    occupancy more than the fewer iterations save.  A/B on gfx950 (DeepSeek
+    I2048/H7168/E8) confirms kVector=8 is best or tied-best across B?{1,2,4,8}
+    for both stages; kV16 only wins ~4% at ``down`` B=1 and loses at B>=2, kV32 is
+    uniformly worse.  Callers may still override via ``kvector=`` for tuning; the
+    builders accept 16/32 (needs ``contraction % 1024`` / ``% 2048``).
+
+    Requires ``contraction % 512 == 0`` (64*8); all ticket shapes satisfy this.
     """
-    if inter % 512 == 0:
+    if contraction % 512 == 0:
         return 8
     raise ValueError(
-        f"INTER={inter} not divisible by 64*8=512; unsupported for warp-decode "
-        "MXFP4 down (FP4 packs 8 nibbles/dword)"
+        f"contraction={contraction} not divisible by 64*8=512; unsupported for "
+        "warp-decode MXFP4 (FP4 packs 8 nibbles/dword)"
     )
 
 
@@ -227,6 +236,7 @@ def flydsl_warp_decode_gate_up_fp4(
     scale_block: tuple[int, int] = (1, 32),
     serialize_dot2: bool = True,
     dot2_acc: int = 1,
+    kvector: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **MXFP4** weights (BF16 activation, FP4 e2m1 + E8M0).
@@ -249,6 +259,8 @@ def flydsl_warp_decode_gate_up_fp4(
             (serialized)**: G7 measured ~4% slower for gate_up on gfx950 (the two
             gate/up streams already cover the hazard and the B=1 grid is
             occupancy-bound); ``>1`` enables the s_nop-free ILP path (see builder).
+        kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
+            HIDDEN (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -271,7 +283,8 @@ def flydsl_warp_decode_gate_up_fp4(
     assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
     assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
 
-    kvector = pick_kvector_fp4(HIDDEN)
+    if kvector is None:
+        kvector = pick_kvector_fp4(HIDDEN)
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
@@ -401,6 +414,7 @@ def flydsl_warp_decode_down_reduce_fp4(
     serialize_dot2: bool = True,
     kh_per_warp: int | None = None,
     dot2_acc: int = 4,
+    kvector: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **MXFP4** weights (BF16 intermediate, FP4 e2m1 + E8M0).
@@ -423,6 +437,8 @@ def flydsl_warp_decode_down_reduce_fp4(
         kh_per_warp:  outputs per wave (defaults to 2 when HIDDEN is even, else 1).
         dot2_acc:     G7 independent dot2 accumulators (default 4; s_nop-free ILP).
             ``<=1`` falls back to the serialized ``s_nop`` chain (``serialize_dot2``).
+        kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
+            INTER (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -462,7 +478,8 @@ def flydsl_warp_decode_down_reduce_fp4(
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
     assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
 
-    kvector = pick_kvector_fp4(INTER)
+    if kvector is None:
+        kvector = pick_kvector_fp4(INTER)
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
