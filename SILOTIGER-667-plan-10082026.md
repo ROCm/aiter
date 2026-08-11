@@ -322,6 +322,14 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `BF16_DOWN_CASES` over small + real **E=256** shapes; all pass at **cos ≈ 1.0** (only bf16
       dot2 rounding, no quant error) — **32/32 suite**. This is the unquantized oracle that
       isolates dequant bugs from reduce/routing bugs, and the scaffold for the gfx942 scalar path.
+- [x] **BF16-oracle cross-check (2026-08-11).** `test_{down,gate_up}_fp4_matches_bf16_oracle`
+      run the FP4 kernel and the BF16 kernel on the **same logical weights** (FP4's e8m0 scales
+      are powers of two + LUT values exact ⇒ the fp32 dequant is bf16-exact, so `w_deq.to(bf16)`
+      is precisely what the FP4 convert produces). Both stages at small + real **E=256** agree at
+      **`fp4~bf16` cos = 1.000000** (only f32 dot2 reassociation could differ). This closes the
+      "isolate the FP4 convert/scale from the reduce" gap noted under the Phase-B correctness item
+      — a future FP4 convert regression now fails against the oracle, not just the fp32 matmul ref.
+      **36/36 suite.**
 - [ ] `use_dot2=False` scalar-f32 path (bitshift widen + FMA) for gfx942 portability;
       auto-select by arch (`get_gfx`), mirroring the reference's `_is_gfx950`.
 - [ ] Extend the op_test arch guard to exercise the scalar path where available.
