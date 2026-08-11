@@ -161,7 +161,7 @@ def _gemm2_body_a16w4(
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KH_TILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N
-    # int4 groupwise scale: bf16 pairs (E, N_OUT, G//2, 2). G//2 is the WITHIN-expert
+    # int4 groupwise scale: bf16 pairs (E, G//2, N_OUT, 2). G//2*N_OUT is the per-expert
     # stride the scale_expert_base term below is built from.
     _g_half = (K // 32) // 2
 

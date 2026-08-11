@@ -21,7 +21,7 @@ from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
-# K-group). Scale packed bf16 pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
+# K-group). Scale packed bf16 pairs (E, G//2, N, 2); even/odd ku selects lo/hi half.
 A16WI4_GROUP_SIZE = 32
 
 
@@ -383,7 +383,7 @@ def make_b_loader(
     sc_stride_klane = 16
     sc_stride_k0 = 64
     sc_stride_n0 = sc_k1 * sc_stride_k0
-    # a16wi4 groupwise scale: bf16 pairs, layout (E, N, G//2, 2).
+    # a16wi4 groupwise scale: bf16 pairs, layout (E, G//2, N, 2).
     _g_half = (K // A16WI4_GROUP_SIZE) // 2
 
     # ---- buffer resources -----------------------------------------------------
@@ -409,7 +409,7 @@ def make_b_loader(
         w_reg_lay2 = fx.make_layout(2, 1)
         w_tiles8 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 2)
     if _is_int4:
-        # int4 groupwise scale buffer (E, N_OUT, G//2, 2) bf16 -> G//2 dwords per N.
+        # int4 groupwise scale buffer (E, G//2, N_OUT, 2) bf16 -> G//2 dwords per N.
         _sw_bytes = NE * N_OUT * _g_half * 4
     else:
         _sw_bytes = NE * N_OUT * (scale_k_padded // 32)

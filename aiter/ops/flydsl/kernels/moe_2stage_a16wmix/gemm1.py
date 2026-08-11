@@ -111,7 +111,7 @@ def _gemm1_body_a16w4(
     _A_GRP_BYTES = A_LDS_STAGES * A_SLOT_BYTES
     NUM_N_BLOCKS = INTER // TILE_N
 
-    # a16wi4 groupwise scale: bf16 pairs, layout (E, N, G//2, 2).
+    # a16wi4 groupwise scale: bf16 pairs, layout (E, G//2, N, 2).
     _num_groups = K // A16WI4_GROUP_SIZE
     _g_half = _num_groups // 2
 
