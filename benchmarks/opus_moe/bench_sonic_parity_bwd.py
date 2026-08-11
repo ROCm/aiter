@@ -158,20 +158,17 @@ def component_benchmark(
     w2 = (0.02 * torch.randn(E, H, I, device=device, dtype=BF16)).contiguous()
 
     if backend == "opus":
-        seid, bms, bme = opus.build_dgrad_block_meta(offs, 128)
         w1t = w1.transpose(1, 2).contiguous()
         w2t = w2.transpose(1, 2).contiguous()
-        dh = torch.empty(M, I, device=device, dtype=BF16)
         dx_route = torch.empty(M, H, device=device, dtype=BF16)
         dw1 = torch.empty(E, 2 * I, H, device=device, dtype=BF16)
         dw2 = torch.empty(E, H, I, device=device, dtype=BF16)
 
         calls = {
-            "stage2_dgrad": lambda: opus.opus_moe_dgrad_uniform_prepared(
-                dy, w2t, per_expert, dh
+            "stage2_dgrad+act": lambda: opus.opus_moe_dgrad_swiglu_uniform_prepared(
+                dy, w2t, actin, per_expert, dact
             ),
             "dW2": lambda: opus._opus_moe_wgrad_tn_bf16_raw(dy, h, offs, dw2),
-            "activation": lambda: opus.opus_moe_act_bwd_bf16(dh, actin, ACT),
             "stage1_dgrad": lambda: opus.opus_moe_dgrad_uniform_prepared(
                 dact, w1t, per_expert, dx_route
             ),
@@ -189,6 +186,7 @@ def component_benchmark(
         }
 
     gemm_flops = {
+        "stage2_dgrad+act": 2 * M * H * I,
         "stage2_dgrad": 2 * M * H * I,
         "dW2": 2 * M * H * I,
         "stage1_dgrad": 4 * M * H * I,

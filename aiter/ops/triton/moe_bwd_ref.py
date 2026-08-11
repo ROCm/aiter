@@ -251,7 +251,8 @@ def _moe_ref_forward_impl(ctx, x, w1, w2, router_logits, topk, act_type, dgrad,
 
 
 def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
-                           dx_scatter=None, router_bwd=None):
+                           dx_scatter=None, router_bwd=None,
+                           dgrad_actbwd=None):
     (x_g, w1, w2, act_input, h, y, p_sorted, x_gather_idx, order, lens,
      topk_ids, topk_w) = ctx.saved_tensors
     T, H, E, _I, topk = ctx.dims
@@ -266,12 +267,15 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
         dy = (dout_routes.float() * p_sorted.float()[:, None]).to(dtype)
         dp_sorted = (dout_routes.float() * y.float()).sum(-1)      # [M]
 
-    # stage2
-    dh = dgrad(dy, w2, lens)                                       # [M,I] = dy @ W2
-    dW2 = wgrad(dy, h, lens)                                      # [E,H,I]
+    # stage2 dgrad + activation bwd. Optimized backends may fuse these while
+    # the reference and ragged-route paths retain the two-call implementation.
+    if dgrad_actbwd is not None:
+        d_act = dgrad_actbwd(dy, w2, act_input, act_type, lens)    # [M,2I]
+    else:
+        dh = dgrad(dy, w2, lens)                                  # [M,I] = dy @ W2
+        d_act = actbwd(dh, act_input, act_type)                    # [M,2I]
 
-    # activation bwd
-    d_act = actbwd(dh, act_input, act_type)                        # [M,2I]
+    dW2 = wgrad(dy, h, lens)                                      # [E,H,I]
 
     # stage1
     dA_route = dgrad(d_act, w1, lens)                             # [M,H] = d_act @ W1

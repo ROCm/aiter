@@ -35,6 +35,14 @@ void opus_moe_dgrad_mfma_bf16(aiter_tensor_t& dy,
                               aiter_tensor_t& block_m_end,
                               aiter_tensor_t& dh);
 
+// Equal-routes stage-2 dgrad with a standard SwiGLU-backward epilogue.
+// dy [E*M,K], w [E,N,K], act_input/d_act_input [E*M,2N], all BF16.
+void opus_moe_dgrad_swiglu_bf16(aiter_tensor_t& dy,
+                                aiter_tensor_t& w,
+                                aiter_tensor_t& act_input,
+                                aiter_tensor_t& d_act_input,
+                                int uniform_m);
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32), transposed+padded inputs.
 //   dyT [P,Mp] bf16, aT [Q,Mp] bf16, pad_offs [E+1] i32, dW [E,P,Q] fp32
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,

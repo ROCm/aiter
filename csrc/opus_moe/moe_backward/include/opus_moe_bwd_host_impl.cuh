@@ -9,6 +9,7 @@
 #include "aiter_stream.h"
 #include "opus_moe_bwd.h"
 #include "gfx950/opus_moe_dgrad_mfma_gfx950.cuh"
+#include "gfx950/opus_moe_dgrad_swiglu_gfx950.cuh"
 #include "gfx950/opus_moe_wgrad_mfma_gfx950.cuh"
 #include "gfx950/opus_moe_wgrad_tn_gfx950.cuh"
 
@@ -139,6 +140,50 @@ void opus_moe_dgrad_mfma_bf16(aiter_tensor_t& dy,
     k.stride_c          = static_cast<int>(dh.stride(0));
     k.stride_b_expert   = static_cast<int64_t>(w.stride(0));
     opus_moe_dgrad_mfma_launch_gfx950(k, aiter::getCurrentHIPStream());
+}
+
+void opus_moe_dgrad_swiglu_bf16(aiter_tensor_t& dy,
+                                aiter_tensor_t& w,
+                                aiter_tensor_t& act_input,
+                                aiter_tensor_t& d_act_input,
+                                int uniform_m)
+{
+    const int E = static_cast<int>(w.size(0));
+    const int N = static_cast<int>(w.size(1));
+    const int K = static_cast<int>(w.size(2));
+    AITER_CHECK(uniform_m > 0, "uniform_m must be positive");
+    AITER_CHECK(static_cast<int>(dy.size(0)) == E * uniform_m,
+                "dy rows must equal E * uniform_m");
+    AITER_CHECK(static_cast<int>(dy.size(1)) == K, "dy K must match weight K");
+    AITER_CHECK(static_cast<int>(act_input.size(0)) == E * uniform_m,
+                "act_input rows must equal E * uniform_m");
+    AITER_CHECK(static_cast<int>(act_input.size(1)) == 2 * N,
+                "act_input width must equal 2 * N");
+    AITER_CHECK(static_cast<int>(d_act_input.size(0)) == E * uniform_m &&
+                    static_cast<int>(d_act_input.size(1)) == 2 * N,
+                "d_act_input must have shape [E * uniform_m, 2 * N]");
+    AITER_CHECK(K >= 128 && K % 64 == 0,
+                "fused mono dgrad requires K >= 128 and divisible by 64");
+    AITER_CHECK(N % 256 == 0, "fused mono dgrad requires N divisible by 256");
+
+    opus_moe_dgrad_swiglu_kargs k{};
+    k.ptr_a = dy.data_ptr();
+    k.ptr_b = w.data_ptr();
+    k.ptr_act_input = act_input.data_ptr();
+    k.ptr_dact = d_act_input.data_ptr();
+    k.m = uniform_m;
+    k.n = N;
+    k.k = K;
+    k.batch = E;
+    k.stride_a = static_cast<int>(dy.stride(0));
+    k.stride_b = static_cast<int>(w.stride(1));
+    k.stride_act_input = static_cast<int>(act_input.stride(0));
+    k.stride_dact = static_cast<int>(d_act_input.stride(0));
+    k.stride_a_batch = uniform_m * k.stride_a;
+    k.stride_b_batch = static_cast<int>(w.stride(0));
+    k.stride_act_input_batch = uniform_m * k.stride_act_input;
+    k.stride_dact_batch = uniform_m * k.stride_dact;
+    opus_moe_dgrad_swiglu_launch_gfx950(k, aiter::getCurrentHIPStream());
 }
 
 // Fused opus-MFMA grouped wgrad (BF16->FP32). Feature-major transposed +

@@ -289,6 +289,48 @@ def opus_moe_dgrad_uniform_prepared(
     return out
 
 
+@compile_ops("module_moe_opus_bwd", fc_name="opus_moe_dgrad_swiglu_bf16", develop=True)
+def _opus_moe_dgrad_swiglu_bf16_raw(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    d_act_input: Tensor,
+    uniform_m: int,
+) -> None: ...
+
+
+def opus_moe_dgrad_swiglu_uniform_prepared(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    uniform_m: int,
+    out: Tensor,
+) -> Tensor:
+    """Equal-routes stage-2 dgrad fused with standard SwiGLU backward.
+
+    Computes ``dh = dy @ w_bnk.T`` and immediately applies the Jacobian for
+    ``silu(gate) * up`` from ``act_input=[gate; up]``.  ``dh`` is rounded to
+    BF16 before the Jacobian, matching the unfused path's numerical contract.
+    """
+    if not _mono_dgrad_shape_ok(dy, w_bnk, uniform_m):
+        raise ValueError(
+            "opus_moe_dgrad_swiglu_uniform_prepared: shape is unsupported by "
+            f"the mono kernel (dy={tuple(dy.shape)}, w={tuple(w_bnk.shape)}, "
+            f"uniform_m={uniform_m})"
+        )
+    E, N, _K = w_bnk.shape
+    expected = (E * uniform_m, 2 * N)
+    if act_input.shape != expected or out.shape != expected:
+        raise ValueError(
+            "fused dgrad-SwiGLU expects act_input/out shape "
+            f"{expected}, got {tuple(act_input.shape)} and {tuple(out.shape)}"
+        )
+    _opus_moe_dgrad_swiglu_bf16_raw(
+        dy.contiguous(), w_bnk.contiguous(), act_input.contiguous(), out, uniform_m
+    )
+    return out
+
+
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_wgrad_tn_bf16", develop=True)
 def _opus_moe_wgrad_tn_bf16_raw(
     dy: Tensor, a: Tensor, offs: Tensor, dW: Tensor
@@ -512,6 +554,19 @@ class OpusMoERefFunc(torch.autograd.Function):
                 )
             return opus_moe_dgrad_mfma_prepared(dy_op.contiguous(), wt, seid, bms, bme, out)
 
+        def dgrad_actbwd_prepared(dy_op, w, act_input, act_type, lens):
+            wt = w2t if w is w2_ref else w1t
+            if (
+                act_type in ("Silu", SONIC_SWIGLU)
+                and ctx.uniform_m is not None
+                and _mono_dgrad_shape_ok(dy_op, wt, ctx.uniform_m)
+            ):
+                out = torch.empty_like(act_input)
+                return opus_moe_dgrad_swiglu_uniform_prepared(
+                    dy_op.contiguous(), wt, act_input, ctx.uniform_m, out
+                )
+            return _opus_actbwd(dgrad_prepared(dy_op, w, lens), act_input, act_type)
+
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             return opus_moe_gather_sum_bf16(src, ctx.token_routes, T)
@@ -522,7 +577,8 @@ class OpusMoERefFunc(torch.autograd.Function):
         return _moe_ref_backward_impl(
             ctx, dout, dgrad_prepared, wgrad_prepared, _opus_actbwd,
             combine_bwd=opus_moe_combine_bwd_bf16, dx_scatter=dx_gather_sum,
-            router_bwd=opus_moe_router_bwd_bf16)
+            router_bwd=opus_moe_router_bwd_bf16,
+            dgrad_actbwd=dgrad_actbwd_prepared)
 
 
 def opus_moe_ref(x, w1, w2, router_logits, topk, act_type="Silu"):

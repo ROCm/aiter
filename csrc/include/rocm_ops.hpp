@@ -366,6 +366,14 @@ namespace py = pybind11;
           py::arg("block_m_start"), \
           py::arg("block_m_end"), \
           py::arg("dh")); \
+    m.def("opus_moe_dgrad_swiglu_bf16", \
+          &opus_moe_dgrad_swiglu_bf16, \
+          "MoE equal-routes dgrad + standard SwiGLU backward (BF16)", \
+          py::arg("dy"), \
+          py::arg("w"), \
+          py::arg("act_input"), \
+          py::arg("d_act_input"), \
+          py::arg("uniform_m")); \
     m.def("opus_moe_wgrad_mfma_bf16", \
           &opus_moe_wgrad_mfma_bf16, \
           "MoE fused MFMA grouped wgrad (BF16->FP32, transposed+padded)", \
