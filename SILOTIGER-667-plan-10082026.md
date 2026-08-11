@@ -305,6 +305,22 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `w_row*INTER` (2× FP4), overflows 2^31, needs the **K3 Tier-2 per-expert i64 base**; the cold
       harness auto-skips the FP8 leg above 2^31 and reports it n/a. Remaining upside: G8 prefetch +
       K3 Tier-2 (unlocks FP8 E=256 + Kimi-K3 9.85 GB).
+    - **gate_up cold A/B (2026-08-11) — FP4 wins *bigger* than down.** `bench_gate_up_cold`
+      mirrors the down harness (two-stream gate+up pools `_gen_gate_up_fp4_pool` /
+      `_gen_gate_up_fp8_pool`, touched-expert dequant, same router rotation + dual i32 guard on
+      `E*INTER*HIDDEN`). Paired E=128 (both legs, DeepSeek H7168/I2048, cos 1.0):
+      | B | FP4 µs | FP8 µs | FP4/FP8 | speedup |
+      |---|--------|--------|---------|---------|
+      | 1 | 28.5 | 41.1 | 0.695 | **1.44×** |
+      | 2 | 45.9 | 72.2 | 0.635 | **1.57×** |
+      | 4 | 81.0 | 131.2 | 0.618 | **1.62×** |
+      | 8 | 152.4 | 251.2 | 0.607 | **1.65×** |
+      This **overturns the prior** that gate_up (occupancy-bound per G7) would show a *smaller*
+      FP4 win: cold gate_up streams **two** weight matrices per output, so it's even more
+      weight-BW-dominated than down, and halving the weight bytes helps more (1.44–1.65× vs down's
+      1.26–1.54×). FP8 keeps higher raw TB/s (5.7→7.5 vs FP4 4.4→6.6, convert overhead) but moves
+      2× the bytes. Real **E=256 FP4-only** confirmed fault-free (28.5/45.9/81.6/150.4 µs, cos 1.0,
+      matches E=128 → ratios carry); FP8 E=256 skipped (K3 Tier-2), same as down.
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
