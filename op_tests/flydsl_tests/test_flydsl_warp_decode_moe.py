@@ -438,6 +438,39 @@ def test_down_reduce_fp8(case):
 
 
 # -------------------------------------------------------------------------
+# Phase D / G5 -- Split-K down (see SILOTIGER-667-plan-Split-K.md).  Each split-K
+# wave covers a disjoint INTER sub-range and atomic-adds its FP32 partial into a
+# caller-zeroed accumulator; the result must match the non-split (split_k=1) path
+# and the fp32 reference (only atomic reassociation differs).  num_iter =
+# INTER/(64*kvector) must be divisible by split_k (kv=16 when INTER%1024==0).
+# name, B, INTER, HIDDEN, E, TOPK, split_k.
+DOWN_SPLITK_CASES = [
+    ("splitk_i2048_h128_e8_tk2_sk2", 1, 2048, 128, 8, 2, 2),
+    ("splitk_i4096_h64_e8_tk2_sk4", 1, 4096, 64, 8, 2, 4),
+]
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_SPLITK_CASES])
+def test_down_reduce_split_k(case):
+    name, B, INTER, HIDDEN, E, TOPK, split_k = case
+    inter, w_down, rid, rwt, wds = _gen_down(B, INTER, HIDDEN, E, TOPK, "pertensor")
+    base = flydsl_warp_decode_down_reduce(
+        inter, w_down, rid, rwt, wds, w_scale_mode="pertensor"
+    )
+    got = flydsl_warp_decode_down_reduce(
+        inter, w_down, rid, rwt, wds, w_scale_mode="pertensor", split_k=split_k
+    )
+    torch.cuda.synchronize()
+    ref = _ref_down(inter, w_down, rid, rwt, wds, "pertensor")
+    cos_ref = _cosine(ref, got)
+    cos_base = _cosine(base, got)
+    print(f"[splitk {name}] cos_vs_ref={cos_ref:.6f} cos_vs_base={cos_base:.6f}")
+    assert cos_ref >= 0.999, f"split_k {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_base >= 0.999, f"split_k {name}: cos_vs_base={cos_base:.6f}"
+
+
+# -------------------------------------------------------------------------
 # Phase B -- down_reduce MXFP4 (BF16 intermediate, FP4 e2m1 + E8M0 block scale)
 # -------------------------------------------------------------------------
 from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
