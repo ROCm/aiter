@@ -163,6 +163,34 @@ def pick_kvector_fp4(contraction: int) -> int:
     )
 
 
+_WARP_SIZE = 64  # lanes per wave (mirrors kernels.warp_decode_moe.WARP_SIZE)
+
+
+@functools.lru_cache(maxsize=8)
+def _cu_count(device_index: int) -> int:
+    """Compute-unit count of the given CUDA device (cached)."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _auto_split_k_down(
+    B, HIDDEN, kh_per_warp, INTER, kvector, device_index, candidates=(8, 4, 2)
+):
+    """Pick the split-K factor for `down` (G5 gate, see SILOTIGER-667-plan-Split-K.md).
+
+    Split-K only helps when the base grid under-fills the CUs, so we take the
+    largest ``k ? candidates`` that (a) evenly divides the iteration count
+    ``num_iter = INTER/(64.kVector)`` (the split granularity) and (b) keeps the
+    scaled grid within the CU count (``base_grid.k <= CuCount``).  Returns 1 (the
+    BF16 direct-store fast path) for already-saturated grids (e.g. DeepSeek)."""
+    base_grid = B * (HIDDEN // kh_per_warp)
+    num_iter = INTER // (_WARP_SIZE * kvector)
+    cu = _cu_count(device_index)
+    for k in sorted(candidates, reverse=True):
+        if num_iter % k == 0 and base_grid * k <= cu:
+            return k
+    return 1
+
+
 def _run(launcher, args):
     """JIT-compile on first call, then dispatch via the cached CompiledFunction."""
     cf = getattr(launcher, "_cf", None)
@@ -349,7 +377,7 @@ def flydsl_warp_decode_down_reduce(
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     kh_per_warp: int | None = None,
-    split_k: int = 1,
+    split_k: int | str = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
@@ -377,6 +405,9 @@ def flydsl_warp_decode_down_reduce(
             ``split_k`` waves per output that atomic-add FP32 partials into a caller-
             zeroed accumulator (finalized to bf16); use only when the base grid under-
             fills the CUs (small-grid Qwen, low B). Default 1 (BF16 direct-store path).
+            Pass ``"auto"`` to CU-count-gate the factor: picks the largest valid
+            ``k ? {8,4,2}`` with ``base_grid.k <= CuCount`` (and ``num_iter % k == 0``),
+            else 1 -- so saturated grids (DeepSeek) stay on the fast path automatically.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -387,7 +418,7 @@ def flydsl_warp_decode_down_reduce(
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
     assert router_wts.dtype == torch.float32, "router_wts must be float32"
-    assert split_k >= 1, "split_k must be >= 1"
+    assert split_k == "auto" or split_k >= 1, "split_k must be >= 1 or 'auto'"
 
     B, TOPK, INTER = intermediate.shape
     E, HIDDEN, Ik = w_down.shape
@@ -407,6 +438,10 @@ def flydsl_warp_decode_down_reduce(
     assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
 
     kvector = pick_kvector(INTER)
+    if split_k == "auto":
+        split_k = _auto_split_k_down(
+            B, HIDDEN, kh_per_warp, INTER, kvector, intermediate.device.index or 0
+        )
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 

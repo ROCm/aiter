@@ -81,11 +81,18 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
       (small grid) with INTER large enough to split (e.g. HIDDEN≤512, INTER≥2048), not the
       INTER=512 shapes — refine the Step 3 shape list accordingly.
 
-### Step 2 — trigger gate + autotune  [ ]
-- [ ] Query CU count (device props / `runtime.device`). Pick largest `k_batch ∈ {1,2,4,8}` with
-      `grid * k_batch <= CuCount`; default **1 (off)** for saturated grids (DeepSeek).
-- [ ] Wire the auto-pick into the down entry point behind the existing shape logic; keep the
-      bf16 direct-store path when `k_batch==1` (no atomic, no scratch).
+### Step 2 — trigger gate + autotune  [x]  (2026-08-11)
+- [x] `_cu_count(device_index)` (lru-cached `torch.cuda.get_device_properties().multi_processor_count`;
+      gfx950 → **256 CU**) + `_auto_split_k_down(B, HIDDEN, kh_per_warp, INTER, kvector, dev)`: picks the
+      largest `k ∈ {8,4,2}` with `num_iter % k == 0` **and** `base_grid·k ≤ CuCount`, else **1**
+      (`base_grid = B·(HIDDEN/kh)`, `num_iter = INTER/(64·kVector)`).
+- [x] Entry point `flydsl_warp_decode_down_reduce(..., split_k="auto")` resolves the factor after
+      `kvector` is known (before alloc/launch); the early assert accepts `"auto"`. Explicit int
+      `split_k` still overrides. `k_batch==1` keeps the bf16 direct-store fast path (no atomic/scratch).
+- [x] Tests: `test_down_reduce_split_k_auto` (auto path cos 1.000000 vs base) +
+      `test_auto_split_k_gate_logic` (divisibility + `base_grid·k ≤ CuCount`, saturated→1).
+      On gfx950 the small grid (base_grid=64, num_iter=2) auto-picks **k=2** (128 ≤ 256); a
+      DeepSeek-scale `base_grid` (HIDDEN=7168) stays at **1**. **40/40 suite.**
 
 ### Step 3 — down perf A/B (prove the occupancy win)  [ ]
 - [ ] `@benchmark()` A/B `split_k` on/off across `k_batch∈{1,2,4,8}` on **Qwen3Next-TP1 B=1**
@@ -133,3 +140,6 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
   caller-zeroed accum, bf16 finalize). split_k=2/4 bit-faithful (cos 1.0 vs ref + non-split);
   38/38 suite. Surfaced the `num_iter ≥ k_batch` granularity constraint → adjusted the Step 3
   target shapes to small-HIDDEN / large-INTER.
+- 2026-08-11 — **Step 2 done:** CU-count trigger + `k_batch` autotune (`split_k="auto"`).
+  gfx950 CU=256; gate picks largest `k∈{8,4,2}` with `num_iter%k==0` and `base_grid·k≤CuCount`,
+  else 1. Small grid → k=2, DeepSeek-scale → 1 (fast path). 40/40 suite (2 new tests).
