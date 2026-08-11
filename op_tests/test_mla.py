@@ -4,6 +4,7 @@
 import argparse
 import itertools
 import random
+
 import pandas as pd
 import torch
 
@@ -21,18 +22,16 @@ torch.set_printoptions(sci_mode=False)
 
 
 def check_support(dtype, kv_dtype, nhead):
-    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
-        return False
-    return True
+    return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
 
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    amax_diff = (x - y).abs().max().item()
+    (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -305,7 +304,7 @@ def test_mla(
         # )
 
         out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm = run_perftest(
+        (_attn_logits, _attn_lse), us_asm = run_perftest(
             aiter.mla.mla_prefill_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -404,7 +403,7 @@ def test_mla(
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -419,6 +418,7 @@ def test_mla(
             sm_scale,
             num_kv_splits=split_per_batch,
             return_lse=return_lse,
+            causal=is_causal,
         )
 
         err = checkAllclose(
@@ -452,7 +452,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -468,6 +468,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            causal=is_causal,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -507,7 +508,7 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        (attn_logits, attn_lse), us_gluon_decode = run_perftest(
+        (_attn_logits, attn_lse), us_gluon_decode = run_perftest(
             mla_gluon,
             q_nope,
             q_pe,
@@ -602,8 +603,23 @@ def test_mla(
     # ASM/CK decode baseline only supports MTP up to qlen=4; skip it beyond that
     # (gluon still validates against the torch reference).
     asm_supports_mtp = decode_qlen <= 4
+    # --no-causal needs a non-masked (msk0) kernel. decode_qlen==1 always works:
+    # a single query token makes the mask a no-op, so the dispatch reuses the
+    # masked kernel. Beyond that the non-persistent side only ships fp8/fp8 msk0
+    # builds for nhead=128 (any qlen) and nhead=16 qlen 3/4 -- see the ps=0,
+    # causal=0 rows of hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
+    # get_heuristic_kernel_mla, so skip it instead of killing the sweep.
+    asm_supports_non_causal = (
+        is_causal
+        or decode_qlen == 1
+        or (
+            dtype == dtypes.fp8
+            and kvtype == dtypes.fp8
+            and (nhead == 128 or (nhead == 16 and decode_qlen in (3, 4)))
+        )
+    )
     # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse or not asm_supports_mtp:
+    if return_lse or not asm_supports_mtp or not asm_supports_non_causal:
         pass
     elif (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
@@ -696,8 +712,11 @@ def test_mla(
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
-        and nhead <= 16
+        and nhead <= 96
         and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
+        # mla_gluon has no causal switch and its MTP path is always the causal
+        # tail, so a non-causal golden would never match it for qlen>1.
+        and (is_causal or decode_qlen == 1)
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
@@ -804,7 +823,7 @@ parser.add_argument(
     "--nhead",
     type=dtypes.str2tuple,
     choices=(
-        [(nh, q) for nh in (4, 8, 12, 16) for q in range(1, 18)]
+        [(nh, q) for nh in (4, 8, 12, 16, 96) for q in range(1, 18)]
         + [
             (32, 1),
             (32, 2),

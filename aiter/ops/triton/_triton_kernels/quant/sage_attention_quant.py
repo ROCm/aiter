@@ -1,7 +1,6 @@
 import triton
 import triton.language as tl
 
-
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 ################# Sage V2 quantization kernels ####################
@@ -549,22 +548,21 @@ def _rotate_quantize_qk_kernel(
     )  # (BLOCK_M, D)
     original_dtype = qk_tile.dtype
 
-    if is_q_pid:
-        if q_smoothing:
-            ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
-            m_row_mean = (
-                tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M
-            )  # Sum over BLOCK_M -> shape [D]
-            qk_tile -= m_row_mean[None, :]
-            qk_tile = qk_tile.to(original_dtype)
-            mean_ptr = (
-                Q_mean
-                + pid_b * stride_mb
-                + pid_h * stride_mh
-                + pid_m * stride_mm
-                + offs_d * stride_md
-            )
-            tl.store(mean_ptr, m_row_mean * sm_scale)
+    if is_q_pid and q_smoothing:
+        ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
+        m_row_mean = (
+            tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M
+        )  # Sum over BLOCK_M -> shape [D]
+        qk_tile -= m_row_mean[None, :]
+        qk_tile = qk_tile.to(original_dtype)
+        mean_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m * stride_mm
+            + offs_d * stride_md
+        )
+        tl.store(mean_ptr, m_row_mean * sm_scale)
 
     if hadamard_rotation:
         r_ptr = (

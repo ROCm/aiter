@@ -16,18 +16,13 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm
-from .tensor_shim import GTensor, _to_raw
+
+from .tensor_shim import GTensor
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 _LLVM_GEP_DYNAMIC = -2147483648
-
-
-def _llvm_lds_ptr_ty():
-    return ir.Type.parse("!llvm.ptr<3>")
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -277,7 +272,7 @@ def compile_chunk_gated_delta_h(
             return col ^ ((row & fx.Int32(0x7)) << fx.Int32(3))
 
         def _xor_swizzle_idx(row, col):
-            return col ^ ((row & fx.Index(0x7)) << fx.Index(3))
+            return col ^ ((row & fx.Int64(0x7)) << fx.Int64(3))
 
         # -- LDS vector read helpers (generates ds_read_b128 for 8xbf16) --
         v8bf16_type = T.vec(8, T.bf16)
@@ -291,13 +286,13 @@ def compile_chunk_gated_delta_h(
         # -- ds_read_b64_tr_b16 helper (gfx950) --
         v4bf16_type = T.vec(4, T.bf16)
 
+        lds_ptr_ty = lds_h_ptr.type
+
         def _ds_read_tr_bf16x4(lds_byte_offset):
-            byte_idx = arith.index_cast(T.index, lds_byte_offset)
-            byte_i64 = arith.index_cast(T.i64, byte_idx)
-            ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), byte_i64).result
+            # Raw int LDS byte offset -> bf16 shared ptr; fx resolves the
+            # backend address space (-> !llvm.ptr<3>) for the ds_read intrinsic.
+            ptr = fx.to_llvm_ptr(fx.inttoptr(lds_ptr_ty, fx.Int64(lds_byte_offset)))
             raw = rocdl.ds_read_tr16_b64(v4bf16_type, ptr).result
-            # Wrap as Vector so call-sites can use .shuffle()/.bitcast()
-            # method-style API instead of the bare vector.shuffle wrapper.
             return fx.Vector(raw, (4,), fx.BFloat16)
 
         # ds_read_b64_tr_b16 lane decomposition
@@ -306,11 +301,11 @@ def compile_chunk_gated_delta_h(
 
         # -- Prologue: compute bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
-            bos = cu_[fx.Index(i_n)]
-            eos = cu_[fx.Index(i_n) + fx.Index(1)]
+            bos = cu_[fx.Int64(i_n)]
+            eos = cu_[fx.Int64(i_n) + fx.Int64(1)]
             T_local = eos - bos
             NT = (T_local + fx.Int32(BT - 1)) // fx.Int32(BT)
-            boh = co_[fx.Index(i_n)]
+            boh = co_[fx.Int64(i_n)]
         else:
             bos = i_n * T_val
             T_local = T_val
@@ -357,9 +352,9 @@ def compile_chunk_gated_delta_h(
         lane_m_base = lane // fx.Int32(16)
 
         # index-typed versions for LDS addressing
-        wid_idx = fx.Index(wid)
-        lane_n_idx = fx.Index(lane_n)
-        lane_m_base_idx = fx.Index(lane_m_base)
+        wid_idx = fx.Int64(wid)
+        lane_n_idx = fx.Int64(lane_n)
+        lane_m_base_idx = fx.Int64(lane_m_base)
 
         # -- Initialize h accumulators --
         acc_zero = fx.full(4, 0.0, fx.Float32)
@@ -384,7 +379,7 @@ def compile_chunk_gated_delta_h(
                         + lane_m_base * fx.Int32(4)
                     )
                     h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
-                    loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
+                    loaded_vec = h0_.vec_load((fx.Int64(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
                     acc_idx = kb * N_REPEAT + nr
@@ -402,14 +397,16 @@ def compile_chunk_gated_delta_h(
                 abs_row = i_t0_i32 * fx.Int32(BT) + row
                 safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                 g_off = w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                w_prefetch_init.append(w_.vec_load((fx.Index(g_off),), LOAD_VEC_WIDTH))
+                w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
 
-        init_state = [_to_raw(v) for v in h_accs] + [
-            _to_raw(v) for v in w_prefetch_init
-        ]
-        c_zero = fx.Index(0)
-        c_one = fx.Index(1)
-        nt_idx = fx.Index(NT)
+        # h_accs are fx.Vector, w_prefetch_init are raw buffer_load results;
+        # ``range(init=)`` runs each element through ``as_ir_value`` and the
+        # ``yield`` below through the scf-yield rewriter, so both fx values and
+        # raw ir.Values are accepted directly -- no manual _to_raw needed.
+        init_state = list(h_accs) + list(w_prefetch_init)
+        c_zero = fx.Int64(0)
+        c_one = fx.Int64(1)
+        nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
@@ -467,7 +464,7 @@ def compile_chunk_gated_delta_h(
                 bf16_tile = fx.ptr_load(lds_h_ptr + fx.Int32(lds_read_idx))
                 v_global = i_v * fx.Int32(BV) + v_loc
                 h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_idx
-                h_[fx.Index(h_off)] = bf16_tile
+                h_[fx.Int64(h_off)] = bf16_tile
 
             # -- Store prefetched w to LDS (data already in registers from previous iter/prologue) --
             for i_wp in range_constexpr(NUM_W_LOADS):
@@ -598,7 +595,7 @@ def compile_chunk_gated_delta_h(
             _gk_local = gk_ if USE_GK else g_  # safe placeholder when USE_GK=False
 
             def _make_emit_g_last(_g=g_, _off=g_last_off, _cell=g_last_prefetch_cell):
-                return lambda: _cell.__setitem__(0, _g[fx.Index(_off)])
+                return lambda: _cell.__setitem__(0, _g[fx.Int64(_off)])
 
             def _make_emit_g_row(
                 idx,
@@ -609,17 +606,17 @@ def compile_chunk_gated_delta_h(
             ):
                 _off_i = _offs[idx]
                 _bnd_i = _bnds[idx]
-                return lambda: _arr.__setitem__(idx, (_g[fx.Index(_off_i)], _bnd_i))
+                return lambda: _arr.__setitem__(idx, (_g[fx.Int64(_off_i)], _bnd_i))
 
             def _make_emit_gk(
                 idx, _gk=_gk_local, _offs=gk_off_flat, _arr=gk_raw_prefetch
             ):
                 _off_i = _offs[idx]
-                return lambda: _arr.__setitem__(idx, _gk[fx.Index(_off_i)])
+                return lambda: _arr.__setitem__(idx, _gk[fx.Int64(_off_i)])
 
             def _make_emit_u(idx, _v=v_, _offs=u_off_list, _arr=u_prefetch):
                 _off_i = _offs[idx]
-                return lambda: _arr.__setitem__(idx, _v[fx.Index(_off_i)])
+                return lambda: _arr.__setitem__(idx, _v[fx.Int64(_off_i)])
 
             # OPT-VC: assemble emitter queue using plain Python ``for`` loops
             # (not ``range_constexpr``). These emitter objects are pure Python
@@ -664,16 +661,16 @@ def compile_chunk_gated_delta_h(
                     mfma_slot = kb * K_STEPS_PER_BLOCK + ks
                     if mfma_slot < NUM_K_LOADS:
                         k_prefetch[mfma_slot] = k_.vec_load(
-                            (fx.Index(k_prefetch_off[mfma_slot]),), LOAD_VEC_WIDTH
+                            (fx.Int64(k_prefetch_off[mfma_slot]),), LOAD_VEC_WIDTH
                         )
 
-                    w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
-                    w_lds_col_idx = fx.Index(
+                    w_lds_row_idx = wid_idx * fx.Int64(16) + lane_n_idx
+                    w_lds_col_idx = fx.Int64(
                         kb * 64 + ks * WMMA_K
-                    ) + lane_m_base_idx * fx.Index(8)
+                    ) + lane_m_base_idx * fx.Int64(8)
                     # OPT-4: apply SAME XOR swizzle as the write side.
                     w_lds_col_idx = _xor_swizzle_idx(w_lds_row_idx, w_lds_col_idx)
-                    w_lds_idx = w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
+                    w_lds_idx = w_lds_row_idx * fx.Int64(LDS_W_STRIDE) + w_lds_col_idx
                     a_frag = _lds_vec_read_w_bf16x8(w_lds_idx)
 
                     global_ks = kb * K_STEPS_PER_BLOCK + ks
@@ -730,7 +727,7 @@ def compile_chunk_gated_delta_h(
                     # the bare arith.extf wrapper.
                     u_bf16 = fx.BFloat16(u_prefetch[nr * 4 + elem_i])
                     u_f32_elems.append(u_bf16.to(fx.Float32))
-                u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
+                u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
 
                 vn_frags.append(u_f32 - bv_val)
 
@@ -745,7 +742,7 @@ def compile_chunk_gated_delta_h(
                 # function call (ast.Name, not ast.Attribute / Subscript)
                 # makes the analyzer skip it.
                 def _emit_vn_store(off, value):
-                    vn_[fx.Index(off)] = value
+                    vn_[fx.Int64(off)] = value
 
                 for nr in range_constexpr(N_REPEAT):
                     vn_val = vn_frags[nr]
@@ -776,7 +773,7 @@ def compile_chunk_gated_delta_h(
                     g_row, in_bounds = g_row_prefetch[elem_i]
                     gate = _fast_exp(g_last - g_row)
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
-                gate_vec = vector.from_elements(T.f32x4, gate_elems)
+                gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
 
                 for nr in range_constexpr(N_REPEAT):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
@@ -797,9 +794,9 @@ def compile_chunk_gated_delta_h(
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     # Same simplification as gate_vec above: one
                     # from_elements instead of fx.full(0.0) + 4x insert.
-                    gk_vec = vector.from_elements(
-                        T.f32x4,
+                    gk_vec = fx.Vector.from_elements(
                         [gk_last_prefetch[kb][elem_i] for elem_i in range_constexpr(4)],
+                        dtype=fx.Float32,
                     )
                     for nr in range_constexpr(N_REPEAT):
                         acc_idx = kb * N_REPEAT + nr
@@ -860,7 +857,7 @@ def compile_chunk_gated_delta_h(
             if const_expr(not OPT_W_ENABLED):
                 for _i in range_constexpr(NUM_W_NEXT_LOADS):
                     w_next_prefetch[_i] = w_.vec_load(
-                        (fx.Index(w_next_prefetch_off[_i]),), LOAD_VEC_WIDTH
+                        (fx.Int64(w_next_prefetch_off[_i]),), LOAD_VEC_WIDTH
                     )
 
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -871,12 +868,11 @@ def compile_chunk_gated_delta_h(
                     # gets exactly one load. Skipped when OPT_W_ENABLED is
                     # False (BV>=32) since the batch was already issued above.
                     w_slot = kb * BT_STEPS + bt_s
-                    if const_expr(OPT_W_ENABLED):
-                        if w_slot < NUM_W_NEXT_LOADS:
-                            w_next_prefetch[w_slot] = w_.vec_load(
-                                (fx.Index(w_next_prefetch_off[w_slot]),),
-                                LOAD_VEC_WIDTH,
-                            )
+                    if const_expr(OPT_W_ENABLED) and w_slot < NUM_W_NEXT_LOADS:
+                        w_next_prefetch[w_slot] = w_.vec_load(
+                            (fx.Int64(w_next_prefetch_off[w_slot]),),
+                            LOAD_VEC_WIDTH,
+                        )
 
                     k_col_tr = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
                     bt_row_tr = (
@@ -924,12 +920,13 @@ def compile_chunk_gated_delta_h(
             for i_wp in range_constexpr(NUM_W_NEXT_LOADS):
                 if w_next_prefetch[i_wp] is None:
                     w_next_prefetch[i_wp] = w_.vec_load(
-                        (fx.Index(w_next_prefetch_off[i_wp]),), LOAD_VEC_WIDTH
+                        (fx.Int64(w_next_prefetch_off[i_wp]),), LOAD_VEC_WIDTH
                     )
 
-            results = yield [_to_raw(v) for v in h_accs_in] + [
-                _to_raw(v) for v in w_next_prefetch
-            ]
+            # h_accs_in are fx.Vector, w_next_prefetch are raw buffer_load
+            # results; the scf-yield rewriter converts fx values via ir_value()
+            # and passes raw ir.Values through unchanged.
+            results = yield list(h_accs_in) + list(w_next_prefetch)
 
         h_accs_final = list(results[:NUM_H_ACCS])
 
@@ -954,7 +951,7 @@ def compile_chunk_gated_delta_h(
                         out_vec = acc_val.truncf(T.vec(4, T.bf16))
                     else:
                         out_vec = acc_val
-                    ht_.vec_store((fx.Index(ht_off_base),), out_vec, 4)
+                    ht_.vec_store((fx.Int64(ht_off_base),), out_vec, 4)
 
     # -- Host launcher ------------------------------------------------------
     @flyc.jit

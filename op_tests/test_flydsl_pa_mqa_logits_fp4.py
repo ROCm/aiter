@@ -268,11 +268,11 @@ def _bench_gluon_fp8(
     if the gluon path is unavailable.
     """
     try:
+        from aiter.ops.shuffle import shuffle_weight
         from aiter.ops.triton.attention.pa_mqa_logits import (
             deepgemm_fp8_paged_mqa_logits,
         )
         from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-        from aiter.ops.shuffle import shuffle_weight
 
         fp8_dtype = get_fp8_e4m3_dtype()
         batch_size = q_bf16.shape[0]
@@ -461,7 +461,9 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
 
     # ---- Host schedule (precomputed once so the bench times only the launch) ----
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import compute_varctx_schedule
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
 
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped

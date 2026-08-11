@@ -4,31 +4,41 @@
 import torch
 import triton
 
-from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
-from aiter.ops.triton.utils.conv_config_utils import format_shape_key
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _get_config as _get_config_1x1,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
+    _conv2d_3x3_cblocked_kernel,
+    _conv2d_3x3_nhwc_kernel,
+    _get_config_cblocked,
+    _get_config_nhwc,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_gemm as _get_config_wino_gemm,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_input as _get_config_wino_input,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_output as _get_config_wino_output,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _winograd_f4x3_batched_gemm_kernel,
+    _winograd_f4x3_cblocked_input_transform_kernel,
+    _winograd_f4x3_input_transform_kernel,
+    _winograd_f4x3_output_transform_kernel,
 )
 from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _conv2d_general_kernel,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _get_config as _get_config_general,
 )
-from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
-    _conv2d_3x3_nhwc_kernel,
-    _conv2d_3x3_cblocked_kernel,
-    _get_config_nhwc,
-    _get_config_cblocked,
-)
-from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
-    _winograd_f4x3_input_transform_kernel,
-    _winograd_f4x3_cblocked_input_transform_kernel,
-    _winograd_f4x3_batched_gemm_kernel,
-    _winograd_f4x3_output_transform_kernel,
-    _get_config_input as _get_config_wino_input,
-    _get_config_gemm as _get_config_wino_gemm,
-    _get_config_output as _get_config_wino_output,
-)
+from aiter.ops.triton.conv._utils import _is_winograd_eligible, _out_hw
+from aiter.ops.triton.utils.conv_config_utils import format_shape_key
 
 
 def _make_mn_grid(M_total, K_out):

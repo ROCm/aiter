@@ -1,16 +1,17 @@
-import os
-import json
 import inspect
-from pathlib import Path
-import torch
-import triton.language as tl
-import triton
-import warnings
-import sys
-import time
-import tempfile
+import json
+import os
 import re
+import sys
+import tempfile
+import time
+import warnings
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import torch
+import triton
+import triton.language as tl
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
@@ -138,7 +139,7 @@ def model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -158,7 +159,7 @@ def batched_model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:
@@ -356,13 +357,9 @@ def print_vgpr(fun, table_start="result-table-name"):
 
 
 def get_dtype_bytes(dtype):
-    if dtype in [torch.float16, tl.float16]:
+    if dtype in [torch.float16, tl.float16] or dtype in [torch.bfloat16, tl.bfloat16]:
         return 2
-    elif dtype in [torch.bfloat16, tl.bfloat16]:
-        return 2
-    elif dtype in [torch.float32, tl.float32]:
-        return 4
-    elif dtype == torch.int32:
+    elif dtype in [torch.float32, tl.float32] or dtype == torch.int32:
         return 4
     elif dtype == torch.int64:
         return 8

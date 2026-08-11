@@ -1,30 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
-from typing import Dict
+import torch
 
 from aiter.ops.triton.moe.moe_op import (
     fused_moe as triton_moe,
+)
+from aiter.ops.triton.moe.moe_op import (
     moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel,
 )
 from aiter.ops.triton.moe.moe_op_e2e import (
     e2e_moe as triton_e2e_moe,
-    moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel,
 )
-from aiter.ops.triton.moe.moe_op_silu_fused import (
-    fused_moe_silu as triton_moe_silu,
-    moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel,
+from aiter.ops.triton.moe.moe_op_e2e import (
+    moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel,
 )
 from aiter.ops.triton.moe.moe_op_gelu import (
     fused_moe_gelu as triton_moe_gelu,
+)
+from aiter.ops.triton.moe.moe_op_gelu import (
     moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.moe.moe_op_silu_fused import (
+    fused_moe_silu as triton_moe_silu,
+)
+from aiter.ops.triton.moe.moe_op_silu_fused import (
+    moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
-from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 
 DEBUG_MODE = False
 
@@ -52,7 +59,7 @@ def torch_moe_ref(
     if fp8_w8a8:
         a, _, a_scale = quantize_fp8(a)
 
-    M, top_k, N = c.shape
+    _M, top_k, N = c.shape
     _, K = a.shape
 
     if int4_w4a16:
@@ -238,7 +245,7 @@ def torch_e2e_moe(
         a, _, a_scale = quantize_fp8(a)
 
     M, top_k, _ = c.shape
-    E, N, _ = w1.shape
+    _E, N, _ = w1.shape
 
     # Repeat a -> (M, top_k, K)
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
@@ -292,7 +299,7 @@ def torch_e2e_moe(
     return c
 
 
-def get_default_config() -> Dict[str, int]:
+def get_default_config() -> dict[str, int]:
     config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
@@ -302,7 +309,7 @@ def get_default_config() -> Dict[str, int]:
     return config
 
 
-def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
+def get_default_config_moe_e2e(persistent: bool) -> dict[str, int]:
     if persistent:
         return {
             "BLOCK_SIZE_M": 64,
@@ -931,8 +938,8 @@ def test_fused_moe_gelu(
         a,
         b,
         triton_out,
-        triton_out_silu,
-        b_zp,
+        _triton_out_silu,
+        _b_zp,
         a_scale,
         b_scale,
         topk_weights,

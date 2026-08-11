@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, empty, empty_like, autograd
-from typing import Tuple, Union
+from torch import Tensor, autograd, empty, empty_like
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_rope"
 
 
-@compile_ops("module_rope_1c_uncached_fwd")
+@compile_ops("module_rope_1c_uncached_fwd", develop=True)
 def rope_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -25,10 +25,9 @@ def rope_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_uncached_bwd")
+@compile_ops("module_rope_1c_uncached_bwd", develop=True)
 def rope_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -45,10 +44,9 @@ def rope_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_uncached_fwd")
+@compile_ops("module_rope_2c_uncached_fwd", develop=True)
 def rope_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -67,10 +65,9 @@ def rope_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_uncached_bwd")
+@compile_ops("module_rope_2c_uncached_bwd", develop=True)
 def rope_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -89,10 +86,9 @@ def rope_2c_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_cached_fwd")
+@compile_ops("module_rope_1c_cached_fwd", develop=True)
 def rope_cached_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -110,10 +106,9 @@ def rope_cached_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_cached_bwd")
+@compile_ops("module_rope_1c_cached_bwd", develop=True)
 def rope_cached_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -131,10 +126,9 @@ def rope_cached_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_cached_fwd")
+@compile_ops("module_rope_2c_cached_fwd", develop=True)
 def rope_cached_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -154,10 +148,9 @@ def rope_cached_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_cached_bwd")
+@compile_ops("module_rope_2c_cached_bwd", develop=True)
 def rope_cached_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -177,10 +170,9 @@ def rope_cached_2c_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_cached_positions_fwd")
+@compile_ops("module_rope_1c_cached_positions_fwd", develop=True)
 def rope_cached_positions_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -200,10 +192,9 @@ def rope_cached_positions_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_cached_positions_fwd")
+@compile_ops("module_rope_2c_cached_positions_fwd", develop=True)
 def rope_cached_positions_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -225,10 +216,9 @@ def rope_cached_positions_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_cached_positions_offsets_fwd")
+@compile_ops("module_rope_1c_cached_positions_offsets_fwd", develop=True)
 def rope_cached_positions_offsets_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -249,10 +239,9 @@ def rope_cached_positions_offsets_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_2c_cached_positions_offsets_fwd")
+@compile_ops("module_rope_2c_cached_positions_offsets_fwd", develop=True)
 def rope_cached_positions_offsets_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -275,10 +264,9 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_thd_fwd")
+@compile_ops("module_rope_1c_thd_fwd", develop=True)
 def rope_thd_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -297,10 +285,9 @@ def rope_thd_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_thd_bwd")
+@compile_ops("module_rope_1c_thd_bwd", develop=True)
 def rope_thd_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -319,10 +306,9 @@ def rope_thd_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_2d_fwd")
+@compile_ops("module_rope_1c_2d_fwd", develop=True)
 def rope_2d_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -347,10 +333,9 @@ def rope_2d_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
-@compile_ops("module_rope_1c_2d_bwd")
+@compile_ops("module_rope_1c_2d_bwd", develop=True)
 def rope_2d_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -375,7 +360,6 @@ def rope_2d_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 def rope_fwd(
@@ -1153,7 +1137,7 @@ class RoPE(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads: Tensor) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads: Tensor) -> tuple[Tensor | None, ...]:
         (freqs,) = ctx.saved_tensors
         return (
             rope_bwd(
@@ -1197,7 +1181,7 @@ class RoPECached(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cos, sin = ctx.saved_tensors
         return (
             rope_cached_bwd(
@@ -1234,7 +1218,7 @@ class RoPETHD(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cu_seqlens, freqs = ctx.saved_tensors
         return (
             rope_thd_bwd(
@@ -1285,7 +1269,7 @@ class RoPE2D(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cos_height, sin_height, cos_width, sin_width = ctx.saved_tensors
         return (
             rope_2d_bwd(
