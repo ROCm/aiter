@@ -469,9 +469,12 @@ _MXFP4_LUT = [
 # MXFP4 uses a fixed Block2D<1,32> E8M0 scale (BK=32 by spec). INTER must be a
 # multiple of 64*8=512 (one i32 = 8 FP4 = one weight dword/lane/iter).
 # name, B, INTER, HIDDEN, E, TOPK
+# name, B, INTER, HIDDEN, E, TOPK, kvector (explicit to cover 8/16/32 builder paths;
+# the shipped default is always 8 -- see pick_kvector_fp4).
 DOWN_FP4_CASES = [
-    ("down_fp4_i512_h256_e8_tk2", 1, 512, 256, 8, 2),
-    ("down_fp4_i1024_h128_e8_tk4", 2, 1024, 128, 8, 4),
+    ("down_fp4_i512_h256_e8_tk2_kv8", 1, 512, 256, 8, 2, 8),
+    ("down_fp4_i1024_h128_e8_tk4_kv16", 2, 1024, 128, 8, 4, 16),
+    ("down_fp4_i2048_h128_e8_tk4_kv32", 1, 2048, 128, 8, 4, 32),
 ]
 _MXFP4_BK = 32
 
@@ -531,14 +534,20 @@ def _ref_down_fp4(inter, w_deq, router_ids, router_wts):
 
 
 def _run_down_fp4_case(case, *, cos_thresh=0.99):
-    name, B, INTER, HIDDEN, E, TOPK = case
+    name, B, INTER, HIDDEN, E, TOPK, kvector = case
     print("=" * 78)
     print(f"[flydsl] warp-decode down_reduce MXFP4  case={name}")
     inter, w_down, w_scale, router_ids, router_wts, w_deq = _gen_down_fp4(
         B, INTER, HIDDEN, E, TOPK
     )
     out = flydsl_warp_decode_down_reduce_fp4(
-        inter, w_down, router_ids, router_wts, w_scale, scale_block=(1, _MXFP4_BK)
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        w_scale,
+        scale_block=(1, _MXFP4_BK),
+        kvector=kvector,
     )
     torch.cuda.synchronize()
     ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)
@@ -571,9 +580,12 @@ from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
 
 # name, B, HIDDEN, INTER, E, TOPK. HIDDEN (the contraction) must be a multiple
 # of 64*8=512 (FP4 fast path).
+# name, B, HIDDEN, INTER, E, TOPK, kvector (HIDDEN is the contraction; explicit
+# kvector covers the 8/16/32 builder paths, shipped default is always 8).
 GATE_UP_FP4_CASES = [
-    ("gate_up_fp4_h512_i256_e8_tk2", 1, 512, 256, 8, 2),
-    ("gate_up_fp4_h1024_i128_e8_tk4", 2, 1024, 128, 8, 4),
+    ("gate_up_fp4_h512_i256_e8_tk2_kv8", 1, 512, 256, 8, 2, 8),
+    ("gate_up_fp4_h1024_i128_e8_tk4_kv16", 2, 1024, 128, 8, 4, 16),
+    ("gate_up_fp4_h2048_i128_e8_tk4_kv32", 1, 2048, 128, 8, 4, 32),
 ]
 
 
@@ -640,14 +652,21 @@ def _ref_gate_up_fp4(x, w_gate_deq, w_up_deq, router_ids):
 
 
 def _run_gate_up_fp4_case(case, *, cos_thresh=0.99):
-    name, B, HIDDEN, INTER, E, TOPK = case
+    name, B, HIDDEN, INTER, E, TOPK, kvector = case
     print("=" * 78)
     print(f"[flydsl] warp-decode gate_up MXFP4  case={name}")
     x, w_gate, w_up, gs, us, router_ids, wg_deq, wu_deq = _gen_gate_up_fp4(
         B, HIDDEN, INTER, E, TOPK
     )
     out = flydsl_warp_decode_gate_up_fp4(
-        x, w_gate, w_up, router_ids, gs, us, scale_block=(1, _MXFP4_BK)
+        x,
+        w_gate,
+        w_up,
+        router_ids,
+        gs,
+        us,
+        scale_block=(1, _MXFP4_BK),
+        kvector=kvector,
     )
     torch.cuda.synchronize()
     ref = _ref_gate_up_fp4(x, wg_deq, wu_deq, router_ids)
