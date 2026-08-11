@@ -31,7 +31,6 @@ from .fmha_utils import *  # constants, classes, prologue helpers
 from .fmha_utils import _ep_finish  # underscore name, not covered by star import
 
 
-
 def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
     """Compile FMHA kernel variant. Cached per (is_causal, return_lse)."""
     IS_CAUSAL = int(is_causal)
@@ -174,12 +173,19 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         m_start_raw = m_start
 
         k_oob_dg1 = TDM.build_oob_dg1_list(
-            K_CFG_OOB, QK_HDIM, stride_k_elems_oob,
-            actual_kv_len, wave_id, dim0_stride=200,
+            K_CFG_OOB,
+            QK_HDIM,
+            stride_k_elems_oob,
+            actual_kv_len,
+            wave_id,
+            dim0_stride=200,
         )
         v_oob_dg1 = TDM.build_oob_dg1_list(
-            V_CFG_OOB, 128, stride_v_elems_oob,
-            actual_kv_len, wave_id,
+            V_CFG_OOB,
+            128,
+            stride_v_elems_oob,
+            actual_kv_len,
+            wave_id,
         )
         # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len)
         # write nothing.
@@ -461,8 +467,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             k_tile1_offset = k_offset + k_tile1_stride
             kv_remain_t1 = actual_kv_len - TILE_N
             k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
-                K_CFG_OOB, QK_HDIM, stride_k_elems_oob,
-                kv_remain_t1, wave_id, dim0_stride=200,
+                K_CFG_OOB,
+                QK_HDIM,
+                stride_k_elems_oob,
+                kv_remain_t1,
+                wave_id,
+                dim0_stride=200,
             )
             TDM.load_k_only(
                 ptr_K,
@@ -737,7 +747,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
             # V(N-1) global offset for endtile GEMM1 TDM.
             num_tiles_m1_ep = num_tiles - 1
-            ep_v_endtile_offset = v_offset + num_tiles_m1_ep * tile_n_const * stride_v_seq
+            ep_v_endtile_offset = (
+                v_offset + num_tiles_m1_ep * tile_n_const * stride_v_seq
+            )
 
             # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
             ia_exp_delta = [
@@ -770,11 +782,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             if is_multi:  # N>=2: endtile core_loop then ep_finish
                 # All variables defined fresh inside THEN — not state variables.
                 et_sp_t = [
-                    [set_vgpr_bank(zero_v8f32, m)]
-                    for m in fx.range_constexpr(NUM_MSB)
+                    [set_vgpr_bank(zero_v8f32, m)] for m in fx.range_constexpr(NUM_MSB)
                 ]
                 et_sfx = make_softmax_state(
-                    ep_old_max, ep_local_max, ep_delta, ep_row_sums,
+                    ep_old_max,
+                    ep_local_max,
+                    ep_delta,
+                    ep_row_sums,
                     sp_pairs_prev=[
                         [
                             ep_partial_sp_pairs[m][i]
@@ -799,7 +813,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for d in range(NUM_MSB)
                 ]
                 if const_expr(IS_CAUSAL):
-                    et_tile_n_start = (arith.index_cast(T.i32, num_tiles_idx) - 1) * TILE_N
+                    et_tile_n_start = (
+                        arith.index_cast(T.i32, num_tiles_idx) - 1
+                    ) * TILE_N
                     et_causal_ns = et_tile_n_start - causal_offset
                 else:
                     et_causal_ns = None
@@ -807,8 +823,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _et_V_CFG_OOB = (1 << 16) | V_TDM_CONFIG
                 _et_stride_v_elems = stride_v_seq >> 1
                 et_v_oob_dg1 = TDM.build_oob_dg1_list(
-                    _et_V_CFG_OOB, 128, _et_stride_v_elems,
-                    et_kv_remain, wave_id,
+                    _et_V_CFG_OOB,
+                    128,
+                    _et_stride_v_elems,
+                    et_kv_remain,
+                    wave_id,
                 )
                 _, _, et_o, _, et_psp_lo, et_psp_hi, et_ped = fmha_pipeline_ctx(
                     ctx,
@@ -1011,10 +1030,10 @@ def flash_attn_varlen_d192_gfx1250(
 ):
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.shape[-1] == HEAD_DIM_QK, (
-        f"Expected headdim_qk={HEAD_DIM_QK}," f" got {q.shape[-1]}"
+        f"Expected headdim_qk={HEAD_DIM_QK}, got {q.shape[-1]}"
     )
     assert v.shape[-1] == HEAD_DIM_V, (
-        f"Expected headdim_v={HEAD_DIM_V}," f" got {v.shape[-1]}"
+        f"Expected headdim_v={HEAD_DIM_V}, got {v.shape[-1]}"
     )
 
     total_q_tokens = q.shape[0]

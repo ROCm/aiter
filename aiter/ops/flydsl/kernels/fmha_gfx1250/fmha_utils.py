@@ -12,8 +12,6 @@ Used by fmha_kernel.py which implements the top-level kernel
 
 from __future__ import annotations
 
-from typing import List
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -42,16 +40,16 @@ def lds_ptr_ty():
 # SECTION 1: Schedule Tables
 
 # Schedule token IDs (used by schedule helpers and dispatch engine)
-P1 = 4        # PART1 cross-MSB merge
+P1 = 4  # PART1 cross-MSB merge
 O_RESC0 = 17  # O-rescale pk_mul
 TDM_TOKEN = 18  # tensor_load_to_lds
 PART2_EXP_START = 24  # ops[0..23] = setup+pkfma (cheap), ops[24..] = exp
 
 # Token base offsets for per-MSB helpers: token_id = BASE + msb
-P2_BASE = 5   # P2_M0..P2_M3 = 5..8 (softmax PART2)
+P2_BASE = 5  # P2_M0..P2_M3 = 5..8 (softmax PART2)
 EXP_BASE = 19  # EXP_M0..EXP_M3 = 19..22 (pair_exp, 3cy)
-K_BASE = 9    # K_M0..K_M3 = 9..12 (ds_load_b128)
-V_BASE = 13   # V_M0..V_M3 = 13..16 (ds_load_tr16_b128)
+K_BASE = 9  # K_M0..K_M3 = 9..12 (ds_load_b128)
+V_BASE = 13  # V_M0..V_M3 = 13..16 (ds_load_tr16_b128)
 
 # Schedule dimensions
 
@@ -69,17 +67,39 @@ V_BASE = 13   # V_M0..V_M3 = 13..16 (ds_load_tr16_b128)
 
 # Schedule row helpers: generate n copies of a token for MSB bank m.
 # Each helper name describes the hardware operation it schedules.
-def lds_k(m, n=1): return [K_BASE + m] * n      # ds_load_b128 K tile
-def lds_v(m, n=1): return [V_BASE + m] * n      # ds_load_tr16_b128 V tile
-def tree_max(m, n=1): return [m] * n              # PART0: per-bank max reduction
-def cross_max(n=1): return [P1] * n               # PART1: cross-MSB max merge + delta
-def sm_ops(m, n=1): return [P2_BASE + m] * n     # PART2: rescale / pkfma / cvt / sum
-def pair_exp(m, n=1): return [EXP_BASE + m] * n  # PART2 exp2 (3-cycle transcendental)
-def o_rescale(n=1): return [O_RESC0] * n           # O *= exp_delta (pk_mul)
-def tdm_load(n=1): return [TDM_TOKEN] * n          # tensor_load_to_lds (DMA prefetch)
+def lds_k(m, n=1):
+    return [K_BASE + m] * n  # ds_load_b128 K tile
 
 
-def build_gemm1_schedule() -> List[List[int]]:
+def lds_v(m, n=1):
+    return [V_BASE + m] * n  # ds_load_tr16_b128 V tile
+
+
+def tree_max(m, n=1):
+    return [m] * n  # PART0: per-bank max reduction
+
+
+def cross_max(n=1):
+    return [P1] * n  # PART1: cross-MSB max merge + delta
+
+
+def sm_ops(m, n=1):
+    return [P2_BASE + m] * n  # PART2: rescale / pkfma / cvt / sum
+
+
+def pair_exp(m, n=1):
+    return [EXP_BASE + m] * n  # PART2 exp2 (3-cycle transcendental)
+
+
+def o_rescale(n=1):
+    return [O_RESC0] * n  # O *= exp_delta (pk_mul)
+
+
+def tdm_load(n=1):
+    return [TDM_TOKEN] * n  # tensor_load_to_lds (DMA prefetch)
+
+
+def build_gemm1_schedule() -> list[list[int]]:
     """GEMM1 (QK) interleaved schedule: 96 rows = 4 stages × 24 WMMAs.
 
     Each row lists ops to issue between two consecutive WMMA instructions.
@@ -96,75 +116,117 @@ def build_gemm1_schedule() -> List[List[int]]:
     # w01-w08:  K loads grouped by MSB (3 loads/WMMA); softmax same-bank
     # w09-w23:  K done → pure softmax drain + 4 O-rescale scattered
     s0 = [
-        tdm_load(2) + sm_ops(0),                                        # w00
-        lds_k(0,3) + o_rescale(),                                       # w01
-        lds_k(0,3) + sm_ops(0,2),                                       # w02
-        lds_k(1,3) + sm_ops(1,2),  lds_k(1,3) + sm_ops(1,2),           # w03-04
-        lds_k(2,3) + sm_ops(2,2),  lds_k(2,3) + sm_ops(2) + sm_ops(0), # w05-06
-        lds_k(3,3) + sm_ops(3,2),  lds_k(3,3) + sm_ops(3),             # w07-08
-        sm_ops(0,2),                                                     # w09
-        sm_ops(0,2), sm_ops(1,2), sm_ops(1,2),                          # w10-12
-        sm_ops(1) + o_rescale(),                                         # w13
-        sm_ops(1) + sm_ops(0),  sm_ops(2) + sm_ops(3),                  # w14-15
-        sm_ops(2) + o_rescale(), sm_ops(2) + o_rescale(),                # w16-17
-        sm_ops(0,2), sm_ops(0,2), sm_ops(0,2), sm_ops(0,2), sm_ops(0,2),# w18-22
-        sm_ops(0) + sm_ops(2),                                           # w23
+        tdm_load(2) + sm_ops(0),  # w00
+        lds_k(0, 3) + o_rescale(),  # w01
+        lds_k(0, 3) + sm_ops(0, 2),  # w02
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(1, 3) + sm_ops(1, 2),  # w03-04
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(2, 3) + sm_ops(2) + sm_ops(0),  # w05-06
+        lds_k(3, 3) + sm_ops(3, 2),
+        lds_k(3, 3) + sm_ops(3),  # w07-08
+        sm_ops(0, 2),  # w09
+        sm_ops(0, 2),
+        sm_ops(1, 2),
+        sm_ops(1, 2),  # w10-12
+        sm_ops(1) + o_rescale(),  # w13
+        sm_ops(1) + sm_ops(0),
+        sm_ops(2) + sm_ops(3),  # w14-15
+        sm_ops(2) + o_rescale(),
+        sm_ops(2) + o_rescale(),  # w16-17
+        sm_ops(0, 2),
+        sm_ops(0, 2),
+        sm_ops(0, 2),
+        sm_ops(0, 2),
+        sm_ops(0, 2),  # w18-22
+        sm_ops(0) + sm_ops(2),  # w23
     ]
 
     # ── Stage 1: K loads + TDM prefetch, 10 exp/MSB ──────────────────────
     # Same structure as stage 0 with different MSB distribution
     s1 = [
-        tdm_load(2) + sm_ops(2),                                         # w00
-        lds_k(0,3) + o_rescale(),  lds_k(0,3) + sm_ops(0),              # w01-02
-        lds_k(1,3) + sm_ops(1,2),  lds_k(1,3) + sm_ops(1,2),           # w03-04
-        lds_k(2,3) + sm_ops(2,2),  lds_k(2,3) + sm_ops(2,2),           # w05-06
-        lds_k(3,3) + sm_ops(3),    lds_k(3,3) + sm_ops(3),             # w07-08
-        sm_ops(3,2), sm_ops(3,2), sm_ops(3,2),                          # w09-11
-        sm_ops(1,2), sm_ops(1,2),                                        # w12-13
-        sm_ops(1) + sm_ops(2),  sm_ops(1) + o_rescale(),                # w14-15
-        sm_ops(2) + o_rescale(), sm_ops(2) + o_rescale(),                # w16-17
-        sm_ops(2,2), sm_ops(2,2),                                        # w18-19
-        sm_ops(3,2), sm_ops(3,2), sm_ops(3,2),                          # w20-22
-        sm_ops(3) + sm_ops(0),                                           # w23
+        tdm_load(2) + sm_ops(2),  # w00
+        lds_k(0, 3) + o_rescale(),
+        lds_k(0, 3) + sm_ops(0),  # w01-02
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(1, 3) + sm_ops(1, 2),  # w03-04
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(2, 3) + sm_ops(2, 2),  # w05-06
+        lds_k(3, 3) + sm_ops(3),
+        lds_k(3, 3) + sm_ops(3),  # w07-08
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2),  # w09-11
+        sm_ops(1, 2),
+        sm_ops(1, 2),  # w12-13
+        sm_ops(1) + sm_ops(2),
+        sm_ops(1) + o_rescale(),  # w14-15
+        sm_ops(2) + o_rescale(),
+        sm_ops(2) + o_rescale(),  # w16-17
+        sm_ops(2, 2),
+        sm_ops(2, 2),  # w18-19
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2),  # w20-22
+        sm_ops(3) + sm_ops(0),  # w23
     ]
 
     # ── Stage 2: K loads only (no TDM), 4 exp + 21 cheap/MSB ─────────────
     # Larger softmax budget (132 cy) → bulk cheap ops fill w08-w23
     s2 = [
-        lds_k(0,3) + sm_ops(0) + sm_ops(3),                             # w00
-        lds_k(0,3) + sm_ops(0) + sm_ops(2),                             # w01
-        lds_k(1,3) + sm_ops(1,2),  lds_k(1,3) + sm_ops(1,2),           # w02-03
-        lds_k(2,3) + sm_ops(2,2),  lds_k(2,3) + sm_ops(2,2),           # w04-05
-        lds_k(3,3) + sm_ops(3,2),  lds_k(3,3) + sm_ops(3,2),           # w06-07
-        sm_ops(0,6),                                                     # w08
-        sm_ops(0,7), sm_ops(0,7),                                        # w09-10
-        sm_ops(1,7), sm_ops(1,7), sm_ops(1,7),                          # w11-13
-        sm_ops(2,2) + o_rescale(),                                       # w14
-        sm_ops(2,2) + o_rescale(), sm_ops(2,2) + o_rescale(),            # w15-16
-        sm_ops(3,2) + o_rescale(),                                       # w17
-        sm_ops(2,6), sm_ops(2,6),                                        # w18-19
-        sm_ops(2,3) + sm_ops(3,3),                                       # w20
-        sm_ops(3,6), sm_ops(3,6),                                        # w21-22
-        sm_ops(0,4) + sm_ops(3,2),                                       # w23
+        lds_k(0, 3) + sm_ops(0) + sm_ops(3),  # w00
+        lds_k(0, 3) + sm_ops(0) + sm_ops(2),  # w01
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(1, 3) + sm_ops(1, 2),  # w02-03
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(2, 3) + sm_ops(2, 2),  # w04-05
+        lds_k(3, 3) + sm_ops(3, 2),
+        lds_k(3, 3) + sm_ops(3, 2),  # w06-07
+        sm_ops(0, 6),  # w08
+        sm_ops(0, 7),
+        sm_ops(0, 7),  # w09-10
+        sm_ops(1, 7),
+        sm_ops(1, 7),
+        sm_ops(1, 7),  # w11-13
+        sm_ops(2, 2) + o_rescale(),  # w14
+        sm_ops(2, 2) + o_rescale(),
+        sm_ops(2, 2) + o_rescale(),  # w15-16
+        sm_ops(3, 2) + o_rescale(),  # w17
+        sm_ops(2, 6),
+        sm_ops(2, 6),  # w18-19
+        sm_ops(2, 3) + sm_ops(3, 3),  # w20
+        sm_ops(3, 6),
+        sm_ops(3, 6),  # w21-22
+        sm_ops(0, 4) + sm_ops(3, 2),  # w23
     ]
 
     # ── Stage 3: V loads (not K), 33 cheap/MSB ───────────────────────────
     # V uses ds_load_tr16_b128 (transposed); 2 loads/WMMA instead of 3
     s3 = [
-        lds_v(0,2) + sm_ops(0,2),  lds_v(0,2) + sm_ops(0,2),           # w00-01
-        lds_v(1,2) + sm_ops(1,2),  lds_v(1,2) + sm_ops(1,2) + sm_ops(2),# w02-03
-        lds_v(2,2) + sm_ops(2,2),  lds_v(2,2) + sm_ops(2,2),           # w04-05
-        lds_v(3,2) + sm_ops(3,2),  lds_v(3,2) + sm_ops(3) + sm_ops(1), # w06-07
-        sm_ops(1,2) + sm_ops(3),                                         # w08
-        sm_ops(1) + sm_ops(0),  sm_ops(1) + sm_ops(3),                  # w09-10
-        sm_ops(1) + sm_ops(0) + sm_ops(3),                              # w11
-        sm_ops(2) + sm_ops(3),  sm_ops(2,2),                            # w12-13
-        sm_ops(3,2),  sm_ops(3,2) + sm_ops(1),                          # w14-15
-        o_rescale() + sm_ops(2), o_rescale() + sm_ops(2),                # w16-17
-        o_rescale() + sm_ops(2) + sm_ops(0),                             # w18
-        o_rescale() + sm_ops(2) + sm_ops(3),                             # w19
-        sm_ops(0) + sm_ops(3) + sm_ops(1),                              # w20
-        sm_ops(0), sm_ops(3), [],                                        # w21-23
+        lds_v(0, 2) + sm_ops(0, 2),
+        lds_v(0, 2) + sm_ops(0, 2),  # w00-01
+        lds_v(1, 2) + sm_ops(1, 2),
+        lds_v(1, 2) + sm_ops(1, 2) + sm_ops(2),  # w02-03
+        lds_v(2, 2) + sm_ops(2, 2),
+        lds_v(2, 2) + sm_ops(2, 2),  # w04-05
+        lds_v(3, 2) + sm_ops(3, 2),
+        lds_v(3, 2) + sm_ops(3) + sm_ops(1),  # w06-07
+        sm_ops(1, 2) + sm_ops(3),  # w08
+        sm_ops(1) + sm_ops(0),
+        sm_ops(1) + sm_ops(3),  # w09-10
+        sm_ops(1) + sm_ops(0) + sm_ops(3),  # w11
+        sm_ops(2) + sm_ops(3),
+        sm_ops(2, 2),  # w12-13
+        sm_ops(3, 2),
+        sm_ops(3, 2) + sm_ops(1),  # w14-15
+        o_rescale() + sm_ops(2),
+        o_rescale() + sm_ops(2),  # w16-17
+        o_rescale() + sm_ops(2) + sm_ops(0),  # w18
+        o_rescale() + sm_ops(2) + sm_ops(3),  # w19
+        sm_ops(0) + sm_ops(3) + sm_ops(1),  # w20
+        sm_ops(0),
+        sm_ops(3),
+        [],  # w21-23
     ]
 
     sched = s0 + s1 + s2 + s3
@@ -187,7 +249,7 @@ def build_gemm1_schedule() -> List[List[int]]:
 # Totals: P0=22/MSB ✓  P1=8 ✓  P2=24/MSB ✓  EXP=8/MSB=32 total ✓
 
 
-def build_gemm2_schedule() -> List[List[int]]:
+def build_gemm2_schedule() -> list[list[int]]:
     """GEMM2 (PV) interleaved schedule: 64 rows = 4 stages x 16 WMMAs.
 
     Pipeline: GEMM2 computes P*V while interleaving softmax for the NEXT tile:
@@ -202,67 +264,92 @@ def build_gemm2_schedule() -> List[List[int]]:
     # -- Stage 0: V+TDM, PART0 tree-max 10/MSB --
     # V loads paired with same-MSB tree-max ops; overflow fills w09-w15
     s0 = [
-        tdm_load(2) + tree_max(0,3),                                     # w00
-        lds_v(0,2) + tree_max(0,3),  lds_v(0,2) + tree_max(0,3),        # w01-02
-        lds_v(1,2) + tree_max(1,4),  lds_v(1,2) + tree_max(1,4),        # w03-04
-        lds_v(2,2) + tree_max(2,4),  lds_v(2,2) + tree_max(2,4),        # w05-06
-        lds_v(3,2) + tree_max(3,4),  lds_v(3,2) + tree_max(3,4),        # w07-08
-        tree_max(0) + tree_max(2,3) + tree_max(3),                       # w09
-        tree_max(0) + tree_max(1,2) + tree_max(3),                       # w10
-        tree_max(0,4) + tree_max(1),                                     # w11
-        tree_max(0) + tree_max(1,2) + tree_max(2,2),                     # w12
-        tree_max(1) + tree_max(2,2) + tree_max(3,2),                     # w13
-        tree_max(2) + tree_max(3,2) + tree_max(1,2),                     # w14
-        tree_max(3,2),                                                   # w15
+        tdm_load(2) + tree_max(0, 3),  # w00
+        lds_v(0, 2) + tree_max(0, 3),
+        lds_v(0, 2) + tree_max(0, 3),  # w01-02
+        lds_v(1, 2) + tree_max(1, 4),
+        lds_v(1, 2) + tree_max(1, 4),  # w03-04
+        lds_v(2, 2) + tree_max(2, 4),
+        lds_v(2, 2) + tree_max(2, 4),  # w05-06
+        lds_v(3, 2) + tree_max(3, 4),
+        lds_v(3, 2) + tree_max(3, 4),  # w07-08
+        tree_max(0) + tree_max(2, 3) + tree_max(3),  # w09
+        tree_max(0) + tree_max(1, 2) + tree_max(3),  # w10
+        tree_max(0, 4) + tree_max(1),  # w11
+        tree_max(0) + tree_max(1, 2) + tree_max(2, 2),  # w12
+        tree_max(1) + tree_max(2, 2) + tree_max(3, 2),  # w13
+        tree_max(2) + tree_max(3, 2) + tree_max(1, 2),  # w14
+        tree_max(3, 2),  # w15
     ]
 
     # -- Stage 1: V+TDM, PART0 12/MSB + PART1 8 + PART2 start --
     # P0 interleaved across MSBs; P1 at w09-10; P2 seeds w11-15
     s1 = [
-        tdm_load(2) + tree_max(0),                                       # w00
-        lds_v(0,2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),  # w01
-        lds_v(0,2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),  # w02
-        lds_v(1,2) + tree_max(1) + tree_max(0) + tree_max(2) + tree_max(3),  # w03
-        lds_v(1,2) + tree_max(1) + tree_max(0),                         # w04
-        lds_v(2,2) + tree_max(2,2) + tree_max(1),                       # w05
-        lds_v(2,2) + tree_max(2) + tree_max(0) + tree_max(1),           # w06
-        lds_v(3,2) + tree_max(3),  lds_v(3,2) + tree_max(3,2),          # w07-08
-        cross_max(4),  cross_max(4),                                     # w09-10: P1 merge
-        sm_ops(1,4) + sm_ops(2,4),  sm_ops(0,4) + sm_ops(3,4),          # w11-12: P2 start
-        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),                  # w13
-        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3)                   # w14
-        + sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),
-        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),                  # w15
+        tdm_load(2) + tree_max(0),  # w00
+        lds_v(0, 2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),  # w01
+        lds_v(0, 2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),  # w02
+        lds_v(1, 2) + tree_max(1) + tree_max(0) + tree_max(2) + tree_max(3),  # w03
+        lds_v(1, 2) + tree_max(1) + tree_max(0),  # w04
+        lds_v(2, 2) + tree_max(2, 2) + tree_max(1),  # w05
+        lds_v(2, 2) + tree_max(2) + tree_max(0) + tree_max(1),  # w06
+        lds_v(3, 2) + tree_max(3),
+        lds_v(3, 2) + tree_max(3, 2),  # w07-08
+        cross_max(4),
+        cross_max(4),  # w09-10: P1 merge
+        sm_ops(1, 4) + sm_ops(2, 4),
+        sm_ops(0, 4) + sm_ops(3, 4),  # w11-12: P2 start
+        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),  # w13
+        sm_ops(0)
+        + sm_ops(1)
+        + sm_ops(2)
+        + sm_ops(3)  # w14
+        + sm_ops(0)
+        + sm_ops(1)
+        + sm_ops(2)
+        + sm_ops(3),
+        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),  # w15
     ]
 
     # -- Stage 2: V only, PART2 bulk 24/MSB --
     # V loads + pkfma at w00-07; pure softmax drain at w08-15
     s2 = [
-        lds_v(0,2) + sm_ops(0,3),  lds_v(0,2) + sm_ops(0,3),           # w00-01
-        lds_v(1,2) + sm_ops(1) + sm_ops(2,2),                           # w02
-        lds_v(1,2) + sm_ops(1) + sm_ops(2,2),                           # w03
-        lds_v(2,2) + sm_ops(2) + sm_ops(1,2),                           # w04
-        lds_v(2,2) + sm_ops(2) + sm_ops(1,2),                           # w05
-        lds_v(3,2) + sm_ops(3,4),  lds_v(3,2) + sm_ops(3,3),           # w06-07
-        sm_ops(0,6),  sm_ops(0,3) + sm_ops(1),                          # w08-09
-        sm_ops(1,6),  sm_ops(1,3) + sm_ops(2,2),                        # w10-11
-        sm_ops(2,6),  sm_ops(3,3),                                       # w12-13
-        sm_ops(3,4),  sm_ops(0,2) + sm_ops(1,2),                        # w14-15
+        lds_v(0, 2) + sm_ops(0, 3),
+        lds_v(0, 2) + sm_ops(0, 3),  # w00-01
+        lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),  # w02
+        lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),  # w03
+        lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),  # w04
+        lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),  # w05
+        lds_v(3, 2) + sm_ops(3, 4),
+        lds_v(3, 2) + sm_ops(3, 3),  # w06-07
+        sm_ops(0, 6),
+        sm_ops(0, 3) + sm_ops(1),  # w08-09
+        sm_ops(1, 6),
+        sm_ops(1, 3) + sm_ops(2, 2),  # w10-11
+        sm_ops(2, 6),
+        sm_ops(3, 3),  # w12-13
+        sm_ops(3, 4),
+        sm_ops(0, 2) + sm_ops(1, 2),  # w14-15
     ]
 
     # -- Stage 3: K prefetch, pair_exp 8/MSB (3cy each) --
     # K loads for NEXT tile; pair_exp <=2/WMMA to stay within cycle budget
     s3 = [
-        lds_k(0,3) + pair_exp(0,2),  lds_k(0,3) + pair_exp(0),          # w00-01
-        lds_k(1,3) + pair_exp(1,2),  lds_k(1,3) + pair_exp(1,2),        # w02-03
-        lds_k(2,3) + sm_ops(2) + pair_exp(2),                           # w04
-        lds_k(2,3) + sm_ops(2) + pair_exp(2),                           # w05
-        lds_k(3,3) + sm_ops(3) + pair_exp(3),                           # w06
-        lds_k(3,3) + sm_ops(3) + pair_exp(3),                           # w07
-        pair_exp(0,3),  pair_exp(0,2) + pair_exp(1),                     # w08-09
-        pair_exp(1,3),  pair_exp(3,3),                                   # w10-11
-        pair_exp(2,3),  pair_exp(2,3),                                   # w12-13
-        pair_exp(3,3),  [],                                              # w14-15
+        lds_k(0, 3) + pair_exp(0, 2),
+        lds_k(0, 3) + pair_exp(0),  # w00-01
+        lds_k(1, 3) + pair_exp(1, 2),
+        lds_k(1, 3) + pair_exp(1, 2),  # w02-03
+        lds_k(2, 3) + sm_ops(2) + pair_exp(2),  # w04
+        lds_k(2, 3) + sm_ops(2) + pair_exp(2),  # w05
+        lds_k(3, 3) + sm_ops(3) + pair_exp(3),  # w06
+        lds_k(3, 3) + sm_ops(3) + pair_exp(3),  # w07
+        pair_exp(0, 3),
+        pair_exp(0, 2) + pair_exp(1),  # w08-09
+        pair_exp(1, 3),
+        pair_exp(3, 3),  # w10-11
+        pair_exp(2, 3),
+        pair_exp(2, 3),  # w12-13
+        pair_exp(3, 3),
+        [],  # w14-15
     ]
 
     sched = s0 + s1 + s2 + s3
@@ -270,10 +357,9 @@ def build_gemm2_schedule() -> List[List[int]]:
     return sched
 
 
-
 # Pre-built tables
-GEMM1_SCHEDULE: List[List[int]] = build_gemm1_schedule()
-GEMM2_SCHEDULE: List[List[int]] = build_gemm2_schedule()
+GEMM1_SCHEDULE: list[list[int]] = build_gemm1_schedule()
+GEMM2_SCHEDULE: list[list[int]] = build_gemm2_schedule()
 
 
 # Index helpers
@@ -283,7 +369,6 @@ def g1_row_idx(stage: int, wmma: int) -> int:
 
 def g2_row_idx(stage: int, wmma: int) -> int:
     return stage * PV_GEMM_INST_COUNT + wmma
-
 
 
 # SECTION 2: Core Loop
@@ -317,45 +402,45 @@ def rocdl_fmax3(a, b, c):
 # Hardware / tile geometry
 WAVE_SIZE = 32
 NUM_WAVES = 4
-NUM_MSB = 4                              # VGPR banks
-BLOCK_SIZE = WAVE_SIZE * NUM_WAVES       # 128 threads per workgroup
+NUM_MSB = 4  # VGPR banks
+BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 128 threads per workgroup
 
-QK_HDIM = 192                            # Q/K head dimension (bf16 elements)
-V_HDIM = 128                             # V head dimension
-Q_BPP = 2                               # bytes per element (bf16)
+QK_HDIM = 192  # Q/K head dimension (bf16 elements)
+V_HDIM = 128  # V head dimension
+Q_BPP = 2  # bytes per element (bf16)
 KV_BPP = 2
-TG_SUBQD = 128                          # tile_m (Q rows per workgroup)
-TG_SUBKV = 128                          # tile_n (KV cols per tile)
+TG_SUBQD = 128  # tile_m (Q rows per workgroup)
+TG_SUBKV = 128  # tile_n (KV cols per tile)
 WV_SUBKV = TG_SUBKV
-SU_K_N = 32                             # rows per SU (sub-unit)
+SU_K_N = 32  # rows per SU (sub-unit)
 SU_K_K = QK_HDIM
-CNT_SU = WV_SUBKV // SU_K_N             # 4 SUs per tile
+CNT_SU = WV_SUBKV // SU_K_N  # 4 SUs per tile
 
 # WMMA instruction shape
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 
 # VGPR register file layout (per-MSB)
-VPS_Q = TG_SUBQD * QK_HDIM * Q_BPP // 128           # 64
-VPS_MSB_Q = VPS_Q // NUM_MSB                         # 16
-VTS_MSB_Q = VPS_MSB_Q                                # 16
-Q_WMMA_PER_MSB = VTS_MSB_Q // 8                      # 2
-VPS_KV = SU_K_K * SU_K_N * KV_BPP // 128             # 128
-VPS_MSB_KV = VPS_KV // NUM_MSB                       # 32
-VPS_MSB_SP = 32                                       # 4 SUs × 8 f32/lane per MSB
+VPS_Q = TG_SUBQD * QK_HDIM * Q_BPP // 128  # 64
+VPS_MSB_Q = VPS_Q // NUM_MSB  # 16
+VTS_MSB_Q = VPS_MSB_Q  # 16
+Q_WMMA_PER_MSB = VTS_MSB_Q // 8  # 2
+VPS_KV = SU_K_K * SU_K_N * KV_BPP // 128  # 128
+VPS_MSB_KV = VPS_KV // NUM_MSB  # 32
+VPS_MSB_SP = 32  # 4 SUs × 8 f32/lane per MSB
 SP_MSB_M = 16
 SP_MSB_N = 16
 SP_MSB_K = QK_HDIM
 
 # GEMM instruction counts
-GEMM_INST_COUNT = 24                     # WMMAs per GEMM1 stage
-LDS_INST_COUNT = 24                      # K LDS loads per stage (4 MSBs × 6)
-N_LDS_PER_MSB = VPS_MSB_KV // 4         # 6 K loads per MSB
-N_LDS_V_PER_MSB = 4                     # V loads per MSB
+GEMM_INST_COUNT = 24  # WMMAs per GEMM1 stage
+LDS_INST_COUNT = 24  # K LDS loads per stage (4 MSBs × 6)
+N_LDS_PER_MSB = VPS_MSB_KV // 4  # 6 K loads per MSB
+N_LDS_V_PER_MSB = 4  # V loads per MSB
 LDS_V_INST_COUNT = NUM_MSB * N_LDS_V_PER_MSB  # 16
 
 # Pipeline control
 ALU_STAGES = 8
-GEMM1 = 0                               # QK gemm index
+GEMM1 = 0  # QK gemm index
 KV_K = 0
 KV_V = 1
 KV_NONE = 2
@@ -366,8 +451,8 @@ QK_WMMA_INTERLEAVE = 1
 TDM_LOADS_PER_STAGE = 2
 
 # LDS layout (byte offsets)
-LDS_K_SU_P_SIZE = 0x3200                 # per-SU K region: 12800 bytes
-LDS_V_SU_P_SIZE = 0x2400                 # per-SU V region: 9216 bytes
+LDS_K_SU_P_SIZE = 0x3200  # per-SU K region: 12800 bytes
+LDS_V_SU_P_SIZE = 0x2400  # per-SU V region: 9216 bytes
 
 # PART2 double-buffer pipeline split (ops per MSB):
 #   FIRST HALF  [0..PART2_SPLIT-1] = setup(8) + pkfma(16) + exp(EXP_PER_MSB_TO_G2) ops
@@ -435,7 +520,6 @@ def emit_void(inst_str, operands=None, constraints="", **kwargs):
     llvm_dialect.inline_asm(
         None, operands or [], inst_str, constraints, has_side_effects=True, **kwargs
     )
-
 
 
 def sched_barrier(mask=0):
@@ -536,13 +620,7 @@ def broadcast_f32_to_v2f32(val, bank=0):
 # WMMA Fragment Pairing (from prologue — concat two v4i32 → v16bf16)
 
 
-
-
-
-
 N_WMMA_K_TILES = (QK_HDIM // WMMA_K) // 2  # 3 for QK_HDIM=192, 2 for 128
-
-
 
 
 # Atomic Instruction Primitives
@@ -560,8 +638,15 @@ class Atom:
         sched_barrier(0)
         zero = fx.constant_vector(0.0, T.vec(8, T.f32))
         result = rocdl_dialect.wmma_f32_16x16x32_bf16(
-            ty["v8f32"], src_a, src_b, zero,
-            signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
+            ty["v8f32"],
+            src_a,
+            src_b,
+            zero,
+            signA=False,
+            signB=False,
+            modC=0,
+            reuseA=False,
+            reuseB=False,
         )
         banked = set_vgpr_bank(result.result, bank_dst)
         sched_barrier(0)
@@ -571,8 +656,15 @@ class Atom:
     def wmma_accum(ty, src_a, src_b, acc, bank_dst):
         sched_barrier(0)
         result = rocdl_dialect.wmma_f32_16x16x32_bf16(
-            ty["v8f32"], src_a, src_b, acc,
-            signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
+            ty["v8f32"],
+            src_a,
+            src_b,
+            acc,
+            signA=False,
+            signB=False,
+            modC=0,
+            reuseA=False,
+            reuseB=False,
         )
         banked = set_vgpr_bank(result.result, bank_dst)
         sched_barrier(0)
@@ -799,7 +891,9 @@ class Softmax:
             _scl = sgpr["s_log2e_scl"]
             v = Vec.from_elements([_scl, _scl], Float32)
             if const_expr(b > 0):
-                ss["vgpr_log2e_scl_pair"][b] = set_vgpr_bank_offset(v, b, LOG2E_PAIR_OFFSET)
+                ss["vgpr_log2e_scl_pair"][b] = set_vgpr_bank_offset(
+                    v, b, LOG2E_PAIR_OFFSET
+                )
             else:
                 ss["vgpr_log2e_scl_pair"][b] = set_vgpr_bank(v, b)
             sched_barrier(0)
@@ -856,7 +950,9 @@ class Softmax:
         if not skip_rescale_sum:
 
             def op_rescale_sum(b=bank):
-                ss["row_sums"][b] = Atom.mul_f32(ss["exp_delta"][b], ss["row_sums"][b], b)
+                ss["row_sums"][b] = Atom.mul_f32(
+                    ss["exp_delta"][b], ss["row_sums"][b], b
+                )
 
             ops.append(op_rescale_sum)
 
@@ -1034,7 +1130,9 @@ class Softmax:
 
         def _get_sp(offset):
             if const_expr(sp_f32[offset] is None):
-                sp_f32[offset] = Vec(sp_pairs[offset // 2], dtype=Float32)[offset % 2].ir_value()
+                sp_f32[offset] = Vec(sp_pairs[offset // 2], dtype=Float32)[
+                    offset % 2
+                ].ir_value()
             return sp_f32[offset]
 
         # Phase 1: initial max3 per valid group (4 ops)
@@ -1075,7 +1173,9 @@ class Softmax:
 
             def op_last_elem(k_=k, b=bank):
                 base = k_ * VALID_GROUP_STRIDE
-                tmps[k_] = Atom.max3_num_f32(_get_sp(base + 7), tmps[k_], _get_sp(base), b)
+                tmps[k_] = Atom.max3_num_f32(
+                    _get_sp(base + 7), tmps[k_], _get_sp(base), b
+                )
 
             ops.append(op_last_elem)
 
@@ -1123,7 +1223,9 @@ class Softmax:
 
         # Phase 8 cur_max (op21): max3(tmps[0], tmps[1], old_max), reads perm_exec result
         def op_cur_max(b=bank):
-            ss["local_max"][b] = Atom.max3_num_f32(tmps[0], tmps[1], ss["old_max"][b], b)
+            ss["local_max"][b] = Atom.max3_num_f32(
+                tmps[0], tmps[1], ss["old_max"][b], b
+            )
 
         ops.append(op_cur_max)
 
@@ -1184,7 +1286,10 @@ class Softmax:
 
             def op_fma_delta(b=msb):
                 ss["delta"][b] = Atom.fma_f32_neg_src0(
-                    ss["local_max"][b], sgpr["s_log2e_scl"], ss["pre_max_log2e_scl"][b], b
+                    ss["local_max"][b],
+                    sgpr["s_log2e_scl"],
+                    ss["pre_max_log2e_scl"][b],
+                    b,
                 )
 
             ops.append(op_fma_delta)
@@ -1473,8 +1578,6 @@ class Softmax:
         return p_tiles
 
 
-
-
 # Softmax PART2 Builder
 
 
@@ -1540,7 +1643,9 @@ class Fragment:
         # Stage 2: 4 v4bf16 → 2 v8bf16
         v8s = []
         for i in range_constexpr(2):
-            v8s.append(vector.shuffle(v4s[i * 2], v4s[i * 2 + 1], list(range_constexpr(8))))
+            v8s.append(
+                vector.shuffle(v4s[i * 2], v4s[i * 2 + 1], list(range_constexpr(8)))
+            )
 
         # Stage 3: 2 v8bf16 → 1 v16bf16
         result = vector.shuffle(v8s[0], v8s[1], list(range_constexpr(16)))
@@ -1614,7 +1719,6 @@ class Fragment:
         Atom.s_wait_dscnt(0)
         sched_barrier(0)
         return raw0, raw1
-
 
 
 class Pipeline:
@@ -1898,12 +2002,16 @@ def _ensure_ir_value(v):
 
 def add_nuw(a, b):
     """arith.addi with nuw flag — enables gfx1250 buffer offset folding."""
-    return arith.addi(_ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw())
+    return arith.addi(
+        _ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw()
+    )
 
 
 def mul_nuw(a, b):
     """arith.muli with nuw flag — preserves nuw through constant folding."""
-    return arith.muli(_ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw())
+    return arith.muli(
+        _ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw()
+    )
 
 
 def setreg(hwreg_enc, value):
@@ -1912,7 +2020,6 @@ def setreg(hwreg_enc, value):
     imm = arith.constant(hwreg_enc, type=T.i32)
     val = arith.constant(value, type=T.i32)
     llvm_dialect.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
-
 
 
 # FlyDSL Phase Functions
@@ -2026,7 +2133,6 @@ def compute_global_addr(tensor, byte_offset, wave_id, stride_32):
     return base_i64 + off_i64 + wave_off
 
 
-
 # LDS base extraction helper
 
 
@@ -2089,8 +2195,10 @@ def build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
         v_addrs += [set_vgpr_bank(v_dh0_b, msb), set_vgpr_bank(v_dh1_b, msb)]
 
     return [
-        set_vgpr_bank(k_dh0, 0), set_vgpr_bank(k_dh1, 1),
-        set_vgpr_bank(k_dh0_hi, 2), set_vgpr_bank(k_dh1_hi, 3),
+        set_vgpr_bank(k_dh0, 0),
+        set_vgpr_bank(k_dh1, 1),
+        set_vgpr_bank(k_dh0_hi, 2),
+        set_vgpr_bank(k_dh1_hi, 3),
     ] + v_addrs
 
 
@@ -2586,7 +2694,12 @@ class TDM:
 
     @staticmethod
     def make_kv_dg1_with_oob(
-        config_bf16, dim0_elems, dim1_rows, stride_seq_elems, oob_dim1_raw, dim0_stride=None
+        config_bf16,
+        dim0_elems,
+        dim1_rows,
+        stride_seq_elems,
+        oob_dim1_raw,
+        dim0_stride=None,
     ):
         _td1_lo = arith.andi(oob_dim1_raw, arith.constant(0xFFFF, type=T.i32))
         _sgpr2 = arith.shli(_td1_lo, arith.constant(16, type=T.i32))
@@ -2607,10 +2720,15 @@ class TDM:
         )
 
     @staticmethod
-    def build_oob_dg1_list(config, dim0_elems, stride_elems, remain, wave_id, dim0_stride=None):
+    def build_oob_dg1_list(
+        config, dim0_elems, stride_elems, remain, wave_id, dim0_stride=None
+    ):
         return [
             TDM.make_kv_dg1_with_oob(
-                config, dim0_elems, 8, stride_elems,
+                config,
+                dim0_elems,
+                8,
+                stride_elems,
                 TDM.per_warp_oob_dim1(remain - su * 32, wave_id, 8),
                 dim0_stride=dim0_stride,
             )
@@ -2624,7 +2742,9 @@ class TDM:
         Each TDM load covers one SU. After all loads, issues barrier.
         dg1 can be a single v8i32 or a list of n_su v8i32 (per-SU OOB).
         """
-        descs = TDM.build_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su)
+        descs = TDM.build_descs(
+            dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su
+        )
         TDM.issue_from_descs(descs)
 
     @staticmethod
@@ -2644,7 +2764,7 @@ class TDM:
         Per-warp: 4 warps x 8 rows = 32 rows per SU, 4 SUs total.
         """
         _DIM0_VALID = QK_HDIM  # 192
-        _DIM0_STRIDE = 200     # LDS row stride in elements
+        _DIM0_STRIDE = 200  # LDS row stride in elements
         _DIM1_ROWS = 8
 
         _K_CONFIG_BF16 = (1 << 16) | K_TDM_CONFIG
@@ -2676,7 +2796,13 @@ class TDM:
         k_stride_adv = fx.Int64(stride_k_32)
 
         TDM.load_kv_blk(
-            KV_K, k_dg1, k_addr, k_stride_adv, lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU
+            KV_K,
+            k_dg1,
+            k_addr,
+            k_stride_adv,
+            lds_base_with_warp,
+            LDS_K_SU_P_SIZE,
+            CNT_SU,
         )
 
         tdm_wait_and_barrier()
@@ -2727,7 +2853,13 @@ class TDM:
         v_stride_adv = fx.Int64(stride_v_32)
 
         TDM.load_kv_blk(
-            KV_V, v_dg1, v_addr, v_stride_adv, lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU
+            KV_V,
+            v_dg1,
+            v_addr,
+            v_stride_adv,
+            lds_base_with_warp,
+            LDS_V_SU_P_SIZE,
+            CNT_SU,
         )
 
         tdm_wait_and_barrier()
@@ -2910,14 +3042,21 @@ def fmha_pipeline_ctx(
                 fx.Int32,
             )
         k_addr = compute_global_addr(
-            ptr_K, tdm_k_offset, wave_id, 8 * stride_k_seq,
+            ptr_K,
+            tdm_k_offset,
+            wave_id,
+            8 * stride_k_seq,
         )
         k_stride_adv = fx.Int64(stride_k_32)
         _k_warp_off = wave_id * (8 * K_ROW_BYTES)
         _k_lds_base = tdm_k_target + _k_warp_off
         k_descs = TDM.build_descs(
-            k_dg1, k_addr, k_stride_adv,
-            _k_lds_base, LDS_K_SU_P_SIZE, CNT_SU,
+            k_dg1,
+            k_addr,
+            k_stride_adv,
+            _k_lds_base,
+            LDS_K_SU_P_SIZE,
+            CNT_SU,
         )
         tdm_state["k_descs"] = k_descs
         tdm_state["k_desc_idx"] = 0
@@ -2942,21 +3081,26 @@ def fmha_pipeline_ctx(
                 fx.Int32,
             )
         v_addr = compute_global_addr(
-            ptr_V, tdm_v_offset, wave_id, 8 * stride_v_seq,
+            ptr_V,
+            tdm_v_offset,
+            wave_id,
+            8 * stride_v_seq,
         )
         v_stride_adv = fx.Int64(stride_v_32)
         _v_warp_off = wave_id * (8 * V_ROW_BYTES)
         _v_lds_base = tdm_v_target + _v_warp_off
         v_descs = TDM.build_descs(
-            v_dg1, v_addr, v_stride_adv,
-            _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU,
+            v_dg1,
+            v_addr,
+            v_stride_adv,
+            _v_lds_base,
+            LDS_V_SU_P_SIZE,
+            CNT_SU,
         )
         tdm_state["v_descs"] = v_descs
         tdm_state["v_desc_idx"] = 0
 
-    g1_tdm_type = (
-        KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE
-    )
+    g1_tdm_type = KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE
     stage_configs = [
         (0, g1_tdm_type, KV_K, blk, 1),
         (1, g1_tdm_type, KV_K, blk, 2),
@@ -2984,10 +3128,7 @@ def fmha_pipeline_ctx(
             stage_closures.append(mk_rescale())
         o_rescale_by_stage.append(stage_closures)
 
-    for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in enumerate(
-        stage_configs
-    ):
-
+    for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in enumerate(stage_configs):
         n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
         kv_tiles_next_raw = [[None] * n_lds for _ in range(NUM_MSB)]
 
@@ -3023,9 +3164,7 @@ def fmha_pipeline_ctx(
             o_rescale_ops=stage_o_rescale,
         )
 
-        su_sp_tiles_list.append(
-            [[sp_tiles[msb][0]] for msb in range(NUM_MSB)]
-        )
+        su_sp_tiles_list.append([[sp_tiles[msb][0]] for msb in range(NUM_MSB)])
 
         if const_expr(l_type == KV_K):
             kv_tiles = Fragment.pair_k_tiles(kv_tiles_next_raw, ty)
@@ -3104,14 +3243,21 @@ def fmha_pipeline_ctx(
                 fx.Int32,
             )
         v_addr = compute_global_addr(
-            ptr_V, tdm_v_offset, wave_id, 8 * stride_v_seq,
+            ptr_V,
+            tdm_v_offset,
+            wave_id,
+            8 * stride_v_seq,
         )
         v_stride_adv = fx.Int64(stride_v_32)
         _v_warp_off = wave_id * (8 * V_ROW_BYTES)
         _v_lds_base = tdm_v_target + _v_warp_off
         v_descs = TDM.build_descs(
-            v_dg1, v_addr, v_stride_adv,
-            _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU,
+            v_dg1,
+            v_addr,
+            v_stride_adv,
+            _v_lds_base,
+            LDS_V_SU_P_SIZE,
+            CNT_SU,
         )
         tdm_state["v_descs"] = v_descs
         tdm_state["v_desc_idx"] = 0
@@ -3131,7 +3277,6 @@ def fmha_pipeline_ctx(
         t_type,
         barrier,
     ) in enumerate(g2_stage_configs):
-
         p_tiles_su = p_tiles_computed[g_su]
 
         n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
@@ -3139,9 +3284,7 @@ def fmha_pipeline_ctx(
 
         if const_expr(l_type == KV_K):
             g2_addrs = (
-                kv_lds_addrs_next
-                if kv_lds_addrs_next is not None
-                else kv_lds_addrs
+                kv_lds_addrs_next if kv_lds_addrs_next is not None else kv_lds_addrs
             )
         else:
             g2_addrs = kv_lds_addrs
@@ -3164,9 +3307,7 @@ def fmha_pipeline_ctx(
             tdm_state=tdm_state,
             tdm_type=t_type,
             tdm_barrier=barrier,
-            o_rescale_exp_delta=(
-                o_rescale_exp_delta if stage_idx == 0 else None
-            ),
+            o_rescale_exp_delta=(o_rescale_exp_delta if stage_idx == 0 else None),
         )
 
         if const_expr(l_type == KV_V):
@@ -3232,17 +3373,13 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         o_tiles.append(row)
 
     ia_old_max = [
-        set_vgpr_bank(iter_args[16 + i], i)
-        for i in fx.range_constexpr(NUM_MSB)
+        set_vgpr_bank(iter_args[16 + i], i) for i in fx.range_constexpr(NUM_MSB)
     ]
     ia_row_sums = [
-        set_vgpr_bank(iter_args[20 + i], i)
-        for i in fx.range_constexpr(NUM_MSB)
+        set_vgpr_bank(iter_args[20 + i], i) for i in fx.range_constexpr(NUM_MSB)
     ]
 
-    kv_tiles_flat = [
-        iter_args[24 + i] for i in fx.range_constexpr(_KV_SIZE)
-    ]
+    kv_tiles_flat = [iter_args[24 + i] for i in fx.range_constexpr(_KV_SIZE)]
     kv_tiles = []
     for msb in fx.range_constexpr(NUM_MSB):
         row = []
@@ -3256,13 +3393,10 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         for i in fx.range_constexpr(NUM_MSB)
     ]
     ia_delta = [
-        set_vgpr_bank(iter_args[_OFF_DELTA + i], i)
-        for i in fx.range_constexpr(NUM_MSB)
+        set_vgpr_bank(iter_args[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)
     ]
 
-    ia_sp_flat = [
-        iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)
-    ]
+    ia_sp_flat = [iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)]
     prev_su_sp_tiles = []
     for su in fx.range_constexpr(CNT_SU):
         msb_list = []
@@ -3290,15 +3424,12 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     )
 
     # Unpack partial_sp_pairs: reconstruct v2f32 from separate lo+hi f32 scalars
-    ia_partial_sp_lo = [
-        iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
-    ]
+    ia_partial_sp_lo = [iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)]
     ia_partial_sp_hi = [
         iter_args[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
     ]
     ia_exp_delta = [
-        set_vgpr_bank(iter_args[_OFF_PED + i], i)
-        for i in fx.range_constexpr(NUM_MSB)
+        set_vgpr_bank(iter_args[_OFF_PED + i], i) for i in fx.range_constexpr(NUM_MSB)
     ]
 
     ia_partial_sp_pairs = []
@@ -3319,7 +3450,10 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
 
     softmax_state = make_softmax_state(
-        ia_old_max, ia_local_max, ia_delta, ia_row_sums,
+        ia_old_max,
+        ia_local_max,
+        ia_delta,
+        ia_row_sums,
         sp_pairs_prev=ia_partial_sp_pairs,
     )
 
@@ -3353,13 +3487,20 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
 
     loop_v_remain = actual_kv_len - tile_idx_i32 * tile_n_const
     loop_v_oob_dg1 = TDM.build_oob_dg1_list(
-        _loop_V_CFG_OOB, 128, _loop_stride_v_elems,
-        loop_v_remain, wave_id,
+        _loop_V_CFG_OOB,
+        128,
+        _loop_stride_v_elems,
+        loop_v_remain,
+        wave_id,
     )
     loop_k_remain = actual_kv_len - next_tile * tile_n_const
     loop_k_oob_dg1 = TDM.build_oob_dg1_list(
-        _loop_K_CFG_OOB, QK_HDIM, _loop_stride_k_elems,
-        loop_k_remain, wave_id, dim0_stride=200,
+        _loop_K_CFG_OOB,
+        QK_HDIM,
+        _loop_stride_k_elems,
+        loop_k_remain,
+        wave_id,
+        dim0_stride=200,
     )
 
     # Core fmha_pipeline call
@@ -3402,24 +3543,16 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         for n in fx.range_constexpr(N_PV_WMMA_N):
             new_o.append(o_tiles[d][n])
 
-    new_max = [
-        softmax_state["old_max"][i] for i in fx.range_constexpr(NUM_MSB)
-    ]
-    new_sums = [
-        softmax_state["row_sums"][i] for i in fx.range_constexpr(NUM_MSB)
-    ]
+    new_max = [softmax_state["old_max"][i] for i in fx.range_constexpr(NUM_MSB)]
+    new_sums = [softmax_state["row_sums"][i] for i in fx.range_constexpr(NUM_MSB)]
 
     kv_out_flat = []
     for msb in fx.range_constexpr(NUM_MSB):
         for k in fx.range_constexpr(N_WMMA_K_TILES):
             kv_out_flat.append(kv_out[msb][k])
 
-    new_local_max = [
-        softmax_state["local_max"][i] for i in fx.range_constexpr(NUM_MSB)
-    ]
-    new_delta = [
-        softmax_state["delta"][i] for i in fx.range_constexpr(NUM_MSB)
-    ]
+    new_local_max = [softmax_state["local_max"][i] for i in fx.range_constexpr(NUM_MSB)]
+    new_delta = [softmax_state["delta"][i] for i in fx.range_constexpr(NUM_MSB)]
 
     sp_out_flat = []
     for su in fx.range_constexpr(CNT_SU):
@@ -3434,9 +3567,7 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     ]
 
     new_partial_sp_flat = partial_sp_lo_out + partial_sp_hi_out
-    new_exp_delta = [
-        partial_ed_out[m] for m in fx.range_constexpr(NUM_MSB)
-    ]
+    new_exp_delta = [partial_ed_out[m] for m in fx.range_constexpr(NUM_MSB)]
 
     return (
         new_o
@@ -3486,7 +3617,10 @@ def _ep_finish(
     stride_v_seq = ctx["stride_v_seq"]
 
     sfx = make_softmax_state(
-        old_max_in, local_max_in, delta_in, row_sums_in,
+        old_max_in,
+        local_max_in,
+        delta_in,
+        row_sums_in,
         sp_pairs_prev=sp_pairs_in,
     )
 
@@ -3623,11 +3757,7 @@ def _ep_finish(
     loff = llo * TDM_D_TILE_DIM0 + lhi * 16
     for msb in fx.range_constexpr(NUM_MSB):
         for n in fx.range_constexpr(N_PV_WMMA_N):
-            ioff = (
-                (msb // 2) * 16 * TDM_D_TILE_DIM0
-                + (msb % 2) * 128
-                + n * 32
-            )
+            ioff = (msb // 2) * 16 * TDM_D_TILE_DIM0 + (msb % 2) * 128 + n * 32
             la = dw + loff + ioff
             llvm_dialect.store(
                 fx.vector.bitcast(v4i32t, obf16[msb][n]),
@@ -3648,7 +3778,8 @@ def _ep_finish(
     alo, ahi = split_i64_to_lo_hi(oadr64)
     olds2 = extract_lds_base_i32(lds_alloc_v_a.get_base()) + wsgpr * LDS_D_WV_SIZE
     _dg0 = Vec.from_elements(
-        [fx.Int32(1), olds2, alo, ahi], fx.Int32,
+        [fx.Int32(1), olds2, alo, ahi],
+        fx.Int32,
     )
     _g0 = fx.Int32((1 << 16) | 0)
     _g1 = fx.Int32((128 & 0xFFFF) << 16)
@@ -3664,7 +3795,8 @@ def _ep_finish(
     _g6 = fx.Int32(0)
     _g7 = fx.Int32(0)
     _dg1 = Vec.from_elements(
-        [_g0, _g1, _g2, _g3, _g4, _g5, _g6, _g7], fx.Int32,
+        [_g0, _g1, _g2, _g3, _g4, _g5, _g6, _g7],
+        fx.Int32,
     )
     tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
     tdm_ops.tensor_wait(0)
