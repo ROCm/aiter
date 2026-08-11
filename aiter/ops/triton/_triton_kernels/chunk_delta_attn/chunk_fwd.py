@@ -15,15 +15,25 @@ Pipeline:
 
 import torch
 
-from ..gated_delta_rule.prefill.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .gate import beta_sigmoid_fwd
-from .gla_output import chunk_gla_fwd_o
-from .intra_attn import chunk_delta_attn_fwd_intra
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     RCP_LN2,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.gla_output import (
+    chunk_gla_fwd_o,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.intra_attn import (
+    chunk_delta_attn_fwd_intra,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
-    l2norm_fwd,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
 )
 
 
@@ -125,7 +135,9 @@ def chunk_delta_attn_fwd(
             lower_bound=lower_bound,
         )
     else:
-        from ..gated_delta_rule.utils import chunk_local_cumsum
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+            chunk_local_cumsum,
+        )
 
         g_cumsum = chunk_local_cumsum(
             g=g,
