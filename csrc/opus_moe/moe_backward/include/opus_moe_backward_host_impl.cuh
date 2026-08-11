@@ -203,8 +203,11 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         return requested_kernel_id;
 
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr uint64_t single_expert_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 3;
     constexpr int cohort4_direct_lds_kid = 5;
+    constexpr int cohort1_direct_lds_kid = 6;
+    constexpr int cohort2_direct_lds_kid = 7;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -213,8 +216,20 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     const uint64_t source_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         source_row_elements * sizeof(hip_bfloat16);
-    return source_bytes > l2_friendly_bytes ? cohort4_direct_lds_kid
-                                             : legacy_kid;
+    if(source_bytes <= l2_friendly_bytes)
+        return legacy_kid;
+    // Once the combined gathered-dO/a_scaled working set is much larger
+    // than L2, finish one expert at a time to minimize source reuse distance.
+    if(source_bytes > single_expert_bytes)
+        return cohort1_direct_lds_kid;
+    // In the medium regime retain the largest bounded cohort that does not
+    // pad the expert grid.  Empty expert CTAs are otherwise material at these
+    // shorter runtimes (for example E=10/14 versus E=12/16).
+    if(kargs.route.num_experts % 4 == 0)
+        return cohort4_direct_lds_kid;
+    if(kargs.route.num_experts % 2 == 0)
+        return cohort2_direct_lds_kid;
+    return cohort1_direct_lds_kid;
 }
 
 } // namespace detail

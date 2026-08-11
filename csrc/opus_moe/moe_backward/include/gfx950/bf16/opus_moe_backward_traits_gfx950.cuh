@@ -347,6 +347,18 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
+struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort1DirectLds
+    : Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
+{
+    static constexpr int EXPERT_COHORT = 1;
+};
+
+struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort2DirectLds
+    : Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
+{
+    static constexpr int EXPERT_COHORT = 2;
+};
+
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled
     : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
 {
