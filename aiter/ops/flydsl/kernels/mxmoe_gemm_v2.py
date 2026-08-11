@@ -225,7 +225,6 @@ def gemm2_body_v2(
     has_pad=False,
     SBM=None,
     mn_idx=None,
-    g2_kstages=2,
     g2_bhoist=True,
     g2_ascale_pf=True,
     g2_bf16_lds=False,
@@ -234,9 +233,8 @@ def gemm2_body_v2(
     g2_out_pitch_align=0,
     g2_scale_blk=8,
 ):
-    # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
-    if g2_kstages not in (1, 2):
-        raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
+    # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
+    # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     # SBM (sort padding unit) >= BM (compute tile); SBM==BM default byte-identical.
     if SBM is None:
         SBM = BM
@@ -467,12 +465,6 @@ def gemm2_body_v2(
     def make_scale_fragments(count):
         return [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(count)]
 
-    def stream_b_tile(kt_rt):
-        bqf = make_bq_fragments()
-        bsf = make_scale_fragments(nPairs)
-        issue_b_load_into(bqf, bsf, kt_rt)
-        return bqf, bsf
-
     def shift_scale_word(scale, kt_rt):
         if const_expr(tilesPerScaleChunk == 1):
             return scale
@@ -612,26 +604,6 @@ def gemm2_body_v2(
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
-    elif const_expr(g2_kstages == 1):
-        # 1-deep pipe: synchronous B load per K-tile.
-        for kt_iv, state in range(
-            fx.Int32(0),
-            K_TILES_RT,
-            fx.Int32(1),
-            init=init_c_carry(),
-        ):
-            store_c_carry(state)
-            kt_rt = fx.Int32(kt_iv)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
-            nxt = kt_rt + fx.Int32(kStages)
-            if nxt < K_TILES_RT:
-                issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
-            bqf, bsf = stream_b_tile(kt_rt)
-            sa = load_a_scale_tile(kt_rt)
-            mfma_cluster(bqf, bsf, sa, kt_rt)
-            results = yield load_c_carry()
-        store_c_carry(results)
     else:
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = make_bq_fragments()
