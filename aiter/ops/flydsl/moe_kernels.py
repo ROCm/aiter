@@ -521,7 +521,13 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
 
 
 def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
-    """Return {kernelName: params} for all supported int4_bf16 stage2 configs."""
+    """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage2 configs.
+
+    ``b_nt`` is registered explicitly (as ``get_flydsl_stage2_kernels`` does for fp4).
+    This registry is the only thing the runtime wrapper and the AOT precompile share,
+    so a key it omits is one the two sides default independently -- and ``b_nt`` is
+    baked into the gemm2 kernel name, so disagreeing there is a run-only cache miss.
+    """
     kernels = {}
     a_dtype = "bf16"
     b_dtype = "int4"
@@ -549,6 +555,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                         "mode": mode,
                         "MPerBlock": tm,
                         "in_dtype": "int4_bf16",
+                        "b_nt": 0,
                     }
                     kernels[base_name] = base_params
                     kernels[base_name + "_persist"] = {
