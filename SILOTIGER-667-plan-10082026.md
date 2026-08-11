@@ -351,6 +351,8 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
 - [ ] Extend the op_test arch guard to exercise the scalar path where available.
 
 ### Phase D — Occupancy levers: split-K + LDS (G5, G6)  [ ]
+> **Split-K (G5) is tracked in its own sub-plan:**
+> [`SILOTIGER-667-plan-Split-K.md`](./SILOTIGER-667-plan-Split-K.md) (steps + status).
 - [ ] **Split-K** (`k_batch`) on down (split INTER) and gate_up (split HIDDEN), triggered
       only when `grid * k_batch <= CuCount` (under-occupied: Qwen short-INTER, low B).
       Atomic-add epilogue into a **zeroed** buffer, with **zero-init folded** into the
