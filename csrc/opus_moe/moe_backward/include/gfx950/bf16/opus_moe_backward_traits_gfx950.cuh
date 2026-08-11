@@ -92,6 +92,7 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     // a small route cohort: route tiles remain fastest within each N tile so
     // they share W1, while dZ is revisited after only one cohort.
     static constexpr int ROUTE_COHORT_TILES = 0;
+    static constexpr int ROUTE_M_TILES = 2;
     static constexpr int ROUTE_M = 32;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -146,6 +147,13 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
     static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
     static constexpr int SMEM_B_BYTES =
         SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+};
+
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM3Cohort6
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
+{
+    static constexpr int ROUTE_COHORT_TILES = 6;
+    static constexpr int ROUTE_M_TILES = 3;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128

@@ -109,7 +109,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     constexpr int BK = T::B_K;
     constexpr int CTA_M = RouteTiles * BM;
     constexpr bool fixed_shape = FixedD > 0;
-    static_assert(RouteTiles == 1 || RouteTiles == 2);
+    static_assert(RouteTiles >= 1 && RouteTiles <= 3);
+    static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));
     static_assert(!fixed_shape || (FixedD % BN == 0 && 2 * FixedI % BK == 0));
@@ -156,19 +157,18 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     if(expert_id < 0 || expert_id >= kargs.route.num_experts)
         return;
     int expert_end_row = valid_rows;
-    if constexpr(RouteTiles == 2)
+    if constexpr(RouteTiles > 1)
     {
         if(kargs.route.expert_offsets == nullptr)
             return;
         const int expert_first_tile =
             kargs.route.expert_offsets[expert_id] / BM;
-        if((route_tile - expert_first_tile) & 1)
+        if((route_tile - expert_first_tile) % RouteTiles != 0)
             return;
-        // An expert may own an odd number of padded BM tiles.  In that case
-        // this CTA still computes two accumulator groups, but the second one
-        // must not publish rows belonging to the following expert.  Keeping
-        // the tail masked avoids a separate single-M launch and preserves the
-        // shared W1 load for every complete pair.
+        // An expert may own a non-multiple of RouteTiles padded BM tiles.  The
+        // final CTA keeps all accumulator groups but does not publish rows of
+        // the following expert.  This avoids a separate tail launch while
+        // preserving one shared W1 load for each complete route group.
         expert_end_row = kargs.route.expert_offsets[expert_id + 1];
     }
     const int tid = static_cast<int>(thread_id_x());
@@ -269,29 +269,32 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
         }
         else
         {
-            static_assert(a_vectors % T::BLOCK_SIZE == 0);
+            static_assert(a_vectors % opus::get_warp_size() == 0);
             constexpr int a_loads_per_thread =
-                a_vectors / T::BLOCK_SIZE;
+                (a_vectors + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
             opus::static_for<a_loads_per_thread>([&](auto load) {
                 const int a_vector =
                     load.value * T::BLOCK_SIZE + tid;
-                const int a_element = a_vector * T::VEC_A;
-                const int local_m = a_element / BK;
-                const int local_k = a_element % BK;
-                const int sorted_row = route_base + local_m;
-                const int source_base = static_cast<int32_t>(
-                    static_cast<int64_t>(sorted_row) * stride_dz_r);
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    a_lds +
-                    (load.value * T::BLOCK_SIZE +
-                     wave_id * opus::get_warp_size()) *
-                        T::VEC_A;
-                g_a.template _async_load<T::VEC_A>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (source_base + tile_k * BK + local_k) * sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
+                if(a_vector < a_vectors)
+                {
+                    const int a_element = a_vector * T::VEC_A;
+                    const int local_m = a_element / BK;
+                    const int local_k = a_element % BK;
+                    const int sorted_row = route_base + local_m;
+                    const int source_base = static_cast<int32_t>(
+                        static_cast<int64_t>(sorted_row) * stride_dz_r);
+                    OPUS_LDS_ADDR D_A* a_wave_dst =
+                        a_lds +
+                        (load.value * T::BLOCK_SIZE +
+                         wave_id * opus::get_warp_size()) *
+                            T::VEC_A;
+                    g_a.template _async_load<T::VEC_A>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                        (source_base + tile_k * BK + local_k) * sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                }
             });
         }
 
@@ -503,13 +506,14 @@ inline void route_dx_launch_gfx950(const RouteDxKargs& kargs,
         kargs.stride_w1_e == 2 * target_i * target_d &&
         kargs.stride_w1_i == target_d &&
         kargs.stride_dx_route_r == target_d;
+    constexpr int route_tiles = T::ROUTE_M_TILES;
     if(use_target_shape)
     {
         if(kargs.route.expert_offsets != nullptr)
         {
             hipLaunchKernelGGL(
                 (route_dx_kernel_gfx950<
-                    T, target_d, target_i, target_topk, 2>),
+                    T, target_d, target_i, target_topk, route_tiles>),
                 grid,
                 dim3(T::BLOCK_SIZE),
                 0,
@@ -531,12 +535,13 @@ inline void route_dx_launch_gfx950(const RouteDxKargs& kargs,
     else if constexpr(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor)
     {
         if(kargs.route.expert_offsets != nullptr)
-            hipLaunchKernelGGL((route_dx_kernel_gfx950<T, 0, 0, 0, 2>),
-                               grid,
-                               dim3(T::BLOCK_SIZE),
-                               0,
-                               stream,
-                               kargs);
+            hipLaunchKernelGGL(
+                (route_dx_kernel_gfx950<T, 0, 0, 0, route_tiles>),
+                grid,
+                dim3(T::BLOCK_SIZE),
+                0,
+                stream,
+                kargs);
         else
             hipLaunchKernelGGL((route_dx_kernel_gfx950<T>),
                                grid,
