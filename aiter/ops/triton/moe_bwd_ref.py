@@ -252,7 +252,8 @@ def _moe_ref_forward_impl(ctx, x, w1, w2, router_logits, topk, act_type, dgrad,
 
 def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
                            dx_scatter=None, router_bwd=None,
-                           dgrad_actbwd=None):
+                           dgrad_actbwd=None, stage2_wgrad_start=None,
+                           stage2_wgrad_finish=None):
     (x_g, w1, w2, act_input, h, y, p_sorted, x_gather_idx, order, lens,
      topk_ids, topk_w) = ctx.saved_tensors
     T, H, E, _I, topk = ctx.dims
@@ -267,6 +268,10 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
         dy = (dout_routes.float() * p_sorted.float()[:, None]).to(dtype)
         dp_sorted = (dout_routes.float() * y.float()).sum(-1)      # [M]
 
+    dW2_handle = None
+    if stage2_wgrad_start is not None:
+        dW2_handle = stage2_wgrad_start(dy, h, lens)
+
     # stage2 dgrad + activation bwd. Optimized backends may fuse these while
     # the reference and ragged-route paths retain the two-call implementation.
     if dgrad_actbwd is not None:
@@ -275,7 +280,8 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
         dh = dgrad(dy, w2, lens)                                  # [M,I] = dy @ W2
         d_act = actbwd(dh, act_input, act_type)                    # [M,2I]
 
-    dW2 = wgrad(dy, h, lens)                                      # [E,H,I]
+    if dW2_handle is None:
+        dW2 = wgrad(dy, h, lens)                                  # [E,H,I]
 
     # stage1
     dA_route = dgrad(d_act, w1, lens)                             # [M,H] = d_act @ W1
@@ -301,6 +307,9 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
         dlogits = torch.zeros(T, E, device=dout.device, dtype=torch.float32)
         dlogits.scatter_(1, topk_ids.to(torch.int64), dtopk_vals)
         dlogits = dlogits.to(dtype)
+
+    if dW2_handle is not None:
+        dW2 = stage2_wgrad_finish(dW2_handle)
 
     return dx, dW1, dW2, dlogits, None, None
 

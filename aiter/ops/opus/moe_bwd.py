@@ -540,6 +540,9 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.w1t = w1.transpose(1, 2).contiguous()
         ctx.w2t = w2.transpose(1, 2).contiguous()
         ctx.w2_ref = w2
+        ctx.wgrad_stream = torch.cuda.Stream(device=x.device)
+        ctx.wgrad_ready = torch.cuda.Event()
+        ctx.wgrad_done = torch.cuda.Event()
         return out
 
     @staticmethod
@@ -583,11 +586,28 @@ class OpusMoERefFunc(torch.autograd.Function):
                 dy_op, a_op, offs, offs.numel() - 1, ctx.uniform_m or 0
             )
 
+        def stage2_wgrad_start(dy_op, a_op, lens):
+            current = torch.cuda.current_stream(dy_op.device)
+            ctx.wgrad_ready.record(current)
+            ctx.wgrad_stream.wait_event(ctx.wgrad_ready)
+            with torch.cuda.stream(ctx.wgrad_stream):
+                out = wgrad_prepared(dy_op, a_op, lens)
+                ctx.wgrad_done.record(ctx.wgrad_stream)
+            return out
+
+        def stage2_wgrad_finish(out):
+            current = torch.cuda.current_stream(out.device)
+            current.wait_event(ctx.wgrad_done)
+            out.record_stream(current)
+            return out
+
         return _moe_ref_backward_impl(
             ctx, dout, dgrad_prepared, wgrad_prepared, _opus_actbwd,
             combine_bwd=opus_moe_combine_bwd_bf16, dx_scatter=dx_gather_sum,
             router_bwd=opus_moe_router_bwd_bf16,
-            dgrad_actbwd=dgrad_actbwd_prepared)
+            dgrad_actbwd=dgrad_actbwd_prepared,
+            stage2_wgrad_start=stage2_wgrad_start,
+            stage2_wgrad_finish=stage2_wgrad_finish)
 
 
 def opus_moe_ref(x, w1, w2, router_logits, topk, act_type="Silu"):
