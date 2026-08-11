@@ -117,6 +117,117 @@ PRESET_SHAPES: list[tuple] = [
     # Control for dispatch order: identical length multiset to shape 20, but the
     # long sequence is last. Only affects shapes whose grid exceeds the CU count.
     ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    # -- chiplet-remap partial-grid stress cases ---------------------------
+    # grid_nh = N*H is NOT a multiple of nXCD=8, so the XCD remap co-locates
+    # each head's V-tiles only for the full nXCD*GRID_V cycles; the tail passes
+    # through as the round-robin identity. These verify the partial case still
+    # benefits (majority of heads co-located) and never regresses (tail == base).
+    # H=4 (real Qwen3-Next TP8 head count); N chosen to break divisibility.
+    ("gdn_q3n_rmp",  4,  2,  8192, 1, 128, 128, 64, "g", "equal"),  # grid_nh=4  (<nXCD: identity)
+    ("gdn_q3n_rmp",  4,  2,  8192, 3, 128, 128, 64, "g", "equal"),  # grid_nh=12 (67% clean)
+    ("gdn_q3n_rmp",  4,  2,  8192, 5, 128, 128, 64, "g", "equal"),  # grid_nh=20 (80% clean)
+    ("gdn_q3n_rmp",  4,  2,  8192, 7, 128, 128, 64, "g", "equal"),  # grid_nh=28 (86% clean)
+    # -- variant-autoselect gap-fill sweep ---------------------------------
+    # Signatures the tuned table (gate,H,N-bucket,is_varlen) did not yet cover.
+    # skew / skew_last share a SELECTION signature with equal (seq_pattern is
+    # invisible to the selector); they are here only to pick the robust variant
+    # for the varlen KDA groups. Each new signature runs at T=8192 AND 32768 to
+    # confirm the table's T-invariance holds for these (previously untested) groups.
+    # Tier 1: interior N-bucket fills for gate+H already in the table.
+    ("kda_tp4_g",   24, 24,  8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g",   24, 24, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("gdn_h8_g",     8,  4,  8192, 1, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4,  8192, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4,  8192, 8, 128, 128, 64, "g",  "skew"),
+    ("gdn_h8_g",     8,  4, 32768, 1, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4, 32768, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4, 32768, 8, 128, 128, 64, "g",  "skew"),
+    ("gdn_h16_g",   16, 16,  8192, 4, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16,  8192, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16,  8192, 8, 128, 128, 64, "g",  "skew"),
+    ("gdn_h16_g",   16, 16, 32768, 4, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768, 8, 128, 128, 64, "g",  "skew"),
+    ("gdn_h32_g",   32,  8,  8192, 4, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192, 8, 128, 128, 64, "g",  "skew"),
+    ("gdn_h32_g",   32,  8, 32768, 4, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768, 8, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768, 8, 128, 128, 64, "g",  "skew"),
+    # Tier 2: KDA TP2 (H48) and TP1 (H96), all N-buckets, both T.
+    ("kda_tp2",     48, 48,  8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2",     48, 48, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1",     96, 96,  8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1",     96, 96, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    # -- N-bucket disambiguation (equal only) ------------------------------
+    # The auto-selector buckets N as {1, <=4, >=5}, and the >=5 bucket for these
+    # (gate,H) groups is currently anchored only at N=8. The scalar-g equal optimum
+    # tracks the H*N grid-size product (H*N~32->bv16, ~64->bv32, >=128->bv64w8), so
+    # the >=5 bucket may not be flat. These probe N inside the bucket (6,12,16) and
+    # the <=4 / >=5 boundary (N=2) to confirm the bucketing or justify a finer split.
+    # Skew omitted -- undetectable at selection time, so it can't inform the key.
+    ("gdn_h16_g",   16, 16,  8192,  2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16,  8192,  6, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16,  8192, 12, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16,  8192, 16, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768,  2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768,  6, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768, 12, 128, 128, 64, "g",  "equal"),
+    ("gdn_h16_g",   16, 16, 32768, 16, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192,  2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192,  6, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192, 12, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8,  8192, 16, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768,  2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768,  6, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768, 12, 128, 128, 64, "g",  "equal"),
+    ("gdn_h32_g",   32,  8, 32768, 16, 128, 128, 64, "g",  "equal"),
+    ("kda_tp4_g",   24, 24,  8192,  6, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g",   24, 24,  8192, 16, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g",   24, 24, 32768,  6, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g",   24, 24, 32768, 16, 128, 128, 64, "gk", "equal"),
+    # -- N=2 boundary coverage (equal only) --------------------------------
+    # The <=4 N-bucket is not flat: N=2 halves the grid and drops the optimal tile
+    # one regime below N=4 (measured: g H16 N2->bv16 vs N4->bv32; g H32 N2->bv32 vs
+    # N4->bv64w8). N=2 was previously measured only for g H16/H32; these add it for
+    # the remaining (gate,H) groups so a <=2 sub-bucket can be populated with data
+    # rather than extrapolation.
+    ("gdn_q3n_tp8",  4,  2,  8192, 2, 128, 128, 64, "g",  "equal"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4,  8192, 2, 128, 128, 64, "g",  "equal"),
+    ("gdn_h8_g",     8,  4, 32768, 2, 128, 128, 64, "g",  "equal"),
+    ("kda_tp8",     12, 12,  8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8",     12, 12, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4",     24, 24,  8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4",     24, 24, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48,  8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2",     48, 48, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96,  8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1",     96, 96, 32768, 2, 128, 128, 64, "gk", "equal"),
 ]
 
 _BENCH_TITLE = "GDN K5 inter-chunk state scan"
@@ -277,7 +388,13 @@ def _auto_variant_for_shape(shape, cu) -> str | None:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
 
         return _auto_variant(
-            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=cu is not None
+            H=H,
+            Hg=Hg,
+            V=V,
+            T_flat=T_flat,
+            N=N,
+            is_varlen=cu is not None,
+            gate=_gate,
         )
     except Exception:
         return None
@@ -714,12 +831,22 @@ def run(args):
 
     cfg = make_measure_config(args)
 
+    n_shapes = len(PRESET_SHAPES)
     if args.shape_index is not None:
         idx = args.shape_index
-        if not (1 <= idx <= len(PRESET_SHAPES)):
-            print(f"--shape-index must be 1–{len(PRESET_SHAPES)}", file=sys.stderr)
+        if not (1 <= idx <= n_shapes):
+            print(f"--shape-index must be 1–{n_shapes}", file=sys.stderr)
             sys.exit(1)
         shapes_to_run = [(idx, PRESET_SHAPES[idx - 1])]
+    elif getattr(args, "shape_range", None) is not None:
+        lo, hi = args.shape_range
+        if not (1 <= lo <= hi <= n_shapes):
+            print(
+                f"--shape-range must satisfy 1 <= START <= END <= {n_shapes}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        shapes_to_run = [(i, PRESET_SHAPES[i - 1]) for i in range(lo, hi + 1)]
     else:
         gate_filter = getattr(args, "gate", "all")
         shapes_to_run = [
@@ -763,10 +890,29 @@ def main():
         description="A/B benchmark: GDN K5 inter-chunk state scan (SILOTIGER-859)."
     )
 
+    def _shape_range(s: str) -> tuple[int, int]:
+        """Parse ``START-END`` (1-based, inclusive) or a single ``N`` into (lo, hi)."""
+        parts = s.split("-")
+        try:
+            if len(parts) == 1:
+                v = int(parts[0]); return (v, v)
+            if len(parts) == 2:
+                return (int(parts[0]), int(parts[1]))
+        except ValueError:
+            pass
+        raise argparse.ArgumentTypeError(
+            f"--shape-range expects 'START-END' or 'N' (1-based); got {s!r}"
+        )
+
     shape_grp = parser.add_mutually_exclusive_group()
     shape_grp.add_argument(
         "--shape-index", type=int, default=None, metavar="N",
         help="Run one preset shape by 1-based index (see --list).",
+    )
+    shape_grp.add_argument(
+        "--shape-range", type=_shape_range, default=None, metavar="START-END",
+        help="Run a 1-based inclusive range of preset shapes, e.g. '96-103' "
+             "(or a single 'N'). Useful for benchmarking only newly-added shapes.",
     )
     shape_grp.add_argument(
         "--list", action="store_true",

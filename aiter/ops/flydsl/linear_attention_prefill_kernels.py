@@ -33,9 +33,25 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
 from flydsl.runtime.device import get_rocm_arch as _get_rocm_arch
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.chunk_gated_delta_h_gfx942 import compile_chunk_gated_delta_h_gfx942
+from .kernels.chunk_gated_delta_h_gfx942 import (
+    compile_chunk_gated_delta_h_gfx942,
+    select_variant as _gfx942_select_variant,
+)
 
 from .kernels.tensor_shim import _run_compiled
+
+# Arch-agnostic K5 variant tag grammar + legality (shared with the gfx942 kernel
+# module -- kept in its own module to avoid an import cycle). Re-exported here so
+# existing callers (bench, AOT, tests) keep importing them from this wrapper.
+from .kernels.k5_variants import (  # noqa: F401  (re-exported)
+    _BV_CANDIDATES,
+    _DEFAULT_BV,
+    _bv_of_variant,
+    _bv_waves_of_variant,
+    _legal_bv_candidates,
+    K5_DEFAULT_VARIANT,
+    K5_VARIANTS,
+)
 
 # Arch detected once at import time; used by _get_or_compile to select the
 # right compile backend.
@@ -54,12 +70,11 @@ __all__ = [
 # -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
 
 _compiled_kernels = {}
-_BV_CANDIDATES = [16, 32, 64]
-_DEFAULT_BV = 16
 
 
-def _legal_bv_candidates(V: int) -> list[int]:
-    return [c for c in _BV_CANDIDATES if c <= V and V % c == 0]
+def _gate_of(use_g: bool, use_gk: bool) -> str:
+    """Gate rank as used by the tuned table ("gk" dominates when both set)."""
+    return "gk" if use_gk else "g"
 
 
 def _grid_ctas(*, H: int, V: int, N: int, BV: int) -> int:
@@ -94,70 +109,38 @@ def _device_cu_count() -> int:
 _GFX942_MIN_FILL = 0.37
 
 
-# -- Kernel variants -----------------------------------------------------
-# BV (the V-tile width) is the only compile-time tuning axis for K5: BT=64 is
-# fixed by the K1-K3 pipeline that produces w/u, and everything else is derived.
-# So a variant tag is just the tile size. ``auto`` is not a registered tag --
-# it is the sentinel meaning "defer to _heuristic_bv for this shape".
-#
-# A second axis was added on gfx942: ``w<N>`` = the number of waves in the
-# workgroup. The default (4) is the historical kernel. Wider workgroups split
-# the N_REPEAT (V) axis across waves, which multiplies RESIDENT waves per CU --
-# LDS pins gfx942 to one workgroup per CU, so a 4-wave block is 1 wave/SIMD and
-# cannot hide HBM latency. See docs/gdn_k5_algorithmic_comparison.md §9.
-# ``bv32`` is shorthand for ``bv32w4``.
-_WAVE_CANDIDATES = (4, 8, 16)
-K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES) + tuple(
-    f"bv{b}w{w}"
-    for b in _BV_CANDIDATES
-    for w in _WAVE_CANDIDATES
-    # NR_SPLIT = w/4 must divide N_REPEAT = b/16
-    if w > 4 and (b // 16) % (w // 4) == 0
-)
-K5_DEFAULT_VARIANT = "auto"
+# The env override for the variant selector (host-wrapper concern; the tag
+# grammar itself lives in kernels/k5_variants.py).
 _K5_VARIANT_ENV = "FLYDSL_GDN_K5_VARIANT"
 
 
-def _bv_of_variant(tag: str) -> int:
-    """``"bv64"`` -> ``64``, ``"bv64w16"`` -> ``64``."""
-    return _bv_waves_of_variant(tag)[0]
-
-
-def _bv_waves_of_variant(tag: str) -> tuple[int, int]:
-    """``"bv64w16"`` -> ``(64, 16)``; ``"bv32"`` -> ``(32, 4)``.
-
-    Raises ValueError on an unknown tag.
-    """
-    if tag not in K5_VARIANTS:
-        raise ValueError(
-            f"unknown GDN K5 variant {tag!r}; available: {list(K5_VARIANTS)} "
-            f"(or {K5_DEFAULT_VARIANT!r} for shape-adaptive selection)"
-        )
-    body = tag[2:]
-    if "w" in body:
-        bv_s, w_s = body.split("w")
-        return int(bv_s), int(w_s)
-    return int(body), 4
-
-
-def _auto_variant(**kw) -> str:
+def _auto_variant(*, gate: str | None = None, **kw) -> str:
     """The shape-adaptive choice, as a variant tag.
 
-    Thin wrapper over ``_heuristic_bv`` so the heuristic stays the single source
-    of truth -- callers that want to *display* what auto picked (the benchmark)
-    and callers that want to *use* it go through the same code path.
+    Arch dispatcher: on gfx942 with a known gate rank, defer to the gfx942 kernel
+    module's measured tuned table (``select_variant``) -- the only path that emits
+    wave-widened tags and corrects the scalar-gate BV bias. On a table miss (or any
+    other arch, or ``gate`` unknown) fall back to ``_heuristic_bv``, the cross-arch
+    grid-fill heuristic. ``gate`` defaults to None so callers that do not supply it
+    transparently keep the historical behaviour.
     """
+    if _ARCH == "gfx942" and gate is not None:
+        tuned = _gfx942_select_variant(
+            gate=gate, H=kw["H"], N=kw["N"], V=kw["V"], is_varlen=kw["is_varlen"]
+        )
+        if tuned is not None:
+            return tuned
     return f"bv{_heuristic_bv(**kw)}"
 
 
-def _resolve_variant(variant: str | None, **kw) -> str:
+def _resolve_variant(variant: str | None, *, gate: str | None = None, **kw) -> str:
     """Effective variant tag: explicit arg > env var > shape-adaptive.
 
     Mirrors the resolution chain used by the fp8_mqa_logits kernel.
     """
-    tag = variant or os.environ.get(_K5_VARIANT_ENV) or _auto_variant(**kw)
+    tag = variant or os.environ.get(_K5_VARIANT_ENV) or _auto_variant(gate=gate, **kw)
     if tag == K5_DEFAULT_VARIANT:  # env var may legitimately say "auto"
-        tag = _auto_variant(**kw)
+        tag = _auto_variant(gate=gate, **kw)
     bv = _bv_of_variant(tag)
     legal = _legal_bv_candidates(kw["V"])
     if bv not in legal:
@@ -671,6 +654,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             T_flat=T_flat,
             N=N,
             is_varlen=is_varlen,
+            gate=_gate_of(use_g, use_gk),
         )
     )
 

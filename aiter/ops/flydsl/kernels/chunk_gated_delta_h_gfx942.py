@@ -12,6 +12,7 @@ For each chunk t (serial over NT chunks):
 """
 
 import math
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -21,8 +22,130 @@ from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import vector as _vector
 
 from .tensor_shim import GTensor, _to_raw
+from .k5_variants import _bv_of_variant, _legal_bv_candidates
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
+
+
+# -- gfx942 tuned variant table ------------------------------------------
+# Data-driven K5 variant selection for gfx942, from the MI325X graph-mode sweep.
+# The host wrapper's grid-fill heuristic never emits a wave-widened tag and mispicks
+# BV for many shapes; this table encodes the best variant per selection signature and
+# is consulted first for gfx942 (the wrapper falls back to the heuristic on a miss).
+#
+# Key = (gate, H, _n_bucket(N), is_varlen). Findings from the full sweep:
+#   * gate x H x N together decide the tile. gate alone is not enough: scalar-g is
+#     bv16 only at small H*N; by H>=8,N>=4 the larger tiles win (g,8,8->bv32;
+#     g,16,4->bv32; g,16/32,>=8->bv64w8). KDA scales the same way -- the N=1 pick
+#     grows with H (gk,12/24,1->bv16; gk,48,1->bv32; gk,96,1->bv64w8), and every KDA
+#     N>=4 at H>=24 is bv64w8.
+#   * T_local (=T_flat/N) is never discriminative: each (gate,H,N-bucket) group
+#     picks the same variant at T_flat 8192 and 32768, so T is not in the key.
+#   * N-buckets are {1, 2, 4:(3-4), 8:(>=5)}. The >=5 bucket is flat (measured
+#     N=6/8/12/16 for g H16/H32 and gk H24 all agree). N=2 is its own bucket: it
+#     halves the grid and drops the tile one regime below N=4 for the mid-H groups
+#     (g H16 & gk H12: N2->bv16 vs N4->bv32; g H32 & gk H24: N2->bv32 vs N4->bv64w8);
+#     flat at the extremes (small-H floor bv16, gk H48/H96 ceiling bv64w8). N=3 has
+#     no data for the groups that matter and folds into bucket 4 (larger-tile side).
+#   * Tie-break objective is MIN-MEAN loss across the shapes sharing a signature,
+#     including the varlen skew/skew_last patterns the selector cannot see (only
+#     cu_seqlens exists). Rationale: real prefill batches are equal/ragged/bimodal;
+#     the "skew" pattern (one seq holds ~half the tokens) is an adversarial corner,
+#     so favour the common case and let the rare skew batch degrade.
+
+
+@dataclass(frozen=True)
+class _K5TunedEntry:
+    gate: str  # "g" (scalar) | "gk" (per-channel)
+    H: int
+    n_bucket: int  # output of _n_bucket(N): 1 | 2 | 4 | 8
+    is_varlen: bool
+    variant: str  # registered K5 variant tag, e.g. "bv64w8"
+
+
+# is_varlen is (N > 1) at runtime -- the wrapper sets it from cu_seqlens, which the
+# host builds for every N>1 batch regardless of length distribution. So N=1 shapes
+# are is_varlen=False and all N>1 shapes are is_varlen=True (redundant with the
+# n_bucket, but kept explicit to mirror the selection signature).
+_K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
+    # KDA (per-channel gate). N=1 pick grows with H; N>=4 at H>=24 is bv64w8.
+    # N=2 is one tile below N=4 for the mid-H groups (H12/H24), flat at the extremes.
+    _K5TunedEntry("gk", 12, 1, False, "bv16"),
+    _K5TunedEntry("gk", 12, 2, True, "bv16"),
+    _K5TunedEntry("gk", 12, 4, True, "bv32"),
+    _K5TunedEntry("gk", 12, 8, True, "bv64w8"),
+    _K5TunedEntry("gk", 24, 1, False, "bv16"),
+    _K5TunedEntry("gk", 24, 2, True, "bv32"),
+    _K5TunedEntry("gk", 24, 4, True, "bv64w8"),
+    _K5TunedEntry("gk", 24, 8, True, "bv64w8"),
+    _K5TunedEntry("gk", 48, 1, False, "bv32"),
+    _K5TunedEntry("gk", 48, 2, True, "bv64w8"),
+    _K5TunedEntry("gk", 48, 4, True, "bv64w8"),
+    _K5TunedEntry("gk", 48, 8, True, "bv64w8"),
+    _K5TunedEntry("gk", 96, 1, False, "bv64w8"),
+    _K5TunedEntry("gk", 96, 2, True, "bv64w8"),
+    _K5TunedEntry("gk", 96, 4, True, "bv64w8"),
+    _K5TunedEntry("gk", 96, 8, True, "bv64w8"),
+    # GDN (scalar gate). bv16 only at small H*N; larger tiles win as H*N grows.
+    # N=2 is one tile below N=4 for the mid-H groups (H16/H32), flat at small H.
+    _K5TunedEntry("g", 4, 1, False, "bv16"),
+    _K5TunedEntry("g", 4, 2, True, "bv16"),
+    _K5TunedEntry("g", 4, 4, True, "bv16"),
+    _K5TunedEntry("g", 4, 8, True, "bv16"),
+    _K5TunedEntry("g", 8, 1, False, "bv16"),
+    _K5TunedEntry("g", 8, 2, True, "bv16"),
+    _K5TunedEntry("g", 8, 4, True, "bv16"),
+    _K5TunedEntry("g", 8, 8, True, "bv32"), 
+    _K5TunedEntry("g", 16, 1, False, "bv16"),
+    _K5TunedEntry("g", 16, 2, True, "bv16"),  # N=2 halves grid -> bv16 (N4 is bv32)
+    _K5TunedEntry("g", 16, 4, True, "bv32"),
+    _K5TunedEntry("g", 16, 8, True, "bv64w8"), 
+    _K5TunedEntry("g", 32, 1, False, "bv16"),
+    _K5TunedEntry("g", 32, 2, True, "bv32"),  # N=2 halves grid -> bv32 (N4 is bv64w8)
+    _K5TunedEntry("g", 32, 4, True, "bv64w8"),
+    _K5TunedEntry("g", 32, 8, True, "bv64w8"),
+)
+
+_K5_TUNED_TABLE_GFX942: dict[tuple, str] = {
+    (e.gate, e.H, e.n_bucket, e.is_varlen): e.variant for e in _K5_TUNED_ROWS_GFX942
+}
+
+
+def _n_bucket(N: int) -> int:
+    """Normalize the batch/sequence count into the measured grid-size regimes.
+
+    Four buckets: {1: N==1, 2: N==2, 4: 3<=N<=4, 8: N>=5}. N=2 is its own bucket
+    because halving the grid drops the optimal tile one regime below N=4 for the
+    mid-H groups (measured: g H16/gk H12 N2->bv16 vs N4->bv32; g H32/gk H24 N2->bv32
+    vs N4->bv64w8). N=3 has no measurement for the groups that matter and folds into
+    bucket 4 (the larger-tile side). The >=5 bucket was validated flat (N=6/8/12/16).
+    """
+    if N <= 1:
+        return 1
+    if N == 2:
+        return 2
+    if N <= 4:
+        return 4
+    return 8
+
+
+def select_variant(
+    *, gate: str, H: int, N: int, V: int, is_varlen: bool
+) -> str | None:
+    """gfx942 measured-best K5 variant tag for this shape, or None on a table miss.
+
+    Returns a tag from ``K5_VARIANTS`` (e.g. ``"bv64w8"``) when the
+    ``(gate, H, _n_bucket(N), is_varlen)`` signature is tabled and the tabled BV is
+    legal for ``V``; otherwise None (the host wrapper then falls back to its
+    cross-arch grid-fill heuristic). ``T_flat``/``Hg`` are intentionally not part of
+    the key -- see the table note above.
+    """
+    tag = _K5_TUNED_TABLE_GFX942.get((gate, H, _n_bucket(N), is_varlen))
+    if tag is None:
+        return None
+    if _bv_of_variant(tag) not in _legal_bv_candidates(V):
+        return None
+    return tag
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -1108,4 +1231,5 @@ def compile_chunk_gated_delta_h_gfx942(
 
 __all__ = [
     "compile_chunk_gated_delta_h_gfx942",
+    "select_variant",
 ]
