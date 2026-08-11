@@ -1,6 +1,8 @@
 name: vLLM disagg CI smoke workflow
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   schedule:
     # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
     - cron: '30 18 * * *'
@@ -10,17 +12,17 @@ on:
         description: "vLLM repository to clone"
         required: false
         type: string
-        default: "itej89/vllm"
+        default: "lcskrishna/vllm"
       vllm_ref:
-        description: "vLLM branch/ref with lcskrishna/vllm PR #5 changes"
+        description: "vLLM branch/ref with MiniMax DI model config"
         required: false
         type: string
-        default: "fix/moriio-ep8-dp8-read-rdma-session-routing"
+        default: "3e90fd20a48f6b42c395224f10a7793117bf65a6"
       model_name:
-        description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
+        description: "MODEL_NAME passed to the vLLM disagg script"
         required: false
         type: string
-        default: "DeepSeek-V3"
+        default: "MiniMax-M3-MXFP8"
       disagg_scripts_stage:
         description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
         required: false
@@ -40,12 +42,52 @@ on:
         description: "Slurm script under .buildkite/amd-disagg"
         required: false
         type: string
-        default: "run_xPyD_diagg.slurm"
+        default: "run-slurm-disagg-test.sh"
+      router_type:
+        description: "ROUTER_TYPE passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "proxy"
+      moriio_read_mode:
+        description: "MORIIO_READ_MODE passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "0"
+      run_after_health:
+        description: "RUN_AFTER_HEALTH passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "accuracy"
+      wide_ep_mode:
+        description: "WIDE_EP_MODE passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "0"
+      nodes:
+        description: "NODES passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "2"
+      gpus_per_node:
+        description: "GPUS_PER_NODE passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "8"
+      slurm_time_limit:
+        description: "SLURM_TIME_LIMIT passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "08:30:00"
+      wait:
+        description: "WAIT passed to the vLLM disagg script"
+        required: false
+        type: string
+        default: "1"
       wait_timeout_minutes:
         description: "Maximum time to wait for the Slurm job"
         required: false
         type: string
-        default: "420"
+        default: "540"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -56,20 +98,32 @@ permissions:
 
 jobs:
   vllm-disagg-smoke:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (github.event.pull_request.number == 4274 ||
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
-    timeout-minutes: 480
+    timeout-minutes: 600
     env:
-      VLLM_REPOSITORY_DEFAULT: itej89/vllm
-      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
-      MODEL_NAME_DEFAULT: DeepSeek-V3
+      VLLM_REPOSITORY_DEFAULT: lcskrishna/vllm
+      VLLM_REF_DEFAULT: 3e90fd20a48f6b42c395224f10a7793117bf65a6
+      MODEL_NAME_DEFAULT: MiniMax-M3-MXFP8
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
       SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
-      ROUTER_TYPE_DEFAULT: vllm-router
+      ROUTER_TYPE_DEFAULT: proxy
       MORIIO_READ_MODE_DEFAULT: "0"
+      RUN_AFTER_HEALTH_DEFAULT: accuracy
+      WIDE_EP_MODE_DEFAULT: "0"
+      NODES_DEFAULT: "2"
+      GPUS_PER_NODE_DEFAULT: "8"
       VLLM_ROUTER_IMAGE_DEFAULT: vllm/vllm-router:nightly
-      SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
-      WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
+      SLURM_SCRIPT_DEFAULT: run-slurm-disagg-test.sh
+      SLURM_TIME_LIMIT_DEFAULT: "08:30:00"
+      WAIT_DEFAULT: "1"
+      WAIT_TIMEOUT_MINUTES_DEFAULT: "540"
     steps:
       - name: Apply vLLM disagg inputs
         run: |
@@ -98,10 +152,16 @@ jobs:
           )
           print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
           print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
-          print(f"ROUTER_TYPE={os.environ['ROUTER_TYPE_DEFAULT']}")
-          print(f"MORIIO_READ_MODE={os.environ['MORIIO_READ_MODE_DEFAULT']}")
+          print(f"ROUTER_TYPE={value('router_type', 'ROUTER_TYPE_DEFAULT')}")
+          print(f"MORIIO_READ_MODE={value('moriio_read_mode', 'MORIIO_READ_MODE_DEFAULT')}")
+          print(f"RUN_AFTER_HEALTH={value('run_after_health', 'RUN_AFTER_HEALTH_DEFAULT')}")
+          print(f"WIDE_EP_MODE={value('wide_ep_mode', 'WIDE_EP_MODE_DEFAULT')}")
+          print(f"NODES={value('nodes', 'NODES_DEFAULT')}")
+          print(f"GPUS_PER_NODE={value('gpus_per_node', 'GPUS_PER_NODE_DEFAULT')}")
           print(f"VLLM_ROUTER_IMAGE={os.environ['VLLM_ROUTER_IMAGE_DEFAULT']}")
           print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
+          print(f"SLURM_TIME_LIMIT={value('slurm_time_limit', 'SLURM_TIME_LIMIT_DEFAULT')}")
+          print(f"WAIT={value('wait', 'WAIT_DEFAULT')}")
           print(
               "WAIT_TIMEOUT_MINUTES="
               + value("wait_timeout_minutes", "WAIT_TIMEOUT_MINUTES_DEFAULT")
@@ -147,6 +207,14 @@ jobs:
             echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
             echo "- IMAGE: \`${IMAGE}\`"
             echo "- Requested Slurm script: \`${SLURM_SCRIPT}\`"
+            echo "- ROUTER_TYPE: \`${ROUTER_TYPE}\`"
+            echo "- MORIIO_READ_MODE: \`${MORIIO_READ_MODE}\`"
+            echo "- RUN_AFTER_HEALTH: \`${RUN_AFTER_HEALTH}\`"
+            echo "- WIDE_EP_MODE: \`${WIDE_EP_MODE}\`"
+            echo "- NODES: \`${NODES}\`"
+            echo "- GPUS_PER_NODE: \`${GPUS_PER_NODE}\`"
+            echo "- SLURM_TIME_LIMIT: \`${SLURM_TIME_LIMIT}\`"
+            echo "- WAIT: \`${WAIT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Submit and monitor vLLM disagg Slurm job
@@ -161,7 +229,7 @@ jobs:
 
           script="${SLURM_SCRIPT}"
           if [[ ! -f "${script}" ]]; then
-            for candidate in run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
+            for candidate in run-slurm-disagg-test.sh run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
               if [[ -f "${candidate}" ]]; then
                 echo "Requested Slurm script ${script} not found; using ${candidate}"
                 script="${candidate}"
@@ -170,7 +238,7 @@ jobs:
             done
           fi
           if [[ ! -f "${script}" ]]; then
-            echo "No run_xPyD disagg Slurm script found under ${PWD}" >&2
+            echo "No vLLM disagg script found under ${PWD}" >&2
             find . -maxdepth 2 -type f | sort >&2
             exit 1
           fi
@@ -196,6 +264,56 @@ jobs:
           : > "${squeue_log}"
           : > "${sacct_log}"
 
+          common_env=(
+            LOG_ROOT="${log_root}"
+            MODEL_NAME="${MODEL_NAME}"
+            NODES="${NODES}"
+            GPUS_PER_NODE="${GPUS_PER_NODE}"
+            WIDE_EP_MODE="${WIDE_EP_MODE}"
+            MORIIO_READ_MODE="${MORIIO_READ_MODE}"
+            RUN_AFTER_HEALTH="${RUN_AFTER_HEALTH}"
+            ROUTER_TYPE="${ROUTER_TYPE}"
+            WAIT="${WAIT}"
+            SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT}"
+            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}"
+            DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}"
+            IMAGE="${IMAGE}"
+            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}"
+          )
+
+          parse_job_id() {
+            python3 - "${submit_log}" <<'PY' || true
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(encoding="utf-8")
+          patterns = (
+              r"Submitted batch job\s+(\d+)",
+              r"\bSLURM_JOB_ID[=:]\s*(\d+)",
+              r"\bjob(?:_id| id)?[=: ]+(\d+)",
+          )
+          for pattern in patterns:
+              match = re.search(pattern, text, re.IGNORECASE)
+              if match:
+                  print(match.group(1))
+                  break
+          PY
+          }
+
+          if [[ "${script}" == *.sh ]]; then
+            echo "Running vLLM disagg wrapper: MODEL_NAME=${MODEL_NAME} NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WIDE_EP_MODE=${WIDE_EP_MODE} MORIIO_READ_MODE=${MORIIO_READ_MODE} RUN_AFTER_HEALTH=${RUN_AFTER_HEALTH} ROUTER_TYPE=${ROUTER_TYPE} WAIT=${WAIT} SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT} IMAGE=${IMAGE} bash ${script}"
+            set +e
+            env "${common_env[@]}" bash "${script}" 2>&1 | tee "${submit_log}"
+            wrapper_rc=${PIPESTATUS[0]}
+            set -e
+            job_id="$(parse_job_id)"
+            if [[ -n "${job_id}" ]]; then
+              echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
+            fi
+            exit "${wrapper_rc}"
+          fi
+
           # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
           # resource flags (--nodelist/--nodes/--ntasks/--gres/...), but in-script
           # #SBATCH directives ARE honored (proven pattern: ATOM pd_submit.sh
@@ -209,30 +327,15 @@ jobs:
           fi
           sbatch_args=()
 
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
-          LOG_ROOT="${log_root}" \
-            MODEL_NAME="${MODEL_NAME}" \
-            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
-            DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
-            IMAGE="${IMAGE}" \
-            ROUTER_TYPE="${ROUTER_TYPE}" \
-            MORIIO_READ_MODE="${MORIIO_READ_MODE}" \
-            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
-            sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
+          echo "Submitting: MODEL_NAME=${MODEL_NAME} NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WIDE_EP_MODE=${WIDE_EP_MODE} MORIIO_READ_MODE=${MORIIO_READ_MODE} RUN_AFTER_HEALTH=${RUN_AFTER_HEALTH} ROUTER_TYPE=${ROUTER_TYPE} WAIT=${WAIT} SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
+          env "${common_env[@]}" sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
 
-          job_id="$(
-            python3 - "${submit_log}" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          text = Path(sys.argv[1]).read_text(encoding="utf-8")
-          match = re.search(r"Submitted batch job\s+(\d+)", text)
-          if not match:
-              raise SystemExit(f"Could not parse Slurm job id from: {text!r}")
-          print(match.group(1))
-          PY
-          )"
+          job_id="$(parse_job_id)"
+          if [[ -z "${job_id}" ]]; then
+            echo "Could not parse Slurm job id from ${submit_log}" >&2
+            cat "${submit_log}" >&2
+            exit 1
+          fi
           echo "Submitted Slurm job ${job_id}"
           echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
 
