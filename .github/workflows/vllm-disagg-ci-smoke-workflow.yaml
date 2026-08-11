@@ -47,7 +47,7 @@ env:
 
 jobs:
   build_aiter_wheel:
-    name: Build gfx950 Aiter wheel
+    name: Build gfx950 Aiter overlay wheels
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -112,18 +112,31 @@ jobs:
               pip install --upgrade "ninja>=1.11.1"
               pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
               pip install tabulate
+              flydsl_version="$(python3 -c "from importlib.metadata import version; print(version(\"flydsl\"))")"
+              echo "Packaging runtime dependency flydsl==${flydsl_version}"
+              python3 -m pip download \
+                --no-deps \
+                --only-binary=:all: \
+                --dest dist \
+                "flydsl==${flydsl_version}"
               echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
               python setup.py bdist_wheel 2>&1 | tee .aiter-build.log
               ls -lh dist/*.whl
-              wheels=(dist/*.whl)
-              if (( ${#wheels[@]} != 1 )); then
-                echo "Expected exactly one AITER wheel, found ${#wheels[@]}" >&2
+              aiter_wheels=(dist/amd_aiter-*.whl)
+              flydsl_wheels=(dist/flydsl-*.whl)
+              if (( ${#aiter_wheels[@]} != 1 )); then
+                echo "Expected exactly one amd_aiter wheel, found ${#aiter_wheels[@]}" >&2
                 exit 1
               fi
-              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"Wheel entries: {len(names)}; packaged HSA arches: {sorted(arches)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"aiter/__init__.py\" in names; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${wheels[0]}"
+              if (( ${#flydsl_wheels[@]} != 1 )); then
+                echo "Expected exactly one flydsl wheel, found ${#flydsl_wheels[@]}" >&2
+                exit 1
+              fi
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"AITER wheel entries: {len(names)}; packaged HSA arches: {sorted(arches)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"aiter/__init__.py\" in names; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${aiter_wheels[0]}"
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); print(f\"FlyDSL wheel entries: {len(names)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"flydsl/__init__.py\" in names, \"missing flydsl package\"" "${flydsl_wheels[0]}"
             '
 
-      - name: Upload AITER wheel
+      - name: Upload AITER overlay wheels
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
@@ -268,7 +281,7 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
-      - name: Download AITER wheel
+      - name: Download AITER overlay wheels
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
@@ -304,9 +317,10 @@ jobs:
         run: |
           set -euo pipefail
           artifact_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
-          mapfile -d '' wheels < <(find "${artifact_dir}" -type f -name '*.whl' -print0)
-          if [[ "${#wheels[@]}" -ne 1 ]]; then
-            echo "Expected exactly one AITER wheel in ${artifact_dir}, found ${#wheels[@]}" >&2
+          mapfile -d '' aiter_wheels < <(find "${artifact_dir}" -type f -name 'amd_aiter-*.whl' -print0)
+          mapfile -d '' flydsl_wheels < <(find "${artifact_dir}" -type f -name 'flydsl-*.whl' -print0)
+          if [[ "${#aiter_wheels[@]}" -ne 1 || "${#flydsl_wheels[@]}" -ne 1 ]]; then
+            echo "Expected one amd_aiter wheel and one flydsl wheel in ${artifact_dir}; found AITER=${#aiter_wheels[@]} FlyDSL=${#flydsl_wheels[@]}" >&2
             find "${artifact_dir}" -type f -printf '%P\n' >&2 || true
             exit 1
           fi
@@ -315,10 +329,12 @@ jobs:
           test -d "${disagg_dir}"
           rm -rf "${disagg_dir}/aiter_overlay"
           mkdir -p "${disagg_dir}/aiter_overlay"
-          # Extract the wheel on the login runner so compute nodes never invoke
-          # pip or PyPI and only consume the staged AITER overlay.
-          python3 -m zipfile -e "${wheels[0]}" "${disagg_dir}/aiter_overlay"
+          # Extract AITER and its matching FlyDSL dependency on the login runner
+          # so compute nodes never invoke pip or PyPI.
+          python3 -m zipfile -e "${aiter_wheels[0]}" "${disagg_dir}/aiter_overlay"
+          python3 -m zipfile -e "${flydsl_wheels[0]}" "${disagg_dir}/aiter_overlay"
           test -f "${disagg_dir}/aiter_overlay/aiter/__init__.py"
+          test -f "${disagg_dir}/aiter_overlay/flydsl/__init__.py"
 
           cat > "${disagg_dir}/aiter_cluster_env.sh" <<'SH'
           #!/usr/bin/env bash
@@ -335,12 +351,15 @@ jobs:
 
           root = Path(sys.argv[1]).resolve()
           loaded = Path(aiter.__file__).resolve()
+          flydsl_loaded = Path(flydsl.__file__).resolve()
           print(
               f"[aiter-overlay] loaded {loaded}; "
-              f"flydsl={version('flydsl')} at {flydsl.__file__}"
+              f"flydsl={version('flydsl')} at {flydsl_loaded}"
           )
           if root not in loaded.parents:
               raise SystemExit(f"AITER was not loaded from {root}")
+          if root not in flydsl_loaded.parents:
+              raise SystemExit(f"FlyDSL was not loaded from {root}")
           PY
           SH
           chmod +x "${disagg_dir}/aiter_cluster_env.sh"
@@ -400,7 +419,7 @@ jobs:
             echo
             echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
             echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
-            echo "- AITER gfx950 wheel overlay: \`PREBUILD_KERNELS=0 (offline, no compute-node pip)\`"
+            echo "- AITER gfx950 + FlyDSL wheel overlay: \`PREBUILD_KERNELS=0 (offline, no compute-node pip)\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
