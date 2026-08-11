@@ -119,6 +119,8 @@ jobs:
                 --only-binary=:all: \
                 --dest dist \
                 "flydsl==${flydsl_version}"
+              echo "Prebuilding the gfx950 CKTile A8W8 blockscale module"
+              python3 .github/scripts/prebuild_vllm_disagg_cktile.py
               echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
               python setup.py bdist_wheel 2>&1 | tee .aiter-build.log
               ls -lh dist/*.whl
@@ -132,7 +134,7 @@ jobs:
                 echo "Expected exactly one flydsl wheel, found ${#flydsl_wheels[@]}" >&2
                 exit 1
               fi
-              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"AITER wheel entries: {len(names)}; packaged HSA arches: {sorted(arches)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"aiter/__init__.py\" in names; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${aiter_wheels[0]}"
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"AITER wheel entries: {len(names)}; packaged HSA arches: {sorted(arches)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"aiter/__init__.py\" in names; assert \"aiter/jit/module_gemm_a8w8_blockscale_cktile.so\" in names, \"missing targeted CKTile prebuild\"; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${aiter_wheels[0]}"
               python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); print(f\"FlyDSL wheel entries: {len(names)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"flydsl/__init__.py\" in names, \"missing flydsl package\"" "${flydsl_wheels[0]}"
             '
 
@@ -422,7 +424,7 @@ jobs:
             echo
             echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
             echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
-            echo "- AITER gfx950 + FlyDSL wheel overlay: \`PREBUILD_KERNELS=0 (offline, no compute-node pip)\`"
+            echo "- AITER gfx950 + FlyDSL wheel overlay: \`PREBUILD_KERNELS=0 + targeted CKTile prebuild (offline, no compute-node pip)\`"
             echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
