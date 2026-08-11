@@ -116,9 +116,13 @@ DOCKER_DOWNLOAD_COMMON="--rm --network host --ipc host --shm-size 32g \\
     text = replace_once(
         text,
         'MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1',
-        """MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || MODEL_PATH="${MODEL:-}"
-if [[ -n "${MODEL:-}" && "$MODEL_PATH" == /* && ! -e "$MODEL_PATH" ]]; then
-    echo "WARN: MODEL_PATH is not visible on the submit node; compute containers will try it before falling back to model id: $MODEL_PATH -> $MODEL" >&2
+        """MODEL_PATH_ORIGINAL="$MODEL_PATH"
+if RESOLVED_MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")"; then
+    MODEL_PATH="$RESOLVED_MODEL_PATH"
+elif [[ "$MODEL_PATH" == /* ]]; then
+    echo "WARN: MODEL_PATH is not visible on the submit node; compute nodes will try it before falling back to model id: $MODEL_PATH" >&2
+else
+    MODEL_PATH="${MODEL:-$MODEL_PATH}"
 fi""",
     )
     text = replace_once(
@@ -200,7 +204,7 @@ cat > "$WORKDIR/model_path_helpers.sh" <<'EOF'
 model_has_complete_files() {
   local p="$1"
   [[ -f "$p/config.json" ]] || return 1
-  find "$p" -maxdepth 1 -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print -quit 2>/dev/null | grep -q .
+  find "$p" -maxdepth 1 \( -type f -o -type l \) \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print -quit 2>/dev/null | grep -q .
 }
 
 resolve_local_model_path() {
@@ -234,7 +238,7 @@ resolve_local_model_path() {
       candidate="$dir"
       break
     fi
-  done < <(find "$original" -maxdepth 6 -type f -name config.json -printf "%h\\n" 2>/dev/null | sort -u)
+  done < <(find "$original" -maxdepth 6 \( -type f -o -type l \) -name config.json -printf "%h\\n" 2>/dev/null | sort -u)
 
   [[ -n "$candidate" ]] || return 1
   printf "%s\\n" "$candidate"
@@ -259,7 +263,7 @@ model_runtime_path() {
 
   if resolved="$(resolve_local_model_path "$original")"; then
     echo "[model] resolved local model path: ${original} -> ${resolved}" >&2
-    find "$resolved" -maxdepth 1 -type f \( -name config.json -o -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print 2>/dev/null | head -20 >&2 || true
+    find "$resolved" -maxdepth 1 \( -type f -o -type l \) \( -name config.json -o -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print 2>/dev/null | head -20 >&2 || true
     printf "%s\\n" "$resolved"
     return 0
   fi
