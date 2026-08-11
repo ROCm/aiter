@@ -309,6 +309,7 @@ def _top_k_per_row_prefill(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -363,12 +364,17 @@ def top_k_per_row_prefill(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (prefill). The multi-block path runs on a persistent,
     zero-initialized workspace (memset-free; see get_topk_mb_workspace); the
-    one-block path allocates its own scratch internally."""
+    one-block path allocates its own scratch internally.
+
+    When stable=True, the one-block path is forced with deterministic,
+    ascending-index ordered, smallest-index tie-breaking emit so every
+    tensor-parallel rank selects and orders an identical KV set."""
     workspace = None
-    if topk_use_mulblocks(numRows, stride0):
+    if not stable and topk_use_mulblocks(numRows, stride0):
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_prefill(
@@ -382,6 +388,7 @@ def top_k_per_row_prefill(
         stride1,
         k,
         workspace,
+        stable,
     )
 
 
@@ -409,6 +416,7 @@ def _top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -661,6 +669,7 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (decode), writing k indices per row.
 
@@ -668,6 +677,12 @@ def top_k_per_row_decode(
     the HIP one-block kernel everywhere else; see _should_use_flydsl_decode for
     the gates and AITER_DISABLE_FLYDSL_TOPK_DECODE to force HIP. Both kernels
     return the indices as an unordered set.
+
+    stable=True asks for the deterministic ascending-ordered, smallest-index
+    tie-break emit so every TP rank selects and orders an identical KV set. Only
+    the HIP kernel emits that order -- FlyDSL returns an unordered set and
+    rejects ordered output outright -- so stable disqualifies the FlyDSL path
+    rather than silently handing back an unordered answer.
 
     ``workspace`` lets a caller that already owns a buffer (a serving framework
     reserving device memory up front, say) hand it over instead of paying an
@@ -677,7 +692,9 @@ def top_k_per_row_decode(
     argument, so a shape that falls back drops the buffer on the floor rather than
     misreading it.
     """
-    if _should_use_flydsl_decode(logits, next_n, numRows, stride0, stride1, k):
+    if not stable and _should_use_flydsl_decode(
+        logits, next_n, numRows, stride0, stride1, k
+    ):
         if _FLYDSL_TOPK_COUNT:
             topk_decode_dispatch_counts["flydsl"] += 1
         from .flydsl.topk_per_row_decode import flydsl_top_k_per_row_decode
@@ -703,13 +720,8 @@ def top_k_per_row_decode(
         topk_decode_dispatch_counts["hip"] += 1
     # Decode always takes the ob path (see topk_per_row_kernels.cu), and the C++
     # side ignores the workspace argument there.
-    # The original mb dispatch is commented out below for reference:
-    #   workspace = None
-    #   if topk_use_mulblocks(numRows, stride0):
-    #       size = topk_mb_workspace_size(numRows, stride0, k, True)
-    #       workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_decode(
-        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
+        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None, stable
     )
 
 
