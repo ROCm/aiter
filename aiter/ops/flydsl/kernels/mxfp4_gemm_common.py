@@ -6,6 +6,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -59,8 +60,10 @@ def _buffer_rsrc(addr_i64, num_records_bytes):
     )
 
 
-def _lds_swizzle_mask(row):
-    return (row & fx.Int32(14)) << fx.Int32(3)
+def _lds_swizzle_mask(row, row_bytes=128):
+    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns."""
+    assert row_bytes in (64, 128), f"unsupported FP4 LDS row width {row_bytes}"
+    return (row & fx.Int32(2 * (row_bytes // 16) - 2)) << fx.Int32(3)
 
 
 def lds_swizzle_mask_f8(row, row_bytes):
@@ -122,7 +125,7 @@ def flat_buffer_view(
 
 
 def _fabs_f32(x):
-    return fx.Float32(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(x)], [], []))
+    return fmath.absf(x)
 
 
 def _e8m0_roundup(amax_f32):

@@ -622,20 +622,6 @@ def torch_mla_extend_split_kv(
         )
         or (
             get_gfx() == "gfx950"
-            and nheads == 32
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 32
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (
-            get_gfx() == "gfx950"
             and nheads == 8
             and is_fp8_q
             and is_fp8_kvc
@@ -653,14 +639,9 @@ def torch_mla_extend_split_kv(
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and (
-                (nheads == 32 and max_seqlen_q >= 4)
-                or (nheads == 64)
-                or (nheads == 128)
-            )
+            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
         )
         or (
-            # gfx942 native QH64 fp8/fp8 PS decode
             get_gfx() == "gfx942"
             and nheads == 64
             and is_fp8_q
@@ -1114,6 +1095,7 @@ def test_mla(
     paged_layout,
     scale_dim,
     return_lse,
+    causal,
 ):
     ret = {}
 
@@ -1229,7 +1211,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=causal,
         dtype=out_dtype,
     )
 
@@ -1289,7 +1271,7 @@ def test_mla(
         kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
-        False,
+        causal,
         work_meta_data,
         work_info_set,
         work_indptr,
@@ -1405,7 +1387,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -1432,6 +1414,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             kv_scale=kv_scale,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1465,7 +1448,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
                 )
@@ -1509,6 +1492,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             return_lse=return_lse,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1542,7 +1526,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                 )
             )
 
@@ -1582,7 +1566,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -1611,6 +1595,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             return_lse=return_lse,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1651,7 +1636,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
                 )
@@ -1699,7 +1684,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             scale_dim=scale_dim,
         )
 
@@ -1730,6 +1715,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1765,7 +1751,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     scale_dim=scale_dim,
                 )
             )
@@ -2034,6 +2020,15 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--causal",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="""apply the causal mask across the decode_qlen query tokens. Default: True.
+    Only matters for decode_qlen > 1; --no-causal needs a non-masked (msk0)
+    kernel, which today exists for gfx950 bf16/bf16 persistent only.
+    e.g.: --no-causal""",
+)
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []
@@ -2059,6 +2054,7 @@ for nhead, decode_qlen in args.nhead:
                 paged_layout=args.paged_layout,
                 scale_dim=args.scale_dim,
                 return_lse=args.return_lse,
+                causal=args.causal,
             )
             df.append(ret)
     df = pd.DataFrame(df)

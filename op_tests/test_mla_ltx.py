@@ -125,6 +125,8 @@ class Harness:
 
 
 # (q_dtype, kv_dtype, nhead/Gqa, decode_qlen/qSeqLen)
+# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=1, cprr=0).
+# causal=0 rows are the msk0 non-masked builds, which this harness does not cover.
 PresetConfig = tuple[torch.dtype, torch.dtype, int, int]
 
 PRESETS: dict[str, PresetConfig] = {
