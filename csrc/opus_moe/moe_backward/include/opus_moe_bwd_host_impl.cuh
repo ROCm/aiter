@@ -518,6 +518,92 @@ void opus_moe_combine_bwd_bf16(aiter_tensor_t& dout,   // [T,H] bf16
         H);
 }
 
+// Sonic parity specialization: one 512-thread block owns a token and all its
+// eight routes. Each wave retains the low-register route-major dot/scale loop,
+// while the CTA stages dout[t,:] once in LDS for all eight waves to reuse.
+__global__ __launch_bounds__(512, 1)
+void opus_moe_combine_bwd_token8_h2048_bf16_kernel(
+    const __bf16* __restrict__ dout,          // [T,2048]
+    const int32_t* __restrict__ token_routes, // [T,8]
+    const float* __restrict__ p,              // [M]
+    const __bf16* __restrict__ y,             // [M,2048]
+    __bf16* __restrict__ dy,                  // [M,2048]
+    float* __restrict__ dp)                   // [M]
+{
+    constexpr int H = 2048;
+    constexpr int TOPK = 8;
+    constexpr int VEC = 8;
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+
+    __shared__ __align__(16) __bf16 dout_shared[H];
+    __shared__ int32_t routes[TOPK];
+    __shared__ float scores[TOPK];
+    if(tid < TOPK)
+    {
+        const int32_t route = token_routes[static_cast<int64_t>(t) * TOPK + tid];
+        routes[tid] = route;
+        scores[tid] = p[route];
+    }
+    if(tid < H / VEC)
+    {
+        const int h = tid * VEC;
+        *reinterpret_cast<opus_bf16x8*>(dout_shared + h) =
+            *reinterpret_cast<const opus_bf16x8*>(
+                dout + static_cast<int64_t>(t) * H + h);
+    }
+    __syncthreads();
+
+    const int32_t route = routes[wave];
+    const float score = scores[wave];
+    float acc = 0.0f;
+    for(int h = lane * VEC; h < H; h += 64 * VEC)
+    {
+        const int64_t offset = static_cast<int64_t>(route) * H + h;
+        const opus_bf16x8 dv =
+            *reinterpret_cast<const opus_bf16x8*>(dout_shared + h);
+        const opus_bf16x8 yv = *reinterpret_cast<const opus_bf16x8*>(y + offset);
+        opus_bf16x8 dyv;
+#pragma unroll
+        for(int i = 0; i < VEC; ++i)
+        {
+            const float d = static_cast<float>(dv[i]);
+            dyv[i] = static_cast<__bf16>(d * score);
+            acc = fmaf(d, static_cast<float>(yv[i]), acc);
+        }
+        *reinterpret_cast<opus_bf16x8*>(dy + offset) = dyv;
+    }
+
+#pragma unroll
+    for(int delta = 32; delta > 0; delta >>= 1)
+        acc += __shfl_down(acc, delta, 64);
+    if(lane == 0)
+        dp[route] = acc;
+}
+
+void opus_moe_combine_bwd_token8_h2048_bf16(
+    aiter_tensor_t& dout,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& y,
+    aiter_tensor_t& dy,
+    aiter_tensor_t& dp)
+{
+    const int T = static_cast<int>(dout.size(0));
+    if(T == 0)
+        return;
+    opus_moe_combine_bwd_token8_h2048_bf16_kernel<<<
+        dim3(T), dim3(512), 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(dout.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(p.data_ptr()),
+        reinterpret_cast<const __bf16*>(y.data_ptr()),
+        reinterpret_cast<__bf16*>(dy.data_ptr()),
+        reinterpret_cast<float*>(dp.data_ptr()));
+}
+
 // dx scatter-add (M5 R6): sum each route's dA back to its token via atomicAdd
 // (topk routes -> one token). dst must be pre-zeroed. Replaces torch index_add_.
 __global__ void opus_moe_scatter_add_bf16_kernel(const hip_bfloat16* __restrict__ src, // [M,H]

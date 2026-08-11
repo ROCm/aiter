@@ -394,6 +394,16 @@ def _opus_moe_combine_bwd_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_combine_bwd_token8_h2048_bf16",
+    develop=True,
+)
+def _opus_moe_combine_bwd_token8_h2048_bf16_raw(
+    dout: Tensor, token_routes: Tensor, p: Tensor, y: Tensor, dy: Tensor, dp: Tensor
+) -> None: ...
+
+
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_scatter_add_bf16", develop=True)
 def _opus_moe_scatter_add_bf16_raw(
     src: Tensor, gather: Tensor, dst: Tensor
@@ -411,6 +421,26 @@ def opus_moe_combine_bwd_bf16(dout: Tensor, gather: Tensor, p_sorted: Tensor, y:
     _opus_moe_combine_bwd_bf16_raw(
         dout.contiguous(), gather.to(torch.int32).contiguous(),
         p_sorted.contiguous(), y.contiguous(), dy, dp)
+    return dy, dp
+
+
+def opus_moe_combine_bwd_token8_h2048_bf16(
+    dout: Tensor, token_routes: Tensor, p_sorted: Tensor, y: Tensor
+):
+    """Token-major exact-shape combine backward for H=2048 and topk=8."""
+    assert dout.shape[1] == 2048 and token_routes.shape[1] == 8
+    assert p_sorted.dtype == torch.float32
+    M, H = y.shape
+    dy = torch.empty(M, H, device=y.device, dtype=torch.bfloat16)
+    dp = torch.empty(M, device=y.device, dtype=torch.float32)
+    _opus_moe_combine_bwd_token8_h2048_bf16_raw(
+        dout.contiguous(),
+        token_routes.to(torch.int32).contiguous(),
+        p_sorted.contiguous(),
+        y.contiguous(),
+        dy,
+        dp,
+    )
     return dy, dp
 
 
@@ -577,6 +607,13 @@ class OpusMoERefFunc(torch.autograd.Function):
                 )
             return _opus_actbwd(dgrad_prepared(dy_op, w, lens), act_input, act_type)
 
+        def combine_bwd_prepared(dout, gather, p_sorted, y):
+            if dout.shape[1] == 2048 and ctx.token_routes.shape[1] == 8:
+                return opus_moe_combine_bwd_token8_h2048_bf16(
+                    dout, ctx.token_routes, p_sorted, y
+                )
+            return opus_moe_combine_bwd_bf16(dout, gather, p_sorted, y)
+
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             return opus_moe_gather_sum_bf16(src, ctx.token_routes, T)
@@ -603,7 +640,7 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         return _moe_ref_backward_impl(
             ctx, dout, dgrad_prepared, wgrad_prepared, _opus_actbwd,
-            combine_bwd=opus_moe_combine_bwd_bf16, dx_scatter=dx_gather_sum,
+            combine_bwd=combine_bwd_prepared, dx_scatter=dx_gather_sum,
             router_bwd=opus_moe_router_bwd_bf16,
             dgrad_actbwd=dgrad_actbwd_prepared,
             stage2_wgrad_start=stage2_wgrad_start,

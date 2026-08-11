@@ -84,6 +84,16 @@ void opus_moe_combine_bwd_bf16(aiter_tensor_t& dout,
                                aiter_tensor_t& dy,
                                aiter_tensor_t& dp);
 
+// Exact Sonic-parity token-major combine. token_routes[t,k] is the compact
+// route row for token t's kth selection. One block shares dout[t,:] across all
+// eight routes, avoiding the route-major kernel's eight identical dout reads.
+void opus_moe_combine_bwd_token8_h2048_bf16(aiter_tensor_t& dout,
+                                             aiter_tensor_t& token_routes,
+                                             aiter_tensor_t& p,
+                                             aiter_tensor_t& y,
+                                             aiter_tensor_t& dy,
+                                             aiter_tensor_t& dp);
+
 // dx scatter-add (M5). dst[gather[m],:] += src[m,:] (topk routes -> token).
 // src [M,H] bf16, gather [M] i32, dst [T,H] fp32 (pre-zeroed).
 void opus_moe_scatter_add_bf16(aiter_tensor_t& src,
