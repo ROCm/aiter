@@ -469,14 +469,18 @@ def opus_moe_router_bwd_bf16(dp_sorted: Tensor, order: Tensor, topk_ids: Tensor,
     dp_flat = torch.empty_like(dp_sorted)
     dp_flat[order] = dp_sorted
     dp = dp_flat.reshape(T, topk).contiguous()
-    dlogits = torch.zeros(T, E, device=dp.device, dtype=torch.float32)
     ids = topk_ids.to(torch.int32).contiguous()
     if scoring == "sigmoid":
         assert logits is not None, "sigmoid router bwd needs logits [T,E]"
+        dlogits = torch.zeros(T, E, device=dp.device, dtype=torch.float32)
         _opus_moe_router_bwd_sigmoid_bf16_raw(
             dp, logits.float().contiguous(), ids, dlogits, int(renorm))
     else:
         assert topk_w.dtype == torch.float32
+        # The router projection consumes BF16 dlogits. Store the FP32 Jacobian
+        # result directly as BF16 instead of writing/casting a full [T,E] FP32
+        # temporary after the kernel.
+        dlogits = torch.zeros(T, E, device=dp.device, dtype=torch.bfloat16)
         _opus_moe_router_bwd_bf16_raw(dp, topk_w.contiguous(), ids, dlogits)
     return dlogits
 

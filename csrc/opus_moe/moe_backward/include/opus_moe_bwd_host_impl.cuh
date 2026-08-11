@@ -602,7 +602,7 @@ void opus_moe_gather_sum_bf16(aiter_tensor_t& src,          // [M,H] bf16
 __global__ void opus_moe_router_bwd_bf16_kernel(const float* __restrict__ dp,       // [T,topk]
                                                 const float* __restrict__ pw,         // [T,topk]
                                                 const int32_t* __restrict__ ids,     // [T,topk]
-                                                float* __restrict__ dlogits,         // [T,E]
+                                                __bf16* __restrict__ dlogits,        // [T,E]
                                                 int T,
                                                 int topk,
                                                 int E)
@@ -616,15 +616,15 @@ __global__ void opus_moe_router_bwd_bf16_kernel(const float* __restrict__ dp,   
     float s = 0.f;
     for(int k = 0; k < topk; ++k)
         s += dpt[k] * pwt[k];
-    float* drow = dlogits + static_cast<int64_t>(t) * E;
+    __bf16* drow = dlogits + static_cast<int64_t>(t) * E;
     for(int k = 0; k < topk; ++k)
-        drow[idt[k]] = pwt[k] * (dpt[k] - s);
+        drow[idt[k]] = static_cast<__bf16>(pwt[k] * (dpt[k] - s));
 }
 
 void opus_moe_router_bwd_bf16(aiter_tensor_t& dp,       // [T,topk] fp32
                               aiter_tensor_t& topk_w,   // [T,topk] fp32
                               aiter_tensor_t& topk_ids, // [T,topk] i32
-                              aiter_tensor_t& dlogits)  // [T,E] fp32 pre-zeroed
+                              aiter_tensor_t& dlogits)  // [T,E] bf16 pre-zeroed
 {
     const int T    = static_cast<int>(dp.size(0));
     const int topk = static_cast<int>(dp.size(1));
@@ -637,7 +637,7 @@ void opus_moe_router_bwd_bf16(aiter_tensor_t& dp,       // [T,topk] fp32
         reinterpret_cast<const float*>(dp.data_ptr()),
         reinterpret_cast<const float*>(topk_w.data_ptr()),
         reinterpret_cast<const int32_t*>(topk_ids.data_ptr()),
-        reinterpret_cast<float*>(dlogits.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()),
         T, topk, E);
 }
 
