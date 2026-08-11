@@ -392,7 +392,7 @@ def build_gate_up_fp8_module(
             for i in range_constexpr(num_iter):
                 k_base = i * ktile_n + lane * kvector
                 x_word0 = (token_b * hidden + k_base) // 2
-                w_word0 = (w_row * hidden + k_base) // 4
+                w_word0 = w_row * (hidden // 4) + k_base // 4
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
                 gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
                 uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
@@ -424,7 +424,7 @@ def build_gate_up_fp8_module(
                 k_base = i * ktile_n + lane * kvector
                 # element bases -> word (i32) offsets: x 2 bf16/word, w 4 fp8/word.
                 x_word0 = (token_b * hidden + k_base) // 2
-                w_word0 = (w_row * hidden + k_base) // 4
+                w_word0 = w_row * (hidden // 4) + k_base // 4
                 # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
                 gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
@@ -604,7 +604,7 @@ def build_down_reduce_fp8_module(
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
                         load_i32_words(
-                            wd_rsrc, (w_row[h] * inter + k_base) // 4, n_wwords
+                            wd_rsrc, w_row[h] * (inter // 4) + k_base // 4, n_wwords
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -650,7 +650,7 @@ def build_down_reduce_fp8_module(
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
                         load_i32_words(
-                            wd_rsrc, (w_row[h] * inter + k_base) // 4, n_wwords
+                            wd_rsrc, w_row[h] * (inter // 4) + k_base // 4, n_wwords
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -816,7 +816,7 @@ def build_gate_up_fp4_module(
         for i in range_constexpr(num_iter):
             k_base = i * ktile_n + lane * kvector
             x_word0 = (token_b * hidden + k_base) // 2
-            w_word0 = (w_row * hidden + k_base) // 8
+            w_word0 = w_row * (hidden // 8) + k_base // 8
             xw = load_i32_words(x_rsrc, x_word0, n_pairs)
             gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
             uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
@@ -1008,7 +1008,9 @@ def build_down_reduce_fp4_module(
                 # Shared activation load + kh independent FP4 weight loads.
                 aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                 dw = [
-                    load_i32_words(wd_rsrc, (w_row[h] * inter + k_base) // 8, n_wwords)
+                    load_i32_words(
+                        wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
+                    )
                     for h in range(kh_per_warp)
                 ]
                 col_blk = k_base // scale_bk
