@@ -188,46 +188,49 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
     // One bf16x8 per thread covers a complete 16x128 tile collectively.
     const int load_k = tid / 16;
     const int load_f = (tid % 16) * 8;
-    auto load_stage = [&](int stage, int buf) {
+    auto load_global = [&](int stage, opus_bf16x8& av, opus_bf16x8& bv) {
         const int route_base = r0 + stage * OPUS_WGTN_BK;
+        const int route = route_base + load_k;
+        av = {};
+        bv = {};
+        if(route < r1)
+        {
+            const int mf = m0 + load_f;
+            const int nf = n0 + load_f;
+            if(mf + 7 < P)
+                av = *reinterpret_cast<const opus_bf16x8*>(
+                    dy + static_cast<int64_t>(route) * P + mf);
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < 8; ++i)
+                    av[i] = mf + i < P
+                                ? dy[static_cast<int64_t>(route) * P + mf + i]
+                                : (__bf16)0;
+            }
+            if(nf + 7 < Q)
+                bv = *reinterpret_cast<const opus_bf16x8*>(
+                    a + static_cast<int64_t>(route) * Q + nf);
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < 8; ++i)
+                    bv[i] = nf + i < Q
+                                ? a[static_cast<int64_t>(route) * Q + nf + i]
+                                : (__bf16)0;
+            }
+        }
+    };
+    auto store_stage = [&](int buf, const opus_bf16x8& av, const opus_bf16x8& bv) {
         auto as = opus::make_smem(&As[buf][0][0]);
         auto bs = opus::make_smem(&Bs[buf][0][0]);
-#pragma unroll
-        for(int kpack = 0; kpack < OPUS_WGTN_BK / 16; ++kpack)
-        {
-            const int tile_k = kpack * 16 + load_k;
-            const int route = route_base + tile_k;
-            opus_bf16x8 av = {}, bv = {};
-            if(route < r1)
-            {
-                const int mf = m0 + load_f;
-                const int nf = n0 + load_f;
-                if(mf + 7 < P)
-                    av = *reinterpret_cast<const opus_bf16x8*>(
-                        dy + static_cast<int64_t>(route) * P + mf);
-                else
-                {
-#pragma unroll
-                    for(int i = 0; i < 8; ++i)
-                        av[i] = mf + i < P
-                                    ? dy[static_cast<int64_t>(route) * P + mf + i]
-                                    : (__bf16)0;
-                }
-                if(nf + 7 < Q)
-                    bv = *reinterpret_cast<const opus_bf16x8*>(
-                        a + static_cast<int64_t>(route) * Q + nf);
-                else
-                {
-#pragma unroll
-                    for(int i = 0; i < 8; ++i)
-                        bv[i] = nf + i < Q
-                                    ? a[static_cast<int64_t>(route) * Q + nf + i]
-                                    : (__bf16)0;
-                }
-            }
-            as.template store<8>(av, tile_k * OPUS_WGTN_BM + load_f);
-            bs.template store<8>(bv, tile_k * OPUS_WGTN_BN + load_f);
-        }
+        as.template store<8>(av, load_k * OPUS_WGTN_BM + load_f);
+        bs.template store<8>(bv, load_k * OPUS_WGTN_BN + load_f);
+    };
+    auto load_stage = [&](int stage, int buf) {
+        opus_bf16x8 av, bv;
+        load_global(stage, av, bv);
+        store_stage(buf, av, bv);
     };
 
     opus_f32x16 vc[2][2];
@@ -251,8 +254,10 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
     for(int stage = 0; stage < num_k_stages; ++stage)
     {
         const int cur = stage & 1;
-        if(stage + 1 < num_k_stages)
-            load_stage(stage + 1, cur ^ 1);
+        const bool has_next = stage + 1 < num_k_stages;
+        opus_bf16x8 next_av, next_bv;
+        if(has_next)
+            load_global(stage + 1, next_av, next_bv);
 
 #pragma unroll
         for(int kpack = 0; kpack < OPUS_WGTN_BK / 16; ++kpack)
@@ -288,7 +293,12 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
                     vc[sm][sn] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
                         va[sm], vb[sn], vc[sm][sn], 0, 0, 0);
         }
-        __syncthreads();
+        if(has_next)
+        {
+            store_stage(cur ^ 1, next_av, next_bv);
+            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+            __syncthreads();
+        }
     }
 
     const int lm = lane % 32;
