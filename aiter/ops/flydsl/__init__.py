@@ -188,6 +188,30 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "flydsl_warp_decode_down_reduce": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce",
+    ),
+    "flydsl_warp_decode_down_reduce_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_bf16",
+    ),
+    "flydsl_warp_decode_down_reduce_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_fp4",
+    ),
+    "flydsl_warp_decode_gate_up": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up",
+    ),
+    "flydsl_warp_decode_gate_up_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_bf16",
+    ),
+    "flydsl_warp_decode_gate_up_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_fp4",
+    ),
 }
 
 __all__ = [
@@ -243,6 +267,12 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "flydsl_warp_decode_down_reduce",
+    "flydsl_warp_decode_down_reduce_bf16",
+    "flydsl_warp_decode_down_reduce_fp4",
+    "flydsl_warp_decode_gate_up",
+    "flydsl_warp_decode_gate_up_bf16",
+    "flydsl_warp_decode_gate_up_fp4",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
