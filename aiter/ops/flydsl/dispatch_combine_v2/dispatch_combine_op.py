@@ -667,6 +667,21 @@ class EpDispatchCombineOp:
         else:
             dispatch_specs = [(cfg.dispatch_block_num, cfg.dispatch_warp_num_per_block)]
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
+        # Pin the dispatch geometry via DISPATCH_BW (e.g. "32,8"), mirroring
+        # SCATTER_COMB_BW below. Pinning one spec makes _pick fall back to it for
+        # every token count, which is what a sweep wants.
+        #
+        # Measured on gfx1250 across bs=8/128/512 and both push_group paths: the
+        # only thing block_num controls is whether block*warp covers the
+        # cur_tok*topk work items in one grid-stride pass. Above coverage it is
+        # flat (bs=8 ran the same from 8 to 128 blocks), because the Phase-2 grid
+        # barrier is paced by how late the slowest payload block arrives, not by
+        # the per-block atomic on disp_bar. Below coverage each extra pass costs
+        # ~40% (bs=128 went 73 -> 102 -> 133 us at 96 -> 64 -> 32 blocks). So
+        # tune for coverage while latency-bound and ignore the block count.
+        _disp_bw = os.environ.get("DISPATCH_BW")
+        if _disp_bw:
+            dispatch_specs = [tuple(int(x) for x in _disp_bw.split(","))]
         if cfg.is_scatter:
             # Scatter combine hits an all-block grid barrier mid-kernel (Stage 1
             # write -> barrier -> Stage 3 read). With the gather-tuned (block=80,

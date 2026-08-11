@@ -89,15 +89,20 @@ def _is_gfx12():
         return False
 
 
-def waitcnt_all():
-    """Drain all outstanding memory counters (no cache management, unlike a
-    release fence). gpu.barrier/s_barrier only syncs wavefronts and does NOT
-    wait for in-flight memory ops, so this must precede a grid barrier when the
-    stores before it need to be complete. gfx12/gfx1250 split the legacy
-    s_waitcnt into per-kind counters."""
+def waitcnt_stores():
+    """Drain outstanding global stores (no cache management, unlike a release
+    fence). gpu.barrier/s_barrier only syncs wavefronts and does NOT wait for
+    in-flight memory ops, so this must precede a grid barrier when the stores
+    before it need to be complete.
+
+    Store completion alone is what makes those writes visible to a peer released
+    by the barrier; in-flight loads need no wait here because their results are
+    already ordered by the register dependencies that consume them. gfx12/gfx1250
+    split the legacy s_waitcnt into per-kind counters, so there the wait narrows
+    to storecnt; gfx9's unified vmcnt tracks loads and stores together and cannot
+    be narrowed."""
     if _is_gfx12():
         _rocdl_d.s_wait_storecnt(0)
-        _rocdl_d.s_wait_loadcnt(0)
     else:
         _rocdl_d.s_waitcnt(0)
 
