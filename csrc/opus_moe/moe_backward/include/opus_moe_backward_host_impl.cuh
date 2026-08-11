@@ -165,7 +165,10 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     // only on the runtime working set, not on an exact model shape.
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 5;
-    constexpr int cohort4_kid = 6;
+    // The large-working-set cohort also uses gfx950 buffer_load_*_lds so the
+    // three K32 operand vectors land directly in the existing swizzled tile.
+    // Small problems retain the register-load/LDS-store legacy kernel.
+    constexpr int cohort4_kid = 7;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     const uint64_t source_row_elements =

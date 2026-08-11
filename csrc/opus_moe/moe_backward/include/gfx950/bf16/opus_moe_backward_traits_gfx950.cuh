@@ -225,6 +225,7 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     // shortening the L2 reuse distance without serializing the whole grid by
     // expert.  Tuning candidates inherit this trait and override the policy.
     static constexpr int EXPERT_COHORT = 0;
+    static constexpr bool DIRECT_GMEM_TO_LDS = false;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -261,6 +262,12 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4
     : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
 {
     static constexpr int EXPERT_COHORT = 4;
+};
+
+struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4DirectLds
+    : Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4
+{
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.

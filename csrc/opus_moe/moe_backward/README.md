@@ -60,9 +60,9 @@ The layout follows forward `opus_moe_stage1`:
 6. `launch_fixed_pipeline` exposes K1--K5 as one explicit sequential host
    pipeline; tensor validation and kargs construction stay outside it.
 
-Failed tuning candidates and legacy fallback kernels do not belong in the
-instance table. Keep only configurations that are valid production dispatch
-targets.
+Failed tuning candidates do not belong in the instance table. Keep only
+configurations that are valid production dispatch targets, including a
+fallback when a genuinely different working-set regime needs it.
 
 ## Production instances
 
@@ -71,7 +71,9 @@ targets.
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
 | K2 `route_dx` | 5 | `BM32 x BN128 x BK64` |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
-| K4 `dw1` | 5 | `BM64 x BN128 x BK32` |
+| K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
+| K4 `dw1` cohort baseline | 6 | `BM64 x BN128 x BK32`, four-expert cohort |
+| K4 `dw1` large working set | 7 | `BM64 x BN128 x BK32`, cohort + direct GMEM-to-LDS |
 | K5 `dw2` | 3 | `BM64 x BN64 x BK64` |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
@@ -79,6 +81,13 @@ targets.
 Compact variable-routing instances use kid `100`. `RouteLayout` is a
 compile-time layout gate, so compact route ids cannot be decoded as fixed
 packed token/slot ids.
+
+K4 auto-dispatch uses runtime source working-set size rather than an exact
+model tuple. Kid 5 remains selected when the combined padded `dZ` and `X`
+sources are at most 128 MiB (or fewer than four experts are present). Larger
+working sets select kid 7. Kid 6 is retained as the register-load/LDS-store
+cohort baseline used to isolate and validate the direct-LDS optimization; it
+is not selected by auto-dispatch.
 
 ## Shape contract
 
