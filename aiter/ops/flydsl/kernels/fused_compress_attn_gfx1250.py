@@ -43,6 +43,7 @@ from aiter.ops.flydsl.kernels import buffer_ops, vector
 from .fused_compress_attn_common import (
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
+    state_slot_byte_offset,
 )
 from .tensor_shim import _run_compiled, _to_raw
 
@@ -482,9 +483,16 @@ def _build_kernel(
             # Buffer resources reused across K iters.
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -531,15 +539,14 @@ def _build_kernel(
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
 
+                # Slot term already folded into the descriptor base.
                 base_kv_off = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
                 base_sc_off = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
@@ -1132,19 +1139,21 @@ def _build_kernel(
                         dword = tuple(dword_list)
 
                     # Compute store address (in BYTES from kv_cache base).
-                    # Both layouts use the same base (= phys * block_stride);
-                    # the offset within the block differs.
+                    # Both layouts share the same block base, folded into the
+                    # descriptor above; only the in-block offset differs.
+                    # Block base on the descriptor, not on the 32-bit offset
+                    # -- see `block_base_bytes_i64`.
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
-                    block_byte_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 1
+                        ),
                     )
 
                     if const_expr(preshuffle):
                         # MFMA 16x16 tile layout
-                        # offset = block_base
-                        #        + token_tile_id * (TILE * D)
+                        # offset = token_tile_id * (TILE * D)
                         #        + col_tile_id * (TILE * TILE)
                         #        + token_in_tile * TILE
                         #        + col_in_tile
@@ -1166,12 +1175,12 @@ def _build_kernel(
                             + ArithValue(col_in_tile)
                         )
                     else:
-                        # Linear layout: phys * block_stride + slot * D + tid * VEC
+                        # Linear layout: slot * D + tid * VEC
                         in_block_off = ArithValue(slot_in_block) * arith.constant(
                             D, type=i32
                         ) + ArithValue(tid) * arith.constant(VEC, type=i32)
 
-                    byte_off = block_byte_base + in_block_off
+                    byte_off = in_block_off
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
@@ -1231,12 +1240,15 @@ def _build_kernel(
                     _if_l0 = scf.IfOp(is_lane0)
                     with _if_then(_if_l0):
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, cache_scale_block_stride, 4
+                            ),
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
-                            cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        buffer_ops.buffer_store(
+                            scale_v, cs_rsrc, ArithValue(slot_in_block)
+                        )
             # else: warmup -- no scatter, just consume compute.
 
     @flyc.jit
@@ -1492,9 +1504,16 @@ def _build_kernel_ksplit(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -1621,15 +1640,14 @@ def _build_kernel_ksplit(
                 s_safe = arith.select(is_pad, c_zero_i32, s)
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
+                # Slot term already folded into the descriptor base.
                 base_kv = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
                 base_sc = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
@@ -2042,11 +2060,14 @@ def _build_kernel_ksplit(
                             dword_list.append(pk)
                         dword = tuple(dword_list)
 
+                    # Block base on the descriptor, not on the 32-bit offset
+                    # -- see `block_base_bytes_i64`.
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
-                    )
-                    block_byte_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 1
+                        ),
                     )
 
                     if const_expr(preshuffle):
@@ -2071,7 +2092,7 @@ def _build_kernel_ksplit(
                             D, type=i32
                         ) + ArithValue(lid) * arith.constant(VEC, type=i32)
 
-                    byte_off = block_byte_base + in_block_off
+                    byte_off = in_block_off
 
                     if const_expr(VEC == 2):
                         is_even = arith.cmpi(
@@ -2125,12 +2146,15 @@ def _build_kernel_ksplit(
                     _if_l0 = scf.IfOp(is_lane0)
                     with _if_then(_if_l0):
                         cs_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale, max_size=True
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, cache_scale_block_stride, 4
+                            ),
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
-                            cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
-                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+                        buffer_ops.buffer_store(
+                            scale_v, cs_rsrc, ArithValue(slot_in_block)
+                        )
 
     @flyc.jit
     def launch_fused_compress_attn_ksplit(
@@ -2379,8 +2403,13 @@ def flydsl_fused_compress_attn_gfx1250(
         raise ValueError("score_state shape != kv_state")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
-    if not (kv_state.is_contiguous() and score_state.is_contiguous()):
-        raise ValueError("kv_state/score_state must be contiguous")
+    # Slot and ring strides are passed to the kernel and the descriptor is
+    # rebased per slot, so the states may be strided views — a per-request
+    # arena hands out a view whose slot stride is a whole entry. Only the
+    # innermost dim must be unit stride: the kernel addresses it as
+    # `col_off + lane`.
+    if kv_state.stride(-1) != 1 or score_state.stride(-1) != 1:
+        raise ValueError("kv_state/score_state inner stride must be 1")
     if ape.shape != (ratio, dim_full) or ape.dtype != torch.float32:
         raise ValueError(
             f"ape shape {tuple(ape.shape)} dtype {ape.dtype} != ({ratio}, {dim_full}) f32"

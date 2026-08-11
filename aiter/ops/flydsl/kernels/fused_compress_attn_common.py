@@ -54,9 +54,11 @@ def group_fp8_mx_dtype():
 def state_slot_byte_offset(slot, slot_stride_f32_elems):
     """`slot * slot_stride` in bytes, computed in 64 bits.
 
-    Both compress-attn kernels rebase their `kv_state` / `score_state` buffer
-    descriptors onto the program's own slot instead of carrying the slot term
-    in the load offset. A buffer offset is a 32-bit BYTE offset, so one
+    All four compress-attn kernels (CSA and HCA, wave64 and gfx1250) rebase
+    their `kv_state` / `score_state` buffer descriptors onto the program's own
+    slot instead of carrying the slot term in the load offset, so a caller may
+    hand any of them a strided per-request arena view. A buffer offset is a
+    32-bit BYTE offset, so one
     descriptor reaches at most 4 GiB from its base — which the slot term
     alone can exceed once the caller's state tensor is a view whose slot
     stride is a whole per-request arena entry rather than the field's own
@@ -86,11 +88,17 @@ def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
     layer-major predecessor still wrapped at block 65,536 for a CSA layer, well
     inside a pool that routinely holds 150,000.
 
-    ``block_stride`` is in elements of the cache's own dtype; ``elem_bytes``
-    converts (1 for the fp8 entry cache, 2 for a bf16 one).
+    ``block_stride`` is in elements of the cache's own dtype and may be either
+    a runtime value (the caller passed the tensor's stride) or a Python int
+    (the packed fp4/preshuffle layouts derive it from compile-time shape
+    constants). ``elem_bytes`` converts: 1 for the fp8/uint8 entry caches, 2
+    for a bf16 one, 4 for the fp32 per-token scale.
     """
     blk_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(physical_block))
-    stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(block_stride))
+    if isinstance(block_stride, int):
+        stride_i64 = arith.constant(block_stride, type=T.i64)
+    else:
+        stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(block_stride))
     base = arith.muli(blk_i64, stride_i64)
     if elem_bytes == 1:
         return base
