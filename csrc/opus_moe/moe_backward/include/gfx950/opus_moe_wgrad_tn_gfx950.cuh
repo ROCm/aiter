@@ -78,6 +78,94 @@ __device__ inline opus_bf16x8 opus_wgtn_materialize_fragment(opus_bf16x8 x)
     return __builtin_bit_cast(opus_bf16x8, dst);
 }
 
+// Minimal fixed-register wrappers for the aligned 8-wave kernel. Keeping these
+// local avoids making the whole backward module depend on an external template
+// library merely to name physical VGPR/AGPR operands in four ISA instructions.
+#define OPUS_WGTN_CLOBBER_V8(A, B, C, D, E, F, G, H) \
+    asm volatile("" ::: "v" #A, "v" #B, "v" #C, "v" #D, \
+                         "v" #E, "v" #F, "v" #G, "v" #H)
+#define OPUS_WGTN_CLOBBER_A8(A, B, C, D, E, F, G, H) \
+    asm volatile("" ::: "a" #A, "a" #B, "a" #C, "a" #D, \
+                         "a" #E, "a" #F, "a" #G, "a" #H)
+
+__device__ inline void opus_wgtn_clobber_fixed_regs()
+{
+    OPUS_WGTN_CLOBBER_V8(96, 97, 98, 99, 100, 101, 102, 103);
+    OPUS_WGTN_CLOBBER_V8(104, 105, 106, 107, 108, 109, 110, 111);
+    OPUS_WGTN_CLOBBER_V8(112, 113, 114, 115, 116, 117, 118, 119);
+    OPUS_WGTN_CLOBBER_A8(0, 1, 2, 3, 4, 5, 6, 7);
+    OPUS_WGTN_CLOBBER_A8(8, 9, 10, 11, 12, 13, 14, 15);
+    OPUS_WGTN_CLOBBER_A8(16, 17, 18, 19, 20, 21, 22, 23);
+    OPUS_WGTN_CLOBBER_A8(24, 25, 26, 27, 28, 29, 30, 31);
+    OPUS_WGTN_CLOBBER_A8(32, 33, 34, 35, 36, 37, 38, 39);
+    OPUS_WGTN_CLOBBER_A8(40, 41, 42, 43, 44, 45, 46, 47);
+    OPUS_WGTN_CLOBBER_A8(48, 49, 50, 51, 52, 53, 54, 55);
+    OPUS_WGTN_CLOBBER_A8(56, 57, 58, 59, 60, 61, 62, 63);
+    OPUS_WGTN_CLOBBER_A8(64, 65, 66, 67, 68, 69, 70, 71);
+    OPUS_WGTN_CLOBBER_A8(72, 73, 74, 75, 76, 77, 78, 79);
+    OPUS_WGTN_CLOBBER_A8(80, 81, 82, 83, 84, 85, 86, 87);
+    OPUS_WGTN_CLOBBER_A8(88, 89, 90, 91, 92, 93, 94, 95);
+    OPUS_WGTN_CLOBBER_A8(96, 97, 98, 99, 100, 101, 102, 103);
+    OPUS_WGTN_CLOBBER_A8(104, 105, 106, 107, 108, 109, 110, 111);
+    OPUS_WGTN_CLOBBER_A8(112, 113, 114, 115, 116, 117, 118, 119);
+    OPUS_WGTN_CLOBBER_A8(120, 121, 122, 123, 124, 125, 126, 127);
+}
+
+#undef OPUS_WGTN_CLOBBER_V8
+#undef OPUS_WGTN_CLOBBER_A8
+
+template<int GPR_START>
+__device__ inline void opus_wgtn_ds_read_b64_tr_b16(uint32_t smem_ptr)
+{
+    asm volatile("ds_read_b64_tr_b16 v[%0:%1], %2 offset:0"
+                 :
+                 : "n"(GPR_START), "n"(GPR_START + 1), "v"(smem_ptr)
+                 : "memory");
+}
+
+template<int A, int B, int D>
+__device__ inline void opus_wgtn_mfma_zero()
+{
+    asm volatile("v_mfma_f32_32x32x16_bf16 a[%0:%1], "
+                 "v[%2:%3], v[%4:%5], 0"
+                 :
+                 : "n"(D - 256), "n"(D + 15 - 256),
+                   "n"(A), "n"(A + 3), "n"(B), "n"(B + 3));
+}
+
+template<int A, int B, int C, int D>
+__device__ inline void opus_wgtn_mfma_accum()
+{
+    asm volatile("v_mfma_f32_32x32x16_bf16 a[%0:%1], "
+                 "v[%2:%3], v[%4:%5], a[%6:%7]"
+                 :
+                 : "n"(D - 256), "n"(D + 15 - 256),
+                   "n"(A), "n"(A + 3), "n"(B), "n"(B + 3),
+                   "n"(C - 256), "n"(C + 15 - 256));
+}
+
+template<int GPR>
+__device__ inline uint32_t opus_wgtn_read_acc()
+{
+    uint32_t value;
+    asm volatile("v_accvgpr_read_b32 %0, a[%1]"
+                 : "=v"(value)
+                 : "n"(GPR - 256));
+    return value;
+}
+
+template<int GPR_START, typename Smem, typename Layout>
+__device__ inline void opus_wgtn_fixed_tr_fragment(Smem& src, const Layout& layout)
+{
+    auto offsets = opus::layout_to_offsets<4>(layout);
+    const uint32_t addr0 = static_cast<uint32_t>(
+        reinterpret_cast<__UINTPTR_TYPE__>(src.ptr + offsets[0] * sizeof(__bf16)));
+    const uint32_t addr1 = static_cast<uint32_t>(
+        reinterpret_cast<__UINTPTR_TYPE__>(src.ptr + offsets[1] * sizeof(__bf16)));
+    opus_wgtn_ds_read_b64_tr_b16<GPR_START>(addr0);
+    opus_wgtn_ds_read_b64_tr_b16<GPR_START + 2>(addr1);
+}
+
 // dy [M,P] bf16, a [M,Q] bf16 (compact, expert-grouped), offs [E+1] i32,
 // dW [E,P,Q] bf16. grid(ceil(Q/128), ceil(P/128), E), block 256 (4 waves).
 __global__ void opus_moe_wgrad_tn_direct_kernel(const __bf16* __restrict__ dy,
@@ -329,11 +417,14 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
 // transpose-read/MFMA mapping of the verified 128x128 kernel above while
 // halving operand traffic per output element.
 __global__ __launch_bounds__(512, 1)
+__attribute__((amdgpu_num_vgpr(120)))
 void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                                     const __bf16* __restrict__ a,
                                     const int32_t* __restrict__ offs,
                                     __bf16* __restrict__ dW, int P, int Q)
 {
+    opus_wgtn_clobber_fixed_regs();
+
     constexpr int BM = 256;
     constexpr int BN = 256;
     constexpr int BK = 32;
@@ -386,15 +477,6 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         bs.template store<8>(x.b1, os + 8);
     };
 
-    opus_f32x16 vc[4][2];
-#pragma unroll
-    for(int sm = 0; sm < 4; ++sm)
-#pragma unroll
-        for(int sn = 0; sn < 2; ++sn)
-#pragma unroll
-            for(int i = 0; i < 16; ++i)
-                vc[sm][sn][i] = 0.0f;
-
     if(num_k_stages > 0)
     {
         load_regs first;
@@ -415,36 +497,37 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
         for(int kpack = 0; kpack < 2; ++kpack)
         {
-            opus_bf16x8 va[4], vb[2];
-#pragma unroll
-            for(int sm = 0; sm < 4; ++sm)
-            {
+            opus::static_for<4>([&](auto sm) {
                 auto smem = opus::make_smem(
-                    &As[cur][kpack * 16][wm * 128 + sm * 32]);
-                va[sm] = __builtin_bit_cast(
-                    opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
-            }
-#pragma unroll
-            for(int sn = 0; sn < 2; ++sn)
-            {
+                    &As[cur][kpack * 16][wm * 128 + sm.value * 32]);
+                opus_wgtn_fixed_tr_fragment<96 + sm.value * 4>(smem, tr_layout);
+            });
+            opus::static_for<2>([&](auto sn) {
                 auto smem = opus::make_smem(
-                    &Bs[cur][kpack * 16][wn * 64 + sn * 32]);
-                vb[sn] = __builtin_bit_cast(
-                    opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
-            }
+                    &Bs[cur][kpack * 16][wn * 64 + sn.value * 32]);
+                opus_wgtn_fixed_tr_fragment<112 + sn.value * 4>(smem, tr_layout);
+            });
             opus::s_waitcnt_lgkmcnt(opus::number<0>{});
-#pragma unroll
-            for(int sm = 0; sm < 4; ++sm)
-                va[sm] = opus_wgtn_materialize_fragment(va[sm]);
-#pragma unroll
-            for(int sn = 0; sn < 2; ++sn)
-                vb[sn] = opus_wgtn_materialize_fragment(vb[sn]);
-#pragma unroll
-            for(int sm = 0; sm < 4; ++sm)
-#pragma unroll
-                for(int sn = 0; sn < 2; ++sn)
-                    vc[sm][sn] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
-                        va[sm], vb[sn], vc[sm][sn], 0, 0, 0);
+            if(stage == 0 && kpack == 0)
+            {
+                opus::static_for<4>([&](auto sm) {
+                    opus::static_for<2>([&](auto sn) {
+                        constexpr int c = 256 + (sm.value * 2 + sn.value) * 16;
+                        opus_wgtn_mfma_zero<
+                            96 + sm.value * 4, 112 + sn.value * 4, c>();
+                    });
+                });
+            }
+            else
+            {
+                opus::static_for<4>([&](auto sm) {
+                    opus::static_for<2>([&](auto sn) {
+                        constexpr int c = 256 + (sm.value * 2 + sn.value) * 16;
+                        opus_wgtn_mfma_accum<
+                            96 + sm.value * 4, 112 + sn.value * 4, c, c>();
+                    });
+                });
+            }
         }
 
         if(has_next)
@@ -457,26 +540,19 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
     const int lm = lane % 32;
     const int64_t dW_e = static_cast<int64_t>(e) * P * Q;
-#pragma unroll
-    for(int sm = 0; sm < 4; ++sm)
-    {
-        const int p_base = m0 + wm * 128 + sm * 32 + (lane / 32) * 4;
-#pragma unroll
-        for(int sn = 0; sn < 2; ++sn)
-        {
-            const int q = n0 + wn * 64 + sn * 32 + lm;
-            if(q >= Q)
-                continue;
-#pragma unroll
-            for(int i = 0; i < 16; ++i)
-            {
-                const int p = p_base + (i / 4) * 8 + (i % 4);
-                if(p < P)
-                    dW[dW_e + static_cast<int64_t>(p) * Q + q] =
-                        (__bf16)vc[sm][sn][i];
-            }
-        }
-    }
+    opus::static_for<4>([&](auto sm) {
+        const int p_base = m0 + wm * 128 + sm.value * 32 + (lane / 32) * 4;
+        opus::static_for<2>([&](auto sn) {
+            const int q = n0 + wn * 64 + sn.value * 32 + lm;
+            opus::static_for<16>([&](auto i) {
+                constexpr int c = 256 + (sm.value * 2 + sn.value) * 16 + i.value;
+                const int p = p_base + (i.value / 4) * 8 + (i.value % 4);
+                const uint32_t bits = opus_wgtn_read_acc<c>();
+                const float value = __builtin_bit_cast(float, bits);
+                dW[dW_e + static_cast<int64_t>(p) * Q + q] = (__bf16)value;
+            });
+        });
+    });
 }
 
 inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
