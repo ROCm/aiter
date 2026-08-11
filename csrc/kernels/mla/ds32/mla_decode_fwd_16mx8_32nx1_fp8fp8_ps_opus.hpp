@@ -42,6 +42,14 @@ constexpr int MFMA    = 0x08;
 constexpr int VALU    = 0x02;
 constexpr int DS_READ = 0x100;
 constexpr int EXP     = 0x400;
+
+// sched_barrier mask that blocks only DS reads (0x80 all-DS + 0x100 DS-read) and lets
+// everything else cross. It keeps the load/store optimiser from re-associating two
+// ds_read_b64 into one ds_read2_b64, which measures ~16 LDS index cycles against 2 x 2
+// for the separate reads -- and does so even at a perfectly linear address, so the cost
+// is the paired instruction form, not the bank layout. The mask has to stay permissive
+// because this sits inside the GEMM0 region that sched_compute_qk() interleaves.
+constexpr int KEEP_DS_READ_ORDER = 0x67F;
 } // namespace sched_masks
 
 // Interleave the GEMM0 region (dsa_v32's sched_compute_qk_dsa applied to this kernel's
@@ -307,17 +315,23 @@ __device__ inline auto make_layout_sk_rope(int warp_id)
 }
 
 // LDS -> register map for the K rope A-operand (fed to the plain fp8 16x16x32 MFMA).
+//
+// One e_n token tile per layout, i.e. exactly one ds_read_b64 per load<>; the caller
+// adds the tile's own e_n base (rope_en_off below). GEMM0_E_N used to be a y-dim here,
+// so a single load<> emitted two DS reads and the load/store optimiser paired them --
+// with the two ek steps that gave two ds_read2_b64 per tile, 32 LDS index cycles where
+// four separate ds_read_b64 cost 8. Splitting the tile out is what lets the caller fence
+// the reads apart (sched_masks::KEEP_DS_READ_ORDER).
 template <typename T>
 __device__ inline auto make_layout_rk_rope(int lane_id)
 {
-    constexpr auto rk_block_shape = opus::make_tuple(opus::number<T::GEMM0_E_N>{},           // 2
-                                                     opus::number<T::smem_n_rpt>{},          // 4
+    constexpr auto rk_block_shape = opus::make_tuple(opus::number<T::smem_n_rpt>{},          // 4
                                                      opus::number<T::W_N / T::smem_n_rpt>{}, // 2
                                                      opus::number<T::WARP_SIZE / T::W_N>{},  // 4
                                                      opus::number<T::VEC_KV_ROPE>{});        // 8
 
     constexpr auto rk_block_dim =
-        opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}), // 4
+        opus::make_tuple(opus::make_tuple(opus::p_dim{}),
                          opus::make_tuple(opus::p_dim{}),
                          opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
@@ -667,6 +681,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                                                 mfma_adaptor_swap_ab{});
 
     using k_nope_tile_t = vector_t<D_K, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
+    using k_rope_tile_t = vector_t<D_K, T::W_N * T::W_K_ROPE / T::WARP_SIZE>;
     using v_tile_t      = vector_t<D_K, T::W_N * T::W_K_ROPE / T::WARP_SIZE>;
     using s_tile_t      = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
@@ -706,6 +721,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // k_nope_ds_read_insts / v_ds_read_insts waitcnt budgets still hold.
     constexpr auto k_en_off = number<T::smem_n_rpt * T::D_128B_NOPE_SIZE>{};
     constexpr auto v_en_off = number<T::W_N>{};
+    constexpr auto rope_en_off =
+        number<T::smem_n_rpt*(T::smem_linear_wave_rope + T::smem_padding_rope)>{};
 
     auto load_k_nope = [&](auto& dst, auto noff, auto slice) {
         auto* tile = reinterpret_cast<k_nope_tile_t*>(&dst);
@@ -767,9 +784,20 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             }
         });
     };
+    // The four rope DS reads are fenced apart so the load/store optimiser cannot pair any
+    // two of them into a ds_read2_b64 (see sched_masks::KEEP_DS_READ_ORDER). Program order
+    // is e_n 0,1 of ek 0 then e_n 0,1 of ek 1, which is what makes the lgkmcnt budget below
+    // land on "k[0] complete, k[1] still in flight".
+    auto load_k_rope = [&](auto& dst, auto noff, auto slice) {
+        auto* tile = reinterpret_cast<k_rope_tile_t*>(&dst);
+        tile[0]    = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff + slice);
+        __builtin_amdgcn_sched_barrier(sched_masks::KEEP_DS_READ_ORDER);
+        tile[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff + slice + rope_en_off);
+    };
     auto compute_qk_rope = [&](auto& s, auto& q, auto& k, auto noff) {
-        k[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff);
-        k[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff + sk_rope_slice(1_I));
+        load_k_rope(k[0], noff, sk_rope_slice(0_I));
+        __builtin_amdgcn_sched_barrier(sched_masks::KEEP_DS_READ_ORDER);
+        load_k_rope(k[1], noff, sk_rope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_rope_ds_read_insts>{});
         s = mma0_rope(q[0], k[0], s);
         s_waitcnt_lgkmcnt(0_I);
