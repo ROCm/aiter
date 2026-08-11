@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
@@ -8,7 +9,7 @@ def _reduce_grouped(
     X,
     stride_xb: tl.uint64,
     stride_xm: tl.uint64,
-    stride_xn,  #
+    stride_xn,
     Out,
     stride_om: tl.uint64,
     stride_on,  # output tensor

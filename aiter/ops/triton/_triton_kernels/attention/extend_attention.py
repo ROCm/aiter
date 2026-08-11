@@ -18,17 +18,16 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 import functools
-import json
+
 import torch
 import triton
 import triton.language as tl
 
-
 from aiter.ops.triton._triton_kernels.activation import _tanh
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 _fwd_kernel_extend_repr = make_kernel_repr(
     "_fwd_kernel",
@@ -321,16 +320,13 @@ def _fwd_kernel(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(HEAD_SIZE, dtype):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
+    dev = arch_info.get_arch()
+    config = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json"
+    )
 
     # HEAD_SIZE 192 = 128 head and 64 pe head dim
     if (HEAD_SIZE > 192) or dtype == torch.float32:
-        return _get_config._config_dict["large_head_or_fp32"]
+        return config["large_head_or_fp32"]
 
-    return _get_config._config_dict["default"]
+    return config["default"]

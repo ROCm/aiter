@@ -82,6 +82,45 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/multigpu_tests/bench_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 versus Mori EP performance guards on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env MORI_SOCKET_IFNAME=lo MORI_SHMEM_HEAP_SIZE=40G
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    bench=$1
+                    for spec in \
+                        "512 uniform 0.6" \
+                        "512 rank-mixed-skew 1.0" \
+                        "8192 uniform 0.6" \
+                        "8192 rank-mixed-skew 1.0"; do
+                        read -r tokens route bias <<< "$spec"
+                        torchrun --standalone --nproc_per_node=8 "$bench" \
+                            --tokens "$tokens" --mtpr 8192 --route "$route" \
+                            --hot-bias "$bias" --iters 20 --perf-guard
+                    done
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env MORI_SHMEM_HEAP_SIZE=40G
+                timeout 60m
+                torchrun --standalone --nproc_per_node=8 "$file"
+                --network v4_pro
+                --bs-list 128,512
+                --iters 10
+                --accuracy-max-bs 512
+                --rtol 0.10
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
@@ -129,7 +168,8 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
         "-c 98304 -b 1 -n 16,1 -kvd fp8" \
         "-c 10000 100000 -b 1 3 4 -n 12,1 16,1 -kvd bf16 -lse" \
-        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse"; do
+        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse" \
+        "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
         if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true

@@ -6,19 +6,49 @@
 import functools
 import os
 import re
-from typing import Dict, Optional
 
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-_KERNEL_PARAMS: Dict[str, Dict] = {}
+_KERNEL_PARAMS: dict[str, dict] = {}
+
+# HIP limits grid.y/grid.z to 65535.
+_HIP_MAX_GRID_DIM_Y = 65535
 
 
 def _get_dtypes():
     from aiter.utility import dtypes
 
     return dtypes
+
+
+@functools.lru_cache(maxsize=256)
+def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int):
+    """Emit a one-time (deduped) warning when a requested tile is force-changed.
+
+    Deduped by (axis, inter_dim, requested, resolved) so it fires once per shape
+    during tuning/serving instead of every launch.
+    """
+    try:
+        from aiter import logger
+    except ImportError:  # pragma: no cover - logging must never break the kernel
+        import logging
+
+        logger = logging.getLogger("aiter")
+    logger.warning(
+        "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "config naming tile=%d here actually runs %d.",
+        axis,
+        requested,
+        inter_dim,
+        axis,
+        resolved,
+        requested,
+        requested,
+        resolved,
+    )
 
 
 _SUFFIX_RE = re.compile(
@@ -46,7 +76,90 @@ def flydsl_kernel_name(
     return name
 
 
-def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
+def pick_flydsl_stage2_tile_k(inter_dim: int) -> int:
+    """Heuristic stage2 K-tile size for FlyDSL mxfp4/mxfp8 MoE.
+
+    ``inter_dim % 256 != 0`` (e.g. DSV4 TP8 ``inter=640``) must use
+    ``tile_k=128``; ``tile_k=256`` only tiles cleanly when K is 256-aligned.
+    Matches ``fused_moe.get_2stage_cfgs`` FlyDSL fallback (``_s2_tk``).
+    """
+    inter_dim = int(inter_dim)
+    return 256 if (inter_dim % 256 == 0) else 128
+
+
+def pick_flydsl_stage1_tile_n(inter_dim: int) -> int:
+    """Heuristic stage1 N-tile size for FlyDSL a16w4/mxfp4 MoE.
+
+    ``inter_dim % 256 != 0`` must use ``tile_n=128``; ``tile_n=256`` only
+    tiles cleanly on the N (gate/up) axis when ``inter_dim`` is 256-aligned.
+    """
+    inter_dim = int(inter_dim)
+    return 256 if (inter_dim % 256 == 0) else 128
+
+
+def resolve_flydsl_grid_y_persist_m(
+    num_m_blocks: int, requested_persist_m: int = 0
+) -> int:
+    """Increase persist_m as needed to keep grid.y within HIP's limit."""
+    num_m_blocks = max(int(num_m_blocks), 0)
+    requested_persist_m = max(int(requested_persist_m), 1)
+    required_persist_m = max(
+        1, (num_m_blocks + _HIP_MAX_GRID_DIM_Y - 1) // _HIP_MAX_GRID_DIM_Y
+    )
+    return max(requested_persist_m, required_persist_m)
+
+
+def requires_flydsl_stage2_reduce(
+    token_num: int, model_dim: int, element_size: int
+) -> bool:
+    """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
+    return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
+
+
+def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
+    """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
+
+    For non-256-aligned ``inter_dim`` (e.g. DSV4 ``inter=640``) the stage2 K axis
+    cannot be tiled with ``tile_k=256`` (OOB reads), so this forces the largest
+    legal tile (``pick_flydsl_stage2_tile_k`` -> 128). The downgrade is silent by
+    default but logs a one-time warning, because it means ``tile_k=256`` is NOT
+    tunable for such shapes: a tuned config that names a 256 kernel here actually
+    runs 128. Tuners should not offer 256 candidates for non-256 ``inter_dim``.
+    """
+    inter_dim = int(inter_dim)
+    tile_k = int(tile_k)
+    if inter_dim % tile_k == 0:
+        return tile_k
+    auto = pick_flydsl_stage2_tile_k(inter_dim)
+    if inter_dim % auto == 0:
+        _warn_tile_override("tile_k", inter_dim, tile_k, auto)
+        return auto
+    return tile_k
+
+
+def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
+    """Return a ``tile_n`` that divides ``inter_dim``, preferring the caller value.
+
+    For non-256-aligned ``inter_dim`` (e.g. MiniMax TP4 ``inter=384``) the stage1
+    gate/up (N) axis cannot be tiled with ``tile_n=256`` (OOB reads -> wrong output
+    or memfault), so this forces the largest legal tile
+    (``pick_flydsl_stage1_tile_n`` -> 128). The downgrade is silent by default but
+    logs a one-time warning, because it means ``tile_n=256`` is NOT tunable for
+    such shapes: a tuned config that names a 256 kernel here actually runs 128.
+    Tuners should not offer 256 candidates for non-256 ``inter_dim``.
+    """
+    inter_dim = int(inter_dim)
+    tile_n = int(tile_n)
+    if inter_dim % tile_n == 0:
+        return tile_n
+    auto = pick_flydsl_stage1_tile_n(inter_dim)
+    if inter_dim % auto == 0:
+        _warn_tile_override("tile_n", inter_dim, tile_n, auto)
+        return auto
+    return tile_n
+
+
+def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
     Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
@@ -59,7 +172,7 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
         base_name = name[: m.start()]
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
-            extra: Dict = {}
+            extra: dict = {}
             if m.group("kw") is not None:
                 extra["k_wave"] = int(m.group("kw"))
             if m.group("fp4"):
@@ -74,20 +187,24 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
 
 def get_flydsl_stage1_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+) -> dict[str, dict]:
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
+    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
+    # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
+    # (t32x{64,128}x128 / _xcd1), which the other dtypes don't use.
+    is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
-    tile_ks = [256]
-    tile_ms = [32, 64, 128]
+    tile_ks = [128, 256] if is_a16w4 else [256]
+    tile_ms = [16, 32, 64, 128] if a_dtype == "fp8" and is_fp4_b else [32, 64, 128]
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
-    xcd_swizzles = [0, 4]
+    xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
         if tm == 32:
@@ -169,7 +286,7 @@ def get_flydsl_stage1_kernels(
 
 def get_flydsl_stage2_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+) -> dict[str, dict]:
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
@@ -221,8 +338,90 @@ def get_flydsl_stage2_kernels(
     return kernels
 
 
+def build_flydslv2_gemm2_name(
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    *,
+    tm,
+    epilog,
+    persist,
+    use_nt,
+    sbm=0,
+    tn=256,
+    tk=256,
+):
+    """Build a v2 layout GEMM2 name matching ``_FLYDSL_V2_GEMM2_RE``."""
+    name = (
+        f"flydsl_moe2_layout_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tm}x{tn}x{tk}_{epilog}"
+    )
+    if persist:
+        name += "_persist"
+    if use_nt:
+        name += "_nt"
+    if sbm:
+        name += f"_sbm{sbm}"
+    return name
+
+
+def get_flydsl_stage2_v2_kernels(
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    block_m,
+    model_dim=None,
+    inter_dim=None,
+):
+    """Return v2 layout GEMM2 candidates, optionally filtered for a shape."""
+    kernels = {}
+    # tile_m=16 requires the native SBM16 layout: its A-scale chunks are only
+    # valid when the sort block (sbm=block_m) is also 16, so re-tiling a larger
+    # sort block down to 16 is excluded.
+    bms = [
+        b
+        for b in (16, 32, 64, 128)
+        if b <= block_m and block_m % b == 0 and (b != 16 or block_m == 16)
+    ]
+    tile_ns = [tn for tn in (128, 256) if model_dim is None or model_dim % tn == 0]
+    tile_ks = [tk for tk in (128, 256) if inter_dim is None or inter_dim % tk == 0]
+    persists = [False, True] if a_dtype == "fp4" else [False]
+    for tm in bms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for epilog in ("atomic", "reduce"):
+                    for use_nt in (True, False):
+                        for persist in persists:
+                            name = build_flydslv2_gemm2_name(
+                                a_dtype,
+                                b_dtype,
+                                out_dtype,
+                                tm=tm,
+                                tn=tn,
+                                tk=tk,
+                                epilog=epilog,
+                                persist=persist,
+                                use_nt=use_nt,
+                                sbm=block_m,
+                            )
+                            kernels[name] = {
+                                "stage": 2,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": tm,
+                                "tile_n": tn,
+                                "tile_k": tk,
+                                "epilog": epilog,
+                                "use_nt": use_nt,
+                                "persist": persist,
+                                "sort_block_m": block_m,
+                                "v2": True,
+                            }
+    return kernels
+
+
 def _register_production_variants_stage2(
-    kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
+    kernels: dict[str, dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:
     """Append hand-tuned stage2 variants to ``kernels`` in-place."""
     # (a, b, out, tile_m, tile_n, tile_k, mode, suffix, overrides)
@@ -253,7 +452,7 @@ def _register_production_variants_stage2(
         kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
-def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 stage1 configs."""
     kernels = {}
     a_dtype = "bf16"
@@ -287,7 +486,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
-def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 stage2 configs."""
     kernels = {}
     a_dtype = "bf16"
@@ -327,7 +526,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
+    for a in ("fp8", "fp4", "fp16", "bf16"):
         for b in ("fp4",):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
@@ -358,6 +557,8 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -370,11 +571,36 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
+    # a16w4 (bf16 A x fp4 W) SiTUv2: build the ported gemm1 (moe_2stage_a16wmix),
+    # consuming the standard GGUU W1+scale layout (w_layout="standard"), matching main.
+    if a_dtype == "bf16" and b_dtype == "fp4":
+        from flydsl.runtime.device import get_rocm_arch
+
+        from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+
+        return compile_gemm1_a16w4_port(
+            BM=tile_m,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            NE=experts,
+            TOPK=topk,
+            TILE_N=tile_n,
+            TILE_K=tile_k,
+            act=act,
+            b_cache_mod=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=waves_per_eu,
+            w_dtype="fp4",
+            w_layout="standard",
+            k_wave=k_wave,
+            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
+            use_k16="gfx95" not in str(get_rocm_arch()),
+        )
     if b_dtype in ("fp4", "fp8"):
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
-        from .moe_common import GateMode
+        from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -389,6 +615,8 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             persist_m=persist_m,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
@@ -401,6 +629,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            v2_output_layout=v2_output_layout,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -446,7 +675,7 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
@@ -456,6 +685,27 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
+    # a16w4 (bf16 A x fp4 W) down-proj: build the ported gemm2 (moe_2stage_a16wmix);
+    # its gate_up=False W2+scale layout matches the standard shuffle_weight/e8m0.
+    if a_dtype == "bf16" and b_dtype == "fp4":
+        from flydsl.runtime.device import get_rocm_arch
+
+        from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
+
+        return compile_gemm2_a16w4_port(
+            BM=tile_m,
+            NE=experts,
+            N_OUT=model_dim,
+            D_INTER=inter_dim,
+            TILE_N=tile_n,
+            TILE_K=tile_k,
+            xcd_swizzle=xcd_swizzle,
+            b_cache_mod=b_nt,
+            waves_per_eu=waves_per_eu,
+            w_dtype="fp4",
+            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
+            use_k16="gfx95" not in str(get_rocm_arch()),
+        )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -528,7 +778,7 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
     )
 
 
-def runtime_swiglu_limit(swiglu_limit: Optional[float], act: str) -> float:
+def runtime_swiglu_limit(swiglu_limit: float | None, act: str) -> float:
     """Normalize swiglu_limit into the runtime f32 clamp bound passed to kernels.
 
     The kernels always clamp using this value, so "no clamp" is encoded as +inf:
@@ -560,12 +810,13 @@ def _s1_args_fp4(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    pass_swiglu_limit: bool = True,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
     if stream is None:
         stream = torch.cuda.current_stream()
-    return (
+    args = (
         ptr_arg(out),
         ptr_arg(a),
         ptr_arg(w),
@@ -581,9 +832,10 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
-        float(swiglu_limit),
-        stream,
     )
+    if pass_swiglu_limit:
+        return args + (float(swiglu_limit), stream)
+    return args + (stream,)
 
 
 def _s1_args_std(
@@ -723,7 +975,7 @@ def _run_compiled(exe, args):
 
             while ir.Context.current is not None:
                 ir.Context.current.__exit__(None, None, None)
-        except Exception:
+        except Exception:  # noqa: BLE001,S110 - best-effort context cleanup
             pass
         raise
 
@@ -737,6 +989,7 @@ def _run_moe_reduction(
     expert_mask=None,
     topk_ids=None,
     stream=None,
+    is_fp8=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -764,36 +1017,40 @@ def _run_moe_reduction(
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         return
 
-    from .kernels.moe_gemm_2stage import compile_moe_reduction
+    from .kernels.moe_reduce import compile_moe_reduction
 
+    # fp8 route-out: X is a flat uint8 [rows, model_dim + model_dim/8] buffer,
+    # reduced (fp8 * e8m0) -> out.dtype. Dense dtypes reduce the contiguous
+    # X[tokens, topk, model_dim]. out_dtype_str is only used by the fp8 path.
+    out_dtype_str = _reduce_dtype_str
+    if is_fp8:
+        _reduce_dtype_str = "fp8"
+        out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+        X = target
+    else:
+        X = target.view(token_num, topk, model_dim)
+    if use_mask:
+        em = expert_mask.to(torch.int32).contiguous()
+        tk = topk_ids.to(torch.int32).contiguous()
+    else:
+        # Placeholders; kernel ignores them when use_mask=False (and for fp8).
+        em = torch.empty(0, device=out.device, dtype=torch.int32)
+        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
+    num_experts = int(expert_mask.numel()) if use_mask else 0
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
-        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-        num_experts=int(expert_mask.numel()) if use_mask else 0,
+        num_experts=num_experts,
+        out_dtype_str=out_dtype_str,
     )
-    X = target.view(token_num, topk, model_dim)
-    if use_mask:
-        em = expert_mask.to(torch.int32).contiguous()
-        tk = topk_ids.to(torch.int32).contiguous()
-    else:
-        # Placeholders; kernel ignores them when use_mask=False.
-        em = torch.empty(0, device=out.device, dtype=torch.int32)
-        tk = torch.empty(0, device=out.device, dtype=torch.int32)
-    if stream is None:
-        stream = torch.cuda.current_stream()
     _run_compiled(
         reduce_exe,
-        (
-            ptr_arg(X),
-            ptr_arg(out),
-            ptr_arg(em),
-            ptr_arg(tk),
-            token_num,
-            stream,
-        ),
+        (ptr_arg(X), ptr_arg(out), ptr_arg(em), ptr_arg(tk), token_num, stream),
     )
 
 
@@ -1003,8 +1260,14 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
+    """Compile and cache the fused gate activation + quant + scale-sort kernel.
+
+    situ_beta/situ_linear_beta are compile-time constants for the SiTUv2 split-K
+    post-activation (mirrors the main gemm1 kernel); they are part of the cache
+    key so distinct betas compile distinct modules and never alias on disk."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1014,6 +1277,8 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -1040,8 +1305,8 @@ def flydsl_swiglu_and_mul_interleaved(
     _run_compiled(
         _swiglu_fn,
         (
-            input,
-            out,
+            ptr_arg(input),
+            ptr_arg(out),
             num_rows,
             torch.cuda.current_stream(),
         ),
@@ -1096,13 +1361,13 @@ def flydsl_silu_and_mul_interleaved(
 # Public API
 
 
-def flydsl_moe_stage1(
+def _flydsl_moe_stage1_impl(
     a: torch.Tensor,
     w1: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
     topk: int = 1,
     *,
     tile_m: int = 32,
@@ -1112,23 +1377,29 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
-    w1_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    sorted_weights: Optional[torch.Tensor] = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    w1_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
     persist_m: int = 0,
     use_async_copy: bool = False,
     k_batch: int = 1,
+    k_batch_intra_block: int | None = None,
     waves_per_eu: int = 3,
     b_nt: int = 0,
     gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
-    bias: Optional[torch.Tensor] = None,
-    topk_ids: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
+    _compile_kernel=compile_flydsl_moe_stage1,
+    _build_mx_args=_s1_args_fp4,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1146,10 +1417,16 @@ def flydsl_moe_stage1(
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
 
+    `_compile_kernel` and `_build_mx_args` are injectable so the heterogeneous
+    shared-expert path can reuse this launcher with its own kernel builders.
+
     Returns:
         Basic:                      out
         fuse_quant:                 (out, out_scale_sorted)
     """
+    if k_batch_intra_block is not None:
+        k_batch = k_batch_intra_block
+
     token_num = a.shape[0]
     E = w1.shape[0]
     inter_dim = w1.shape[1] // 2
@@ -1173,13 +1450,75 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
+    _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
+
     dev = a.device
+    _is_a16w4 = a_dtype == "bf16" and b_dtype == "fp4"
+    if _is_a16w4:
+        # a16w4 (bf16 A x fp4 W): ported gemm1 -> bf16 sorted intermediate,
+        # threaded to stage2 unchanged. Tiles from the CSV kernelName;
+        # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel).
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
+
+        _act = "situv2" if act in ("situv2", "situ") else act
+        sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
+        _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
+        inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
+        flydsl_a16w4_gemm1(
+            a_bf16=a.to(torch.bfloat16).contiguous(),
+            w1_u8=w1.view(torch.uint8).contiguous(),
+            w1_scale_u8=(
+                w1_scale.view(torch.uint8).contiguous().view(-1)
+                if w1_scale is not None
+                else torch.empty(0, dtype=torch.uint8, device=dev)
+            ),
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
+            m_indices=sorted_token_ids.to(torch.int32).contiguous(),
+            inter_sorted_bf16=inter_sorted,
+            n_tokens=token_num,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=int(tile_m),
+            tile_n=tile_n,
+            tile_k=tile_k,
+            k_wave=k_wave,
+            b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=None,
+            act=_act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
+            w_layout="standard",
+        )
+        return inter_sorted
+    # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
+    # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
+    # or memfault). Downgrade to a divisor (128). Applies to both a16w4
+    # (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is unaffected.
+    if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
+        tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
     _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
-        if _need_fp4 or (_gui_sk_fused and _need_fp4):
+        if _v2_output_layout:
+            _sorted_rows = max(
+                sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m
+            )
+            if _need_fp4:
+                out = torch.empty(
+                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
+                )
+            else:
+                out = torch.empty(
+                    (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
+                )
+        elif _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
@@ -1223,7 +1562,7 @@ def flydsl_moe_stage1(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = persist_m if persist_m > 0 else 1
+    _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -1253,7 +1592,7 @@ def flydsl_moe_stage1(
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
 
     if use_mx_gemm:
-        args = _s1_args_fp4(
+        args = _build_mx_args(
             _kernel_out.view(-1),
             a.view(-1),
             w1.view(-1),
@@ -1293,32 +1632,38 @@ def flydsl_moe_stage1(
             _grid_y,
         )
 
-    exe = compile_flydsl_moe_stage1(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=_gemm_out_dtype,
-        act=act,
-        persist_m=_persist_m,
-        use_async_copy=use_async_copy,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_mode=gate_mode,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        enable_bias=(kernel_bias is not None),
-        a_scale_one=a_scale_one,
-        xcd_swizzle=xcd_swizzle,
-        k_wave=k_wave,
-    )
+    compile_kwargs = {
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": E,
+        "topk": topk,
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "doweight_stage1": sorted_weights is not None,
+        "a_dtype": a_dtype,
+        "b_dtype": b_dtype,
+        "out_dtype": _gemm_out_dtype,
+        "act": act,
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+        "persist_m": _persist_m,
+        "use_async_copy": use_async_copy,
+        "k_batch": k_batch,
+        "waves_per_eu": waves_per_eu,
+        "b_nt": b_nt,
+        "gate_mode": gate_mode,
+        "model_dim_pad": model_dim_pad,
+        "inter_dim_pad": inter_dim_pad,
+        "enable_bias": kernel_bias is not None,
+        "a_scale_one": a_scale_one,
+        "xcd_swizzle": xcd_swizzle,
+        "k_wave": k_wave,
+    }
+    # The injected FHMoE compiler does not implement the v2 sorted-row layout.
+    if _v2_output_layout:
+        compile_kwargs["v2_output_layout"] = True
+    exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
@@ -1350,6 +1695,8 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1375,6 +1722,8 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1398,6 +1747,8 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1450,13 +1801,110 @@ def flydsl_moe_stage1(
     return out
 
 
-def flydsl_moe_stage2(
+def flydsl_moe_stage1(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 256,
+    tile_k: int = 256,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    w1_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
+    persist_m: int = 0,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    k_batch_intra_block: int | None = None,
+    waves_per_eu: int = 3,
+    b_nt: int = 0,
+    gate_mode: str = "separated",
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
+    bias: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
+    swiglu_limit: float | None = None,
+    k_wave: int = 1,
+    v2_output_layout: bool = False,
+):
+    """Fused gate+up GEMM (MOE stage1).
+
+    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    model_dim and inter_dim INCLUDE padding (model_dim_pad, inter_dim_pad).
+    bias: optional (E, 2*inter_dim) f32 bias added before activation.
+    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
+    `shuffle_weight_a16w4(w1, 16, True)` and `shuffle_scale_a16w4(w1_scale, E, True)`.
+
+    When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
+    out_dtype) and writes e8m0 scales in sorted tiled layout directly.
+
+    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
+    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+
+    gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    Returns:
+        Basic:                      out
+        fuse_quant:                 (out, out_scale_sorted)
+    """
+    return _flydsl_moe_stage1_impl(
+        a=a,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+        persist_m=persist_m,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        k_batch_intra_block=k_batch_intra_block,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode=gate_mode,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        bias=bias,
+        topk_ids=topk_ids,
+        a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
+        k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
+    )
+
+
+def _flydsl_moe_stage2_impl(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
     topk: int = 1,
     *,
     tile_m: int = 32,
@@ -1466,44 +1914,82 @@ def flydsl_moe_stage2(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     mode: str = "atomic",
-    w2_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    sorted_weights: Optional[torch.Tensor] = None,
+    w2_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
     sort_block_m: int = 0,
-    persist: Optional[bool] = None,
-    waves_per_eu: Optional[int] = None,
+    persist: bool | None = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     return_per_slot: bool = False,
-    expert_mask: Optional[torch.Tensor] = None,
-    topk_ids: Optional[torch.Tensor] = None,
+    expert_mask: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    _compile_kernel=compile_flydsl_moe_stage2,
+    _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
-    """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+    """Run stage2 with injectable compiler and launch-argument builders."""
 
-    a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
-    Returns (token_num, model_dim) by default.
-    bias: optional (E, model_dim) f32 bias added after GEMM.
+    if a_dtype == "bf16" and b_dtype == "fp4":
+        # a16w4 (bf16 A x fp4 W) down-proj: ported gemm2 atomic-scatters into the
+        # caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like a4w4/a8w4).
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
 
-    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
-        assumed equal to tile_m. When set, stage2 can use a different tile_m
-        from sorting/stage1.
-    persist: if True, use persistent round-robin mode (grid_y=cu_num);
-        if False, use legacy persist_m mode; if None, auto-select.
+        E = w2.shape[0]
+        model_dim = w2.shape[1]
+        inter_dim = inter_states.shape[1]
+        assert out is not None, "a16w4 stage2 requires a caller-provided output buffer"
+        M_logical = int(out.shape[0])
+        max_sorted = int(inter_states.shape[0])
 
-    return_per_slot: when True, return the raw per-(token, slot) output as a
-        contiguous (token_num, topk, model_dim) tensor without applying the
-        topk reduction.
+        g2_tile_n = tile_n
+        if model_dim % g2_tile_n != 0:
+            g2_tile_n = 256 if model_dim % 256 == 0 else 128
+        g2_tile_k = tile_k
+        if inter_dim % g2_tile_k != 0:
+            g2_tile_k = 128 if inter_dim % 128 == 0 else 64
 
-    expert_mask, topk_ids: when both are provided and mode="reduce", the
-        post-GEMM reduction fuses the EP validity gather
-        ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
-        slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
-    """
+        _sw = (
+            sorted_weights
+            if sorted_weights is not None
+            else torch.empty(
+                sorted_token_ids.shape,
+                dtype=torch.float32,
+                device=inter_states.device,
+            )
+        )
+        flydsl_a16w4_gemm2(
+            inter_sorted_bf16=inter_states,
+            w2_u8=w2.view(torch.uint8).contiguous(),
+            w2_scale_u8=(
+                w2_scale.view(torch.uint8).contiguous().view(-1)
+                if w2_scale is not None
+                else torch.empty(0, dtype=torch.uint8, device=inter_states.device)
+            ),
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
+            sorted_token_ids=sorted_token_ids,
+            sorted_weights=_sw,
+            flat_out=out.view(-1),
+            M_logical=M_logical,
+            max_sorted=max_sorted,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=int(tile_m),
+            tile_n=g2_tile_n,
+            tile_k=g2_tile_k,
+            b_nt=b_nt,
+            waves_per_eu=waves_per_eu,
+            xcd_swizzle=xcd_swizzle,
+        )
+        return out
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]
@@ -1514,11 +2000,20 @@ def flydsl_moe_stage2(
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
+    elif (
+        mode != "reduce"
+        and not return_per_slot
+        and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
+    ):
+        # Buffer atomics use 32-bit offsets; reduce outputs larger than 4 GiB.
+        mode = "reduce"
 
     accumulate = mode != "reduce" and not return_per_slot
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
+
+    tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
@@ -1570,7 +2065,8 @@ def flydsl_moe_stage2(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        _persist_m = 1
+        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+        _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
@@ -1580,18 +2076,31 @@ def flydsl_moe_stage2(
     _k_in = inter_dim
 
     target = out
+    _s2_fp8_inter = (
+        (not accumulate)
+        and (not return_per_slot)
+        and use_mx_gemm
+        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
+    _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
+
     if not accumulate:
         if return_per_slot:
             target = out.view(-1)
         else:
+            # fp8 route-out stores uint8 rows: N value bytes + N/8 e8m0 scale bytes.
             target = torch.empty(
-                (token_num * topk * model_dim,),
+                (
+                    (token_num * topk, model_dim + model_dim // 8)
+                    if _s2_fp8_inter
+                    else (token_num * topk * model_dim,)
+                ),
                 device=out.device,
-                dtype=out.dtype,
+                dtype=torch.uint8 if _s2_fp8_inter else out.dtype,
             )
 
     if use_mx_gemm:
-        args = _s2_args_fp4(
+        args = _build_mx_args(
             target,
             inter_states,
             w2,
@@ -1625,7 +2134,7 @@ def flydsl_moe_stage2(
             m_blocks,
         )
 
-    exe = compile_flydsl_moe_stage2(
+    exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -1636,7 +2145,7 @@ def flydsl_moe_stage2(
         doweight_stage2=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        out_dtype=out_dtype,
+        out_dtype=_s2_gemm_out_dtype,
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
@@ -1659,9 +2168,104 @@ def flydsl_moe_stage2(
             )
     if not accumulate and not return_per_slot:
         _run_moe_reduction(
-            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim,
+            expert_mask,
+            topk_ids,
+            is_fp8=_s2_fp8_inter,
         )
     return out
+
+
+def flydsl_moe_stage2(
+    inter_states: torch.Tensor,
+    w2: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 128,
+    tile_k: int = 256,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    mode: str = "atomic",
+    w2_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
+    sort_block_m: int = 0,
+    persist: bool | None = None,
+    waves_per_eu: int | None = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
+    b_nt: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
+    xcd_swizzle: int = 0,
+    bias: torch.Tensor | None = None,
+    return_per_slot: bool = False,
+    expert_mask: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+
+    a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
+    Returns (token_num, model_dim) by default.
+    bias: optional (E, model_dim) f32 bias added after GEMM.
+
+    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
+        assumed equal to tile_m. When set, stage2 can use a different tile_m
+        from sorting/stage1.
+    persist: if True, use persistent round-robin mode (grid_y=cu_num);
+        if False, use legacy persist_m mode; if None, auto-select.
+
+    return_per_slot: when True, return the raw per-(token, slot) output as a
+        contiguous (token_num, topk, model_dim) tensor without applying the
+        topk reduction.
+
+    expert_mask, topk_ids: when both are provided and mode="reduce", the
+        post-GEMM reduction fuses the EP validity gather
+        ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
+        slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+    """
+    return _flydsl_moe_stage2_impl(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        mode=mode,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
+        sort_block_m=sort_block_m,
+        persist=persist,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
+        b_nt=b_nt,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        xcd_swizzle=xcd_swizzle,
+        bias=bias,
+        return_per_slot=return_per_slot,
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
+    )
 
 
 # Fused route-map + MX quant + scatter-copy + scale-preshuffle kernels
@@ -1675,6 +2279,8 @@ def _get_compiled_fused_route_quant_scatter(
     quant_mode: str = "fp4",
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    use_g2l: bool = False,
+    weight_dtype: str = "bf16",
 ):
     """Compile and cache the fused route+quant+scatter+preshuffle kernel."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -1688,6 +2294,8 @@ def _get_compiled_fused_route_quant_scatter(
         quant_mode=quant_mode,
         use_expert_row_base=use_expert_row_base,
         max_m=max_m,
+        use_g2l=use_g2l,
+        weight_dtype=weight_dtype,
     )
 
 
@@ -1721,29 +2329,161 @@ def _get_compiled_topids_to_rows():
     return build_moe_topids_to_rows_module()
 
 
+@functools.cache
+def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_g2l_module,
+    )
+
+    return build_moe_topids_to_rows_g2l_module(weight_dtype)
+
+
+@functools.cache
+def _get_compiled_route_g2l_fused(weight_dtype: str):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_route_g2l_fused_module,
+    )
+
+    return build_moe_route_g2l_fused_module(weight_dtype)
+
+
+@functools.cache
+def _get_compiled_route_g2l_lds(weight_dtype: str):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_route_g2l_lds_module,
+    )
+
+    return build_moe_route_g2l_lds_module(weight_dtype)
+
+
 def flydsl_moe_topids_to_rows(
     topk_ids: torch.Tensor,
     E: int,
     max_m: int,
+    *,
+    g2l_lut: torch.Tensor | None = None,
+    expert_mask: torch.Tensor | None = None,
+    gather_w: torch.Tensor | None = None,
+    weight_in: torch.Tensor | None = None,
+    counter: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    num_valid_routes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build masked-layout route rows and per-expert counts."""
+    """Build masked-layout route rows and per-expert counts.
+
+    When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
+    remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
+    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes fold into
+    bucket 0. The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
+    (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
+    folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
+
+    ``counter`` is the ``(E,)`` per-expert atomic slot counter; when a pre-zeroed
+    buffer is passed (the g2l-LUT kernel zeroes it as a side output) the host
+    ``torch.zeros(E)`` launch is skipped, otherwise it is allocated here.
+
+    When ``expert_mask`` is given (instead of ``g2l_lut``), the single-block fused
+    kernel builds the LUT in LDS and zeros the counter itself -- collapsing the
+    ``moe_g2l_lut`` + ``moe_route_g2l`` pair into one launch (no global LUT buffer).
+    """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     numel = token_num * topk
-    counter = torch.zeros(E, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
 
+    # Dynamic EP token count (capture-safe): the dispatch buffer is padded to a
+    # static token_num but only the first ``num_local_tokens`` (= total_recv) rows
+    # are valid. Build a (1,) int32 DEVICE scalar num_valid_routes = total_recv*topk
+    # (no host sync); the route kernel treats routes >= this as dropped. When
+    # truncation is disabled we pass ``numel`` so every route stays valid.
+    #
+    # The caller can pass a precomputed ``num_valid_routes`` (the grouped path
+    # already builds ``_ep_nvr = total_recv*topk`` for the psum-remap / quant
+    # kernels); reusing it skips a redundant ``* topk`` elementwise launch here.
+    if num_valid_routes is not None:
+        num_valid_routes = num_valid_routes.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        )
+    elif num_local_tokens is not None:
+        num_valid_routes = (
+            num_local_tokens.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            * int(topk)
+        ).contiguous()
+    else:
+        # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
+        # null as "no truncation".
+        num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
+
+    if expert_mask is not None:
+        # Fused single-block path: build LUT + zero counter + route in one kernel.
+        assert gather_w is not None, "expert_mask fused path requires gather_w (out)"
+        assert weight_in is not None, "expert_mask fused path requires weight_in (f32)"
+        wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
+        counter = torch.empty(E, dtype=torch.int32, device=device)
+        mask_i32 = expert_mask.to(torch.int32).reshape(-1)
+        _get_compiled_route_g2l_fused(wdt)(
+            ptr_arg(mask_i32),
+            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            ptr_arg(gather_w.reshape(-1)),
+            ptr_arg(num_valid_routes),
+            int(mask_i32.numel()),
+            numel,
+            int(max_m),
+            int(E),
+            stream=torch.cuda.current_stream(),
+        )
+        return counter, topids_to_rows.view(token_num, topk)
+
+    if counter is None or counter.numel() != E:
+        counter = torch.zeros(E, dtype=torch.int32, device=device)
+
     route_grid = (numel + 255) // 256
-    topids_to_rows_kernel = _get_compiled_topids_to_rows()
-    topids_to_rows_kernel(
-        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-        ptr_arg(counter),
-        ptr_arg(topids_to_rows),
-        numel,
-        int(max_m),
-        route_grid,
-        stream=torch.cuda.current_stream(),
-    )
+    if g2l_lut is not None:
+        assert gather_w is not None, "g2l_lut requires gather_w (out)"
+        assert weight_in is not None, "g2l_lut requires weight_in (f32 route weights)"
+        wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
+        # Two-level (LDS -> global) atomic reduction when the bucket count fits
+        # the LDS counter: collapses the per-route device atomics (which serialize
+        # on bucket 0 under EP drops) into one device atomic per non-empty bucket
+        # per block. Falls back to the plain device-atomic kernel for large E.
+        from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
+
+        _use_lds_reduce = (
+            os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+            and int(E) <= MAX_ROUTE_BUCKETS
+        )
+        if _use_lds_reduce:
+            topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+        else:
+            topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
+        topids_to_rows_kernel(
+            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+            ptr_arg(g2l_lut),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+            ptr_arg(gather_w.reshape(-1)),
+            ptr_arg(num_valid_routes),
+            numel,
+            int(max_m),
+            int(E),
+            route_grid,
+            stream=torch.cuda.current_stream(),
+        )
+    else:
+        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        topids_to_rows_kernel(
+            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            numel,
+            int(max_m),
+            route_grid,
+            stream=torch.cuda.current_stream(),
+        )
     return counter, topids_to_rows.view(token_num, topk)
 
 
@@ -1755,17 +2495,28 @@ def flydsl_moe_fused_route_quant_scatter(
     *,
     wmma_rep: int,
     quant_mode: str = "fp4",
-    expert_row_base: Optional[torch.Tensor] = None,  # (E,) int32 dst row base
-    out_E: Optional[int] = None,
-    out_max_m: Optional[int] = None,
-    grouped_a1: Optional[torch.Tensor] = None,  # (out_E, out_max_m, Pb) uint8 out
-    grouped_a1_scale: Optional[
-        torch.Tensor
-    ] = None,  # (out_E, out_max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 out
+    expert_row_base: torch.Tensor | None = None,  # (E,) int32 dst row base
+    out_E: int | None = None,
+    out_max_m: int | None = None,
+    grouped_a1: torch.Tensor | None = None,  # (out_E, out_max_m, Pb) uint8 out
+    grouped_a1_scale: (
+        torch.Tensor | None
+    ) = None,  # (out_E, out_max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 out
+    g2l_lut: torch.Tensor | None = None,  # (E_global,) int32 global->local
+    gather_w: torch.Tensor | None = None,  # (token_num, topk) out; kept->cast,drop->0
+    weight_in: torch.Tensor | None = None,  # (token_num, topk) f32 route weights in
+    counter: torch.Tensor | None = None,  # (E,) int32 pre-zeroed slot counter
 ):
     """Fused route+MX-quant+scatter+preshuffle in one pass.
 
     Returns (grouped_a1, grouped_a1_scale, masked_m, topids_to_rows).
+
+    When ``g2l_lut`` is given (EP fusion), ``topk_ids`` are GLOBAL expert ids and
+    the kernel remaps them to local buckets in [0, E) on-device (sentinel ``E``
+    for dropped routes, folded into bucket 0 with their ``gather_w`` entry zeroed).
+
+    ``counter`` is the ``(E,)`` per-expert atomic slot counter; a pre-zeroed
+    buffer (from the g2l-LUT kernel) skips the host ``torch.zeros(E)`` launch.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -1787,10 +2538,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
-    assert out_max_m % rows_per_tile == 0, (
-        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 "
-        f"({rows_per_tile})"
-    )
+    assert (
+        out_max_m % rows_per_tile == 0
+    ), f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
@@ -1799,11 +2549,23 @@ def flydsl_moe_fused_route_quant_scatter(
     if use_expert_row_base:
         expert_row_base = expert_row_base.to(device=device, dtype=torch.int32)
 
+    use_g2l = g2l_lut is not None
+    if use_g2l:
+        assert gather_w is not None, "g2l_lut requires gather_w (in/out)"
+        weight_dtype = "f16" if gather_w.dtype == torch.float16 else "bf16"
+
     use_routeks_stage1 = (
-        token_num > 1 and topk > 1 and quant_mode == "fp4" and not use_expert_row_base
+        token_num > 1
+        and topk > 1
+        and quant_mode == "fp4"
+        and not use_expert_row_base
+        # EP g2l fusion is only implemented on the generic fused_route_quant_scatter
+        # path; route EP through it (assert message: "use the generic path").
+        and not use_g2l
     )
     route_grid = (numel + 255) // 256
-    counter = torch.zeros(E, dtype=torch.int32, device=device)
+    if counter is None or counter.numel() != E:
+        counter = torch.zeros(E, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     if grouped_a1 is None:
         grouped_a1 = torch.empty(
@@ -1831,6 +2593,9 @@ def flydsl_moe_fused_route_quant_scatter(
     )
 
     if use_routeks_stage1:
+        assert (
+            not use_g2l
+        ), "EP g2l fusion is not implemented on the routeks stage1 path"
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
             ptr_arg(topk_ids_i32),
@@ -1841,11 +2606,13 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
+        use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             source_topk=topk,
+            ksplit=use_ksplit_s1,
         )
         launch_routeks(
             ptr_arg(hidden_flat),
@@ -1865,8 +2632,14 @@ def flydsl_moe_fused_route_quant_scatter(
             topids_to_rows.view(token_num, topk),
         )
 
-    use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+    use_st_ksplit = (
+        token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0 and not use_g2l
+    )
     if use_st_ksplit:
+        assert not use_g2l, (
+            "EP g2l fusion is not implemented on the st_ksplit path "
+            "(single-token pow2-topk); use the generic path"
+        )
         launch = _get_compiled_fused_route_quant_scatter_st_ksplit(
             model_dim=model_dim,
             topk=topk,
@@ -1874,6 +2647,19 @@ def flydsl_moe_fused_route_quant_scatter(
             quant_mode=quant_mode,
             use_expert_row_base=use_expert_row_base,
             max_m=max_m,
+        )
+        # st_ksplit keeps the original ABI (no g2l params).
+        launch(
+            ptr_arg(topk_ids_i32),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            ptr_arg(hidden_flat),
+            ptr_arg(grouped_a1.view(-1)),
+            ptr_arg(grouped_a1_scale.view(-1)),
+            ptr_arg(expert_row_base_arg),
+            numel,
+            grid_blocks,
+            stream=torch.cuda.current_stream(),
         )
     else:
         launch = _get_compiled_fused_route_quant_scatter(
@@ -1883,19 +2669,33 @@ def flydsl_moe_fused_route_quant_scatter(
             quant_mode=quant_mode,
             use_expert_row_base=use_expert_row_base,
             max_m=max_m,
+            use_g2l=use_g2l,
+            weight_dtype=weight_dtype if use_g2l else "bf16",
         )
-    launch(
-        ptr_arg(topk_ids_i32),
-        ptr_arg(counter),
-        ptr_arg(topids_to_rows),
-        ptr_arg(hidden_flat),
-        ptr_arg(grouped_a1.view(-1)),
-        ptr_arg(grouped_a1_scale.view(-1)),
-        ptr_arg(expert_row_base_arg),
-        numel,
-        grid_blocks,
-        stream=torch.cuda.current_stream(),
-    )
+        # When g2l is disabled the kernel never reads these (const_expr-gated),
+        # so a dummy valid pointer + n_buckets=0 keeps the ABI uniform.
+        if use_g2l:
+            assert weight_in is not None, "g2l fusion requires weight_in (f32 weights)"
+        g2l_arg = g2l_lut if use_g2l else counter
+        wi_arg = weight_in.to(torch.float32).reshape(-1) if use_g2l else counter
+        gw_arg = gather_w.reshape(-1) if use_g2l else counter
+        n_buckets_arg = int(E) if use_g2l else 0
+        launch(
+            ptr_arg(topk_ids_i32),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            ptr_arg(hidden_flat),
+            ptr_arg(grouped_a1.view(-1)),
+            ptr_arg(grouped_a1_scale.view(-1)),
+            ptr_arg(expert_row_base_arg),
+            numel,
+            ptr_arg(g2l_arg),
+            ptr_arg(wi_arg),
+            ptr_arg(gw_arg),
+            n_buckets_arg,
+            grid_blocks,
+            stream=torch.cuda.current_stream(),
+        )
     return (
         grouped_a1,
         grouped_a1_scale,
@@ -2047,6 +2847,9 @@ def _get_compiled_fused_quant_preshuffle(
     )
 
 
+_ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+
+
 @functools.cache
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
@@ -2054,6 +2857,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    ksplit: bool = True,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2065,6 +2869,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         quant_mode=quant_mode,
         source_topk=source_topk,
         remap_rows=remap_rows,
+        ksplit=ksplit,
     )
 
 
@@ -2075,13 +2880,16 @@ def flydsl_moe_fused_quant_preshuffle(
     *,
     wmma_rep: int,
     quant_mode: str = "fp4",
-    masked_m: Optional[torch.Tensor] = None,  # (E,) int32 valid rows per expert
-    topids_to_rows: Optional[torch.Tensor] = None,  # route -> global row
+    masked_m: torch.Tensor | None = None,  # (E,) int32 valid rows per expert
+    topids_to_rows: torch.Tensor | None = None,  # route -> global row
     source_topk: int = 0,  # when >0, routeks reads source row = route // source_topk
-    row_starts: Optional[torch.Tensor] = None,  # remap masked rows to starts[e]+slot
+    row_starts: torch.Tensor | None = None,  # remap masked rows to starts[e]+slot
     route_max_m: int = 0,
-    out_payload: Optional[torch.Tensor] = None,  # (E, max_m, Pb) uint8
-    out_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    out_payload: torch.Tensor | None = None,  # (E, max_m, Pb) uint8
+    out_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    num_valid_routes: (
+        torch.Tensor | None
+    ) = None,  # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -2092,10 +2900,9 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert grouped_in.dtype == torch.bfloat16, (
-        "fused grouped quant+preshuffle requires bf16 input "
-        f"(got {grouped_in.dtype})"
-    )
+    assert (
+        grouped_in.dtype == torch.bfloat16
+    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
@@ -2142,13 +2949,25 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             source_topk=source_topk,
             remap_rows=remap_rows,
+            ksplit=use_ksplit,
         )
+        # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
+        # padding rows of the dispatch buffer and are not gathered/quantized. When
+        # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
+        if num_valid_routes is None:
+            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+        else:
+            num_valid_routes_i32 = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            ).contiguous()
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),
@@ -2157,6 +2976,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ptr_arg(row_starts_i32),
             route_max_m_arg,
             numel,
+            ptr_arg(num_valid_routes_i32),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )

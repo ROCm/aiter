@@ -1,23 +1,24 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
+
+from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
     fused_flatten_mxfp4_quant,
-    fused_rms_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
-    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_rms_mxfp4_quant,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
+from aiter.utility.fp4_utils import dynamic_mxfp4_quant, moe_mxfp4_sort
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    SCALE_GROUP_SIZE,
+    e8m0_to_f32,
+    mxfp4_to_f32,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    mxfp4_to_f32,
-    e8m0_to_f32,
-    SCALE_GROUP_SIZE,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
-from aiter.ops.quant import per_1x32_f4_quant_hip
-from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -157,6 +158,7 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shuffle", [True, False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+@pytest.mark.parametrize("inargs", ["triton", "gluon"])
 def test_fused_rms_quant(
     M: int,
     N1: int,
@@ -167,11 +169,14 @@ def test_fused_rms_quant(
     dtype,
     shuffle: bool,
     scale_shuffle_padding: bool,
+    inargs: str,
 ):
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    torch.manual_seed(0)
+    if inargs == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
@@ -201,6 +206,7 @@ def test_fused_rms_quant(
             shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=True,
+            inargs=inargs,
         )
     )
 
