@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -34,6 +35,12 @@ from .quant_utils import (
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
+
+# One whole tensor per wave for the four A/B/SA/SB TDM loads, instead of the
+# default one wave pair per job. Off by default: the four tensors are wildly
+# different sizes (A moves 64 KB per k-tile at t256x256x256, SA/SB a few
+# hundred bytes), so a whole-tensor split cannot balance bytes across waves.
+BALANCED_WAVE_SPEC_TDM = int(os.environ.get("BALANCED_WAVE_SPEC_TDM", "0"))
 
 
 @flyc.jit
@@ -107,6 +114,12 @@ def launch_gemm_a8w4_tdm(
     next_stage_on = (
         1 if (next_stage_prefetch and num_buffers >= 3 and KWS % 2 == 0) else 0
     )
+    # Env knob AND exactly four waves, so every wave owns one job: a wave in no
+    # owner list runs no copy of the unswitched loop and hangs the workgroup.
+    # No tile-size floor is needed. That floor exists for the pair split, whose
+    # seg = outer // 2 silently drops rows once an outer dim (SB's tile_n // 32)
+    # stops halving exactly; a solo owner takes seg = outer and never divides.
+    wave_spec_solo = 1 if (BALANCED_WAVE_SPEC_TDM and m_warp * n_warp == 4) else 0
     cache_tag = (
         K,
         tile_m,
@@ -125,6 +138,7 @@ def launch_gemm_a8w4_tdm(
         quant_wmma_rep,
         cluster_n,
         next_stage_on,
+        wave_spec_solo,
     )
     _ = cache_tag
     warp_tile_m = tile_m // m_warp
@@ -180,11 +194,12 @@ def launch_gemm_a8w4_tdm(
     _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
+    _bws = "_bws" if wave_spec_solo else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_bws}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -333,7 +348,7 @@ def launch_gemm_a8w4_tdm(
         WAVE_SPEC = num_waves >= 4 and tile_m >= 64 and tile_n >= 64
         # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
         # Both the tensorcnt arithmetic and the WMMA interleave count in these.
-        TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
+        TDM_PER = 1 if wave_spec_solo else ((1 if WS8 else 2) if WAVE_SPEC else 4)
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -341,7 +356,12 @@ def launch_gemm_a8w4_tdm(
         p32_shared = fx.PointerType.get(
             elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
         )
-        if const_expr(WAVE_SPEC):
+        if const_expr(wave_spec_solo):
+            # One wave per tensor: four full-extent descriptors, where the pair
+            # split below issues eight half-extent ones. Four waves exactly.
+            waves = [(0,), (1,), (2,), (3,)]
+            nw = 1
+        elif const_expr(WAVE_SPEC):
             waves = [
                 (0, 1),
                 (2, 3),
@@ -1032,9 +1052,8 @@ def launch_gemm_a8w4_tdm(
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                                 all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
                             )
-                            mx_blk_i = (
-                                fx.Int32(blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16) >> 6
-                            )
+                            mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
+                            mx_blk_i = fx.Int32(mx_col) >> 6
                             e8m0_bytes.append(e8m0_byte)
                             mx_blk_is.append(mx_blk_i)
 
