@@ -809,6 +809,44 @@ def _grouped_a8w4_tdm_moe(
     return moe_out
 
 
+_PG_TILE_META_CACHE = {}
+
+
+def _push_group_tile_meta(device, max_tiles, E, prefill):
+    """Cached tile-schedule buffers for the push-group GEMMs.
+
+    Reallocating these per layer costs four fill kernels (~6 us/layer at
+    E=192) for buffers whose shape never changes, so they are cached per
+    (device, max_tiles, E). Reuse across layers is safe because finalize
+    rewrites the whole compacted prefix each call and the GEMMs consume it
+    before the next finalize runs on the same stream.
+
+    ``prefill`` refills the padding-tile sentinels (row base -1, expert id
+    E == skip, 0 valid rows). Only the static-grid GEMM reads past
+    ``num_valid``, so the persistent scheduler skips the refill and leaves the
+    previous layer's stale entries in the tail. ``num_valid`` is an atomic_add
+    accumulator and must be zeroed every call either way.
+    """
+    key = (device, int(max_tiles), int(E))
+    buf = _PG_TILE_META_CACHE.get(key)
+    if buf is None:
+        buf = (
+            torch.empty((max_tiles,), dtype=torch.int32, device=device),
+            torch.empty((max_tiles,), dtype=torch.int32, device=device),
+            torch.empty((max_tiles,), dtype=torch.int32, device=device),
+            torch.empty(1, dtype=torch.int32, device=device),
+        )
+        _PG_TILE_META_CACHE[key] = buf
+        prefill = True
+    trb, eids, tvd, num_valid = buf
+    if prefill:
+        trb.fill_(-1)
+        eids.fill_(E)
+        tvd.zero_()
+    num_valid.zero_()
+    return trb, eids, tvd, num_valid
+
+
 def grouped_a8w4_tdm_moe_push_scatter(
     disp_out, pg_running, pg_rowmap, w1, w2, w1_scale, w2_scale, *,
     E_local, model_dim, inter_dim, cap, activation, swiglu_limit=None,
@@ -861,15 +899,33 @@ def grouped_a8w4_tdm_moe_push_scatter(
     wmma_rep = tile_m // 16
     wmma_rep2 = tile_m2 // 16
 
+    # The static grid is E*cap/tile_m M-tiles, but only the tiles finalize actually
+    # filled carry data (at uniform routing that is ~tokens*topk/tile_m, orders of
+    # magnitude fewer). num_valid is a device scalar, so the grid cannot depend on
+    # it without a host sync that would break graph capture; instead launch a fixed
+    # set of CU-resident workers that stride over the num_valid-derived tile range.
+    # Resolved here, ahead of the tile metadata, because it decides whether the
+    # padding sentinels below are read at all.
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    persistent = _as_bool(
+        os.environ.get("AITER_EP_PUSH_GROUP_PERSISTENT_GEMM1"), True
+    )
+    # One workgroup per CU starves the machine: a tile's TDM loads are then hidden
+    # by nothing, and both GEMMs measured slower than the static grid. Oversubscribe
+    # so several workgroups stay resident per CU (8x was the flat optimum across
+    # bs=8..256; below 4x the loss of latency hiding dominates).
+    workers_env = os.environ.get("AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS")
+    persistent_workers = int(workers_env) if workers_env else 8 * int(get_cu_num())
+    if persistent_workers < 1:
+        raise ValueError("AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS must be >= 1")
+
     # 1) counts -> tile schedule (local expert ids: rank=0/experts_per_rank=E so the
     #    gemm's `expert` indexes the LOCAL weight slab, padding tiles carry E==skip).
     max_tiles = cm // tile_m
-    trb = torch.full((max_tiles,), -1, dtype=torch.int32, device=device)
-    eids = torch.full((max_tiles,), E, dtype=torch.int32, device=device)
-    # tile_valid defaults to 0: a padding tile (never written by finalize) then
-    # loads 0 rows of A -> computes nothing garbage.
-    tvd = torch.zeros((max_tiles,), dtype=torch.int32, device=device)
-    num_valid = torch.zeros(1, dtype=torch.int32, device=device)
+    trb, eids, tvd, num_valid = _push_group_tile_meta(
+        device, max_tiles, E, prefill=not persistent
+    )
     presorted = disp_scale is not None
     if not presorted:
         # Snapshot the counts for the preshuffle mask BEFORE finalize, which read-
@@ -926,24 +982,6 @@ def grouped_a8w4_tdm_moe_push_scatter(
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     psum_dummy = torch.zeros(E, dtype=torch.int32, device=device)
 
-    # The static grid is E*cap/tile_m M-tiles, but only the tiles finalize actually
-    # filled carry data (at uniform routing that is ~tokens*topk/tile_m, orders of
-    # magnitude fewer). num_valid is a device scalar, so the grid cannot depend on
-    # it without a host sync that would break graph capture; instead launch a fixed
-    # set of CU-resident workers that stride over the num_valid-derived tile range.
-    from aiter.jit.utils.chip_info import get_cu_num
-
-    persistent = _as_bool(
-        os.environ.get("AITER_EP_PUSH_GROUP_PERSISTENT_GEMM1"), True
-    )
-    # One workgroup per CU starves the machine: a tile's TDM loads are then hidden
-    # by nothing, and both GEMMs measured slower than the static grid. Oversubscribe
-    # so several workgroups stay resident per CU (8x was the flat optimum across
-    # bs=8..256; below 4x the loss of latency hiding dominates).
-    workers_env = os.environ.get("AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS")
-    persistent_workers = int(workers_env) if workers_env else 8 * int(get_cu_num())
-    if persistent_workers < 1:
-        raise ValueError("AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS must be >= 1")
     _persist_kw = (
         dict(
             persistent_gemm1=1,
