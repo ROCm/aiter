@@ -167,13 +167,13 @@ def component_benchmark(
         dw2 = torch.empty(E, H, I, device=device, dtype=BF16)
 
         calls = {
-            "stage2_dgrad": lambda: opus.opus_moe_dgrad_mfma_prepared(
-                dy, w2t, seid, bms, bme, dh
+            "stage2_dgrad": lambda: opus.opus_moe_dgrad_uniform_prepared(
+                dy, w2t, per_expert, dh
             ),
             "dW2": lambda: opus._opus_moe_wgrad_tn_bf16_raw(dy, h, offs, dw2),
             "activation": lambda: opus.opus_moe_act_bwd_bf16(dh, actin, ACT),
-            "stage1_dgrad": lambda: opus.opus_moe_dgrad_mfma_prepared(
-                dact, w1t, seid, bms, bme, dx_route
+            "stage1_dgrad": lambda: opus.opus_moe_dgrad_uniform_prepared(
+                dact, w1t, per_expert, dx_route
             ),
             "dW1": lambda: opus._opus_moe_wgrad_tn_bf16_raw(dact, xg, offs, dw1),
         }

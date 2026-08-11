@@ -166,12 +166,13 @@ def _opus_moe_dgrad_mfma_bf16_raw(
 ) -> None: ...
 
 
-def build_dgrad_block_meta(offs: Tensor, B_M: int):
-    """Compact grouped-dgrad tiling metadata (no operand padding). Each B_M row
-    block covers COMPACT rows [start, expert_end) of one expert. offs[E+1]
-    cumulative -> (sorted_expert_ids, block_m_start, block_m_end) [num_blocks] i32.
-    Computed on host (E is tiny; ~10 GPU-op launches cost >150us here) then
-    uploaded once."""
+def _build_dgrad_block_meta(offs: Tensor, B_M: int):
+    """Build grouped-dgrad metadata and detect an equal-routes fast path.
+
+    The offsets are already copied to the host here to construct the compact
+    ragged tile list.  Reuse that same copy to return ``uniform_m`` instead of
+    adding another device synchronization in the MoE forward path.
+    """
     dev = offs.device
     o = offs.to(torch.int64).cpu().tolist()
     E = len(o) - 1
@@ -184,7 +185,19 @@ def build_dgrad_block_meta(offs: Tensor, B_M: int):
             s += B_M
     meta = torch.tensor(e_ids + bms + bme, dtype=torch.int32, device=dev)
     n = len(e_ids)
-    return meta[:n], meta[n:2 * n], meta[2 * n:]
+    lens = [o[e + 1] - o[e] for e in range(E)]
+    uniform_m = lens[0] if lens and all(m == lens[0] for m in lens) else None
+    return meta[:n], meta[n:2 * n], meta[2 * n:], uniform_m
+
+
+def build_dgrad_block_meta(offs: Tensor, B_M: int):
+    """Compact grouped-dgrad tiling metadata (no operand padding). Each B_M row
+    block covers COMPACT rows [start, expert_end) of one expert. offs[E+1]
+    cumulative -> (sorted_expert_ids, block_m_start, block_m_end) [num_blocks] i32.
+    Computed on host (E is tiny; ~10 GPU-op launches cost >150us here) then
+    uploaded once."""
+    seid, bms, bme, _uniform_m = _build_dgrad_block_meta(offs, B_M)
+    return seid, bms, bme
 
 
 def opus_moe_dgrad_mfma_bf16(dy: Tensor, w: Tensor, offs: Tensor, B_M: int = 128) -> Tensor:
@@ -230,6 +243,49 @@ def opus_moe_dgrad_mfma_prepared(dy: Tensor, w_bnk: Tensor, sorted_expert_ids: T
     """dgrad kernel-only (compact): dy [M,K], w_bnk [E,N,K] (=forward weight
     transposed), sorted_expert_ids/block_m_start/block_m_end [num_blocks], out [M,N]."""
     _opus_moe_dgrad_mfma_bf16_raw(dy, w_bnk, sorted_expert_ids, block_m_start, block_m_end, out)
+    return out
+
+
+def _mono_dgrad_shape_ok(dy: Tensor, w_bnk: Tensor, uniform_m: int) -> bool:
+    """Whether the gfx950 8-wave mono kid 1400 can serve this uniform GMM."""
+    E, N, K = w_bnk.shape
+    return (
+        uniform_m > 0
+        and dy.shape == (E * uniform_m, K)
+        and K >= 128
+        and K % 64 == 0
+        and N % 256 == 0
+    )
+
+
+def opus_moe_dgrad_uniform_prepared(
+    dy: Tensor, w_bnk: Tensor, uniform_m: int, out: Tensor
+) -> Tensor:
+    """Equal-routes dgrad through the mature gfx950 8-wave mono GEMM.
+
+    Routing has already made every expert's rows contiguous.  When all experts
+    own the same number of rows, the grouped problem is exactly a zero-copy
+    strided-batched GEMM: ``[E,M,K] @ [E,N,K]^T -> [E,M,N]``.  Kid 1400 uses
+    the 192x256x64, eight-wave pipeline; ragged routing must keep using
+    :func:`opus_moe_dgrad_mfma_prepared`.
+    """
+    if not _mono_dgrad_shape_ok(dy, w_bnk, uniform_m):
+        raise ValueError(
+            "opus_moe_dgrad_uniform_prepared: shape is unsupported by mono "
+            f"kid 1400 (dy={tuple(dy.shape)}, w={tuple(w_bnk.shape)}, "
+            f"uniform_m={uniform_m})"
+        )
+    from .gemm_op_a16w16 import opus_gemm_a16w16_tune
+
+    E, N, K = w_bnk.shape
+    opus_gemm_a16w16_tune(
+        dy.view(E, uniform_m, K),
+        w_bnk,
+        out.view(E, uniform_m, N),
+        bias=None,
+        kernelId=1400,
+        splitK=0,
+    )
     return out
 
 
@@ -406,10 +462,12 @@ class OpusMoERefFunc(torch.autograd.Function):
         x_g = x[x_gather_idx].contiguous()
 
         offs = _offs_from_lens(lens)
-        seid, bms, bme = build_dgrad_block_meta(offs, _DGRAD_B_M)
+        seid, bms, bme, uniform_m = _build_dgrad_block_meta(offs, _DGRAD_B_M)
 
         def fwd_gemm(dy, w_nat):  # dh[m,n]=sum_k dy[m,k]*w_nat[e,n,k]
             out = torch.empty(dy.shape[0], w_nat.shape[1], device=dy.device, dtype=torch.bfloat16)
+            if uniform_m is not None and _mono_dgrad_shape_ok(dy, w_nat, uniform_m):
+                return opus_moe_dgrad_uniform_prepared(dy, w_nat, uniform_m, out)
             return opus_moe_dgrad_mfma_prepared(dy, w_nat, seid, bms, bme, out)
 
         act_input = fwd_gemm(x_g, w1)                                  # [M,2I]=x_g@W1ᵀ
@@ -425,6 +483,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.dims = (T, H, E, I, topk)
         ctx.act_type = act_type
         ctx.dgrad_meta = (seid, bms, bme)
+        ctx.uniform_m = uniform_m
         ctx.offs = offs
         # dx reverse map for the deterministic gather-sum (no atomics); built once
         # here (moe-sort semantics), reused in backward.
@@ -445,6 +504,12 @@ class OpusMoERefFunc(torch.autograd.Function):
             wt = w2t if w is w2_ref else w1t
             out = torch.empty(dy_op.shape[0], wt.shape[1],
                               device=dy_op.device, dtype=torch.bfloat16)
+            if ctx.uniform_m is not None and _mono_dgrad_shape_ok(
+                dy_op, wt, ctx.uniform_m
+            ):
+                return opus_moe_dgrad_uniform_prepared(
+                    dy_op.contiguous(), wt, ctx.uniform_m, out
+                )
             return opus_moe_dgrad_mfma_prepared(dy_op.contiguous(), wt, seid, bms, bme, out)
 
         # deterministic dx (no atomics): gather-sum over each token's topk routes
