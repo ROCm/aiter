@@ -323,6 +323,9 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         out_args.B = static_cast<int>(B);
         out_args.T = static_cast<int>(T);
         out_args.H = static_cast<int>(H);
+        // The C-input launcher is MHA-only: q/k carry one key head per value
+        // head, so K6's GQA addressing degenerates to its dense form.
+        out_args.Hg = static_cast<int>(H);
         out_args.K = 128;
         out_args.V = 128;
         out_args.NT = NT;

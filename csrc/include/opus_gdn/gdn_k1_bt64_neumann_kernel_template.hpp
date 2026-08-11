@@ -62,6 +62,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     const int K  = kargs.K;
     const int V  = kargs.V;
     const int H  = kargs.H;
+    const int Hg = kargs.Hg;
 
     int bos, seq_len, chunk_start;
     if constexpr (IS_VARLEN) {
@@ -84,6 +85,17 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     const int64_t global_token_base =
         static_cast<int64_t>(bos) + chunk_start;
     const int64_t global_head_base = global_token_base * H + i_h;
+    // k is the only key-head input here; v/beta/g/w_bar/u_bar stay value-head
+    // indexed.  GQA lets H / Hg value heads share one key head; the uniform
+    // Hg == H branch keeps MHA on its original address arithmetic instead of
+    // paying for the group divide in every workgroup.
+    int64_t global_key_head_base = global_head_base;
+    int k_token_stride = H * K;
+    if (Hg != H) {
+        const int i_hg = i_h / (H / Hg);
+        global_key_head_base = global_token_base * Hg + i_hg;
+        k_token_stride = Hg * K;
+    }
 
     // =====================================================================
     // Shared memory allocation
@@ -174,7 +186,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     // Phase 1b: Load k[BT, K] into LDS with padding (stride = K_STRIDE)
     // =====================================================================
     const D_ATTN* k_base = reinterpret_cast<const D_ATTN*>(kargs.ptr_k)
-                           + global_head_base * K;
+                           + global_key_head_base * K;
 
     {
         // v8bf16_t (128-bit) vectorized k load — half the VMEM load instructions
@@ -188,7 +200,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
             v8bf16_t val{};
             if (global_t < seq_len)
                 val = *reinterpret_cast<const v8bf16_t*>(
-                    &k_base[row * H * K + col8]);
+                    &k_base[row * k_token_stride + col8]);
             *reinterpret_cast<v8bf16_t*>(&s_k[row * K_STRIDE + col8]) = val;
         }
     }
@@ -560,7 +572,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
                 v8bf16_t vals{};
                 if (chunk_start + j < seq_len)
                     vals = *reinterpret_cast<const v8bf16_t*>(
-                        &k_base[j * H * K + k_offset + ki]);
+                        &k_base[j * k_token_stride + k_offset + ki]);
                 D_ACC scale_j = s_beta[j] * __expf(s_g[j]);
                 for (int vv = 0; vv < VEC; vv++)
                     s_vT[(ki + vv) * VT_STRIDE + j] = static_cast<D_ATTN>(

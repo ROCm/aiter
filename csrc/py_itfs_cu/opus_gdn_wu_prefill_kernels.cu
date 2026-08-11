@@ -170,9 +170,19 @@ void launch_gdn_prefill_impl(
 
     const int input_B = gdn_checked_int(q.size(0), "B");
     const int T = gdn_checked_int(q.size(1), "T");
-    const int H = gdn_checked_int(q.size(2), "H");
+    // H counts value heads (v/o/g/beta/state); Hg counts the q/k key heads that
+    // H / Hg value heads share.  Every grid, snapshot and W/U buffer below is
+    // value-head indexed, so only q/k addressing changes for GQA.
+    const int H = gdn_checked_int(v.size(2), "H");
+    const int Hg = gdn_checked_int(q.size(2), "Hg");
     const int K = gdn_checked_int(q.size(3), "K");
     const int V = gdn_checked_int(v.size(3), "V");
+    const bool is_gqa = Hg != H;
+    if constexpr (algo != K1Algo::NEUMANN) {
+        TORCH_CHECK(!is_gqa,
+                    "GQA (Hg != H) is currently supported only by the BT64 "
+                    "Neumann K1 of the W/U split (WS) path");
+    }
     constexpr int BT = K1Traits::BT;
     constexpr int BV = K2Traits::BV;
     const int NT = gdn_checked_int(
@@ -229,7 +239,8 @@ void launch_gdn_prefill_impl(
         ? static_cast<const int32_t*>(chunk_indices.data_ptr()) : nullptr;
     k1args.g_is_bf16 = g.scalar_type() == at::ScalarType::BFloat16;
     k1args.beta_is_bf16 = beta.scalar_type() == at::ScalarType::BFloat16;
-    k1args.B = N; k1args.T = T; k1args.H = H; k1args.K = K; k1args.V = V;
+    k1args.B = N; k1args.T = T; k1args.H = H; k1args.Hg = Hg;
+    k1args.K = K; k1args.V = V;
 
     gdn_k2_kargs k2args{};
     k2args.ptr_q       = q.data_ptr();
@@ -248,7 +259,8 @@ void launch_gdn_prefill_impl(
         ? static_cast<const int32_t*>(chunk_indices.data_ptr()) : nullptr;
     k2args.ptr_chunk_offsets = IS_VARLEN
         ? static_cast<const int32_t*>(chunk_offsets.data_ptr()) : nullptr;
-    k2args.B = N; k2args.T = T; k2args.H = H; k2args.K = K; k2args.V = V;
+    k2args.B = N; k2args.T = T; k2args.H = H; k2args.Hg = Hg;
+    k2args.K = K; k2args.V = V;
     k2args.NT = NT;
     k2args.scale = scale;
 
@@ -261,11 +273,11 @@ void launch_gdn_prefill_impl(
         // three allocations with this consumer stream so replacing the
         // process-wide cache cannot recycle their storage while the kernels
         // below are still reading it.
-        c10::cuda::CUDACachingAllocator::recordStream(
+        c10::hip::HIPCachingAllocator::recordStream(
             cu_seqlens.storage().data_ptr(), current_stream);
-        c10::cuda::CUDACachingAllocator::recordStream(
+        c10::hip::HIPCachingAllocator::recordStream(
             chunk_indices.storage().data_ptr(), current_stream);
-        c10::cuda::CUDACachingAllocator::recordStream(
+        c10::hip::HIPCachingAllocator::recordStream(
             chunk_offsets.storage().data_ptr(), current_stream);
     }
 
@@ -440,6 +452,11 @@ void launch_gdn_prefill_impl(
                     "packed varlen requires the metadata-aware reference "
                     "state scan; OPUS_GDN_REF must be 16, 32, or 64");
             }
+            TORCH_CHECK(
+                !is_gqa ||
+                    ref_bv == 16 || ref_bv == 32 || ref_bv == 64,
+                "GQA requires the reference W/U state scan; OPUS_GDN_REF "
+                "must be 16, 32, or 64");
             if (ref_bv == 16 || ref_bv == 32 || ref_bv == 64) {
                 // reference now reads opus token-major w/u/k directly (strided loads)
                 // and writes v_new token-major [B,T,H,V] -> zero transposes.
@@ -450,7 +467,7 @@ void launch_gdn_prefill_impl(
                     static_cast<int64_t>(BT) * H * K * sizeof(hip_bfloat16),
                     "BT * H * K * sizeof(bfloat16)");
                 const int k_stride_t = gdn_checked_int(
-                    static_cast<int64_t>(H) * K, "H * K");
+                    static_cast<int64_t>(Hg) * K, "Hg * K");
                 const int batch_chunks = total_chunks;
                 const int64_t g_sb = IS_VARLEN ? 0 : (int64_t)T * H;
                 const int64_t g_sh = 1, g_st = H;
@@ -471,7 +488,7 @@ void launch_gdn_prefill_impl(
                         rg, rb, 0, stream, kp, wp, up, gp, (const float*)nullptr, h0p, hsp, vnp, htp, \
                         IS_VARLEN ? static_cast<const int32_t*>(cu_seqlens.data_ptr()) : nullptr, \
                         IS_VARLEN ? static_cast<const int32_t*>(chunk_offsets.data_ptr()) : nullptr, \
-                        N, batch_chunks, T, H, H, k_stride_t, g_sb, g_sh, g_st)
+                        N, batch_chunks, T, H, Hg, k_stride_t, g_sb, g_sh, g_st)
                 #define REF_BV(UINIT, SFIN) do { \
                     if (ref_bv==16) REF_LAUNCH(16, UINIT, SFIN); \
                     else if (ref_bv==32) REF_LAUNCH(32, UINIT, SFIN); \
@@ -584,6 +601,11 @@ void launch_gdn_prefill_impl(
             return;
         }
     }
+    // Only the split (WS) K2 family carries key-head addressing; the fused
+    // kernel below reads q/k with the value-head stride.
+    TORCH_CHECK(!is_gqa,
+                "GQA (Hg != H) requires the W/U split path; select k2_mode=2 "
+                "(WS)");
     // Runtime A/B switch for the gfx942 dense fused W/U kernel.  The public
     // wrapper above guarantees complete BT and BV tiles; split K2 has already
     // returned, so none of its scan/output specializations are affected.
@@ -708,24 +730,39 @@ void opus_gdn_wu_prefill_fwd(
     TORCH_CHECK(q.defined(), "q must be defined");
     TORCH_CHECK(q.is_cuda(), "q must be a HIP tensor");
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
-    TORCH_CHECK(q.dim() == 4, "q must be 4D [B, T, H, K]");
+    TORCH_CHECK(q.dim() == 4, "q must be 4D [B, T, Hg, K]");
     TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0,
-                "B, T, and H must be positive");
+                "B, T, and Hg must be positive");
     TORCH_CHECK(q.size(3) == 128, "K must be 128");
-    for (const auto& item : {
-             std::pair<const char*, torch::Tensor>("k", k),
-             std::pair<const char*, torch::Tensor>("v", v),
-             std::pair<const char*, torch::Tensor>("o", o)}) {
-        check_hip_tensor(item.second, item.first);
-        TORCH_CHECK(item.second.dim() == 4 &&
-                        item.second.size(0) == q.size(0) &&
-                        item.second.size(1) == q.size(1) &&
-                        item.second.size(2) == q.size(2) &&
-                        item.second.size(3) == 128,
-                    item.first, " must match q shape [B, T, H, 128]");
-        TORCH_CHECK(item.second.scalar_type() == at::ScalarType::BFloat16,
-                    item.first, " must be bf16");
+    check_hip_tensor(k, "k");
+    TORCH_CHECK(k.dim() == 4 && k.size(0) == q.size(0) &&
+                    k.size(1) == q.size(1) && k.size(2) == q.size(2) &&
+                    k.size(3) == 128,
+                "k must match q shape [B, T, Hg, 128]");
+    TORCH_CHECK(k.scalar_type() == at::ScalarType::BFloat16, "k must be bf16");
+    check_hip_tensor(v, "v");
+    TORCH_CHECK(v.dim() == 4 && v.size(0) == q.size(0) &&
+                    v.size(1) == q.size(1) && v.size(2) > 0 &&
+                    v.size(3) == 128,
+                "v must have shape [B, T, H, 128]");
+    TORCH_CHECK(v.scalar_type() == at::ScalarType::BFloat16, "v must be bf16");
+    // GQA: H / Hg value heads share one q/k head.  Hg == H is plain MHA.
+    const int64_t value_heads = v.size(2);
+    const int64_t key_heads = q.size(2);
+    TORCH_CHECK(value_heads % key_heads == 0,
+                "v head count ", value_heads,
+                " must be a multiple of the q/k head count ", key_heads);
+    const bool is_gqa = value_heads != key_heads;
+    if (is_gqa) {
+        TORCH_CHECK(BT == 64 && k1_algo == 1,
+                    "GQA requires BT=64 and k1_algo=1 (Neumann)");
+        TORCH_CHECK(is_varlen || k2_mode == 2,
+                    "GQA requires the W/U split path; pass k2_mode=2 (WS)");
     }
+    check_hip_tensor(o, "o");
+    TORCH_CHECK(o.dim() == 4 && o.sizes() == v.sizes(),
+                "o must match v shape [B, T, H, 128]");
+    TORCH_CHECK(o.scalar_type() == at::ScalarType::BFloat16, "o must be bf16");
     const bool native_scalar_loads = BT == 64 && k1_algo == 1;
     for (const auto& item : {
              std::pair<const char*, torch::Tensor>("g", g),
@@ -734,7 +771,7 @@ void opus_gdn_wu_prefill_fwd(
         TORCH_CHECK(item.second.dim() == 3 &&
                         item.second.size(0) == q.size(0) &&
                         item.second.size(1) == q.size(1) &&
-                        item.second.size(2) == q.size(2),
+                        item.second.size(2) == value_heads,
                     item.first, " must have shape [B, T, H]");
         if (native_scalar_loads) {
             TORCH_CHECK(
@@ -796,7 +833,7 @@ void opus_gdn_wu_prefill_fwd(
         TORCH_CHECK(state.scalar_type() == at::ScalarType::Float,
                     name, " must be fp32");
         TORCH_CHECK(state.dim() == 4 && state.size(0) == state_batch &&
-                        state.size(1) == q.size(2) && state.size(2) == 128 &&
+                        state.size(1) == value_heads && state.size(2) == 128 &&
                         state.size(3) == 128,
                     name, " must have shape [N, H, 128, 128]");
     };

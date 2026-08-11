@@ -94,6 +94,7 @@ gdn_k2_out_kernel(gdn_k2_kargs kargs) {
     const int K  = kargs.K;
     const int V  = kargs.V;
     const int H  = kargs.H;
+    const int Hg = kargs.Hg;
     const int NT = kargs.NT;
     const int v_off = i_v * BV;
     int bos, seq_len, t0;
@@ -114,7 +115,6 @@ gdn_k2_out_kernel(gdn_k2_kargs kargs) {
         bos = i_n * kargs.T;
         seq_len = kargs.T;
     }
-    const int stride_k = H * K;
     const int stride_v = H * V;
     const int stride_g = H;
 
@@ -122,7 +122,15 @@ gdn_k2_out_kernel(gdn_k2_kargs kargs) {
     // indices fit in int.  Form the CTA-owned global bases in 64 bits once.
     const int64_t token_head_base =
         (static_cast<int64_t>(bos) + t0) * H + i_h;
-    const int64_t qk_base = token_head_base * K;
+    // GQA: q/k carry Hg key heads, each shared by H / Hg value heads.  The
+    // uniform Hg == H branch keeps MHA on its original address arithmetic.
+    int stride_k = H * K;
+    int64_t qk_base = token_head_base * K;
+    if (Hg != H) {
+        const int i_hg = i_h / (H / Hg);
+        stride_k = Hg * K;
+        qk_base = ((static_cast<int64_t>(bos) + t0) * Hg + i_hg) * K;
+    }
     const int64_t vo_base = token_head_base * V;
     const int64_t snapshot_chunk = IS_VARLEN
         ? static_cast<int64_t>(i_chunk)
