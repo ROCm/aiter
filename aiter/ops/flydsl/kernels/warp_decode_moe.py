@@ -195,6 +195,27 @@ def wave_reduce_add_f32(val_f32):
     return w
 
 
+def atomic_add_f32(ptr, elem_off, val_f32):
+    """Atomic ``fadd`` of one f32 into global ``ptr[elem_off]`` (split-K accumulate).
+
+    ``ptr`` is the kernel's ``fx.Pointer`` output arg (an FP32 accumulator the caller
+    pre-zeroed); ``elem_off`` is the f32 element index; ``val_f32`` the fx.Float32 to
+    add.  Mirrors the ``llvm.AtomicRMWOp(fadd, ..., syncscope="agent")`` epilogue used
+    by the split-K GEMMs (small_m_hgemm / splitk_hgemm)."""
+    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+    addr = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(elem_off) * fx.Int64(4)
+    p = llvm.IntToPtrOp(ptr_ty, addr.ir_value()).result
+    p = p._value if hasattr(p, "_value") else p
+    llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.fadd,
+        p,
+        val_f32.ir_value(),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+        alignment=4,
+    )
+
+
 # -------------------------------------------------------------------------
 # Phase 1 primitive-validation kernel + launcher
 # -------------------------------------------------------------------------
@@ -503,6 +524,7 @@ def build_down_reduce_fp8_module(
     scale_bn: int | None = None,
     scale_bk: int | None = None,
     kh_per_warp: int = 1,
+    k_batch: int = 1,
 ):
     """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
 
@@ -541,6 +563,14 @@ def build_down_reduce_fp8_module(
     if inter % ktile_n != 0:
         raise ValueError(f"INTER={inter} not divisible by 64*kVector={ktile_n}")
     num_iter = inter // ktile_n
+    if k_batch < 1:
+        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
+    if num_iter % k_batch != 0:
+        raise ValueError(
+            f"num_iter={num_iter} (INTER/{ktile_n}) not divisible by k_batch={k_batch}"
+        )
+    iters_per_kb = num_iter // k_batch  # INTER iterations each split-K wave covers
+    split_k = const_expr(k_batch > 1)
     n_pairs = kvector // 2
     n_wwords = kvector // 4  # fp8 weight dwords/lane/iter (4 fp8 each)
     n_cols = hidden // kh_per_warp  # output column-groups per token
@@ -572,8 +602,12 @@ def build_down_reduce_fp8_module(
         bid = fx.block_idx.x
         lane = fx.thread_idx.x
 
-        col = bid % n_cols
-        token_b = bid // n_cols
+        # Split-K: the low `k_batch` bids share an output but cover disjoint INTER
+        # sub-ranges (kb).  For k_batch==1, kb==0 and this is the plain layout.
+        kb = bid % k_batch
+        rest = bid // k_batch
+        col = rest % n_cols
+        token_b = rest // n_cols
         out_j0 = col * kh_per_warp  # this wave owns out_j0 .. out_j0+kh_per_warp-1
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
@@ -596,8 +630,8 @@ def build_down_reduce_fp8_module(
             if const_expr(block2d):
                 # Block2D<BN,BK> scale varies along K -> fold each K-block's
                 # (router_wt * ds_block) into each output's per-lane partial.
-                for i in range_constexpr(num_iter):
-                    k_base = i * ktile_n + lane * kvector
+                for i in range_constexpr(iters_per_kb):
+                    k_base = (kb * iters_per_kb + i) * ktile_n + lane * kvector
                     inter_row = token_b * top_k + k
                     a_word0 = (inter_row * inter + k_base) // 2
                     # Shared activation load + kh independent weight loads in flight.
@@ -642,8 +676,8 @@ def build_down_reduce_fp8_module(
                     ds = [ds0 for _ in range(kh_per_warp)]
 
                 dot = [fx.Float32(0.0).ir_value() for _ in range(kh_per_warp)]
-                for i in range_constexpr(num_iter):
-                    k_base = i * ktile_n + lane * kvector
+                for i in range_constexpr(iters_per_kb):
+                    k_base = (kb * iters_per_kb + i) * ktile_n + lane * kvector
                     inter_row = token_b * top_k + k
                     a_word0 = (inter_row * inter + k_base) // 2
                     # Shared activation load + kh independent weight loads in flight.
@@ -672,17 +706,26 @@ def build_down_reduce_fp8_module(
                         fx.Float32(rw) * fx.Float32(ds[h])
                     )
 
-        # Reduce runs on all lanes (cross-lane shuffles); only lane 0 stores.
+        # Reduce runs on all lanes (cross-lane shuffles); only lane 0 writes.
         y_sum = [
             fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
             for h in range(kh_per_warp)
         ]
-        y_rsrc = _ptr_rsrc(y_ptr)
-        if lane == 0:
-            for h in range_constexpr(kh_per_warp):
-                buffer_ops.buffer_store(
-                    BFloat16(y_sum[h]).ir_value(), y_rsrc, token_b * hidden + out_j0 + h
-                )
+        if const_expr(split_k):
+            # Split-K: each kb wave holds a disjoint INTER partial -> atomic-add into
+            # the caller-zeroed FP32 accumulator (finalized to bf16 by the caller).
+            if lane == 0:
+                for h in range_constexpr(kh_per_warp):
+                    atomic_add_f32(y_ptr, token_b * hidden + out_j0 + h, y_sum[h])
+        else:
+            y_rsrc = _ptr_rsrc(y_ptr)
+            if lane == 0:
+                for h in range_constexpr(kh_per_warp):
+                    buffer_ops.buffer_store(
+                        BFloat16(y_sum[h]).ir_value(),
+                        y_rsrc,
+                        token_b * hidden + out_j0 + h,
+                    )
 
     @flyc.jit
     def _launch(
