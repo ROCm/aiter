@@ -566,7 +566,7 @@ def gen_persistent_instance(
     **_unused,
 ):
     """gfx950 a16w16_persistent launcher emit. See gen_instances.opus_gemm_codegen._gen_persistent_instance."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_oob_str = "true" if k.has_oob else "false"
@@ -668,11 +668,11 @@ void
     kargs.n = N;
     kargs.k = K;
     kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
     kargs.stride_c_batch = M * N;
 {grid_setup}
     auto stream = aiter::getCurrentHIPStream();
@@ -703,7 +703,7 @@ def gen_scale_instance(
     **_unused,
 ):
     """gfx950 a8w8_scale launcher emit."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     traits_aliases = f"""
@@ -933,11 +933,11 @@ void
     kargs.n = N;
     kargs.k = K;
     kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
     kargs.stride_c_batch = M * N;
 {kargs_init_extra}{bias_kargs_block}
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
@@ -1068,11 +1068,11 @@ void
     kargs.n = N;
     kargs.k = K;
     kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
     kargs.stride_c_batch = M * N;
 
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
@@ -1128,7 +1128,7 @@ def gen_flatmm_instance(
     **_unused,
 ):
     """gfx950 a16w16_flatmm launcher emit."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_bias_str = "false"
@@ -1197,11 +1197,11 @@ void
     kargs.n = N;
     kargs.k = K;
     kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
     kargs.stride_c_batch = M * N;
 
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
@@ -1238,7 +1238,7 @@ def gen_flatmm_splitk_instance(
     **_unused,
 ):
     """gfx950 a16w16_flatmm_splitk launcher emit (uses ws_handle + reduce kernel call)."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_oob_str = "true" if k.has_oob else "false"
@@ -1364,12 +1364,12 @@ void
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
     kargs.split_k = split_k;
-    kargs.stride_a        = K;
-    kargs.stride_b        = K;
+    kargs.stride_a        = XQ.stride(1);
+    kargs.stride_b        = WQ.stride(1);
     kargs.stride_ws       = padded_N;
     kargs.stride_c        = N;
-    kargs.stride_a_batch  = M * K;
-    kargs.stride_b_batch  = N * K;
+    kargs.stride_a_batch  = XQ.stride(0);
+    kargs.stride_b_batch  = WQ.stride(0);
     kargs.stride_ws_batch = padded_M * padded_N;
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;

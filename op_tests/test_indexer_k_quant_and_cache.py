@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
-from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter import (
-    pertoken_quant,
+    cp_gather_indexer_k_quant_cache,
     dtypes,
     indexer_k_quant_and_cache,
-    cp_gather_indexer_k_quant_cache,
+    pertoken_quant,
 )
-import argparse
-import pandas as pd
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 MAX_TOKEN_SUPPORTED = 16384
 TILE = 16  # MFMA 16x16 tile size used by the preshuffle layout
@@ -150,7 +152,7 @@ def test_indexer_k_quant_and_cache(
             err2_k = checkAllclose(k_ref.to(torch.float), k_vllm.to(torch.float))
             err2_s = checkAllclose(s_ref, s_vllm)
             ret.update({"vllm us": us2, "vllm k_err": err2_k, "vllm s_err": err2_s})
-        except Exception:
+        except Exception:  # noqa: BLE001,S110
             # Ignore all exceptions here because vllm._custom_ops is optional and may not be available.
             pass
     return ret

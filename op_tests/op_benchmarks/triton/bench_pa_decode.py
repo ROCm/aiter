@@ -1,17 +1,19 @@
-import sys
-import random
-import torch
 import argparse
+import random
+import sys
+
+import torch
 import triton
+
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
-    get_dtype_bytes,
     get_caller_name_no_ext,
+    get_dtype_bytes,
+    get_model_configs,
     print_vgpr,
 )
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 
 def input_helper(
@@ -161,7 +163,7 @@ def paged_attn_decode(
     k_scale = torch.tensor([1.0])
     v_scale = torch.tensor([1.0])
 
-    return lambda: paged_attention_decode(  # noqa: E731
+    return lambda: paged_attention_decode(
         output=triton_output,
         query=query,
         key_cache=key_cache_tri,
@@ -184,8 +186,6 @@ def run_benchmark(args):
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
-
-    model_name = "paged-attn-decode"
 
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
@@ -307,7 +307,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

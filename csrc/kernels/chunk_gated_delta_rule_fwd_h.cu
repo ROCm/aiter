@@ -318,9 +318,25 @@ __device__ __forceinline__ floatx4 zero_floatx4()
     return {0.0f, 0.0f, 0.0f, 0.0f};
 }
 
+__device__ __forceinline__ int mma_row_group(const int lane_id)
+{
+    const int physical_row_group = lane_id >> 4;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // Wave64 WMMA maps physical lane groups 0..3 to result rows 0, 2, 1, 3.
+    return ((physical_row_group & 1) << 1) |
+           ((physical_row_group & 2) >> 1);
+#else
+    return physical_row_group;
+#endif
+}
+
 __device__ __forceinline__ floatx4 mfma16x16x16_bf16(const _B16x4& a, const _B16x4& b, const floatx4& c)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12(a, b, c);
+#else
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+#endif
 }
 
 template <bool USE_EXP2>
@@ -668,6 +684,12 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
         }
     }
 
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __syncthreads();
+#endif
+
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
     float g_scale[4];
@@ -728,7 +750,7 @@ __device__ __forceinline__ void run_gemm2_fulltile_bvp(
 {
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
     const float decay = gated_exp(g_last, use_exp2);
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
 
     for (int round = 0; round < K_DIM / (MFMA_M * WAVE_COUNT); ++round) {
         floatx4 gacc[NUM_BV_TILES];
@@ -873,7 +895,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     int64_t g_stride_t = 0)
 {
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
     const int v_idx = lane_id & 15;
     const bf16_t zero_val = float_to_bf16(0.0f);
     const bf16_t* w_chunk = overlap2_w_ptr<IS_VARLEN>(w_bf16, i_n, H, i_h, T_flat, token_base);
@@ -927,6 +949,12 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
         }
     }
     write_k_panels_to_lds(k_data, k_panel0, k_panel1);
+
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __syncthreads();
+#endif
 
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
@@ -1017,10 +1045,11 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const hip_bfloat16* __restrict__ u,
     const float* __restrict__ g,
     const float* __restrict__ gk,
-    const void* __restrict__ h0,
+    const void* h0,
+    const int32_t* __restrict__ initial_state_indices,
     hip_bfloat16* __restrict__ h,
     hip_bfloat16* __restrict__ v_new,
-    void* __restrict__ ht,
+    void* ht,
     const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ chunk_offsets,
     int total_chunks,
@@ -1039,6 +1068,8 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const int i_nh = static_cast<int>(blockIdx.y);
     const int i_n = i_nh / H;
     const int i_h = i_nh % H;
+    // Per-sequence state slot; a null index array means slot == i_n.
+    const int slot = initial_state_indices ? initial_state_indices[i_n] : i_n;
     const int tid = static_cast<int>(threadIdx.x);
     const int wave_id = tid / WAVE_SIZE;
     const int lane_id = tid % WAVE_SIZE;
@@ -1077,14 +1108,14 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     __shared__ bf16_t h_transpose_buf[BV_P * K_DIM];
 
     const int v_idx = lane_id & 15;
-    const int row_group = lane_id >> 4;
+    const int row_group = mma_row_group(lane_id);
     const int h_row_base_lo = wave_id * MFMA_M + row_group * 4;
     const int h_row_base_hi = h_row_base_lo + 64;
     float h_reg[8 * NUM_BV_TILES];
 
     if constexpr (USE_INITIAL_STATE) {
         const void* h0_base = reinterpret_cast<const char*>(h0)
-            + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM
+            + (static_cast<int64_t>(slot) * H + i_h) * V_DIM * K_DIM
                 * static_cast<int64_t>(STATE_BF16 ? sizeof(bf16_t) : sizeof(float));
         load_vk_hreg_from_global<BV_P, STATE_BF16>(
             h_reg, h0_base, global_v_base, v_idx, h_row_base_lo, h_row_base_hi);
@@ -1186,7 +1217,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
 
     if constexpr (STORE_FINAL_STATE) {
         void* ht_base = reinterpret_cast<char*>(ht)
-            + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM
+            + (static_cast<int64_t>(slot) * H + i_h) * V_DIM * K_DIM
                 * static_cast<int64_t>(STATE_BF16 ? sizeof(bf16_t) : sizeof(float));
         store_vk_hreg_to_global<BV_P, STATE_BF16>(
             h_reg, ht_base, global_v_base, v_idx, h_row_base_lo, h_row_base_hi);
@@ -1205,6 +1236,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         reinterpret_cast<const float*>(g.data_ptr()),                                                                                 \
         has_gk ? reinterpret_cast<const float*>(gk.data_ptr()) : nullptr,                                                            \
         has_initial_state ? initial_state.data_ptr() : nullptr,                                                                       \
+        has_initial_state_indices ? reinterpret_cast<const int32_t*>(initial_state_indices.data_ptr()) : nullptr,                     \
         reinterpret_cast<hip_bfloat16*>(h.data_ptr()),                                                                                \
         save_new_value ? reinterpret_cast<hip_bfloat16*>(v_new.data_ptr()) : nullptr,                                                 \
         output_final_state ? final_state.data_ptr() : nullptr,                                                                        \
@@ -1280,6 +1312,7 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
     aiter_tensor_t g,
     aiter_tensor_t gk,
     aiter_tensor_t initial_state,
+    aiter_tensor_t initial_state_indices,
     aiter_tensor_t cu_seqlens,
     aiter_tensor_t chunk_offsets,
     aiter_tensor_t h,
@@ -1294,6 +1327,7 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
 {
     const bool is_varlen = cu_seqlens.numel() > 0;
     const bool has_gk = gk.numel() > 0;
+    const bool has_initial_state_indices = initial_state_indices.numel() > 0;
     AITER_CHECK(k.is_gpu(), "`k` must be a CUDA/HIP tensor.");
     AITER_CHECK(w.is_gpu(), "`w` must be a CUDA/HIP tensor.");
     AITER_CHECK(u.is_gpu(), "`u` must be a CUDA/HIP tensor.");
@@ -1384,12 +1418,21 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
     if (has_initial_state) {
         AITER_CHECK(initial_state.is_gpu(), "`initial_state` must be a CUDA/HIP tensor.");
         AITER_CHECK(initial_state.dim() == 4,
-                    "`initial_state` must have shape [N, H, V, K].");
-        AITER_CHECK(initial_state.size(0) == N && initial_state.size(1) == H,
-                    "`initial_state` shape mismatch.");
+                    "`initial_state` must have shape [N, H, V, K] (dense) or [pool_size, H, V, K] (indexed).");
+        AITER_CHECK(initial_state.size(0) >= N && initial_state.size(1) == H,
+                    "`initial_state` shape mismatch; first dim must be >= N.");
         AITER_CHECK(initial_state.size(2) == V_DIM && initial_state.size(3) == K_DIM,
                     "`initial_state` shape mismatch for VK layout.");
         AITER_CHECK(initial_state.is_contiguous(), "`initial_state` must be contiguous.");
+    }
+    if (has_initial_state_indices) {
+        AITER_CHECK(initial_state_indices.is_gpu(), "`initial_state_indices` must be a CUDA/HIP tensor.");
+        AITER_CHECK(initial_state_indices.dtype() == AITER_DTYPE_i32,
+                    "`initial_state_indices` must be int32, got ",
+                    AiterDtype_to_str(initial_state_indices.dtype()));
+        AITER_CHECK(initial_state_indices.dim() == 1 && initial_state_indices.size(0) == N,
+                    "`initial_state_indices` must have shape [N].");
+        AITER_CHECK(initial_state_indices.is_contiguous(), "`initial_state_indices` must be contiguous.");
     }
     if (save_new_value) {
         AITER_CHECK(v_new.is_gpu(), "`v_new` must be a CUDA/HIP tensor.");
@@ -1406,9 +1449,9 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
         AITER_CHECK(final_state.dtype() == state_dtype,
                     "`final_state` dtype must match `initial_state`, got ",
                     AiterDtype_to_str(final_state.dtype()));
-        AITER_CHECK(final_state.dim() == 4 && final_state.size(0) == N && final_state.size(1) == H &&
+        AITER_CHECK(final_state.dim() == 4 && final_state.size(0) >= N && final_state.size(1) == H &&
                         final_state.size(2) == V_DIM && final_state.size(3) == K_DIM,
-                    "`final_state` shape mismatch; expected [N, H, V, K].");
+                    "`final_state` shape mismatch; expected [>=N, H, V, K].");
         AITER_CHECK(final_state.is_contiguous(), "`final_state` must be contiguous.");
     }
 
@@ -1448,6 +1491,7 @@ void chunk_gated_delta_rule_fwd_h_hip(
     aiter_tensor_t g,
     aiter_tensor_t gk,
     aiter_tensor_t initial_state,
+    aiter_tensor_t initial_state_indices,
     aiter_tensor_t cu_seqlens,
     aiter_tensor_t chunk_offsets,
     aiter_tensor_t h,
@@ -1461,7 +1505,7 @@ void chunk_gated_delta_rule_fwd_h_hip(
     bool g_head_major)
 {
     chunk_gated_delta_rule_fwd_h_hip_impl(
-        k, w, u, g, gk, initial_state, cu_seqlens, chunk_offsets, h, v_new, final_state,
+        k, w, u, g, gk, initial_state, initial_state_indices, cu_seqlens, chunk_offsets, h, v_new, final_state,
         selected_bv, has_initial_state, output_final_state, save_new_value, use_exp2, g_head_major);
 }
 

@@ -1,8 +1,9 @@
 import triton
 import triton.language as tl
-from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
+
 from aiter.ops.triton._triton_kernels.kv_cache import _store_mla_kv_cache
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
+from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 
 
 @triton.jit
@@ -367,27 +368,24 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             q_pe.to(q_out_ptr.dtype.element_ty),
         )
 
-        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE:
-            if pid < num_decode_toks_for_zeros * QH:
-                decode_q_pe_out_ptrs = (
-                    decode_q_pe_out_ptr
-                    + pid_b * decode_q_pe_out_stride_b
-                    + pid_hq * decode_q_pe_out_stride_h
-                )
-                tl.store(
-                    decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
-                    q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
-                )
-                z = tl.zeros(
-                    (BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + d_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid < num_decode_toks_for_zeros * QH:
+            decode_q_pe_out_ptrs = (
+                decode_q_pe_out_ptr
+                + pid_b * decode_q_pe_out_stride_b
+                + pid_hq * decode_q_pe_out_stride_h
+            )
+            tl.store(
+                decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
+                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+            )
+            z = tl.zeros((BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + d_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         # pid_hk = pid_hq // QH_PER_KH
         # is_kv = pid_hq % QH_PER_KH == 0
@@ -581,6 +579,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     zeros_out_ptr,
     T,
     T_slot,
+    MAX_EMBD_POS,
     q_stride_t,
     q_stride_h,
     q_stride_d,
@@ -950,7 +949,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel(
                 ).to(d_cos_offs.dtype)
             else:
                 d_cos_offs = d_pe_offs // 2
-                d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
 
         else:
             d_cos_offs = d_pe_offs

@@ -9,11 +9,13 @@
 #include "opus_gemm_heuristic_dispatch_gfx942.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_dispatch_gfx942<>
 #include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_BF16 / FP32
 #include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_BF16 / FP32
+#include "opus_gemm_a8w8_tune_lookup.h"             // GENERATE_A8W8_TUNE_LOOKUP_BF16
 #include "opus_gemm_manifest.h"                     // launcher symbols referenced by the lookup macros
 #include "../opus_gemm_utils.cuh"                   // bf16_t / fp32_t
 
 #include <algorithm>  // std::lower_bound
 #include <cstddef>
+#include <optional>
 
 namespace opus_gfx942_detail
 {
@@ -57,6 +59,22 @@ constexpr bool tune_entry_less(const OpusA16W16TuneEntry& a,
 }
 
 using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
+
+using OpusA8W8BlockscaleBPreshuffleKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+
+struct OpusA8W8TuneEntry
+{
+    int kid;
+    OpusA8W8BlockscaleBPreshuffleKernel func;
+};
+
+constexpr bool a8w8_tune_entry_less(const OpusA8W8TuneEntry& a,
+                                    const OpusA8W8TuneEntry& b) noexcept
+{
+    return a.kid < b.kid;
+}
 }  // namespace opus_gfx942_detail
 
 // -- a16w16 runtime dispatch (tuned lookup -> heuristic fallback) -------------
@@ -138,5 +156,26 @@ opus_a16w16_tune_dispatch_gfx942<fp32_t>(int id)
     AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table (gfx942)");
+    return it->func;
+}
+
+// -- a8w8 tune dispatch (id-based, bf16-output explicit tune API only) --------
+
+inline opus_gfx942_detail::OpusA8W8BlockscaleBPreshuffleKernel
+opus_a8w8_tune_dispatch_gfx942(int id);
+
+inline opus_gfx942_detail::OpusA8W8BlockscaleBPreshuffleKernel
+opus_a8w8_tune_dispatch_gfx942(int id)
+{
+    using namespace opus_gfx942_detail;
+    static constexpr OpusA8W8TuneEntry kTune[] = {
+        GENERATE_A8W8_TUNE_LOOKUP_BF16(bf16_t)
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA8W8TuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle, a8w8_tune_entry_less);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
+                "Kernel id ", id,
+                " not found in a8w8 bf16 tune lookup table (gfx942)");
     return it->func;
 }

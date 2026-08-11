@@ -1,13 +1,14 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
 import triton
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
@@ -33,7 +34,7 @@ for config in config_list:
         config = config.copy()
         config["SPLITK_BLOCK_SIZE"] = triton.cdiv(input_shape[2], config["NUM_KSPLIT"])
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a16w16(x, w, bias, dtype, y, config=config)

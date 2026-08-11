@@ -58,9 +58,12 @@ void get_mla_metadata_v1(
     const int32_t                       topk,
     const int32_t                       max_split_per_batch,
     const bool                          intra_batch_mode,
-    const std::optional<at::ScalarType> dtype_q,
-    const std::optional<at::ScalarType> dtype_kv,
-    const bool                          is_cp_round_robin)
+    const bool                          is_cp_round_robin,
+    const MlaVersion                    mla_version,
+    const std::optional<at::ScalarType> dtype_q_nope,
+    const std::optional<at::ScalarType> dtype_q_rope,
+    const std::optional<at::ScalarType> dtype_kv_nope,
+    const std::optional<at::ScalarType> dtype_kv_rope)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -81,8 +84,13 @@ void get_mla_metadata_v1(
     TORCH_CHECK(kv_last_page_lens.scalar_type() == at::ScalarType::Int,
                 __func__, ": kv_last_page_lens's element type should be int!");
 
-    at::ScalarType q_dtype = dtype_q.has_value() ? dtype_q.value() : at::ScalarType::BFloat16;
-    at::ScalarType kv_dtype = dtype_kv.has_value() ? dtype_kv.value() : at::ScalarType::BFloat16;
+    at::ScalarType q_nope_dtype =
+        dtype_q_nope.has_value() ? dtype_q_nope.value() : at::ScalarType::BFloat16;
+    at::ScalarType kv_nope_dtype =
+        dtype_kv_nope.has_value() ? dtype_kv_nope.value() : at::ScalarType::BFloat16;
+    // rope dtypes default to their corresponding nope dtype when unspecified.
+    at::ScalarType q_rope_dtype  = dtype_q_rope.has_value() ? dtype_q_rope.value() : q_nope_dtype;
+    at::ScalarType kv_rope_dtype = dtype_kv_rope.has_value() ? dtype_kv_rope.value() : kv_nope_dtype;
 
     if (fast_mode)
     {
@@ -99,9 +107,12 @@ void get_mla_metadata_v1(
             uni_seqlen_qo,
             topk,
             max_split_per_batch,
-            q_dtype,
-            kv_dtype,
+            q_nope_dtype,
+            kv_nope_dtype,
+            q_rope_dtype,
+            kv_rope_dtype,
             is_cp_round_robin,
+            mla_version,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
@@ -121,7 +132,7 @@ void get_mla_metadata_v1(
             max_seqlen_qo,
             uni_seqlen_qo,
             max_split_per_batch,
-            q_dtype,
+            q_nope_dtype,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,

@@ -4,6 +4,7 @@
         "BLOCK_N": 32,
         "BLOCK_K": 256,
         "NUM_BUFFERS": 5,
-        "num_warps": 2
+        "num_warps": 2,
+        "kernel_type": "bandwidth_bound"
     }
 }

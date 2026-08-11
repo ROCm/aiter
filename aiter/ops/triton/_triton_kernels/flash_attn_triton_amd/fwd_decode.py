@@ -1,12 +1,14 @@
 import warnings
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
+
 from .common import apply_rotary
 from .utils import (
-    DEBUG,
     AUTOTUNE,
+    DEBUG,
     AutotuneMode,
     get_arch,
     get_padded_headsize,
@@ -37,43 +39,7 @@ def get_fwd_decode_configs(mode: AutotuneMode):
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
 
-    if mode == "off":
-        arch = get_arch()
-        if arch.is_rdna:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 32, "BLOCK_N": 32},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-        elif arch.is_cdna:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-        else:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-
-    elif mode == "on":
+    if mode == "off" or mode == "on":
         arch = get_arch()
         if arch.is_rdna:
             return (
@@ -186,7 +152,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         qk += tl.dot(q, kT) * q_descale * k_descale  # Apply FP8 scaling
     else:
-        qk = tl.dot(q, kT, acc=qk)  # noqa: F821
+        qk = tl.dot(q, kT, acc=qk)
 
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -213,8 +179,13 @@ def _attn_fwd_inner(
             # -------- causal + window --------
             diag = N_CTX_K_FINAL - N_CTX_Q  # sk-sq
             causal_ok = col <= row + diag
-            if WINDOW_SIZE_LEFT < 0:  # only right window
+            if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                # both edges unbounded: only the causal cap constrains cols
+                win_ok = causal_ok
+            elif WINDOW_SIZE_LEFT < 0:  # only right window
                 win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+            elif WINDOW_SIZE_RIGHT < 0:  # only left window (causal caps the right)
+                win_ok = col >= row + diag - WINDOW_SIZE_LEFT
             else:  # both sides
                 win_ok = (col >= row + diag - WINDOW_SIZE_LEFT) & (
                     col <= row + diag + WINDOW_SIZE_RIGHT
@@ -223,8 +194,14 @@ def _attn_fwd_inner(
         else:
             # -------- non-causal window --------
             sk, sq = N_CTX_K_FINAL, N_CTX_Q
-            if WINDOW_SIZE_LEFT < 0:
+            if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                # both edges unbounded: full attention, nothing masked
+                mask = (row < 0) | (col < 0)
+            elif WINDOW_SIZE_LEFT < 0:
                 mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+            elif WINDOW_SIZE_RIGHT < 0:
+                # unbounded right, finite left (mirror of infinite-left)
+                mask = col < row + (sk - sq) - WINDOW_SIZE_LEFT
             else:
                 right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
                 left = row + (sk - sq) - WINDOW_SIZE_LEFT
@@ -516,7 +493,7 @@ def _fwd_kernel_splitK(
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)  # noqa: F821
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     # loop over k, v and update accumulator
     if USE_BLOCK_TABLE:
@@ -949,27 +926,27 @@ def attention_forward_decode_triton_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k_new: Optional[torch.Tensor],
-    v_new: Optional[torch.Tensor],
+    k_new: torch.Tensor | None,
+    v_new: torch.Tensor | None,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     layout: Literal["bshd"],
-    cache_seqlens: Optional[torch.Tensor],
-    cache_batch_idx: Optional[torch.Tensor],
-    block_table: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    cache_seqlens: torch.Tensor | None,
+    cache_batch_idx: torch.Tensor | None,
+    block_table: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
+    seqlens_rotary: torch.Tensor | None = None,
 ):
     # Validate layout at entry
     if layout != "bshd":
@@ -1054,11 +1031,15 @@ def attention_forward_decode_triton_impl(
 
     # kernel_configs
     is_new_kv = False  # Cache has been updated, so no new KV in kernel
-    use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False, (
+    use_alibi, (stride_az, stride_ah) = alibi_slopes is not None, (
         alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     )
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    # As in the prefill kernel, either edge may be unbounded and is handled
+    # uniformly in the per-element window mask: WINDOW_SIZE_LEFT < 0 drops the left
+    # bound, WINDOW_SIZE_RIGHT < 0 drops the right bound (the causal cap still bounds
+    # the right when IS_CAUSAL). (-1, -1) is the only "off" sentinel.
     use_block_table = block_table is not None
 
     # get shapes and strides
@@ -1068,15 +1049,14 @@ def attention_forward_decode_triton_impl(
     # Handle paged KV cache layout
     if use_block_table:
         # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
-        num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
-        num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
+        _num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
+        _num_blocks_vc, _block_size_v, nheads_vc, dim_vc = v_cache.shape
         # Get the actual sequence length from the block_table upper bound.
         # Avoid cache_seqlens.max().item(): GPU-to-CPU sync is illegal during
         # CUDA graph capture, and the block-table bound is always safe.
         assert block_table is not None
         num_blocks_per_seq = block_table.shape[1]
         seqlen_kc = num_blocks_per_seq * block_size_k
-        seqlen_vc = seqlen_kc
 
         # Strides for paged layout
         stride_kc_z = 0  # No batch dimension in paged cache
@@ -1093,17 +1073,17 @@ def attention_forward_decode_triton_impl(
         stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(
             k_cache, layout
         )
-        _, seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
+        _, _seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
         stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(
             v_cache, layout
         )
         block_size_k = 0  # Not used
     if is_new_kv:
-        _, seqlen_kn, nheads_kn, dim_kn = get_shape_from_layout(k_new, layout)
+        _, _seqlen_kn, nheads_kn, _dim_kn = get_shape_from_layout(k_new, layout)
         stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(
             k_new, layout
         )
-        _, seqlen_vn, nheads_vn, dim_vn = get_shape_from_layout(v_new, layout)
+        _, _seqlen_vn, nheads_vn, _dim_vn = get_shape_from_layout(v_new, layout)
         stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(
             v_new, layout
         )
@@ -1112,7 +1092,7 @@ def attention_forward_decode_triton_impl(
         stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = None, None, None, None
         _, _seqlen_vn, nheads_vn, _dim_vn = None, None, None, None
         stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = None, None, None, None
-    _, seqlen_o, nheads_o, dim_o = get_shape_from_layout(out, layout)
+    _, _seqlen_o, nheads_o, _dim_o = get_shape_from_layout(out, layout)
     stride_oz, stride_oh, stride_om, stride_od = get_stride_from_layout(out, layout)
     assert (
         dim_q == dim_kc == dim_vc
