@@ -432,7 +432,7 @@ __global__ void opus_moe_combine_bwd_bf16_kernel(const hip_bfloat16* __restrict_
         dp[m] = sm[0];
 }
 
-// Vectorized fast path: one wave per route, four routes per 256-thread block.
+// Vectorized fast path: one 64-thread wave/block per route.
 // Each lane streams bf16x8 chunks and the route-score dot product stays within
 // the wave, eliminating the shared-memory reduction and its block barriers.
 __global__ void opus_moe_combine_bwd_bf16_wave_kernel(
@@ -446,7 +446,7 @@ __global__ void opus_moe_combine_bwd_bf16_wave_kernel(
     int H)
 {
     constexpr int WAVE = 64;
-    constexpr int WAVES_PER_BLOCK = 4;
+    constexpr int WAVES_PER_BLOCK = 1;
     const int lane = threadIdx.x % WAVE;
     const int wave = threadIdx.x / WAVE;
     const int m = blockIdx.x * WAVES_PER_BLOCK + wave;
@@ -493,7 +493,7 @@ void opus_moe_combine_bwd_bf16(aiter_tensor_t& dout,   // [T,H] bf16
         return;
     if(H % 8 == 0)
     {
-        constexpr int WAVES_PER_BLOCK = 4;
+        constexpr int WAVES_PER_BLOCK = 1;
         constexpr int BLOCK = WAVES_PER_BLOCK * 64;
         const int grid = (M + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
         opus_moe_combine_bwd_bf16_wave_kernel<<<
