@@ -156,6 +156,13 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM3Cohort6
     static constexpr int ROUTE_M_TILES = 3;
 };
 
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
+{
+    static constexpr int ROUTE_COHORT_TILES = 10;
+    static constexpr int ROUTE_M_TILES = 5;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,

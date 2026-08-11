@@ -122,7 +122,7 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
 
     constexpr int legacy_kid = 5;
     constexpr int cohort4_m2_kid = 7;
-    constexpr int cohort6_m3_kid = 8;
+    constexpr int cohort10_m5_kid = 9;
     constexpr int output_n_tile = 128;
     // A cohort is useful only when there are enough route and N tiles to
     // trade a bounded amount of W1 reuse for much shorter dZ reuse distance.
@@ -145,7 +145,7 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
     const uint64_t w1_bytes =
         static_cast<uint64_t>(kargs.route.num_experts) * gate_up_dim *
         static_cast<uint64_t>(kargs.model_dim) * sizeof(hip_bfloat16);
-    return dz_bytes + w1_bytes > l2_friendly_bytes ? cohort6_m3_kid
+    return dz_bytes + w1_bytes > l2_friendly_bytes ? cohort10_m5_kid
                                                    : cohort4_m2_kid;
 }
 

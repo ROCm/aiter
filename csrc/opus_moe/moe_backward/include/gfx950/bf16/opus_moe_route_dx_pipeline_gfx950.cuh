@@ -109,7 +109,7 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     constexpr int BK = T::B_K;
     constexpr int CTA_M = RouteTiles * BM;
     constexpr bool fixed_shape = FixedD > 0;
-    static_assert(RouteTiles >= 1 && RouteTiles <= 3);
+    static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));
