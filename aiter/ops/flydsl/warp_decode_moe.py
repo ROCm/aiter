@@ -21,8 +21,10 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.kernels.warp_decode_moe import (
+    build_down_reduce_bf16_module,
     build_down_reduce_fp4_module,
     build_down_reduce_fp8_module,
+    build_gate_up_bf16_module,
     build_gate_up_fp4_module,
     build_gate_up_fp8_module,
     pick_kvector,
@@ -66,6 +68,29 @@ def _get_down_reduce(
         serialize_dot2=serialize_dot2,
         scale_bn=scale_bn,
         scale_bk=scale_bk,
+        kh_per_warp=kh_per_warp,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_gate_up_bf16(hidden, inter, top_k, kvector, serialize_dot2):
+    return build_gate_up_bf16_module(
+        hidden,
+        inter,
+        top_k,
+        kvector=kvector,
+        serialize_dot2=serialize_dot2,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_down_reduce_bf16(inter, hidden, top_k, kvector, serialize_dot2, kh_per_warp):
+    return build_down_reduce_bf16_module(
+        inter,
+        hidden,
+        top_k,
+        kvector=kvector,
+        serialize_dot2=serialize_dot2,
         kh_per_warp=kh_per_warp,
     )
 
@@ -395,6 +420,126 @@ def flydsl_warp_decode_down_reduce(
             ptr_arg(intermediate),
             ptr_arg(w_down),
             ptr_arg(w_down_scale),
+            ptr_arg(router_ids),
+            ptr_arg(router_wts),
+            ptr_arg(out),
+            grid_x,
+            torch.cuda.current_stream(),
+        ),
+    )
+    return out
+
+
+def flydsl_warp_decode_gate_up_bf16(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    router_ids: torch.Tensor,
+    *,
+    serialize_dot2: bool = True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gate_up stage with **BF16 weights** (unquantized oracle; no scales).
+
+    Same reduction + ``silu(gate)*up`` epilogue as
+    :func:`flydsl_warp_decode_gate_up`, but ``w_gate``/``w_up`` are plain bf16 fed
+    straight to the dot2 (no scaled convert, no weight scale). Intended as the
+    non-quantized correctness reference for the FP8/FP4 paths and a gfx942 scaffold.
+
+    Args:
+        x:            [B, HIDDEN] bfloat16.
+        w_gate/w_up:  [E, INTER, HIDDEN] bfloat16 (row = e*INTER + j).
+        router_ids:   [B, TOPK] int32.
+        out:          optional [B, TOPK, INTER] bfloat16 output buffer.
+
+    Returns:
+        [B, TOPK, INTER] bfloat16 intermediate.
+    """
+    assert x.dtype == torch.bfloat16, "activation must be bfloat16"
+    assert w_gate.dtype == torch.bfloat16, "w_gate must be bfloat16 for this path"
+    assert w_up.dtype == torch.bfloat16, "w_up must be bfloat16 for this path"
+    assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
+
+    B, HIDDEN = x.shape
+    E, INTER, Hk = w_gate.shape
+    assert Hk == HIDDEN, f"w_gate HIDDEN {Hk} != x HIDDEN {HIDDEN}"
+    assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
+    TOPK = router_ids.shape[1]
+
+    kvector = pick_kvector(HIDDEN)
+    if out is None:
+        out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
+
+    launcher = _get_gate_up_bf16(HIDDEN, INTER, TOPK, kvector, serialize_dot2)
+    grid_x = B * TOPK * INTER
+    _run(
+        launcher,
+        (
+            ptr_arg(x),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(router_ids),
+            ptr_arg(out),
+            grid_x,
+            torch.cuda.current_stream(),
+        ),
+    )
+    return out
+
+
+def flydsl_warp_decode_down_reduce_bf16(
+    intermediate: torch.Tensor,
+    w_down: torch.Tensor,
+    router_ids: torch.Tensor,
+    router_wts: torch.Tensor,
+    *,
+    kh_per_warp: int | None = None,
+    serialize_dot2: bool = True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """down_reduce stage with **BF16 weights** (unquantized oracle; no scales).
+
+    Same reduction as :func:`flydsl_warp_decode_down_reduce`, but ``w_down`` is
+    plain bf16 (no convert, no weight scale -- only ``router_wts`` folded).
+
+    Args:
+        intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k).
+        w_down:       [E, HIDDEN, INTER] bfloat16 (row = e*HIDDEN + out_j).
+        router_ids:   [B, TOPK] int32.
+        router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
+        kh_per_warp:  outputs per wave (defaults to 2 when HIDDEN is even, else 1).
+        out:          optional [B, HIDDEN] bfloat16 output buffer.
+
+    Returns:
+        [B, HIDDEN] bfloat16 output.
+    """
+    assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
+    assert w_down.dtype == torch.bfloat16, "w_down must be bfloat16 for this path"
+    assert intermediate.is_contiguous() and w_down.is_contiguous()
+    assert router_wts.dtype == torch.float32, "router_wts must be float32"
+
+    B, TOPK, INTER = intermediate.shape
+    E, HIDDEN, Ik = w_down.shape
+    assert Ik == INTER, f"w_down INTER {Ik} != intermediate INTER {INTER}"
+    assert router_ids.shape == (B, TOPK), "router_ids must be [B, TOPK]"
+
+    if kh_per_warp is None:
+        kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
+    assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
+
+    kvector = pick_kvector(INTER)
+    if out is None:
+        out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
+
+    launcher = _get_down_reduce_bf16(
+        INTER, HIDDEN, TOPK, kvector, serialize_dot2, kh_per_warp
+    )
+    grid_x = B * (HIDDEN // kh_per_warp)
+    _run(
+        launcher,
+        (
+            ptr_arg(intermediate),
+            ptr_arg(w_down),
             ptr_arg(router_ids),
             ptr_arg(router_wts),
             ptr_arg(out),

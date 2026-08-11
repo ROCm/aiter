@@ -1123,3 +1123,237 @@ def build_down_reduce_fp4_module(
         )
 
     return _launch
+
+
+# -------------------------------------------------------------------------
+# Phase C -- BF16 weight path (unquantized correctness oracle + gfx942 scaffold)
+# -------------------------------------------------------------------------
+def build_gate_up_bf16_module(
+    hidden: int,
+    inter: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    serialize_dot2: bool = True,
+):
+    """Build the gate_up launcher with **BF16 weights** (BF16 activation too).
+
+    Structurally identical to :func:`build_gate_up_fp8_module` but the weights are
+    plain BF16: a weight dword already packs two bf16, so it feeds ``v_dot2_f32_bf16``
+    directly with **no scaled convert and no weight scale**.  This is the
+    unquantized correctness oracle -- it exercises the same load / dot2 / reduce /
+    silu-GLU epilogue as the FP8 and FP4 paths, so any mismatch isolates the
+    dequant math rather than the reduction.
+
+    Shapes / layout (row-major, contiguous):
+      * x            [B, HIDDEN]         bf16
+      * w_gate/w_up  [E, INTER, HIDDEN]  bf16   (row = e*INTER + j)
+      * router_ids   [B, TOPK]           int32
+      * out (inter)  [B, TOPK, INTER]    bf16   (row = b*TOPK + k)
+    """
+    if kvector is None:
+        kvector = pick_kvector(hidden)
+    if kvector % 2 != 0:
+        raise ValueError(f"kVector must be even for dot2, got {kvector}")
+    ktile_n = WARP_SIZE * kvector
+    if hidden % ktile_n != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by 64*kVector={ktile_n}")
+    num_iter = hidden // ktile_n
+    n_pairs = kvector // 2  # x words == bf16 weight words per lane per iter
+
+    @flyc.kernel
+    def _kernel(
+        x_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        neuron_j = bid % inter
+        d = bid // inter
+        expert_k = d % top_k
+        token_b = d // top_k
+
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        e = fx.Int32(
+            buffer_ops.buffer_load(
+                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
+            )
+        )
+        w_row = e * inter + neuron_j
+
+        x_rsrc = _ptr_rsrc(x_ptr)
+        wg_rsrc = _ptr_rsrc(wg_ptr)
+        wu_rsrc = _ptr_rsrc(wu_ptr)
+
+        gate_dot = fx.Float32(0.0).ir_value()
+        up_dot = fx.Float32(0.0).ir_value()
+        for i in range_constexpr(num_iter):
+            k_base = i * ktile_n + lane * kvector
+            x_word0 = (token_b * hidden + k_base) // 2
+            # bf16 weights: 2 bf16/dword, so the word offset mirrors the activation.
+            w_word0 = w_row * (hidden // 2) + k_base // 2
+            xw = load_i32_words(x_rsrc, x_word0, n_pairs)
+            gw = load_i32_words(wg_rsrc, w_word0, n_pairs)
+            uw = load_i32_words(wu_rsrc, w_word0, n_pairs)
+            for ipair in range_constexpr(n_pairs):
+                x_i32 = xw[ipair]
+                # No convert: the bf16 weight pair is already a dot2 operand.
+                gate_dot = dot2_f32_bf16(
+                    x_i32, gw[ipair], gate_dot, serialize=serialize_dot2
+                )
+                up_dot = dot2_f32_bf16(
+                    x_i32, uw[ipair], up_dot, serialize=serialize_dot2
+                )
+
+        gate_acc = fx.Float32(wave_reduce_add_f32(gate_dot))
+        up_acc = fx.Float32(wave_reduce_add_f32(up_dot))
+        sig = fx.Float32(1.0) / (
+            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
+        )
+        out_val = gate_acc * sig * up_acc
+
+        out_off = (token_b * top_k + expert_k) * inter + neuron_j
+        out_rsrc = _ptr_rsrc(out_ptr)
+        if lane == 0:
+            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+
+    @flyc.jit
+    def _launch(
+        x_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(x_ptr, wg_ptr, wu_ptr, rid_ptr, out_ptr).launch(
+            grid=(grid_x, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
+def build_down_reduce_bf16_module(
+    inter: int,
+    hidden: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    serialize_dot2: bool = True,
+    kh_per_warp: int = 1,
+):
+    """Build the down_reduce launcher with **BF16 weights** (BF16 intermediate too).
+
+    Mirror of :func:`build_down_reduce_fp8_module` with unquantized BF16 weights:
+    each weight dword is two bf16 fed straight to ``v_dot2_f32_bf16`` (no convert,
+    no weight scale -- only the lane-uniform ``router_wt`` is folded).  Serves as
+    the non-quantized correctness oracle for the reduce + routing.
+
+    Shapes / layout (row-major, contiguous):
+      * inter        [B, TOPK, INTER]    bf16   (row = b*TOPK + k)
+      * w_down       [E, HIDDEN, INTER]  bf16   (row = e*HIDDEN + out_j)
+      * router_ids   [B, TOPK]           int32
+      * router_wts   [B, TOPK]           float32  (normalized to sum 1 per token)
+      * y            [B, HIDDEN]         bf16
+    """
+    if kvector is None:
+        kvector = pick_kvector(inter)
+    if kvector % 2 != 0:
+        raise ValueError(f"kVector must be even for dot2, got {kvector}")
+    if kh_per_warp < 1:
+        raise ValueError(f"kh_per_warp must be >= 1, got {kh_per_warp}")
+    if hidden % kh_per_warp != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by kh_per_warp={kh_per_warp}")
+    ktile_n = WARP_SIZE * kvector
+    if inter % ktile_n != 0:
+        raise ValueError(f"INTER={inter} not divisible by 64*kVector={ktile_n}")
+    num_iter = inter // ktile_n
+    n_pairs = kvector // 2  # activation words == bf16 weight words per lane per iter
+    n_cols = hidden // kh_per_warp
+
+    @flyc.kernel
+    def _kernel(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        col = bid % n_cols
+        token_b = bid // n_cols
+        out_j0 = col * kh_per_warp
+
+        inter_rsrc = _ptr_rsrc(inter_ptr)
+        wd_rsrc = _ptr_rsrc(wd_ptr)
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+
+        acc = [fx.Float32(0.0) for _ in range(kh_per_warp)]
+
+        for k in range_constexpr(top_k):
+            ridx = token_b * top_k + k
+            e = fx.Int32(
+                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
+            )
+            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
+
+            dot = [fx.Float32(0.0).ir_value() for _ in range(kh_per_warp)]
+            for i in range_constexpr(num_iter):
+                k_base = i * ktile_n + lane * kvector
+                inter_row = token_b * top_k + k
+                a_word0 = (inter_row * inter + k_base) // 2
+                aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                dw = [
+                    load_i32_words(
+                        wd_rsrc, w_row[h] * (inter // 2) + k_base // 2, n_pairs
+                    )
+                    for h in range(kh_per_warp)
+                ]
+                for h in range_constexpr(kh_per_warp):
+                    for ipair in range_constexpr(n_pairs):
+                        dot[h] = dot2_f32_bf16(
+                            aw[ipair], dw[h][ipair], dot[h], serialize=serialize_dot2
+                        )
+
+            for h in range_constexpr(kh_per_warp):
+                acc[h] = acc[h] + fx.Float32(dot[h]) * fx.Float32(rw)
+
+        y_sum = [
+            fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
+            for h in range(kh_per_warp)
+        ]
+        y_rsrc = _ptr_rsrc(y_ptr)
+        if lane == 0:
+            for h in range_constexpr(kh_per_warp):
+                buffer_ops.buffer_store(
+                    BFloat16(y_sum[h]).ir_value(), y_rsrc, token_b * hidden + out_j0 + h
+                )
+
+    @flyc.jit
+    def _launch(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(inter_ptr, wd_ptr, rid_ptr, rwt_ptr, y_ptr).launch(
+            grid=(grid_x, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
