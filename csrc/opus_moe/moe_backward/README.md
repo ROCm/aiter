@@ -69,7 +69,9 @@ fallback when a genuinely different working-set regime needs it.
 | Family | Kid | Tile |
 | --- | ---: | --- |
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
-| K2 `route_dx` | 5 | `BM32 x BN128 x BK64` |
+| K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
+| K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
+| K2 `route_dx` production | 7 | `BM32 x BN128 x BK32`, four-route cohort |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` cohort baseline | 6 | `BM64 x BN128 x BK32`, four-expert cohort |
@@ -81,6 +83,12 @@ fallback when a genuinely different working-set regime needs it.
 Compact variable-routing instances use kid `100`. `RouteLayout` is a
 compile-time layout gate, so compact route ids cannot be decoded as fixed
 packed token/slot ids.
+
+K2 auto-dispatch selects kid 7 whenever fixed routing provides expert offsets
+and the launch has at least four route tiles and more than one N tile. The
+BK32 production tile retains two-stage async loads while reducing its LDS
+allocation and VGPR count relative to kid 6. Degenerate grids and callers
+without expert offsets retain kid 5.
 
 K4 auto-dispatch uses runtime source working-set size rather than an exact
 model tuple. Kid 5 remains selected when the combined padded `dZ` and `X`

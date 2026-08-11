@@ -135,6 +135,19 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStoreCohort4
     static constexpr int ROUTE_COHORT_TILES = 4;
 };
 
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
+    : RouteDxBf16Gfx950Bm32Bn128Bk64WideStoreCohort4
+{
+    // Preserve the two-stage pipeline while halving each stage's LDS
+    // footprint.  The extra K-loop boundaries trade more barriers for higher
+    // residency; auto-dispatch can select it only if the measured trade wins.
+    static constexpr int B_K = 32;
+    static constexpr int E_K = 2;
+    static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
+    static constexpr int SMEM_B_BYTES =
+        SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,

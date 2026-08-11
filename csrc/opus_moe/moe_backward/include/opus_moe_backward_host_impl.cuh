@@ -121,10 +121,13 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
         return requested_kernel_id;
 
     constexpr int legacy_kid = 5;
-    constexpr int cohort4_kid = 6;
+    constexpr int cohort4_kid = 7;
     constexpr int output_n_tile = 128;
     // A cohort is useful only when there are enough route and N tiles to
     // trade a bounded amount of W1 reuse for much shorter dZ reuse distance.
+    // The production cohort uses BK32: two async stages then occupy about half
+    // the LDS and substantially fewer VGPRs than BK64 while preserving the
+    // same MFMA work and exact BF16 result.
     // The policy depends on launch geometry and reusable sorting metadata,
     // not on an exact model tuple.  Keep the legacy layout for degenerate
     // grids and for contracts without expert offsets.
