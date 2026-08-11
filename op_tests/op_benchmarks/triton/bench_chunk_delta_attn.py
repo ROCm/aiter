@@ -26,6 +26,8 @@ import sys
 # Skip CK/HIP native .so loading – Triton kernels only
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+os.environ.setdefault("DA_USE_GLUON", "1")
+os.environ.setdefault("DA_TRITON_OPT", "1")
 
 
 # Ensure repo root is on the path when running this script directly
