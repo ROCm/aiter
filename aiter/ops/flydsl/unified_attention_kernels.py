@@ -12,11 +12,12 @@ Dispatch follows the in-tree convention for a new backend competing for an
 existing op: a pure code predicate that returns ``None`` when it cannot serve
 the configuration, letting the caller fall through to Triton unchanged (see
 ``flydsl_flash_attn_varlen_func`` in ``fmha_kernels.py`` and the flydsl branch
-in ``ops/gemm_op_a8w8.py``). There is deliberately no environment variable:
-aiter already carries 19 undocumented backend-gate vars, and this path is arch-
-and shape-scoped, so a code gate states the choice more honestly. To force the
-Triton path for comparison, set ``_FLYDSL_UNIFIED_ATTN_ARCH`` to ``False`` in
-the Triton module.
+in ``ops/gemm_op_a8w8.py``). The dispatch decision itself takes no environment
+variable -- aiter already carries 19 undocumented backend-gate vars, and this
+path is arch- and shape-scoped, so a code gate states the choice more honestly.
+To force the Triton path for comparison, set ``_FLYDSL_UNIFIED_ATTN_ARCH`` to
+``False`` in the Triton module. The one tuning knob is the split-count cap,
+``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``).
 
 Two tiers, chosen at call time from the machine-fill deficit (see
 ``_split_count`` and the gate in ``flydsl_unified_attention``), not from
@@ -34,6 +35,7 @@ varlen batch with unequal query lengths combines correctly.
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -72,10 +74,32 @@ def _target_num_prgms() -> int:
 
 _TARGET_NUM_PRGMS = _target_num_prgms()
 
-# Cap on the auto-dispatched split count. >8 is verified correct (16 and 32
-# splits, causal and non-causal) but not perf-measured; only {2, 4, 8} are, so
-# auto-dispatch stays capped at 8 until larger counts are tuned.
-_MAX_SEGMENTS = 8
+
+def _env_max_kv_splits(default: int = 16) -> int:
+    """Auto-dispatch split-count cap, overridable by environment.
+
+    Split-K selection cannot be tuned perfectly from shape alone (a lesson from
+    CK), so the cap is an override knob rather than a derived guess.
+    ``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` raises or lowers it; a non-integer or
+    non-positive value is ignored and the default is used.
+    """
+    raw = os.environ.get("AITER_UNIFIED_ATTN_MAX_KV_SPLITS")
+    if raw is None:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return n if n >= 1 else default
+
+
+# Cap on the auto-dispatched split count. Default 16: benchmarked no-regression
+# across tested decode shapes while capturing most of the long-context win. >16
+# (up to 32-64) helps only very long contexts and regresses short ones, because
+# _split_count keys on machine fill, not KV depth; all counts are verified
+# correct to 128. Raise via AITER_UNIFIED_ATTN_MAX_KV_SPLITS for long-context
+# workloads.
+_MAX_SEGMENTS = _env_max_kv_splits(16)
 
 # block_m, and with it the largest GQA group that can pack into the M dimension.
 # _make_dualwave_swp_fp8_traits asserts block_m % gqa_group_size == 0.
@@ -140,8 +164,9 @@ def _split_count(num_2d_prgms: int) -> int:
 
     The measured no-oversubscribe rule (NOT Triton's ceil/round-up/MIN=8): the
     largest power of two such that the launch does not oversubscribe the CU
-    count, capped at 8. No MIN floor -- b=9 needs 4, below Triton's floor of 8.
-    Below 2 there is no split to take, so the caller falls back to single-pass.
+    count, capped at _MAX_SEGMENTS. No MIN floor -- b=9 needs 4, below Triton's
+    floor of 8. Below 2 there is no split to take, so the caller falls back to
+    single-pass.
 
     Verified against the measured best split count: num_2d = 4*b for a
     b-sequence GQA-16 decode gives b=7 -> 8, b=8 -> 8, b=9 -> 4.
