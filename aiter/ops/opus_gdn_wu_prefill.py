@@ -209,9 +209,12 @@ def opus_gdn_wu_prefill_fwd(
     K=V=128 specialized, gfx942/gfx950.
 
     Args:
-        q: [B, T, H, K] bf16
-        k: [B, T, H, K] bf16
-        v: [B, T, H, V] bf16
+        q: [B, T, Hg, K] bf16
+        k: [B, T, Hg, K] bf16
+        v: [B, T, H, V] bf16. H must be a multiple of the q/k head count Hg;
+            H > Hg selects GQA, where H / Hg value heads share one key head.
+            GQA is available on the WS path only (BT=64, k1_algo=1), and a
+            dense k2_mode=0 request is promoted to WS.
         g: [B, T, H] — gate (log-space decay). BT64 Neumann kernels load
             bf16/fp32 directly; other dtypes are cast to fp32.
         beta: [B, T, H] — sigmoid gating. BT64 Neumann kernels load
@@ -244,20 +247,30 @@ def opus_gdn_wu_prefill_fwd(
         [B, H, V, K] for dense input, [N, H, V, K] for packed varlen, or None.
     """
     if not isinstance(q, torch.Tensor) or q.ndim != 4:
-        raise ValueError("q must have shape [B, T, H, 128]")
-    B, T, H, K = q.shape
+        raise ValueError("q must have shape [B, T, Hg, 128]")
+    B, T, Hg, K = q.shape
     if K != 128:
         raise ValueError("q feature size must be 128")
-    expected_vector_shape = (B, T, H, 128)
-    expected_scalar_shape = (B, T, H)
+    if not isinstance(k, torch.Tensor) or tuple(k.shape) != (B, T, Hg, 128):
+        raise ValueError(f"k must have shape {(B, T, Hg, 128)}")
+    if (
+        not isinstance(v, torch.Tensor)
+        or v.ndim != 4
+        or v.shape[0] != B
+        or v.shape[1] != T
+        or v.shape[3] != 128
+    ):
+        raise ValueError(f"v must have shape [{B}, {T}, H, 128]")
+    H = v.shape[2]
+    if H <= 0 or H % Hg != 0:
+        raise ValueError(
+            f"v head count {H} must be a positive multiple of the q/k head "
+            f"count {Hg}"
+        )
     for name, tensor in (("k", k), ("v", v)):
-        if (
-            not isinstance(tensor, torch.Tensor)
-            or tuple(tensor.shape) != expected_vector_shape
-        ):
-            raise ValueError(f"{name} must have shape {expected_vector_shape}")
         if tensor.device != q.device:
             raise ValueError(f"{name} must be on the same device as q")
+    expected_scalar_shape = (B, T, H)
     for name, tensor in (("g", g), ("beta", beta)):
         if (
             not isinstance(tensor, torch.Tensor)
@@ -268,6 +281,7 @@ def opus_gdn_wu_prefill_fwd(
             raise ValueError(f"{name} must be on the same device as q")
     V = v.shape[-1]
     is_varlen = cu_seqlens is not None
+    is_gqa = H != Hg
 
     if BT not in (16, 32, 64, 128):
         raise ValueError(f"Unsupported BT={BT}; expected 16, 32, 64, or 128")
@@ -284,6 +298,15 @@ def opus_gdn_wu_prefill_fwd(
             f"Unsupported k2_mode={k2_mode}; expected one of "
             f"{OPUS_GDN_SUPPORTED_K2_MODES}"
         )
+    if is_gqa:
+        # Only the WS family carries key-head addressing end to end (K1 reads k
+        # per key head, the reference state scan takes Hg, and K6 re-reads q/k
+        # with the key-head stride).
+        if BT != 64 or k1_algo != 1:
+            raise ValueError("GQA requires BT=64 and k1_algo=1")
+        if k2_mode == OPUS_GDN_K2_WU_FUSED:
+            raise ValueError("GQA supports the WS path only")
+        k2_mode = OPUS_GDN_K2_SPLIT
     if k2_mode == OPUS_GDN_K2_SPLIT and BT != 64:
         raise ValueError("k2_mode=2 (WS) requires BT=64")
     if is_varlen:

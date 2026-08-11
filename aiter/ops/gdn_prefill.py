@@ -89,19 +89,22 @@ def _opus_input_error(
             return f"{name} must be contiguous"
 
     if q.ndim != 4:
-        return "q must have shape [B, T, H, 128]"
-    B, T, H, K = q.shape
-    if B <= 0 or T <= 0 or H <= 0:
-        return "B, T, and H must be positive"
+        return "q must have shape [B, T, Hg, 128]"
+    B, T, Hg, K = q.shape
+    if B <= 0 or T <= 0 or Hg <= 0:
+        return "B, T, and Hg must be positive"
     if K != _DENSE_DIM:
         return "q feature size must be 128"
     if is_varlen and B != 1:
         return "packed varlen expects B=1"
+    if tuple(k.shape) != (B, T, Hg, _DENSE_DIM):
+        return "k must match q shape [B, T, Hg, 128]"
+    if v.ndim != 4 or (v.shape[0], v.shape[1], v.shape[3]) != (B, T, _DENSE_DIM):
+        return "v must have shape [B, T, H, 128]"
+    H = v.shape[2]
+    if H <= 0 or H % Hg:
+        return "v head count must be a positive multiple of the q/k head count"
     expected_vector_shape = (B, T, H, _DENSE_DIM)
-    if tuple(k.shape) != expected_vector_shape:
-        return "k must match q shape [B, T, H, 128]"
-    if tuple(v.shape) != expected_vector_shape:
-        return "v must match q shape [B, T, H, 128]"
     if k.device != q.device or v.device != q.device:
         return "q, k, and v must be on the same device"
     if not is_varlen and T % _DENSE_BT and (not allow_padding or o is not None):
@@ -185,6 +188,17 @@ def _opus_input_error(
     return None
 
 
+def _is_gqa(q: torch.Tensor, v: torch.Tensor) -> bool:
+    """Report whether v carries more heads than q/k (grouped value heads)."""
+    return (
+        isinstance(q, torch.Tensor)
+        and isinstance(v, torch.Tensor)
+        and q.ndim == 4
+        and v.ndim == 4
+        and q.shape[2] != v.shape[2]
+    )
+
+
 def _select_wu_path(T: int, batch_heads: int, with_state_io: bool) -> str:
     """Deterministic WS/WF envelope from the dense closeout."""
     if T <= 64:
@@ -232,7 +246,16 @@ def select_gdn_prefill_path(
         raise ValueError(
             f"unsupported path={path!r}; expected one of {sorted(_ALL_PATHS)}"
         )
+    # GQA inputs cannot be delegated: ``chunk_gated_delta_rule_opt_vk`` reads
+    # q/k with the value-head count, so a silent fallback would compute the
+    # wrong result rather than a slower one.
+    gqa = _is_gqa(q, v)
     if normalized_path == "triton":
+        if gqa:
+            raise ValueError(
+                "path='triton' is unavailable: the fallback does not support "
+                "GQA (v carries more heads than q/k)"
+            )
         return "triton"
 
     explicit = normalized_path in _EXPLICIT_OPUS_PATHS
@@ -256,7 +279,7 @@ def select_gdn_prefill_path(
     )
     if error is not None:
         unsafe_alias = error.startswith(("o must not alias", "o may alias"))
-        if explicit or unsafe_alias:
+        if explicit or unsafe_alias or gqa:
             raise ValueError(f"path={normalized_path!r} is unavailable: {error}")
         return "triton"
 
@@ -268,6 +291,19 @@ def select_gdn_prefill_path(
                 "currently supports the W/U split path only"
             )
         return "triton"
+
+    if gqa:
+        # WS is the only family whose K1 / state scan / K6 all address q and k
+        # per key head, so GQA selects it regardless of the dense envelope.
+        if normalized_path in ("c", "cf", "cs", "wf"):
+            raise ValueError(
+                f"path={normalized_path!r} is unavailable: GQA is supported by "
+                "the W/U split (ws) path only"
+            )
+        gqa_gfx, _ = _runtime_target(q)
+        if gqa_gfx not in ("gfx942", "gfx950"):
+            raise ValueError(f"GQA GDN prefill requires gfx942/gfx950, got {gqa_gfx}")
+        return "ws"
 
     gfx, cu_count = _runtime_target(q)
     if explicit:

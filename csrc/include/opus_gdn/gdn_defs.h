@@ -12,7 +12,7 @@ using bf16_t = unsigned short;
 // K1 kernel arguments: Step 1 (cumsum + KKT) + Step 2 (trisol + WY factors)
 // --------------------------------------------------------------------------
 struct gdn_k1_kargs {
-    const void* __restrict__ ptr_k;        // [B, T, H, K]   bf16
+    const void* __restrict__ ptr_k;        // [B, T, Hg, K]  bf16
     const void* __restrict__ ptr_v;        // [B, T, H, V]   bf16
     const void* __restrict__ ptr_beta;     // [B, T, H]      fp32/bf16
     const void* __restrict__ ptr_g;        // [B, T, H]      fp32/bf16
@@ -27,6 +27,7 @@ struct gdn_k1_kargs {
     int B;
     int T;
     int H;
+    int Hg;  // key heads; H / Hg value heads share one key head (GQA), Hg == H for MHA
     int K;
     int V;
 };
@@ -35,8 +36,8 @@ struct gdn_k1_kargs {
 // K2 kernel arguments: Step 3 (h update) + Step 4 (output)
 // --------------------------------------------------------------------------
 struct gdn_k2_kargs {
-    const void* __restrict__ ptr_q;        // [B, T, H, K]    bf16
-    const void* __restrict__ ptr_k;        // [B, T, H, K]    bf16
+    const void* __restrict__ ptr_q;        // [B, T, Hg, K]   bf16
+    const void* __restrict__ ptr_k;        // [B, T, Hg, K]   bf16
     const void* __restrict__ ptr_w_bar;    // [B, T, H, K]    bf16
     const void* __restrict__ ptr_u_bar;    // [B, T, H, V]    bf16
     const void* __restrict__ ptr_g_cumsum; // [B, T, H]       fp32
@@ -52,6 +53,7 @@ struct gdn_k2_kargs {
     int B;
     int T;
     int H;
+    int Hg;  // key/query heads; H / Hg value heads share one, Hg == H for MHA
     int K;
     int V;
     int NT;
