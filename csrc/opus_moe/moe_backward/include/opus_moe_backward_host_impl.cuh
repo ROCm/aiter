@@ -157,14 +157,19 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
 
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 2;
-    constexpr int cohort4_kid = 3;
+    constexpr int cohort2_kid = 4;
     const uint64_t z_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         2ull * static_cast<uint64_t>(kargs.inter_dim) *
         sizeof(hip_bfloat16);
     if(kargs.d_scores_parts <= 1 || z_bytes <= l2_friendly_bytes)
         return legacy_kid;
-    return cohort4_kid;
+    // Keep two neighboring route tiles together while walking all dW2 N
+    // parts.  Compared with four tiles this shortens the dO/Z reuse window
+    // without giving up the W2 locality of the route-major cohort.  The
+    // working-set gate is geometry based and applies across expert counts
+    // and balanced or skewed routing distributions.
+    return cohort2_kid;
 }
 
 inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
