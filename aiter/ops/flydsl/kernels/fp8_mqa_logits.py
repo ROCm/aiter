@@ -768,7 +768,7 @@ def _build_kernel_mfma_r_w(
                     # assignment to `out_row_t` and tries to carry the
                     # TensorView out of the scf.if as a result.
                     def _store():
-                        out_row_t[col] = fx.Float32(col_sum)
+                        out_row_t[col] = fx.Float32(col_sum)  # noqa: B023
 
                     if is_writer:
                         _store()
@@ -1275,7 +1275,7 @@ def _build_kernel_mfma_lds_pipe(
                     # Closure, not a bare subscript store -- see the direct-load
                     # builder's epilogue for why.
                     def _store():
-                        out_row_t[col] = fx.Float32(col_sum)
+                        out_row_t[col] = fx.Float32(col_sum)  # noqa: B023
 
                     if is_writer:
                         _store()
@@ -1372,7 +1372,9 @@ def _build_kernel_mfma_lds_pipe(
 # --------------------------------------------------------------------------- #
 
 
-def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True, prefetch_depth=2):
+def _mk_builder(
+    rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True, prefetch_depth=2
+):
     """Registry entry factory.
 
     ``lds`` is None for the direct-load builder, else the LDS slot count.
@@ -1545,7 +1547,7 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
 
     gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
 
-    gfx950 H<=32: mfma32x32x64 with WPB=4 for small/square shapes, 
+    gfx950 H<=32: mfma32x32x64 with WPB=4 for small/square shapes,
         WPB=2 r=2 for streaming / large-square.
         K64 gives M_TILES=1 at H=32 -- half the compute of H=64 -- so the
         smaller tile grid benefits from extra wavefronts per block (WPB=4)
