@@ -443,7 +443,7 @@ class DeviceMoEPipeline:
 
     def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
                  w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather",
-                 push_group=False):
+                 push_group=False, pg_cap=0, send_quant=-1):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
@@ -454,6 +454,8 @@ class DeviceMoEPipeline:
         self.ct = ct
         self.combine_mode = combine_mode
         self.push_group = push_group
+        self.pg_cap = pg_cap
+        self.send_quant_opt = send_quant
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -498,7 +500,13 @@ class DeviceMoEPipeline:
         # dispatch bytes) and, more importantly, the receiver never runs a quant pass
         # over the padded E*cap grid. Dispatch permutes the e8m0 scale into GEMM1's
         # WMMA layout as it lands each row, so nothing has to repack it afterwards.
-        self.send_quant = self.push_group
+        # Decoupled from push_group so the two halves of the push path can be
+        # measured apart: send_quant=0 keeps the grouped fixed-slot landing but
+        # sends bf16 with no scales (so dispatch does no WMMA scale permute) and
+        # lets the receiver run its own quant pass.
+        self.send_quant = self.push_group if self.send_quant_opt < 0 else bool(
+            self.send_quant_opt
+        )
         self.pg_wmma_rep = _PUSH_TILE_M // 16
         cfg = EpDispatchCombineConfig(
             rank=r,
@@ -517,6 +525,10 @@ class DeviceMoEPipeline:
             push_group_scale_wmma_rep=self.pg_wmma_rep if self.send_quant else 0,
             combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
             push_group=self.push_group,      # explicit switch (was AITER_EP_PUSH_GROUP)
+            # 0 => worst case ws*tokens_per_rank (one expert could take every token).
+            # That makes the fixed-slot grid E_local*cap rows, so landings scatter
+            # cap*hidden bytes apart; pinning it near the real peak keeps them close.
+            cap_per_expert=self.pg_cap,
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -560,10 +572,12 @@ class DeviceMoEPipeline:
                 cap=pg["cap"], activation=self.spec["activation"],
                 situ_beta=self.spec.get("situ_beta", 1.0),
                 situ_linear_beta=self.spec.get("situ_linear_beta", 1.0),
-                # GEMM1 K=hidden -> tile_k=256 (matches pull); GEMM2 K=inter_dim ->
-                # tile_k2=128, aligning to pull's tuned GEMM2 tile (don't inherit 256).
+                # Both GEMMs use the tile the pull path measured fastest here
+                # (t64x256x256). GEMM1 keeps num_buffers=2 -- its persistent
+                # scheduler already hides the loads, and b2 beat pull's b3 -- while
+                # GEMM2 needs the third buffer to match pull.
                 tile_m=_PUSH_TILE_M, tile_n=256, tile_k=256, num_buffers=2,
-                tile_k2=128,
+                tile_k2=256, num_buffers2=3,
                 ep_arena_handle=ep["ep_arena_handle"],
                 ep_comb_inp_off=ep["ep_comb_inp_off"],
                 ep_wire_nbytes=ep["ep_wire_nbytes"],
@@ -715,30 +729,35 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     per_rank = dist_ctx.gather_objects(local)
     if dist_ctx.rank != 0:
         return None
-    agg = {}  # name -> [self_us_sum, count_sum, nranks]
+    agg = {}  # name -> [self_us_sum, count_sum, nranks, [per_rank_self_us]]
     for d in per_rank:
         for name, (self_us, count) in d.items():
-            a = agg.setdefault(name, [0.0, 0, 0])
+            a = agg.setdefault(name, [0.0, 0, 0, []])
             a[0] += self_us
             a[1] += count
             a[2] += 1
+            a[3].append(self_us)
     rows = []
     total_self = 0.0
-    for name, (self_sum, count_sum, nranks) in agg.items():
+    for name, (self_sum, count_sum, nranks, spread) in agg.items():
         avg_self = self_sum / nranks
         avg_count = count_sum / nranks
         per_call = avg_self / avg_count if avg_count else 0.0
         total_self += avg_self
-        rows.append((avg_self, name, per_call, avg_count))
+        lo = min(spread) / avg_count if avg_count else 0.0
+        hi = max(spread) / avg_count if avg_count else 0.0
+        rows.append((avg_self, name, per_call, avg_count, lo, hi))
     rows.sort(reverse=True)
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
     lines = [
         f"# per-kernel avg over {dist_ctx.world} ranks (self device time):",
-        f"{'Name':<58}{'avg_self(us)':>14}{'per_call(us)':>14}{'calls':>8}",
+        f"{'Name':<58}{'avg_self(us)':>14}{'per_call(us)':>14}{'calls':>8}"
+        f"{'min/call':>10}{'max/call':>10}",
     ]
-    for avg_self, name, per_call, avg_count in rows[:row_limit]:
+    for avg_self, name, per_call, avg_count, lo, hi in rows[:row_limit]:
         lines.append(
             f"{name[:58]:<58}{avg_self:>14.1f}{per_call:>14.3f}{avg_count:>8.1f}"
+            f"{lo:>10.1f}{hi:>10.1f}"
         )
     lines.append(
         f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
@@ -806,6 +825,8 @@ def main():
         dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct,
         combine_mode=args.combine,
         push_group=bool(args.push_group),
+        pg_cap=args.pg_cap,
+        send_quant=args.send_quant,
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -901,6 +922,14 @@ def _parse_args():
     p.add_argument("--push_group", type=int, default=0,
                    help="1 = fixed-slot push-group dispatch->GEMM1 fusion (explicit "
                         "switch; end-to-end push path, gfx1250 a8w4). Default 0 (pull).")
+    p.add_argument("--send_quant", type=int, default=-1,
+                   help="push-group send-side quant: -1 follows --push_group, 0 forces "
+                        "bf16 transport + receiver-side quant, 1 forces fp8 transport "
+                        "with the WMMA scale permute in dispatch.")
+    p.add_argument("--pg_cap", type=int, default=0,
+                   help="push-group per-local-expert row capacity (0 = worst-case "
+                        "world*tokens_per_rank). A peak per-expert load above this is "
+                        "silently DROPPED, which acc_verify will catch.")
     return p.parse_args()
 
 
