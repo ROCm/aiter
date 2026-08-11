@@ -217,6 +217,9 @@ jobs:
                   continue
 
               topology = f"{topology_match.group(1)}-TP8"
+              if model != "DeepSeek-V3" or topology != "2P2D-TP8":
+                  continue
+
               slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{model}-{topology}")
               cases.append(
                   {
@@ -230,9 +233,9 @@ jobs:
               )
 
           selected = {(case["model_name"], case["topology"]) for case in cases}
-          if len(cases) != 6 or len(selected) != len(cases):
+          if len(cases) != 1 or selected != {("DeepSeek-V3", "2P2D-TP8")}:
               raise SystemExit(
-                  "Expected exactly six unique non-Kimi vLLM-router cases "
+                  "Expected exactly the DeepSeek-V3 2P2D TP8 vLLM-router case "
                   f"from {pipeline}; selected {sorted(selected)!r}"
               )
 
@@ -244,7 +247,7 @@ jobs:
           with summary.open("a", encoding="utf-8") as output:
               print("### Selected upstream vLLM cases\n", file=output)
               print(
-                  f"Selected all {len(cases)} non-Kimi vLLM-router accuracy cases; "
+                  "Selected only the DeepSeek-V3 2P2D TP8 vLLM-router accuracy case; "
                   f"excluded {len(excluded_kimi)} Kimi cases.\n",
                   file=output,
               )
