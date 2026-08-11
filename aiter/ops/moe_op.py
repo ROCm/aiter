@@ -160,7 +160,6 @@ def fmoe_g1u1(
     kernelName: str | None = "",
     fc2_smooth_scale: Tensor | None = None,
     activation: int | None = ActivationType.Silu.value,
-    flat_mode: int = 0,
 ) -> None: ...
 
 
@@ -242,7 +241,6 @@ def fmoe_fp8_blockscale_g1u1(
     fc2_smooth_scale: Tensor | None = None,
     activation: int | None = ActivationType.Silu.value,
     block_size_M: int = 32,
-    flat_mode: int = 0,
 ) -> None: ...
 
 
