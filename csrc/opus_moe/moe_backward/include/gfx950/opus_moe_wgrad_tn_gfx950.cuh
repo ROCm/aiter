@@ -92,7 +92,6 @@ __device__ inline void opus_wgtn_clobber_fixed_regs()
 {
     OPUS_WGTN_CLOBBER_V8(96, 97, 98, 99, 100, 101, 102, 103);
     OPUS_WGTN_CLOBBER_V8(104, 105, 106, 107, 108, 109, 110, 111);
-    OPUS_WGTN_CLOBBER_V8(112, 113, 114, 115, 116, 117, 118, 119);
     OPUS_WGTN_CLOBBER_A8(0, 1, 2, 3, 4, 5, 6, 7);
     OPUS_WGTN_CLOBBER_A8(8, 9, 10, 11, 12, 13, 14, 15);
     OPUS_WGTN_CLOBBER_A8(16, 17, 18, 19, 20, 21, 22, 23);
@@ -417,7 +416,7 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
 // transpose-read/MFMA mapping of the verified 128x128 kernel above while
 // halving operand traffic per output element.
 __global__ __launch_bounds__(512, 1)
-__attribute__((amdgpu_num_vgpr(120)))
+__attribute__((amdgpu_num_vgpr(112)))
 void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                                     const __bf16* __restrict__ a,
                                     const int32_t* __restrict__ offs,
@@ -497,37 +496,48 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
         for(int kpack = 0; kpack < 2; ++kpack)
         {
-            opus::static_for<4>([&](auto sm) {
-                auto smem = opus::make_smem(
-                    &As[cur][kpack * 16][wm * 128 + sm.value * 32]);
-                opus_wgtn_fixed_tr_fragment<96 + sm.value * 4>(smem, tr_layout);
-            });
+            // B is reused by all four M subtiles. Keep it resident, then
+            // ping-pong two A fragment slots so the next LDS transpose read
+            // overlaps the current pair of MFMAs.
             opus::static_for<2>([&](auto sn) {
                 auto smem = opus::make_smem(
                     &Bs[cur][kpack * 16][wn * 64 + sn.value * 32]);
-                opus_wgtn_fixed_tr_fragment<112 + sn.value * 4>(smem, tr_layout);
+                opus_wgtn_fixed_tr_fragment<104 + sn.value * 4>(smem, tr_layout);
             });
-            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
-            if(stage == 0 && kpack == 0)
             {
-                opus::static_for<4>([&](auto sm) {
+                auto smem = opus::make_smem(
+                    &As[cur][kpack * 16][wm * 128]);
+                opus_wgtn_fixed_tr_fragment<96>(smem, tr_layout);
+            }
+            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+            opus::static_for<4>([&](auto sm) {
+                constexpr int a_reg = 96 + (sm.value & 1) * 4;
+                if constexpr(sm.value + 1 < 4)
+                {
+                    auto smem = opus::make_smem(
+                        &As[cur][kpack * 16][wm * 128 + (sm.value + 1) * 32]);
+                    opus_wgtn_fixed_tr_fragment<96 + ((sm.value + 1) & 1) * 4>(
+                        smem, tr_layout);
+                }
+                if(stage == 0 && kpack == 0)
+                {
                     opus::static_for<2>([&](auto sn) {
                         constexpr int c = 256 + (sm.value * 2 + sn.value) * 16;
                         opus_wgtn_mfma_zero<
-                            96 + sm.value * 4, 112 + sn.value * 4, c>();
+                            a_reg, 104 + sn.value * 4, c>();
                     });
-                });
-            }
-            else
-            {
-                opus::static_for<4>([&](auto sm) {
+                }
+                else
+                {
                     opus::static_for<2>([&](auto sn) {
                         constexpr int c = 256 + (sm.value * 2 + sn.value) * 16;
                         opus_wgtn_mfma_accum<
-                            96 + sm.value * 4, 112 + sn.value * 4, c, c>();
+                            a_reg, 104 + sn.value * 4, c, c>();
                     });
-                });
-            }
+                }
+                if constexpr(sm.value + 1 < 4)
+                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+            });
         }
 
         if(has_next)
