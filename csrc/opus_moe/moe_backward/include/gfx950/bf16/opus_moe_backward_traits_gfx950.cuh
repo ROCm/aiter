@@ -291,6 +291,12 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4DirectLds
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
+struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort2DirectLds
+    : Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4DirectLds
+{
+    static constexpr int EXPERT_COHORT = 2;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

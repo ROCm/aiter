@@ -181,9 +181,11 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     constexpr int legacy_kid = 5;
     // The large-working-set cohort also uses gfx950 buffer_load_*_lds so the
     // three K32 operand vectors land directly in the existing swizzled tile.
-    // Small problems retain the register-load/LDS-store legacy kernel.
-    constexpr int cohort4_kid = 7;
-    if(kargs.route.num_experts < 4)
+    // Two experts keep the reusable source window comfortably below L2
+    // capacity while retaining enough inter-expert load balance.  Small
+    // problems retain the register-load/LDS-store legacy kernel.
+    constexpr int cohort2_kid = 8;
+    if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
         2ull * static_cast<uint64_t>(kargs.inter_dim) +
@@ -191,7 +193,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     const uint64_t source_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         source_row_elements * sizeof(hip_bfloat16);
-    return source_bytes > l2_friendly_bytes ? cohort4_kid : legacy_kid;
+    return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;
 }
 
 inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
