@@ -810,6 +810,74 @@ def test_down_reduce_bf16(case):
 
 
 # -------------------------------------------------------------------------
+# BF16-oracle cross-check: run the FP4 kernel and the BF16 kernel on the *same*
+# logical weights (FP4's e8m0 scales are powers of two + LUT values exact => the
+# fp32 dequant is bf16-exact, so the BF16 kernel fed `w_deq.to(bf16)` computes
+# exactly what the FP4 kernel converts internally).  The two outputs must agree to
+# near bit-exactness (only the f32 dot2 *reassociation* differs -- FP4 uses the G7
+# 4-accumulator drain, BF16 a serial chain), which isolates any FP4 convert/scale
+# bug from the reduce/routing.  Includes the real E=256 shape.
+# -------------------------------------------------------------------------
+XCHECK_DOWN_CASES = [
+    ("xcheck_down_i512_h256_e8_tk2", 1, 512, 256, 8, 2),
+    ("xcheck_down_i2048_h128_e256_tk8", 1, 2048, 128, 256, 8),
+]
+XCHECK_GATE_UP_CASES = [
+    ("xcheck_gate_up_h512_i256_e8_tk2", 1, 512, 256, 8, 2),
+    ("xcheck_gate_up_h512_i128_e256_tk8", 1, 512, 128, 256, 8),
+]
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in XCHECK_DOWN_CASES])
+def test_down_fp4_matches_bf16_oracle(case):
+    name, B, INTER, HIDDEN, E, TOPK = case
+    inter, w_down, w_scale, rid, rwt, w_deq = _gen_down_fp4(B, INTER, HIDDEN, E, TOPK)
+    out_fp4 = flydsl_warp_decode_down_reduce_fp4(
+        inter, w_down, rid, rwt, w_scale, scale_block=(1, _MXFP4_BK)
+    )
+    out_bf16 = flydsl_warp_decode_down_reduce_bf16(
+        inter, w_deq.to(torch.bfloat16).contiguous(), rid, rwt
+    )
+    torch.cuda.synchronize()
+    cos_xc = _cosine(out_bf16, out_fp4)
+    ref = _ref_down_fp4(inter, w_deq, rid, rwt)
+    cos_ref = _cosine(ref, out_fp4)
+    print(f"[xcheck down {name}] fp4~bf16 cos={cos_xc:.6f}  fp4~fp32 cos={cos_ref:.6f}")
+    assert (
+        cos_xc >= 0.999
+    ), f"down {name}: FP4 diverges from BF16 oracle (cos={cos_xc:.6f})"
+
+
+@pytest.mark.parametrize(
+    "case", [pytest.param(c, id=c[0]) for c in XCHECK_GATE_UP_CASES]
+)
+def test_gate_up_fp4_matches_bf16_oracle(case):
+    name, B, HIDDEN, INTER, E, TOPK = case
+    x, w_gate, w_up, gs, us, rid, wg_deq, wu_deq = _gen_gate_up_fp4(
+        B, HIDDEN, INTER, E, TOPK
+    )
+    out_fp4 = flydsl_warp_decode_gate_up_fp4(
+        x, w_gate, w_up, rid, gs, us, scale_block=(1, _MXFP4_BK)
+    )
+    out_bf16 = flydsl_warp_decode_gate_up_bf16(
+        x,
+        wg_deq.to(torch.bfloat16).contiguous(),
+        wu_deq.to(torch.bfloat16).contiguous(),
+        rid,
+    )
+    torch.cuda.synchronize()
+    cos_xc = _cosine(out_bf16, out_fp4)
+    ref = _ref_gate_up_fp4(x, wg_deq, wu_deq, rid)
+    cos_ref = _cosine(ref, out_fp4)
+    print(
+        f"[xcheck gate_up {name}] fp4~bf16 cos={cos_xc:.6f}  fp4~fp32 cos={cos_ref:.6f}"
+    )
+    assert (
+        cos_xc >= 0.999
+    ), f"gate_up {name}: FP4 diverges from BF16 oracle (cos={cos_xc:.6f})"
+
+
+# -------------------------------------------------------------------------
 # Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
 # -------------------------------------------------------------------------
 # GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
