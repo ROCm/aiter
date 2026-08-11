@@ -18,10 +18,19 @@ For an end-to-end GDN forward that uses this K5 wrapper, call
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 
+# NOTE (mfma16_hip fork): ``get_rocm_arch`` is imported here for the additive
+# HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
+# dependency of the baseline ``compile_chunk_gated_delta_h``) and does NOT raise
+# on flydsl <0.2.0 -- the mfma16_hip-only ``>=0.2.0`` requirement is enforced
+# lazily in ``_get_or_compile_mfma16_hip`` so the baseline path keeps its
+# original ``>=0.1.8`` compatibility.
 import torch
 import triton
+from flydsl.runtime.device import get_rocm_arch
 
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
@@ -39,6 +48,7 @@ _RCP_LN2 = math.log2(math.e)
 
 __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl",
+    "chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip",
 ]
 
 
@@ -186,6 +196,81 @@ def _heuristic_bv(
         _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
     )
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
+
+
+# -- HIP-equivalent BV selector (frozen, self-contained copy) --------------
+# The mfma16_hip fork below picks BV to match the hand-tuned HIP K5 kernel
+# (``aiter.ops.chunk_gated_delta_rule_fwd_h``) point-for-point. Rather than
+# importing that module's private ``_select_bv`` -- whose name/signature drift
+# with mainline HIP retunes and have already broken this fork once -- we keep a
+# frozen copy of its LDS/CU-threshold algorithm here. This intentionally does
+# NOT track future mainline HIP changes; re-sync deliberately if the HIP
+# heuristic is retuned and parity is still desired.
+_HIPEQ_BV_FIXED_LDS_BYTES = 32 * 1024
+_HIPEQ_BV_LDS_BYTES_PER_BV = 512
+_HIPEQ_BV_RESIDENT_WGS_CAP = 2
+_HIPEQ_BV_CANDIDATES = (64, 32, 16)
+_HIPEQ_BV_CACHE: dict[tuple[int, int, int, int], int] = {}
+
+
+def _hipeq_device_idx(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device())
+
+
+def _hipeq_shared_memory_per_cu(props: object) -> int:
+    """Per-CU shared memory with architecture-based fallback."""
+    shared_per_cu = getattr(props, "shared_memory_per_multiprocessor", None)
+    if shared_per_cu is not None:
+        return int(shared_per_cu)
+    arch = getattr(props, "gcnArchName", "")
+    if arch:
+        arch = arch.split(":")[0]
+    _arch_lds = {"gfx95": 128 * 1024, "gfx94": 64 * 1024}
+    for prefix, size in _arch_lds.items():
+        if arch.startswith(prefix):
+            return size
+    shared_per_block = getattr(props, "shared_memory_per_block", None)
+    if shared_per_block is not None:
+        return int(shared_per_block)
+    raise RuntimeError("Unable to determine shared memory per CU.")
+
+
+def _hipeq_compute_bv(
+    device: torch.device, total_chunks: int, max_seq_chunks: int, num_heads: int
+) -> int:
+    props = torch.cuda.get_device_properties(device)
+    num_cus = props.multi_processor_count
+    lds_per_cu = _hipeq_shared_memory_per_cu(props)
+    for bv in _HIPEQ_BV_CANDIDATES:
+        lds_per_wg = _HIPEQ_BV_FIXED_LDS_BYTES + _HIPEQ_BV_LDS_BYTES_PER_BV * bv
+        resident = min(max(1, lds_per_cu // lds_per_wg), _HIPEQ_BV_RESIDENT_WGS_CAP)
+        total_wgs = (128 // bv) * num_heads * total_chunks
+        threshold = max(1, (num_cus * resident) // 2) * max_seq_chunks
+        if total_wgs >= threshold:
+            return bv
+    return 16
+
+
+def _hipeq_select_bv(
+    device: torch.device, num_heads: int, total_chunks: int, max_seq_chunks: int
+) -> int:
+    key = (_hipeq_device_idx(device), num_heads, total_chunks, max_seq_chunks)
+    cached = _HIPEQ_BV_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bv = _hipeq_compute_bv(device, total_chunks, max_seq_chunks, num_heads)
+    _HIPEQ_BV_CACHE[key] = bv
+    return bv
+
+
+def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
+    """Total and maximum per-sequence chunk counts (one D2H transfer)."""
+    offsets = chunk_offsets.tolist()
+    total_chunks = offsets[-1]
+    max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
+    return total_chunks, max_seq_chunks
 
 
 def _get_or_compile(
@@ -552,3 +637,650 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     )
 
     return h, v_new, final_state
+
+
+# ==========================================================================
+# mfma16_hip fork (additive) -- HIP-aligned FlyDSL K5 implementation.
+#
+# Everything below is self-contained and does NOT touch the baseline wrapper
+# above: it has its own compiled-kernel cache, BV selection (reusing the hip
+# K5 selector), launch path, and public entry point
+# ``chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip``. The baseline path keeps
+# its original behaviour / flydsl>=0.1.8 compatibility; the mfma16_hip fork
+# requires flydsl>=0.2.0, enforced lazily below.
+# ==========================================================================
+
+# mfma16_hip fork is written against the fx layout / tiled-copy / tiled-MMA API
+# surface (``make_buffer_tensor``, ``fx.copy``, ``fx.gemm``) that only exists
+# from flydsl 0.2.0. Enforced lazily (in ``_get_or_compile_mfma16_hip``) so
+# importing this module and using the baseline wrapper keeps working on
+# flydsl>=0.1.8.
+_MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
+
+# gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
+# (SCHED_GFX942). ``get_rocm_arch()`` may return a feature-suffixed string like
+# ``gfx942:sramecc+:xnack-``; normalize before matching.
+_IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
+
+_INT32_ATTR = "_flydsl_int32_view"
+_PROLOGUE_ATTR = "_flydsl_prologue_cache"
+
+
+def _as_int32(t: torch.Tensor) -> torch.Tensor:
+    """Return an int32 narrowing of ``t``, cached on the tensor itself.
+
+    ``t`` is expected to come from one of the ``@tensor_cache``-decorated
+    prologue helpers (so its identity is stable across forwards). The cached
+    int32 result lives as an attribute on ``t`` itself, keeping cache
+    invalidation trivially correct.
+    """
+    if t.dtype == torch.int32:
+        return t
+    cached = getattr(t, _INT32_ATTR, None)
+    if cached is None:
+        cached = t.to(torch.int32)
+        try:
+            object.__setattr__(t, _INT32_ATTR, cached)
+        except (AttributeError, TypeError):
+            pass
+    return cached
+
+
+def _resolve_prologue(
+    cu_seqlens: torch.Tensor,
+    BT: int,
+    num_decodes: int,
+    num_decode_tokens: int,
+    T_flat: int,
+):
+    """Resolve the per-shape varlen prologue in one cached lookup.
+
+    Collapses the three ``@tensor_cache``-decorated prologue helpers into a
+    single tuple attached to ``cu_seqlens`` (keyed by ``(BT, num_decodes,
+    num_decode_tokens)``), so repeat forwards on the same ``cu_seqlens`` tensor
+    are one ``getattr`` + one dict get.
+
+    Returns ``(NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)``.
+    """
+    cache_key = (BT, num_decodes, num_decode_tokens, T_flat)
+    cache = getattr(cu_seqlens, _PROLOGUE_ATTR, None)
+    if cache is None:
+        cache = {}
+        try:
+            object.__setattr__(cu_seqlens, _PROLOGUE_ATTR, cache)
+        except (AttributeError, TypeError):
+            cache = None
+    if cache is not None:
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return hit
+
+    chunk_offsets = prepare_chunk_offsets(
+        cu_seqlens, BT, num_decodes, num_decode_tokens
+    )
+    NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+    kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+        cu_seqlens, num_decodes, num_decode_tokens
+    )
+    N = len(kernel_cu_seqlens) - 1
+    if N >= 1:
+        seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
+        min_seqlen = int(seg_lens.min().item())
+        first = int(kernel_cu_seqlens[0].item())
+        last = int(kernel_cu_seqlens[-1].item())
+        if first != 0 or last != T_flat or min_seqlen < 0:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: rebased cu_seqlens must start at 0, "
+                f"end at T_flat={T_flat}, and be nondecreasing; got "
+                f"first={first}, last={last}, min_seqlen={min_seqlen}."
+            )
+    else:
+        min_seqlen = None
+    result = (NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _resolve_state_dtype(initial_state, state_dtype):
+    """Resolve/validate the SSM state dtype (float32 or bfloat16)."""
+    if initial_state is not None:
+        resolved = initial_state.dtype
+        if state_dtype is not None and state_dtype != resolved:
+            raise ValueError(
+                f"state_dtype={state_dtype} conflicts with "
+                f"initial_state.dtype={initial_state.dtype}; pass them "
+                f"consistently or omit state_dtype."
+            )
+    elif state_dtype is not None:
+        resolved = state_dtype
+    else:
+        resolved = torch.float32
+    if resolved not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"SSM state dtype must be float32 or bfloat16, got {resolved}."
+        )
+    return resolved
+
+
+@functools.cache
+def _get_or_compile_mfma16_hip(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+    use_state_indices=False,
+    sched_gfx942=False,
+    g_head_major=False,
+    bf16_convert_trunc=True,
+):
+    """Compile (and cache) the mfma16 / HIP-aligned K5 kernel: 16x16x16 bf16
+    MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
+
+    ``use_state_indices`` compiles the indexed state-pool variant: the SSM
+    ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence's slot
+    is gathered from an ``initial_state_indices[N]`` int32 array (with in-place
+    final-state write-back into the same pool slot), mirroring the HIP kernel.
+
+    The hip compile module + its flydsl>=0.2.0 requirement are imported lazily
+    here so the baseline path is unaffected.
+    """
+    import flydsl
+    from packaging.version import Version
+
+    installed = Version(getattr(flydsl, "__version__", "0").split("+")[0])
+    if installed < Version(_MFMA16_HIP_MIN_FLYDSL_VERSION):
+        raise ImportError(
+            "FlyDSL K5 mfma16_hip fork requires `flydsl` "
+            f">=`{_MFMA16_HIP_MIN_FLYDSL_VERSION}` (for the fx layout / "
+            f"tiled-copy API), but got `{getattr(flydsl, '__version__', 'unknown')}`."
+        )
+
+    from .kernels.chunk_gated_delta_h_mfma16x16x16 import (
+        compile_chunk_gated_delta_h_mfma16_hip,
+    )
+
+    return compile_chunk_gated_delta_h_mfma16_hip(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+        USE_STATE_INDICES=use_state_indices,
+        SCHED_GFX942=sched_gfx942,
+        G_HEAD_MAJOR=g_head_major,
+        BF16_CONVERT_TRUNC=bf16_convert_trunc,
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+    g_head_major: bool = False,
+    bf16_convert_trunc: bool = True,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
+    16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
+    across waves, V not split across warps) as the hand-tuned HIP/C++ K5 kernel,
+    writing the public VK layout [..., V, K]. API-compatible with
+    ``chunk_gated_delta_rule_fwd_h_flydsl`` (plus the indexed state-pool
+    contract via ``initial_state_indices`` / ``inplace_final_state``, matching
+    ``chunk_gated_delta_rule_fwd_h_hip_fn``).
+
+    Unlike the baseline wrapper, BV is chosen by a frozen, self-contained copy
+    of the hip K5 LDS/CU selector (``_hipeq_select_bv``) so it matches the
+    hand-tuned HIP kernel today without importing its private API;
+    ``FLYDSL_K5_MFMA16HIP_BV`` (in {16,32,64}) overrides it for A/B sweeps.
+    """
+    use_g = g is not None
+    use_gk = gk is not None
+    use_h0 = initial_state is not None
+    g_log2_scaled = bool(use_exp2)
+
+    # Indexed state-pool support: when ``initial_state_indices`` is given,
+    # ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence
+    # gathers its slot from the index array; the final state is written back
+    # in place into that same pool. ``inplace_final_state`` defaults to True
+    # whenever indices are given.
+    use_state_indices = initial_state_indices is not None
+    inplace = use_state_indices if inplace_final_state is None else inplace_final_state
+    if use_state_indices:
+        if initial_state is None:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires initial_state (the "
+                "state pool)."
+            )
+        if not inplace:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires in-place final-state "
+                "write-back; leave inplace_final_state unset or set it to True."
+            )
+        if not output_final_state:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires output_final_state=True "
+                "(the indexed path writes the final state back into the pool)."
+            )
+    elif inplace and initial_state is None:
+        raise ValueError("FlyDSL K5: inplace_final_state requires initial_state.")
+    elif inplace and not output_final_state:
+        raise ValueError(
+            "FlyDSL K5: inplace_final_state requires output_final_state=True."
+        )
+
+    resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
+    state_bf16 = resolved_state_dtype is torch.bfloat16
+
+    # mfma16_hip keeps the token-major [B, T_flat, Hg, K] k layout (no
+    # host-side pre-transpose), matching the Triton VK convention.
+    if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be 4-D (k=[B,T,Hg,K], "
+            f"w=[B,H,T,K], u=[B,H,T,V]); got k={tuple(k.shape)}, "
+            f"w={tuple(w.shape)}, u={tuple(u.shape)}."
+        )
+    B, T, Hg, K = k.shape
+    H = w.shape[1]
+    V = u.shape[-1]
+    T_flat = w.shape[2]
+    BT = chunk_size
+
+    # -- Input validation (k/w/u/gk). These feed the kernel's raw buffer loads
+    # with no further checks, so a dtype / layout / shape mismatch would
+    # silently read OOB or return wrong results. Fail early with a clear error.
+    if not (k.dtype == w.dtype == u.dtype):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: k/w/u dtype must match; got k={k.dtype}, "
+            f"w={w.dtype}, u={u.dtype}."
+        )
+    if k.dtype != torch.bfloat16:
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be bfloat16 (the 16x16x16 bf16 "
+            f"MFMA path), got {k.dtype}."
+        )
+    if not (w.device == k.device and u.device == k.device):
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be on the same device; got "
+            f"k={k.device}, w={w.device}, u={u.device}."
+        )
+    if not (k.is_contiguous() and w.is_contiguous() and u.is_contiguous()):
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be contiguous; got strides "
+            f"k={k.stride()}, w={w.stride()}, u={u.stride()}."
+        )
+    if k.shape[1] != T_flat:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: k T dim ({k.shape[1]}) must equal w/u T "
+            f"({T_flat})."
+        )
+    if w.shape != (B, H, T_flat, K):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: expected w=[B,H,T,K]=({B},{H},{T_flat},{K}), "
+            f"got {tuple(w.shape)}."
+        )
+    if u.shape != (B, H, T_flat, V):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: expected u=[B,H,T,V]=({B},{H},{T_flat},{V}), "
+            f"got {tuple(u.shape)}."
+        )
+    if H % Hg != 0:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: H ({H}) must be a multiple of Hg ({Hg})."
+        )
+    if gk is not None:
+        if gk.device != k.device:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: gk must be on k's device ({k.device}); "
+                f"got {gk.device}."
+            )
+        if gk.dtype != torch.float32:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: gk must be float32, got " f"{gk.dtype}."
+            )
+        expected_gk_shape = (B, T_flat, H, K)
+        if tuple(gk.shape) != expected_gk_shape:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: gk must use token-major [B,T,H,K] "
+                f"layout with shape {expected_gk_shape}, got {tuple(gk.shape)}."
+            )
+
+    # Explicitly reject unvalidated configs: this kernel's wave mapping
+    # (wid*16, 4 waves cover 64 rows), the gated_v alias-reuse of h_state
+    # panel1 (needs NUM_K_BLOCKS>=2), and the LDS layout are only validated
+    # for K=128, BT=64 (see the asserts inside the kernel). Other values would
+    # trigger LDS aliasing OOB, out-of-bounds stores, or excessive LDS usage,
+    # so fail early with a clear error instead of silently producing wrong
+    # results.
+    if BT != 64:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: only chunk_size=64 is supported, got "
+            f"chunk_size={BT}."
+        )
+    if K != 128:
+        raise ValueError(f"FlyDSL K5 mfma16_hip: only K=128 is supported, got K={K}.")
+    if V != 128:
+        raise ValueError(f"FlyDSL K5 mfma16_hip: only V=128 is supported, got V={V}.")
+
+    if cu_seqlens is None:
+        N = B
+        NT = triton.cdiv(T, BT)
+        chunk_offsets = None
+        kernel_cu_seqlens = None
+        is_varlen = False
+    else:
+        if B != 1:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: varlen mode requires B=1, got B={B}."
+            )
+        if cu_seqlens.device != k.device:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be on k's device "
+                f"({k.device}), got {cu_seqlens.device}."
+            )
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be int32 or int64, "
+                f"got {cu_seqlens.dtype}."
+            )
+        if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be a 1-D tensor with "
+                f"at least two elements, got shape {tuple(cu_seqlens.shape)}."
+            )
+        if not cu_seqlens.is_contiguous():
+            raise ValueError("FlyDSL K5 mfma16_hip: cu_seqlens must be contiguous.")
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T_flat,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            NT = schedule.total_chunks
+            chunk_offsets = schedule.chunk_offsets
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            N = schedule.n_prefill
+        else:
+            NT, chunk_offsets, kernel_cu_seqlens, N, _min_seqlen = _resolve_prologue(
+                cu_seqlens, BT, num_decodes, num_decode_tokens, T_flat
+            )
+        is_varlen = True
+
+    if initial_state is not None:
+        if initial_state.device != k.device:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: initial_state must be on k's device "
+                f"({k.device}), got {initial_state.device}."
+            )
+        if not initial_state.is_contiguous():
+            raise ValueError("FlyDSL K5 mfma16_hip: initial_state must be contiguous.")
+        if initial_state.dim() != 4 or tuple(initial_state.shape[1:]) != (H, V, K):
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: initial_state must have shape "
+                f"[N,H,V,K] or [pool_size,H,V,K] with trailing shape "
+                f"({H},{V},{K}), got {tuple(initial_state.shape)}."
+            )
+        if not use_state_indices and initial_state.shape[0] != N:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: dense initial_state first dimension "
+                f"must equal N={N}, got {initial_state.shape[0]}."
+            )
+
+    # Validate indexed pool access before selecting/compiling a kernel. Indices
+    # gather from and scatter into ``initial_state[pool_size, H, V, K]``:
+    # out-of-range values access OOB, while duplicates race on in-place write-back.
+    if use_state_indices:
+        indices = initial_state_indices
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be int32 or int64, "
+                f"got {indices.dtype}."
+            )
+        if indices.dim() != 1:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be 1-D, "
+                f"got shape {tuple(indices.shape)}."
+            )
+        if initial_state.device != k.device:
+            raise ValueError(
+                "FlyDSL K5: initial_state must be on the same device as k; "
+                f"got initial_state={initial_state.device}, k={k.device}."
+            )
+        if indices.device != k.device:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be on the same device as "
+                f"k and initial_state; got indices={indices.device}, k={k.device}."
+            )
+        if indices.numel() != N:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices length "
+                f"({indices.numel()}) must equal the number of sequences N={N}."
+            )
+        pool_size = initial_state.shape[0]
+        if indices.numel():
+            # Validate in the ORIGINAL integer dtype. Narrowing first would let
+            # int64 values such as 2**32 wrap to a valid-looking int32 zero.
+            idx_min = int(indices.min())
+            idx_max = int(indices.max())
+            if idx_min < 0 or idx_max >= pool_size:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices out of range for a state pool "
+                    f"of size {pool_size}; got [{idx_min}, {idx_max}], expected "
+                    f"values in [0, {pool_size})."
+                )
+            if idx_max > torch.iinfo(torch.int32).max:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices values must fit in int32; "
+                    f"got maximum {idx_max}."
+                )
+            if inplace and torch.unique(indices).numel() != indices.numel():
+                raise ValueError(
+                    "FlyDSL K5: duplicate initial_state_indices with in-place "
+                    "final-state write-back race on the shared pool slot; indices "
+                    "must be unique."
+                )
+        # The kernel ABI is int32; narrow only after all checks pass.
+        si_i32 = indices.to(torch.int32).contiguous()
+    else:
+        si_i32 = None
+
+    # BV selection: use the frozen, self-contained copy of the hip K5 LDS/CU
+    # selector (``_hipeq_select_bv`` above) so this fork picks the same BV as
+    # the hand-tuned HIP kernel today, without importing its private API.
+    # dense: total_chunks = B*NT, max_seq_chunks = NT (NT = cdiv(T, BT));
+    # varlen: both come from chunk_offsets (one D2H transfer, like hip).
+    if is_varlen:
+        _total_chunks, _max_seq_chunks = _hipeq_varlen_host_metadata(chunk_offsets)
+    else:
+        _total_chunks, _max_seq_chunks = B * NT, NT
+    BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
+
+    # Env override for A/B BV sweeps; the hand-tuned HIP K5 reference is fixed
+    # at BV=16 (FLYDSL_K5_MFMA16HIP_BV=16 reproduces it).
+    _bv_env = os.environ.get("FLYDSL_K5_MFMA16HIP_BV")
+    if _bv_env:
+        try:
+            BV = int(_bv_env)
+        except ValueError as exc:
+            raise ValueError(
+                "FLYDSL_K5_MFMA16HIP_BV must be one of 16, 32, or 64, "
+                f"got {_bv_env!r}."
+            ) from exc
+    if BV not in (16, 32, 64):
+        raise ValueError(f"mfma16_hip BV must be in {{16,32,64}}, got {BV}.")
+    if V % BV != 0:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: requires V % BV == 0; got V={V}, BV={BV}."
+        )
+
+    # SCHED_GFX942 is only enabled on gfx942; other arches (incl. gfx950) pass
+    # False, keeping their emitted code byte-identical, and it joins the
+    # lru_cache key as a distinct compiled product.
+    launch_fn = _get_or_compile_mfma16_hip(
+        K,
+        V,
+        BT,
+        BV,
+        H,
+        Hg,
+        use_g,
+        use_gk,
+        use_h0,
+        output_final_state,
+        save_new_value,
+        is_varlen,
+        True,
+        state_bf16=state_bf16,
+        g_log2_scaled=g_log2_scaled,
+        use_state_indices=use_state_indices,
+        sched_gfx942=_IS_GFX942,
+        g_head_major=g_head_major,
+        bf16_convert_trunc=bf16_convert_trunc,
+    )
+
+    # Null-arg placeholder for the @flyc.jit slots ignored on this path. Sized
+    # 1 (not 0) so its ``data_ptr()`` is always a valid non-null device address.
+    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
+    int32_dummy = dummy.to(torch.int32) if not is_varlen else None
+    cu_arg = (
+        _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
+    )
+    co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
+    stream = torch.cuda.current_stream(k.device)
+
+    grid_v = triton.cdiv(V, BV)
+    grid_nh = N * H
+
+    # mfma16_hip writes the public VK layout ([..., V, K]) directly.
+    h_shape = (B, NT, H, V, K)
+    vn_shape = (B, H, T_flat, V)
+    vn_dtype = u.dtype
+    fs_shape = (N, H, V, K) if output_final_state else None
+    fs_dtype = resolved_state_dtype if output_final_state else None
+    save_vn = save_new_value
+
+    # g layout validation, strictly matching the HIP kernel's contract
+    # (aiter.ops.chunk_gated_delta_rule_fwd_h._normalize_g_tensor): g must be a
+    # 3-D tensor whose shape exactly matches the selected layout --
+    #   g_head_major=True  -> head-major  [B, H, T_flat]
+    #   g_head_major=False -> token-major [B, T_flat, H]   (default, == HIP)
+    # In varlen mode the batch dim is 1 (flattened input, N segments live in
+    # cu_seqlens), so B is k.shape[0] (==1). g=None keeps the USE_G=False path.
+    if g is not None:
+        if g.device != k.device:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: g must be on k's device ({k.device}), "
+                f"got {g.device}."
+            )
+        if g.dtype != torch.float32:
+            g = g.to(torch.float32)
+        if g.dim() != 3:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: `g` must be 3-D, got shape "
+                f"{tuple(g.shape)}."
+            )
+        expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
+        if tuple(g.shape) != expected_g_shape:
+            layout = "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: `g` shape mismatch, expected "
+                f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
+            )
+        g = g.contiguous()
+
+    # gk pre-scaling to log2 space (mirrors the Triton VK wrapper).
+    if gk is not None:
+        gk = gk.contiguous()
+        if g_log2_scaled:
+            gk = gk * _RCP_LN2
+
+    h = k.new_empty(h_shape)
+    v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
+    if fs_shape is None:
+        final_state = None
+    elif inplace:
+        # In-place write-back: the final state aliases the ``initial_state``
+        # buffer (the pool when indexed, or the dense [N,H,V,K] state
+        # otherwise), so no separate output tensor is allocated.
+        final_state = initial_state
+    else:
+        final_state = k.new_empty(fs_shape, dtype=fs_dtype)
+
+    # The 11 tensor slots, passed as fx.Tensor args. The kernel body only reads
+    # each slot's base pointer and element type, so the placeholder ``dummy``
+    # stands in for the slots this configuration disables -- its float32 dtype
+    # matches the only such slot the body still views unconditionally (g).
+    tensor_args = (
+        k,
+        u,
+        w,
+        v_new_buf,
+        g if g is not None else dummy,
+        gk if gk is not None else dummy,
+        h,
+        initial_state if initial_state is not None else dummy,
+        final_state if final_state is not None else dummy,
+        cu_arg,
+        co_arg,
+    )
+
+    # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
+    # arg): a real int32 [N] index array when indexed, else a 1-elem int32 dummy.
+    if not use_state_indices:
+        si_i32 = dummy.to(torch.int32)
+    tensor_args = tensor_args + (si_i32,)
+
+    _run_compiled(
+        launch_fn,
+        *tensor_args,
+        T,
+        T_flat,
+        N,
+        grid_v,
+        grid_nh,
+        stream,
+    )
+
+    return h, (v_new_buf if save_vn else None), final_state
