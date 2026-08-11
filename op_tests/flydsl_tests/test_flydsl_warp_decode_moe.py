@@ -475,6 +475,9 @@ DOWN_FP4_CASES = [
     ("down_fp4_i512_h256_e8_tk2_kv8", 1, 512, 256, 8, 2, 8),
     ("down_fp4_i1024_h128_e8_tk4_kv16", 2, 1024, 128, 8, 4, 16),
     ("down_fp4_i2048_h128_e8_tk4_kv32", 1, 2048, 128, 8, 4, 32),
+    # E=256 keeps the real DeepSeek expert count in the fast suite so the K3
+    # Tier-1 w_row*(INTER//8) offset path stays exercised (small dims -> light pool).
+    ("down_fp4_i512_h128_e256_tk8_kv8", 1, 512, 128, 256, 8, 8),
 ]
 _MXFP4_BK = 32
 
@@ -586,6 +589,8 @@ GATE_UP_FP4_CASES = [
     ("gate_up_fp4_h512_i256_e8_tk2_kv8", 1, 512, 256, 8, 2, 8),
     ("gate_up_fp4_h1024_i128_e8_tk4_kv16", 2, 1024, 128, 8, 4, 16),
     ("gate_up_fp4_h2048_i128_e8_tk4_kv32", 1, 2048, 128, 8, 4, 32),
+    # E=256 (real expert count) keeps the K3 Tier-1 w_row*(HIDDEN//8) path covered.
+    ("gate_up_fp4_h512_i128_e256_tk8_kv8", 1, 512, 128, 256, 8, 8),
 ]
 
 
@@ -1015,21 +1020,22 @@ def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
 # E-expert pool once and rotate a tiny router-id set across disjoint expert
 # groups so each launch reads a fresh slice of the (multi-GB) pool.
 # -------------------------------------------------------------------------
-# B, INTER, HIDDEN, E, TOPK.  DeepSeek-V3 down at **E=128** (FP4 pool ~0.94 GB,
-# FP8 ~1.88 GB -- both >> the ~256 MB MALL, so router-rotated reads are cold).
-# NOTE: true E=256 overflows the kernel's i32 weight offset (w_row*inter =
-# 255*7168*2048 ~= 3.76e9 > 2^31) and faults; it needs the K3 i64/per-expert-base
-# addressing follow-on.  E=128 (E*HIDDEN*INTER = 1.88e9 < 2^31) is the largest
-# safe cold pool and still answers the BW question.
+# B, INTER, HIDDEN, E, TOPK.  DeepSeek-V3 down at the **real E=256** (FP4 pool
+# ~1.88 GB, >> the ~256 MB MALL, so router-rotated reads are cold).  After the K3
+# Tier-1 offset restructure (w_row*(DIM//WPACK) + k_base//WPACK) FP4 addresses up
+# to E*HIDDEN*INTER < 2^32; FP8's byte offset is 2x larger, so its E=256 leg
+# (3.76 GB, needs the K3 Tier-2 per-expert i64 base) is skipped and reported n/a.
 COLD_DOWN_SHAPES = [
-    (1, 2048, 7168, 128, 8),
-    (2, 2048, 7168, 128, 8),
-    (4, 2048, 7168, 128, 8),
-    (8, 2048, 7168, 128, 8),
+    (1, 2048, 7168, 256, 8),
+    (2, 2048, 7168, 256, 8),
+    (4, 2048, 7168, 256, 8),
+    (8, 2048, 7168, 256, 8),
 ]
-# Largest E*HIDDEN*INTER the FP4/FP8 down kernels can address in i32 (byte offset
-# for FP8, dword*8 for FP4 both derive from w_row*inter, which must stay < 2^31).
-_COLD_I32_LIMIT = 2**31
+# i32 addressing limits on E*HIDDEN*INTER (see K3 scope): FP4's hardware byte
+# offset is w_row*INTER/2 (dword*4), so it overflows at E*H*I >= 2^32; FP8's is
+# w_row*INTER (dword*4), overflowing at 2^31.
+_COLD_FP4_LIMIT = 2**32
+_COLD_FP8_LIMIT = 2**31
 
 
 def _router_group_list(B, E, TOPK, device, n_route):
@@ -1167,10 +1173,13 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     n_route = max(1, E // TOPK)
     outputs = B * HIDDEN
     flops = 2 * INTER * TOPK * outputs
-    # Guard the K3 i32 weight-offset limit (w_row*inter must stay < 2^31).
+    ehi = E * HIDDEN * INTER
+    # K3 i32 addressing limits (see scope): FP4 byte offset = w_row*INTER/2, FP8 =
+    # w_row*INTER; the FP8 leg is skipped above 2^31 (needs the Tier-2 i64 base).
     assert (
-        E * HIDDEN * INTER < _COLD_I32_LIMIT
-    ), f"E*HIDDEN*INTER={E*HIDDEN*INTER} overflows i32 weight offset (needs K3 i64)"
+        ehi < _COLD_FP4_LIMIT
+    ), f"E*HIDDEN*INTER={ehi} overflows even FP4's i32 offset (needs K3 Tier-2)"
+    run_fp8 = ehi < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
     inter, w_down, w_scale, rid_list, rwt = _gen_down_fp4_pool(
@@ -1191,24 +1200,27 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     del inter, w_down, w_scale, out
     torch.cuda.empty_cache()
 
-    # ---- FP8 (PerTensor) ----
-    inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
-        B, INTER, HIDDEN, E, TOPK, n_route
-    )
-    out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
-    ref8 = _ref_down_fp8_pool(inter8, w_down8, w_scale8, rid_list8[0], rwt8, HIDDEN)
-    entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
-        inter8, w_down8, rid, rwt8, w_scale8, w_scale_mode="pertensor", out=out8
-    )
-    got8 = entry8(rid_list8[0])
-    torch.cuda.synchronize()
-    cos8 = _cosine(ref8, got8)
-    assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
-    _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
-    wbytes8 = outputs * TOPK * INTER  # 1 B/elt FP8 weights
-    tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
-    del inter8, w_down8, w_scale8, out8
-    torch.cuda.empty_cache()
+    # ---- FP8 (PerTensor) -- only when the i32 byte offset fits (E*H*I < 2^31) ----
+    if run_fp8:
+        inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
+            B, INTER, HIDDEN, E, TOPK, n_route
+        )
+        out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
+        ref8 = _ref_down_fp8_pool(inter8, w_down8, w_scale8, rid_list8[0], rwt8, HIDDEN)
+        entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
+            inter8, w_down8, rid, rwt8, w_scale8, w_scale_mode="pertensor", out=out8
+        )
+        got8 = entry8(rid_list8[0])
+        torch.cuda.synchronize()
+        cos8 = _cosine(ref8, got8)
+        assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
+        _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
+        wbytes8 = outputs * TOPK * INTER  # 1 B/elt FP8 weights
+        tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
+        del inter8, w_down8, w_scale8, out8
+        torch.cuda.empty_cache()
+    else:
+        us8 = tbs8 = float("nan")  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
 
     return {
         "gfx": get_gfx(),
@@ -1216,7 +1228,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         "E": E,
         "fp4_us": us4,
         "fp8_us": us8,
-        "fp4/fp8": us4 / us8 if us8 > 0 else 0.0,
+        "fp4/fp8": us4 / us8 if us8 > 0 else float("nan"),
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
         "fp4_cos": cos4,
