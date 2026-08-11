@@ -1007,7 +1007,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             x_scale,
             w_scale,
             dtype=dtype,
-            y=out,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
@@ -1038,7 +1038,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             x_scale,
             w_scale,
             dtype=dtype,
-            y=out,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             backend=backend,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
