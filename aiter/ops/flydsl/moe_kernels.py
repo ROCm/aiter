@@ -456,10 +456,11 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage1 configs.
 
     a16wi4 is served by the shared FlyDSL a16w-mix port (moe_2stage_a16wmix,
-    w_dtype="int4"), which uses intra-block ``k_wave`` (not grid split-K). Legacy
-    ``_kb{n}`` names are still registered (k_batch is parsed but IGNORED by the port
-    -> runs k_wave=1) so pre-existing tuned CSVs keep parsing; new tuned rows should
-    use ``_kw{n}`` for the wave-starved decode regime.
+    w_dtype="int4"), which has NO grid split-K -- it uses intra-block ``k_wave``
+    instead. So no ``_kb{n}`` name is registered: the deleted kernel's split-K names
+    describe a capability this one does not have, and a stale CSV row naming one must
+    fail loudly ("Invalid FlyDSL kernel name") rather than silently run without the
+    split-K its tuned timing assumed. Retune such rows onto ``_kw{n}``.
     """
     kernels = {}
     a_dtype = "bf16"
@@ -471,10 +472,8 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     # solved with grid split-K.
     tile_ns = [16, 32, 64, 128]
 
-    def _emit(tm, tn, tk, *, kb=1, kw=1, bnt=2):
+    def _emit(tm, tn, tk, *, kw=1, bnt=2):
         name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
-        if kb != 1:
-            name += f"_kb{kb}"
         if bnt != 2:
             name += f"_bnt{bnt}"
         if kw != 1:
@@ -489,7 +488,6 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
             "tile_k": tk,
             "MPerBlock": tm,
             "in_dtype": "int4_bf16",
-            "k_batch": kb,
             "b_nt": bnt,
             "k_wave": kw,
         }
@@ -511,12 +509,6 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                         continue
                     for bnt in (0, 2):
                         _emit(tm, tn, tk, kw=kw, bnt=bnt)
-                # Legacy grid-split-K names: k_batch is parsed but IGNORED by the
-                # port (it runs k_wave=1), and they only ever existed for the tile_n
-                # the old kernel supported. Kept so pre-existing tuned CSVs parse.
-                if tn >= 64:
-                    for kb in (2, 4, 7, 14):
-                        _emit(tm, tn, tk, kb=kb)
     return kernels
 
 
@@ -527,6 +519,9 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     This registry is the only thing the runtime wrapper and the AOT precompile share,
     so a key it omits is one the two sides default independently -- and ``b_nt`` is
     baked into the gemm2 kernel name, so disagreeing there is a run-only cache miss.
+
+    No ``_persist`` name is registered: ``_flydsl_moe_stage2_impl``'s a16w branch does
+    not forward ``persist`` to the port, so such a name would silently run non-persist.
     """
     kernels = {}
     a_dtype = "bf16"
@@ -544,7 +539,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                     base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
-                    base_params = {
+                    kernels[base_name] = {
                         "stage": 2,
                         "a_dtype": a_dtype,
                         "b_dtype": b_dtype,
@@ -556,11 +551,6 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                         "MPerBlock": tm,
                         "in_dtype": "int4_bf16",
                         "b_nt": 0,
-                    }
-                    kernels[base_name] = base_params
-                    kernels[base_name + "_persist"] = {
-                        **base_params,
-                        "persist": True,
                     }
     return kernels
 
@@ -1492,6 +1482,10 @@ def _flydsl_moe_stage1_impl(
             tile_n=tile_n,
             tile_k=tile_k,
             k_wave=k_wave,
+            # Forwarded so the port's k_batch != 1 guard actually fires: the port has
+            # no grid split-K, and dropping the request here would silently run a
+            # non-split-K kernel under a name whose tuned timing assumed one.
+            k_batch=k_batch,
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=None,
