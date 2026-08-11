@@ -1418,6 +1418,210 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     }
 
 
+# -------------------------------------------------------------------------
+# Cold-HBM gate_up A/B (mirror of bench_down_cold).  gate_up's contraction is
+# HIDDEN and it streams *two* weight matrices (gate + up), so the per-launch cold
+# read is 2x a same-shape down; the grid (B*TOPK*INTER waves) is also far larger,
+# so this measures whether FP4's byte-halving still wins when the stage is
+# occupancy-bound rather than latency-bound (cf. the G7 finding).
+# -------------------------------------------------------------------------
+# B, HIDDEN, INTER, E, TOPK.  DeepSeek-V3 gate_up at the real E=256 (FP4 gate+up
+# pool ~3.76 GB >> MALL).  FP4 addresses up to E*INTER*HIDDEN < 2^32; FP8's byte
+# offset is 2x, so its E=256 leg is skipped (needs K3 Tier-2) and reported n/a.
+COLD_GATE_UP_SHAPES = [
+    (1, 7168, 2048, 256, 8),
+    (2, 7168, 2048, 256, 8),
+    (4, 7168, 2048, 256, 8),
+    (8, 7168, 2048, 256, 8),
+]
+
+
+def _dequant_expert_fp4_rows(w_e, s_e, lut):
+    """Unpack + dequantize one expert's FP4 weight matrix (fp32 [ROWS, K]) given
+    packed [ROWS, K//2] uint8 nibbles and [ROWS, K//_MXFP4_BK] E8M0 scale bytes.
+    Generic over the contraction dim so it serves gate_up ([INTER, HIDDEN])."""
+    lo = (w_e & 0x0F).to(torch.long)
+    hi = (w_e >> 4).to(torch.long)
+    rows, half = w_e.shape
+    K = half * 2
+    codes = torch.empty(rows, K, dtype=torch.long, device=w_e.device)
+    codes[:, 0::2] = lo
+    codes[:, 1::2] = hi
+    blk = torch.pow(2.0, s_e.float() - 127.0)
+    return lut[codes] * blk.repeat_interleave(_MXFP4_BK, dim=1)
+
+
+def _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK, n_route):
+    """Full E-expert MXFP4 gate_up pool (packed gate+up uint8 + E8M0 scales) +
+    rotating router list.  Returns (x, wg, wgs, wu, wus, rid_list)."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    rows = E * INTER
+    scale_cols = HIDDEN // _MXFP4_BK
+
+    def _one():
+        w = torch.randint(
+            0,
+            256,
+            (E, INTER, HIDDEN // 2),
+            generator=gen,
+            device=device,
+            dtype=torch.uint8,
+        ).contiguous()
+        s = torch.randint(
+            123,
+            132,
+            (rows, scale_cols),
+            generator=gen,
+            device=device,
+            dtype=torch.uint8,
+        ).contiguous()
+        return w, s
+
+    wg, wgs = _one()
+    wu, wus = _one()
+    x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    return x, wg, wgs, wu, wus, rid_list
+
+
+def _ref_gate_up_fp4_pool(x, wg, wgs, wu, wus, rid, INTER, HIDDEN):
+    B, _ = x.shape
+    TOPK = rid.shape[1]
+    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=x.device)
+    xf = x.float()
+    out = torch.zeros(B, TOPK, INTER, device=x.device)
+    cache = {}
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(rid[b, k])
+            if e not in cache:
+                sr = slice(e * INTER, (e + 1) * INTER)
+                gate_e = _dequant_expert_fp4_rows(wg[e], wgs[sr], lut)
+                up_e = _dequant_expert_fp4_rows(wu[e], wus[sr], lut)
+                cache[e] = (gate_e, up_e)
+            gate_e, up_e = cache[e]
+            gate = xf[b] @ gate_e.T
+            up = xf[b] @ up_e.T
+            out[b, k] = (gate * torch.sigmoid(gate)) * up
+    return out.to(torch.bfloat16)
+
+
+def _gen_gate_up_fp8_pool(B, HIDDEN, INTER, E, TOPK, n_route):
+    """Full E-expert FP8 gate_up pool + PerTensor scales + rotating router list."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+
+    def _one():
+        return (
+            (
+                (torch.rand((E, INTER, HIDDEN), generator=gen, device=device) * 2 - 1)
+                * 0.25
+            )
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+
+    wg = _one()
+    wu = _one()
+    ones = torch.tensor([1.0], dtype=torch.float32, device=device)
+    x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    return x, wg, ones, wu, ones, rid_list
+
+
+def _ref_gate_up_fp8_pool(x, wg, wu, rid, INTER):
+    B, _ = x.shape
+    TOPK = rid.shape[1]
+    xf = x.float()
+    out = torch.zeros(B, TOPK, INTER, device=x.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(rid[b, k])
+            gate = xf[b] @ wg[e].float().T
+            up = xf[b] @ wu[e].float().T
+            out[b, k] = (gate * torch.sigmoid(gate)) * up
+    return out.to(torch.bfloat16)
+
+
+@benchmark()
+def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup):
+    """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
+
+    ``wbytes`` counts the two weight streams (gate + up) a single launch reads for
+    its TOPK experts, so TB/s reflects real HBM bandwidth.
+    """
+    device = torch.device("cuda")
+    n_route = max(1, E // TOPK)
+    out_elems = B * TOPK * INTER
+    flops = 2 * 2 * HIDDEN * out_elems  # gate+up matmuls, mul+add
+    ehi = E * INTER * HIDDEN
+    assert (
+        ehi < _COLD_FP4_LIMIT
+    ), f"E*INTER*HIDDEN={ehi} overflows even FP4's i32 offset (needs K3 Tier-2)"
+    run_fp8 = ehi < _COLD_FP8_LIMIT
+
+    # ---- FP4 ----
+    x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp4_pool(
+        B, HIDDEN, INTER, E, TOPK, n_route
+    )
+    out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
+    ref4 = _ref_gate_up_fp4_pool(x, wg, wgs, wu, wus, rid_list[0], INTER, HIDDEN)
+    entry4 = lambda rid, x=x, wg=wg, wgs=wgs, wu=wu, wus=wus, out=out: flydsl_warp_decode_gate_up_fp4(  # noqa: E731
+        x, wg, wu, rid, wgs, wus, scale_block=(1, _MXFP4_BK), out=out
+    )
+    got4 = entry4(rid_list[0])
+    torch.cuda.synchronize()
+    cos4 = _cosine(ref4, got4)
+    assert cos4 >= 0.99, f"gate_up fp4 cold: correctness regression (cos={cos4:.4f})"
+    _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
+    wbytes4 = out_elems * HIDDEN + B * TOPK * 2 * INTER * (HIDDEN // _MXFP4_BK)
+    tbs4 = wbytes4 / us4 / 1e6 if us4 > 0 else 0.0
+    del x, wg, wgs, wu, wus, out
+    torch.cuda.empty_cache()
+
+    # ---- FP8 (PerTensor) -- only when the i32 byte offset fits (E*I*H < 2^31) ----
+    if run_fp8:
+        x8, wg8, s8, wu8, _, rid_list8 = _gen_gate_up_fp8_pool(
+            B, HIDDEN, INTER, E, TOPK, n_route
+        )
+        out8 = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
+        ref8 = _ref_gate_up_fp8_pool(x8, wg8, wu8, rid_list8[0], INTER)
+        entry8 = lambda rid, x8=x8, wg8=wg8, wu8=wu8, s8=s8, out8=out8: flydsl_warp_decode_gate_up(  # noqa: E731
+            x8, wg8, wu8, rid, s8, s8, w_scale_mode="pertensor", out=out8
+        )
+        got8 = entry8(rid_list8[0])
+        torch.cuda.synchronize()
+        cos8 = _cosine(ref8, got8)
+        assert (
+            cos8 >= 0.99
+        ), f"gate_up fp8 cold: correctness regression (cos={cos8:.4f})"
+        _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
+        wbytes8 = out_elems * HIDDEN * 2  # gate+up, 1 B/elt FP8
+        tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
+        del x8, wg8, wu8, out8
+        torch.cuda.empty_cache()
+    else:
+        us8 = tbs8 = float("nan")  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
+
+    return {
+        "gfx": get_gfx(),
+        "B": B,
+        "E": E,
+        "fp4_us": us4,
+        "fp8_us": us8,
+        "fp4/fp8": us4 / us8 if us8 > 0 else float("nan"),
+        "fp4_TB/s": tbs4,
+        "fp8_TB/s": tbs8,
+        "fp4_cos": cos4,
+        "TFLOPS_fp4": flops / us4 / 1e6 if us4 > 0 else 0.0,
+    }
+
+
 def _fmt_table(rows) -> str:
     """Markdown table when ``tabulate`` is available; plain text otherwise."""
     df = pd.DataFrame(rows)
@@ -1474,6 +1678,17 @@ def _run_perf_sweeps(args) -> None:
             args.timing,
             _fmt_table(cold_rows),
         )
+        cold_gu_rows = [
+            bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, **timing_kw)
+            for (B, HIDDEN, INTER, E, TOPK) in args.cold_gate_up_shapes
+        ]
+        aiter.logger.info(
+            "warp-decode gate_up COLD-HBM E=%d A/B FP4-vs-FP8 (%s timing, "
+            "router rotated over the pool):\n%s",
+            args.cold_gate_up_shapes[0][3],
+            args.timing,
+            _fmt_table(cold_gu_rows),
+        )
 
 
 def main() -> int:
@@ -1508,6 +1723,7 @@ def main() -> int:
     args.down_shapes = DOWN_PERF_SHAPES
     args.down_fp4_shapes = DOWN_FP4_PERF_SHAPES
     args.cold_down_shapes = COLD_DOWN_SHAPES
+    args.cold_gate_up_shapes = COLD_GATE_UP_SHAPES
 
     print("=" * 78)
     print("[flydsl] warp-decode MoE primitives (Phase 1)")
