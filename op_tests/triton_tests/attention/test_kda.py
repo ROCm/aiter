@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -124,6 +126,103 @@ def run(q, k, v, g, beta, h0_kv, **kw):
         **kw,
     )
     return o, state.transpose(-1, -2)
+
+
+def _seq_lens(kw, n_seq):
+    cu = kw.get("cu_seqlens")
+    if cu is not None:
+        return (cu[1:] - cu[:-1]).tolist()
+    return [kw["q"].shape[1]] * n_seq
+
+
+def _replay_into_snapshots(pool, indices, lens, BV=32):
+    """Rebuild the per-token snapshot states a cached-update launch elided:
+    replay each sequence's updates over its base state and write the results
+    where snapshot mode would have put them (torch replay is ULP-close, not
+    bitwise -- callers compare with assert_close). Records are replicated per
+    i_v tile in chunks of 2*K + BV; a/k are read from tile 0, err assembled
+    across tiles."""
+    K, V = pool.shape[-1], pool.shape[-2]
+    H = pool.shape[1]
+    ch = 2 * K + BV
+    for n, ln in enumerate(lens):
+        if ln == 0:
+            continue
+        S = pool[int(indices[n, 0])].clone()
+        for t in range(1, ln):
+            rec = pool[int(indices[n, t])].reshape(H, V * K)
+            a, kr = rec[:, :K], rec[:, K : 2 * K]
+            er = torch.cat(
+                [rec[:, i * ch + 2 * K : i * ch + 2 * K + BV] for i in range(V // BV)],
+                dim=1,
+            )
+            S = S * a[:, None, :] + er[:, :, None] * kr[:, None, :]
+            pool[int(indices[n, t])] = S
+
+
+@pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
+def kda_store_mode(request, monkeypatch):
+    """Run the whole suite twice: once as-is, once routing every compatible
+    kernel call through the cached-update store path. Non-paged calls are
+    transparently rewritten onto a slot pool; the snapshots each test expects
+    are then reconstructed from the updates, so every existing assertion also
+    validates the record contents."""
+    if request.param == "snapshots":
+        yield request.param
+        return
+
+    real = fused_recurrent_kda
+
+    def wrapped(**kw):
+        state = kw.get("initial_state")
+        idx = kw.get("ssm_state_indices")
+        if (
+            "cache_state_updates" in kw
+            or kw.get("num_accepted_tokens") is not None
+            or kw.get("use_tdm_store")
+            or kw.get("state_v_first") is False
+            or not kw.get("inplace_final_state", True)
+            or state is None
+            or (idx is not None and idx.ndim != 2)
+        ):
+            return real(**kw)
+
+        if idx is not None:  # already paged: just flip the store path
+            o, pool = real(**kw, cache_state_updates=True)
+            _replay_into_snapshots(
+                pool, idx, _seq_lens(kw, idx.shape[0]), kw.get("BV", 32)
+            )
+            return o, pool
+
+        # non-paged: emulate on a pool where slot n is the caller's state row
+        # (the seed and base slot), with scratch slots for the token updates
+        N = state.shape[0]
+        lens = _seq_lens(kw, N)
+        maxlen = max(lens)
+        if len(lens) != N or maxlen > 64:
+            # malformed calls stay on the real path so guards still fire;
+            # training-length tests stay off the B*T scratch pool
+            return real(**kw)
+        scratch = N * max(0, maxlen - 1)
+        pool = torch.cat([state, state.new_empty(scratch, *state.shape[1:])])
+        indices = torch.empty(N, max(1, maxlen), dtype=torch.int32, device=DEVICE)
+        for n in range(N):
+            indices[n, 0] = n
+            for t in range(1, max(1, maxlen)):
+                indices[n, t] = N + n * (maxlen - 1) + t - 1
+        o, pool = real(
+            **dict(kw, initial_state=pool),
+            ssm_state_indices=indices,
+            cache_state_updates=True,
+        )
+        _replay_into_snapshots(pool, indices, lens, kw.get("BV", 32))
+        for n, ln in enumerate(lens):
+            if ln:
+                state[n] = pool[int(indices[n, ln - 1])]
+        return o, state
+
+    monkeypatch.setattr(sys.modules[__name__], "fused_recurrent_kda", wrapped)
+    yield request.param
 
 
 @pytest.mark.parametrize(
@@ -370,6 +469,298 @@ def test_fused_recurrent_vllm_decode(B, T, spec):
     ), "kernel wrote outside its slots"
 
 
+def _spec_inputs(total_T, H, HV, D, seed, gate=False, beta_headwise=False, dtype=None):
+    """Raw spec-decode inputs; l2norm always in-kernel, gate chain optional."""
+    dtype = dtype or torch.float32
+    torch.manual_seed(seed)
+    q = torch.rand(1, total_T, H, D, dtype=dtype, device=DEVICE)
+    k = torch.rand(1, total_T, H, D, dtype=dtype, device=DEVICE)
+    v = torch.rand(1, total_T, HV, D, dtype=dtype, device=DEVICE)
+    g = torch.randn(1, total_T, HV, D, dtype=torch.float32, device=DEVICE)
+    bshape = (1, total_T, HV, D) if beta_headwise else (1, total_T, HV)
+    beta = torch.rand(bshape, dtype=torch.float32, device=DEVICE)
+    kw = {"q": q, "k": k, "v": v, "use_qk_l2norm_in_kernel": True}
+    if gate:
+        A_log = torch.log(
+            torch.empty(HV, dtype=torch.float32, device=DEVICE).uniform_(1, 16)
+        )
+        kw.update(
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=torch.randn(HV * D, dtype=torch.float32, device=DEVICE),
+            lower_bound=-5.0,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+        )
+    else:
+        kw.update(g=F.logsigmoid(g), beta=beta.sigmoid())
+    return kw
+
+
+def _cached_vs_snapshot(B, T, H, HV, D, accepted_rounds, **kw):
+    """Run the same launch chain in snapshot and cached-update mode: every launch
+    output and the token-0 base state must be bitwise identical, and poisoned
+    slots must stay untouched. Round 0 has no verifier seed; each later round
+    seeds from its `accepted_rounds` entry against the previous round's pool."""
+    gate = kw.pop("gate", False)
+    beta_headwise = kw.pop("beta_headwise", False)
+    dtype = kw.pop("dtype", None)
+    total_T = B * T
+    pool_kv, indices, untouched = make_pool(B, T, HV, D)
+    base = to_vk(pool_kv)
+    cu = torch.arange(0, total_T + 1, step=T, device=DEVICE).long()
+
+    results = {}
+    for cached in (False, True):
+        pool = base.clone()
+        outs = []
+        for r, acc in enumerate([None] + list(accepted_rounds)):
+            inp = _spec_inputs(
+                total_T,
+                H,
+                HV,
+                D,
+                seed=17 + r,
+                gate=gate,
+                beta_headwise=beta_headwise,
+                dtype=dtype,
+            )
+            o, _ = fused_recurrent_kda(
+                **inp,
+                initial_state=pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                ssm_state_indices=indices,
+                num_accepted_tokens=acc,
+                cache_state_updates=cached,
+                **kw,
+            )
+            outs.append(o)
+        results[cached] = (outs, pool)
+
+    snap_outs, snap_pool = results[False]
+    cached_outs, cached_pool = results[True]
+    for r, (o_s, o_d) in enumerate(zip(snap_outs, cached_outs)):
+        assert torch.equal(o_s, o_d), f"round {r}: cached-update output diverged"
+    s0 = indices[:, 0].long()
+    assert torch.equal(snap_pool[s0], cached_pool[s0]), "base state diverged"
+    assert torch.equal(
+        cached_pool[untouched], base[untouched]
+    ), "kernel wrote outside its slots"
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("pattern", ["one", "all", "perseq"])
+def test_cache_state_updates_matches_snapshots(T, pattern):
+    """Spec-decode two-launch round trip: replaying the (a, k, err) updates must
+    reconstruct the seed state bitwise identically to loading the full snapshot,
+    for every acceptance count the verifier can produce."""
+    B = 4
+    acc = {
+        "one": torch.ones(B, device=DEVICE, dtype=torch.int32),
+        "all": torch.full((B,), T, device=DEVICE, dtype=torch.int32),
+        "perseq": torch.arange(1, B + 1, device=DEVICE, dtype=torch.int32).clamp(max=T),
+    }[pattern]
+    _cached_vs_snapshot(B, T, 4, 4, 128, [acc])
+
+
+def test_cache_state_updates_multi_round():
+    """Four chained verifier rounds with random per-sequence acceptance: updates
+    are overwritten in place every round and must never drift from snapshots."""
+    B, T = 3, 6
+    torch.manual_seed(123)
+    rounds = [
+        torch.randint(1, T + 1, (B,), device=DEVICE, dtype=torch.int32)
+        for _ in range(4)
+    ]
+    _cached_vs_snapshot(B, T, 4, 4, 128, rounds)
+
+
+@pytest.mark.parametrize(
+    ("gate", "beta_headwise", "dtype", "H", "HV"),
+    [
+        pytest.param(True, False, torch.bfloat16, 4, 4, id="gate-bf16"),
+        pytest.param(True, True, torch.bfloat16, 4, 4, id="gate-headwise-bf16"),
+        pytest.param(False, True, torch.float32, 4, 4, id="headwise-fp32"),
+        pytest.param(True, False, torch.float32, 2, 4, id="gate-grouped-HV2H"),
+    ],
+)
+def test_cache_state_updates_variants(gate, beta_headwise, dtype, H, HV):
+    """Cached state updates across the K3 math flags: in-kernel gate + dt_bias +
+    lower bound, headwise beta, bf16 inputs, and grouped heads (HV != H)."""
+    acc = torch.tensor([1, 2, 4, 3], device=DEVICE, dtype=torch.int32)
+    _cached_vs_snapshot(
+        4, 4, H, HV, 128, [acc], gate=gate, beta_headwise=beta_headwise, dtype=dtype
+    )
+
+
+@pytest.mark.parametrize(
+    ("BV", "num_warps", "SK", "num_buffers", "use_tdm_load", "use_tdm_fused_load"),
+    [
+        (32, 4, 32, 1, False, False),
+        (32, 2, 16, 2, False, False),
+        (64, 2, 32, 2, False, False),
+        (32, 4, 32, 2, True, False),
+        (32, 4, 32, 2, False, True),
+        (32, 2, 16, 2, False, True),
+        (64, 2, 32, 2, False, True),
+    ],
+)
+def test_cache_state_updates_tiling(
+    BV, num_warps, SK, num_buffers, use_tdm_load, use_tdm_fused_load
+):
+    """Update loads/stores are layout-parameterized: every tiling and load path
+    must reconstruct bitwise identically to snapshots under the same tiling."""
+    acc = torch.tensor([2, 4, 1, 3], device=DEVICE, dtype=torch.int32)
+    _cached_vs_snapshot(
+        4,
+        4,
+        4,
+        4,
+        128,
+        [acc],
+        BV=BV,
+        num_warps=num_warps,
+        SK=SK,
+        num_buffers=num_buffers,
+        use_tdm_load=use_tdm_load,
+        use_tdm_fused_load=use_tdm_fused_load,
+    )
+
+
+@pytest.mark.parametrize("BV, num_warps", [(32, 4), (32, 2), (64, 2), (128, 4)])
+def test_cache_state_updates_k_first(BV, num_warps):
+    """The [K, V] layout mirrors the replay's broadcast axes; the update offsets
+    themselves are layout-neutral. Must still be bitwise-exact vs snapshots."""
+    acc = torch.tensor([1, 4, 2, 3], device=DEVICE, dtype=torch.int32)
+    _cached_vs_snapshot(
+        4, 4, 4, 4, 128, [acc], BV=BV, num_warps=num_warps, state_v_first=False
+    )
+
+
+def test_cache_state_updates_vs_reference():
+    """Two cached-update launches checked against the pure-torch recurrence: seq n's
+    second launch must continue from the state after its accepted[n] tokens."""
+    B, T, H, D = 4, 6, 4, 128
+    total_T = B * T
+    pool_kv, indices, untouched = make_pool(B, T, H, D)
+    pool = to_vk(pool_kv)
+    cu = torch.arange(0, total_T + 1, step=T, device=DEVICE).long()
+    acc = torch.arange(1, B + 1, device=DEVICE, dtype=torch.int32).clamp(max=T)
+
+    def mk(seed):
+        q, k, v = make_qkv(1, total_T, H, H, D, torch.float32, seed=seed)
+        q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
+        g = F.logsigmoid(
+            torch.randn(1, total_T, H, D, dtype=torch.float32, device=DEVICE)
+        )
+        beta = torch.rand(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+        return {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+
+    in1, in2 = mk(3), mk(5)
+    o1, _ = fused_recurrent_kda(
+        **in1,
+        initial_state=pool,
+        output_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        cache_state_updates=True,
+    )
+    o2, _ = fused_recurrent_kda(
+        **in2,
+        initial_state=pool,
+        output_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        num_accepted_tokens=acc,
+        cache_state_updates=True,
+    )
+
+    for n in range(B):
+        a, (b, e) = int(acc[n]), (n * T, (n + 1) * T)
+        h0 = pool_kv[int(indices[n, 0])][None]
+        sl1 = {k_: v_[:, b:e] for k_, v_ in in1.items()}
+        ref1, _ = naive_recurrent_kda(**sl1, initial_state=h0)
+        assert_close(f"o1[{n}]", ref1, o1[:, b:e])
+        sl1a = {k_: v_[:, b : b + a] for k_, v_ in in1.items()}
+        _, ht_a = naive_recurrent_kda(**sl1a, initial_state=h0)
+        sl2 = {k_: v_[:, b:e] for k_, v_ in in2.items()}
+        ref2, _ = naive_recurrent_kda(**sl2, initial_state=ht_a)
+        assert_close(f"o2[{n}]", ref2, o2[:, b:e])
+
+    base = to_vk(pool_kv)
+    assert torch.equal(pool[untouched], base[untouched]), "wrote outside slots"
+
+
+def test_cache_state_updates_varlen():
+    """Unequal sequence lengths: per-sequence record counts and acceptance."""
+    lens, H, D = [3, 1, 4], 4, 128
+    N, total_T, maxlen = len(lens), sum(lens), max(lens)
+    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=DEVICE).long()
+
+    torch.manual_seed(11)
+    max_slots = N * maxlen * 3
+    pool_kv = torch.randn(max_slots, H, D, D, dtype=torch.float32, device=DEVICE)
+    perm = torch.randperm(max_slots, device=DEVICE)[: N * maxlen]
+    untouched = torch.ones(max_slots, dtype=torch.bool, device=DEVICE)
+    untouched[perm] = False
+    pool_kv[untouched] = POISON
+    indices = perm.int().view(N, maxlen)
+    base = to_vk(pool_kv)
+    acc = torch.tensor([2, 1, 4], device=DEVICE, dtype=torch.int32)
+
+    results = {}
+    for cached in (False, True):
+        pool = base.clone()
+        outs = []
+        for r, a in enumerate([None, acc]):
+            inp = _spec_inputs(total_T, H, H, D, seed=29 + r)
+            o, _ = fused_recurrent_kda(
+                **inp,
+                initial_state=pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                ssm_state_indices=indices,
+                num_accepted_tokens=a,
+                cache_state_updates=cached,
+            )
+            outs.append(o)
+        results[cached] = (outs, pool)
+
+    for r in range(2):
+        assert torch.equal(
+            results[False][0][r], results[True][0][r]
+        ), f"round {r}: output diverged"
+    s0 = indices[:, 0].long()
+    assert torch.equal(results[False][1][s0], results[True][1][s0])
+    assert torch.equal(results[True][1][untouched], base[untouched])
+
+
+def test_cache_state_updates_guards():
+    """The wrapper must reject configurations the record layout cannot support."""
+    B, T, H, D = 2, 2, 2, 128
+    inp = _spec_inputs(B * T, H, H, D, seed=1)
+    cu = torch.arange(0, B * T + 1, step=T, device=DEVICE).long()
+    state = torch.randn(B * T, H, D, D, dtype=torch.float32, device=DEVICE)
+    indices = torch.arange(B * T, device=DEVICE, dtype=torch.int32).view(B, T)
+    shared = dict(inp, initial_state=state, cu_seqlens=cu, cache_state_updates=True)
+
+    with pytest.raises(AssertionError, match="ssm_state_indices"):
+        fused_recurrent_kda(
+            **dict(shared, initial_state=state[:B])  # non-paged: one slot per seq
+        )
+    with pytest.raises(AssertionError, match="inplace_final_state"):
+        fused_recurrent_kda(
+            **shared,
+            ssm_state_indices=indices,
+            inplace_final_state=False,
+            state_out=torch.empty_like(state),
+        )
+    with pytest.raises(AssertionError, match="tdm_store"):
+        fused_recurrent_kda(**shared, ssm_state_indices=indices, use_tdm_store=True)
+
+
 @pytest.mark.parametrize("BV, num_warps", [(32, 1), (64, 2), (128, 4), (64, 1)])
 def test_tiling_equivalence(BV, num_warps):
     """BV / num_warps must not change results."""
@@ -447,6 +838,8 @@ def test_not_inplace_leaves_initial_state_untouched():
 
 
 def test_inplace_matches_not_inplace():
+    # pinned to snapshot mode: the bit-for-bit contract between the two paths
+    # only exists when both actually store full states
     q, k, v, g, beta, h0 = _small()
     _, ht_out = fused_recurrent_kda(
         q=q,
@@ -457,6 +850,7 @@ def test_inplace_matches_not_inplace():
         initial_state=to_vk(h0),
         output_final_state=True,
         inplace_final_state=False,
+        cache_state_updates=False,
     )
     _, ht_ip = fused_recurrent_kda(
         q=q,
@@ -467,6 +861,7 @@ def test_inplace_matches_not_inplace():
         initial_state=to_vk(h0),
         output_final_state=True,
         inplace_final_state=True,
+        cache_state_updates=False,
     )
     assert torch.equal(ht_out, ht_ip), "in-place and not must agree bit-for-bit"
 
@@ -542,10 +937,11 @@ def test_beta_headwise(T):
     assert_close("ht", ref_ht, tri_ht)
 
 
-@pytest.mark.parametrize("num_buffers", [1, 2, 3])
+@pytest.mark.parametrize("num_buffers", [1, 2])
 @pytest.mark.parametrize("use_tdm_store", [False, True])
-def test_num_buffers(num_buffers, use_tdm_store):
-    """Operand prefetch mode and store path must not change results (paged)."""
+@pytest.mark.parametrize("use_tdm_fused_load", [False, True])
+def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
+    """Operand prefetch mode and load/store paths must not change results (paged)."""
     B, T, H, D = 2, 4, 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
     total_T = B * T
@@ -567,6 +963,7 @@ def test_num_buffers(num_buffers, use_tdm_store):
         ssm_state_indices=indices,
         num_buffers=num_buffers,
         use_tdm_store=use_tdm_store,
+        use_tdm_fused_load=use_tdm_fused_load,
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):

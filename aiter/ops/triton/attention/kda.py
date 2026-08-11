@@ -52,8 +52,10 @@ def fused_recurrent_kda(
     SK: int | None = None,
     num_warps: int | None = None,
     num_buffers: int = 2,
-    nt_stream: bool = False,
     use_tdm_store: bool = False,
+    use_tdm_load: bool = False,
+    cache_state_updates: bool = False,
+    use_tdm_fused_load: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
@@ -128,7 +130,10 @@ def fused_recurrent_kda(
     else:
         avg_T = T
     if SK is None:
-        SK = 16 if avg_T > 1 and K % 16 == 0 and BV * 16 >= 64 else math.gcd(32, K)
+        if avg_T > 1 and K % 16 == 0 and BV * 16 >= 64:
+            SK = 8 if (V // BV) * N * HV <= 8192 else 16
+        else:
+            SK = math.gcd(32, K)
         if num_warps is None and avg_T > 1:
             num_warps = max(1, min(2, BV * SK // 32))
     if num_warps is None:
@@ -183,7 +188,7 @@ def fused_recurrent_kda(
             assert final_state.shape[0] >= B * T, "state_out needs one slot per token"
 
     if out is None:
-        out = torch.zeros_like(v)
+        out = torch.empty_like(v)
     else:
         assert out.shape == v.shape, "out must match v"
 
@@ -204,11 +209,11 @@ def fused_recurrent_kda(
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if final_state is initial_state else _rows(final_state)
     )
-    assert num_buffers in (
-        1,
-        2,
-        3,
-    ), "num_buffers: 1 sync, 2 register prefetch, 3 adds the TDM L2 prefetch"
+    assert num_buffers in (1, 2), "num_buffers: 1 sync, 2 register prefetch"
+    if cache_state_updates:
+        assert is_paged, "cache_state_updates requires ssm_state_indices"
+        assert inplace_final_state, "cache_state_updates requires inplace_final_state"
+        assert not use_tdm_store, "cache_state_updates is incompatible with tdm_store"
 
     if _LOG_INFO:
         _LOGGER.info(
@@ -236,6 +241,7 @@ def fused_recurrent_kda(
         stride_indices_seq=stride_indices_seq,
         stride_state_slot_rows=slot_rows_in,
         stride_state_out_slot_rows=slot_rows_out,
+        state_rows=rows_in,
         state_out_rows=rows_out,
         scale=scale,
         H=H,
@@ -246,7 +252,6 @@ def fused_recurrent_kda(
         NUM_WARPS=num_warps,
         SK=SK,
         NUM_BUFFERS=num_buffers,
-        NT_STREAM=nt_stream,
         IS_VARLEN=cu_seqlens is not None,
         IS_CONTINUOUS_BATCHING=is_paged,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
@@ -262,6 +267,9 @@ def fused_recurrent_kda(
         INPLACE_FINAL_STATE=inplace_final_state,
         STATE_V_FIRST=state_v_first,
         USE_TDM_STORE=use_tdm_store,
+        USE_TDM_LOAD=use_tdm_load,
+        CACHE_STATE_UPDATES=cache_state_updates,
+        USE_TDM_FUSED_LOAD=use_tdm_fused_load,
         num_warps=num_warps,
     )
     return out, final_state

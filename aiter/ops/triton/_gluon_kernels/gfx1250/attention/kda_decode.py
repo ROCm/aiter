@@ -12,10 +12,16 @@ _TDM = gl.amd.gfx1250.tdm
 
 
 @gluon.constexpr_function
-def _state_layout(v_first, ROWS, K, SK, NUM_WARPS):
+def _state_layout(v_first, ROWS, K, BV, SK, NUM_WARPS):
     if v_first:
         return gl.BlockedLayout([ROWS, K // SK], [32 // SK, SK], [NUM_WARPS, 1], [1, 0])
-    return gl.BlockedLayout([K // SK, ROWS], [SK, 32 // SK], [1, NUM_WARPS], [0, 1])
+    LV = min(BV, 32)
+    return gl.BlockedLayout(
+        [K // ((32 // LV) * NUM_WARPS), BV // LV],
+        [32 // LV, LV],
+        [NUM_WARPS, 1],
+        [1, 0],
+    )
 
 
 @gluon.constexpr_function
@@ -23,6 +29,16 @@ def _smem_layout(v_first, K, BV):
     if v_first:
         return gl.PaddedSharedLayout.with_identity_for([[K, 4]], [BV, K], [1, 0])
     return gl.PaddedSharedLayout.with_identity_for([[BV, 4]], [K, BV], [1, 0])
+
+
+@gluon.constexpr_function
+def _k_row_layout(K, SK, NUM_WARPS):
+    return gl.BlockedLayout([1, K // SK], [32 // SK, SK], [NUM_WARPS, 1], [1, 0])
+
+
+@gluon.constexpr_function
+def _v_row_layout(ROWS, SK, NUM_WARPS):
+    return gl.BlockedLayout([1, ROWS], [SK, 32 // SK], [1, NUM_WARPS], [1, 0])
 
 
 @gluon.jit
@@ -66,18 +82,82 @@ def _fetch_token(
     off_k,
     off_v,
     IS_BETA_HEADWISE: gl.constexpr,
-    NT_STREAM: gl.constexpr,
 ):
-    NT: gl.constexpr = ".cs" if NT_STREAM else None
-    qr = gl.amd.gfx1250.buffer_load(q_p, off_k, cache=NT)
-    kr = gl.amd.gfx1250.buffer_load(k_p, off_k, cache=NT)
-    vr = gl.amd.gfx1250.buffer_load(v_p, off_v, cache=NT)
-    gr = gl.amd.gfx1250.buffer_load(g_p, off_k, cache=NT)
+    qr = gl.amd.gfx1250.buffer_load(q_p, off_k)
+    kr = gl.amd.gfx1250.buffer_load(k_p, off_k)
+    vr = gl.amd.gfx1250.buffer_load(v_p, off_v)
+    gr = gl.amd.gfx1250.buffer_load(g_p, off_k)
     if IS_BETA_HEADWISE:
-        br = gl.amd.gfx1250.buffer_load(b_p, off_v, cache=NT)
+        br = gl.amd.gfx1250.buffer_load(b_p, off_v)
     else:
         br = gl.load(b_p)
     return qr, kr, vr, gr, br
+
+
+@gluon.jit
+def _stage_token(
+    dq,
+    dk,
+    dg,
+    dv,
+    sq,
+    sk,
+    sg,
+    sv,
+    slot,
+    row,
+    NUM_WARPS: gl.constexpr,
+):
+    uq = _TDM.update_tensor_descriptor(dq, add_offsets=[row, 0], clamp_bounds=True)
+    uk = _TDM.update_tensor_descriptor(dk, add_offsets=[row, 0], clamp_bounds=True)
+    ug = _TDM.update_tensor_descriptor(dg, add_offsets=[row, 0], clamp_bounds=True)
+    uv = _TDM.update_tensor_descriptor(dv, add_offsets=[row, 0], clamp_bounds=True)
+    if NUM_WARPS >= 4:
+        _TDM.async_load_fused(
+            [
+                (uq, sq.index(slot), 0b0001),
+                (uk, sk.index(slot), 0b0010),
+                (ug, sg.index(slot), 0b0100),
+                (uv, sv.index(slot), 0b1000),
+            ],
+        )
+    elif NUM_WARPS == 2:
+        _TDM.async_load_fused(
+            [(uq, sq.index(slot), 0b01), (uk, sk.index(slot), 0b10)],
+        )
+        _TDM.async_load_fused(
+            [(ug, sg.index(slot), 0b01), (uv, sv.index(slot), 0b10)],
+        )
+    else:
+        _TDM.async_load(uq, dest=sq.index(slot))
+        _TDM.async_load(uk, dest=sk.index(slot))
+        _TDM.async_load(ug, dest=sg.index(slot))
+        _TDM.async_load(uv, dest=sv.index(slot))
+
+
+@gluon.jit
+def _staged_token(
+    sq,
+    sk,
+    sg,
+    sv,
+    slot,
+    K_LAYOUT: gl.constexpr,
+    V_LAYOUT: gl.constexpr,
+    KROW: gl.constexpr,
+    VROW: gl.constexpr,
+    STAGE_OPS: gl.constexpr,
+    DRAINING: gl.constexpr,
+):
+    if DRAINING:
+        _TDM.async_wait(0)
+    else:
+        _TDM.async_wait(STAGE_OPS)
+    qr = gl.convert_layout(gl.sum(sq.index(slot).load(KROW), axis=0), K_LAYOUT)
+    kr = gl.convert_layout(gl.sum(sk.index(slot).load(KROW), axis=0), K_LAYOUT)
+    gr = gl.convert_layout(gl.sum(sg.index(slot).load(KROW), axis=0), K_LAYOUT)
+    vr = gl.convert_layout(gl.sum(sv.index(slot).load(VROW), axis=0), V_LAYOUT)
+    return qr, kr, gr, vr
 
 
 @gluon.jit
@@ -142,6 +222,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_indices_seq,
     stride_state_slot_rows,
     stride_state_out_slot_rows,
+    state_rows,
     state_out_rows,
     scale: gl.constexpr,
     H: gl.constexpr,
@@ -152,7 +233,6 @@ def fused_recurrent_kda_packed_decode_kernel(
     NUM_WARPS: gl.constexpr,
     SK: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    NT_STREAM: gl.constexpr,
     IS_VARLEN: gl.constexpr,
     IS_CONTINUOUS_BATCHING: gl.constexpr,
     IS_SPEC_DECODING: gl.constexpr,
@@ -167,7 +247,10 @@ def fused_recurrent_kda_packed_decode_kernel(
     ALLOW_NEG_EIGVAL: gl.constexpr,
     INPLACE_FINAL_STATE: gl.constexpr,
     STATE_V_FIRST: gl.constexpr,
-    USE_TDM_STORE: gl.constexpr = False,
+    USE_TDM_STORE: gl.constexpr = False,  # state stores via LDS + TDM async_store
+    USE_TDM_LOAD: gl.constexpr = False,  # state load via TDM async_load + LDS
+    CACHE_STATE_UPDATES: gl.constexpr = False,  # per-token (a, k, err), needs ssm_state_indicies and no tdm_store
+    USE_TDM_FUSED_LOAD: gl.constexpr = False,  # token operands via one fused TDM + LDS
 ):
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
@@ -175,12 +258,19 @@ def fused_recurrent_kda_packed_decode_kernel(
     gl.static_assert(
         (BV * SK) % (32 * NUM_WARPS) == 0, "BV*SK must cover 32*NUM_WARPS lanes"
     )
+    gl.static_assert(NUM_BUFFERS == 1 or NUM_BUFFERS == 2, "NUM_BUFFERS must be 1 or 2")
     gl.static_assert(
-        NUM_BUFFERS == 1 or NUM_BUFFERS == 2 or NUM_BUFFERS == 3,
+        (not CACHE_STATE_UPDATES) or (IS_CONTINUOUS_BATCHING and not USE_TDM_STORE),
+    )
+    gl.static_assert(
+        (not CACHE_STATE_UPDATES) or (V // BV) * (2 * K + BV) <= V * K,
+        "per-tile (a, k, err) updates must fit in a state slot",
     )
 
     ROWS: gl.constexpr = (BV * SK) // (32 * NUM_WARPS)
-    STATE_LAYOUT: gl.constexpr = _state_layout(STATE_V_FIRST, ROWS, K, SK, NUM_WARPS)
+    STATE_LAYOUT: gl.constexpr = _state_layout(
+        STATE_V_FIRST, ROWS, K, BV, SK, NUM_WARPS
+    )
     K_LAYOUT: gl.constexpr = gl.SliceLayout(0 if STATE_V_FIRST else 1, STATE_LAYOUT)
     V_LAYOUT: gl.constexpr = gl.SliceLayout(1 if STATE_V_FIRST else 0, STATE_LAYOUT)
     ROWLEN: gl.constexpr = K if STATE_V_FIRST else V
@@ -235,62 +325,53 @@ def fused_recurrent_kda_packed_decode_kernel(
         b_p = beta_ptr + tok0 * HV + i_hv
         B_STEP: gl.constexpr = HV
 
-    if NUM_BUFFERS == 3:
-        pf_end = (bos + n_tok).to(gl.int32)
-        desc_q = _TDM.make_tensor_descriptor(
+    if USE_TDM_FUSED_LOAD:
+        KROW: gl.constexpr = _k_row_layout(K, SK, NUM_WARPS)
+        VROW: gl.constexpr = _v_row_layout(ROWS, SK, NUM_WARPS)
+        TOK_SMEM: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+        STAGE_OPS: gl.constexpr = 1 if NUM_WARPS >= 4 else (2 if NUM_WARPS == 2 else 4)
+        raw0 = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE)
+        stage_end = (bos + n_tok).to(gl.int32)
+        sq = gl.allocate_shared_memory(q_ptr.dtype.element_ty, [2, 1, K], TOK_SMEM)
+        sk = gl.allocate_shared_memory(k_ptr.dtype.element_ty, [2, 1, K], TOK_SMEM)
+        sg = gl.allocate_shared_memory(g_ptr.dtype.element_ty, [2, 1, K], TOK_SMEM)
+        sv = gl.allocate_shared_memory(v_ptr.dtype.element_ty, [2, 1, BV], TOK_SMEM)
+        dq = _TDM.make_tensor_descriptor(
             base=q_ptr + i_h * K,
-            shape=(pf_end, K),
+            shape=(stage_end, K),
             strides=(H * K, 1),
-            block_shape=(8, K),
-            layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
+            block_shape=(1, K),
+            layout=TOK_SMEM,
         )
-        _TDM.prefetch(desc_q, [bos, 0])
-        desc_k = _TDM.make_tensor_descriptor(
+        dk = _TDM.make_tensor_descriptor(
             base=k_ptr + i_h * K,
-            shape=(pf_end, K),
+            shape=(stage_end, K),
             strides=(H * K, 1),
-            block_shape=(8, K),
-            layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
+            block_shape=(1, K),
+            layout=TOK_SMEM,
         )
-        _TDM.prefetch(desc_k, [bos, 0])
-        desc_g = _TDM.make_tensor_descriptor(
+        dg = _TDM.make_tensor_descriptor(
             base=g_ptr + i_hv * K,
-            shape=(pf_end, K),
+            shape=(stage_end, K),
             strides=(HV * K, 1),
-            block_shape=(8, K),
-            layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
+            block_shape=(1, K),
+            layout=TOK_SMEM,
         )
-        _TDM.prefetch(desc_g, [bos, 0])
-        desc_v = _TDM.make_tensor_descriptor(
+        dv = _TDM.make_tensor_descriptor(
             base=v_ptr + i_hv * V + i_v * BV,
-            shape=(pf_end, BV),
+            shape=(stage_end, BV),
             strides=(HV * V, 1),
-            block_shape=(8, BV),
-            layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
+            block_shape=(1, BV),
+            layout=TOK_SMEM,
         )
-        _TDM.prefetch(desc_v, [bos, 0])
+        if n_tok > 1:
+            _stage_token(dq, dk, dg, dv, sq, sk, sg, sv, 0, bos + 1, NUM_WARPS)
         if IS_BETA_HEADWISE:
-            desc_b = _TDM.make_tensor_descriptor(
-                base=beta_ptr + i_hv * V + i_v * BV,
-                shape=(pf_end, BV),
-                strides=(HV * V, 1),
-                block_shape=(8, BV),
-                layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
-            )
+            b_nxt = gl.amd.gfx1250.buffer_load(b_p, off_v)
         else:
-            desc_b = _TDM.make_tensor_descriptor(
-                base=beta_ptr + i_hv,
-                shape=(pf_end, 1),
-                strides=(HV, 1),
-                block_shape=(8, 1),
-                layout=gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0]),
-            )
-        _TDM.prefetch(desc_b, [bos, 0])
-
-    if NUM_BUFFERS >= 2:
-        nxt = _fetch_token(
-            q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE, NT_STREAM
-        )
+            b_nxt = gl.load(b_p)
+    elif NUM_BUFFERS >= 2:
+        nxt = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE)
 
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
@@ -298,17 +379,65 @@ def fused_recurrent_kda_packed_decode_kernel(
                 seed = gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1
             else:
                 seed = 0
-            slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + seed).to(
-                gl.int32
-            )
+            if CACHE_STATE_UPDATES:
+                slot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
+                    gl.int32
+                )
+            else:
+                slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + seed).to(
+                    gl.int32
+                )
         else:
             slot = i_n
         row_in = _state_row(
             slot, stride_state_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
         )
-        S = gl.amd.gfx1250.buffer_load(
-            state_ptr + row_in.to(gl.int64) * ROWLEN + col, off_s
-        ).to(gl.float32)
+        if USE_TDM_LOAD:
+            SMEM_IN: gl.constexpr = _smem_layout(STATE_V_FIRST, K, BV)
+            if STATE_V_FIRST:
+                smem_in = gl.allocate_shared_memory(gl.float32, [BV, K], SMEM_IN)
+                desc_in = _TDM.make_tensor_descriptor(
+                    base=state_ptr,
+                    shape=(state_rows, K),
+                    strides=(K, 1),
+                    block_shape=(BV, K),
+                    layout=SMEM_IN,
+                )
+            else:
+                smem_in = gl.allocate_shared_memory(gl.float32, [K, BV], SMEM_IN)
+                desc_in = _TDM.make_tensor_descriptor(
+                    base=state_ptr,
+                    shape=(state_rows, V),
+                    strides=(V, 1),
+                    block_shape=(K, BV),
+                    layout=SMEM_IN,
+                )
+            _TDM.async_load(desc_in, [row_in, col], smem_in)
+            _TDM.async_wait(0)
+            S = smem_in.load(STATE_LAYOUT)
+        else:
+            S = gl.amd.gfx1250.buffer_load(
+                state_ptr + row_in.to(gl.int64) * ROWLEN + col, off_s
+            ).to(gl.float32)
+        if CACHE_STATE_UPDATES and IS_SPEC_DECODING:
+            for j in range(1, seed + 1):
+                rslot = gl.load(state_indices_ptr + i_n * stride_indices_seq + j).to(
+                    gl.int32
+                )
+                r_p = (
+                    state_ptr
+                    + rslot.to(gl.int64) * (stride_state_slot_rows * ROWLEN)
+                    + i_hv * V * K
+                    + i_v * (2 * K + BV)
+                )
+                a_r = gl.amd.gfx1250.buffer_load(r_p, off_k).to(gl.float32)
+                k_r = gl.amd.gfx1250.buffer_load(r_p, K + off_k).to(gl.float32)
+                e_r = gl.amd.gfx1250.buffer_load(r_p, 2 * K + off_v).to(gl.float32)
+                if STATE_V_FIRST:
+                    S = gl.fma(e_r[:, None], k_r[None, :], S * a_r[None, :])
+                else:
+                    S = gl.fma(k_r[:, None], e_r[None, :], S * a_r[:, None])
+            gl.barrier()
     elif STATE_V_FIRST:
         S = gl.full([BV, K], 0.0, gl.float32, STATE_LAYOUT)
     else:
@@ -336,95 +465,176 @@ def fused_recurrent_kda_packed_decode_kernel(
             )
         buf: gl.int32 = 0
 
-    for t in range(n_tok):
-        if NUM_BUFFERS >= 2:
-            a, kv, qv, vv, b = _process_token(
-                nxt,
-                a_exp,
-                b_bias,
-                lower_bound,
-                scale,
-                USE_QK_L2NORM_IN_KERNEL,
-                USE_GATE_IN_KERNEL,
-                HAS_DT_BIAS,
-                USE_LOWER_BOUND,
-                APPLY_BETA_SIGMOID,
-                ALLOW_NEG_EIGVAL,
-            )
-            adv = (t + 1 < n_tok).to(gl.int32)
-            q_p += adv * H * K
-            k_p += adv * H * K
-            v_p += adv * HV * V
-            g_p += adv * HV * K
-            b_p += adv * B_STEP
-            nxt = _fetch_token(
-                q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE, NT_STREAM
-            )
+    PREFETCH_DEPTH: gl.constexpr = (
+        2 if USE_TDM_FUSED_LOAD else (1 if NUM_BUFFERS >= 2 else 0)
+    )
+    PHASES: gl.constexpr = 1 if PREFETCH_DEPTH == 0 else 2
+    n_steady = gl.where(n_tok > PREFETCH_DEPTH, n_tok - PREFETCH_DEPTH, 0)
+
+    for PHASE in gl.static_range(PHASES):
+        if PHASE == 0:
+            t_lo = 0
+            t_hi = n_steady
         else:
-            raw = _fetch_token(
-                q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE, NT_STREAM
-            )
-            q_p += H * K
-            k_p += H * K
-            v_p += HV * V
-            g_p += HV * K
-            b_p += B_STEP
-            a, kv, qv, vv, b = _process_token(
-                raw,
-                a_exp,
-                b_bias,
-                lower_bound,
-                scale,
-                USE_QK_L2NORM_IN_KERNEL,
-                USE_GATE_IN_KERNEL,
-                HAS_DT_BIAS,
-                USE_LOWER_BOUND,
-                APPLY_BETA_SIGMOID,
-                ALLOW_NEG_EIGVAL,
-            )
+            t_lo = n_steady
+            t_hi = n_tok
+        for t in range(t_lo, t_hi):
+            if USE_TDM_FUSED_LOAD:
+                if t == 0:
+                    raw = raw0
+                else:
+                    qr, kr, gr, vr = _staged_token(
+                        sq,
+                        sk,
+                        sg,
+                        sv,
+                        (t - 1) & 1,
+                        K_LAYOUT,
+                        V_LAYOUT,
+                        KROW,
+                        VROW,
+                        STAGE_OPS,
+                        PHASE != 0,
+                    )
+                    raw = (qr, kr, vr, gr, b_nxt)
+                if PHASE == 0:
+                    _stage_token(
+                        dq,
+                        dk,
+                        dg,
+                        dv,
+                        sq,
+                        sk,
+                        sg,
+                        sv,
+                        (t + 1) & 1,
+                        bos + t + 2,
+                        NUM_WARPS,
+                    )
 
-        kq = gl.sum(kv * qv, axis=0)
-        if STATE_V_FIRST:
-            S = S * a[None, :]  # decay:  Diag(alpha) S
-            stored = gl.sum(S * kv[None, :], axis=1)  # read:   S^T k
-            odec = gl.sum(S * qv[None, :], axis=1)  # output: S^T q, pre-write
-            err = (vv - stored) * b  # error:  beta * (v - S^T k)
-            S = S + err[:, None] * kv[None, :]  # write:  S += beta * k (x) err
-        else:
-            S = S * a[:, None]  # decay:  Diag(alpha) S
-            stored = gl.sum(S * kv[:, None], axis=0)  # read:   S^T k
-            odec = gl.sum(S * qv[:, None], axis=0)  # output: S^T q, pre-write
-            err = (vv - stored) * b  # error:  beta * (v - S^T k)
-            S = S + kv[:, None] * err[None, :]  # write:  S += beta * k (x) err
-        o = odec + err * kq
-        gl.amd.gfx1250.buffer_store(
-            o.to(o_ptr.dtype.element_ty), o_p, off_v, cache=".cs" if NT_STREAM else None
-        )
-
-        if IS_CONTINUOUS_BATCHING:
-            if INPLACE_FINAL_STATE:
-                out_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + t).to(
-                    gl.int32
+                adv = (t + 1 < n_tok).to(gl.int32)
+                b_p += adv * B_STEP
+                if IS_BETA_HEADWISE:
+                    b_nxt = gl.amd.gfx1250.buffer_load(b_p, off_v)
+                else:
+                    b_nxt = gl.load(b_p)
+                a, kv, qv, vv, b = _process_token(
+                    raw,
+                    a_exp,
+                    b_bias,
+                    lower_bound,
+                    scale,
+                    USE_QK_L2NORM_IN_KERNEL,
+                    USE_GATE_IN_KERNEL,
+                    HAS_DT_BIAS,
+                    USE_LOWER_BOUND,
+                    APPLY_BETA_SIGMOID,
+                    ALLOW_NEG_EIGVAL,
                 )
+            elif NUM_BUFFERS >= 2:
+                a, kv, qv, vv, b = _process_token(
+                    nxt,
+                    a_exp,
+                    b_bias,
+                    lower_bound,
+                    scale,
+                    USE_QK_L2NORM_IN_KERNEL,
+                    USE_GATE_IN_KERNEL,
+                    HAS_DT_BIAS,
+                    USE_LOWER_BOUND,
+                    APPLY_BETA_SIGMOID,
+                    ALLOW_NEG_EIGVAL,
+                )
+                if PHASE == 0:
+                    q_p += H * K
+                    k_p += H * K
+                    v_p += HV * V
+                    g_p += HV * K
+                    b_p += B_STEP
+                    nxt = _fetch_token(
+                        q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
+                    )
             else:
-                out_slot = bos + t
-            row_out = _state_row(
-                out_slot, stride_state_out_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
-            )
-            if USE_TDM_STORE:
-                _TDM.async_wait(1)
-                smem.index(buf).store(S)
-                gl.barrier()
-                _TDM.async_store(desc_out, [row_out, col], smem.index(buf))
-                buf = (buf + 1) % 2
-            else:
-                gl.amd.gfx1250.buffer_store(
-                    S.to(state_out_ptr.dtype.element_ty),
-                    state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
-                    off_s,
+                raw = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE)
+                q_p += H * K
+                k_p += H * K
+                v_p += HV * V
+                g_p += HV * K
+                b_p += B_STEP
+                a, kv, qv, vv, b = _process_token(
+                    raw,
+                    a_exp,
+                    b_bias,
+                    lower_bound,
+                    scale,
+                    USE_QK_L2NORM_IN_KERNEL,
+                    USE_GATE_IN_KERNEL,
+                    HAS_DT_BIAS,
+                    USE_LOWER_BOUND,
+                    APPLY_BETA_SIGMOID,
+                    ALLOW_NEG_EIGVAL,
                 )
 
-        o_p += HV * V
+            kq = gl.sum(kv * qv, axis=0)
+            if STATE_V_FIRST:
+                S = S * a[None, :]  # decay:  Diag(alpha) S
+                stored = gl.sum(S * kv[None, :], axis=1)  # read:   S^T k
+                odec = gl.sum(S * qv[None, :], axis=1)  # output: S^T q, pre-write
+                err = (vv - stored) * b  # error:  beta * (v - S^T k)
+                S = S + err[:, None] * kv[None, :]  # write:  S += beta * k (x) err
+            else:
+                S = S * a[:, None]  # decay:  Diag(alpha) S
+                stored = gl.sum(S * kv[:, None], axis=0)  # read:   S^T k
+                odec = gl.sum(S * qv[:, None], axis=0)  # output: S^T q, pre-write
+                err = (vv - stored) * b  # error:  beta * (v - S^T k)
+                S = S + kv[:, None] * err[None, :]  # write:  S += beta * k (x) err
+            o = odec + err * kq
+            gl.amd.gfx1250.buffer_store(o.to(o_ptr.dtype.element_ty), o_p, off_v)
+
+            if IS_CONTINUOUS_BATCHING:
+                if INPLACE_FINAL_STATE:
+                    out_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + t).to(
+                        gl.int32
+                    )
+                else:
+                    out_slot = bos + t
+                row_out = _state_row(
+                    out_slot, stride_state_out_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
+                )
+                if CACHE_STATE_UPDATES:
+                    if t == 0:
+                        gl.amd.gfx1250.buffer_store(
+                            S.to(state_out_ptr.dtype.element_ty),
+                            state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
+                            off_s,
+                        )
+                    else:
+                        r_p = (
+                            state_out_ptr
+                            + out_slot.to(gl.int64) * (stride_state_out_slot_rows * ROWLEN)
+                            + i_hv * V * K
+                            + i_v * (2 * K + BV)
+                        )
+                        gl.amd.gfx1250.buffer_store(a, r_p, off_k)
+                        gl.amd.gfx1250.buffer_store(kv, r_p, K + off_k)
+                        gl.amd.gfx1250.buffer_store(err, r_p, 2 * K + off_v)
+                elif USE_TDM_STORE:
+                    _TDM.async_wait(1)
+                    smem.index(buf).store(S)
+                    gl.barrier()
+                    _TDM.async_store(desc_out, [row_out, col], smem.index(buf))
+                    buf = (buf + 1) % 2
+                else:
+                    gl.amd.gfx1250.buffer_store(
+                        S.to(state_out_ptr.dtype.element_ty),
+                        state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
+                        off_s,
+                    )
+
+            o_p += HV * V
+
+    if USE_TDM_FUSED_LOAD:
+        _TDM.async_wait(0)
 
     if USE_TDM_STORE and IS_CONTINUOUS_BATCHING:
         _TDM.async_wait(0)
