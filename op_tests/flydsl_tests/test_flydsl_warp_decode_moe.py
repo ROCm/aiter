@@ -696,6 +696,120 @@ def test_gate_up_fp4(case):
 
 
 # -------------------------------------------------------------------------
+# Phase C -- BF16 weight path (unquantized correctness oracle)
+# -------------------------------------------------------------------------
+from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
+    flydsl_warp_decode_down_reduce_bf16,
+    flydsl_warp_decode_gate_up_bf16,
+)
+
+# name, B, {HIDDEN|INTER contraction first}, ..., E, TOPK. Contraction dim must be
+# a multiple of 64*8=512. These sweep small + real (E=256) expert counts; the BF16
+# path has no quantization, so cos should be ~1.0 (only bf16 dot2 rounding).
+BF16_GATE_UP_CASES = [
+    ("bf16_gate_up_h512_i256_e8_tk2", 1, 512, 256, 8, 2),
+    ("bf16_gate_up_h1024_i128_e32_tk4", 2, 1024, 128, 32, 4),
+    ("bf16_gate_up_h512_i128_e256_tk8", 1, 512, 128, 256, 8),
+]
+BF16_DOWN_CASES = [
+    ("bf16_down_i512_h256_e8_tk2", 1, 512, 256, 8, 2),
+    ("bf16_down_i1024_h128_e32_tk4", 2, 1024, 128, 32, 4),
+    ("bf16_down_i512_h128_e256_tk8", 1, 512, 128, 256, 8),
+]
+
+
+def _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK):
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    scale = 0.1  # keep magnitudes small so bf16 rounding stays tight
+    x = (torch.randn((B, HIDDEN), generator=gen, device=device) * scale).to(
+        torch.bfloat16
+    )
+    w_gate = (torch.randn((E, INTER, HIDDEN), generator=gen, device=device) * scale).to(
+        torch.bfloat16
+    )
+    w_up = (torch.randn((E, INTER, HIDDEN), generator=gen, device=device) * scale).to(
+        torch.bfloat16
+    )
+    router_ids = torch.randint(
+        0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
+    )
+    router_ids[0, 0] = E - 1  # exercise the max weight-row offset
+    return x, w_gate, w_up, router_ids
+
+
+def _ref_bf16_gate_up(x, w_gate, w_up, router_ids):
+    B, HIDDEN = x.shape
+    _, INTER, _ = w_gate.shape
+    TOPK = router_ids.shape[1]
+    xf = x.float()
+    out = torch.zeros(B, TOPK, INTER, device=x.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(router_ids[b, k])
+            gate = xf[b] @ w_gate[e].float().T
+            up = xf[b] @ w_up[e].float().T
+            silu = gate * torch.sigmoid(gate)
+            out[b, k] = silu * up
+    return out.to(torch.bfloat16)
+
+
+def _gen_bf16_down(B, INTER, HIDDEN, E, TOPK):
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260811)
+    scale = 0.1
+    inter = (torch.randn((B, TOPK, INTER), generator=gen, device=device) * scale).to(
+        torch.bfloat16
+    )
+    w_down = (torch.randn((E, HIDDEN, INTER), generator=gen, device=device) * scale).to(
+        torch.bfloat16
+    )
+    router_ids = torch.randint(
+        0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
+    )
+    router_ids[0, 0] = E - 1
+    router_wts = torch.rand((B, TOPK), generator=gen, device=device).float()
+    router_wts = router_wts / router_wts.sum(dim=1, keepdim=True)
+    return inter, w_down, router_ids, router_wts
+
+
+def _ref_bf16_down(inter, w_down, router_ids, router_wts):
+    B, TOPK, _ = inter.shape
+    _, HIDDEN, _ = w_down.shape
+    interf = inter.float()
+    y = torch.zeros(B, HIDDEN, device=inter.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(router_ids[b, k])
+            y[b] += float(router_wts[b, k]) * (interf[b, k] @ w_down[e].float().T)
+    return y.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_GATE_UP_CASES])
+def test_gate_up_bf16(case):
+    name, B, HIDDEN, INTER, E, TOPK = case
+    x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
+    out = flydsl_warp_decode_gate_up_bf16(x, w_gate, w_up, router_ids)
+    torch.cuda.synchronize()
+    ref = _ref_bf16_gate_up(x, w_gate, w_up, router_ids)
+    cos = _cosine(ref, out)
+    print(f"[bf16 gate_up {name}] cos={cos:.6f}")
+    assert cos >= 0.99, f"bf16 gate_up {name}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_DOWN_CASES])
+def test_down_reduce_bf16(case):
+    name, B, INTER, HIDDEN, E, TOPK = case
+    inter, w_down, router_ids, router_wts = _gen_bf16_down(B, INTER, HIDDEN, E, TOPK)
+    out = flydsl_warp_decode_down_reduce_bf16(inter, w_down, router_ids, router_wts)
+    torch.cuda.synchronize()
+    ref = _ref_bf16_down(inter, w_down, router_ids, router_wts)
+    cos = _cosine(ref, out)
+    print(f"[bf16 down {name}] cos={cos:.6f}")
+    assert cos >= 0.99, f"bf16 down {name}: cos={cos:.6f}"
+
+
+# -------------------------------------------------------------------------
 # Real expert-count regression (SILOTIGER-667-plan-10082026 Phase A / G1)
 # -------------------------------------------------------------------------
 # GATE_UP_CASES / DOWN_CASES all use E<=8, which never exercises a large
