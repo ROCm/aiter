@@ -452,6 +452,28 @@ def _register_production_variants_stage2(
         kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
+# gfx950 LDS budget per workgroup. A registered name whose LDS request exceeds this
+# is not merely slow, it fails to build ("local memory (N) exceeds limit"), so the
+# tuner never times it and the AOT precompile silently drops the config.
+_MAX_LDS_BYTES = 160 * 1024
+
+
+def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
+    """LDS bytes ``compile_gemm1_a16w4_port`` allocates for this tile config.
+
+    Mirrors the ``lds_bytes`` computation in :mod:`kernels.moe_2stage_a16wmix.gemm1`:
+    a per-k-wave double-buffered ``BM x TILE_K`` bf16 A tile, and (``k_wave>1``) a
+    slice-K reduce scratch that overlays it. ``K`` is not known here, so the A tile
+    assumes the 2-stage (pipelined) case -- true for every real ``model_dim``.
+    """
+    a_lds = k_wave * 2 * tile_m * tile_k * 2
+    if k_wave == 1:
+        return a_lds
+    num_acc_n = (tile_n // (4 // k_wave)) // 16
+    reduce_bytes = 4 * (num_acc_n * (tile_m // 16)) * 64 * 4 * 4
+    return max(a_lds, reduce_bytes)
+
+
 def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage1 configs.
 
@@ -506,6 +528,8 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                     if tn % num_n_waves or tn // num_n_waves < 16:
                         continue
                     if kw > 1 and 4 * tn > tk:
+                        continue
+                    if _gemm1_lds_bytes(tm, tn, tk, kw) > _MAX_LDS_BYTES:
                         continue
                     for bnt in (0, 2):
                         _emit(tm, tn, tk, kw=kw, bnt=bnt)
