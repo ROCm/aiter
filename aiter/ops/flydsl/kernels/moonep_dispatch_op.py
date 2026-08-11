@@ -102,7 +102,7 @@ class MoonEPPreplannedDispatchOp:
                 self.recv_duplicate_src.data_ptr(), config.rank, peer
             )
             self.peer_expert_output_ptrs[peer] = ms.shmem_ptr_p2p(
-                self.recv_hidden.data_ptr(), config.rank, peer
+                self.expert_output.data_ptr(), config.rank, peer
             )
 
         self._jit = make_moonep_preplanned_dispatch_jit(
@@ -350,7 +350,7 @@ class MoonEPPreplannedDispatchOp:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather expert outputs from their execution ranks and top-k reduce.
 
-        Expert outputs must be staged in the symmetric ``recv_hidden`` shard.
+        Expert compute must write this op's symmetric ``expert_output`` buffer.
         The device barrier publishes every rank's writes before direct peer
         loads begin on the same current stream.
         """

@@ -99,7 +99,7 @@ def make_moonep_preplanned_dispatch_kernel(
 
         for route_idx in range(global_warp, route_count, global_warps):
             encoded_dst = buffer_load(
-                dst_rsrc, route_idx, vec_width=1, dtype=T.i32()
+                dst_rsrc, route_idx, vec_width=1, dtype=T.i32
             )
             is_primary = encoded_dst >= 0
             raw_dst = is_primary.select(encoded_dst, -encoded_dst - 1)
@@ -118,7 +118,7 @@ def make_moonep_preplanned_dispatch_kernel(
                     dst_rsrc,
                     src_token * top_k + prior_k,
                     vec_width=1,
-                    dtype=T.i32(),
+                    dtype=T.i32,
                 )
                 prior_is_primary = prior_encoded >= 0
                 prior_raw = prior_is_primary.select(
@@ -135,16 +135,16 @@ def make_moonep_preplanned_dispatch_kernel(
             # negative-encoded duplicate route.  Keep its scalar weight there.
             if lane == 0:
                 route_weight = buffer_load(
-                    weight_in_rsrc, route_idx, vec_width=1, dtype=T.f32()
+                    weight_in_rsrc, route_idx, vec_width=1, dtype=T.f32
                 )
                 remote_weight_addr = buffer_load(
-                    peer_weight_rsrc, dest_rank, vec_width=1, dtype=T.i64()
+                    peer_weight_rsrc, dest_rank, vec_width=1, dtype=T.i64
                 )
                 remote_weight_rsrc = create_buffer_resource_from_addr(
                     remote_weight_addr
                 )
                 buffer_store(
-                    arith.bitcast(T.i32(), route_weight),
+                    arith.bitcast(T.i32, route_weight),
                     remote_weight_rsrc,
                     dest_row,
                 )
@@ -152,7 +152,7 @@ def make_moonep_preplanned_dispatch_kernel(
                     peer_duplicate_src_rsrc,
                     dest_rank,
                     vec_width=1,
-                    dtype=T.i64(),
+                    dtype=T.i64,
                 )
                 remote_duplicate_src_rsrc = create_buffer_resource_from_addr(
                     remote_duplicate_src_addr
@@ -166,7 +166,7 @@ def make_moonep_preplanned_dispatch_kernel(
             # For duplicates copy_end == lane_i32_off, making the loop empty.
             remote_hidden_addr = (
                 buffer_load(
-                    peer_hidden_rsrc, dest_rank, vec_width=1, dtype=T.i64()
+                    peer_hidden_rsrc, dest_rank, vec_width=1, dtype=T.i64
                 )
                 + fx.Int64(dest_row) * hidden_bytes
             )
@@ -177,7 +177,7 @@ def make_moonep_preplanned_dispatch_kernel(
             copy_end = is_primary.select(hidden_i32, lane_i32_off)
             for i32_off in range(lane_i32_off, copy_end, 64 * 4):
                 hidden_vec = buffer_load(
-                    local_hidden_rsrc, i32_off, vec_width=4, dtype=T.i32()
+                    local_hidden_rsrc, i32_off, vec_width=4, dtype=T.i32
                 )
                 buffer_store(hidden_vec, remote_hidden_rsrc, i32_off)
 

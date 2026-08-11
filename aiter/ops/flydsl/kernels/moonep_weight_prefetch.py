@@ -66,13 +66,13 @@ def make_moonep_weight_prefetch_jit(
         for i32_off in range(global_thread * 4, total_i32, global_threads * 4):
             slot = i32_off // weight_i32
             expert = buffer_load(
-                experts_rsrc, slot, vec_width=1, dtype=T.i32()
+                experts_rsrc, slot, vec_width=1, dtype=T.i32
             )
             if expert >= 0:
                 owner = expert // experts_per_rank
                 local_expert = expert % experts_per_rank
                 owner_base = buffer_load(
-                    peer_ptrs_rsrc, owner, vec_width=1, dtype=T.i64()
+                    peer_ptrs_rsrc, owner, vec_width=1, dtype=T.i64
                 )
                 src_addr = (
                     owner_base + fx.Int64(local_expert) * weight_bytes
@@ -83,7 +83,7 @@ def make_moonep_weight_prefetch_jit(
                     src_rsrc,
                     expert_i32_off,
                     vec_width=4,
-                    dtype=T.i32(),
+                    dtype=T.i32,
                 )
                 buffer_store(value, dst_rsrc, i32_off)
 

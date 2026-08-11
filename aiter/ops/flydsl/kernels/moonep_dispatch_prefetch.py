@@ -103,7 +103,7 @@ def make_moonep_dispatch_prefetch_jit(
                 global_warp, route_count, dispatch_global_warps
             ):
                 encoded_dst = buffer_load(
-                    dst_rsrc, route_idx, vec_width=1, dtype=T.i32()
+                    dst_rsrc, route_idx, vec_width=1, dtype=T.i32
                 )
                 is_primary = encoded_dst >= 0
                 raw_dst = is_primary.select(encoded_dst, -encoded_dst - 1)
@@ -118,7 +118,7 @@ def make_moonep_dispatch_prefetch_jit(
                         dst_rsrc,
                         src_token * top_k + prior_k,
                         vec_width=1,
-                        dtype=T.i32(),
+                        dtype=T.i32,
                     )
                     prior_is_primary = prior_encoded >= 0
                     prior_raw = prior_is_primary.select(
@@ -138,19 +138,19 @@ def make_moonep_dispatch_prefetch_jit(
                         weight_in_rsrc,
                         route_idx,
                         vec_width=1,
-                        dtype=T.f32(),
+                        dtype=T.f32,
                     )
                     remote_weight_addr = buffer_load(
                         peer_weight_rsrc,
                         dest_rank,
                         vec_width=1,
-                        dtype=T.i64(),
+                        dtype=T.i64,
                     )
                     remote_weight_rsrc = create_buffer_resource_from_addr(
                         remote_weight_addr
                     )
                     buffer_store(
-                        arith.bitcast(T.i32(), route_weight),
+                        arith.bitcast(T.i32, route_weight),
                         remote_weight_rsrc,
                         dest_row,
                     )
@@ -158,7 +158,7 @@ def make_moonep_dispatch_prefetch_jit(
                         peer_duplicate_src_rsrc,
                         dest_rank,
                         vec_width=1,
-                        dtype=T.i64(),
+                        dtype=T.i64,
                     )
                     remote_duplicate_src_rsrc = create_buffer_resource_from_addr(
                         remote_duplicate_src_addr
@@ -173,7 +173,7 @@ def make_moonep_dispatch_prefetch_jit(
                         peer_hidden_rsrc,
                         dest_rank,
                         vec_width=1,
-                        dtype=T.i64(),
+                        dtype=T.i64,
                     )
                     + fx.Int64(dest_row) * hidden_bytes
                 )
@@ -193,7 +193,7 @@ def make_moonep_dispatch_prefetch_jit(
                         local_hidden_rsrc,
                         i32_off,
                         vec_width=4,
-                        dtype=T.i32(),
+                        dtype=T.i32,
                     )
                     buffer_store(hidden_vec, remote_hidden_rsrc, i32_off)
         else:
@@ -213,13 +213,13 @@ def make_moonep_dispatch_prefetch_jit(
             ):
                 slot = i32_off // weight_i32
                 expert = buffer_load(
-                    experts_rsrc, slot, vec_width=1, dtype=T.i32()
+                    experts_rsrc, slot, vec_width=1, dtype=T.i32
                 )
                 if expert >= 0:
                     owner = expert // experts_per_rank
                     local_expert = expert % experts_per_rank
                     owner_base = buffer_load(
-                        peer_home_rsrc, owner, vec_width=1, dtype=T.i64()
+                        peer_home_rsrc, owner, vec_width=1, dtype=T.i64
                     )
                     src_addr = (
                         owner_base + fx.Int64(local_expert) * weight_bytes
@@ -230,7 +230,7 @@ def make_moonep_dispatch_prefetch_jit(
                         src_rsrc,
                         expert_i32_off,
                         vec_width=4,
-                        dtype=T.i32(),
+                        dtype=T.i32,
                     )
                     buffer_store(value, prefetched_rsrc, i32_off)
 

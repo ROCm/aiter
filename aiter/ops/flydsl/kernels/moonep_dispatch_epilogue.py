@@ -65,7 +65,7 @@ def make_moonep_dispatch_epilogue_jit(
 
         for dst_row in range(global_warp, num_dispatch_rows, global_warps):
             src_row = buffer_load(
-                duplicate_src_rsrc, dst_row, vec_width=1, dtype=T.i32()
+                duplicate_src_rsrc, dst_row, vec_width=1, dtype=T.i32
             )
             is_duplicate = src_row >= 0
             src_addr = addr_hidden + fx.Int64(src_row) * hidden_bytes
@@ -76,7 +76,7 @@ def make_moonep_dispatch_epilogue_jit(
             copy_end = is_duplicate.select(hidden_i32, lane_i32_off)
             for i32_off in range(lane_i32_off, copy_end, 64 * 4):
                 value = buffer_load(
-                    src_rsrc, i32_off, vec_width=4, dtype=T.i32()
+                    src_rsrc, i32_off, vec_width=4, dtype=T.i32
                 )
                 buffer_store(value, dst_rsrc, i32_off)
 
@@ -98,10 +98,10 @@ def make_moonep_dispatch_epilogue_jit(
 
         for group in range(global_warp, num_groups, global_warps):
             start = buffer_load(
-                ranges_rsrc, group * 2, vec_width=1, dtype=T.i32()
+                ranges_rsrc, group * 2, vec_width=1, dtype=T.i32
             )
             count = buffer_load(
-                ranges_rsrc, group * 2 + 1, vec_width=1, dtype=T.i32()
+                ranges_rsrc, group * 2 + 1, vec_width=1, dtype=T.i32
             )
             for pad_idx in range(0, count, 1):
                 row = start + pad_idx

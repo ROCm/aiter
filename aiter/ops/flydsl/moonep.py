@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 
 
@@ -35,6 +37,9 @@ class MoonEPPlanConfig:
     num_experts: int
     prefetch_slots: int | None = None
     token_padding: int = 1
+    # Decode mode: keep every expert on its home rank (no balancing, no
+    # migration). See MoonEPPlanGeometry.NO_MIG.
+    no_migration: bool = False
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
@@ -71,6 +76,15 @@ class MoonEPPlanConfig:
 
     @property
     def num_dispatch_rows(self) -> int:
+        if self.no_migration:
+            # Without balancing a destination is no longer capped at capacity:
+            # in the worst case every rank routes all of its entries to experts
+            # owned by one rank, so bound by world_size * capacity. Only the
+            # local home groups can be non-empty, so the padding term loses its
+            # factor of two.
+            return self.world_size * self.capacity + self.experts_per_rank * (
+                self.token_padding - 1
+            )
         # At most one remote home group and one local home group contribute
         # non-empty expert segments to a destination rank.  Each segment may
         # need token_padding - 1 rows of padding.
@@ -218,8 +232,10 @@ def build_reference_plan(
     num_rows = config.num_dispatch_rows
     num_slots = int(config.prefetch_slots)
 
+    # cumsum for tokens of each expert, last element is total tokens of each expert
     tpe_cumsum = tpe.cumsum(dim=0)
     expert_count = tpe_cumsum[-1]
+    
     group_tokens = expert_count.view(world_size, experts_per_rank).sum(dim=1)
     balance = group_tokens - capacity
 
@@ -231,7 +247,7 @@ def build_reference_plan(
     # First choose how many entries each overloaded home group moves to each
     # underloaded destination rank.
     quotas_by_home = torch.zeros(world_size, world_size, dtype=torch.int64)
-    while True:
+    while not config.no_migration:
         home = int(balance.argmax().item())
         dest = int(balance.argmin().item())
         if int(balance[home].item()) <= 0:
@@ -267,11 +283,12 @@ def build_reference_plan(
 
     if not torch.equal(alloc.sum(dim=1), expert_count):
         raise AssertionError("per-expert token conservation failed")
-    expected_capacity = torch.full(
-        (world_size,), capacity, dtype=torch.int64
-    )
-    if not torch.equal(alloc.sum(dim=0), expected_capacity):
-        raise AssertionError("destination ranks are not perfectly balanced")
+    if not config.no_migration:
+        expected_capacity = torch.full(
+            (world_size,), capacity, dtype=torch.int64
+        )
+        if not torch.equal(alloc.sum(dim=0), expected_capacity):
+            raise AssertionError("destination ranks are not perfectly balanced")
 
     alloc_cumsum = alloc.cumsum(dim=1)
     expert_offsets = torch.zeros(
@@ -294,6 +311,8 @@ def build_reference_plan(
     for dest in range(world_size):
         local_begin = dest * experts_per_rank
         local_end = local_begin + experts_per_rank
+        # alloc[expert,dest] => expert i has n routed to dest 
+        # find remote expert which routes to dest
         remote_experts = [
             expert
             for expert in range(num_experts)
@@ -304,6 +323,8 @@ def build_reference_plan(
             key=lambda expert: (int(alloc[expert, dest].item()), expert),
             reverse=True,
         )
+
+        # just get num_slot from remote
         remote_stats[dest, 0] = len(remote_experts)
         for slot, expert in enumerate(remote_experts[:num_slots]):
             experts_to_copy[dest, slot] = expert
@@ -639,9 +660,387 @@ def hipblaslt_moonep_mlp_reference(
     return output
 
 
+class MoonEPGpuPlanner:
+    """FlyDSL planner producing the same plan as ``build_reference_plan``.
+
+    ``build_reference_plan`` runs on the host and walks ``num_tokens * top_k``
+    routed entries in Python; on the 8k production shape that costs ~800 ms,
+    about 34x the whole MoonEP forward.  This planner runs the identical
+    algorithm as three FlyDSL launches and keeps every tie-break bit-identical,
+    so the two are interchangeable field by field.
+
+    Buffers are allocated once and reused.  The returned plan therefore aliases
+    planner-owned storage and is invalidated by the next ``build`` call; use
+    ``MoonEPReferencePlan.clone()`` to keep one across calls, exactly like the
+    upstream ``MoonEPCommPlan`` reuse contract.
+    """
+
+    def __init__(
+        self,
+        config: MoonEPPlanConfig,
+        device: torch.device | str,
+        *,
+        num_vblocks: int = 128,
+        hist_waves_per_block: int = 4,
+        dst_block_threads: int = 256,
+        dst_blocks: int = 256,
+    ) -> None:
+        from aiter.ops.flydsl.kernels.moonep_planning import (
+            MoonEPPlanGeometry,
+            make_moonep_plan_jit,
+        )
+
+        self.config = config
+        # Normalise "cuda" to "cuda:N" so the input check can compare devices
+        # against tensors, which always carry an explicit index.
+        self.device = torch.empty(0, device=device).device
+        self.geo = MoonEPPlanGeometry(
+            rank=config.rank,
+            world_size=config.world_size,
+            num_tokens=config.num_tokens,
+            top_k=config.top_k,
+            num_experts=config.num_experts,
+            prefetch_slots=int(config.prefetch_slots),
+            token_padding=config.token_padding,
+            num_dispatch_rows=config.num_dispatch_rows,
+            no_migration=config.no_migration,
+            num_vblocks=num_vblocks,
+            hist_waves_per_block=hist_waves_per_block,
+            dst_block_threads=dst_block_threads,
+            dst_blocks=dst_blocks,
+        )
+        self._jits = make_moonep_plan_jit(self.geo)
+        self._compiled: list = [None, None, None]
+
+        R = config.world_size
+        E = config.num_experts
+        B = int(config.prefetch_slots)
+        G = E + B
+
+        def _i32(*shape: int) -> torch.Tensor:
+            return torch.zeros(shape, dtype=torch.int32, device=self.device)
+
+        sizes = self.geo.scratch_sizes()
+        self._order = _i32(sizes["order"])
+        self._local_hist = _i32(sizes["local_hist"])
+        self._tpe_prefix = _i32(sizes["tpe_prefix"])
+        self._alloc_cumsum = _i32(sizes["alloc_cumsum"])
+        self._expert_off = _i32(sizes["expert_off"])
+
+        self.dst = _i32(config.num_tokens, config.top_k)
+        self.cu_seqlens = _i32(G)
+        self.experts_to_copy = _i32(R, B)
+        self.zero_fill_ranges = _i32(G, 2)
+        self.remote_stats = _i32(2)
+        self.alloc = _i32(R, E)
+        self.group_expert_ids = _i32(G)
+
+    def _check_inputs(
+        self, topk_experts: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> None:
+        cfg = self.config
+        if tuple(topk_experts.shape) != (cfg.num_tokens, cfg.top_k):
+            raise ValueError(
+                f"topk_experts must have shape {(cfg.num_tokens, cfg.top_k)}, "
+                f"got {tuple(topk_experts.shape)}"
+            )
+        if tuple(tokens_per_expert.shape) != (cfg.world_size, cfg.num_experts):
+            raise ValueError(
+                f"tokens_per_expert must have shape "
+                f"{(cfg.world_size, cfg.num_experts)}, "
+                f"got {tuple(tokens_per_expert.shape)}"
+            )
+        for name, t in (
+            ("topk_experts", topk_experts),
+            ("tokens_per_expert", tokens_per_expert),
+        ):
+            if t.dtype != torch.int32:
+                raise TypeError(f"{name} must be int32 for the GPU planner")
+            if not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if t.device != self.device:
+                raise ValueError(f"{name} must live on {self.device}")
+
+    def _run(self, slot: int, args: tuple) -> None:
+        """First call compiles *and* runs; later calls take the fast path."""
+
+        if self._compiled[slot] is None:
+            self._compiled[slot] = flyc.compile(self._jits[slot], *args)
+        else:
+            raw = tuple(
+                a.value if hasattr(a, "value") else a for a in args[:-1]
+            ) + (args[-1],)
+            self._compiled[slot](*raw)
+
+    STAGES = ("order_hist", "meta", "dst")
+
+    @property
+    def stages(self) -> tuple:
+        return self.STAGES
+
+    def stage_args(
+        self,
+        slot: int,
+        topk_experts: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> tuple:
+        """Launch arguments for one stage; also used by the stage benchmark."""
+
+        p = fx.Int64
+        if slot == 0:
+            return (
+                p(topk_experts.data_ptr()),
+                p(self._order.data_ptr()),
+                p(self._local_hist.data_ptr()),
+                stream,
+            )
+        if slot == 1:
+            return (
+                p(tokens_per_expert.data_ptr()),
+                p(self._local_hist.data_ptr()),
+                p(self._tpe_prefix.data_ptr()),
+                p(self._alloc_cumsum.data_ptr()),
+                p(self._expert_off.data_ptr()),
+                p(self.alloc.data_ptr()),
+                p(self.experts_to_copy.data_ptr()),
+                p(self.cu_seqlens.data_ptr()),
+                p(self.zero_fill_ranges.data_ptr()),
+                p(self.group_expert_ids.data_ptr()),
+                p(self.remote_stats.data_ptr()),
+                stream,
+            )
+        return (
+            p(topk_experts.data_ptr()),
+            p(self._order.data_ptr()),
+            p(self._local_hist.data_ptr()),
+            p(self._tpe_prefix.data_ptr()),
+            p(self._alloc_cumsum.data_ptr()),
+            p(self._expert_off.data_ptr()),
+            p(self.dst.data_ptr()),
+            self.config.num_tokens,
+            stream,
+        )
+
+    def run_stage(
+        self,
+        slot: int,
+        topk_experts: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Run one planning stage.  Stages are only valid in ascending order."""
+
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        self._run(slot, self.stage_args(slot, topk_experts, tokens_per_expert, stream))
+
+    def build(
+        self, topk_experts: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> MoonEPReferencePlan:
+        self._check_inputs(topk_experts, tokens_per_expert)
+        stream = torch.cuda.current_stream(self.device)
+        for slot in range(3):
+            self._run(
+                slot, self.stage_args(slot, topk_experts, tokens_per_expert, stream)
+            )
+
+        return MoonEPReferencePlan(
+            config=self.config,
+            dst=self.dst,
+            cu_seqlens=self.cu_seqlens,
+            experts_to_copy=self.experts_to_copy,
+            zero_fill_ranges=self.zero_fill_ranges,
+            remote_stats=self.remote_stats,
+            alloc=self.alloc,
+            group_expert_ids=self.group_expert_ids,
+        )
+
+
+class MoonEPFusedPlanner:
+    """Single-launch FlyDSL planner; same plan, latency-tuned.
+
+    Produces byte-identical output to :class:`MoonEPGpuPlanner` and to
+    ``build_reference_plan``.  The difference is the launch structure: block 0
+    runs the single-workgroup planning metadata while every other block runs the
+    histogram, and two software grid barriers separate the remaining phases.
+
+    Because those barriers spin, **every block must be co-resident**: ``blocks``
+    is capped at the device CU count, and the kernel must not run concurrently
+    with other work on the same device.  :class:`MoonEPGpuPlanner` has no such
+    requirement and stays the safe default.
+
+    Buffers are allocated once and reused; ``clone()`` the returned plan to keep
+    it past the next ``build`` call.
+    """
+
+    STAGES = ("fused",)
+
+    def __init__(
+        self,
+        config: MoonEPPlanConfig,
+        device: torch.device | str,
+        *,
+        num_vblocks: int = 128,
+        blocks: int = 64,
+        waves_per_block: int | None = None,
+    ) -> None:
+        from aiter.ops.flydsl.kernels.moonep_planning_fused import (
+            MoonEPFusedGeometry,
+            make_moonep_fused_plan_jit,
+        )
+
+        self.config = config
+        self.device = torch.empty(0, device=device).device
+
+        num_cu = torch.cuda.get_device_properties(
+            self.device.index or 0
+        ).multi_processor_count
+        if blocks > num_cu:
+            raise ValueError(
+                f"fused planner: blocks={blocks} exceeds the device CU count "
+                f"({num_cu}).  Its grid-wide barriers require every block to be "
+                f"co-resident; keep blocks <= {num_cu}."
+            )
+
+        self.geo = MoonEPFusedGeometry(
+            rank=config.rank,
+            world_size=config.world_size,
+            num_tokens=config.num_tokens,
+            top_k=config.top_k,
+            num_experts=config.num_experts,
+            prefetch_slots=int(config.prefetch_slots),
+            token_padding=config.token_padding,
+            num_dispatch_rows=config.num_dispatch_rows,
+            num_vblocks=num_vblocks,
+            blocks=blocks,
+            waves_per_block=waves_per_block,
+        )
+        self._jit = make_moonep_fused_plan_jit(self.geo)
+        self._compiled = None
+
+        R = config.world_size
+        E = config.num_experts
+        B = int(config.prefetch_slots)
+        G = E + B
+
+        def _i32(*shape: int) -> torch.Tensor:
+            return torch.zeros(shape, dtype=torch.int32, device=self.device)
+
+        sizes = self.geo.scratch_sizes()
+        self._order = _i32(sizes["order"])
+        self._local_hist = _i32(sizes["local_hist"])
+        self._tpe_prefix = _i32(sizes["tpe_prefix"])
+        self._alloc_cumsum = _i32(sizes["alloc_cumsum"])
+        self._expert_off = _i32(sizes["expert_off"])
+        # Barrier tickets are never reset: each wait is ">= the end of my
+        # epoch", so repeated calls just keep counting up.
+        self._barrier = torch.zeros(
+            sizes["barrier"], dtype=torch.int64, device=self.device
+        )
+
+        self.dst = _i32(config.num_tokens, config.top_k)
+        self.cu_seqlens = _i32(G)
+        self.experts_to_copy = _i32(R, B)
+        self.zero_fill_ranges = _i32(G, 2)
+        self.remote_stats = _i32(2)
+        self.alloc = _i32(R, E)
+        self.group_expert_ids = _i32(G)
+
+    _check_inputs = MoonEPGpuPlanner._check_inputs
+
+    def stage_args(
+        self,
+        slot: int,
+        topk_experts: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> tuple:
+        p = fx.Int64
+        return (
+            p(topk_experts.data_ptr()),
+            p(tokens_per_expert.data_ptr()),
+            p(self._order.data_ptr()),
+            p(self._local_hist.data_ptr()),
+            p(self._tpe_prefix.data_ptr()),
+            p(self._alloc_cumsum.data_ptr()),
+            p(self._expert_off.data_ptr()),
+            p(self.alloc.data_ptr()),
+            p(self.experts_to_copy.data_ptr()),
+            p(self.cu_seqlens.data_ptr()),
+            p(self.zero_fill_ranges.data_ptr()),
+            p(self.group_expert_ids.data_ptr()),
+            p(self.remote_stats.data_ptr()),
+            p(self.dst.data_ptr()),
+            p(self._barrier.data_ptr()),
+            stream,
+        )
+
+    def run_stage(
+        self,
+        slot: int,
+        topk_experts: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        args = self.stage_args(0, topk_experts, tokens_per_expert, stream)
+        if self._compiled is None:
+            self._compiled = flyc.compile(self._jit, *args)
+        else:
+            raw = tuple(
+                a.value if hasattr(a, "value") else a for a in args[:-1]
+            ) + (args[-1],)
+            self._compiled(*raw)
+
+    def build(
+        self, topk_experts: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> MoonEPReferencePlan:
+        self._check_inputs(topk_experts, tokens_per_expert)
+        self.run_stage(0, topk_experts, tokens_per_expert)
+        return MoonEPReferencePlan(
+            config=self.config,
+            dst=self.dst,
+            cu_seqlens=self.cu_seqlens,
+            experts_to_copy=self.experts_to_copy,
+            zero_fill_ranges=self.zero_fill_ranges,
+            remote_stats=self.remote_stats,
+            alloc=self.alloc,
+            group_expert_ids=self.group_expert_ids,
+        )
+
+
+_GPU_PLANNER_CACHE: dict = {}
+
+
+def build_plan_gpu(
+    config: MoonEPPlanConfig,
+    topk_experts: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    **planner_kwargs,
+) -> MoonEPReferencePlan:
+    """Convenience wrapper around a cached :class:`MoonEPGpuPlanner`.
+
+    The returned plan aliases planner-owned buffers; ``clone()`` it to keep one
+    beyond the next call for the same ``(config, device)``.
+    """
+
+    device = topk_experts.device
+    key = (config, str(device), tuple(sorted(planner_kwargs.items())))
+    planner = _GPU_PLANNER_CACHE.get(key)
+    if planner is None:
+        planner = MoonEPGpuPlanner(config, device, **planner_kwargs)
+        _GPU_PLANNER_CACHE[key] = planner
+    return planner.build(topk_experts, tokens_per_expert)
+
+
 __all__ = [
+    "MoonEPFusedPlanner",
+    "MoonEPGpuPlanner",
     "MoonEPPlanConfig",
     "MoonEPReferencePlan",
+    "build_plan_gpu",
     "build_reference_plan",
     "hipblaslt_grouped_gemm_reference",
     "hipblaslt_moonep_grouped_gemm_reference",
