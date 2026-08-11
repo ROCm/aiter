@@ -234,7 +234,8 @@ __global__ void opus_moe_transpose_pad_bf16_kernel(const hip_bfloat16* __restric
 void opus_moe_wgrad_tn_bf16(aiter_tensor_t& dy,
                             aiter_tensor_t& a,
                             aiter_tensor_t& offs,
-                            aiter_tensor_t& dW)
+                            aiter_tensor_t& dW,
+                            int uniform_m)
 {
     const int E = static_cast<int>(dW.size(0));
     const int P = static_cast<int>(dW.size(1));
@@ -244,7 +245,7 @@ void opus_moe_wgrad_tn_bf16(aiter_tensor_t& dy,
         reinterpret_cast<const __bf16*>(a.data_ptr()),
         reinterpret_cast<const int32_t*>(offs.data_ptr()),
         reinterpret_cast<__bf16*>(dW.data_ptr()),
-        E, P, Q, aiter::getCurrentHIPStream());
+        E, P, Q, uniform_m, aiter::getCurrentHIPStream());
 }
 
 void opus_moe_transpose_pad_bf16(aiter_tensor_t& src,      // [M,F] bf16 compact

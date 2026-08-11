@@ -168,11 +168,15 @@ def component_benchmark(
             "stage2_dgrad+act": lambda: opus.opus_moe_dgrad_swiglu_uniform_prepared(
                 dy, w2t, actin, per_expert, dact
             ),
-            "dW2": lambda: opus._opus_moe_wgrad_tn_bf16_raw(dy, h, offs, dw2),
+            "dW2": lambda: opus._opus_moe_wgrad_tn_bf16_raw(
+                dy, h, offs, dw2, per_expert
+            ),
             "stage1_dgrad": lambda: opus.opus_moe_dgrad_uniform_prepared(
                 dact, w1t, per_expert, dx_route
             ),
-            "dW1": lambda: opus._opus_moe_wgrad_tn_bf16_raw(dact, xg, offs, dw1),
+            "dW1": lambda: opus._opus_moe_wgrad_tn_bf16_raw(
+                dact, xg, offs, dw1, per_expert
+            ),
         }
     else:
         calls = {

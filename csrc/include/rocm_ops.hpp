@@ -393,7 +393,8 @@ namespace py = pybind11;
           py::arg("dy"), \
           py::arg("a"), \
           py::arg("offs"), \
-          py::arg("dW")); \
+          py::arg("dW"), \
+          py::arg("uniform_m")); \
     m.def("opus_moe_act_bwd_bf16", \
           &opus_moe_act_bwd_bf16, \
           "MoE elementwise activation backward (g1u1, BF16)", \

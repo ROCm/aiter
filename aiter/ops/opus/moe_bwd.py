@@ -333,11 +333,13 @@ def opus_moe_dgrad_swiglu_uniform_prepared(
 
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_wgrad_tn_bf16", develop=True)
 def _opus_moe_wgrad_tn_bf16_raw(
-    dy: Tensor, a: Tensor, offs: Tensor, dW: Tensor
+    dy: Tensor, a: Tensor, offs: Tensor, dW: Tensor, uniform_m: int
 ) -> None: ...
 
 
-def opus_moe_wgrad_tn_bf16(dy: Tensor, a: Tensor, offs: Tensor, E: int) -> Tensor:
+def opus_moe_wgrad_tn_bf16(
+    dy: Tensor, a: Tensor, offs: Tensor, E: int, uniform_m: int = 0
+) -> Tensor:
     """Full-TN grouped wgrad. dW[e]=dy_e^T@a_e from NATURAL compact dy[M,P]/a[M,Q]
     (no transpose, no padding). offs [E+1] cumulative. Returns dW [E,P,Q] bf16
     (fp32 mfma accumulate, bf16 store -- matches triton ptgmm; halves write).
@@ -345,7 +347,8 @@ def opus_moe_wgrad_tn_bf16(dy: Tensor, a: Tensor, offs: Tensor, E: int) -> Tenso
     P, Q = dy.shape[1], a.shape[1]
     dW = torch.empty(E, P, Q, device=dy.device, dtype=torch.bfloat16)
     _opus_moe_wgrad_tn_bf16_raw(
-        dy.contiguous(), a.contiguous(), offs.to(torch.int32).contiguous(), dW)
+        dy.contiguous(), a.contiguous(), offs.to(torch.int32).contiguous(), dW,
+        uniform_m)
     return dW
 
 
@@ -576,7 +579,9 @@ class OpusMoERefFunc(torch.autograd.Function):
             return opus_moe_gather_sum_bf16(src, ctx.token_routes, T)
 
         def wgrad_prepared(dy_op, a_op, _lens):
-            return opus_moe_wgrad_tn_bf16(dy_op, a_op, offs, offs.numel() - 1)
+            return opus_moe_wgrad_tn_bf16(
+                dy_op, a_op, offs, offs.numel() - 1, ctx.uniform_m or 0
+            )
 
         return _moe_ref_backward_impl(
             ctx, dout, dgrad_prepared, wgrad_prepared, _opus_actbwd,

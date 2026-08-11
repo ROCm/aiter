@@ -55,7 +55,8 @@ void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,
 void opus_moe_wgrad_tn_bf16(aiter_tensor_t& dy,
                             aiter_tensor_t& a,
                             aiter_tensor_t& offs,
-                            aiter_tensor_t& dW);
+                            aiter_tensor_t& dW,
+                            int uniform_m);
 
 // Fused compact->feature-major pad+transpose (BF16). dst[F,Mp] = padded
 // transpose of src[M,F]; col_to_m[col] = compact row of padded column col

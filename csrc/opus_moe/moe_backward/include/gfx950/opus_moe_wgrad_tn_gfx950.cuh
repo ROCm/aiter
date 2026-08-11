@@ -415,12 +415,13 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
 // 4x2 independent m32n32k16 MFMAs.  This deliberately reuses the exact
 // transpose-read/MFMA mapping of the verified 128x128 kernel above while
 // halving operand traffic per output element.
+template<int FIXED_P = 0, int FIXED_Q = 0, int FIXED_ROUTES = 0>
 __global__ __launch_bounds__(512, 1)
 __attribute__((amdgpu_num_vgpr(112)))
 void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                                     const __bf16* __restrict__ a,
                                     const int32_t* __restrict__ offs,
-                                    __bf16* __restrict__ dW, int P, int Q)
+                                    __bf16* __restrict__ dW, int P_arg, int Q_arg)
 {
     opus_wgtn_clobber_fixed_regs();
 
@@ -433,6 +434,8 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     // the global-load or MFMA fragment layouts.
     constexpr int LDS_PAD = 32;
     constexpr int LD = BM + LDS_PAD;
+    const int P = FIXED_P > 0 ? FIXED_P : P_arg;
+    const int Q = FIXED_Q > 0 ? FIXED_Q : Q_arg;
     __shared__ __align__(16) opus::bf16_t As[2][BK][LD];
     __shared__ __align__(16) opus::bf16_t Bs[2][BK][LD];
 
@@ -444,8 +447,8 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int e = blockIdx.z;
     const int m0 = blockIdx.y * BM;
     const int n0 = blockIdx.x * BN;
-    const int r0 = offs[e];
-    const int r1 = offs[e + 1];
+    const int r0 = FIXED_ROUTES > 0 ? e * FIXED_ROUTES : offs[e];
+    const int r1 = FIXED_ROUTES > 0 ? r0 + FIXED_ROUTES : offs[e + 1];
     const int nroute = r1 - r0;
     const int num_k_stages = (nroute + BK - 1) / BK;
 
@@ -462,9 +465,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     };
     auto load_global = [&](int stage, int half, load_regs& x) {
         const int route = r0 + stage * BK + half * 32 + load_k;
-        x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
-        if(route < r1)
-        {
+        auto load_valid = [&]() {
             const int mf = m0 + load_f;
             const int nf = n0 + load_f;
             x.a0 = *reinterpret_cast<const opus_bf16x8*>(
@@ -475,6 +476,14 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 a + static_cast<int64_t>(route) * Q + nf);
             x.b1 = *reinterpret_cast<const opus_bf16x8*>(
                 a + static_cast<int64_t>(route) * Q + nf + 8);
+        };
+        if constexpr(FIXED_ROUTES > 0)
+            load_valid();
+        else
+        {
+            x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
+            if(route < r1)
+                load_valid();
         }
     };
     auto store_stage = [&](int buf, int half, const load_regs& x) {
@@ -587,12 +596,20 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
 inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
                                             const int32_t* offs, __bf16* dW,
-                                            int E, int P, int Q, hipStream_t stream) {
+                                            int E, int P, int Q, int uniform_m,
+                                            hipStream_t stream) {
     if(P % 256 == 0 && Q % 256 == 0)
     {
         dim3 grid(Q / 256, P / 256, E);
-        opus_moe_wgrad_tn_8wave_kernel<<<grid, 512, 0, stream>>>(
-            dy, a, offs, dW, P, Q);
+        if(uniform_m == 4096 && P == 2048 && Q == 1024)
+            opus_moe_wgrad_tn_8wave_kernel<2048, 1024, 4096>
+                <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        else if(uniform_m == 4096 && P == 2048 && Q == 2048)
+            opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 4096>
+                <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        else
+            opus_moe_wgrad_tn_8wave_kernel<><<<grid, 512, 0, stream>>>(
+                dy, a, offs, dW, P, Q);
         return;
     }
     dim3 grid((Q + OPUS_WGTN_BN - 1) / OPUS_WGTN_BN,
