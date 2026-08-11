@@ -171,16 +171,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import itertools
           import json
           import os
           import re
           from pathlib import Path
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
-          models = {"MiniMax-M3-MXFP8"}
-          topologies = {"2P2D": "2P2D-TP8"}
           cases = []
+          excluded_kimi = []
           label = None
 
           for line in pipeline.read_text(encoding="utf-8").splitlines():
@@ -210,17 +208,15 @@ jobs:
               if not model_match or not nodes_match:
                   continue
               model = model_match.group(1)
-              if model not in models:
+              if model.startswith("Kimi-"):
+                  excluded_kimi.append(label)
                   continue
 
-              topology_key = next(
-                  (key for key in topologies if f"-PD-{key}-" in label),
-                  None,
-              )
-              if topology_key is None:
+              topology_match = re.search(r"-PD-(1P1D|2P2D)-TP8-", label)
+              if topology_match is None:
                   continue
 
-              topology = topologies[topology_key]
+              topology = f"{topology_match.group(1)}-TP8"
               slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{model}-{topology}")
               cases.append(
                   {
@@ -233,12 +229,11 @@ jobs:
                   }
               )
 
-          expected = set(itertools.product(models, topologies.values()))
           selected = {(case["model_name"], case["topology"]) for case in cases}
-          if selected != expected or len(cases) != len(expected):
+          if len(cases) != 6 or len(selected) != len(cases):
               raise SystemExit(
-                  f"Expected exactly {sorted(expected)!r}; selected {sorted(selected)!r} "
-                  f"from {pipeline}"
+                  "Expected exactly six unique non-Kimi vLLM-router cases "
+                  f"from {pipeline}; selected {sorted(selected)!r}"
               )
 
           matrix = json.dumps({"include": cases}, separators=(",", ":"))
@@ -248,6 +243,11 @@ jobs:
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
           with summary.open("a", encoding="utf-8") as output:
               print("### Selected upstream vLLM cases\n", file=output)
+              print(
+                  f"Selected all {len(cases)} non-Kimi vLLM-router accuracy cases; "
+                  f"excluded {len(excluded_kimi)} Kimi cases.\n",
+                  file=output,
+              )
               print("| Case | Nodes | Upstream command |", file=output)
               print("|---|---:|---|", file=output)
               for case in cases:
@@ -270,7 +270,7 @@ jobs:
     timeout-minutes: 600
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 6
       matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -453,6 +453,9 @@ jobs:
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
           log_root="${DISAGG_SCRIPTS_STAGE%/}"
           mkdir -p "${log_root}"
+          # Self-hosted runners keep their workspace between jobs. Clear stale
+          # submit/accounting files before the live-log thread looks for a job ID.
+          rm -f "${submit_log}" "${sacct_log}"
 
           cd "${GITHUB_WORKSPACE}/vllm"
           echo "Running vLLM Buildkite #17 baseline case: ${CASE_NAME}"
@@ -494,7 +497,11 @@ jobs:
                   continue
                 fi
                 followed["${logfile}"]=1
-                echo "[live-log] following ${logfile}"
+                if [[ "$(basename "${logfile}")" == accuracy_*.log ]]; then
+                  echo "[accuracy-live] following ${logfile}"
+                else
+                  echo "[live-log] following ${logfile}"
+                fi
                 tail -n +1 -F -- "${logfile}" &
                 tail_pids+=("$!")
               done < <(
@@ -513,7 +520,11 @@ jobs:
             sleep 2
             while IFS= read -r -d '' logfile; do
               if [[ -z "${followed[${logfile}]+x}" ]]; then
-                echo "[live-log] final ${logfile}"
+                if [[ "$(basename "${logfile}")" == accuracy_*.log ]]; then
+                  echo "[accuracy-live] final ${logfile}"
+                else
+                  echo "[live-log] final ${logfile}"
+                fi
                 tail -n +1 -- "${logfile}" || true
               fi
             done < <(
@@ -541,7 +552,7 @@ jobs:
 
           set +e
           env \
-            BUILDKITE_COMMIT="${VLLM_BASELINE_SHA}" \
+            BUILDKITE_COMMIT="${VLLM_BASELINE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
             IMAGE="${BASE_IMAGE}" \
             VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
@@ -556,6 +567,23 @@ jobs:
           job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" | grep -oE '[0-9]+' | tail -1 || true)"
           if [[ -n "${job_id}" ]]; then
             echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
+            role_dir="${log_root}/${job_id}"
+            job_log="${log_root}/vllm-disagg-pd-${job_id}.log"
+            mapfile -d '' accuracy_logs < <(
+              find "${role_dir}" -maxdepth 1 -type f -name 'accuracy_*.log' -print0 2>/dev/null
+            )
+            if (( ${#accuracy_logs[@]} == 0 )); then
+              echo "[accuracy-result] no accuracy log found under ${role_dir}"
+            else
+              for accuracy_log in "${accuracy_logs[@]}"; do
+                echo "::group::Accuracy result: ${accuracy_log}"
+                grep -ahE 'exact_match|stderr' "${accuracy_log}" | tail -20 || true
+                echo "::endgroup::"
+              done
+            fi
+            echo "::group::Accuracy verdict: Slurm job ${job_id}"
+            grep -ahE '\[vllm_disagg\] (PASS|FAIL|VERDICT):|exact_match' "${job_log}" | tail -20 || true
+            echo "::endgroup::"
             if command -v sacct >/dev/null 2>&1; then
               sacct -j "${job_id}" --format=JobID,State,ExitCode,Elapsed,NodeList \
                 | tee "${sacct_log}" || true
