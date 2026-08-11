@@ -70,6 +70,30 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "flydsl_warp_decode_down_reduce": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce",
+    ),
+    "flydsl_warp_decode_down_reduce_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_bf16",
+    ),
+    "flydsl_warp_decode_down_reduce_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_down_reduce_fp4",
+    ),
+    "flydsl_warp_decode_gate_up": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up",
+    ),
+    "flydsl_warp_decode_gate_up_bf16": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_bf16",
+    ),
+    "flydsl_warp_decode_gate_up_fp4": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_fp4",
+    ),
 }
 
 __all__ = [
@@ -89,6 +113,12 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_warp_decode_down_reduce",
+    "flydsl_warp_decode_down_reduce_bf16",
+    "flydsl_warp_decode_down_reduce_fp4",
+    "flydsl_warp_decode_gate_up",
+    "flydsl_warp_decode_gate_up_bf16",
+    "flydsl_warp_decode_gate_up_fp4",
 ]
 
 
