@@ -94,31 +94,55 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
       On gfx950 the small grid (base_grid=64, num_iter=2) auto-picks **k=2** (128 ≤ 256); a
       DeepSeek-scale `base_grid` (HIDDEN=7168) stays at **1**. **40/40 suite.**
 
-### Step 3 — down perf A/B (prove the occupancy win)  [ ]
-- [ ] `@benchmark()` A/B `split_k` on/off across `k_batch∈{1,2,4,8}` on **Qwen3Next-TP1 B=1**
-      (INTER=512/256/128) via `run_perftest`; expect a win only in the under-occupied regime.
-- [ ] Confirm **neutral/negative on the big-grid DeepSeek** shape (guards the gate). Record the
-      Qwen small-grid rows.
+### Step 3 — down perf A/B (measure the occupancy win)  [x]  (2026-08-11)  — **negative result**
+- [x] `bench_down_splitk` A/B (`DOWN_SPLITK_PERF_SHAPES`, `--splitk`): `split_k=1` vs each valid
+      `k_batch` on small-grid (base_grid 64/128/256) + DeepSeek-scale (base_grid 3584) shapes,
+      reporting base_grid / CU / auto_k. Also a **kernel-only** isolation (persistent pre-zeroed
+      accum, no per-iter `zeros`/finalize copy) to separate the kernel effect from v1 overhead.
+- **Finding — split-K does NOT pay for warp-decode `down`:**
+  - *End-to-end (v1):* regresses **~2×** on every shape (e.g. B1/I8192/H128: k1=5.60µs → k2=11.95µs,
+    0.47×). The per-call `torch.zeros` accumulator + bf16 finalize `copy_` add two extra kernels
+    that dwarf the 4–6µs `down`.
+  - *Kernel-only (overhead removed):* still **no win** even in the ideal under-occupied regime
+    (base_grid=64, 4× idle CUs on 256-CU gfx950): k2/k4 ≈ **1.02–1.03×** (within noise), and
+    **k8 regresses to 0.88×** (atomic contention on the shared output). DeepSeek-scale is neutral
+    (0.98×).
+  - *Root cause:* at B=1 the kernel is at its **launch + memory-latency floor** (~4.4µs; the actual
+    weight traffic is ~2MB ≈ 0.4µs at 5TB/s), not occupancy- or bandwidth-bound. base_grid=64 already
+    runs one-wave-per-CU with idle CUs to spare, so partitioning the contraction cannot cut the fixed
+    latency floor — it only adds atomic-add + (v1) zero-init/finalize cost.
+- **Consequence:** the Step 2 CU-count gate is validated as the right call — it keeps split-K **off**
+  by default; given the above it should stay off for `down` in practice. Steps 4–6 below are **not
+  worth pursuing** for this kernel family (same latency-floor physics); see status log.
 
-### Step 4 — gate_up 2-phase split-K  [ ]
+> **Steps 4–6 not pursued** (Step 3 negative result). gate_up at B=1 is the *same* one-wave-per-output,
+> latency-floor-bound regime as down (and streams 2× the weights), so a 2-phase split-K — which adds an
+> FP32 scratch `[B,TOPK,INTER]×2` round-trip **plus** a second (phase-2) launch — can only lose where
+> down already showed no kernel-level win. FP4 split-K (Step 5) and folding zero-init (Step 6) likewise
+> optimize a lever that doesn't pay. Kept below for provenance; revisit only if a future large-batch /
+> compute-bound regime changes the occupancy picture.
+
+### Step 4 — gate_up 2-phase split-K  [~]  (not pursued — see Step 3)
 - [ ] Phase-1 builder: `k_batch` split over HIDDEN; atomic-fadd partial gate/up into FP32
       scratch `[B,TOPK,INTER]`×2 (reuse `moe_gemm_2stage` scratch/atomic patterns).
 - [ ] Phase-2 elementwise kernel: read scratch, apply scale + `silu(gate)·up`, write bf16.
 - [ ] Entry point orchestration (alloc + zero scratch, launch p1, launch p2); correctness vs
       non-split gate_up; A/B on the Qwen small-grid shapes.
 
-### Step 5 — FP4 split-K (optional, after FP8 proven)  [ ]
+### Step 5 — FP4 split-K (optional, after FP8 proven)  [~]  (not pursued — see Step 3)
 - [ ] Port `k_batch` to `build_down_reduce_fp4_module` / `build_gate_up_fp4_module` (offset math
       already K3-Tier-1-safe). Same atomic epilogue; measure whether the FP4 win + split-K stack
       on the small-grid shapes.
 
-### Step 6 — fold zero-init (v2), only if profiled as costly  [ ]
+### Step 6 — fold zero-init (v2), only if profiled as costly  [~]  (moot — see Step 3)
 - [ ] Replace the `torch.zeros_` with the `kb==0`-inits / `kb>0`-atomic-adds trick or a fused
       prologue; re-measure to confirm the memset overhead is gone.
 
-### Step 7 — record + close  [ ]
-- [ ] Add the Qwen small-grid split-K/LDS rows to the main plan's Phase D perf table; check off
-      G5 in the main plan's summary table; summarize the win/regime here.
+### Step 7 — record + close  [x]  (2026-08-11)
+- [x] Recorded the Step 3 A/B here (kernel-only + end-to-end). **G5 closed as a negative result:**
+      split-K is implemented, correct, and CU-gated **off** by default, but does not beat the B=1
+      latency floor for warp-decode `down`. Reflect in the main plan's Phase D / summary as
+      "G5: implemented, gated-off; no win at decode shapes (latency-floor bound)".
 
 ---
 
@@ -143,3 +167,8 @@ final output cannot be split-K'd directly. Mirror `moe_gemm_2stage.py`'s 2-phase
 - 2026-08-11 — **Step 2 done:** CU-count trigger + `k_batch` autotune (`split_k="auto"`).
   gfx950 CU=256; gate picks largest `k∈{8,4,2}` with `num_iter%k==0` and `base_grid·k≤CuCount`,
   else 1. Small grid → k=2, DeepSeek-scale → 1 (fast path). 40/40 suite (2 new tests).
+- 2026-08-11 — **Step 3 done → G5 closed (negative).** A/B `bench_down_splitk` + kernel-only
+  isolation on gfx950: split-K gives **no kernel-level win** even at base_grid=64 (≤1.03×, k8=0.88×),
+  and **~2× regression** end-to-end via the v1 zeros+finalize kernels. Root cause: B=1 `down` is at
+  its ~4.4µs launch/memory-latency floor, not occupancy/BW bound. Steps 4–6 (gate_up 2-phase, FP4
+  port, fold zero-init) **not pursued** — same physics, would only add cost. Lever stays gated-off.
