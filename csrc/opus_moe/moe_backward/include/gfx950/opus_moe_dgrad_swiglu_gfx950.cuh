@@ -244,7 +244,9 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             const float dh = static_cast<float>(v_dh[i * T::VEC_C + j]);
             const float g = static_cast<float>(gate[j]);
             const float u = static_cast<float>(up[j]);
-            const float sig = 1.0f / (1.0f + expf(-g));
+            constexpr float log2e = 1.4426950408889634f;
+            const float exp_neg_g = __builtin_amdgcn_exp2f(-g * log2e);
+            const float sig = __builtin_amdgcn_rcpf(1.0f + exp_neg_g);
             const float silu = g * sig;
             dgate[j] = static_cast<D_C>(dh * u * (sig + silu * (1.0f - sig)));
             dup[j] = static_cast<D_C>(dh * silu);
