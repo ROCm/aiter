@@ -898,6 +898,7 @@ def build_down_reduce_fp4_module(
     scale_bk: int = 32,
     kh_per_warp: int = 1,
     dot2_acc: int = 4,
+    prefetch: bool = False,
 ):
     """Build the down_reduce MXFP4 launcher (BF16 intermediate, FP4 e2m1 weights).
 
@@ -1001,34 +1002,83 @@ def build_down_reduce_fp4_module(
             # the final write per accumulator).  The E8M0 block scale is folded
             # in-convert, so cross-iter accumulation of the raw dots is exact.
             pairs_h = [[] for _ in range(kh_per_warp)]
-            for i in range_constexpr(num_iter):
-                k_base = i * ktile_n + lane * kvector
-                inter_row = token_b * top_k + k
-                a_word0 = (inter_row * inter + k_base) // 2
-                # Shared activation load + kh independent FP4 weight loads.
-                aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
-                dw = [
-                    load_i32_words(
-                        wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
+            if const_expr(prefetch):
+                # G8 software prefetch: issue *every* activation/weight/scale load
+                # for this expert up front (all outstanding before any convert), so
+                # the load->use latency of the cold weight reads is hidden explicitly
+                # rather than relying on the scheduler to hoist across the converts.
+                aw_all, dw_all, scale_all = [], [], []
+                for i in range_constexpr(num_iter):
+                    k_base = i * ktile_n + lane * kvector
+                    inter_row = token_b * top_k + k
+                    a_word0 = (inter_row * inter + k_base) // 2
+                    aw_all.append(load_i32_words(inter_rsrc, a_word0, n_pairs))
+                    dw_all.append(
+                        [
+                            load_i32_words(
+                                wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
+                            )
+                            for h in range(kh_per_warp)
+                        ]
                     )
-                    for h in range(kh_per_warp)
-                ]
-                col_blk = k_base // scale_bk
-                for h in range_constexpr(kh_per_warp):
-                    # E8M0 block scale for this (weight row, K-block), applied
-                    # in the convert; uniform over the lane's chunk this iter.
-                    sidx = fx.Int32(w_row[h] // scale_bn * scale_cols + col_blk)
-                    blk_byte = buffer_ops.buffer_load(
-                        wds_rsrc, sidx, vec_width=1, dtype=T.i8()
+                    col_blk = k_base // scale_bk
+                    scale_all.append(
+                        [
+                            e8m0_byte_to_f32(
+                                buffer_ops.buffer_load(
+                                    wds_rsrc,
+                                    fx.Int32(
+                                        w_row[h] // scale_bn * scale_cols + col_blk
+                                    ),
+                                    vec_width=1,
+                                    dtype=T.i8(),
+                                )
+                            )
+                            for h in range(kh_per_warp)
+                        ]
                     )
-                    blk_scale = e8m0_byte_to_f32(blk_byte)
-                    for ipair in range_constexpr(n_pairs):
-                        w_word = ipair // 4
-                        sel = ipair % 4
-                        d_i32 = bf16x2_to_i32(
-                            fp4x2_to_bf16x2(dw[h][w_word], blk_scale, sel=sel)
+                for i in range_constexpr(num_iter):
+                    aw = aw_all[i]
+                    for h in range_constexpr(kh_per_warp):
+                        blk_scale = scale_all[i][h]
+                        for ipair in range_constexpr(n_pairs):
+                            w_word = ipair // 4
+                            sel = ipair % 4
+                            d_i32 = bf16x2_to_i32(
+                                fp4x2_to_bf16x2(
+                                    dw_all[i][h][w_word], blk_scale, sel=sel
+                                )
+                            )
+                            pairs_h[h].append((aw[ipair], d_i32))
+            else:
+                for i in range_constexpr(num_iter):
+                    k_base = i * ktile_n + lane * kvector
+                    inter_row = token_b * top_k + k
+                    a_word0 = (inter_row * inter + k_base) // 2
+                    # Shared activation load + kh independent FP4 weight loads.
+                    aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                    dw = [
+                        load_i32_words(
+                            wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
                         )
-                        pairs_h[h].append((aw[ipair], d_i32))
+                        for h in range(kh_per_warp)
+                    ]
+                    col_blk = k_base // scale_bk
+                    for h in range_constexpr(kh_per_warp):
+                        # E8M0 block scale for this (weight row, K-block), applied
+                        # in the convert; uniform over the lane's chunk this iter.
+                        sidx = fx.Int32(w_row[h] // scale_bn * scale_cols + col_blk)
+                        blk_byte = buffer_ops.buffer_load(
+                            wds_rsrc, sidx, vec_width=1, dtype=T.i8()
+                        )
+                        blk_scale = e8m0_byte_to_f32(blk_byte)
+                        for ipair in range_constexpr(n_pairs):
+                            w_word = ipair // 4
+                            sel = ipair % 4
+                            d_i32 = bf16x2_to_i32(
+                                fp4x2_to_bf16x2(dw[h][w_word], blk_scale, sel=sel)
+                            )
+                            pairs_h[h].append((aw[ipair], d_i32))
 
             for h in range_constexpr(kh_per_warp):
                 if const_expr(dot2_acc > 1):
