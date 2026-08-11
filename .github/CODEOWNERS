@@ -1,0 +1,5 @@
+# Code owners for aiter.
+# Each line is a file pattern followed by one or more owners.
+# The last matching pattern takes precedence.
+
+/aiter/ops/triton/ @Dewei-Wang-sh @vgokhale @azaidy
