@@ -1135,7 +1135,7 @@ def fused_moe_1stage(
                 flat_mode=flat,
             )
         elif isG1U1:
-            fmoe_func = aiter.fmoe_g1u1
+            fmoe_func = functools.partial(aiter.fmoe_g1u1, flat_mode=flat)
         else:
             aiter.fmoe_int8_g1u0(
                 moe_buf,
