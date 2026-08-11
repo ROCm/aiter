@@ -2561,23 +2561,16 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        if not is_flydsl_available():
-            # a16wi4 is FlyDSL-only: no CK/ASM stage1 consumes the bf16-A x int4-W
-            # (per_1x32) combination, so there is no fallback to fall through to.
-            raise NotImplementedError(
-                "a16wi4 (per_1x32 int4 weights) requires FlyDSL; no CK/ASM kernel "
-                "consumes the a16wi4 weight layout."
-            )
-        # a16wi4 (bf16 A x int4 W) with no tuned CSV row: route to the shared a16w-mix
-        # port (moe_2stage_a16wmix, w_dtype="int4") on a single safe config, mirroring
-        # the mxfp4 fallback below. Tiles are NOT heuristically chosen here -- they are
-        # a tuning result and belong in the tuned CSV (kernelName1/2, which the
-        # CSV-driven branch above consumes). This config is shape-safe, not fast: it
-        # has no k_wave, so at decode it leaves the machine wave-starved (measured 2.5x
-        # off a tuned narrow-N tile at token=1). Tune the shape instead of widening
-        # this. block_m (MOEMetadata arg 3) MUST equal tile_m -- it sizes moe_sorting
-        # AND the gemm tile_m.
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.i4x2
+        and is_flydsl_available()
+    ):
+        # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
+        # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
+        # the port has no grid split-K (it uses intra-block k_wave); asking for it
+        # would set up partials the kernel never writes. block_m MUST equal tile_m --
+        # it sizes both moe_sorting and the gemm tile.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = _tile_k = 128

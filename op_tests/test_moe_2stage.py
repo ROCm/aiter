@@ -294,24 +294,19 @@ def test_fmoe(
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
-        # a16wi4 consumes the OLD FlyDSL int4 kernel's preshuffle (the kernel this PR
-        # replaces): pack_int8_to_packed_int4(shuffle_weight(w.i8, (16,16))) kpack=8 +
-        # shuffle_scale_for_int4 (E,G//2,N,2). Caller contract is byte-identical to the
-        # replaced kernel -> drop-in, no model/serving change.
-        w1_qt_aiter = (
-            pack_int8_to_packed_int4(
-                shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
-            )
-            .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-            .view(dtypes.i4x2)
+        w1_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
         )
-        w2_qt_aiter = (
-            pack_int8_to_packed_int4(
-                shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
-            )
-            .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-            .view(dtypes.i4x2)
+        w1_qt_aiter = w1_qt_aiter.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(
+            dtypes.i4x2
         )
+        w2_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
+        )
+        w2_qt_aiter = w2_qt_aiter.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(
+            dtypes.i4x2
+        )
+        # groupwise scale: [E, K//32, N] bf16 -> shuffle and flatten for kernel
         w1_scale_aiter = (
             shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
         )

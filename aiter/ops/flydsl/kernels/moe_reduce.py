@@ -5,10 +5,9 @@
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
 (``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
-``mode="reduce"``, shared by every dtype's reduce path. Extracted from
-the old ``moe_gemm_2stage.py`` (now deleted). Build a per-shape launcher with ``compile_moe_reduction``
-(cached); the kernel's compile-time params are ``Constexpr`` so flyc specializes
-per shape/dtype.
+``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
+with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
+``Constexpr`` so flyc specializes per shape/dtype.
 
 ``dtype_str="fp8"`` reduces MXFP8 route-out rows (a flat uint8 buffer of
 ``[model_dim fp8 bytes | model_dim/8 e8m0 scale bytes]`` per row): each fp8
