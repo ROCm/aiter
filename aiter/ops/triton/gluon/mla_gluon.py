@@ -55,27 +55,6 @@ from triton.experimental.gluon import language as gl
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
-# ~one MI350 wave of workgroups; the bh16 split budget targets filling this.
-_MLA_WG_BUDGET = 256
-
-
-def _bh16_num_kv_splits(nhead, batch_size, qlen, BLOCK_H=16):
-    """Graph-stable KV-split budget for the bh16 decode regimes.
-
-    The launched split count is fixed by the ~256-workgroup budget and is
-    deliberately *independent of sequence length* (never derived from
-    min_kv_seq_len, which vLLM hard-codes to 1 under CUDA Graph capture), so
-    capture cannot freeze it. stage-1/stage-2 then derive the active per-batch
-    split count from the runtime KV length in seq_info (DYNAMIC_KV_SPLITS).
-
-    Total stage-1 WGs = batch * NUM_KV_SPLITS * (NUM_M_BLOCKS * qlen); head
-    blocks (NUM_M_BLOCKS = cdiv(nhead, BLOCK_H)) and MTP qlen already consume
-    part of the wave, so the split budget divides by them.
-    """
-    num_m_blocks = triton.cdiv(nhead, BLOCK_H)
-    return max(1, _MLA_WG_BUDGET // (batch_size * qlen * num_m_blocks))
-
-
 # fmt: off
 @gluon.jit
 def _mla_gluon(
@@ -123,7 +102,6 @@ def _mla_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
-    DYNAMIC_KV_SPLITS: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     QLEN: gl.constexpr,  # MTP query length; 1 for plain decode
     # --- dsv4-prefill knobs ---
@@ -163,40 +141,19 @@ def _mla_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # split-KV: each program covers [split_kv_start, split_kv_end).
-    # OLD: ceil-based per_split. The LAST split could be empty (num_iter=0),
-    # which breaks the unconditional epilogue-2 consume. Kept here as commented
-    # reference; remove in cleanup.
-    # kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-    # split_kv_start = kv_len_per_split * split_kv_id
-    # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    #
-    # NEW: floor per_split with the last split absorbing the remainder
-    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). Combined with
-    # the wrapper bound min_kv_seq_len >= NUM_KV_SPLITS this guarantees every
-    # split is non-empty (split_len >= floor >= 1, hence num_iter >= 1); bh64
-    # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
-    # Trade-off: at seqs just above the wrapper minimum the last CU does up to
-    # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    #
-    # DYNAMIC_KV_SPLITS: NUM_KV_SPLITS is launched at a fixed, seq-independent
-    # budget (so CUDA Graph capture cannot freeze it), while the *active* split
-    # count is derived from the runtime per-batch KV length read from B_seq_len.
-    # active = min(budget, cdiv(seq, BLOCK_N)) reproduces the original block-bound
-    # policy without over-splitting short seqs into 1-token partial blocks; the
-    # surplus WGs (split_kv_id >= active) early-return. stage-2 mirrors this.
-    active_kv_splits = NUM_KV_SPLITS
-    if DYNAMIC_KV_SPLITS:
-        active_kv_splits = gl.maximum(
-            1, gl.minimum(gl.cdiv(cur_batch_seq_len, BLOCK_N), NUM_KV_SPLITS)
-        )
-        if split_kv_id >= active_kv_splits:
-            return
-    kv_len_per_split = cur_batch_seq_len // active_kv_splits
+    # NUM_KV_SPLITS is a launch-time budget only. 
+    # the partition is derived here from the runtime per-batch KV length.
+    # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
+    #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
+    #     is spread over fewer, whole-block splits instead of many partial ones;
+    kv_len_per_split = gl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = split_kv_start + kv_len_per_split
-    if split_kv_id == active_kv_splits - 1:
+    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    if split_kv_id == NUM_KV_SPLITS - 1:
         split_kv_end = cur_batch_seq_len
+    # early return for inactive split
+    if split_kv_start >= split_kv_end:
+        return
     num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
     start_n = split_kv_start
 
@@ -204,10 +161,6 @@ def _mla_gluon(
     if not WITHIN_2GB:
         stride_kv_c_bs = stride_kv_c_bs.to(gl.int64)
         stride_k_pe_bs = stride_k_pe_bs.to(gl.int64)
-
-    # early return with empty kv slice to save compute
-    if split_kv_start >= split_kv_end:
-        return
 
     # MTP causal tail mask: query position q_pos may attend KV
     # [0, seq_len-QLEN+q_pos] only, so score_end is its per-program valid-score
@@ -795,7 +748,6 @@ def _mla_softmax_reducev_kernel(
     USE_2D_VIEW: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    DYNAMIC_KV_SPLITS: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -810,15 +762,13 @@ def _mla_softmax_reducev_kernel(
     else:
         batch_page_start = tl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
-    # Mirror stage-1's active-split derivation so both stages agree on how many
-    # splits actually hold data (see _mla_gluon). Inactive splits (>= active) were
-    # never written by stage-1; they are masked out of the reduce below.
-    active_kv_splits = NUM_KV_SPLITS
-    if DYNAMIC_KV_SPLITS:
-        active_kv_splits = tl.maximum(
-            1, tl.minimum(tl.cdiv(cur_batch_seq_len, BLOCK_N), NUM_KV_SPLITS)
-        )
-    kv_len_per_split = cur_batch_seq_len // active_kv_splits
+    # Mirror stage-1's partition (see _mla_gluon) so both stages agree on how many
+    # splits actually hold data. Splits >= active were early-returned by stage-1
+    # and never written; they are masked out of the reduce below.
+    kv_len_per_split = tl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
+    active_kv_splits = tl.minimum(
+        tl.cdiv(cur_batch_seq_len, kv_len_per_split), NUM_KV_SPLITS
+    )
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_s = tl.arange(0, BLOCK_S)
@@ -833,12 +783,10 @@ def _mla_softmax_reducev_kernel(
     # over NUM_KV_SPLITS (latency-bound on ~batch*nhead workgroups), reduce BLOCK_S
     # splits at a time as a vectorized [BLOCK_S, HEAD_DIM] tile. This overlaps the
     # per-split loads and shortens the dependent chain to NUM_KV_SPLITS/BLOCK_S.
-    # Upper bound is active_kv_splits, not the constexpr NUM_KV_SPLITS: under the
-    # dynamic policy active can be far below the launched budget, so bounding by it
-    # collapses the reduce to ceil(active / BLOCK_S) tiles instead of always
-    # sweeping the full budget. Non-dynamic keeps active == NUM_KV_SPLITS (static).
-    LOOP_START = active_kv_splits - 1 if kv_len_per_split == 0 else 0
-    for start in range(LOOP_START, active_kv_splits, BLOCK_S):
+    # Upper bound is active_kv_splits, not the constexpr NUM_KV_SPLITS: active can
+    # be far below the launched budget, so bounding by it collapses the reduce to
+    # ceil(active / BLOCK_S) tiles instead of always sweeping the full budget.
+    for start in range(0, active_kv_splits, BLOCK_S):
         s_ids = start + offs_s  # [BLOCK_S]
         s_mask = s_ids < active_kv_splits
         lse = tl.load(
@@ -973,11 +921,6 @@ def mla_gluon(
 
     PAGE_SIZE = 1
 
-    # Device-side split policy: launch a fixed (graph-stable) split budget and
-    # let the kernels derive the active count from runtime seq_info. Enabled only
-    # where a CUDA-Graph-frozen min_kv_seq_len (vLLM hard-codes it to 1) would
-    # otherwise collapse the split count; see the bh16bn64 low-head branch below.
-    DYNAMIC_KV_SPLITS = False
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
@@ -1009,26 +952,16 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # nhead > 16 tiles heads into cdiv(nhead, BLOCK_H) blocks on grid axis 2, so
-        # the ~256-WG split budget also divides by those head blocks; that division
-        # lives in _bh16_num_kv_splits (head blocks already fill the machine,
-        # mirroring how bh64 folds head blocks into the grid).
+        # Fixed ~256-WG launch budget, independent of sequence length so CUDA
+        # Graph capture cannot freeze it; the kernels derive the per-batch
+        # partition from the runtime KV length. Head blocks and MTP qlen already
+        # consume part of the wave, so the budget divides by them too.
+        NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
+        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
         if REGIME == "bh16bn128":
             assert (
                 batch_size == 1
             ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-        # Both bh16 regimes (bh16bn64 for any nhead <= 96, bh16bn128 fp8) launch
-        # the fixed, seq-independent ~256-WG split budget rather than deriving it
-        # from min_kv_seq_len (which vLLM hard-codes to 1 under CUDA Graph capture,
-        # collapsing the split count). stage-1/stage-2 derive the active per-batch
-        # block-bound count from the runtime KV length in seq_info: short seqs are
-        # not over-split (no 1-token partial blocks), long seqs still fan out
-        # across CUs, and the launch/workspace stay graph-stable. bh16 supports
-        # num_iter in {1, 2, ...} (no gl.assume(num_iter >= 3)), so any active
-        # count is safe as long as each active split is non-empty, which the
-        # active = min(budget, cdiv(seq, BLOCK_N)) derivation guarantees.
-        NUM_KV_SPLITS = _bh16_num_kv_splits(nhead, batch_size, qlen, BLOCK_H)
-        DYNAMIC_KV_SPLITS = True
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -1159,7 +1092,6 @@ def mla_gluon(
         NUM_XCDS=NUM_XCDS,
         NHEAD=nhead,
         REGIME=REGIME,
-        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
@@ -1200,7 +1132,6 @@ def mla_gluon(
         USE_2D_VIEW=use_2d_view,
         BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
         BLOCK_N=BLOCK_N,
-        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
         num_warps=8,
     )
 
