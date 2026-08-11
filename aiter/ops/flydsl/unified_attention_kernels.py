@@ -14,8 +14,9 @@ the configuration, letting the caller fall through to Triton unchanged (see
 ``flydsl_flash_attn_varlen_func`` in ``fmha_kernels.py`` and the flydsl branch
 in ``ops/gemm_op_a8w8.py``). There is deliberately no environment variable:
 aiter already carries 19 undocumented backend-gate vars, and this path is arch-
-and shape-scoped, so a code gate states the choice more honestly. For an A/B,
-patch ``_FLYDSL_UNIFIED_ATTN_ARCH`` in the Triton module to ``False``.
+and shape-scoped, so a code gate states the choice more honestly. To force the
+Triton path for comparison, set ``_FLYDSL_UNIFIED_ATTN_ARCH`` to ``False`` in
+the Triton module.
 
 Two tiers, chosen at call time from the machine-fill deficit (see
 ``_split_count`` and the gate in ``flydsl_unified_attention``), not from
@@ -82,8 +83,7 @@ _BLOCK_M = 256
 # The block table is staged through a fixed LDS window of PAGED_BT_LDS_SIZE=2048
 # entries. Past that the stager writes only `local_tile < segment_tiles` slots
 # and silently drops the remaining page ids -- wrong output, not a fault -- so
-# the KV length must be capped here. 2048 pages * 64 tokens = 131072 tokens,
-# which is exactly the model's maximum context rather than comfortably above it.
+# the KV length must be capped here: 2048 pages * 64 tokens = 131072 tokens.
 _MAX_KV_TILES = 2048
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -143,9 +143,8 @@ def _split_count(num_2d_prgms: int) -> int:
     count, capped at 8. No MIN floor -- b=9 needs 4, below Triton's floor of 8.
     Below 2 there is no split to take, so the caller falls back to single-pass.
 
-    Verified against the committed A/B winners (39f7e68de): num_2d = 4*b for a
-    b-sequence GQA-16 decode gives b=7 -> 8, b=8 -> 8, b=9 -> 4, matching the
-    measured best split count at each.
+    Verified against the measured best split count: num_2d = 4*b for a
+    b-sequence GQA-16 decode gives b=7 -> 8, b=8 -> 8, b=9 -> 4.
     """
     n = 1
     while n * 2 <= _MAX_SEGMENTS and num_2d_prgms * (n * 2) <= _TARGET_NUM_PRGMS:

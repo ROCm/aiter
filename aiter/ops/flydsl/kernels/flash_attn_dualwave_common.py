@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Shared DUALWAVE_SWP flash-attention helpers, vendored from FlyDSL.
+"""Shared DUALWAVE_SWP flash-attention helpers, adapted and extended from FlyDSL.
 
 Consumed by ``flash_attn_fp8_gfx950.py``. Kept flat and un-suffixed rather
 than under an arch directory because these are dtype/layout helpers, not
@@ -13,15 +13,15 @@ Upstream: FlyDSL ``kernels/attention/flash_attn_utils.py`` at tag v0.3.0
 outside ``python/``, which is what ``find_packages`` scans), so aiter vendors
 these sources rather than importing them.
 
-Contents are the fp8-reachable subset of that file: 56 of 153 top-level
-symbols, 1807 of 5535 lines, taken as the transitive AST closure of what
-``flash_attn_fp8_gfx950.py`` imports. The bf16 ``Dualwave*`` hierarchy is
-deliberately absent -- note that puts ``DualwavePageIdLoader``, the paged
-block-table loader, outside this file.
+The extracted base is the fp8-reachable subset of that file (the transitive
+AST closure of what ``flash_attn_fp8_gfx950.py`` imports); the fp8 paged,
+varlen, and split-K machinery on top of it is aiter-owned and not upstream-
+tracked. The bf16 ``Dualwave*`` hierarchy is deliberately absent -- note that
+puts ``DualwavePageIdLoader``, the paged block-table loader, outside this file.
 
-Regenerate with ``scripts/vendor_fp8_attention.py`` (vault issue directory
-``projects/aiter/issues/flydsl-unified-attention``) when the FlyDSL pin moves,
-rather than hand-patching against a new upstream.
+Regenerate the extracted base with ``scripts/vendor_fp8_attention.py`` (vault
+issue directory ``projects/aiter/issues/flydsl-unified-attention``) when the
+FlyDSL pin moves; the aiter-owned fp8 additions must be re-applied on top.
 """
 
 import math as host_math

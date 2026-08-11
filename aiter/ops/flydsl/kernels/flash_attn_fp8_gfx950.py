@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""gfx950 DUALWAVE_SWP FP8 flash attention, vendored from FlyDSL.
+"""gfx950 DUALWAVE_SWP FP8 flash attention, adapted and extended from FlyDSL.
 
 Helpers live in ``flash_attn_dualwave_common.py``.
 
@@ -10,6 +10,10 @@ Upstream: FlyDSL ``kernels/attention/flash_attn_fp8_gfx950.py`` at tag v0.3.0
 (5675194f). ``flydsl.kernels`` is not shipped in the wheel (``kernels/`` sits
 outside ``python/``, which is what ``find_packages`` scans), so aiter vendors
 these sources rather than importing them.
+
+Upstream's fp8 path is dense-only and refuses paged, varlen, and split-K; the
+paged/varlen/split-K/sinks machinery here is aiter-owned and not upstream-
+tracked, so re-vendoring a new pin re-extracts only the dense base.
 """
 
 import flydsl.compiler as flyc
@@ -95,14 +99,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
         raise RuntimeError(
             f"flash_attn_dualwave_swp_fp8 output supports bf16/f16 only, got out_dtype={out_dtype_str}"
         )
-    # fp8 split-K was rejected here. What blocked it was the combine pass
-    # packing its output as DTYPE_STR (the input dtype) rather than the
-    # kernel's fixed 2-byte output; see pack_output in the common module.
-    # fp8 varlen was rejected here too. It needed the active guard the fp8
-    # context was missing (see compute_active_guard in the common module) plus
-    # the BN128 pipeline held on independently of varlen; with both, it works.
-    # fp8 always builds BN128 -- the shallow path's PV dispatch expects an
-    # unpacked P pair the body never produces, so it does not build at all.
+    # fp8 always builds the BN128 deep-pipeline path: the shallow path's PV
+    # dispatch expects an unpacked P pair the body never produces. Split-K and
+    # varlen are both supported -- split-K needs the combine pass to pack output
+    # at the kernel's fixed 2-byte width (see pack_output), varlen needs the
+    # active guard (see compute_active_guard), both in the common module.
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -353,7 +354,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             #
             # The lgkm wait is separate and not optional: with VDMA off, V is
             # staged global->VGPR->LDS and only lgkmcnt covers that LDS store,
-            # which the barrier below must see. Same pairing as the bf16 kernel.
+            # which the barrier below must see. Same pairing as the upstream
+            # bf16 kernel (FlyDSL kernels/attention/flash_attn_gfx950.py).
             rocdl.s_waitcnt(traits.LGKMCNT_0_ONLY)
             waitcnt_vm_n(4 * ctx.NUM_DMA_K)
             rocdl.sched_barrier(0)
@@ -413,7 +415,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 f_b_buf = _ring_wrap(a_buf + fx.Index(5))
 
                 # Eight clusters, memory and compute strictly alternating, one
-                # barrier each. Mirrors the bf16 sibling's decomposition, which
+                # barrier each. Mirrors the upstream bf16 kernel's decomposition, which
                 # the wave stagger needs: a one-barrier loop makes the stagger a
                 # full-iteration skew, and every LDS handoff desynchronises.
                 #
@@ -431,9 +433,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 v_k_a = kv_lds_to_regs.load_k(a_buf)
                 _cluster_boundary()
 
-                # C1 (cmp): QK for subtile a. v_k_a dies here, before v_k_b is
-                # loaded -- today both are live at once, so this costs 32 fewer
-                # VGPRs at peak rather than more.
+                # C1 (cmp): QK for subtile a. Doing it here frees v_k_a before
+                # v_k_b loads, so only one K subtile is live at peak -- 32 fewer
+                # VGPRs than keeping both.
                 v_s_a = gemm_helper.qk(v_k_a, q_wide)
                 v_s_a = _mask_sub(v_s_a, j)
                 _sched_barrier_pairs(traits, 4, 6, 14)
@@ -469,10 +471,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 pf_a = _pf_tile(j + fx.Index(4))
                 pf_b = _pf_tile(j + fx.Index(5))
                 # Resolve both prefetch page ids under ONE lgkmcnt(0) drain, and
-                # reuse them for the V half at C6. Unbatched this cost four
-                # drains per iteration -- K and V for a given tile resolve the
-                # SAME page id, so the four lookups only ever held two distinct
-                # values. Measured at 2.8% of kernel latency (ATT, M=4023).
+                # reuse them for the V half at C6. K and V for a given tile
+                # resolve the SAME page id, so batching the lookups avoids
+                # redundant drains.
                 pf_pages = (
                     kv_gmem_to_lds.end_page_ids(
                         kv_gmem_to_lds.begin_page_ids([pf_a, pf_b])
@@ -539,11 +540,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # partial-store helpers existed but nothing called them.
                 output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
 
-        # Skip workgroups whose Q block lies past their own sequence. The grid
-        # is sized for the longest sequence, so under varlen the excess blocks
-        # of every shorter one would otherwise write into the next packed
-        # sequence's rows. `active` is None on the dense path, which keeps the
-        # emitted code identical to before. Mirrors the bf16 kernel.
+        # Under varlen the grid is sized for the longest sequence, so a shorter
+        # sequence's surplus Q blocks would write into the next packed sequence's
+        # rows. Guarding the body with `active` skips them. On the dense path
+        # `active` is None, so the body runs directly and emits no guard. Mirrors
+        # the upstream bf16 kernel.
         if ctx.active is None:
             _main_body()
         else:
