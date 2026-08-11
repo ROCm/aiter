@@ -164,9 +164,11 @@ namespace py = pybind11;
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
     m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
-#define AITER_UNARY_PYBIND                                  \
-    m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
-    m.def("tanh", &aiter_tanh, "apply for tanh.");
+#define AITER_UNARY_PYBIND                                                        \
+    AITER_SET_STREAM_PYBIND;                                                      \
+    m.def(                                                                        \
+        "sigmoid", &aiter_sigmoid, "apply for sigmoid.", py::arg("out"), py::arg("input")); \
+    m.def("tanh", &aiter_tanh, "apply for tanh.", py::arg("out"), py::arg("input"));
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -331,9 +333,11 @@ namespace py = pybind11;
           py::arg("sorted_expert_ids"),                                             \
           py::arg("num_valid_ids"),                                                 \
           py::arg("out"),                                                           \
+          py::arg("token_num"),                                                     \
+          py::arg("topk"),                                                          \
           py::arg("block_m"),                                                       \
           py::arg("kernel_id"),                                                     \
-          py::arg("inter_dim_pad"));                                                 \
+          py::arg("inter_dim_pad"));                                                \
     m.def("opus_moe_stage2_reduce_token_slot_route_output_fwd",                     \
           &opus_moe_stage2_reduce_token_slot_route_output_fwd,                      \
           "Opus MoE route-output topk reduce",                                      \
@@ -354,6 +358,7 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                                  \
           py::arg("out"),                                                            \
           py::arg("out_scale"),                                                      \
+          py::arg("topk"),                                                           \
           py::arg("block_m"),                                                        \
           py::arg("kernelName"),                                                     \
           py::arg("inter_dim_pad"),                                                  \
@@ -1752,21 +1757,22 @@ namespace py = pybind11;
           py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
-#define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
-#define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
-#define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
-#define ROPE_2C_CACHED_FWD_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
-#define ROPE_1C_THD_FWD_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
-#define ROPE_1C_2D_FWD_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_1C_UNCACHED_BWD_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
-#define ROPE_2C_UNCACHED_BWD_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
-#define ROPE_1C_CACHED_BWD_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
-#define ROPE_2C_CACHED_BWD_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
-#define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
-#define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
 #define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND  \
+    AITER_SET_STREAM_PYBIND;                  \
     m.def("rope_cached_positions_fwd_impl",  \
           &rope_cached_positions_fwd_impl,   \
           py::arg("output"),                 \
@@ -1778,6 +1784,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"), \
           py::arg("nope_first"))
 #define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND;                    \
     m.def("rope_cached_positions_2c_fwd_impl", \
           &rope_cached_positions_2c_fwd_impl,  \
           py::arg("output_x"),                 \
@@ -1791,6 +1798,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
 #define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND;                         \
     m.def("rope_cached_positions_offsets_fwd_impl", \
           &rope_cached_positions_offsets_fwd_impl,  \
           py::arg("output"),                        \
@@ -1803,6 +1811,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),        \
           py::arg("nope_first"))
 #define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND;                            \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", \
           &rope_cached_positions_offsets_2c_fwd_impl,  \
           py::arg("output_x"),                         \
@@ -2089,6 +2098,7 @@ namespace py = pybind11;
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
 
 #define SAMPLE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND;                                                         \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
     m.def("random_sample_outer_exponential",                                         \
           &aiter::random_sample_outer_exponential,                                   \
@@ -2102,9 +2112,10 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("input"),                                                          \
           py::arg("temperature"),                                                    \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
     m.def("mixed_sample_outer_exponential",                                          \
           &aiter::mixed_sample_outer_exponential,                                    \
           py::arg("out"),                                                            \
@@ -2117,15 +2128,17 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("input"),                                                          \
           py::arg("temperature"),                                                    \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
     m.def("exponential",                                                             \
           &aiter::exponential,                                                       \
           py::arg("out"),                                                            \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);
 
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
