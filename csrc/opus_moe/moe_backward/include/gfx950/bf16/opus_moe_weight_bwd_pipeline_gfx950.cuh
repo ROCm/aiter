@@ -499,9 +499,11 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     clear(v_c);
 
     // Eight lanes cover one K row; every lane owns eight contiguous columns.
-    const int local_k0 = tid / 8;
+    const int loader_tid =
+        T::DIRECT_GMEM_TO_LDS ? tid ^ ((tid >> 4) & 7) : tid;
+    const int local_k0 = loader_tid / 8;
     const int local_k1 = local_k0 + 32;
-    const int local_vec = (tid % 8) * VEC;
+    const int local_vec = (loader_tid % 8) * VEC;
     // The two logical shared encodings have the same vector-store address.
     const int store_addr_bytes = (tid << 4) ^ (tid & 0x70);
 
@@ -572,30 +574,50 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int source_b0 = sorted0;
         const int source_b1 = sorted1;
 
-        auto a0 = g_a.template load<VEC>(
-            source_a0 * kargs.stride_a_row + output_m_base + local_vec,
-            0,
-            opus::number<T::CACHECTL_A>{});
-        auto a1 = g_a.template load<VEC>(
-            source_a1 * kargs.stride_a_row + output_m_base + local_vec,
-            0,
-            opus::number<T::CACHECTL_A>{});
-        auto b0 = g_b.template load<VEC>(
-            source_b0 * kargs.stride_b_row + output_n_base + local_vec,
-            0,
-            opus::number<T::CACHECTL_B>{});
-        auto b1 = g_b.template load<VEC>(
-            source_b1 * kargs.stride_b_row + output_n_base + local_vec,
-            0,
-            opus::number<T::CACHECTL_B>{});
-
-        // Close the prior tile's shared-memory lifetime while allowing its
-        // MFMA to overlap this tile's global loads.
-        __builtin_amdgcn_s_barrier();
-        s_tile.template _store<VEC>(a0, store_addr_bytes);
-        s_tile.template _store<VEC>(a1, store_addr_bytes + 4096);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr(T::DIRECT_GMEM_TO_LDS)
+        {
+            // Invert the {vec=8, perPhase=2, maxPhase=8} shared swizzle in
+            // the global vector owner.  gfx950 then deposits every 16-byte
+            // lane vector directly into the physical LDS layout consumed by
+            // the transpose reads below.
+            __builtin_amdgcn_s_barrier();
+            OPUS_LDS_ADDR D_A* wave_dst =
+                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_tile.ptr) +
+                wave_id * opus::get_warp_size() * VEC;
+            g_a.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(wave_dst),
+                (source_a0 * kargs.stride_a_row + output_m_base + local_vec) *
+                    sizeof(D_A),
+                0,
+                opus::number<0>{},
+                opus::number<T::CACHECTL_A>{});
+            g_a.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(wave_dst) + 4096),
+                (source_a1 * kargs.stride_a_row + output_m_base + local_vec) *
+                    sizeof(D_A),
+                0,
+                opus::number<0>{},
+                opus::number<T::CACHECTL_A>{});
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
+        else
+        {
+            auto a0 = g_a.template load<VEC>(
+                source_a0 * kargs.stride_a_row + output_m_base + local_vec,
+                0,
+                opus::number<T::CACHECTL_A>{});
+            auto a1 = g_a.template load<VEC>(
+                source_a1 * kargs.stride_a_row + output_m_base + local_vec,
+                0,
+                opus::number<T::CACHECTL_A>{});
+            __builtin_amdgcn_s_barrier();
+            s_tile.template _store<VEC>(a0, store_addr_bytes);
+            s_tile.template _store<VEC>(a1, store_addr_bytes + 4096);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
 
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_K>([&](auto ek) {
@@ -614,10 +636,44 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        s_tile.template _store<VEC>(b0, store_addr_bytes);
-        s_tile.template _store<VEC>(b1, store_addr_bytes + 4096);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr(T::DIRECT_GMEM_TO_LDS)
+        {
+            OPUS_LDS_ADDR D_B* wave_dst =
+                reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile.ptr) +
+                wave_id * opus::get_warp_size() * VEC;
+            g_b.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(wave_dst),
+                (source_b0 * kargs.stride_b_row + output_n_base + local_vec) *
+                    sizeof(D_B),
+                0,
+                opus::number<0>{},
+                opus::number<T::CACHECTL_B>{});
+            g_b.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(wave_dst) + 4096),
+                (source_b1 * kargs.stride_b_row + output_n_base + local_vec) *
+                    sizeof(D_B),
+                0,
+                opus::number<0>{},
+                opus::number<T::CACHECTL_B>{});
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
+        else
+        {
+            auto b0 = g_b.template load<VEC>(
+                source_b0 * kargs.stride_b_row + output_n_base + local_vec,
+                0,
+                opus::number<T::CACHECTL_B>{});
+            auto b1 = g_b.template load<VEC>(
+                source_b1 * kargs.stride_b_row + output_n_base + local_vec,
+                0,
+                opus::number<T::CACHECTL_B>{});
+            s_tile.template _store<VEC>(b0, store_addr_bytes);
+            s_tile.template _store<VEC>(b1, store_addr_bytes + 4096);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
 
         typename decltype(mma)::vtype_b v_b;
         opus::static_for<T::E_K>([&](auto ek) {

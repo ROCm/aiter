@@ -204,7 +204,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
 
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 3;
-    constexpr int cohort4_kid = 4;
+    constexpr int cohort4_direct_lds_kid = 5;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -213,7 +213,8 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     const uint64_t source_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         source_row_elements * sizeof(hip_bfloat16);
-    return source_bytes > l2_friendly_bytes ? cohort4_kid : legacy_kid;
+    return source_bytes > l2_friendly_bytes ? cohort4_direct_lds_kid
+                                             : legacy_kid;
 }
 
 } // namespace detail

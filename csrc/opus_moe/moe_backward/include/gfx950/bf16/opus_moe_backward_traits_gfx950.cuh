@@ -302,6 +302,7 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
 {
     static constexpr int EXPERT_COHORT = 0;
+    static constexpr bool DIRECT_GMEM_TO_LDS = false;
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
     static constexpr int T_K = 1;
@@ -338,6 +339,12 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4
     : Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
 {
     static constexpr int EXPERT_COHORT = 4;
+};
+
+struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
+    : Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4
+{
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled
