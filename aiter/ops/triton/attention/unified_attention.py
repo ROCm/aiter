@@ -44,19 +44,11 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 
 # gfx950 has a FlyDSL fp8 paged backend for this op; see
-# aiter/ops/flydsl/unified_attention_kernels.py. Resolved once, here, because
-# this module is imported at startup on every arch: get_gfx_runtime() shells out
-# to rocminfo and raises on an unrecognised device, so it must not be able to
-# propagate. The adapter import stays inside the dispatch branch, so a non-gfx950
-# host never touches flydsl at all. Patch this to False to A/B against Triton.
-try:
-    from aiter.jit.utils.chip_info import get_gfx_runtime as _get_gfx_runtime
-
-    # Runtime detection, NOT get_gfx(): that honours the GPU_ARCHS build
-    # variable and would claim gfx950 on a host that is not one.
-    _FLYDSL_UNIFIED_ATTN_ARCH = _get_gfx_runtime() == "gfx950"
-except Exception:  # noqa: BLE001
-    _FLYDSL_UNIFIED_ATTN_ARCH = False
+# aiter/ops/flydsl/unified_attention_kernels.py. Reuses DEVICE_ARCH, already
+# resolved above, rather than running a second detector at import time. The
+# adapter import stays inside the dispatch branch, so a non-gfx950 host never
+# touches flydsl at all. Patch this to False to A/B against Triton.
+_FLYDSL_UNIFIED_ATTN_ARCH = DEVICE_ARCH == "gfx950"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
@@ -141,45 +133,6 @@ def select_2d_config(
         TILE_SIZE = block_size
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
-
-    # --- tuned override -----------------------------------------------------
-    # Alternate launch config for the all_decode + non-shuffled +
-    # head_size=128 + num_queries_per_kv<=16 shape family. Scoped to exactly
-    # that shape family -- everything else keeps the original values
-    # computed above untouched.
-    is_tuned_shape = (
-        all_decode
-        and not shuffled_kv_cache
-        and head_size == 128
-        and num_queries_per_kv <= 16
-        and not arch.is_rdna
-    )
-    if is_tuned_shape:
-        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
-            TILE_SIZE, num_warps, num_stages_2d, waves_per_eu = 64, 1, 2, 0
-        else:
-            TILE_SIZE, num_warps, num_stages_2d, waves_per_eu = 32, 1, 2, 2
-
-    # Alternate launch config for the large-prefill (max_seqlen_q >= 256)
-    # + non-shuffled + head_size=128 + FP8 Q/KV shape family. Measured a
-    # consistent speedup across every prefill token-count tested, with no
-    # regression on any of them (checked both as single long sequences and
-    # as multiple shorter sequences summing to the same token count).
-    # Only tested with FP8 Q + FP8 KV -- scoped to exactly that, not
-    # extended to BF16/FP16 prefill which wasn't validated.
-    is_tuned_prefill_shape = (
-        not all_decode
-        and max_seqlen_q >= 256
-        and not shuffled_kv_cache
-        and head_size == 128
-        and q_dtype == e4m3_dtype
-        and kv_cache_dtype == e4m3_dtype
-        and not arch.is_rdna
-    )
-    if is_tuned_prefill_shape:
-        BLOCK_M, TILE_SIZE, num_warps, num_stages_2d, waves_per_eu = 256, 128, 8, 2, 0
-        BLOCK_Q = BLOCK_M // num_queries_per_kv  # BLOCK_M changed above, keep in sync
-    # -------------------------------------------------------------------------
 
     return {
         "BLOCK_M": BLOCK_M,
@@ -384,8 +337,6 @@ def unified_attention(
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
-
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -478,6 +429,10 @@ def unified_attention(
         if _flydsl_out is not None:
             return _flydsl_out
 
+    # FlyDSL declined (or this isn't gfx950); the Triton fallback below only
+    # implements the causal mask.
+    assert causal, "Only causal attention is supported"
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -502,50 +457,8 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
 
-    # --- tuned override: force 2D instead of 3D split-KV for small-batch
-    # decode ---
-    # For ALL_DECODE + head_size=128 + GQA<=16 + non-shuffled cache,
-    # AITER's use_2d_kernel() heuristic routes small batches to the 3D
-    # split-KV kernel + reduce_segments combine. Measured end-to-end through
-    # this same unified_attention() entry point (i.e. apples-to-apples, same
-    # Python-side dispatch overhead on both sides): the single-launch 2D
-    # kernel beats 3D+combine for short-to-moderate context lengths, is
-    # roughly breakeven for longer ones, and regresses beyond that.
-    # Threshold set conservatively inside the clear-win zone -- do not raise
-    # this without re-validating with a fair (same-wrapper) comparison; an
-    # earlier raw-kernel-vs-wrapper comparison overstated the win at higher
-    # context lengths because it didn't control for Python-side dispatch
-    # overhead on both sides.
-    force_2d_decode = (
-        ALL_DECODE
-        and not shuffled_kv_cache
-        and head_size == 128
-        and num_queries_per_kv <= 16
-        and not IS_DEVICE_ARCH_GFX12
-        and not get_arch().is_rdna
-        and max_seqlen_k < 4096
-        # Scoped to small batches only. At large batches this override
-        # clobbers select_2d_config()'s own, separately-tuned ALL_DECODE
-        # config (TILE_SIZE=64, num_warps=1), which is already the right
-        # choice there and regresses noticeably if overridden with the
-        # small-batch tuning below.
-        #
-        # No lower bound here (tried adding a lower bound on max_seqlen_k to
-        # avoid a small dip at very short context -- made it worse, not
-        # better: without this override, very short context still hits the
-        # 2D path via use_2d_kernel()'s own unconditional short-context rule,
-        # but then gets select_2d_config()'s *unconditional* is_tuned_shape
-        # config (num_warps=1), which is tuned for large batches and is
-        # noticeably worse than true default at this small batch/context
-        # combo -- i.e. removing this override at low context doesn't fall
-        # back to the untouched original, it falls forward into a worse
-        # override. Keeping this one active is the better of the two
-        # available options.
-        and num_seqs < 150
-    )
-
     # if batch contains a prefill
-    if force_2d_decode or use_2d_kernel(
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -596,15 +509,6 @@ def unified_attention(
                 kv_cache_dtype,
                 shuffled_kv_cache,
             )
-            if force_2d_decode:
-                # Tuned for the small-batch decode-via-2D shape family
-                # (see force_2d_decode above), distinct from
-                # select_2d_config()'s own ALL_DECODE tuning (which targets
-                # much larger batches).
-                config["TILE_SIZE"] = 128
-                config["num_warps"] = 4
-                config["num_stages"] = 2
-                config["waves_per_eu"] = 2
             assert config["BLOCK_Q"] >= 1
             if ALL_DECODE:
                 total_num_q_blocks = num_seqs

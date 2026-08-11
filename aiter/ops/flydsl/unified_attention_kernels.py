@@ -17,21 +17,17 @@ aiter already carries 19 undocumented backend-gate vars, and this path is arch-
 and shape-scoped, so a code gate states the choice more honestly. For an A/B,
 patch ``_FLYDSL_UNIFIED_ATTN_ARCH`` in the Triton module to ``False``.
 
-Two tiers. Prefill and mixed batches take the single-pass packed kernel. The
-decode-only case (``max_seqlen_q == 1``) is machine-underfilled -- a handful of
-workgroups each serially scan the full KV depth while most CUs sit idle -- so it
-takes packed + split-K, which partitions each sequence's KV across split
-workgroups and combines the partials. The tier is chosen at call time from the
-machine-fill deficit; see ``_split_count`` and the gate in
-``flydsl_unified_attention``.
-
-The split-K tier is confined to ``max_seqlen_q == 1`` on purpose. The split-K
-workspace and its combine kernel address O DENSELY by ``batch_idx *
-max_seqlen_q`` with no ``cu_seqlens_q``, so they are correct only when every
-sequence's query length equals ``max_seqlen_q`` -- exactly the all-decode case.
-A mixed/prefill varlen batch (unequal query lengths) would be miscombined, so it
-stays on single-pass regardless of fill. Serving the low-chunk mixed case would
-need a varlen-q-aware workspace, which is out of scope here.
+Two tiers, chosen at call time from the machine-fill deficit (see
+``_split_count`` and the gate in ``flydsl_unified_attention``), not from
+whether the batch is all-decode. A launch whose base workgroup count leaves
+the machine underfilled -- a handful of workgroups each serially scanning the
+full KV depth while most CUs sit idle -- takes packed + split-K, which
+partitions each sequence's KV across split workgroups and combines the
+partials; a full-pass batch (a real prefill chunk or high-chunk mix) stays on
+the single-pass packed kernel. This is why split-K also serves the low-chunk
+mixed case, not just all-decode: the combine kernel rebases its O write on
+``cu_seqlens_q`` (``DualwaveSplitKCombineContext.init_descriptors``), so a
+varlen batch with unequal query lengths combines correctly.
 """
 
 from __future__ import annotations
@@ -55,11 +51,25 @@ _PAGE_SIZE = 64
 # Head dim is fixed by the kernel (it raises on anything else).
 _HEAD_DIM = 128
 
-# gfx950/MI355X CU count. This is the split-K fill target: a launch with
-# num_2d_prgms base workgroups is "full" at num_2d_prgms >= _TARGET_NUM_PRGMS.
-# An arch constant, not a runtime GPU query -- the whole path is gfx950-gated
-# (the Triton hook only calls in on gfx950), so the CU count is known.
-_TARGET_NUM_PRGMS = 256
+
+def _target_num_prgms() -> int:
+    """Split-K fill target: a launch with num_2d_prgms base workgroups is "full"
+    at num_2d_prgms >= this value.
+
+    Both full-chip gfx950 parts (MI350X, MI355X) are 256 CUs, so this is a
+    device CU-count query, not a hardcoded arch constant -- it also handles
+    CU-partitioned modes (CPX/NPS) where fewer CUs are exposed. Falls back to
+    256 (the full-chip count) if the query fails.
+    """
+    try:
+        from aiter.ops.triton.utils.device_info import get_num_sms
+
+        return get_num_sms()
+    except Exception:  # noqa: BLE001
+        return 256
+
+
+_TARGET_NUM_PRGMS = _target_num_prgms()
 
 # The prototype only measured split counts in {2, 4, 8}; do not emit 16+ on
 # unmeasured shapes.
@@ -137,7 +147,9 @@ def _split_count(num_2d_prgms: int) -> int:
     return n if n >= 2 else 1
 
 
-def _strides_ok(q, out, k, v, block_table, num_kv_heads, head_size) -> bool:
+def _strides_ok(
+    q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
+) -> bool:
     """Check the exact layout the kernel's two scalar strides imply.
 
     The launcher takes one ``stride_q_n`` and one ``stride_kv_n`` and derives
@@ -151,6 +163,18 @@ def _strides_ok(q, out, k, v, block_table, num_kv_heads, head_size) -> bool:
     # One stride_q_n argument serves the Q read, the O write, and BOTH buffer
     # num_records bounds (init_descriptors), so Q and O must agree on it.
     if q.stride(0) != out.stride(0):
+        return False
+    # `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`. Those
+    # bake the tensor's full memref (shape+strides) into the FlyDSL kernel
+    # cache signature, so a genuinely padded (non-flattenable) layout would
+    # make reshape return a silent COPY: the kernel writes the copy and the
+    # caller's real `out` buffer is never touched. Requiring stride(0) to
+    # equal the flattened row size restricts acceptance to exactly the
+    # layouts where reshape(-1) is a view, not a copy. Padded layouts decline
+    # here and fall through to the Triton path, which handles them correctly.
+    if q.stride(0) != num_query_heads * head_size:
+        return False
+    if out.stride(0) != num_query_heads * head_size:
         return False
     page_row = num_kv_heads * head_size
     for t in (k, v):
@@ -239,12 +263,15 @@ def _supported(
         and q_scales is None
         and output_scale is None
         # Sinks are served (per-head [num_query_heads] fp32) but only on the
-        # single-split path. The adapter never builds split-K (see module
-        # docstring), so any accepted sinks call is single-split; the guard is
-        # defensive in case that ever changes.
+        # single-split path -- exp(sink) would be counted once per split in the
+        # combine denominator otherwise. The dispatch gate in
+        # flydsl_unified_attention refuses split-K whenever sinks is not None,
+        # so an accepted sinks call always lands single-split.
         and (sinks is None
              or (sinks.dtype == torch.float32 and sinks.numel() == num_query_heads))
-        and _strides_ok(q, out, k, v, block_table, num_kv_heads, head_size)
+        and _strides_ok(
+            q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
+        )
     )
 
 
@@ -345,8 +372,8 @@ def flydsl_unified_attention(
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
 
     # Tier selection. Split-K fires when ALL hold; otherwise single-pass.
-    #  - max_seqlen_k > 512: below this the combine pass does not amortize (it is
-    #    also Triton's own force_2d_decode cutoff).
+    #  - max_seqlen_k > _PAGE_SIZE * 20 (1280): just below the measured single-pass
+    #    <-> split-K crossover; shallower KV does not amortize the combine pass.
     #  - num_2d_prgms < target: the machine is underfilled, which is the only
     #    regime split-K helps. A full launch would only add combine overhead. A
     #    high-chunk mixed batch (a long prefill) fills the machine on its own and
@@ -389,7 +416,7 @@ def flydsl_unified_attention(
     # Every dispatch decision is identical to the exact-sum form; the read is
     # removed from the paths where the exact value cannot change the outcome.
     num_kv_splits = 1
-    if max_seqlen_k > _PAGE_SIZE * 8 and sinks is None:
+    if max_seqlen_k > _PAGE_SIZE * 20 and sinks is None:
         block_q = _BLOCK_M // num_queries_per_kv
         if max_seqlen_q == 1:
             num_q_blocks = num_seqs
@@ -420,10 +447,18 @@ def flydsl_unified_attention(
 
     with torch.cuda.device(q.device.index):
         kernel(
-            _as_i8(q).view(-1),
-            _as_i8(k).view(-1),
-            _as_i8(v).view(-1),
-            out.view(-1),
+            # .reshape(-1) here relies on _strides_ok having already restricted
+            # Q/O to genuinely flattenable layouts (q.stride(0) == out.stride(0)
+            # == num_query_heads * head_size). For an accepted call this is
+            # always a view over the original data pointer, never a copy --
+            # `_run_compiled` bakes the reshaped tensor's memref into the
+            # FlyDSL kernel cache signature, so a copy would silently write
+            # results nobody reads. Padded (non-flattenable) layouts are
+            # declined by _strides_ok and fall through to the Triton path.
+            _as_i8(q).reshape(-1),
+            _as_i8(k).reshape(-1),
+            _as_i8(v).reshape(-1),
+            out.reshape(-1),
             num_seqs,
             # grid.y is ceil(seq_len / BLOCK_Q), so this must be the MAX q len;
             # per-sequence trimming comes from cu_seqlens_q via the active guard.
@@ -437,9 +472,9 @@ def flydsl_unified_attention(
             q_descale=_scaled_q_descale(q_descale, softmax_scale, q.shape[-1]),
             k_descale=k_descale,
             v_descale=v_descale,
-            block_table=block_table.view(-1),
+            block_table=block_table.reshape(-1),
             block_table_stride=int(block_table.stride(0)),
-            sink=None if sinks is None else sinks.view(-1),
+            sink=None if sinks is None else sinks.reshape(-1),
             stream=torch.cuda.current_stream(q.device),
         )
     return out

@@ -8,7 +8,7 @@ auto-off for num_kv_splits > 1). This test forces gqa_pack_m=True together with
 num_kv_splits>1 -- the true Triton-3d analog the build refusal used to forbid --
 and checks it against a torch reference.
 
-Decode-only shapes: Sq=1 against a long KV context (cross_seqlen), GQA 16:1 so
+Decode-only shapes: Sq=1 against a long KV context, GQA 16:1 so
 packing is actually exercised (16 q-heads ride in M per kv head). Both non-paged
 and paged (the production decode configuration).
 
@@ -135,7 +135,7 @@ def _run(build, ws_elems, b, ctx, splits, paged, d, seed, packed):
 
     mod = build(num_heads=H, head_dim=d, causal=False, dtype_str="fp8",
                 num_kv_heads=HKV, num_kv_splits=splits, paged=paged,
-                cross_seqlen=True, gqa_pack_m=packed)
+                gqa_pack_m=packed)
     o = torch.empty(b, sq, H, d, device=DEV, dtype=torch.bfloat16)
     ws = torch.zeros(ws_elems(b, H, sq, splits, d), device=DEV, dtype=torch.float32)
     mod(qf.contiguous().view(-1), kv_k.contiguous().view(-1),

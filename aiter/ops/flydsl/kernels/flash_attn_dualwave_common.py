@@ -1,5 +1,6 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Shared DUALWAVE_SWP flash-attention helpers, vendored from FlyDSL.
 
@@ -599,20 +600,15 @@ class DualwaveSwpFp8Traits:
     DAZ: bool
     DUALWAVE_SWP_LAZY_RESCALE: bool
     DUALWAVE_SWP_SETPRIO: bool
-    DUALWAVE_SWP_DEBUG_LAZY_COUNTS: bool
     DUALWAVE_SWP_ENABLE_STAGGER: bool
     NUM_KV_SPLITS: int
     SPLITK: bool
     VARLEN: bool
-    CROSS_SEQLEN: bool
     PAGED: bool
     PAGED_BT_LDS_SIZE: int
-    PREFETCH_BOUND: str
     PV_SPREAD: bool
     FP8_PV: bool
     FP8_PV_DIRECT: bool
-    BN128: bool
-    BN128_PF: bool
     QREG: bool
     VDMA: bool
     DEFAULT_STRIDE_Q_N: int
@@ -676,9 +672,6 @@ class DualwaveSwpFp8Traits:
             self.DAZ,
             self.DUALWAVE_SWP_LAZY_RESCALE,
             self.DUALWAVE_SWP_SETPRIO,
-            # DUALWAVE_SWP_DEBUG_LAZY_COUNTS and CROSS_SEQLEN are set into traits
-            # but never read by the kernel or helpers, so they only multiplied
-            # compiled variants with identical code -- dropped from the tag.
             self.DUALWAVE_SWP_ENABLE_STAGGER,
             self.NUM_KV_SPLITS,
             self.SPLITK,
@@ -688,7 +681,6 @@ class DualwaveSwpFp8Traits:
             # hands back whichever compiled first.
             self.PAGED,
             self.PAGED_BT_LDS_SIZE,
-            self.PREFETCH_BOUND,
             self.PV_SPREAD,
             "fp8_wide_qk_hiprec_pv",
             self.ELEM_BYTES,
@@ -699,18 +691,11 @@ class DualwaveSwpFp8Traits:
             self.FP8_PV,
             self.FP8_PV_DIRECT,
             self.NUM_PREFETCH_K,
-            # BLOCK_M/NUM_WAVES became parameters 2026-08-07. They change the
-            # tile shape and the CTA width, so they must key the cache -- two
-            # block_m values would otherwise hash alike and the builder would
-            # hand back whichever compiled first. Same class of bug the PAGED
-            # note above records.
             self.BLOCK_M,
             self.NUM_WAVES,
             self.BLOCK_SIZE,
             self.GQA_PACK_M,
             self.BLOCK_Q,
-            self.BN128,
-            self.BN128_PF,
             self.QREG,
             self.VDMA,
         )
@@ -724,28 +709,21 @@ def _make_dualwave_swp_fp8_traits(
     daz=True,
     dualwave_swp_lazy_rescale=True,
     dualwave_swp_setprio=True,
-    dualwave_swp_debug_lazy_counts=False,
     dualwave_swp_enable_stagger=True,
     num_kv_splits=1,
     varlen=False,
-    cross_seqlen=False,
     out_dtype_str="bf16",
     use_sinks=False,
-    bn128=None,
     paged=False,
-    prefetch_bound="none",
     pv_spread=False,
-    num_waves=8,
-    num_prefetch_k_override=None,
     gqa_pack_m=None,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
-    ``bn128`` selects the deep-pipeline shape (6-deep K prefetch ring, Q in
-    registers, DMA V staging, direct packed-i32x8 PV). ``None`` keeps
-    upstream's behaviour of deriving it from ``num_kv_splits``/``varlen``;
-    pass True or False to choose it independently of those. See the comment at
-    the derivation site for why the two are separable.
+    Always builds the BN128 deep-pipeline shape (6-deep K prefetch ring, Q in
+    registers, DMA V staging, direct packed-i32x8 PV) -- the only shape fp8
+    builds at all; the shallow path's PV dispatch expects an unpacked P pair
+    the body never produces.
 
     ``paged`` addresses KV through a block table instead of contiguously. Page
     size is not a parameter: it is structurally ``BLOCK_N`` (64), which is why
@@ -753,56 +731,21 @@ def _make_dualwave_swp_fp8_traits(
     supported here -- the vectorized 5D layout is bf16-only upstream and the
     target workload reports ``SHUFFLED_KV_CACHE_0``.
 
-    ``prefetch_bound="clamp"`` bounds the ring's forward prefetch; it defaults
-    off so the dense path stays bit-identical to upstream, and it is not a perf
-    win (see its use site).
-
-    ``num_waves`` sets the CTA width and, with it, ``block_m = num_waves * 32``
-    (``rows_per_wave`` is pinned by the MFMA tile, so this is the only way to
-    move ``block_m``). Default 8 -> block_m 256, the shape every prefill number
-    in this issue was measured at.
-
-    A 2026-08-06 note here claimed block_m could not usefully be lowered
-    because "the KV ring alone is 96.8 KB against an 80 KB half-budget, at any
-    block_m". Re-derived 2026-08-07: that figure is npf=4, but the fp8 path
-    runs npf=6, and the ring does not depend on block_m at all
-    (``smem_k_tile_elems`` is a function of ``block_n`` and ``head_dim`` only).
-    The real numbers per CU, against 160 KB of LDS on gfx950:
-
-    | npf | block_m=256 | block_m=32 |
-    |-----|-------------|------------|
-    |   6 |    129.0 KB |    101.0 KB |
-    |   4 |     96.8 KB |     68.8 KB |
-    |   3 |     80.6 KB |     52.6 KB |
-
-    So the old conclusion (block_m alone cannot reach 2 workgroups/CU) holds,
-    but the reason is the Q tile, not the ring: at block_m=256 the 32 KB of Q
-    swamps any ring saving, and at npf=6 no block_m fits twice. Lowering both
-    together does fit. Ring depth is ``num_prefetch_k``, still derived from
-    ``bn128`` -- shallowing it for fp8 is unmeasured, which is what the
-    block_m/npf sweep is for.
-
-    Still absent: there is no short-KV prologue variant: the prologue stages
-    exactly the 4 tiles the minimum two loop iterations consume, so there is
-    nothing to trim.
+    CTA width is fixed at 8 waves (``block_m = 256``): the fp8 V staging path
+    distributes BLOCK_N rows over waves with a hardcoded literal 8
+    (``_stage_v_fp8_block`` / ``_stage_v_fp8_block_dma``), so anything else
+    would stage a partial V tile. Ring depth is fixed at 6 buffers: the BN128
+    body's prefetch distance is hardcoded to reach 4/5 buffers ahead
+    (``_ring_wrap(a_buf + 4/5)`` in ``flash_attn_fp8_gfx950.py``), so fewer
+    than 6 live buffers alias a buffer still being read (wrong output at 4,
+    a memory fault at 3).
     """
     # Tile shape and wave geometry follow the gfx950 dual-wave CTA.
     block_n = 64
     k_sub_n = 32
     warp_size = 64
     rows_per_wave = 32
-    num_waves = int(num_waves)
-    assert num_waves in (1, 2, 4, 8), f"num_waves must be a power of two <= 8, got {num_waves}"
-    # The fp8 V staging path distributes BLOCK_N rows over waves as
-    # `n = wave_id * 8 + ...` (_stage_v_fp8_block / _stage_v_fp8_block_dma), a
-    # literal 8 rather than a BLOCK_N // NUM_WAVES. At num_waves < 8 that
-    # covers only part of the tile and the rest is silently stale -- wrong
-    # output, not a crash. K staging is fine (it uses NUM_WAVES). Lift this by
-    # deriving the V stride from BLOCK_N // num_waves in both stagers.
-    assert not (num_waves != 8), (
-        f"fp8 V staging is hardcoded to 8 waves; num_waves={num_waves} would "
-        "stage a partial V tile. See _stage_v_fp8_block."
-    )
+    num_waves = 8
     block_size = num_waves * warp_size
     block_m = num_waves * rows_per_wave
 
@@ -860,74 +803,17 @@ def _make_dualwave_swp_fp8_traits(
     smem_v_line_stride = smem_linear_wave + smem_v_pad
     smem_k_tile_elems = smem_n_rpt * smem_d_rpt * smem_k_line_stride
     smem_v_tile_elems = smem_n_rpt * smem_d_rpt * smem_v_line_stride
-    # BN128 is the deep-pipeline shape: a 6-deep K prefetch ring, Q held in
-    # registers, DMA V staging, and the packed-i32x8 direct PV path. Upstream
-    # derives it as `(num_kv_splits <= 1) and (not varlen)`, which conflates
-    # two unrelated things -- none of what BN128 selects depends on how Q is
-    # packed or on whether the KV range is split. Measured 2026-08-06: forcing
-    # FP8_PV_DIRECT true under varlen makes the kernel build and compute real
-    # attention (cos 0.96), and moves the split-K failure to an unrelated
-    # workspace fault. See the vault issue's bf16-template-assessment.
-    #
-    # So the pipeline shape is its own parameter here. It still defaults to
-    # upstream's expression, because the deep ring has only ever been measured
-    # dense (1804-1858 TFLOPS at NPF=6) and the shallow path is unexercised on
-    # the fp8 side -- callers opt in rather than inherit a silent change.
-    if bn128 is None:
-        bn128 = (num_kv_splits <= 1) and (not varlen)
-    bn128 = bool(bn128)
-    bn128_pf = bn128
-    qreg = bn128_pf
-    vdma = bn128_pf
-    deep_ring = bn128
-    num_prefetch_k = (6 if bn128_pf else 4) if deep_ring else 2
-    if num_prefetch_k_override is not None:
-        # Ring depth independent of the BN128 shape. BN128 selects four things
-        # at once (ring depth, Q in registers, V DMA staging, direct PV) and
-        # only the first is an LDS-budget knob; the fp8 body needs the other
-        # three.
-        #
-        # Measured 2026-08-07, and the floor is 6, not 2. This knob resizes the
-        # LDS ring, but the BN128 body's prefetch distance is hardcoded: the
-        # prologue stages tiles t0..t0+3 (flash_attn_fp8_gfx950.py:306-323) and
-        # the main loop prefetches at +4/+5 (`_ring_wrap(a_buf + 4/5)`, :398-399),
-        # so six buffers must be live simultaneously. Below that the modulo
-        # aliases a buffer being prefetched onto one still being read:
-        #   npf=5 -> bit-identical but 2.3% slower (aliasing not yet fatal)
-        #   npf=4 -> WRONG OUTPUT, maxerr 4.2e-02 against npf=6
-        #   npf=3 -> memory fault
-        # So the ring cannot be shallowed without also shortening the prefetch
-        # distance in the body, which is the pipeline's whole point.
-        #
-        # That closes off 2 workgroups/CU entirely for this pipeline. MEASURED
-        # 2026-08-07 via rocprofv3 kernel trace (LDS_Block_Size): this kernel
-        # takes 140288 B = 137.0 KB per workgroup, against 160 KB per CU. Two
-        # workgroups needs <= 80 KB, i.e. a 41% cut. Zeroing the Q tile outright
-        # still leaves 105 KB.
-        #
-        # Do not go looking for that space in the V staging: the `vt` array is
-        # typed bf16 but under BN128 it is sized `num_prefetch_k *
-        # (fp8_v_tile_bytes // 2)`, so it already holds RAW FP8 at exactly the
-        # theoretical minimum (6 x 8 KB = 48 KB for 6 tiles of BLOCK_N x
-        # HEAD_DIM fp8). There is no bf16 inflation to reclaim -- an earlier
-        # reading of this as "48.2 KB of bf16 staging for fp8 V" was a
-        # misreading of the element type.
-        #
-        # So the M-dimension refactor is justified by issue rate and grid shape,
-        # NOT by occupancy: 1 workgroup/CU is a fixed property of this pipeline.
-        num_prefetch_k = int(num_prefetch_k_override)
-        assert 2 <= num_prefetch_k <= 6, (
-            f"num_prefetch_k must be in [2, 6], got {num_prefetch_k}")
-        if num_prefetch_k < 6:
-            import warnings
-            warnings.warn(
-                f"num_prefetch_k={num_prefetch_k} < 6 aliases live ring buffers "
-                "in the BN128 body (wrong output at 4, faults at 3). Probe only.",
-                stacklevel=2)
-    if bn128_pf:
-        dualwave_swp_kv_per_buffer = smem_k_tile_elems
-    else:
-        dualwave_swp_kv_per_buffer = smem_k_tile_elems + smem_v_tile_elems
+    # BN128 (the deep-pipeline shape: 6-deep K prefetch ring, Q held in
+    # registers, DMA V staging, packed-i32x8 direct PV) is the only shape fp8
+    # builds -- the shallow path's PV dispatch expects an unpacked P pair the
+    # body never produces, so it does not build at all. Ring depth is welded
+    # to 6: see the docstring for why fewer buffers aliases a live one.
+    bn128 = True
+    bn128_pf = True
+    qreg = True
+    vdma = True
+    num_prefetch_k = 6
+    dualwave_swp_kv_per_buffer = smem_k_tile_elems
     lds_kv_total_size = num_prefetch_k * dualwave_swp_kv_per_buffer
     dualwave_swp_k_buf_base = tuple(i * dualwave_swp_kv_per_buffer for i in range(num_prefetch_k))
     dualwave_swp_v_buf_base = tuple(smem_k_tile_elems + i * dualwave_swp_kv_per_buffer for i in range(num_prefetch_k))
@@ -943,17 +829,12 @@ def _make_dualwave_swp_fp8_traits(
     vls_bf = slw_bf + 64 // eb_bf
     vt_bf16_elems = snrpt_bf * sdrpt_bf * vls_bf
     fp8_v_tile_bytes = (block_n // 8) * (head_dim // 16) * 128
-    if bn128_pf:
-        vt_bf16_total = num_prefetch_k * (fp8_v_tile_bytes // eb_bf) + 128
-    else:
-        vt_bf16_total = (2 if deep_ring else num_prefetch_k) * vt_bf16_elems
+    vt_bf16_total = num_prefetch_k * (fp8_v_tile_bytes // eb_bf) + 128
 
     splitk = num_kv_splits > 1
 
-    fp8_pv = os.getenv("FLYDSL_FA_FP8_PV", "0") == "1"
-    fp8_pv_direct = bn128
-    if fp8_pv_direct:
-        fp8_pv = True
+    fp8_pv_direct = True
+    fp8_pv = True
 
     return DualwaveSwpFp8Traits(
         BLOCK_M=block_m,
@@ -980,24 +861,19 @@ def _make_dualwave_swp_fp8_traits(
         DAZ=bool(daz),
         DUALWAVE_SWP_LAZY_RESCALE=bool(dualwave_swp_lazy_rescale),
         DUALWAVE_SWP_SETPRIO=bool(dualwave_swp_setprio),
-        DUALWAVE_SWP_DEBUG_LAZY_COUNTS=bool(dualwave_swp_debug_lazy_counts),
         DUALWAVE_SWP_ENABLE_STAGGER=bool(dualwave_swp_enable_stagger),
         NUM_KV_SPLITS=num_kv_splits,
         SPLITK=splitk,
         VARLEN=bool(varlen),
-        CROSS_SEQLEN=bool(cross_seqlen),
         PAGED=bool(paged),
         # 2048 int32 entries = 8 KB of LDS, matching bf16. Caps a split's tile
         # count; the host checks the window before dispatching.
         PAGED_BT_LDS_SIZE=2048,
-        PREFETCH_BOUND=str(prefetch_bound),
         PV_SPREAD=bool(pv_spread),
         FP8_PV=fp8_pv,
-        FP8_PV_DIRECT=bool(fp8_pv_direct),
-        BN128=bool(bn128),
-        BN128_PF=bool(bn128_pf),
-        QREG=bool(qreg),
-        VDMA=bool(vdma),
+        FP8_PV_DIRECT=fp8_pv_direct,
+        QREG=qreg,
+        VDMA=vdma,
         DEFAULT_STRIDE_Q_N=default_stride_q_n,
         DEFAULT_STRIDE_KV_N=default_stride_kv_n,
         DMA_BYTES=16,

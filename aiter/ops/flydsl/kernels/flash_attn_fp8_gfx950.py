@@ -1,7 +1,6 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-# Portions Apache-2.0, Copyright (c) 2025 FlyDSL Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """gfx950 DUALWAVE_SWP FP8 flash attention, vendored from FlyDSL.
 
@@ -48,39 +47,30 @@ def build_flash_attn_dualwave_swp_fp8_module(
     num_heads,
     head_dim,
     causal=True,
-    dtype_str="bf16",
+    dtype_str="fp8",
     out_dtype_str="bf16",
     num_kv_heads=None,
     waves_per_eu=2,
     daz=True,
     dualwave_swp_lazy_rescale=True,
     dualwave_swp_setprio=True,
-    dualwave_swp_debug_lazy_counts=False,
     dualwave_swp_enable_stagger=True,
     num_kv_splits=1,
     varlen=False,
-    cross_seqlen=False,
     use_sinks=False,
-    bn128=None,
     paged=False,
-    prefetch_bound="none",
     pv_spread=False,
-    num_waves=8,
-    num_prefetch_k_override=None,
     gqa_pack_m=None,
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
-    The dense path supports bf16/f16/fp8 QKV. ``varlen`` builds the packed
-    variant: Q/O are ``[total_q, H, D]``, K/V are ``[total_kv, H_kv, D]``, and
-    per-batch ranges come from int32 ``cu_seqlens_q`` / ``cu_seqlens_kv``.
-    ``paged`` addresses KV through a block table instead of contiguously, with
-    page size fixed at BLOCK_N=64. fp8 supports all three of varlen, paged and
-    split-K, including in combination.
-
-    ``prefetch_bound="clamp"`` bounds the ring's forward prefetch. It defaults
-    off so the dense path stays bit-identical to upstream, and it is not a perf
-    win -- see the comment at its use site."""
+    This builder is fp8-only QKV (``dtype_str`` must be ``"fp8"``; see the
+    check below). ``varlen`` builds the packed variant: Q/O are
+    ``[total_q, H, D]``, K/V are ``[total_kv, H_kv, D]``, and per-batch ranges
+    come from int32 ``cu_seqlens_q`` / ``cu_seqlens_kv``. ``paged`` addresses
+    KV through a block table instead of contiguously, with page size fixed at
+    BLOCK_N=64. fp8 supports all three of varlen, paged and split-K, including
+    in combination."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -103,15 +93,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # fp8 varlen was rejected here too. It needed the active guard the fp8
     # context was missing (see compute_active_guard in the common module) plus
     # the BN128 pipeline held on independently of varlen; with both, it works.
-    #
-    # The shallow (bn128=False) fp8 path still does not build at all -- its PV
-    # dispatch expects an unpacked P pair that the body never produces -- so
-    # fp8 stays on BN128 whatever varlen says, rather than inheriting the
-    # upstream derivation that would turn it off here.
-    if dtype_str == "fp8":
-        if bn128 is False:
-            raise RuntimeError("fp8 flash_attn has no working non-BN128 path (bn128=False)")
-        bn128 = True
+    # fp8 always builds BN128 -- the shallow path's PV dispatch expects an
+    # unpacked P pair the body never produces, so it does not build at all.
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -130,8 +113,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # Sinks seed m_row per split, so under split-K exp(sink) would be counted
     # once per split in the combine denominator (the combine kernel has no sink
     # input to correct it). Refuse the combination rather than compute wrong
-    # output; the single-split path is fully supported. This is the production
-    # path -- the adapter never builds split-K.
+    # output; the single-split path is fully supported. The adapter's dispatch
+    # gate mirrors this: it never selects split-K when sinks is not None.
     if use_sinks and int(num_kv_splits) > 1:
         raise ValueError("attention sinks are not supported together with num_kv_splits > 1")
 
@@ -145,19 +128,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
         daz=daz,
         dualwave_swp_lazy_rescale=dualwave_swp_lazy_rescale,
         dualwave_swp_setprio=dualwave_swp_setprio,
-        dualwave_swp_debug_lazy_counts=dualwave_swp_debug_lazy_counts,
         dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
         num_kv_splits=num_kv_splits,
         varlen=varlen,
-        cross_seqlen=cross_seqlen,
         out_dtype_str=out_dtype_str,
         use_sinks=use_sinks,
-        bn128=bn128,
         paged=paged,
-        prefetch_bound=prefetch_bound,
         pv_spread=pv_spread,
-        num_waves=num_waves,
-        num_prefetch_k_override=num_prefetch_k_override,
         gqa_pack_m=gqa_pack_m,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
@@ -405,27 +382,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             # The ring prefetches two iterations ahead unconditionally, so the
             # last iterations fetch tiles past t_end -- a fixed 4-tile overshoot
-            # however long the range is, hence 1.29x KV traffic at M=1384 against
-            # 1.016x at M=32768. Clamping re-reads a live tile from L2 instead.
-            #
-            # Measured 2026-08-06: this changes nothing at any shape. The kernel
-            # is latency-bound, not bandwidth-bound, at every measured size, so
-            # the overshoot was already absorbed by ring slack. Kept because it
-            # is free and strictly less wasteful, not because it is a win; do not
-            # expect it to help, and do not remove it expecting a regression.
-            #
-            # Clamping the tile INDEX rather than branching keeps the loop one
-            # basic block. That matters: the loop carries a dense
-            # sched_group_barrier schedule, and causal_mask_pair_if_needed
-            # documents that an scf.if here splits it into five blocks and
-            # breaks the QK/softmax/PV interleave. Same trick as
-            # page_id_for_tile, for the same reason.
-            t_last = t_end - fx.Index(1)
-
+            # however long the range is. This is free: the kernel is
+            # latency-bound, not bandwidth-bound, at every measured size, so the
+            # overshoot is already absorbed by ring slack.
             def _pf_tile(x):
-                if const_expr(traits.PREFETCH_BOUND != "clamp"):
-                    return x
-                return fx.Index((x < t_last).select(x, t_last))
+                return x
 
             init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
             loop_results = init_args
@@ -595,6 +556,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
+        combine_rows: fx.Int32,
     ):
         ctx = DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n, CuSeqQ=CuSeqQ)
         ctx.init_types_and_constants()
@@ -603,12 +565,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ctx.init_workspace()
         ctx.init_descriptors()
 
-        combine = DualwaveSplitKCombineHelper(ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
-        o_pack = combine.pack_output(acc, den)
-        combine.store_output(o_pack)
+        # The grid is rounded up to a whole number of COMBINE_ROWS_PER_BLOCK
+        # blocks, so the last block can carry rows past combine_rows (when
+        # combine_rows isn't a multiple of 8) -- guard those into a no-op
+        # rather than reading/writing past the workspace/O bounds.
+        row_active = ctx.row < fx.Index(combine_rows)
+
+        @flyc.jit
+        def _run_combine_if_active():
+            if row_active:
+                combine = DualwaveSplitKCombineHelper(ctx)
+                m_s, l_s = combine.load_ml_rows()
+                m_max = combine.reduce_m_max(m_s)
+                acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+                o_pack = combine.pack_output(acc, den)
+                combine.store_output(o_pack)
+
+        _run_combine_if_active()
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
@@ -684,8 +657,18 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
         if const_expr(SPLITK):
             combine_rows = bs_idx * NUM_HEADS_Q * sl_idx
-            flash_attn_splitk_combine_kernel(O, DebugCounts, CuSeqQ, batch_size, seq_len, stride_q_n).launch(
-                grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
+            # Round the grid up rather than floor-dividing: combine_rows is not
+            # always a multiple of COMBINE_ROWS_PER_BLOCK (8) outside the
+            # production NUM_HEADS_Q=64 configuration. The combine kernel body
+            # guards row < combine_rows, so the extra rows in the rounded-up
+            # last block are a no-op rather than an OOB write, and a
+            # combine_rows < 8 launch still gets one active block instead of a
+            # zero-size grid.
+            combine_grid_x = (combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK) - fx.Index(1)) // fx.Index(COMBINE_ROWS_PER_BLOCK)
+            flash_attn_splitk_combine_kernel(
+                O, DebugCounts, CuSeqQ, batch_size, seq_len, stride_q_n, fx.Int32(combine_rows)
+            ).launch(
+                grid=(combine_grid_x, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
             )
