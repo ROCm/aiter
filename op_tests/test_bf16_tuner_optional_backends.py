@@ -111,7 +111,7 @@ def test_registered_vllm_op_resolution_and_schema(monkeypatch):
 
     class FakeOp:
         default = SimpleNamespace(
-            _schema=(
+            _schema=torch._C.parse_schema(
                 "_rocm_C::wvSplitK(Tensor in_a, Tensor in_b, "
                 "Tensor? in_bias, int CuCount) -> Tensor"
             )
@@ -133,6 +133,29 @@ def test_registered_vllm_op_resolution_and_schema(monkeypatch):
     weight, activation = object(), object()
     assert op(weight, activation, None, 304) is activation
     assert calls == [(weight, activation, None, 304)]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    (
+        (
+            "_rocm_C::wvSplitK(Tensor in_a, Tensor in_b, "
+            "int CuCount, Tensor? in_bias) -> Tensor"
+        ),
+        (
+            "_rocm_C::wvSplitK(Tensor in_a, Tensor in_b, "
+            "Tensor? CuCount, int in_bias) -> Tensor"
+        ),
+        (
+            "_rocm_C::wvSplitK(Tensor in_b, Tensor in_a, "
+            "Tensor? in_bias, int CuCount) -> Tensor"
+        ),
+    ),
+)
+def test_registered_vllm_schema_rejects_reordered_or_retyped_arguments(schema):
+    op = SimpleNamespace(default=SimpleNamespace(_schema=torch._C.parse_schema(schema)))
+    with pytest.raises(ValueError, match="unexpected _rocm_C.wvSplitK schema"):
+        tune._registered_wvsplitk_schema(op)
 
 
 def test_supplied_vllm_library_rejects_bad_registered_schema(tmp_path, monkeypatch):
@@ -228,6 +251,50 @@ def test_small_m_task_generation_uses_distinct_libtype(monkeypatch):
     assert len(tasks) == 1
     assert tasks[0][0][4] == "flydsl_small_m"
     assert "_m5_n128_k128_" in tasks[0][0][3]
+
+
+def test_small_m_task_generation_skips_unsupported_architecture(monkeypatch):
+    messages = []
+    monkeypatch.setattr(tune.logger, "info", messages.append)
+    monkeypatch.setattr(
+        tune,
+        "iter_small_m_registry_configs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsupported architecture must not enumerate")
+        ),
+    )
+    monkeypatch.setattr(
+        tune,
+        "get_gfx_runtime",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unsupported architecture must not select runtime traits")
+        ),
+    )
+    tasks = _tuner()._get_flydsl_small_m_tasks(
+        (
+            "gfx1250",
+            80,
+            5,
+            128,
+            128,
+            False,
+            str(torch.bfloat16),
+            str(torch.bfloat16),
+            False,
+            False,
+        ),
+        False,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        False,
+        {},
+    )
+    assert tasks == []
+    assert messages == [
+        "FlyDSL small-M unavailable for gfx1250: supported architectures "
+        "are gfx942, gfx950"
+    ]
 
 
 def test_vllm_results_are_profile_only(tmp_path):

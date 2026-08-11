@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Coverage for the dedicated small-M BF16 HGEMM family, including its gfx942 port.
+"""Coverage for the gfx942/gfx950 small-M BF16 HGEMM family.
 
-The gfx942 port uses the native `16x16x16` BF16 MFMA atom twice per logical K32
+The gfx942 path uses the native `16x16x16` BF16 MFMA atom twice per logical K32
 step and offers two global-to-LDS staging forms as an explicit compile-time
 axis. Hardware tests run on the attached architecture; architecture legality is
 additionally checked statically with `llvm-mc` so the gfx950-only forms are
@@ -23,7 +23,12 @@ import torch
 pytest.importorskip("flydsl")
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm,
+    flydsl_kernel_name,
+    get_flydsl_splitk_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.kernels import small_m_hgemm
 from aiter.ops.flydsl.kernels.small_m_hgemm import (
     LDS_STAGING_DIRECT,
     LDS_STAGING_OPTIONS,
@@ -51,10 +56,14 @@ ARCH = get_gfx()
 IS_GFX942 = ARCH == "gfx942"
 
 requires_gfx942 = pytest.mark.skipif(
-    not IS_GFX942, reason="the small-M gfx942 port requires a gfx942 device"
+    not IS_GFX942, reason="requires a gfx942 device"
 )
 requires_gfx950 = pytest.mark.skipif(
     ARCH != "gfx950", reason="requires a gfx950 device"
+)
+requires_small_m_arch = pytest.mark.skipif(
+    ARCH not in {"gfx942", "gfx950"},
+    reason="small-M HGEMM supports gfx942 and gfx950",
 )
 
 
@@ -162,7 +171,7 @@ def test_gfx942_uses_the_native_k16_bf16_atom():
     )
 
 
-def test_gfx950_arch_params_are_unchanged():
+def test_gfx950_uses_the_native_k32_bf16_atom():
     params = small_m_arch_params("gfx950")
     assert params["wmma_cls"] is WmmaHalf_m16n16k32
     assert params["mfma_per_warp_k"] == 1
@@ -172,6 +181,52 @@ def test_gfx950_arch_params_are_unchanged():
 def test_lds_capacity_is_architecture_aware():
     assert small_m_max_lds_bytes("gfx942") == 65536
     assert small_m_max_lds_bytes("gfx950") == 163840
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        lambda: small_m_arch_params("gfx1250"),
+        lambda: small_m_max_lds_bytes("gfx1250"),
+        lambda: small_m_kernel_name(
+            "gfx1250",
+            "bf16",
+            5,
+            128,
+            128,
+            tile_n=128,
+            tile_k=64,
+            split_k=1,
+            block_n_warps=2,
+            n_tile_repeat=1,
+            persistent_n_tiles=1,
+            waves_per_eu=0,
+            b_to_lds_unroll=0,
+            b_to_lds=False,
+            has_bias=False,
+        ),
+    ),
+)
+def test_host_interfaces_reject_unsupported_architectures(operation):
+    with pytest.raises(ValueError, match="unsupported small-M architecture 'gfx1250'"):
+        operation()
+
+
+def test_unsupported_architecture_registry_is_empty(monkeypatch):
+    monkeypatch.setattr(small_m_hgemm, "get_rocm_arch", lambda: "gfx1250")
+    assert not list(
+        iter_small_m_registry_configs("bf16", "bf16", m=5, n=128, k=128)
+    )
+
+
+def test_explicit_unsupported_compile_rejects_before_selecting_isa(monkeypatch):
+    monkeypatch.setattr(
+        small_m_hgemm,
+        "small_m_arch_params",
+        lambda _: (_ for _ in ()).throw(AssertionError("must not select ISA")),
+    )
+    with pytest.raises(ValueError, match="unsupported small-M architecture 'gfx1250'"):
+        compile_small_m_hgemm_kernel("bf16", 128, 128, ARCH="gfx1250")
 
 
 def test_lds_model_matches_the_kernel_allocation():
@@ -195,7 +250,7 @@ def test_lds_model_matches_the_kernel_allocation():
         "ds_read_b128 v[4:7], v0",
     ],
 )
-def test_gfx942_supports_every_instruction_the_port_emits(instruction):
+def test_gfx942_supports_every_emitted_instruction(instruction):
     if _llvm_mc() is None:
         pytest.skip("llvm-mc is not available")
     assert assembles("gfx942", instruction)
@@ -217,12 +272,16 @@ def test_gfx950_only_forms_are_rejected_by_gfx942(instruction):
     assert not assembles("gfx942", instruction)
 
 
-def test_non_gfx942_rejects_the_vgpr_staging_variant():
-    if IS_GFX942:
-        pytest.skip("this device is gfx942, where both staging forms exist")
+def test_gfx950_rejects_the_vgpr_staging_variant():
     with pytest.raises(ValueError, match="only implemented for gfx942"):
         compile_small_m_hgemm_kernel(
-            "bf16", 128, 128, TILE_N=128, BLOCK_N_WARPS=2, LDS_STAGING=LDS_STAGING_VGPR
+            "bf16",
+            128,
+            128,
+            ARCH="gfx950",
+            TILE_N=128,
+            BLOCK_N_WARPS=2,
+            LDS_STAGING=LDS_STAGING_VGPR,
         )
 
 
@@ -231,6 +290,7 @@ def test_non_gfx942_rejects_the_vgpr_staging_variant():
 # ---------------------------------------------------------------------------
 
 
+@requires_small_m_arch
 def test_registry_configs_are_resource_safe():
     configs = list(
         iter_small_m_registry_configs("bf16", "bf16", m=8, n=7168, k=7168)
@@ -324,7 +384,32 @@ def test_versioned_kernel_name_round_trips_every_axis(m, lds_staging):
     assert config["b_to_lds_unroll"] == 8
 
 
-def test_staging_variants_have_distinct_names_and_stale_names_are_rejected():
+def test_generic_hgemm_identity_rejects_small_m_suffix():
+    unversioned = (
+        "flydsl_gemm2_abf16_wbf16_bf16_t16x128x64_split_k1_"
+        "block_m_warp1_block_n_warp2_block_k_warp1_async_copyFalse_"
+        "b_to_ldsFalse_b_preshuffleFalse_c_to_ldsFalse_small_m_gfx942"
+    )
+    assert get_flydsl_splitk_hgemm_kernel_params(unversioned) is None
+    with pytest.raises(ValueError, match="generic kernel names require 'hgemm'"):
+        flydsl_kernel_name(
+            2,
+            "bf16",
+            "bf16",
+            16,
+            128,
+            64,
+            1,
+            1,
+            2,
+            1,
+            ARCH != "gfx942",
+            False,
+            kernel_family="small_m",
+        )
+
+
+def test_staging_variants_have_distinct_names_and_invalid_names_are_rejected():
     common = dict(
         tile_n=128,
         tile_k=64,
@@ -350,7 +435,8 @@ def test_staging_variants_have_distinct_names_and_stale_names_are_rejected():
         parse_small_m_kernel_name(vgpr.replace("agfx942", "agfx950"))
 
 
-def test_aot_csv_parser_recognizes_small_m_and_rejects_stale_rows(tmp_path):
+@requires_small_m_arch
+def test_aot_csv_parser_requires_versioned_small_m_identity(tmp_path):
     from aiter.aot.flydsl.gemm import parse_csv
 
     cu_num = 304 if ARCH == "gfx942" else 256
@@ -368,12 +454,20 @@ def test_aot_csv_parser_recognizes_small_m_and_rejects_stale_rows(tmp_path):
 
     csv_path.write_text(
         "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
-        f"{ARCH},{cu_num},5,128,128,False,flydsl_small_m,old_small_m_name\n"
+        f"{ARCH},{cu_num},5,128,128,False,flydsl_small_m,unversioned_small_m\n"
     )
     with pytest.raises(ValueError, match="unrecognized"):
         parse_csv(str(csv_path))
 
+    csv_path.write_text(
+        "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
+        f"{ARCH},{cu_num},5,128,128,False,flydsl,{name}\n"
+    )
+    with pytest.raises(ValueError, match="require libtype=flydsl_small_m"):
+        parse_csv(str(csv_path))
 
+
+@requires_small_m_arch
 def test_synthetic_tuned_csv_dispatches_exact_small_m(tmp_path, monkeypatch):
     import aiter.tuned_gemm as tuned_gemm
     from aiter.jit.core import AITER_CONFIGS
@@ -415,6 +509,7 @@ def test_synthetic_tuned_csv_dispatches_exact_small_m(tmp_path, monkeypatch):
         tuned_gemm.get_GEMM_A16W16_config.cache_clear()
 
 
+@requires_small_m_arch
 def test_small_m_runtime_reloads_from_disk_cache(tmp_path, monkeypatch):
     import aiter.tuned_gemm as tuned_gemm
     from aiter.ops.flydsl.gemm_kernels import _compile_flydsl_hgemm
@@ -461,7 +556,13 @@ def test_small_m_runtime_reloads_from_disk_cache(tmp_path, monkeypatch):
 def test_indivisible_k_is_rejected_not_truncated(k):
     with pytest.raises(ValueError, match="no legal small-M K schedule"):
         compile_small_m_hgemm_kernel(
-            "bf16", 128, k, TILE_N=128, TILE_K=64, BLOCK_N_WARPS=2
+            "bf16",
+            128,
+            k,
+            ARCH="gfx942",
+            TILE_N=128,
+            TILE_K=64,
+            BLOCK_N_WARPS=2,
         )
 
 
@@ -472,6 +573,7 @@ def test_indivisible_n_is_rejected_not_truncated(tile_n, block_n_warps):
             "bf16",
             6288,
             768,
+            ARCH="gfx942",
             TILE_N=tile_n,
             TILE_K=64,
             BLOCK_N_WARPS=block_n_warps,
@@ -562,7 +664,13 @@ def test_swizzle_unsafe_tile_k_is_rejected(tile_k):
     assert not small_m_tile_k_is_swizzle_safe(tile_k)
     with pytest.raises(ValueError, match="LDS swizzle"):
         compile_small_m_hgemm_kernel(
-            "bf16", 512, 768, TILE_N=64, TILE_K=tile_k, BLOCK_N_WARPS=1
+            "bf16",
+            512,
+            768,
+            ARCH="gfx942",
+            TILE_N=64,
+            TILE_K=tile_k,
+            BLOCK_N_WARPS=1,
         )
 
 

@@ -181,7 +181,7 @@ def fail_on_aot_cache_miss(
         def wrapper(*args, **kwargs):
             orig_run_compiled = getattr(run_compiled_module, run_compiled_name)
 
-            def run_compiled_tracked(exe, compile_args):
+            def run_compiled_tracked(exe, *compile_args):
                 if exe not in jit_fns_seen:
                     jit_fns_seen.append(exe)
                 try:
@@ -191,7 +191,7 @@ def fail_on_aot_cache_miss(
                     last_cache_key[id(exe)] = exe._build_full_cache_key(bound.arguments)
                 except Exception:
                     pass
-                return orig_run_compiled(exe, compile_args)
+                return orig_run_compiled(exe, *compile_args)
 
             setattr(run_compiled_module, run_compiled_name, run_compiled_tracked)
             try:

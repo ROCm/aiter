@@ -24,7 +24,6 @@ from aiter.jit.utils.chip_info import get_gfx
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from .kernels.small_m_hgemm import LDS_STAGING_DIRECT
 
-# from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
@@ -57,13 +56,6 @@ _HGEMM_KERNEL_RE = re.compile(
     r"b_to_lds(?P<b_to_lds>True|False)_"
     r"b_preshuffle(?P<b_preshuffle>True|False)_"
     r"c_to_lds(?P<c_to_lds>True|False)"
-    r"(?P<small_m_suffix>"
-    r"(?:_small_m)"
-    r"(?:_nr(?P<n_tile_repeat>\d+))?"
-    r"(?:_pn(?P<persistent_n_tiles>\d+))?"
-    r"(?:_wpe(?P<waves_per_eu>\d+))?"
-    r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
-    r")?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
@@ -80,10 +72,8 @@ def _ptr_view_safe(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
-# Keep the generic auto-generated catalog aligned with the upstream FlyDSL
-# reference tuning space. The wider local one-off search space introduced
-# gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
-# and higher split-K values are now capped at 8 for better accuracy.
+# The generic catalog uses power-of-two tile sizes with split-K capped for
+# numerical accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
@@ -142,10 +132,6 @@ def flydsl_kernel_name(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
 ) -> str:
     async_copy, c_to_lds = _normalize_supported_kernel_metadata(
         async_copy=async_copy,
@@ -157,8 +143,11 @@ def flydsl_kernel_name(
         )
     if kernel_family == KERNEL_FAMILY_HGEMM and b_preshuffle:
         raise ValueError("Current generic kernel only supports `b_preshuffle=False`")
-    if kernel_family == KERNEL_FAMILY_SMALL_M and b_preshuffle:
-        raise ValueError("small-M kernel only supports `b_preshuffle=False`")
+    if kernel_family != KERNEL_FAMILY_HGEMM:
+        raise ValueError(
+            f"Unsupported kernel_family={kernel_family!r}; generic kernel names "
+            f"require {KERNEL_FAMILY_HGEMM!r}"
+        )
     name = (
         f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
@@ -167,21 +156,6 @@ def flydsl_kernel_name(
         f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
         f"_c_to_lds{c_to_lds}"
     )
-    if kernel_family == KERNEL_FAMILY_SMALL_M:
-        name += "_small_m"
-        if n_tile_repeat > 1:
-            name += f"_nr{n_tile_repeat}"
-        if persistent_n_tiles > 1:
-            name += f"_pn{persistent_n_tiles}"
-        if waves_per_eu > 0:
-            name += f"_wpe{waves_per_eu}"
-        if b_to_lds_unroll > 0:
-            name += f"_ur{b_to_lds_unroll}"
-    elif kernel_family != KERNEL_FAMILY_HGEMM:
-        raise ValueError(
-            f"Unsupported kernel_family={kernel_family!r}; expected "
-            f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
-        )
     name += f"_{get_gfx()}"
     return name
 
@@ -552,15 +526,10 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
     if m.group("a_dtype") != m.group("w_dtype"):
         return None
 
-    kernel_family = (
-        KERNEL_FAMILY_SMALL_M
-        if m.group("small_m_suffix") is not None
-        else KERNEL_FAMILY_HGEMM
-    )
     block_k_warps = m.group("block_k_warps")
     block_k_warps = int(block_k_warps) if block_k_warps else 1
     config: Dict[str, object] = {
-        "kernel_family": kernel_family,
+        "kernel_family": KERNEL_FAMILY_HGEMM,
         "stages": int(m.group("stages")),
         "tile_m": int(m.group("tile_m")),
         "tile_n": int(m.group("tile_n")),
@@ -577,11 +546,6 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         "out_dtype": m.group("out_dtype"),
         "target_gfx": m.group("target_gfx"),
     }
-    if kernel_family == KERNEL_FAMILY_SMALL_M:
-        config["n_tile_repeat"] = int(m.group("n_tile_repeat") or 1)
-        config["persistent_n_tiles"] = int(m.group("persistent_n_tiles") or 1)
-        config["waves_per_eu"] = int(m.group("waves_per_eu") or 0)
-        config["b_to_lds_unroll"] = int(m.group("b_to_lds_unroll") or 0)
     return config
 
 
@@ -658,43 +622,6 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["c_to_lds"],
             )
             kernels[name] = config
-    # NOTE: Keep the old small_m registry generation here for now, but leave it
-    # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
-    # Before re-enabling it, `flydsl_kernel_name` must also encode the small-M
-    # `lds_staging` axis; otherwise the two gfx942 staging variants collapse onto
-    # one name and the catalog silently keeps whichever was generated last.
-    #
-    # if m is not None and n is not None and k is not None:
-    #     for config in (
-    #         iter_small_m_registry_configs(
-    #             dtype,
-    #             out_dtype,
-    #             m=m,
-    #             n=n,
-    #             k=k,
-    #         )
-    #         or ()
-    #     ):
-    #         name = flydsl_kernel_name(
-    #             config["stage"],
-    #             dtype,
-    #             out_dtype,
-    #             config["tile_m"],
-    #             config["tile_n"],
-    #             config["tile_k"],
-    #             config["split_k"],
-    #             config["block_m_warps"],
-    #             config["block_n_warps"],
-    #             config["async_copy"],
-    #             config["b_to_lds"],
-    #             c_to_lds=config["c_to_lds"],
-    #             kernel_family=KERNEL_FAMILY_SMALL_M,
-    #             n_tile_repeat=config["n_tile_repeat"],
-    #             persistent_n_tiles=config["persistent_n_tiles"],
-    #             waves_per_eu=config["waves_per_eu"],
-    #             b_to_lds_unroll=config["b_to_lds_unroll"],
-    #         )
-    #         kernels[name] = config
     return kernels
 
 

@@ -14,6 +14,7 @@ import functools
 import hashlib
 import importlib
 import os
+import re
 import sys
 from functools import lru_cache
 
@@ -36,6 +37,7 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 
 FLYDSL_TUNE_ERROR = None
+FLYDSL_SMALL_M_SUPPORTED_ARCHS = frozenset({"gfx942", "gfx950"})
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
@@ -77,20 +79,66 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
+def _normalize_schema_type(type_text):
+    normalized = re.sub(r"\([^)]*\)", "", str(type_text)).replace(" ", "")
+    if normalized == "Optional[Tensor]":
+        return "Tensor?"
+    return normalized
+
+
+def _normalized_registered_schema(schema):
+    arguments = getattr(schema, "arguments", None)
+    returns = getattr(schema, "returns", None)
+    if arguments is not None and returns is not None:
+        return (
+            tuple(
+                (argument.name, _normalize_schema_type(argument.type))
+                for argument in arguments
+            ),
+            tuple(_normalize_schema_type(result.type) for result in returns),
+        )
+
+    schema_text = str(schema)
+    try:
+        argument_text = schema_text.split("(", 1)[1].rsplit(")", 1)[0]
+        return_text = schema_text.rsplit("->", 1)[1].strip()
+    except IndexError as error:
+        raise ValueError(f"unparseable schema: {schema_text}") from error
+
+    normalized_arguments = []
+    for declaration in argument_text.split(","):
+        declaration = declaration.strip().split("=", 1)[0].strip()
+        parts = declaration.rsplit(None, 1)
+        if len(parts) != 2:
+            raise ValueError(f"unparseable schema argument: {declaration!r}")
+        type_text, name = parts
+        normalized_arguments.append((name, _normalize_schema_type(type_text)))
+    return (
+        tuple(normalized_arguments),
+        tuple(_normalize_schema_type(item) for item in return_text.split(",")),
+    )
+
+
 def _registered_wvsplitk_schema(op):
     overload = getattr(op, "default", op)
     schema = getattr(overload, "_schema", None)
     if schema is None:
         raise ValueError("registered _rocm_C.wvSplitK op has no inspectable schema")
-    schema_text = str(schema)
     expected = (
-        "Tensor in_a",
-        "Tensor in_b",
-        "Tensor? in_bias",
-        "int CuCount",
-        "-> Tensor",
+        (
+            ("in_a", "Tensor"),
+            ("in_b", "Tensor"),
+            ("in_bias", "Tensor?"),
+            ("CuCount", "int"),
+        ),
+        ("Tensor",),
     )
-    if not all(fragment in schema_text for fragment in expected):
+    try:
+        normalized = _normalized_registered_schema(schema)
+    except ValueError:
+        normalized = None
+    schema_text = str(schema)
+    if normalized != expected:
         raise ValueError(f"unexpected _rocm_C.wvSplitK schema: {schema_text}")
     return schema_text
 
@@ -1144,6 +1192,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         ):
             return []
         arch = str(info_keys[0])
+        if arch not in FLYDSL_SMALL_M_SUPPORTED_ARCHS:
+            supported = ", ".join(sorted(FLYDSL_SMALL_M_SUPPORTED_ARCHS))
+            logger.info(
+                f"FlyDSL small-M unavailable for {arch}: supported architectures "
+                f"are {supported}"
+            )
+            return []
         runtime_arch = get_gfx_runtime()
         if arch != runtime_arch:
             raise ValueError(

@@ -78,13 +78,13 @@ __all__ = [
 ]
 
 SMALL_M_KERNEL_MAX = 17
+SMALL_M_SUPPORTED_ARCHS = frozenset({"gfx942", "gfx950"})
 TILE_M = 16
 BLOCK_M_WARPS = 1
 STAGES = 2
 WARP_SIZE = 64
 DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
-DEFAULT_MAX_LDS_BYTES = 65536
 
 # Global-to-LDS staging policy. `direct` issues `buffer_load_* ... lds`, which
 # needs no staging VGPR and no explicit DS write but is limited to the widest
@@ -163,7 +163,17 @@ def small_m_tile_k_is_swizzle_safe(tile_k: int) -> bool:
 
 def small_m_max_lds_bytes(arch: str) -> int:
     """LDS capacity the small-M kernel may use on `arch`."""
-    return SMEM_CAPACITY_MAP.get(arch, DEFAULT_MAX_LDS_BYTES)
+    _require_small_m_arch(arch)
+    return SMEM_CAPACITY_MAP[arch]
+
+
+def _require_small_m_arch(arch: str) -> None:
+    if arch not in SMALL_M_SUPPORTED_ARCHS:
+        supported = ", ".join(sorted(SMALL_M_SUPPORTED_ARCHS))
+        raise ValueError(
+            f"unsupported small-M architecture {arch!r}; supported architectures: "
+            f"{supported}"
+        )
 
 
 def small_m_arch_params(arch: str) -> dict:
@@ -171,8 +181,9 @@ def small_m_arch_params(arch: str) -> dict:
 
     gfx942 has no `16x16x32` BF16 MFMA and no wide LDS DMA, so it uses the
     native `16x16x16` atom twice per logical K32 step and a 4-byte direct
-    global-to-LDS transfer. gfx950 keeps its existing `16x16x32` / 16-byte form.
+    global-to-LDS transfer. gfx950 uses the `16x16x32` / 16-byte form.
     """
+    _require_small_m_arch(arch)
     if arch == "gfx942":
         return {
             "wmma_cls": WmmaHalf_m16n16k16,
@@ -187,6 +198,7 @@ def small_m_arch_params(arch: str) -> dict:
 
 
 def _small_m_tile_n_options(arch: str) -> tuple[int, ...]:
+    _require_small_m_arch(arch)
     if arch == "gfx942":
         return tuple(
             sorted(SMALL_M_GFX942_EXTRA_TILE_N_OPTIONS + SMALL_M_TILE_N_OPTIONS)
@@ -261,6 +273,7 @@ def small_m_kernel_name(
     has_bias: bool,
     lds_staging: str = LDS_STAGING_DIRECT,
 ) -> str:
+    _require_small_m_arch(arch)
     if lds_staging not in LDS_STAGING_OPTIONS:
         raise ValueError(f"unrecognized LDS staging policy: {lds_staging!r}")
     return (
@@ -365,6 +378,7 @@ def _validate_small_m_registry_config(
 ) -> None:
     del waves_per_eu
 
+    _require_small_m_arch(arch)
     if lds_staging not in LDS_STAGING_OPTIONS:
         raise ValueError
     if not (1 <= m < SMALL_M_KERNEL_MAX):
@@ -510,7 +524,11 @@ def iter_small_m_registry_configs(
     if dtype != "bf16" or out_dtype != "bf16":
         return
 
+    # Device discovery is process-global because supported deployments expose
+    # one homogeneous GPU architecture per process.
     gpu_arch = get_rocm_arch()
+    if gpu_arch not in SMALL_M_SUPPORTED_ARCHS:
+        return
     if not (1 <= m < SMALL_M_KERNEL_MAX):
         return
 
@@ -612,6 +630,7 @@ def compile_small_m_hgemm_kernel(
         )
 
     GPU_ARCH = get_rocm_arch() if ARCH is None else ARCH
+    _require_small_m_arch(GPU_ARCH)
     ARCH_PARAMS = small_m_arch_params(GPU_ARCH)
     if GPU_ARCH != "gfx942" and LDS_STAGING != LDS_STAGING_DIRECT:
         raise ValueError(

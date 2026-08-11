@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import multiprocessing
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,8 +15,30 @@ pytest.importorskip("flydsl")
 from aiter.aot.flydsl.common import (
     OpKind,
     _make_sequential_aot_run,
+    fail_on_aot_cache_miss,
     wait_aot,
 )
+from aiter.ops.flydsl.kernels import tensor_shim
+
+
+class _TrackedExecutable:
+    def __init__(self, cache_dir, misses):
+        self.calls = []
+        self._cf = lambda *args: self.calls.append(args)
+        self._sig = inspect.signature(lambda first, second: None)
+        self.func = SimpleNamespace(__name__="tracked_kernel")
+        self.manager_key = "test-manager"
+        self.cache_manager = SimpleNamespace(cache_dir=cache_dir)
+        self._misses = misses
+
+    def _ensure_sig(self):
+        return None
+
+    def _build_full_cache_key(self, arguments):
+        return tuple(arguments.items())
+
+    def cache_info(self):
+        return SimpleNamespace(misses=self._misses)
 
 
 def _record_worker_arch(kind, job):
@@ -45,6 +69,30 @@ def _record_or_fail(kind, job):
         raise RuntimeError("intentional worker failure")
     time.sleep(0.1)
     return kind, {"kernel_name": job["kernel_name"], "compile_time": 0.01}
+
+
+def test_aot_cache_guard_forwards_real_helper_arguments(tmp_path):
+    executable = _TrackedExecutable(tmp_path, misses=0)
+
+    @fail_on_aot_cache_miss(tensor_shim)
+    def launch(first, second):
+        tensor_shim._run_compiled(executable, first, second)
+
+    launch("first", "second")
+    assert executable.calls == [("first", "second")]
+
+
+def test_aot_cache_guard_reports_real_helper_miss(tmp_path):
+    executable = _TrackedExecutable(tmp_path, misses=1)
+
+    @fail_on_aot_cache_miss(tensor_shim)
+    def launch(first, second):
+        tensor_shim._run_compiled(executable, first, second)
+
+    with pytest.raises(RuntimeError, match="AOT cache miss") as error:
+        launch("first", "second")
+    assert "tracked_kernel" in str(error.value)
+    assert executable.calls == [("first", "second")]
 
 
 @pytest.mark.parametrize("configured_cap", (1, 2, 8))

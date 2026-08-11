@@ -539,8 +539,8 @@ def mp_tuner(
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     failed_tasks.append((k, "unknown error"))
 
-                    # Always record a dummy result so reconstruction never sees an empty list
-                    # (previously only timeout path did this; async.get() failures left no result_dict[k]).
+                    # Record a dummy result so reconstruction has one entry for
+                    # every failed task.
                     dummy_results = []
                     add_dummy_result(k, dummy_results)
                     result_dict[k] = (

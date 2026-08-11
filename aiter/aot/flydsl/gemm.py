@@ -151,6 +151,13 @@ def parse_csv(csv_path: str):
             }
             if libtype not in supported_libtypes:
                 continue
+            if (
+                kernel_name.startswith("flydsl_small_m_v1")
+                and libtype != "flydsl_small_m"
+            ):
+                raise ValueError(
+                    "flydsl_small_m_v1 kernels require libtype=flydsl_small_m"
+                )
             if not kernel_name.startswith("flydsl_"):
                 if libtype == "flydsl_small_m":
                     raise ValueError(
