@@ -23,6 +23,7 @@ cannot express, so this file keeps its own fp32 reference.
 
 Clear ~/.flydsl/cache before trusting a run after a kernel edit.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,7 +34,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -70,11 +71,11 @@ SPLITS = (2, 4, 8)
 
 
 def _build_mods():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
     from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
         dualwave_splitk_workspace_elems as ws_elems,
+    )
+    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
+        build_flash_attn_dualwave_swp_fp8_module as build,
     )
 
     return build, ws_elems
@@ -93,13 +94,13 @@ def reference_mixed(qf, qs, kf, ks, vf, vs, cu_q, cu_kv, causal, d):
     for i in range(b):
         ql, qh = int(cu_q[i]), int(cu_q[i + 1])
         kl, kh = int(cu_kv[i]), int(cu_kv[i + 1])
-        q = qf[ql:qh].float() * qs                      # [Lq, H, D]
-        k = kf[kl:kh].float() * ks                      # [Lk, HKV, D]
+        q = qf[ql:qh].float() * qs  # [Lq, H, D]
+        k = kf[kl:kh].float() * ks  # [Lk, HKV, D]
         v = vf[kl:kh].float() * vs
         rep = H // k.shape[1]
-        kt = k.repeat_interleave(rep, 1).transpose(0, 1)   # [H, Lk, D]
+        kt = k.repeat_interleave(rep, 1).transpose(0, 1)  # [H, Lk, D]
         vt = v.repeat_interleave(rep, 1).transpose(0, 1)
-        att = q.transpose(0, 1) @ kt.transpose(-1, -2) / (d ** 0.5)  # [H, Lq, Lk]
+        att = q.transpose(0, 1) @ kt.transpose(-1, -2) / (d**0.5)  # [H, Lq, Lk]
         if causal:
             lq, lk = att.shape[1], att.shape[2]
             # right-aligned causal: query row r (0-based) sees kv <= lk-lq+r.
@@ -107,7 +108,7 @@ def reference_mixed(qf, qs, kf, ks, vf, vs, cu_q, cu_kv, causal, d):
             cols = torch.arange(lk, device=DEV).view(1, lk)
             mask = cols > (lk - lq + rows)
             att = att.masked_fill(mask.view(1, lq, lk), float("-inf"))
-        out[ql:qh] = (att.softmax(-1) @ vt).transpose(0, 1)   # [Lq, H, D]
+        out[ql:qh] = (att.softmax(-1) @ vt).transpose(0, 1)  # [Lq, H, D]
     return out
 
 
@@ -161,36 +162,60 @@ def _run_mixed(build, ws_elems, splits, paged, causal, d, seed):
     else:
         kv_k, kv_v = kf, vf
 
-    mod = build(num_heads=H, head_dim=d, causal=causal, dtype_str="fp8",
-                num_kv_heads=HKV, num_kv_splits=splits, paged=paged,
-                varlen=True, gqa_pack_m=True)
+    mod = build(
+        num_heads=H,
+        head_dim=d,
+        causal=causal,
+        dtype_str="fp8",
+        num_kv_heads=HKV,
+        num_kv_splits=splits,
+        paged=paged,
+        varlen=True,
+        gqa_pack_m=True,
+    )
     o = torch.empty(total_q, H, d, device=DEV, dtype=torch.bfloat16)
     ws = torch.zeros(ws_elems(b, H, max_q, splits, d), device=DEV, dtype=torch.float32)
-    mod(qf.contiguous().view(-1), kv_k.contiguous().view(-1),
-        kv_v.contiguous().view(-1), o.contiguous().view(-1), b, max_q,
-        workspace=ws, q_descale=qs, k_descale=ks, v_descale=vs, **kwargs)
+    mod(
+        qf.contiguous().view(-1),
+        kv_k.contiguous().view(-1),
+        kv_v.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        max_q,
+        workspace=ws,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        **kwargs,
+    )
     torch.cuda.synchronize()
 
     ref = reference_mixed(qf, qs, kf, ks, vf, vs, cu_q, cu_kv, causal, d)
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        of.flatten(), ref.flatten(), dim=0).item()
+        of.flatten(), ref.flatten(), dim=0
+    ).item()
     bad = int(((of - ref).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
     del ref
     return err, cos, bad
 
 
-_CASES = [(causal, splits, paged)
-          for causal in (False, True)
-          for splits in SPLITS
-          for paged in (False, True)]
+_CASES = [
+    (causal, splits, paged)
+    for causal in (False, True)
+    for splits in SPLITS
+    for paged in (False, True)
+]
 
 
 @pytest.mark.parametrize(
-    "causal,splits,paged", _CASES,
-    ids=[f"{'causal' if c else 'noncausal'}_sp{sp}_{'paged' if pg else 'dense'}"
-         for c, sp, pg in _CASES],
+    "causal,splits,paged",
+    _CASES,
+    ids=[
+        f"{'causal' if c else 'noncausal'}_sp{sp}_{'paged' if pg else 'dense'}"
+        for c, sp, pg in _CASES
+    ],
 )
 def test_packed_splitk_mixed(causal, splits, paged):
     """Low-chunk mixed prefill+decode batch, gqa_pack_m forced with split-K."""

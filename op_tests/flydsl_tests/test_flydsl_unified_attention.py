@@ -20,8 +20,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
-from op_tests.triton_tests.attention.test_unified_attention import (  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
 
@@ -75,18 +75,33 @@ def _build(query_lens, kv_lens, num_heads, num_kv_heads, seed=0):
     block table whose pages are deliberately non-contiguous."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     total_q = sum(query_lens)
-    q_bf = torch.randn(total_q, num_heads, HEAD_DIM, generator=g, device=DEV,
-                       dtype=torch.bfloat16)
+    q_bf = torch.randn(
+        total_q, num_heads, HEAD_DIM, generator=g, device=DEV, dtype=torch.bfloat16
+    )
 
     pages_per = [(ln + PAGE - 1) // PAGE for ln in kv_lens]
     stride = max(max(pages_per), 1)
     n_pages = max(sum(pages_per), 1)
-    k_bf = torch.randn(n_pages, PAGE, num_kv_heads, HEAD_DIM, generator=g,
-                       device=DEV, dtype=torch.bfloat16)
+    k_bf = torch.randn(
+        n_pages,
+        PAGE,
+        num_kv_heads,
+        HEAD_DIM,
+        generator=g,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
     # randn_like ignores `g` and draws from the global RNG, which would make
     # _build non-deterministic and silently invalidate any A/B that rebuilds.
-    v_bf = torch.randn(n_pages, PAGE, num_kv_heads, HEAD_DIM, generator=g,
-                       device=DEV, dtype=torch.bfloat16)
+    v_bf = torch.randn(
+        n_pages,
+        PAGE,
+        num_kv_heads,
+        HEAD_DIM,
+        generator=g,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
 
     # Scatter pages so the block table cannot be satisfied by contiguous reads.
     perm = torch.randperm(n_pages, generator=torch.Generator().manual_seed(seed + 1))
@@ -119,18 +134,42 @@ def _run(query_lens, kv_lens, num_heads, num_kv_heads, softmax_scale=None, seed=
         softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
 
     got = flydsl_unified_attention(
-        q, k, v, out, cu_q, max(query_lens), seqused_k, max(kv_lens),
-        softmax_scale, True, (-1, -1), bt, 0, q_ds, k_ds, v_ds,
-        num_kv_heads=num_kv_heads, block_size=PAGE,
-        num_queries_per_kv=num_heads // num_kv_heads, num_seqs=len(query_lens),
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        max(query_lens),
+        seqused_k,
+        max(kv_lens),
+        softmax_scale,
+        True,
+        (-1, -1),
+        bt,
+        0,
+        q_ds,
+        k_ds,
+        v_ds,
+        num_kv_heads=num_kv_heads,
+        block_size=PAGE,
+        num_queries_per_kv=num_heads // num_kv_heads,
+        num_seqs=len(query_lens),
     )
     if got is None:
         return None
 
     want = ref_paged_attn(
-        query=q, key_cache=k, value_cache=v, query_lens=query_lens,
-        kv_lens=kv_lens, block_tables=bt, scale=softmax_scale,
-        out_dtype=torch.bfloat16, q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=softmax_scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
     )
     return got.float(), want.float().reshape(got.shape)
 
@@ -170,7 +209,9 @@ def test_build_is_deterministic():
 # --- shape regimes -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(64, 64), (64, 16), (64, 4), (64, 1)])
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads", [(64, 64), (64, 16), (64, 4), (64, 1)]
+)
 def test_gqa_ratios(num_heads, num_kv_heads):
     """1:1 (packing auto-disables) through 64:1 (the deepest packed group)."""
     r = _run([256] * 2, [256] * 2, num_heads, num_kv_heads)
@@ -228,8 +269,9 @@ def test_softmax_scale_actually_changes_output():
     a = _run([256], [256], 64, 4, softmax_scale=1.0 / math.sqrt(HEAD_DIM))
     b = _run([256], [256], 64, 4, softmax_scale=4.0 / math.sqrt(HEAD_DIM))
     assert a is not None and b is not None
-    assert not torch.allclose(a[0], b[0], atol=1e-3), \
-        "softmax_scale had no effect -- the q_descale injection is not reaching the kernel"
+    assert not torch.allclose(
+        a[0], b[0], atol=1e-3
+    ), "softmax_scale had no effect -- the q_descale injection is not reaching the kernel"
 
 
 # --- edge cases --------------------------------------------------------------
@@ -276,20 +318,39 @@ def test_out_not_overwritten_past_active_rows():
     pad = 64
     padded = torch.full(
         (out.shape[0] + pad, out.shape[1], out.shape[2]),
-        float("nan"), device=DEV, dtype=torch.bfloat16,
+        float("nan"),
+        device=DEV,
+        dtype=torch.bfloat16,
     )
     view = padded[: out.shape[0]]
 
     got = flydsl_unified_attention(
-        q, k, v, view, cu_q, max(query_lens), seqused_k, max(kv_lens),
-        1.0 / math.sqrt(HEAD_DIM), True, (-1, -1), bt, 0, q_ds, k_ds, v_ds,
-        num_kv_heads=4, block_size=PAGE, num_queries_per_kv=16,
+        q,
+        k,
+        v,
+        view,
+        cu_q,
+        max(query_lens),
+        seqused_k,
+        max(kv_lens),
+        1.0 / math.sqrt(HEAD_DIM),
+        True,
+        (-1, -1),
+        bt,
+        0,
+        q_ds,
+        k_ds,
+        v_ds,
+        num_kv_heads=4,
+        block_size=PAGE,
+        num_queries_per_kv=16,
         num_seqs=len(query_lens),
     )
     assert got is not None
     assert torch.isfinite(view).all(), "an active output row was left unwritten"
-    assert torch.isnan(padded[out.shape[0]:]).all(), \
-        "the kernel wrote past the end of the output tensor"
+    assert torch.isnan(
+        padded[out.shape[0] :]
+    ).all(), "the kernel wrote past the end of the output tensor"
 
 
 # --- the invariant the softmax_scale injection rests on ----------------------

@@ -90,8 +90,14 @@ _FP8_DTYPE = torch.float8_e4m3fn
 
 
 @lru_cache(maxsize=64)
-def _get_kernel(num_heads: int, num_kv_heads: int, causal: bool, out_dtype_str: str,
-                use_sinks: bool, num_kv_splits: int = 1):
+def _get_kernel(
+    num_heads: int,
+    num_kv_heads: int,
+    causal: bool,
+    out_dtype_str: str,
+    use_sinks: bool,
+    num_kv_splits: int = 1,
+):
     """Build (and cache) the paged+varlen fp8 launcher.
 
     Keyed on the head counts, the mask mode, the output dtype and the split
@@ -267,8 +273,10 @@ def _supported(
         # combine denominator otherwise. The dispatch gate in
         # flydsl_unified_attention refuses split-K whenever sinks is not None,
         # so an accepted sinks call always lands single-split.
-        and (sinks is None
-             or (sinks.dtype == torch.float32 and sinks.numel() == num_query_heads))
+        and (
+            sinks is None
+            or (sinks.dtype == torch.float32 and sinks.numel() == num_query_heads)
+        )
         and _strides_ok(
             q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
         )
@@ -361,10 +369,31 @@ def flydsl_unified_attention(
     ``None`` so the caller falls through to Triton.
     """
     if not _supported(
-        q, k, v, out, cu_seqlens_q, seqused_k, max_seqlen_k, causal, window_size,
-        block_table, softcap, q_descale, k_descale, v_descale, num_kv_heads,
-        block_size, num_queries_per_kv, num_seqs, q_scales, alibi_slopes,
-        output_scale, qq_bias, sinks, shuffled_kv_cache, skip_reduce,
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_k,
+        causal,
+        window_size,
+        block_table,
+        softcap,
+        q_descale,
+        k_descale,
+        v_descale,
+        num_kv_heads,
+        block_size,
+        num_queries_per_kv,
+        num_seqs,
+        q_scales,
+        alibi_slopes,
+        output_scale,
+        qq_bias,
+        sinks,
+        shuffled_kv_cache,
+        skip_reduce,
     ):
         return None
 
@@ -429,20 +458,28 @@ def flydsl_unified_attention(
             else:
                 seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                 num_q_blocks = int(
-                    ((seqlens_q + (block_q - 1)) // block_q).sum().item())
+                    ((seqlens_q + (block_q - 1)) // block_q).sum().item()
+                )
         num_2d_prgms = num_kv_heads * num_q_blocks
         if num_2d_prgms < _TARGET_NUM_PRGMS:
             num_kv_splits = _split_count(num_2d_prgms)
 
-    kernel = _get_kernel(num_query_heads, num_kv_heads, bool(causal), out_dtype_str,
-                         sinks is not None, num_kv_splits)
+    kernel = _get_kernel(
+        num_query_heads,
+        num_kv_heads,
+        bool(causal),
+        out_dtype_str,
+        sinks is not None,
+        num_kv_splits,
+    )
 
     workspace = None
     if num_kv_splits > 1:
         # fp32 partial workspace: O_partial + Mrow + Lrow, sized for the dense
         # [batch, max_seqlen_q(==1), heads, ...] layout the store/combine use.
         ws_elems = dualwave_splitk_workspace_elems(
-            num_seqs, num_query_heads, int(max_seqlen_q), num_kv_splits, _HEAD_DIM)
+            num_seqs, num_query_heads, int(max_seqlen_q), num_kv_splits, _HEAD_DIM
+        )
         workspace = torch.empty(ws_elems, device=q.device, dtype=torch.float32)
 
     with torch.cuda.device(q.device.index):

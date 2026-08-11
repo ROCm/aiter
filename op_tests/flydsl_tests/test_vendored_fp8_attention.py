@@ -17,6 +17,7 @@ bit-identical gate is not useful in practice.
 
 Device: inherits HIP_VISIBLE_DEVICES. Do not override it.
 """
+
 from __future__ import annotations
 
 import os
@@ -27,7 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -76,9 +77,9 @@ VARLEN_CASES = [
     [512],
     [1024, 3072],
     [512, 1536, 2048],
-    [4023, 1384],            # trace-source shapes, packed
+    [4023, 1384],  # trace-source shapes, packed
     [1, 3, 31, 33, 63, 65],  # all << BLOCK_M
-    [8192, 1024],            # long-then-short
+    [8192, 1024],  # long-then-short
 ]
 
 
@@ -89,19 +90,20 @@ def q8(x):
 
 def make_inputs(b, s, h, hkv, d, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
-    mk = lambda n: torch.randn(b, s, n, d, generator=g, device=DEV,  # noqa: E731
-                               dtype=torch.bfloat16)
+    mk = lambda n: torch.randn(
+        b, s, n, d, generator=g, device=DEV, dtype=torch.bfloat16
+    )
     return q8(mk(h)), q8(mk(hkv)), q8(mk(hkv))
 
 
 def torch_reference(qf, qs, kf, ks, vf, vs, causal, d):
     """Reference from the dequantized fp8 tensors -- what the kernel is fed."""
     q, k, v = qf.float() * qs, kf.float() * ks, vf.float() * vs
-    b, s, h, _ = q.shape
+    _b, s, h, _ = q.shape
     rep = h // k.shape[2]
     kt = k.repeat_interleave(rep, 2).transpose(1, 2)
     vt = v.repeat_interleave(rep, 2).transpose(1, 2)
-    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d ** 0.5)
+    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d**0.5)
     if causal:
         m = torch.triu(torch.ones(s, s, device=DEV, dtype=torch.bool), 1)
         att = att.masked_fill(m, float("-inf"))
@@ -120,11 +122,11 @@ def torch_reference_sinks(qf, qs, kf, ks, vf, vs, causal, d, sink):
     kernel's scaled-domain arithmetic.
     """
     q, k, v = qf.float() * qs, kf.float() * ks, vf.float() * vs
-    b, s, h, _ = q.shape
+    _b, s, h, _ = q.shape
     rep = h // k.shape[2]
     kt = k.repeat_interleave(rep, 2).transpose(1, 2)
     vt = v.repeat_interleave(rep, 2).transpose(1, 2)
-    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d ** 0.5)  # [b, h, s, s]
+    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d**0.5)  # [b, h, s, s]
     if causal:
         m = torch.triu(torch.ones(s, s, device=DEV, dtype=torch.bool), 1)
         att = att.masked_fill(m, float("-inf"))
@@ -139,31 +141,61 @@ def torch_reference_sinks(qf, qs, kf, ks, vf, vs, causal, d, sink):
 
 
 def run_sinks(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, d, causal, sink):
-    mod = build(num_heads=h, head_dim=d, causal=causal, dtype_str="fp8",
-                use_sinks=True, num_kv_heads=hkv)
+    mod = build(
+        num_heads=h,
+        head_dim=d,
+        causal=causal,
+        dtype_str="fp8",
+        use_sinks=True,
+        num_kv_heads=hkv,
+    )
     o = torch.empty(b, s, h, d, device=DEV, dtype=torch.bfloat16)
-    mod(qf.contiguous().view(-1), kf.contiguous().view(-1),
-        vf.contiguous().view(-1), o.contiguous().view(-1), b, s,
-        q_descale=qs, k_descale=ks, v_descale=vs, sink=sink.contiguous().view(-1))
+    mod(
+        qf.contiguous().view(-1),
+        kf.contiguous().view(-1),
+        vf.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        s,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        sink=sink.contiguous().view(-1),
+    )
     torch.cuda.synchronize()
     return o
 
 
-def run(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, d, causal,
-        out_dtype_str="bf16"):
+def run(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, d, causal, out_dtype_str="bf16"):
     out_torch = torch.float16 if out_dtype_str == "f16" else torch.bfloat16
-    mod = build(num_heads=h, head_dim=d, causal=causal, dtype_str="fp8",
-                num_kv_heads=hkv, out_dtype_str=out_dtype_str)
+    mod = build(
+        num_heads=h,
+        head_dim=d,
+        causal=causal,
+        dtype_str="fp8",
+        num_kv_heads=hkv,
+        out_dtype_str=out_dtype_str,
+    )
     o = torch.empty(b, s, h, d, device=DEV, dtype=out_torch)
-    mod(qf.contiguous().view(-1), kf.contiguous().view(-1),
-        vf.contiguous().view(-1), o.contiguous().view(-1), b, s,
-        q_descale=qs, k_descale=ks, v_descale=vs)
+    mod(
+        qf.contiguous().view(-1),
+        kf.contiguous().view(-1),
+        vf.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        s,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+    )
     torch.cuda.synchronize()
     return o
 
 
 @pytest.mark.parametrize(
-    "label,b,s,h,hkv,causal", SHAPES, ids=[c[0] for c in SHAPES],
+    "label,b,s,h,hkv,causal",
+    SHAPES,
+    ids=[c[0] for c in SHAPES],
 )
 def test_dense_correctness(label, b, s, h, hkv, causal):
     """Vendored kernel vs a dequantized-fp8 torch reference."""
@@ -175,7 +207,8 @@ def test_dense_correctness(label, b, s, h, hkv, causal):
     ref = torch_reference(qf, qs, kf, ks, vf, vs, causal, HEAD_DIM)
     err = (ov.float() - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        ov.float().flatten(), ref.flatten(), dim=0).item()
+        ov.float().flatten(), ref.flatten(), dim=0
+    ).item()
     assert err < 1e-1, f"max err {err:.4g}"
     assert cos > 0.99, f"cosine {cos:.6f}"
     torch.cuda.empty_cache()
@@ -190,13 +223,15 @@ def test_varlen(seqs):
     h, hkv, d = 64, 4, HEAD_DIM
     total, b = sum(seqs), len(seqs)
     g = torch.Generator(device=DEV).manual_seed(SEED)
-    mk = lambda n: torch.randn(total, n, d, generator=g, device=DEV,  # noqa: E731
-                               dtype=torch.bfloat16)
+    mk = lambda n: torch.randn(
+        total, n, d, generator=g, device=DEV, dtype=torch.bfloat16
+    )
     qf, qs = q8(mk(h))
     kf, ks = q8(mk(hkv))
     vf, vs = q8(mk(hkv))
-    cu = torch.tensor([0] + list(torch.tensor(seqs).cumsum(0)),
-                      device=DEV, dtype=torch.int32)
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seqs).cumsum(0)), device=DEV, dtype=torch.int32
+    )
 
     ref = torch.empty(total, h, d, device=DEV, dtype=torch.float32)
     for i, ln in enumerate(seqs):
@@ -204,25 +239,42 @@ def test_varlen(seqs):
         q, k, v = qf[lo:hi].float() * qs, kf[lo:hi].float() * ks, vf[lo:hi].float() * vs
         kk = k.repeat_interleave(h // hkv, 1).transpose(0, 1)
         vv = v.repeat_interleave(h // hkv, 1).transpose(0, 1)
-        s_ = q.transpose(0, 1) @ kk.transpose(-1, -2) / (d ** 0.5)
+        s_ = q.transpose(0, 1) @ kk.transpose(-1, -2) / (d**0.5)
         s_ = s_.masked_fill(
             torch.triu(torch.ones(ln, ln, device=DEV, dtype=torch.bool), 1),
-            float("-inf"))
+            float("-inf"),
+        )
         ref[lo:hi] = (s_.softmax(-1) @ vv).transpose(0, 1)
 
-    mod = build(num_heads=h, head_dim=d, causal=True, dtype_str="fp8",
-                num_kv_heads=hkv, varlen=True)
+    mod = build(
+        num_heads=h,
+        head_dim=d,
+        causal=True,
+        dtype_str="fp8",
+        num_kv_heads=hkv,
+        varlen=True,
+    )
     o = torch.empty(total, h, d, device=DEV, dtype=torch.bfloat16)
-    mod(qf.contiguous().view(-1), kf.contiguous().view(-1),
-        vf.contiguous().view(-1), o.contiguous().view(-1), b, max(seqs),
-        cu_seqlens_q=cu, cu_seqlens_kv=cu,
-        q_descale=qs, k_descale=ks, v_descale=vs)
+    mod(
+        qf.contiguous().view(-1),
+        kf.contiguous().view(-1),
+        vf.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        max(seqs),
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+    )
     torch.cuda.synchronize()
 
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        of.flatten(), ref.flatten(), dim=0).item()
+        of.flatten(), ref.flatten(), dim=0
+    ).item()
     bad = int(((of - ref).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
     assert bad == 0, f"{bad} rows over threshold (max err {err:.4g})"
     assert err < 1e-1, f"max err {err:.4g}"
@@ -244,13 +296,28 @@ def test_fp16_output(label, b, s, h, hkv, causal):
     built in f16 to compare like-for-like against the f16 store."""
     build = _vendored_build()
     (qf, qs), (kf, ks), (vf, vs) = make_inputs(b, s, h, hkv, HEAD_DIM, SEED)
-    ov = run(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, HEAD_DIM, causal,
-             out_dtype_str="f16")
+    ov = run(
+        build,
+        qf,
+        qs,
+        kf,
+        ks,
+        vf,
+        vs,
+        b,
+        s,
+        h,
+        hkv,
+        HEAD_DIM,
+        causal,
+        out_dtype_str="f16",
+    )
     assert ov.dtype is torch.float16, f"expected f16 output, got {ov.dtype}"
     ref = torch_reference(qf, qs, kf, ks, vf, vs, causal, HEAD_DIM).to(torch.float16)
     err = (ov.float() - ref.float()).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        ov.float().flatten(), ref.float().flatten(), dim=0).item()
+        ov.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
     assert err < 1e-1, f"max err {err:.4g}"
     assert cos > 0.99, f"cosine {cos:.6f}"
     torch.cuda.empty_cache()
@@ -273,14 +340,13 @@ def test_sinks(label, b, s, h, hkv, causal):
     (qf, qs), (kf, ks), (vf, vs) = make_inputs(b, s, h, hkv, HEAD_DIM, SEED)
     g_sink = torch.Generator(device=DEV).manual_seed(SEED + 5)
     # Sinks spanning a useful range: some heads sink-dominated, some not.
-    sink = (torch.randn(h, generator=g_sink, device=DEV,
-                        dtype=torch.float32) * 2.0)
-    ov = run_sinks(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, HEAD_DIM,
-                   causal, sink)
+    sink = torch.randn(h, generator=g_sink, device=DEV, dtype=torch.float32) * 2.0
+    ov = run_sinks(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, HEAD_DIM, causal, sink)
     ref = torch_reference_sinks(qf, qs, kf, ks, vf, vs, causal, HEAD_DIM, sink)
     err = (ov.float() - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        ov.float().flatten(), ref.flatten(), dim=0).item()
+        ov.float().flatten(), ref.flatten(), dim=0
+    ).item()
     # Sinks-only bad-row rule: absolute AND relative. The sink lowers the
     # denominator normalization, amplifying inherent fp8 bf16-P-pack quantization
     # noise on 1-to-9-key rows (~5% rel err, ref magnitude ~2) a few rows over
@@ -300,5 +366,12 @@ def test_sinks_splitk_refused():
     has no sink input). A build that does NOT raise is a failure."""
     build = _vendored_build()
     with pytest.raises(ValueError):
-        build(num_heads=64, head_dim=HEAD_DIM, causal=True, dtype_str="fp8",
-              use_sinks=True, num_kv_heads=4, num_kv_splits=2)
+        build(
+            num_heads=64,
+            head_dim=HEAD_DIM,
+            causal=True,
+            dtype_str="fp8",
+            use_sinks=True,
+            num_kv_heads=4,
+            num_kv_splits=2,
+        )

@@ -25,10 +25,10 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import aiter.ops.triton.attention.unified_attention as ua  # noqa: E402
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
-from op_tests.flydsl_tests.test_flydsl_unified_attention import _build  # noqa: E402
-from op_tests.triton_tests.attention.test_unified_attention import (  # noqa: E402
+import aiter.ops.triton.attention.unified_attention as ua
+from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.flydsl_tests.test_flydsl_unified_attention import _build
+from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
 
@@ -58,14 +58,24 @@ def _call(query_lens, kv_lens, num_heads=64, num_kv_heads=4, seed=0, **over):
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
         query_lens, kv_lens, num_heads, num_kv_heads, seed
     )
-    kwargs = dict(
-        q=q, k=k, v=v, out=out,
-        cu_seqlens_q=cu_q, max_seqlen_q=max(query_lens),
-        seqused_k=seqused_k, max_seqlen_k=max(kv_lens),
-        softmax_scale=SCALE, causal=True, window_size=(-1, -1),
-        block_table=bt, softcap=0,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-    )
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "cu_seqlens_q": cu_q,
+        "max_seqlen_q": max(query_lens),
+        "seqused_k": seqused_k,
+        "max_seqlen_k": max(kv_lens),
+        "softmax_scale": SCALE,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": bt,
+        "softcap": 0,
+        "q_descale": q_ds,
+        "k_descale": k_ds,
+        "v_descale": v_ds,
+    }
     kwargs.update(over)
     return ua.unified_attention(**kwargs)
 
@@ -83,21 +93,40 @@ def _call_with_ref(query_lens, kv_lens, num_heads=64, num_kv_heads=4, seed=0, **
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
         query_lens, kv_lens, num_heads, num_kv_heads, seed
     )
-    kwargs = dict(
-        q=q, k=k, v=v, out=out,
-        cu_seqlens_q=cu_q, max_seqlen_q=max(query_lens),
-        seqused_k=seqused_k, max_seqlen_k=max(kv_lens),
-        softmax_scale=SCALE, causal=True, window_size=(-1, -1),
-        block_table=bt, softcap=0,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-    )
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "cu_seqlens_q": cu_q,
+        "max_seqlen_q": max(query_lens),
+        "seqused_k": seqused_k,
+        "max_seqlen_k": max(kv_lens),
+        "softmax_scale": SCALE,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": bt,
+        "softcap": 0,
+        "q_descale": q_ds,
+        "k_descale": k_ds,
+        "v_descale": v_ds,
+    }
     kwargs.update(over)
     got = ua.unified_attention(**kwargs)
     want = ref_paged_attn(
-        query=q, key_cache=k, value_cache=v, query_lens=query_lens, kv_lens=kv_lens,
-        block_tables=bt, scale=SCALE, out_dtype=kwargs["out"].dtype,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-        sinks=kwargs.get("sinks"), causal=int(kwargs["causal"]),
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=SCALE,
+        out_dtype=kwargs["out"].dtype,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
+        sinks=kwargs.get("sinks"),
+        causal=int(kwargs["causal"]),
     )
     return got.float(), want.float().reshape(got.shape)
 
@@ -148,8 +177,8 @@ def test_supported_config_routes_to_flydsl():
 @pytest.mark.parametrize(
     "query_lens,kv_lens",
     [
-        ([256], [256]),                      # single prefill
-        ([1] * 8, [4096] * 8),               # pure decode
+        ([256], [256]),  # single prefill
+        ([1] * 8, [4096] * 8),  # pure decode
         ([4023] + [1] * 8, [4023] + [16384] * 8),  # mixed: the production shape
     ],
 )
@@ -205,13 +234,17 @@ def _decline_cases():
     """Each entry makes exactly one aspect of an otherwise-supported call
     unsupported. Kept as a factory so each builds fresh tensors."""
     return {
-        "softcap": dict(softcap=30.0),
-        "sliding_window": dict(window_size=(256, 0)),
+        "softcap": {"softcap": 30.0},
+        "sliding_window": {"window_size": (256, 0)},
         # block_table=None is covered in the predicate test instead: Triton's
         # own path dereferences it unconditionally (unified_attention.py:637),
         # so there is no fall-through target to compare against.
-        "alibi_slopes": dict(alibi_slopes=torch.ones(64, device="cuda", dtype=torch.float32)),
-        "output_scale": dict(output_scale=torch.ones(1, device="cuda", dtype=torch.float32)),
+        "alibi_slopes": {
+            "alibi_slopes": torch.ones(64, device="cuda", dtype=torch.float32)
+        },
+        "output_scale": {
+            "output_scale": torch.ones(1, device="cuda", dtype=torch.float32)
+        },
     }
 
 
@@ -281,18 +314,36 @@ def test_fp16_output_routes_and_agrees():
     out = out.to(torch.float16)
     with mock.patch.object(uak, "flydsl_unified_attention", spy):
         got = ua.unified_attention(
-            q=q, k=k, v=v, out=out,
-            cu_seqlens_q=cu_q, max_seqlen_q=256,
-            seqused_k=seqused_k, max_seqlen_k=256,
-            softmax_scale=SCALE, causal=True, window_size=(-1, -1),
-            block_table=bt, softcap=0,
-            q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=256,
+            seqused_k=seqused_k,
+            max_seqlen_k=256,
+            softmax_scale=SCALE,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=bt,
+            softcap=0,
+            q_descale=q_ds,
+            k_descale=k_ds,
+            v_descale=v_ds,
         )
     assert seen.get("served") is True, "fp16-output call did not reach FlyDSL"
     want = ref_paged_attn(
-        query=q, key_cache=k, value_cache=v, query_lens=[256], kv_lens=[256],
-        block_tables=bt, scale=SCALE, out_dtype=torch.float16,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=[256],
+        kv_lens=[256],
+        block_tables=bt,
+        scale=SCALE,
+        out_dtype=torch.float16,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
     )
     _assert_close(got.float(), want.float().reshape(got.shape))
 
@@ -310,8 +361,9 @@ def test_sinks_route_and_agree_and_stay_single_pass():
 
     def spy(num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits=1):
         seen["num_kv_splits"] = num_kv_splits
-        return real_get_kernel(num_heads, num_kv_heads, causal, out_dtype_str,
-                                use_sinks, num_kv_splits)
+        return real_get_kernel(
+            num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits
+        )
 
     # An all-decode shape that would otherwise take split-K (see
     # test_packed_splitk_decode.py), to prove sinks forces single-pass.
@@ -340,8 +392,9 @@ def test_fp16_output_with_packed_splitk():
 
     def spy(num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits=1):
         seen["num_kv_splits"] = num_kv_splits
-        return real_get_kernel(num_heads, num_kv_heads, causal, out_dtype_str,
-                                use_sinks, num_kv_splits)
+        return real_get_kernel(
+            num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits
+        )
 
     # All-decode, deep context: the regime `flydsl_unified_attention` routes to
     # split-K (see its tier-selection comment).
@@ -353,21 +406,39 @@ def test_fp16_output_with_packed_splitk():
     uak._get_kernel.cache_clear()
     with mock.patch.object(uak, "_get_kernel", spy):
         got = ua.unified_attention(
-            q=q, k=k, v=v, out=out,
-            cu_seqlens_q=cu_q, max_seqlen_q=max(query_lens),
-            seqused_k=seqused_k, max_seqlen_k=max(kv_lens),
-            softmax_scale=SCALE, causal=True, window_size=(-1, -1),
-            block_table=bt, softcap=0,
-            q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max(query_lens),
+            seqused_k=seqused_k,
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=SCALE,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=bt,
+            softcap=0,
+            q_descale=q_ds,
+            k_descale=k_ds,
+            v_descale=v_ds,
         )
     assert seen.get("num_kv_splits", 1) > 1, (
         "expected this all-decode/16384-ctx shape to route through split-K; "
         "the cross-feature combination under test did not fire"
     )
     want = ref_paged_attn(
-        query=q, key_cache=k, value_cache=v, query_lens=query_lens, kv_lens=kv_lens,
-        block_tables=bt, scale=SCALE, out_dtype=torch.float16,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=SCALE,
+        out_dtype=torch.float16,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
     )
     _assert_close(got.float(), want.float().reshape(got.shape))
 
@@ -405,12 +476,14 @@ def test_padded_q_stride_declines_to_triton():
     # (non-contiguous, non-flattenable) view.
     extra_heads = 3
     total_q = q.shape[0]
-    q_buf = torch.zeros(total_q, num_heads + extra_heads, HEAD_DIM,
-                         device=q.device, dtype=q.dtype)
+    q_buf = torch.zeros(
+        total_q, num_heads + extra_heads, HEAD_DIM, device=q.device, dtype=q.dtype
+    )
     q_buf[:, :num_heads, :] = q
     q_padded = q_buf[:, :num_heads, :]
-    out_buf = torch.empty(total_q, num_heads + extra_heads, HEAD_DIM,
-                          device=out.device, dtype=out.dtype)
+    out_buf = torch.empty(
+        total_q, num_heads + extra_heads, HEAD_DIM, device=out.device, dtype=out.dtype
+    )
     out_padded = out_buf[:, :num_heads, :]
 
     assert q_padded.stride(0) > num_heads * HEAD_DIM, "not actually padded"
@@ -419,14 +492,31 @@ def test_padded_q_stride_declines_to_triton():
         q_padded.view(-1)  # confirms this layout is genuinely non-flattenable
 
     assert not _supported(
-        q=q_padded, k=k, v=v, out=out_padded, cu_seqlens_q=cu_q,
-        seqused_k=seqused_k, max_seqlen_k=max(kv_lens), causal=True,
-        window_size=(-1, -1), block_table=bt, softcap=0,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-        num_kv_heads=num_kv_heads, block_size=PAGE,
-        num_queries_per_kv=num_heads // num_kv_heads, num_seqs=len(query_lens),
-        q_scales=None, alibi_slopes=None, output_scale=None, qq_bias=None,
-        sinks=None, shuffled_kv_cache=False, skip_reduce=False,
+        q=q_padded,
+        k=k,
+        v=v,
+        out=out_padded,
+        cu_seqlens_q=cu_q,
+        seqused_k=seqused_k,
+        max_seqlen_k=max(kv_lens),
+        causal=True,
+        window_size=(-1, -1),
+        block_table=bt,
+        softcap=0,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
+        num_kv_heads=num_kv_heads,
+        block_size=PAGE,
+        num_queries_per_kv=num_heads // num_kv_heads,
+        num_seqs=len(query_lens),
+        q_scales=None,
+        alibi_slopes=None,
+        output_scale=None,
+        qq_bias=None,
+        sinks=None,
+        shuffled_kv_cache=False,
+        skip_reduce=False,
     ), "a padded, non-flattenable outer stride must be declined by _strides_ok"
 
     real = uak.flydsl_unified_attention
@@ -439,20 +529,38 @@ def test_padded_q_stride_declines_to_triton():
 
     with mock.patch.object(uak, "flydsl_unified_attention", spy):
         got = ua.unified_attention(
-            q=q_padded, k=k, v=v, out=out_padded,
-            cu_seqlens_q=cu_q, max_seqlen_q=max(query_lens),
-            seqused_k=seqused_k, max_seqlen_k=max(kv_lens),
-            softmax_scale=SCALE, causal=True, window_size=(-1, -1),
-            block_table=bt, softcap=0,
-            q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+            q=q_padded,
+            k=k,
+            v=v,
+            out=out_padded,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max(query_lens),
+            seqused_k=seqused_k,
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=SCALE,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=bt,
+            softcap=0,
+            q_descale=q_ds,
+            k_descale=k_ds,
+            v_descale=v_ds,
         )
-    assert seen.get("served") is False, (
-        "a padded-stride Q/O pair must decline to Triton, not route to FlyDSL"
-    )
+    assert (
+        seen.get("served") is False
+    ), "a padded-stride Q/O pair must decline to Triton, not route to FlyDSL"
     want = ref_paged_attn(
-        query=q_padded, key_cache=k, value_cache=v, query_lens=query_lens,
-        kv_lens=kv_lens, block_tables=bt, scale=SCALE, out_dtype=out.dtype,
-        q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
+        query=q_padded,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=SCALE,
+        out_dtype=out.dtype,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
     )
     _assert_close(got.float(), want.float().reshape(got.shape))
 
@@ -466,14 +574,33 @@ def test_predicate_declines_unsupported_geometry():
     from aiter.ops.flydsl.unified_attention_kernels import _supported
 
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build([256], [256], 64, 4)
-    base = dict(
-        q=q, k=k, v=v, out=out, cu_seqlens_q=cu_q, seqused_k=seqused_k,
-        max_seqlen_k=256, causal=True, window_size=(-1, -1), block_table=bt,
-        softcap=0, q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-        num_kv_heads=4, block_size=PAGE, num_queries_per_kv=16, num_seqs=1,
-        q_scales=None, alibi_slopes=None, output_scale=None, qq_bias=None,
-        sinks=None, shuffled_kv_cache=False, skip_reduce=False,
-    )
+    base = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "cu_seqlens_q": cu_q,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 256,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": bt,
+        "softcap": 0,
+        "q_descale": q_ds,
+        "k_descale": k_ds,
+        "v_descale": v_ds,
+        "num_kv_heads": 4,
+        "block_size": PAGE,
+        "num_queries_per_kv": 16,
+        "num_seqs": 1,
+        "q_scales": None,
+        "alibi_slopes": None,
+        "output_scale": None,
+        "qq_bias": None,
+        "sinks": None,
+        "shuffled_kv_cache": False,
+        "skip_reduce": False,
+    }
     assert _supported(**base), "the baseline config should be supported"
 
     # Page size is structural (BLOCK_N), not a builder knob.
@@ -500,14 +627,33 @@ def test_predicate_declines_wrong_dtypes():
     from aiter.ops.flydsl.unified_attention_kernels import _supported
 
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build([256], [256], 64, 4)
-    base = dict(
-        q=q, k=k, v=v, out=out, cu_seqlens_q=cu_q, seqused_k=seqused_k,
-        max_seqlen_k=256, causal=True, window_size=(-1, -1), block_table=bt,
-        softcap=0, q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
-        num_kv_heads=4, block_size=PAGE, num_queries_per_kv=16, num_seqs=1,
-        q_scales=None, alibi_slopes=None, output_scale=None, qq_bias=None,
-        sinks=None, shuffled_kv_cache=False, skip_reduce=False,
-    )
+    base = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "cu_seqlens_q": cu_q,
+        "seqused_k": seqused_k,
+        "max_seqlen_k": 256,
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": bt,
+        "softcap": 0,
+        "q_descale": q_ds,
+        "k_descale": k_ds,
+        "v_descale": v_ds,
+        "num_kv_heads": 4,
+        "block_size": PAGE,
+        "num_queries_per_kv": 16,
+        "num_seqs": 1,
+        "q_scales": None,
+        "alibi_slopes": None,
+        "output_scale": None,
+        "qq_bias": None,
+        "sinks": None,
+        "shuffled_kv_cache": False,
+        "skip_reduce": False,
+    }
     assert not _supported(**{**base, "q": q.to(torch.bfloat16)})
     # fp16 output is supported now (out.dtype in (bfloat16, float16)); see
     # test_fp16_output_routes_and_agrees below.

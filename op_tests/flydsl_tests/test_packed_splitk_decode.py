@@ -21,6 +21,7 @@ reference for a single consistent oracle across dense and paged cases.
 Clear ~/.flydsl/cache before trusting a run after a kernel edit -- the JIT cache
 key does not resolve helper-class methods reached through instance attributes.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,7 +32,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
 
 try:
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -76,11 +77,11 @@ for _b in (7, 8, 9):
 
 
 def _build_mods():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module as build,
-    )
     from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
         dualwave_splitk_workspace_elems as ws_elems,
+    )
+    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
+        build_flash_attn_dualwave_swp_fp8_module as build,
     )
 
     return build, ws_elems
@@ -94,11 +95,11 @@ def q8(x):
 def reference(qf, qs, kf, ks, vf, vs, d):
     # decode: Sq=1, full (non-causal) attention over the KV context.
     q, k, v = qf.float() * qs, kf.float() * ks, vf.float() * vs
-    b, sq, h, _ = q.shape
+    _b, _sq, h, _ = q.shape
     rep = h // k.shape[2]
-    kt = k.repeat_interleave(rep, 2).transpose(1, 2)   # [b,h,skv,d]
+    kt = k.repeat_interleave(rep, 2).transpose(1, 2)  # [b,h,skv,d]
     vt = v.repeat_interleave(rep, 2).transpose(1, 2)
-    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d ** 0.5)  # [b,h,sq,skv]
+    att = q.transpose(1, 2) @ kt.transpose(-1, -2) / (d**0.5)  # [b,h,sq,skv]
     out = (att.softmax(-1) @ vt).transpose(1, 2)  # [b,sq,h,d]
     del att
     return out
@@ -119,13 +120,13 @@ def _run(build, ws_elems, b, ctx, splits, paged, d, seed, packed):
         npages = (ctx + PAGE - 1) // PAGE
         pg = torch.Generator().manual_seed(seed + 4)
         flat = torch.randperm(b * npages, generator=pg).tolist()
-        perm = [flat[i * npages:(i + 1) * npages] for i in range(b)]
+        perm = [flat[i * npages : (i + 1) * npages] for i in range(b)]
         pk = torch.zeros(b * npages, PAGE, HKV, d, device=DEV, dtype=kf.dtype)
         pv = torch.zeros_like(pk)
         for bi in range(b):
             for t in range(npages):
-                pk[perm[bi][t]] = kf[bi, t * PAGE:(t + 1) * PAGE]
-                pv[perm[bi][t]] = vf[bi, t * PAGE:(t + 1) * PAGE]
+                pk[perm[bi][t]] = kf[bi, t * PAGE : (t + 1) * PAGE]
+                pv[perm[bi][t]] = vf[bi, t * PAGE : (t + 1) * PAGE]
         bt = torch.tensor(perm, device=DEV, dtype=torch.int32)
         kv_k, kv_v = pk, pv
         kwargs["block_table"] = bt.contiguous().view(-1)
@@ -133,21 +134,39 @@ def _run(build, ws_elems, b, ctx, splits, paged, d, seed, packed):
     else:
         kv_k, kv_v = kf, vf
 
-    mod = build(num_heads=H, head_dim=d, causal=False, dtype_str="fp8",
-                num_kv_heads=HKV, num_kv_splits=splits, paged=paged,
-                gqa_pack_m=packed)
+    mod = build(
+        num_heads=H,
+        head_dim=d,
+        causal=False,
+        dtype_str="fp8",
+        num_kv_heads=HKV,
+        num_kv_splits=splits,
+        paged=paged,
+        gqa_pack_m=packed,
+    )
     o = torch.empty(b, sq, H, d, device=DEV, dtype=torch.bfloat16)
     ws = torch.zeros(ws_elems(b, H, sq, splits, d), device=DEV, dtype=torch.float32)
-    mod(qf.contiguous().view(-1), kv_k.contiguous().view(-1),
-        kv_v.contiguous().view(-1), o.contiguous().view(-1), b, sq,
-        workspace=ws, q_descale=qs, k_descale=ks, v_descale=vs, **kwargs)
+    mod(
+        qf.contiguous().view(-1),
+        kv_k.contiguous().view(-1),
+        kv_v.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        sq,
+        workspace=ws,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        **kwargs,
+    )
     torch.cuda.synchronize()
 
     ref = reference(qf, qs, kf, ks, vf, vs, d)
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        of.flatten(), ref.flatten(), dim=0).item()
+        of.flatten(), ref.flatten(), dim=0
+    ).item()
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     del ref
     return err, cos, bad
@@ -163,14 +182,14 @@ def reference_ragged(qf, qs, kf, ks, vf, vs, cu_kv, d):
     out = torch.empty(b, 1, H, d, device=DEV, dtype=torch.float32)
     for i in range(b):
         lo, hi = int(cu_kv[i]), int(cu_kv[i + 1])
-        q = qf[i].float() * qs                       # [1, H, D]
-        k = kf[lo:hi].float() * ks                   # [Lk, HKV, D]
+        q = qf[i].float() * qs  # [1, H, D]
+        k = kf[lo:hi].float() * ks  # [Lk, HKV, D]
         v = vf[lo:hi].float() * vs
         rep = H // k.shape[1]
-        kt = k.repeat_interleave(rep, 1).transpose(0, 1)   # [H, Lk, D]
+        kt = k.repeat_interleave(rep, 1).transpose(0, 1)  # [H, Lk, D]
         vt = v.repeat_interleave(rep, 1).transpose(0, 1)
-        att = q.transpose(0, 1) @ kt.transpose(-1, -2) / (d ** 0.5)  # [H, 1, Lk]
-        out[i] = (att.softmax(-1) @ vt).transpose(0, 1)   # [1, H, D]
+        att = q.transpose(0, 1) @ kt.transpose(-1, -2) / (d**0.5)  # [H, 1, Lk]
+        out[i] = (att.softmax(-1) @ vt).transpose(0, 1)  # [1, H, D]
     return out
 
 
@@ -185,7 +204,7 @@ def _run_ragged(build, ws_elems, b, splits, paged, d, seed, packed):
     kf, ks = q8(k)
     vf, vs = q8(v)
 
-    cu_q = torch.arange(b + 1, device=DEV, dtype=torch.int32)   # 1 q-token/seq
+    cu_q = torch.arange(b + 1, device=DEV, dtype=torch.int32)  # 1 q-token/seq
     cu_kv = torch.zeros(b + 1, device=DEV, dtype=torch.int32)
     cu_kv[1:] = torch.tensor(seqs_kv, device=DEV).cumsum(0)
 
@@ -218,21 +237,40 @@ def _run_ragged(build, ws_elems, b, splits, paged, d, seed, packed):
     else:
         kv_k, kv_v = kf, vf
 
-    mod = build(num_heads=H, head_dim=d, causal=False, dtype_str="fp8",
-                num_kv_heads=HKV, num_kv_splits=splits, paged=paged,
-                varlen=True, gqa_pack_m=packed)
+    mod = build(
+        num_heads=H,
+        head_dim=d,
+        causal=False,
+        dtype_str="fp8",
+        num_kv_heads=HKV,
+        num_kv_splits=splits,
+        paged=paged,
+        varlen=True,
+        gqa_pack_m=packed,
+    )
     o = torch.empty(b, 1, H, d, device=DEV, dtype=torch.bfloat16)
     ws = torch.zeros(ws_elems(b, H, 1, splits, d), device=DEV, dtype=torch.float32)
-    mod(qf.contiguous().view(-1), kv_k.contiguous().view(-1),
-        kv_v.contiguous().view(-1), o.contiguous().view(-1), b, 1,
-        workspace=ws, q_descale=qs, k_descale=ks, v_descale=vs, **kwargs)
+    mod(
+        qf.contiguous().view(-1),
+        kv_k.contiguous().view(-1),
+        kv_v.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        1,
+        workspace=ws,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        **kwargs,
+    )
     torch.cuda.synchronize()
 
     ref = reference_ragged(qf, qs, kf, ks, vf, vs, cu_kv, d)
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        of.flatten(), ref.flatten(), dim=0).item()
+        of.flatten(), ref.flatten(), dim=0
+    ).item()
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     del ref
     return err, cos, bad
@@ -245,30 +283,30 @@ def _check(err, cos, bad):
 
 
 @pytest.mark.parametrize(
-    "b,ctx,splits,paged", CASES,
-    ids=[f"b{b}_ctx{ctx}_sp{sp}_{'paged' if pg else 'dense'}"
-         for b, ctx, sp, pg in CASES],
+    "b,ctx,splits,paged",
+    CASES,
+    ids=[
+        f"b{b}_ctx{ctx}_sp{sp}_{'paged' if pg else 'dense'}" for b, ctx, sp, pg in CASES
+    ],
 )
 def test_packed_splitk_decode(b, ctx, splits, paged):
     """Equal-KV packed + split-K decode. gqa_pack_m and num_kv_splits are both
     forced -- the combination the build refusal used to forbid."""
     build, ws_elems = _build_mods()
-    err, cos, bad = _run(build, ws_elems, b, ctx, splits, paged, D, SEED,
-                         packed=True)
+    err, cos, bad = _run(build, ws_elems, b, ctx, splits, paged, D, SEED, packed=True)
     _check(err, cos, bad)
     torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize(
-    "b,splits,paged", RAGGED_CASES,
-    ids=[f"b{b}_sp{sp}_{'paged' if pg else 'dense'}"
-         for b, sp, pg in RAGGED_CASES],
+    "b,splits,paged",
+    RAGGED_CASES,
+    ids=[f"b{b}_sp{sp}_{'paged' if pg else 'dense'}" for b, sp, pg in RAGGED_CASES],
 )
 def test_packed_splitk_decode_ragged(b, splits, paged):
     """Ragged decode: unequal seqused_k per sequence -- the general case that
     exercises per-sequence segment math the equal-KV loop does not."""
     build, ws_elems = _build_mods()
-    err, cos, bad = _run_ragged(build, ws_elems, b, splits, paged, D, SEED,
-                                packed=True)
+    err, cos, bad = _run_ragged(build, ws_elems, b, splits, paged, D, SEED, packed=True)
     _check(err, cos, bad)
     torch.cuda.empty_cache()

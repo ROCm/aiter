@@ -23,6 +23,7 @@ block table the kernel is fed.
 
 Clear ~/.flydsl/cache before trusting a run after a kernel edit.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,8 +34,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
-from op_tests.triton_tests.attention.test_unified_attention import (  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
+from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
 
@@ -95,49 +96,80 @@ def make_pages(kf, vf, seqs, seed):
             pid = flat[c]
             c += 1
             s0, s1 = off + t * PAGE, min(off + (t + 1) * PAGE, off + ln)
-            pk[pid, :s1 - s0] = kf[s0:s1]
-            pv[pid, :s1 - s0] = vf[s0:s1]
+            pk[pid, : s1 - s0] = kf[s0:s1]
+            pv[pid, : s1 - s0] = vf[s0:s1]
             bt[bi, t] = pid
         off += ln
     return pk, pv, bt, stride
 
 
 @pytest.mark.parametrize(
-    "q_lens,kv_lens,label", CASES, ids=[c[2] for c in CASES],
+    "q_lens,kv_lens,label",
+    CASES,
+    ids=[c[2] for c in CASES],
 )
 def test_cross_prefill(q_lens, kv_lens, label):
     build = _build_module()
     total, kv_total, b = sum(q_lens), sum(kv_lens), len(q_lens)
     g = torch.Generator(device=DEV).manual_seed(7)
-    mk = lambda rows, n: torch.randn(rows, n, D, generator=g,  # noqa: E731
-                                     device=DEV, dtype=torch.bfloat16)
+    mk = lambda rows, n: torch.randn(
+        rows, n, D, generator=g, device=DEV, dtype=torch.bfloat16
+    )
     qf, qs = q8(mk(total, H))
     kf, ks = q8(mk(kv_total, HKV))
     vf, vs = q8(mk(kv_total, HKV))
-    cu_q = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)),
-                        device=DEV, dtype=torch.int32)
-    cu_kv = torch.tensor([0] + list(torch.tensor(kv_lens).cumsum(0)),
-                         device=DEV, dtype=torch.int32)
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(q_lens).cumsum(0)), device=DEV, dtype=torch.int32
+    )
+    cu_kv = torch.tensor(
+        [0] + list(torch.tensor(kv_lens).cumsum(0)), device=DEV, dtype=torch.int32
+    )
     pk, pv, bt, stride = make_pages(kf, vf, kv_lens, 8)
-    mod = build(num_heads=H, head_dim=D, causal=True, dtype_str="fp8",
-                num_kv_heads=HKV, varlen=True, paged=True)
+    mod = build(
+        num_heads=H,
+        head_dim=D,
+        causal=True,
+        dtype_str="fp8",
+        num_kv_heads=HKV,
+        varlen=True,
+        paged=True,
+    )
     o = torch.empty(total, H, D, device=DEV, dtype=torch.bfloat16)
-    mod(qf.contiguous().view(-1), pk.contiguous().view(-1),
-        pv.contiguous().view(-1), o.contiguous().view(-1), b, max(q_lens),
-        cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv,
-        q_descale=qs, k_descale=ks, v_descale=vs,
-        block_table=bt.contiguous().view(-1), block_table_stride=stride)
+    mod(
+        qf.contiguous().view(-1),
+        pk.contiguous().view(-1),
+        pv.contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        max(q_lens),
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        block_table=bt.contiguous().view(-1),
+        block_table_stride=stride,
+    )
     torch.cuda.synchronize()
 
     want = ref_paged_attn(
-        query=qf, key_cache=pk, value_cache=pv, query_lens=list(q_lens),
-        kv_lens=list(kv_lens), block_tables=bt, scale=D ** -0.5,
-        out_dtype=torch.float32, q_descale=qs, k_descale=ks, v_descale=vs,
+        query=qf,
+        key_cache=pk,
+        value_cache=pv,
+        query_lens=list(q_lens),
+        kv_lens=list(kv_lens),
+        block_tables=bt,
+        scale=D**-0.5,
+        out_dtype=torch.float32,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
     )
     got = o.float()
     err = (got - want).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        got.flatten(), want.flatten(), dim=0).item()
+        got.flatten(), want.flatten(), dim=0
+    ).item()
     # `bad` -- rows whose worst element exceeds the tolerance -- is the sharper
     # signal: a whole wrong sequence past the first BLOCK_M still read cos=0.96
     # before the active guard existed. A bottom-right/top-left mask confusion is
