@@ -336,7 +336,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 {
     constexpr int BM = 256;
     constexpr int BN = 256;
-    constexpr int BK = 16;
+    constexpr int BK = 32;
     __shared__ __align__(16) opus::bf16_t As[2][BK][BM];
     __shared__ __align__(16) opus::bf16_t Bs[2][BK][BN];
 
@@ -353,47 +353,37 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int nroute = r1 - r0;
     const int num_k_stages = (nroute + BK - 1) / BK;
 
-    // 512 threads x one bf16x8 vector cover one 16x256 operand tile.
-    const int load_k = tid / 32;
-    const int load_f = (tid % 32) * 8;
+    // 512 threads x two bf16x8 vectors cover one 32x256 operand tile.
+    const int load_k = tid / 16;
+    const int load_f = (tid % 16) * 16;
     struct load_regs {
-        opus_bf16x8 av, bv;
+        opus_bf16x8 a0, a1, b0, b1;
     };
     auto load_global = [&](int stage, load_regs& x) {
         const int route = r0 + stage * BK + load_k;
-        x.av = {}; x.bv = {};
+        x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
         if(route < r1)
         {
             const int mf = m0 + load_f;
             const int nf = n0 + load_f;
-            if(mf + 7 < P)
-                x.av = *reinterpret_cast<const opus_bf16x8*>(
-                    dy + static_cast<int64_t>(route) * P + mf);
-            else
-            {
-#pragma unroll
-                for(int i = 0; i < 8; ++i)
-                    if(mf + i < P)
-                        x.av[i] = dy[static_cast<int64_t>(route) * P + mf + i];
-            }
-            if(nf + 7 < Q)
-                x.bv = *reinterpret_cast<const opus_bf16x8*>(
-                    a + static_cast<int64_t>(route) * Q + nf);
-            else
-            {
-#pragma unroll
-                for(int i = 0; i < 8; ++i)
-                    if(nf + i < Q)
-                        x.bv[i] = a[static_cast<int64_t>(route) * Q + nf + i];
-            }
+            x.a0 = *reinterpret_cast<const opus_bf16x8*>(
+                dy + static_cast<int64_t>(route) * P + mf);
+            x.a1 = *reinterpret_cast<const opus_bf16x8*>(
+                dy + static_cast<int64_t>(route) * P + mf + 8);
+            x.b0 = *reinterpret_cast<const opus_bf16x8*>(
+                a + static_cast<int64_t>(route) * Q + nf);
+            x.b1 = *reinterpret_cast<const opus_bf16x8*>(
+                a + static_cast<int64_t>(route) * Q + nf + 8);
         }
     };
     auto store_stage = [&](int buf, const load_regs& x) {
         auto as = opus::make_smem(&As[buf][0][0]);
         auto bs = opus::make_smem(&Bs[buf][0][0]);
         const int os = load_k * BM + load_f;
-        as.template store<8>(x.av, os);
-        bs.template store<8>(x.bv, os);
+        as.template store<8>(x.a0, os);
+        as.template store<8>(x.a1, os + 8);
+        bs.template store<8>(x.b0, os);
+        bs.template store<8>(x.b1, os + 8);
     };
 
     opus_f32x16 vc[4][2];
@@ -423,34 +413,39 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         if(has_next)
             load_global(stage + 1, next);
 
-        opus_bf16x8 va[4], vb[2];
-#pragma unroll
-        for(int sm = 0; sm < 4; ++sm)
+        for(int kpack = 0; kpack < 2; ++kpack)
         {
-            auto smem = opus::make_smem(&As[cur][0][wm * 128 + sm * 32]);
-            va[sm] = __builtin_bit_cast(
-                opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
-        }
+            opus_bf16x8 va[4], vb[2];
 #pragma unroll
-        for(int sn = 0; sn < 2; ++sn)
-        {
-            auto smem = opus::make_smem(&Bs[cur][0][wn * 64 + sn * 32]);
-            vb[sn] = __builtin_bit_cast(
-                opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
-        }
-        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
-#pragma unroll
-        for(int sm = 0; sm < 4; ++sm)
-            va[sm] = opus_wgtn_materialize_fragment(va[sm]);
-#pragma unroll
-        for(int sn = 0; sn < 2; ++sn)
-            vb[sn] = opus_wgtn_materialize_fragment(vb[sn]);
-#pragma unroll
-        for(int sm = 0; sm < 4; ++sm)
+            for(int sm = 0; sm < 4; ++sm)
+            {
+                auto smem = opus::make_smem(
+                    &As[cur][kpack * 16][wm * 128 + sm * 32]);
+                va[sm] = __builtin_bit_cast(
+                    opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
+            }
 #pragma unroll
             for(int sn = 0; sn < 2; ++sn)
-                vc[sm][sn] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
-                    va[sm], vb[sn], vc[sm][sn], 0, 0, 0);
+            {
+                auto smem = opus::make_smem(
+                    &Bs[cur][kpack * 16][wn * 64 + sn * 32]);
+                vb[sn] = __builtin_bit_cast(
+                    opus_bf16x8, opus::tr_load<4>(smem, tr_layout));
+            }
+            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+#pragma unroll
+            for(int sm = 0; sm < 4; ++sm)
+                va[sm] = opus_wgtn_materialize_fragment(va[sm]);
+#pragma unroll
+            for(int sn = 0; sn < 2; ++sn)
+                vb[sn] = opus_wgtn_materialize_fragment(vb[sn]);
+#pragma unroll
+            for(int sm = 0; sm < 4; ++sm)
+#pragma unroll
+                for(int sn = 0; sn < 2; ++sn)
+                    vc[sm][sn] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
+                        va[sm], vb[sn], vc[sm][sn], 0, 0, 0);
+        }
 
         if(has_next)
         {
