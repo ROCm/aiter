@@ -3,6 +3,12 @@
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
+
+
+@triton.jit
+def _int8_rne_sat(x):
+    return tl.clamp(libdevice.nearbyint(x), min=-127.0, max=127.0)
 
 
 @triton.jit
@@ -25,7 +31,10 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     scale = tl.load(scale_in_ptr)
     scale_recip = 1 / scale
 
-    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
+    qx = x * scale_recip
+    if qx_ptr.dtype.element_ty == tl.int8:
+        qx = _int8_rne_sat(qx)
+    qx = qx.to(qx_ptr.dtype.element_ty)
 
     tl.store(qx_ptr + offs, qx, mask=mask)
 
@@ -74,6 +83,8 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
     scale_recip = 1 / scale_out
 
     qx = x * scale_recip
+    if qx_ptr.dtype.element_ty == tl.int8:
+        qx = _int8_rne_sat(qx)
     qx = qx.to(qx_ptr.dtype.element_ty)
 
     scale_offs = pid

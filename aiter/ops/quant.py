@@ -61,6 +61,14 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+def _scaled_quant_cast(x, quant_dtype):
+    # INT8 scales use symmetric qmax=127; leave floating-point formats unchanged.
+    if quant_dtype == dtypes.i8:
+        dtype_max = get_dtype_max(quant_dtype)
+        x = torch.round(x).clamp(-dtype_max, dtype_max)
+    return x.to(dtype=quant_dtype)
+
+
 def pertoken_quant(
     x,
     scale=None,
@@ -89,7 +97,7 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
+    y = _scaled_quant_cast(hidden_states / per_token_scale, quant_dtype)
     y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale
 
@@ -319,13 +327,13 @@ def per_tensor_quant(
     x, scale=None, scale_dtype=dtypes.fp32, quant_dtype=dtypes.i8, dtypeMax=None
 ):
     x = x.to(dtypes.fp32)
+    if dtypeMax is None:
+        dtypeMax = get_dtype_max(quant_dtype)
     if scale is None:
-        if dtypeMax is None:
-            dtypeMax = get_dtype_max(quant_dtype)
         scale = torch.abs(x).max() / dtypeMax
     y = x / scale
 
-    return y.to(quant_dtype), scale.view(1).to(scale_dtype)
+    return _scaled_quant_cast(y, quant_dtype), scale.view(1).to(scale_dtype)
 
 
 def per_block_quant_wrapper(block_shape=(1, 128)):
