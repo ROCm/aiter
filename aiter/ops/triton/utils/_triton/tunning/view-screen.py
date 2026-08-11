@@ -1,12 +1,13 @@
+import argparse
 import os
 import sys
-import argparse
+
 from _utils import (
     config_parms_key,
     read_screen_file,
 )
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -101,62 +102,60 @@ def main():
         print("M\tN\tK\tTriton (us)\tconfig")
         last_config_list = None
         get_at_least_one_config = False
-        fout = open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w")
-        fout.write("{\n")
+        with open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w") as fout:
+            fout.write("{\n")
 
-        for m in mlist:
-            case_data = []
-            screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
-            read_screen_file(screen_filename, case_data)
-            case_data = sorted(case_data, key=lambda x: x[0])
+            for m in mlist:
+                case_data = []
+                screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
+                read_screen_file(screen_filename, case_data)
+                case_data = sorted(case_data, key=lambda x: x[0])
 
-            if len(case_data) > 0:
-                get_at_least_one_config = True
-                triton_runtime = f"{case_data[0][0]:8.3f}"
-                config_str = f"(config = {case_data[0][1]})"
-            else:
-                triton_runtime = "     N/A"
-                config_str = "Warning: your config files is not complete!"
+                if len(case_data) > 0:
+                    get_at_least_one_config = True
+                    triton_runtime = f"{case_data[0][0]:8.3f}"
+                    config_str = f"(config = {case_data[0][1]})"
+                else:
+                    triton_runtime = "     N/A"
+                    config_str = "Warning: your config files is not complete!"
 
-            print(f"{m}\t{n}\t{k}\t{triton_runtime}\t{config_str}")
+                print(f"{m}\t{n}\t{k}\t{triton_runtime}\t{config_str}")
 
-            if len(case_data) == 0:
-                if last_config_list is None:
-                    continue
-                config_list = last_config_list
-            else:
-                config_list = case_data[0][1].split()
-                last_config_list = config_list
+                if len(case_data) == 0:
+                    if last_config_list is None:
+                        continue
+                    config_list = last_config_list
+                else:
+                    config_list = case_data[0][1].split()
+                    last_config_list = config_list
 
-            config_name = m_config_map[m]
+                config_name = m_config_map[m]
 
-            fout.write("""  "%s": {\n""" % (config_name))
-            for i_parms_key, parms_key in enumerate(config_parms_key):
-                parm = config_list[i_parms_key]
+                fout.write(f"""  "{config_name}": {{\n""")
+                for i_parms_key, parms_key in enumerate(config_parms_key):
+                    parm = config_list[i_parms_key]
 
-                if parms_key == "cache_modifier":
-                    fout.write(
-                        """    "%s": %s"""
-                        % (
-                            parms_key,
-                            """".cg\"""" if parm == "0" else "null",
+                    if parms_key == "cache_modifier":
+                        fout.write(
+                            """    "{}": {}""".format(
+                                parms_key,
+                                """".cg\"""" if parm == "0" else "null",
+                            )
                         )
-                    )
+                    else:
+                        fout.write(f"""    "{parms_key}": {parm}""")
+
+                    if i_parms_key != len(config_parms_key) - 1:
+                        fout.write(""",\n""")
+                    else:
+                        fout.write("""\n  }""")
+
+                if config_name == last_config_name:
+                    fout.write("\n")
                 else:
-                    fout.write("""    "%s": %s""" % (parms_key, parm))
+                    fout.write(",\n")
 
-                if i_parms_key != len(config_parms_key) - 1:
-                    fout.write(""",\n""")
-                else:
-                    fout.write("""\n  }""")
-
-            if config_name == last_config_name:
-                fout.write("\n")
-            else:
-                fout.write(",\n")
-
-        fout.write("}\n")
-        fout.close()
+            fout.write("}\n")
         if not get_at_least_one_config:
             os.popen(f"rm {config_json_file_prefix}-N={n}-K={k}.json").read()
             print("No file is created")

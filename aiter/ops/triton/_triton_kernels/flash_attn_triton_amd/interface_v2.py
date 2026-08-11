@@ -1,15 +1,17 @@
+from typing import Literal
+
 import torch
-from typing import Literal, Optional, Union
-from .fwd_prefill import attention_forward_prefill_triton_impl
-from .fwd_decode import attention_forward_decode_triton_impl
+
 from .bwd import attention_backward_triton_impl
+from .fwd_decode import attention_forward_decode_triton_impl
+from .fwd_prefill import attention_forward_prefill_triton_impl
 from .utils import (
-    DEBUG,
-    USE_EXP2,
     BWD_MODE,
-    PHILOX_SEED,
+    DEBUG,
     PHILOX_OFFSET,
+    PHILOX_SEED,
     SHAPE_EXPECTATIONS,
+    USE_EXP2,
     round_multiple,
 )
 
@@ -22,8 +24,8 @@ def fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    out: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -31,8 +33,8 @@ def fwd(
     window_size_right: int,
     softcap: float,
     return_softmax: bool,
-    gen_: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    gen_: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
 
     # Reject FP8 tensors (FA2 AMD path does not support FP8)
     if str(q.dtype).startswith("torch.float8"):
@@ -216,10 +218,10 @@ def bwd(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -227,21 +229,12 @@ def bwd(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
-    gen_: Optional[torch.Tensor] = None,
-    rng_state: Optional[torch.Tensor] = None,
+    gen_: torch.Tensor | None = None,
+    rng_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if softcap != 0.0:
         raise NotImplementedError(
             "softcap is not supported in the AMD Triton FA2 interface (expected 0.0)."
-        )
-
-    # Check for sliding window - backward doesn't support it yet
-    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
-    if is_sliding_window:
-        raise NotImplementedError(
-            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
-            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
-            f"Use window_size=(-1, -1) for full attention."
         )
 
     if DEBUG:
@@ -328,6 +321,8 @@ def bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:
@@ -354,13 +349,13 @@ def varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: Optional[torch.Tensor],
+    out: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    seqused_k: Optional[torch.Tensor],
-    leftpad_k: Optional[torch.Tensor],
-    block_table_: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    seqused_k: torch.Tensor | None,
+    leftpad_k: torch.Tensor | None,
+    block_table_: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -371,9 +366,9 @@ def varlen_fwd(
     window_size_right: int,
     softcap: float,
     return_softmax: bool,
-    gen_: Optional[torch.Tensor] = None,
+    gen_: torch.Tensor | None = None,
     num_splits: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
@@ -554,12 +549,12 @@ def varlen_bwd(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -570,8 +565,8 @@ def varlen_bwd(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
-    gen_: Optional[torch.Tensor] = None,
-    rng_state: Optional[torch.Tensor] = None,
+    gen_: torch.Tensor | None = None,
+    rng_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
@@ -580,14 +575,6 @@ def varlen_bwd(
     if softcap != 0.0:
         raise NotImplementedError(
             "softcap is not supported in varlen_bwd (expected 0.0)."
-        )
-
-    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
-    if is_sliding_window:
-        raise NotImplementedError(
-            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
-            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
-            f"Use window_size=(-1, -1) for full attention."
         )
 
     if DEBUG:
@@ -676,6 +663,8 @@ def varlen_bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:
@@ -703,16 +692,16 @@ def fwd_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor],
-    v: Optional[torch.Tensor],
-    cache_seqlens: Optional[Union[int, torch.Tensor]],
-    rotary_cos: Optional[torch.Tensor],
-    rotary_sin: Optional[torch.Tensor],
-    cache_batch_idx: Optional[torch.Tensor],
-    cache_leftpad: Optional[torch.Tensor],
-    block_table: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    cache_seqlens: int | torch.Tensor | None,
+    rotary_cos: torch.Tensor | None,
+    rotary_sin: torch.Tensor | None,
+    cache_batch_idx: torch.Tensor | None,
+    cache_leftpad: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    out: torch.Tensor | None,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,

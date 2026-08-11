@@ -39,7 +39,7 @@ GFX_MAP = {
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350
-    "gfx1250": 256,  # MI400 placeholder; set CU_NUM explicitly for the target SKU
+    "gfx1250": 256,  # Gfx1250
 }
 
 

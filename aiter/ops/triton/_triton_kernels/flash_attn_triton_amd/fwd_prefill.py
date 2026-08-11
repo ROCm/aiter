@@ -1,14 +1,16 @@
 import warnings
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
-from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
+
+from .common import apply_rotary, compute_alibi_block, compute_fp8_scaling_factors
 from .utils import (
     AUTOTUNE,
-    AutotuneMode,
     DEBUG,
     FWD_CONF_OVERRIDE,
+    AutotuneMode,
     get_arch,
     is_fp8,
     remap_xcd,
@@ -37,20 +39,7 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         if FWD_CONF_OVERRIDE:
             return [FWD_CONF_OVERRIDE]
         arch = get_arch()
-        if arch.name == "gfx950":
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-        elif arch.name == "gfx942":
+        if arch.name == "gfx950" or arch.name == "gfx942":
             return [
                 triton.Config(
                     {
@@ -329,7 +318,7 @@ def _attn_fwd_inner(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     # loop over k, v, and update accumulator
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
@@ -366,12 +355,11 @@ def _attn_fwd_inner(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # Apply extra token masking for partial blocks (only when APPLY_MASK=True)
-        if APPLY_MASK:
-            if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
-                boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
-                size_n = start_n + offs_n[None, :]
-                mask = size_n < boundary_m[:, None]
-                qk = tl.where(mask, qk, float("-inf"))
+        if APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
+            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
+            size_n = start_n + offs_n[None, :]
+            mask = size_n < boundary_m[:, None]
+            qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
         if IS_FP8:
@@ -401,10 +389,19 @@ def _attn_fwd_inner(
                     causal_offset = seqlen_k - seqlen_q
                     causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
 
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        # both edges unbounded: only the causal cap constrains cols
+                        window_mask = causal_mask
+                    elif WINDOW_SIZE_LEFT < 0:
+                        # unbounded left, finite right
                         window_mask = col_idx_expanded > (
                             row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
                         )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        # unbounded right: the causal cap already bounds the right,
+                        # so only the finite left edge masks (mirror of infinite-left)
+                        left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
+                        window_mask = col_idx_expanded < left_bound
                     else:
                         left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
                         right_bound = (
@@ -425,9 +422,18 @@ def _attn_fwd_inner(
                     row_idx_expanded = row_idx[:, None]
                     col_idx_expanded = col_idx[None, :]
 
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        # both edges unbounded: full (non-causal) attention
+                        mask = (row_idx_expanded < 0) | (col_idx_expanded < 0)
+                    elif WINDOW_SIZE_LEFT < 0:
+                        # unbounded left, finite right
                         mask = col_idx_expanded > (
                             row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
+                        )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        # unbounded right, finite left (mirror of infinite-left)
+                        mask = col_idx_expanded < (
+                            row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
                         )
                     else:
                         sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
@@ -505,10 +511,17 @@ def _attn_fwd_inner(
                     sd_store_mask = sd_store_mask & causal_constraint
 
                 if APPLY_MASK and USE_SLIDING_WINDOW:
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        window_constraint = offs_m[:, None] >= 0
+                    elif WINDOW_SIZE_LEFT < 0:
                         window_constraint = kv_offs_n[None, :] <= (
                             offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                         )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        left_bound = (
+                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        )
+                        window_constraint = kv_offs_n[None, :] >= left_bound
                     else:
                         left_bound = (
                             offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
@@ -544,10 +557,15 @@ def _attn_fwd_inner(
                 sd_store_mask = sd_store_mask & causal_constraint
 
             if APPLY_MASK and USE_SLIDING_WINDOW:
-                if WINDOW_SIZE_LEFT < 0:
+                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                    window_constraint = offs_m[:, None] >= 0
+                elif WINDOW_SIZE_LEFT < 0:
                     window_constraint = kv_offs_n[None, :] <= (
                         offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                     )
+                elif WINDOW_SIZE_RIGHT < 0:
+                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                    window_constraint = kv_offs_n[None, :] >= left_bound
                 else:
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
@@ -626,8 +644,12 @@ def compute_window_bounds(
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
         if WINDOW_SIZE_RIGHT < 0:
-            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
-            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
+            # Unbounded right edge: mirror the infinite-left collapse
+            # (WINDOW_SIZE_LEFT < 0 -> left bound collapses to 0). Here the right
+            # bound saturates at the last K index so classify_window_blocks
+            # produces no back-skip / back-masked blocks.
+            right_min = seqlen_k - 1
+            right_max = seqlen_k - 1
         else:
             # Non-causal doesn't have the diagonal constraint
             right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
@@ -1447,38 +1469,38 @@ def attention_forward_prefill_triton_impl(
     v: torch.Tensor,
     o: torch.Tensor,
     softmax_lse: torch.Tensor,
-    sd_mask: Optional[torch.Tensor],
+    sd_mask: torch.Tensor | None,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     layout: Literal["bshd", "bhsd", "thd"],
     # varlen
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlens_q: int,
     max_seqlens_k: int,
     # dropout
     dropout_p: float,
-    philox_seed: Optional[int],
-    philox_offset: Optional[int],
+    philox_seed: int | None,
+    philox_offset: int | None,
     # misc
     return_scores: bool,
     use_exp2: bool,
     # fp8
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     # seqused for FA v3
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
     # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
+    seqlens_rotary: torch.Tensor | None = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1500,8 +1522,8 @@ def attention_forward_prefill_triton_impl(
     if IS_VARLEN:
         # shape
         total_seqlen_q, nheads_q, head_size_q = q.shape
-        total_seqlen_k, nheads_k, head_size_k = k.shape
-        total_seqlen_v, nheads_v, head_size_v = v.shape
+        _total_seqlen_k, nheads_k, head_size_k = k.shape
+        _total_seqlen_v, nheads_v, head_size_v = v.shape
 
         # assert shapes
         assert (
@@ -1766,6 +1788,11 @@ def attention_forward_prefill_triton_impl(
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    # Either edge may be unbounded and is handled uniformly: WINDOW_SIZE_LEFT < 0
+    # collapses the left bound to 0, WINDOW_SIZE_RIGHT < 0 saturates the right bound
+    # at the last K index (compute_window_bounds + the per-element masks mirror the
+    # two edges). (-1, -1) is the only "off" sentinel (leaves use_sliding_window
+    # False), so no negative-right guard is needed.
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
@@ -1905,7 +1932,7 @@ def attention_forward_prefill_triton_impl(
         IS_VARLEN=IS_VARLEN,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False if bias is None else True,
+        USE_BIAS=not bias is None,
         USE_ALIBI=use_alibi,
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,

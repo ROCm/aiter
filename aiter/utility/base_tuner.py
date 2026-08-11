@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import sys
-import shutil
-import tempfile
 import argparse
-import torch
-import pandas as pd
-
-from abc import abstractmethod
-from aiter import logger
-from operator import itemgetter
+import os
+import shutil
+import sys
+import tempfile
 import time
-from aiter import dtypes
+from abc import abstractmethod
+from operator import itemgetter
+from typing import Any, ClassVar
+
+import pandas as pd
+import torch
+
+from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
@@ -34,19 +35,25 @@ def _read_csv(filepath, **kwargs):
 
 
 class TunerCommon:
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
-        "timeout": None,  # 100s timeout for per test
+        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
+        # fault leaves its in-flight task unresolvable; with no timeout the whole
+        # run hangs. A generous default lets the existing reaping path drop the
+        # lost task and restart the pool, while staying comfortably above any
+        # legitimate shape-group tuning time so healthy tasks are never falsely
+        # reaped. Override with --timeout for tighter/looser bounds.
+        "timeout": 1800,
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
     }
-    dtype2bpe_dict = {
+    dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
         dtypes.bf16: 2,
         dtypes.i16: 2,
@@ -193,7 +200,9 @@ class TunerCommon:
             "--timeout",
             type=int,
             default=defaults["timeout"],
-            help="timeout for task group",
+            help="per-task watchdog in seconds; a lost task (dead worker) is "
+            "reaped and the pool restarted after this many seconds. Defaults "
+            "generous so healthy shape groups are never falsely reaped.",
         )
         self.parser.add_argument(
             "--run_config",
@@ -234,32 +243,26 @@ class TunerCommon:
     @abstractmethod
     def _setup_specific_arguments(self):
         """set specific arguments"""
-        pass
 
     @abstractmethod
     def pre_process(self, args):
         """pre_process tunedf and untunedf"""
-        pass
 
     @abstractmethod
     def tune(self, untunedf, tunedf, args):
         """tune process, return all results"""
-        pass
 
     @abstractmethod
     def getKernelName(self, kernel_id):
         """obtain name of the kernel from its id"""
-        pass
 
     @abstractmethod
     def calculate(self, results, inbpe=2, outbpe=2):
         """calculate TFLOPS and bandwidth"""
-        pass
 
     @abstractmethod
     def result_to_df(self, rets):
         """transfer results to dataframe"""
-        pass
 
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
@@ -321,7 +324,9 @@ class TunerCommon:
         assert path_list, "output tuned file is empty"
         return path_list[0]
 
-    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
+        if columns is None:
+            columns = []
         all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
             try:
@@ -372,6 +377,8 @@ class TunerCommon:
                 untunedf = untunedf[target_mask]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf.insert(0, "gfx", gfx)
 
             untunedf_cols = self.untunedf.columns
             mask = (
@@ -391,6 +398,22 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
+        # Backfill columns present in the new results but missing from a legacy
+        # tuned CSV (for example a newly added gfx key column), so that the
+        # key construction and per-column assignment below do not KeyError
+        # during migration. gfx/cu_num default to the running device; any other
+        # missing column defaults to NA.
+        for col in df_updates.columns:
+            if col not in df_old.columns:
+                if col == "gfx":
+                    # Keep gfx as the leading key column (canonical layout)
+                    # rather than appending it at the end when migrating a
+                    # legacy CSV.
+                    df_old.insert(0, col, self.get_gfx())
+                elif col == "cu_num":
+                    df_old[col] = self.get_cu_num()
+                else:
+                    df_old[col] = pd.NA
         # Widen integer columns to object so that float/string updates don't
         # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
         # cannot accept a float like 2.61).
@@ -412,9 +435,11 @@ class TunerCommon:
             "_tmp_key"
         ].tolist()
         for key in matched_keys:
-            df_old.loc[df_old.index[df_old["_tmp_key"] == key][0]] = df_updates.loc[
-                df_updates["_tmp_key"] == key
-            ].values[0]
+            old_idx = df_old.index[df_old["_tmp_key"] == key][0]
+            update_row = df_updates.loc[df_updates["_tmp_key"] == key].iloc[0]
+            # Assign by column name so migrated legacy CSVs with newly inserted
+            # columns (for example gfx) do not corrupt rows by positional shift.
+            df_old.loc[old_idx, df_updates.columns] = update_row
         if unmatched_keys:
             unmatched_rows = df_updates[
                 df_updates["_tmp_key"].isin(unmatched_keys)
@@ -426,6 +451,10 @@ class TunerCommon:
 
     def sortResults(self, tune_file, issorted, values):
         tunedf = _read_csv(tune_file)
+        # Migrate legacy tuned files lacking a gfx column so the gfx-aware
+        # dedup/sort keys below do not KeyError; keep gfx as the leading column.
+        if "gfx" in self.keys and "gfx" not in tunedf.columns:
+            tunedf.insert(0, "gfx", self.get_gfx())
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -535,11 +564,9 @@ class TunerCommon:
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
         """write result to csv file, all means concat all results to file"""
-        pass
 
     def update_tflops_bw(self, tune_file):
         """update tflops and bw from old tune_file"""
-        pass
 
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
@@ -552,7 +579,6 @@ class TunerCommon:
     def _clear_op_caches(self):
         """Clear operator-specific config caches. Subclasses should override this
         to clear only their own caches."""
-        pass
 
     def _set_config_env_for_run_config(self, args, config_file=None):
         """Set the config env var to point to a tuned config file, clear caches,
@@ -977,8 +1003,10 @@ class TunerCommon:
 
         lines = [
             "============= Compare Report =============",
-            f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
-            f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}",
+            (
+                f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
+                f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
+            ),
             f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
             "",
         ]
@@ -1037,8 +1065,8 @@ class TunerCommon:
                     if pd.notna(row.improvement_pct)
                     else "N/A"
                 )
-                pre_summary, _ = self._split_benchmark_status(row.pre_status)
-                post_summary, post_detail = self._split_benchmark_status(
+                _pre_summary, _ = self._split_benchmark_status(row.pre_status)
+                post_summary, _post_detail = self._split_benchmark_status(
                     row.post_status
                 )
                 if post_summary in ("ERROR", "MISMATCH"):
@@ -1319,7 +1347,6 @@ class TunerCommon:
         if report_file:
             print(f"Compare results written to {report_file}", flush=True)
 
-    #
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
@@ -1337,6 +1364,9 @@ class TunerCommon:
             tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
                 cu = self.get_cu_num()
+                gfx = self.get_gfx()
+                if "gfx" in tunedf.columns:
+                    tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
@@ -1468,10 +1498,10 @@ class TunerCommon:
             logger.error(
                 f"interrupted by user, tuning stopped, {completed_batches} batches processed"
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             tuning_status = "Error"
             logger.error(
-                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {str(e)}",
+                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {e!s}",
                 exc_info=True,
             )
         finally:
@@ -1481,7 +1511,7 @@ class TunerCommon:
                 self.tune_summary(tuning_status)
             except SystemExit as e:
                 tune_exit = e
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 summary_exc = e
                 logger.error(
                     f"tune_summary failed (tuning may still have written results): {e}",
@@ -1506,7 +1536,7 @@ class TunerCommon:
 
 class GemmCommonTuner(TunerCommon):
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "sort": True,  # Enable sorting by default for GEMM tuners
     }
@@ -1514,18 +1544,22 @@ class GemmCommonTuner(TunerCommon):
     def __init__(
         self,
         name,
-        key=["gfx", "cu_num", "M", "N", "K"],
-        resultList=[
-            "kernelId",
-            "splitK",
-            "us",
-            "kernelName",
-            "tflops",
-            "bw",
-            "errRatio",
-        ],
+        key=None,
+        resultList=None,
         description=None,
     ):
+        if resultList is None:
+            resultList = [
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+                "tflops",
+                "bw",
+                "errRatio",
+            ]
+        if key is None:
+            key = ["gfx", "cu_num", "M", "N", "K"]
         super().__init__(name, key, resultList, description)
         # Swap M and N positions to ensure N comes before M
         self.sort_keys = list(key)
@@ -1545,6 +1579,10 @@ class GemmCommonTuner(TunerCommon):
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            # Backfill gfx for legacy tuned CSVs so the key-based skip mask
+            # below does not KeyError when gfx is part of the tuner keys.
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf.insert(0, "gfx", self.get_gfx())
 
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
@@ -1560,13 +1598,13 @@ class GemmCommonTuner(TunerCommon):
         """calculate TFLOPS and bandwidth"""
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
-            _gfx, cu_num, m, n, k, *rest = info[0]
+            _gfx, _cu_num, m, n, k, *_rest = info[0]
         else:  # legacy subclass key: (cu_num, m, n, k, ...)
-            cu_num, m, n, k, *rest = info[0]
+            _cu_num, m, n, k, *_rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -1651,14 +1689,14 @@ class GemmCommonTuner(TunerCommon):
         resultdf = self.get_tuned_gemm_list(file)
         for i in range(len(resultdf)):
             if len(resultdf.loc[i]) == 8:
-                *keys, kernelId, splitK, us, kernelName = tuple(resultdf.loc[i])
+                *keys, kernelId, splitK, us, _kernelName = tuple(resultdf.loc[i])
             else:
                 (
                     *keys,
                     kernelId,
                     splitK,
                     us,
-                    kernelName,
+                    _kernelName,
                     tflops,
                     bw,
                     errRatio,
@@ -1674,9 +1712,9 @@ class GemmCommonTuner(TunerCommon):
 
     def set_run_iters(self, input, inputdtype):
         if len(input) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
-            _gfx, cu_num, m, n, k, *rest = input
+            _gfx, _cu_num, m, n, k, *_rest = input
         else:  # legacy subclass key: (cu_num, m, n, k, ...)
-            cu_num, m, n, k, *rest = input
+            _cu_num, m, n, k, *_rest = input
         flops = m * n * k * 2
         if flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 50

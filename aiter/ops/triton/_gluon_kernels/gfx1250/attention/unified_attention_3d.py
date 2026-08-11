@@ -1,16 +1,18 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
-from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from triton.language.core import _aggregate as aggregate
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 import math
+
+import torch
+import triton.experimental.gluon.language as gl
+import triton.language as tl
+from triton.experimental import gluon
+from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -34,6 +36,7 @@ def apply_softcap(S, x):
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -58,7 +61,6 @@ class AttentionConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -556,6 +558,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     """Program state and core operations for the unified attention kernel."""
 
@@ -1298,7 +1301,7 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-                return gl.amd.gfx1250.local_load_packed_transposed(
+                return gl.amd.gfx1250.load_shared_fp4_repacked(
                     self.lds_unshuffle_v(buffer_id), layout=self.cfg.V_DOT_PACKED_LAYOUT
                 )
             else:
@@ -1531,7 +1534,7 @@ class AttentionProgram:
         p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
-            v = gl.amd.gfx1250.local_load_packed_transposed(
+            v = gl.amd.gfx1250.load_shared_fp4_repacked(
                 self.v_shared.index(buffer_id)
                 .reshape(
                     (
@@ -1978,7 +1981,7 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  #
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH: gl.constexpr = 16,  # int
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
@@ -2282,8 +2285,11 @@ def _unified_attention_gluon_kernel_3d(
         cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
     if need_addtional_mask:
-        seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+        seq_offset = (
+            j_hbm_start * cfg.TILE_SIZE
+            + gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )[None, :]
         )
 
     # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride # no-paging expt
@@ -2319,7 +2325,7 @@ def _unified_attention_gluon_kernel_3d(
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
-            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
@@ -2358,7 +2364,7 @@ def _unified_attention_gluon_kernel_3d(
     if not need_addtional_mask:
         seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
-        )
+        )[None, :]
 
     if KV_CACHE_DTYPE == "nvfp4":
         k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
@@ -2372,7 +2378,7 @@ def _unified_attention_gluon_kernel_3d(
     S = S * qk_factor
 
     S = pgm.apply_softcap(S)
-    seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
     S = gl.where(seq_mask, S, float("-inf"))
     if need_addtional_mask:
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
