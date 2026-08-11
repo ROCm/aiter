@@ -138,6 +138,18 @@ def make_dispatch(
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
+    # Hand each lane a contiguous run of scale dwords rather than one dword per
+    # lane-strided step. A 7168-wide row is 56 dwords, so a wave of 32 needed two
+    # steps whose loads sat on a dependency chain; two dwords per lane covers it
+    # in one. Take the narrowest width that still collapses the walk to a single
+    # step -- going wider idles lanes that would otherwise have loads in flight,
+    # which at bs=512 cost more (~7us) than the step it saves.
+    scale_vec = 1
+    _scale_steps = (scale_num_i32 + WAVE - 1) // WAVE
+    for _v in (2, 4, 8):
+        if _v >= _scale_steps and scale_num_i32 % _v == 0:
+            scale_vec = _v
+            break
     # push-group MX scales: the sender quantizes, so the wire carries a linear
     # [row, scale_dim] e8m0 scale, but the GEMM reads the WMMA-preshuffled layout
     # whose position depends on the row's slot within its destination expert --
@@ -283,11 +295,17 @@ def make_dispatch(
                         peer_rowmap = create_buffer_resource_from_addr(
                             fx.Int64(window.lsa_ptr(dest_pe, off_pg_rowmap))
                         )
-                        buffer_store(dst_packed, peer_rowmap, dest_tok_id * 2)
+                        # {origin, weight} occupy adjacent dwords at an 8B-aligned
+                        # slot, so emit one dwordx2 instead of two remote 4B
+                        # stores: each store is a partial-line write across the
+                        # fabric and the Phase-2 drain waits on all of them.
                         buffer_store(
-                            arith.bitcast(T.i32, pg_w),
+                            vector.from_elements(
+                                T.vec(2, T.i32),
+                                [dst_packed, arith.bitcast(T.i32, pg_w)],
+                            ),
                             peer_rowmap,
-                            dest_tok_id * 2 + 1,
+                            dest_tok_id * 2,
                         )
                     dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                         dest_pe
@@ -317,7 +335,7 @@ def make_dispatch(
                     )
 
             # Per-token scales scatter: forward the src token's scale_num_i32 dwords
-            # (lane-strided) to the dest peer's out_scales[dest_tok_id], verbatim.
+            # (scale_vec per lane) to the dest peer's out_scales[dest_tok_id].
             if const_expr(enable_scales):
                 if do_publish:
                     rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
@@ -345,20 +363,42 @@ def make_dispatch(
                             )
                             + wmma_row
                         )
-                    for k_off in range(lane, scale_num_i32, WAVE):
+                    for k_off in range(
+                        lane * scale_vec, scale_num_i32, WAVE * scale_vec
+                    ):
                         scale_val = buffer_load(
                             rsrc_inp_scales,
                             src_tok * scale_num_i32 + k_off,
-                            vec_width=1,
+                            vec_width=scale_vec,
                             dtype=T.i32,
                         )
                         if const_expr(preshuffle_scales):
+                            # wmma_rep interleaves rep rows at dword granularity,
+                            # so the destination dwords stay rep apart however
+                            # wide the source read was.
                             dst_off = dst_base + k_off * arith.constant(
                                 push_group_scale_wmma_rep
                             )
+                            for j in range_constexpr(scale_vec):
+                                elem = (
+                                    vector.extract(scale_val, static_position=[j])
+                                    if const_expr(scale_vec > 1)
+                                    else scale_val
+                                )
+                                buffer_store(
+                                    elem,
+                                    rsrc_peer_scales,
+                                    dst_off
+                                    + arith.constant(
+                                        j * push_group_scale_wmma_rep
+                                    ),
+                                )
                         else:
-                            dst_off = dest_tok_id * scale_num_i32 + k_off
-                        buffer_store(scale_val, rsrc_peer_scales, dst_off)
+                            buffer_store(
+                                scale_val,
+                                rsrc_peer_scales,
+                                dest_tok_id * scale_num_i32 + k_off,
+                            )
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). _DISP_NSTREAMS
             # vec4 streams for memory-level parallelism, one-stream tail for the
@@ -404,9 +444,9 @@ def make_dispatch(
         if const_expr(enable_signal):
             # Self-reset total_recv (replaces the host-side total_recv.zero_()):
             # only global warp 0 touches it — lane 0 zeros it here, all lanes
-            # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
-            # drains this store before the Phase-3 adds; total_recv is local, so
-            # no release fence / L2 writeback is needed. CUDAGraph-safe.
+            # accumulate into it in Phase 3. The waitcnt_stores + grid barrier
+            # below drains this store before the Phase-3 adds; total_recv is
+            # local, so no release fence / L2 writeback is needed. CUDAGraph-safe.
             if global_warp_id == 0:
                 if lane == 0:
                     buffer_store(
@@ -416,11 +456,11 @@ def make_dispatch(
                     )
 
             # ── Phase 2: grid barrier + per-peer count signal ──
-            # s_barrier only syncs wavefronts; drain memory counters first so the
+            # s_barrier only syncs wavefronts; drain the store counter first so the
             # token/count stores above are complete before the grid barrier makes
             # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
             # implicit s_waitcnt).
-            P.waitcnt_all()
+            P.waitcnt_stores()
             fx.barrier()
             if tid == 0:
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))

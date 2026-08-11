@@ -272,9 +272,43 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
 # Shared setup (fed to BOTH reference and device path)
 # --------------------------------------------------------------------------- #
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
-# GEMM1 M-tile of the push path; also fixes the e8m0 scale preshuffle geometry
-# (wmma_rep = tile_m // 16) that dispatch has to write on the send side.
-_PUSH_TILE_M = 64
+def _push_tiles(tok_per_rank, topk, experts_per_rank):
+    """GEMM1/GEMM2 tiles for the push path. ``tile_m`` also fixes the e8m0 scale
+    preshuffle geometry (wmma_rep = tile_m // 16) that dispatch writes on the
+    send side, so the two must move together and this is the single knob for
+    both. Any entry is overridable as PUSH_<NAME> for re-tuning.
+
+    The push path uses one tile set for every shape, and it feeds a fixed-slot
+    grid of E_local*cap rows of which only tok*topk are live, so a wide M mostly
+    multiplies empty rows. 64 was inherited from what the *pull* path measured
+    fastest, but re-measured on the push path 16 wins by 11-15% per layer at
+    every point tried (EP2 bs=8/128, EP4 bs=8..256); only EP4 bs=512, where 32
+    live rows per expert finally fill a 64-wide tile, prefers 64. Keyed on live
+    rows per expert so it holds across EP width and topk. M must stay a multiple
+    of 16 and divide cap, which is why 128 is not offered (it fails at bs=8).
+
+    The K tiles and buffer counts went the other way from what the push path
+    originally inherited: GEMM1 wants the widest K it can hold plus a third
+    buffer (k512/b3 is 3-13% per layer better than k256/b2 at every size, and
+    k1024/b3 or k512/b4 exceed LDS and fail to launch), while GEMM2 is better off
+    with only two buffers. Both GEMMs are one M-tile per expert over a mostly
+    empty grid, so depth in K is what keeps them fed. k64 is not offered: it
+    fails accuracy against the 1x32 MX scale granularity.
+    """
+    rows_per_expert = tok_per_rank * topk / max(experts_per_rank, 1)
+    tiles = dict(
+        tile_m=64 if rows_per_expert >= 32 else 16,
+        tile_n=256,
+        tile_k=512,
+        num_buffers=3,
+        tile_k2=256,
+        num_buffers2=2,
+    )
+    for name in tiles:
+        env = os.environ.get("PUSH_" + name.upper())
+        if env:
+            tiles[name] = int(env)
+    return tiles
 
 
 def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED):
@@ -507,7 +541,8 @@ class DeviceMoEPipeline:
         self.send_quant = self.push_group if self.send_quant_opt < 0 else bool(
             self.send_quant_opt
         )
-        self.pg_wmma_rep = _PUSH_TILE_M // 16
+        self.push_tiles = _push_tiles(self.ct, self.topk, self.EPR)
+        self.pg_wmma_rep = self.push_tiles["tile_m"] // 16
         cfg = EpDispatchCombineConfig(
             rank=r,
             world_size=self.dist_ctx.world,
@@ -572,12 +607,7 @@ class DeviceMoEPipeline:
                 cap=pg["cap"], activation=self.spec["activation"],
                 situ_beta=self.spec.get("situ_beta", 1.0),
                 situ_linear_beta=self.spec.get("situ_linear_beta", 1.0),
-                # Both GEMMs use the tile the pull path measured fastest here
-                # (t64x256x256). GEMM1 keeps num_buffers=2 -- its persistent
-                # scheduler already hides the loads, and b2 beat pull's b3 -- while
-                # GEMM2 needs the third buffer to match pull.
-                tile_m=_PUSH_TILE_M, tile_n=256, tile_k=256, num_buffers=2,
-                tile_k2=256, num_buffers2=3,
+                **self.push_tiles,
                 ep_arena_handle=ep["ep_arena_handle"],
                 ep_comb_inp_off=ep["ep_comb_inp_off"],
                 ep_wire_nbytes=ep["ep_wire_nbytes"],
