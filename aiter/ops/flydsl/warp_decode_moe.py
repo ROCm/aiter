@@ -97,6 +97,7 @@ def _get_down_reduce_fp4(
     scale_bk,
     kh_per_warp,
     dot2_acc,
+    prefetch,
 ):
     return build_down_reduce_fp4_module(
         inter,
@@ -108,6 +109,7 @@ def _get_down_reduce_fp4(
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
         dot2_acc=dot2_acc,
+        prefetch=prefetch,
     )
 
 
@@ -415,6 +417,7 @@ def flydsl_warp_decode_down_reduce_fp4(
     kh_per_warp: int | None = None,
     dot2_acc: int = 4,
     kvector: int | None = None,
+    prefetch: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **MXFP4** weights (BF16 intermediate, FP4 e2m1 + E8M0).
@@ -439,6 +442,8 @@ def flydsl_warp_decode_down_reduce_fp4(
             ``<=1`` falls back to the serialized ``s_nop`` chain (``serialize_dot2``).
         kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
             INTER (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
+        prefetch:     G8 software prefetch -- hoist all weight/scale loads ahead of
+            the converts (default off; A/B lever for B=1 cold-HBM).
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -493,6 +498,7 @@ def flydsl_warp_decode_down_reduce_fp4(
         scale_bk,
         kh_per_warp,
         dot2_acc,
+        prefetch,
     )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run(
