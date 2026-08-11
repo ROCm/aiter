@@ -490,7 +490,6 @@ def compile_one_config(**job):
                 _compile_stage2(job)
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  stage{stage}  {shape_str}")
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
 

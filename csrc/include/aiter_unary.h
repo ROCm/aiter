@@ -1,7 +1,11 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
 
-torch::Tensor aiter_sigmoid(torch::Tensor &input);
-torch::Tensor aiter_tanh(torch::Tensor &input);
+// Elementwise unary activations. The output is written into a caller-provided
+// tensor (allocated Python-side) instead of being returned, so this header
+// stays torch-free (see aiter/ops/aiter_operator.py for the public wrappers,
+// which also handle the non-tile-friendly fallback via torch).
+void aiter_sigmoid(aiter_tensor_t& out, aiter_tensor_t& input);
+void aiter_tanh(aiter_tensor_t& out, aiter_tensor_t& input);

@@ -32,7 +32,7 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-# ── FP4 quant / dequant utilities ─────────────────────────────────────
+# -- FP4 quant / dequant utilities -------------------------------------
 
 # FP4 e2m1 representable values (ordered by magnitude)
 _FP4_GRID_VALUES = [
@@ -52,9 +52,9 @@ _FP4_GRID_VALUES = [
     4.0,
     6.0,
 ]
-# LUT: grid index → fp4 e2m1 4-bit encoding
+# LUT: grid index -> fp4 e2m1 4-bit encoding
 _E2M1_LUT = [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7]
-# Inverse LUT: fp4 e2m1 4-bit encoding → grid index
+# Inverse LUT: fp4 e2m1 4-bit encoding -> grid index
 _E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
 
 
@@ -93,14 +93,14 @@ def fp4_dequant_e2m1_with_e8m0(packed, e8m0, block_size=SCALE_BLOCK):
     ).reshape(*prefix, d)
 
 
-# ── Preshuffle layout helpers (kernel ABI) ────────────────────────────
+# -- Preshuffle layout helpers (kernel ABI) ----------------------------
 
 
 def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tables):
     """Create paged preshuffle FP4 E2M1 KV cache from dense bf16 KV.
 
-    Supports head_dim as any multiple of 128 — splits K dim into k_tiles
-    outer × 4 inner K_chunks (each = 32 K elements / 16 packed bytes).
+    Supports head_dim as any multiple of 128 -- splits K dim into k_tiles
+    outer x 4 inner K_chunks (each = 32 K elements / 16 packed bytes).
 
     Returns:
         kv_cache: [num_blocks, K_TILES, 4 (K_chunks), kv_block_size, 16] uint8
@@ -123,7 +123,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
 
     # FP4 (cbsz=4) per-thread K layout is CONTIGUOUS: 16 bytes of one K_chunk
     # = 32 K elements at K[k*32..k*32+31]. For head_dim > 128, K splits into
-    # k_tiles outer × 4 inner K_chunks. Preshuffle: split K into (k_tiles,
+    # k_tiles outer x 4 inner K_chunks. Preshuffle: split K into (k_tiles,
     # 4 K_chunks, 16 bytes), then permute K-axes ahead of token within a page.
     kv_chunks_perm = (
         kv_fp4.view(batch, t_blocks, kv_block_size, k_tiles, 4, 16)
@@ -132,7 +132,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .view(batch * t_blocks, k_tiles, 4, kv_block_size, 16)
     )
     # KVS_NTPW: nt-bytes packed together for the kernel's packed dword load
-    # (4 ubyte → 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
+    # (4 ubyte -> 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
     # 0..KVS_NTPW-1 are adjacent so one thread dword-loads all 4 nts.
     assert kv_block_size % KVS_NTPW == 0
     kv_e8m0_perm = (
@@ -142,7 +142,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .view(batch * t_blocks, k_tiles, 4, kv_block_size)
         # Interleave 4 nts per token group: split [kv_block_size] into
         # (NTPW=4, T_per_nt), transpose to (T, NTPW) so 4 consecutive bytes
-        # per T cover nts 0..3 → 1 dword load.
+        # per T cover nts 0..3 -> 1 dword load.
         .view(batch * t_blocks, k_tiles, 4, KVS_NTPW, kv_block_size // KVS_NTPW)
         .transpose(-1, -2)
         .contiguous()
@@ -162,7 +162,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
     return kv_cache, kv_scale, kv_fp4, kv_e8m0
 
 
-# ── Reference implementation ─────────────────────────────────────────
+# -- Reference implementation -----------------------------------------
 
 
 def ref_mqa_logits_mixed(
@@ -175,7 +175,7 @@ def ref_mqa_logits_mixed(
     next_n=1,
     weight_scale=1.0,
 ):
-    """Reference: Q (FP4) + KV (FP4) dequant → einsum → relu → weight → sum.
+    """Reference: Q (FP4) + KV (FP4) dequant -> einsum -> relu -> weight -> sum.
 
     Shapes:
       q_packed: [B, NEXT_N, H, D/2] uint8
@@ -236,7 +236,7 @@ def _make_varctx(batch, max_ctx, kv_block_size, var_ratio=0.5, seed=0):
     ]
 
 
-# ── Gluon FP8 baseline (E2E decode calling convention) ───────────────
+# -- Gluon FP8 baseline (E2E decode calling convention) ---------------
 
 
 def _bench_gluon_fp8(
@@ -351,7 +351,7 @@ def _bench_gluon_fp8(
         return None, None
 
 
-# ── Test + Benchmark ─────────────────────────────────────────────────
+# -- Test + Benchmark -------------------------------------------------
 
 _PERF_SUMMARY = []
 
@@ -436,7 +436,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         kv_bf16, kv_block_size, num_blocks, block_tables
     )
 
-    # ---- Reference (Q FP4 + KV FP4 dequant + matmul) — per-batch ctx_lens ----
+    # ---- Reference (Q FP4 + KV FP4 dequant + matmul) -- per-batch ctx_lens ----
     ref_logits = ref_mqa_logits_mixed(
         q_packed,
         q_e8m0,
@@ -448,9 +448,9 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         weight_scale=weight_scale,
     )
 
-    # ── Pre-shuffle Q scales for kernel layout (avoids runtime v_bfe_u32) ──
-    # [B, NEXT_N, H, K_TILES*4] → [B, NEXT_N, K_TILES, 4, 16, qs_pad], H
-    # decomposed as (m_tiles, 16); inner mi_idx padded to qs_pad = ⌈m_tiles/4⌉×4.
+    # -- Pre-shuffle Q scales for kernel layout (avoids runtime v_bfe_u32) --
+    # [B, NEXT_N, H, K_TILES*4] -> [B, NEXT_N, K_TILES, 4, 16, qs_pad], H
+    # decomposed as (m_tiles, 16); inner mi_idx padded to qs_pad = ?m_tiles/4?x4.
     qs_pad = ((m_tiles + 3) // 4) * 4
     qe_real = (
         q_e8m0.view(torch.uint8)
@@ -461,7 +461,9 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
 
     # ---- Host schedule (precomputed once so the bench times only the launch) ----
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import compute_varctx_schedule
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
 
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped
@@ -540,7 +542,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )
     cos_val = cos.item()
     assert cos_val > 0.99, f"FlyDSL qfp4/kvfp4 vs ref cosine_sim={cos_val:.4f} < 0.99"
-    assert neg_inf_ok, "OOB tokens were not NEG_INF — early-exit / pre-init broken"
+    assert neg_inf_ok, "OOB tokens were not NEG_INF -- early-exit / pre-init broken"
 
     if not bench:
         return
@@ -568,7 +570,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         num_warmup,
     )
 
-    # ---- USEFUL FLOPs / bytes (varctx — based on real ctx_lens, not max) ----
+    # ---- USEFUL FLOPs / bytes (varctx -- based on real ctx_lens, not max) ----
     flops = total_tokens * next_n * heads * (2 * head_dim + 3)
     bytes_q = batch_size * next_n * heads * (head_dim_packed + head_dim_scales)
     bytes_kv = total_tokens * (head_dim_packed + head_dim_scales)

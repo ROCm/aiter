@@ -456,11 +456,11 @@ def gemm_afp4wfp4_preshuffle(
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
-    # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_elems
 
     if config is None:
-        config, _ = _get_config(M, N, K_cfg, True)
+        # _get_config doubles K itself (logical K = 2 * K_bytes) -- pass bytes,
+        # matching the non-preshuffled path.
+        config, _ = _get_config(M, N, K_bytes, True)
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
