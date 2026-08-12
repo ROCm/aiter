@@ -620,11 +620,17 @@ jobs:
             if [[ -f "${job_log}" ]]; then
               cp -f "${job_log}" vllm-disagg-job.log
               overlay_line="$(grep -ahE '\[aiter-overlay\] loaded ' "${job_log}" | head -1 || true)"
-              verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL|VERDICT):' "${job_log}" | tail -1 || true)"
+              accuracy="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL): exact_match=' "${job_log}" | tail -1 || true)"
+              verdict="$(grep -ahE '\[vllm_disagg\] VERDICT:' "${job_log}" | tail -1 || true)"
               if [[ -n "${overlay_line}" ]]; then
                 echo "- AITER overlay: \`${overlay_line}\`"
               else
                 echo "- AITER overlay: no load confirmation found"
+              fi
+              if [[ -n "${accuracy}" ]]; then
+                echo "- Accuracy: \`${accuracy}\`"
+              else
+                echo "- Accuracy: no exact_match result found"
               fi
               if [[ -n "${verdict}" ]]; then
                 echo "- Accuracy verdict: \`${verdict}\`"
