@@ -54,8 +54,10 @@ from aiter.ops.flydsl.moe_kernels import (
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
+    _select_mxfp4_a4w4_kernels,
     parse_flydsl_v2_gemm2_kernel,
 )
+from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_shape_supported
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -205,6 +207,70 @@ def parse_csv(csv_path: str):
                     seen.add(key)
 
                     jobs.append(full_job)
+
+            # Legacy A4W4 rows are dynamically replaced at runtime by a sorted
+            # MXMOE GEMM1 plus a FlyDSL GEMM2. The configured pair above remains
+            # covered for replacement-disabled runs; add the effective stage2
+            # specialization as well so RUN_ONLY can find its AOT cache.
+            configured_stage1 = row.get("kernelName1", "").strip()
+            row_gfx = row.get("gfx") or ("gfx950" if cu_num == 256 else "unknown")
+            padded_shape = (
+                experts,
+                model_dim,
+                ((inter_dim + 255) // 256) * 256,
+                topk,
+            )
+            if (
+                not configured_stage1.startswith("flydsl_mxmoe_g1_")
+                and os.environ.get("AITER_MXFP4_GEMM1_REPLACEMENT", "1").lower()
+                not in ("0", "false")
+                and row_gfx == "gfx950"
+                and act_type == "ActivationType.Silu"
+                and dtype == "torch.bfloat16"
+                and row.get("q_dtype_a") == "torch.float4_e2m1fn_x2"
+                and q_dtype_w == "torch.float4_e2m1fn_x2"
+                and q_type == "QuantType.per_1x32"
+                and int(row.get("use_g1u1") or 0) == 1
+                and not doweight_stage1
+                and model_dim % 256 == 0
+                and padded_shape != (896, 3584, 512, 16)
+                and is_mxfp4_moe_shape_supported(experts, model_dim, inter_dim, topk)
+            ):
+                replacement = _select_mxfp4_a4w4_kernels(
+                    token=token,
+                    expert=experts,
+                    topk=topk,
+                )
+                runtime_stage1 = _parse_mxfp4_g1_kname(replacement["kernelName1"])
+                runtime_stage2 = replacement["kernelName2"]
+                params = get_flydsl_kernel_params(runtime_stage2)
+                if params is None:
+                    print(
+                        f"  [WARN] Unknown runtime replacement kernel: "
+                        f"{runtime_stage2}, skipping"
+                    )
+                    continue
+                for enable_bias in enable_bias_options:
+                    full_job = {
+                        "kernel_name": runtime_stage2,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "experts": experts,
+                        "topk": topk,
+                        "doweight_stage1": doweight_stage1,
+                        "cu_num": cu_num,
+                        "act": act,
+                        "enable_bias": enable_bias,
+                        "token_num": token,
+                        "block_m": replacement["BM"],
+                        "stage1_fuse_quant": runtime_stage1["out_dtype"],
+                        "intermediate_sorted": True,
+                        **params,
+                    }
+                    key = job_identity(full_job)
+                    if key not in seen:
+                        seen.add(key)
+                        jobs.append(full_job)
 
     from aiter.aot.flydsl.fhmoe import extend_fhmoe_jobs
 
