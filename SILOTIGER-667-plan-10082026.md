@@ -29,7 +29,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 | G2 | **MXFP4 / FP4 weights** (down + gate_up) | ✅ (down full; gate_up fp4) | ❌ | #1 remaining (ticket) |
 | G3 | **BF16-weight path** (`w_dtype="bf16"`) | ✅ (dot2 + scalar) | ❌ FP8-only | scaffold / gfx942 |
 | G4 | **gfx942 / scalar-f32 fallback** (`use_dot2=False`) | ✅ auto-arch | ❌ gfx950-only | portability |
-| G5 | **Split-K** (`k_batch`) + zero-init fusion | ✅ (gate_up 2-phase, down) | ❌ | ticket lever |
+| G5 | **Split-K** (`k_batch`) + zero-init fusion | ✅ (gate_up 2-phase, down) | ⊘ evaluated — no-win, gated-off, not shipped (attic branch) | ticket lever (closed) |
 | G6 | **LDS cooperative caching** (`n_waves`) | ✅ (down; gate_up dead) | ❌ | ticket lever |
 | G7 | **s_nop-free / independent-accumulator dot2 (ILP)** | ✅ (fp8/fp4) | ❌ serialized `s_nop 2` | perf (deferred) |
 | G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2; fp4 `down` flag) | ❌ default (knob) | **perf: ~5% B=1 fp4**, neutral B≥4 |
@@ -353,12 +353,14 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
 ### Phase D — Occupancy levers: split-K + LDS (G5, G6)  [ ]
 > **Split-K (G5) is tracked in its own sub-plan:**
 > [`SILOTIGER-667-plan-Split-K.md`](./SILOTIGER-667-plan-Split-K.md) (steps + status).
-- [ ] **Split-K** (`k_batch`) on down (split INTER) and gate_up (split HIDDEN), triggered
-      only when `grid * k_batch <= CuCount` (under-occupied: Qwen short-INTER, low B).
-      Atomic-add epilogue into a **zeroed** buffer, with **zero-init folded** into the
-      gate_up epilogue / a prologue (the vLLM `blockscale_splitk_zero_init` trick) so split-K
-      is free. This is where the **FP32 atomic output** variant lives — keep the BF16
-      direct-store as the default non-split path.
+- [~] **Split-K** (`k_batch`) — **evaluated & closed as a no-win (2026-08-11); not shipped.**
+      Implemented + CU-count-gated on down (split INTER) with the FP32 atomic-add-into-zeroed-buffer
+      epilogue (BF16 direct-store kept as the default non-split path), but the Step 3 A/B showed **no
+      decode win** (kernel-only ≤1.03×, k8 regresses; ~2× end-to-end via the v1 zeros+finalize) because
+      B=1 warp-decode is **launch/memory-latency-floor bound**, not occupancy-bound. Gated off by
+      default; live impl **archived on `samaario/warp-decode-moe-splitk-attic`**, not in main. gate_up
+      2-phase split-K + zero-init folding **not pursued** (same physics). See
+      [`SILOTIGER-667-plan-Split-K.md`](./SILOTIGER-667-plan-Split-K.md).
 - [ ] **LDS `n_waves`** cooperative activation staging for down (and a real gate_up
       implementation, which the reference left as dead params). Guard: `inter %
       (n_waves*WAVE_SIZE*2) == 0`.
@@ -538,9 +540,11 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   `/tmp/repro_k3_addr.py`.
 - [open] FP4 gate_up **accuracy** (ticket gates FP4 gate_up on accuracy; MXFP4 mantissa is
   tiny). Measure cos-sim vs BF16-weight reference before claiming the win.
-- [open] Split-K / LDS pay only in the **occupancy-bound** regime (small-grid Qwen, low B);
-  they may be neutral/regressing on large-grid DeepSeek (already near the HBM wall) — treat
-  as regime-limited and isolate the small-grid case.
+- [resolved for split-K] Split-K / LDS were expected to pay only in the **occupancy-bound**
+  regime (small-grid Qwen, low B). **Split-K (G5) measured → no-win even there**: B=1 warp-decode
+  is launch/memory-latency-floor bound, so partitioning the contraction can't cut the ~4.4µs floor
+  (closed, gated-off). **LDS (G6) still open** and likely shares this fate at B=1 — isolate the
+  small-grid case before investing.
 - [resolved, keep] Convert scale is **exponent-only (E8M0)** — see §2.
 
 ## 10. Changelog
