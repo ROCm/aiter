@@ -236,22 +236,20 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     constexpr int rows_per_lane =
         (T::B_M / T::T_M) / T::W_M;
     constexpr int vecs_per_row = r_elem.value / rows_per_lane;
-    float route_dot[rows_per_lane] = {};
-    auto score_storage = opus::make_smem(smem_a);
-    auto* score_smem = reinterpret_cast<OPUS_LDS_ADDR float*>(
-        reinterpret_cast<__UINTPTR_TYPE__>(score_storage.ptr));
-#pragma unroll
-    for(index_t i = 0; i < r_elem.value; ++i)
-    {
-        auto gate = g_act_input.template load<T::VEC_C>(offsets[i], output_offset);
-        auto up = g_act_input.template load<T::VEC_C>(offsets[i], output_offset + kargs.n);
+    // Reduce one route row at a time so six route-dot accumulators do not stay
+    // live across the whole epilogue. Dedicated score LDS permits early writes
+    // without aliasing a mainloop A buffer still being consumed by another wave.
+    __shared__ float score_smem[
+        WRITE_DSCORE ? T::B_M * T::T_N : 1];
+    auto apply_swiglu = [&](auto i, const auto& gate, const auto& up) {
         vector_t<D_C, T::VEC_C> dgate;
         vector_t<D_C, T::VEC_C> dup;
         float vec_dot = 0.0f;
 #pragma unroll
         for(index_t j = 0; j < T::VEC_C; ++j)
         {
-            const float dh = static_cast<float>(v_dh[i * T::VEC_C + j]);
+            const float dh =
+                static_cast<float>(v_dh[i.value * T::VEC_C + j]);
             const float g = static_cast<float>(gate[j]);
             const float u = static_cast<float>(up[j]);
             constexpr float log2e = 1.4426950408889634f;
@@ -263,30 +261,38 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             if constexpr(WRITE_DSCORE)
                 vec_dot = fmaf(dh, silu * u, vec_dot);
         }
-        if constexpr(WRITE_DSCORE)
-            route_dot[i / vecs_per_row] += vec_dot;
-        g_dact.template store<T::VEC_C>(dgate, offsets[i], output_offset);
-        g_dact.template store<T::VEC_C>(dup, offsets[i], output_offset + kargs.n);
-    }
+        g_dact.template store<T::VEC_C>(
+            dgate, offsets[i.value], output_offset);
+        g_dact.template store<T::VEC_C>(
+            dup, offsets[i.value], output_offset + kargs.n);
+        return vec_dot;
+    };
     if constexpr(WRITE_DSCORE)
     {
-        // The mono mainloop intentionally lets its wave groups progress
-        // independently.  Do not reuse the A ping-pong storage until every
-        // wave has consumed its final LDS tile and finished the epilogue.
-        __syncthreads();
-#pragma unroll
-        for(int r = 0; r < rows_per_lane; ++r)
-        {
-            route_dot[r] += __shfl_down(route_dot[r], 16, 64);
-            route_dot[r] += __shfl_down(route_dot[r], 32, 64);
+        static_assert(vecs_per_row == 2);
+        static_for<rows_per_lane>([&](auto r) {
+            constexpr auto i0 = number<r.value * vecs_per_row>{};
+            constexpr auto i1 = number<r.value * vecs_per_row + 1>{};
+            auto gate0 = g_act_input.template load<T::VEC_C>(
+                offsets[i0.value], output_offset);
+            auto up0 = g_act_input.template load<T::VEC_C>(
+                offsets[i0.value], output_offset + kargs.n);
+            auto gate1 = g_act_input.template load<T::VEC_C>(
+                offsets[i1.value], output_offset);
+            float route_dot = apply_swiglu(i0, gate0, up0);
+            auto up1 = g_act_input.template load<T::VEC_C>(
+                offsets[i1.value], output_offset + kargs.n);
+            route_dot += apply_swiglu(i1, gate1, up1);
+            route_dot += __shfl_down(route_dot, 16, 64);
+            route_dot += __shfl_down(route_dot, 32, 64);
             if(lane_id < T::W_M)
             {
                 const int local_row =
                     wave_id_m * (T::B_M / T::T_M) +
-                    r * T::W_M + lane_id;
-                score_smem[local_row * T::T_N + wave_id_n] = route_dot[r];
+                    r.value * T::W_M + lane_id;
+                score_smem[local_row * T::T_N + wave_id_n] = route_dot;
             }
-        }
+        });
         __syncthreads();
         if(thread_id_x() < T::B_M)
         {
@@ -304,6 +310,16 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                     n_tile] = partial;
             }
         }
+    }
+    else
+    {
+        static_for<r_elem.value>([&](auto i) {
+            auto gate = g_act_input.template load<T::VEC_C>(
+                offsets[i.value], output_offset);
+            auto up = g_act_input.template load<T::VEC_C>(
+                offsets[i.value], output_offset + kargs.n);
+            (void)apply_swiglu(i, gate, up);
+        });
     }
 #else
     (void)kargs;
