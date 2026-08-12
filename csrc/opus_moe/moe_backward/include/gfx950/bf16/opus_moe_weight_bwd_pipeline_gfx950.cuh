@@ -133,9 +133,10 @@ inline __device__ void weight_bwd_store_wide(Accum& accum,
 
 
 // Compact gfx950 K32 dW1 path.  A 64x32 dZ slab occupies 4 KiB and a
-// 32x128 gathered-X slab occupies 8 KiB.  BM128 keeps two independently
-// swizzled dZ slabs beside one X slab; BN256 keeps one dZ slab beside two X
-// slabs.  Both four-wave candidates double reuse without changing threads.
+// 32x128 gathered-X tile occupies 8 KiB.  BM128 keeps two independently
+// swizzled dZ slabs beside one X tile; the wave4 BM256 path encodes X as two
+// independently swizzled 32x64 slabs to reduce transpose-read conflicts.
+// Both four-wave candidates increase reuse without changing threads.
 // Keep the operands resident so their stores and transpose reads share one
 // pair of barriers per reduction tile.
 // The first shared encoding is
@@ -158,6 +159,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
+    constexpr bool split_b_n64 = []() constexpr {
+        if constexpr(requires { T::SPLIT_B_N64_SWIZZLE; })
+            return T::SPLIT_B_N64_SWIZZLE;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -173,6 +179,9 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert(T::E_N * T::T_N == BN / T::W_N);
     static_assert((BM == 64 && BN == 128) || T::DIRECT_GMEM_TO_LDS,
                   "wide K4 tiles require direct GMEM-to-LDS loads");
+    static_assert(!split_b_n64 ||
+                      (BN == 128 && T::BLOCK_SIZE == 256),
+                  "split-B K4 requires a four-wave BN128 tile");
     int expert;
     int output_m_base;
     int output_n_base;
@@ -309,6 +318,7 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int b_local_k0 = b_loader_tid / 16;
     const int b_local_k1 = wide_workgroup ? b_local_k0 : b_local_k0 + 16;
     const int b_local_n = (b_loader_tid % 16) * VEC;
+    const int b_split_local_n = a_local_m;
     const int a_store_addr = (tid << 4) ^ (tid & 0x70);
     const int b_store_addr = (tid << 4) ^ (tid & 0xf0);
 
@@ -329,31 +339,38 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         int a;
         int b0;
         int b1;
+        int b_split;
     };
     auto tile_sources = [&](int tile_k) __attribute__((always_inline)) {
         const int a_sorted_row = route_start + tile_k * BK + a_local_k;
         const int b_sorted_row0 = route_start + tile_k * BK + b_local_k0;
         const int b_sorted_row1 = route_start + tile_k * BK + b_local_k1;
         int token_a;
-        int token_b0;
-        int token_b1;
+        int token_b0 = 0;
+        int token_b1 = 0;
         if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
         {
             token_a = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
                 kargs.route, a_sorted_row, true);
-            token_b0 = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
-                kargs.route, b_sorted_row0, true);
-            token_b1 = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
-                kargs.route, b_sorted_row1, true);
+            if constexpr(!split_b_n64)
+            {
+                token_b0 = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
+                    kargs.route, b_sorted_row0, true);
+                token_b1 = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
+                    kargs.route, b_sorted_row1, true);
+            }
         }
         else
         {
             token_a =
                 kargs.route.sorted_token_ids[a_sorted_row] & kPackedTokenMask;
-            token_b0 = kargs.route.sorted_token_ids[b_sorted_row0] &
-                       kPackedTokenMask;
-            token_b1 = kargs.route.sorted_token_ids[b_sorted_row1] &
-                       kPackedTokenMask;
+            if constexpr(!split_b_n64)
+            {
+                token_b0 = kargs.route.sorted_token_ids[b_sorted_row0] &
+                           kPackedTokenMask;
+                token_b1 = kargs.route.sorted_token_ids[b_sorted_row1] &
+                           kPackedTokenMask;
+            }
         }
         const int source_a = token_a < kargs.route.token_num
                                  ? a_sorted_row
@@ -364,7 +381,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int source_b1 = token_b1 < kargs.route.token_num
                                   ? token_b1
                                   : kargs.route.token_num;
-        return TileSources{source_a, source_b0, source_b1};
+        const int source_b_split = token_a < kargs.route.token_num
+                                       ? token_a
+                                       : kargs.route.token_num;
+        return TileSources{source_a, source_b0, source_b1, source_b_split};
     };
 
     auto issue_direct_tile = [&](const TileSources& sources,
@@ -412,27 +432,49 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     opus::number<T::CACHECTL_A>{});
             });
         }
-        opus::static_for<b_n_slabs>([&](auto slab) {
-            OPUS_LDS_ADDR D_B* b_slab_dst =
-                b_wave_dst + slab.value * 128 * BK;
-            const int source_n =
-                output_n_base + slab.value * 128 + b_local_n;
-            g_b.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
-                (sources.b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
-            if constexpr(!wide_workgroup)
+        if constexpr(split_b_n64)
+        {
+            opus::static_for<2>([&](auto slab) {
+                OPUS_LDS_ADDR D_B* b_slab_dst =
+                    b_wave_dst + slab.value * 64 * BK;
+                const int source_n =
+                    output_n_base + slab.value * 64 + b_split_local_n;
                 g_b.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(
-                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) +
-                        4096),
-                    (sources.b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                    (sources.b_split * kargs.stride_b_row + source_n) *
+                        sizeof(D_B),
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_B>{});
-        });
+            });
+        }
+        else
+        {
+            opus::static_for<b_n_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR D_B* b_slab_dst =
+                    b_wave_dst + slab.value * 128 * BK;
+                const int source_n =
+                    output_n_base + slab.value * 128 + b_local_n;
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                    (sources.b0 * kargs.stride_b_row + source_n) *
+                        sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+                if constexpr(!wide_workgroup)
+                    g_b.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(
+                            reinterpret_cast<OPUS_LDS_ADDR char*>(
+                                b_slab_dst) +
+                            4096),
+                        (sources.b1 * kargs.stride_b_row + source_n) *
+                            sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+            });
+        }
     };
 
     auto compute_tile = [&](auto& s_a_tile, auto& s_b_tile)
@@ -477,9 +519,17 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 });
                 typename decltype(mma_k_fragment)::vtype_b v_b;
                 opus::static_for<T::E_N>([&](auto en) {
-                    constexpr int k_byte_offset = ek.value * 4096;
+                    constexpr int k_byte_offset =
+                        ek.value * (split_b_n64 ? 2048 : 4096);
                     int base;
-                    if constexpr(T::T_N == 4)
+                    if constexpr(split_b_n64)
+                    {
+                        const int native_n =
+                            en.value * T::T_N + wave_id_n;
+                        base = a_read_base + (native_n / 2) * 4096;
+                        base ^= (native_n % 2) * 0x40;
+                    }
+                    else if constexpr(T::T_N == 4)
                     {
                         base = b_read_base + en.value * 8192;
                     }
@@ -494,7 +544,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                                                           k_byte_offset>(base);
                     auto hi = s_b_tile.template _tr_load<T::VEC_TR_B,
                                                           k_byte_offset>(
-                        base ^ 0x440);
+                        base ^
+                        (split_b_n64 ? 0x220 : 0x440));
 #pragma unroll
                     for(int j = 0; j < T::VEC_TR_B; ++j)
                     {
@@ -548,9 +599,17 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_b v_b;
         opus::static_for<T::E_N>([&](auto en) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int k_byte_offset = ek.value * 4096;
+                constexpr int k_byte_offset =
+                    ek.value * (split_b_n64 ? 2048 : 4096);
                 int base;
-                if constexpr(T::T_N == 4)
+                if constexpr(split_b_n64)
+                {
+                    const int native_n =
+                        en.value * T::T_N + wave_id_n;
+                    base = a_read_base + (native_n / 2) * 4096;
+                    base ^= (native_n % 2) * 0x40;
+                }
+                else if constexpr(T::T_N == 4)
                 {
                     base = b_read_base + en.value * 8192;
                 }
@@ -564,7 +623,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                                                       k_byte_offset>(base);
                 auto hi = s_b_tile.template _tr_load<T::VEC_TR_B,
                                                       k_byte_offset>(
-                    base ^ 0x440);
+                    base ^
+                    (split_b_n64 ? 0x220 : 0x440));
                 constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
                 for(int j = 0; j < T::VEC_TR_B; ++j)

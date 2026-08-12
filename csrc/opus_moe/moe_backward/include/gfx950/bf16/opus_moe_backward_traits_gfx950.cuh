@@ -355,6 +355,7 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     static constexpr bool DIRECT_GMEM_TO_LDS = false;
     static constexpr bool DOUBLE_BUFFER = false;
     static constexpr bool PIPELINE_REDUCTION_FRAGMENTS = false;
+    static constexpr bool SPLIT_B_N64_SWIZZLE = false;
     static constexpr int EMPTY_M_TILES_PER_CTA = 1;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -497,6 +498,7 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
     static constexpr bool DOUBLE_BUFFER = true;
     static constexpr bool PIPELINE_REDUCTION_FRAGMENTS = true;
+    static constexpr bool SPLIT_B_N64_SWIZZLE = true;
     static constexpr int EMPTY_M_TILES_PER_CTA = 8;
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
