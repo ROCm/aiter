@@ -331,6 +331,20 @@ def _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_dgrad_mono_ragged_bf16",
+    develop=True,
+)
+def _opus_moe_dgrad_mono_ragged_bf16_raw(
+    dy: Tensor,
+    w_bnk: Tensor,
+    out: Tensor,
+    expert_offsets: Tensor,
+    max_m: int,
+) -> None: ...
+
+
 def opus_moe_dgrad_swiglu_uniform_prepared(
     dy: Tensor,
     w_bnk: Tensor,
@@ -421,6 +435,27 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         dscore_partials,
         expert_offsets,
         max_m,
+    )
+    return out
+
+
+def opus_moe_dgrad_mono_ragged_prepared(
+    dy: Tensor,
+    w_bnk: Tensor,
+    expert_offsets: Tensor,
+    max_m: int,
+    out: Tensor,
+) -> Tensor:
+    """Compact ragged plain dgrad through the target mono mainloop."""
+    E, N, K = w_bnk.shape
+    if (
+        dy.shape[1] != K
+        or out.shape != (dy.shape[0], N)
+        or expert_offsets.shape != (E + 1,)
+    ):
+        raise ValueError("invalid ragged mono dgrad inputs")
+    _opus_moe_dgrad_mono_ragged_bf16_raw(
+        dy.contiguous(), w_bnk.contiguous(), out, expert_offsets, max_m
     )
     return out
 
@@ -904,6 +939,16 @@ class OpusMoERefFunc(torch.autograd.Function):
             ):
                 return opus_moe_dgrad_uniform_prepared(
                     dy_op.contiguous(), wt, ctx.uniform_m, out
+                )
+            if (
+                ctx.uniform_m is None
+                and ctx.dims == (32768, 2048, 64, 1024, 8)
+                and dy_op.shape[1] >= 128
+                and dy_op.shape[1] % 64 == 0
+                and wt.shape[1] % 256 == 0
+            ):
+                return opus_moe_dgrad_mono_ragged_prepared(
+                    dy_op.contiguous(), wt, offs, ctx.max_expert_m, out
                 )
             return opus_moe_dgrad_mfma_prepared(dy_op.contiguous(), wt, seid, bms, bme, out)
 

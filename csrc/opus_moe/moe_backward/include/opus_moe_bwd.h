@@ -63,6 +63,13 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     aiter_tensor_t& expert_offsets,
     int max_m);
 
+// Ragged compact-route plain dgrad through the 192x256x64 mono mainloop.
+void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
+                                     aiter_tensor_t& w,
+                                     aiter_tensor_t& out,
+                                     aiter_tensor_t& expert_offsets,
+                                     int max_m);
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32), transposed+padded inputs.
 //   dyT [P,Mp] bf16, aT [Q,Mp] bf16, pad_offs [E+1] i32, dW [E,P,Q] fp32
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,

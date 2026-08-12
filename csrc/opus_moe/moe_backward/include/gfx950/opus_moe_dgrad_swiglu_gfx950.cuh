@@ -39,7 +39,7 @@ struct opus_moe_dgrad_swiglu_kargs
     int ragged;
 };
 
-template<typename UserTraits, bool WRITE_DSCORE = false>
+template<typename UserTraits, bool WRITE_DSCORE = false, bool APPLY_SWIGLU = true>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -264,6 +264,11 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     auto offsets = layout_to_offsets<T::VEC_C>(u_gc);
     const int output_offset =
         wave_id_m * (T::B_M / T::T_M) * kargs.stride_dact + col;
+    if constexpr(!APPLY_SWIGLU)
+    {
+        store<T::VEC_C>(g_dact, v_dh, u_gc, output_offset);
+        return;
+    }
     constexpr int rows_per_lane =
         (T::B_M / T::T_M) / T::W_M;
     constexpr int vecs_per_row = r_elem.value / rows_per_lane;
@@ -389,5 +394,18 @@ inline void opus_moe_dgrad_swiglu_dscore_launch_gfx950(
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<
         opus_moe_dgrad_swiglu_traits_gfx950, true>
+        <<<grid, block, 0, stream>>>(kargs);
+}
+
+inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
+    const opus_moe_dgrad_swiglu_kargs& kargs,
+    hipStream_t stream)
+{
+    const int num_tiles_m = (kargs.m + 191) / 192;
+    const int num_tiles_n = kargs.n / 256;
+    dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
+    dim3 block(512);
+    opus_moe_dgrad_swiglu_kernel_gfx950<
+        opus_moe_dgrad_swiglu_traits_gfx950, false, false>
         <<<grid, block, 0, stream>>>(kargs);
 }

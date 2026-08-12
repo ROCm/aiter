@@ -286,6 +286,46 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
         k, aiter::getCurrentHIPStream());
 }
 
+void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
+                                     aiter_tensor_t& w,
+                                     aiter_tensor_t& out,
+                                     aiter_tensor_t& expert_offsets,
+                                     int max_m)
+{
+    const int E = static_cast<int>(w.size(0));
+    const int N = static_cast<int>(w.size(1));
+    const int K = static_cast<int>(w.size(2));
+    const int M = static_cast<int>(dy.size(0));
+    AITER_CHECK(max_m > 0, "max_m must be positive");
+    AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1,
+                "expert_offsets must have E + 1 elements");
+    AITER_CHECK(static_cast<int>(dy.size(1)) == K, "dy K must match weight K");
+    AITER_CHECK(static_cast<int>(out.size(0)) == M &&
+                    static_cast<int>(out.size(1)) == N,
+                "out must have shape [M, N]");
+    AITER_CHECK(K >= 128 && K % 64 == 0 && N % 256 == 0,
+                "ragged mono dgrad requires K%64==0 and N%256==0");
+
+    opus_moe_dgrad_swiglu_kargs k{};
+    k.ptr_a = dy.data_ptr();
+    k.ptr_b = w.data_ptr();
+    k.ptr_act_input = out.data_ptr();
+    k.ptr_dact = out.data_ptr();
+    k.expert_offsets = reinterpret_cast<const int32_t*>(expert_offsets.data_ptr());
+    k.m = max_m;
+    k.n = N;
+    k.k = K;
+    k.batch = E;
+    k.stride_a = static_cast<int>(dy.stride(0));
+    k.stride_b = static_cast<int>(w.stride(1));
+    k.stride_act_input = static_cast<int>(out.stride(0));
+    k.stride_dact = static_cast<int>(out.stride(0));
+    k.stride_b_batch = static_cast<int>(w.stride(0));
+    k.ragged = 1;
+    opus_moe_dgrad_plain_ragged_launch_gfx950(
+        k, aiter::getCurrentHIPStream());
+}
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32). Feature-major transposed +
 // route-padded inputs (build_padded_transposed). dW[e]=dyT_e @ aT_e^T.
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,       // [P, Mp] bf16
