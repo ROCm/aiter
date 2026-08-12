@@ -40,6 +40,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -50,22 +51,6 @@ _LOGGER = AiterTritonLogger()
 
 _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
-
-
-def _addressable_bytes(t: torch.Tensor) -> int:
-    """Byte span the kernel's gather offsets can reach in ``t``.
-
-    ``nelement() * element_size()`` is the logical size and only equals the
-    span when ``t`` is contiguous; a strided view of a larger allocation
-    addresses the same elements over a far wider range. It is the range that
-    has to fit a 32-bit buffer_load offset. Derived from the strides, so it
-    also covers the overlapping and zero-stride views a broadcast produces.
-    """
-    span = 1
-    for size, stride in zip(t.shape, t.stride()):
-        if size > 1:
-            span += (size - 1) * abs(stride)
-    return span * t.element_size()
 
 
 def pa_decode_sparse(
@@ -502,9 +487,7 @@ def _pa_decode_sparse_gfx950_gluon(
     BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
     num_warps = BLOCK_K // 16
     NOPE_DIM, ROPE_DIM = 448, 64
-    # buffer_load span: make.buffer.rsrc pins num_records to 2**31 - 2 and the
-    # rule is offset >= num_records -> OOB. Larger -> gl.load, which is int64.
-    MAX_BYTES = 2**31 - 2
+    MAX_BYTES = 2**31 - 1
 
     num_queries, num_heads, head_dim = q.shape
     indices = _as_int32_contiguous_1d(indices)
@@ -538,7 +521,7 @@ def _pa_decode_sparse_gfx950_gluon(
         main_block, extra_block = 1, 1
         nope_dim = head_dim
         main_num_rows = extra_num_rows = cache.shape[0]
-        cache_bytes = _addressable_bytes(cache)
+        cache_bytes = max_addressable_bytes(cache)
         avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
         avg_extra = 0.0
     else:
@@ -562,11 +545,13 @@ def _pa_decode_sparse_gfx950_gluon(
         nope_dim = NOPE_DIM
         main_num_rows = cache.shape[0] * cache.shape[1]
         extra_num_rows = extra_cache.shape[0] * extra_cache.shape[1]
-        cache_bytes = max(_addressable_bytes(cache), _addressable_bytes(extra_cache))
+        cache_bytes = max(
+            max_addressable_bytes(cache), max_addressable_bytes(extra_cache)
+        )
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
-    use_buffer_load = cache_bytes <= MAX_BYTES
+    use_buffer_load = cache_bytes < MAX_BYTES
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = torch.empty_like(q, dtype=torch.bfloat16)
