@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 import os
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -51,7 +51,8 @@ _PAGE_SIZE = 64
 _HEAD_DIM = 128
 
 
-def _target_num_prgms() -> int:
+@cache
+def _target_num_prgms(device_index: int) -> int:
     """Split-K fill target: a launch with num_2d_prgms base workgroups is "full"
     at num_2d_prgms >= this value.
 
@@ -59,16 +60,23 @@ def _target_num_prgms() -> int:
     device CU-count query, not a hardcoded arch constant -- it also handles
     CU-partitioned modes (CPX/NPS) where fewer CUs are exposed. Falls back to
     256 (the full-chip count) if the query fails.
+
+    Keyed on ``q.device`` (via ``device_index``) and resolved at call time, not
+    once at import: in a multi-GPU process the active device at import can
+    differ from the device a call actually runs on, and a heterogeneous host
+    can expose different CU counts per device -- either would lock in a wrong
+    fill target and mis-select split-K. ``@cache`` keeps it a one-time
+    host-side query per device. The value comes from ``get_num_sms()`` under
+    that device so the CU_NUM override and the tuning-dispatch CU count stay
+    consistent.
     """
     try:
         from aiter.ops.triton.utils.device_info import get_num_sms
 
-        return get_num_sms()
+        with torch.cuda.device(device_index):
+            return get_num_sms()
     except Exception:  # noqa: BLE001
         return 256
-
-
-_TARGET_NUM_PRGMS = _target_num_prgms()
 
 
 def _env_max_kv_splits(default: int = 16) -> int:
@@ -152,7 +160,7 @@ def _get_kernel(
     )
 
 
-def _split_count(num_2d_prgms: int) -> int:
+def _split_count(num_2d_prgms: int, target_num_prgms: int) -> int:
     """Split count from the machine-fill deficit; 1 means single-pass.
 
     The measured no-oversubscribe rule (NOT Triton's ceil/round-up/MIN=8): the
@@ -165,7 +173,7 @@ def _split_count(num_2d_prgms: int) -> int:
     b-sequence GQA-16 decode gives b=7 -> 8, b=8 -> 8, b=9 -> 4.
     """
     n = 1
-    while n * 2 <= _MAX_SEGMENTS and num_2d_prgms * (n * 2) <= _TARGET_NUM_PRGMS:
+    while n * 2 <= _MAX_SEGMENTS and num_2d_prgms * (n * 2) <= target_num_prgms:
         n *= 2
     return n if n >= 2 else 1
 
@@ -489,13 +497,14 @@ def flydsl_unified_attention(
     # where it cannot change the outcome.
     num_kv_splits = 1
     if max_seqlen_k > _PAGE_SIZE * 20 and sinks is None:
+        target_num_prgms = _target_num_prgms(q.device.index)
         block_q = _BLOCK_M // num_queries_per_kv
         if max_seqlen_q == 1:
             num_q_blocks = num_seqs
         else:
             total_q = q.shape[0]
             lower_bound = max(num_seqs, (total_q + block_q - 1) // block_q)
-            if num_kv_heads * lower_bound >= _TARGET_NUM_PRGMS:
+            if num_kv_heads * lower_bound >= target_num_prgms:
                 # Provably full at single-pass; exact value only gates <target.
                 num_q_blocks = lower_bound
             else:
@@ -504,8 +513,8 @@ def flydsl_unified_attention(
                     ((seqlens_q + (block_q - 1)) // block_q).sum().item()
                 )
         num_2d_prgms = num_kv_heads * num_q_blocks
-        if num_2d_prgms < _TARGET_NUM_PRGMS:
-            num_kv_splits = _split_count(num_2d_prgms)
+        if num_2d_prgms < target_num_prgms:
+            num_kv_splits = _split_count(num_2d_prgms, target_num_prgms)
 
     kernel = _get_kernel(
         num_query_heads,
@@ -531,8 +540,18 @@ def flydsl_unified_attention(
             # flattenable layouts (see _strides_ok), so this is always a
             # view here, never the silent copy that would occur otherwise.
             _as_i8(q).reshape(-1),
-            _as_i8(k).reshape(-1),
-            _as_i8(v).reshape(-1),
+            # K/V go in as a rank-2 [num_blocks, page_row_elems] view, NOT
+            # flattened. FlyDSL's C-ABI codec packs every memref shape dim as
+            # signed int32 (only strides may be int64), so a flattened KV pool
+            # of >= 2**31 elements -- e.g. num_blocks=32768, block_size=64,
+            # 8 kv-heads, head_dim=128 fp8 = exactly 2**31 bytes -- overflows
+            # the shape field and raises struct.error at launch. The kernel
+            # only takes K/V's base pointer (get_iter; the paged path rebases
+            # per page from the block table, dense num_records is a scalar
+            # arg), so the shape is never read -- keeping num_blocks as its own
+            # int32 dim removes the overflow with no addressing or perf change.
+            _as_i8(k).reshape(k.shape[0], -1),
+            _as_i8(v).reshape(v.shape[0], -1),
             out.reshape(-1),
             num_seqs,
             # grid.y is ceil(seq_len / BLOCK_Q), so this must be the MAX q len;

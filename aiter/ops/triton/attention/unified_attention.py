@@ -393,41 +393,49 @@ def unified_attention(
     # returns None for any configuration it cannot serve, so unsupported shapes
     # fall through to Triton below with no behaviour change.
     if _FLYDSL_UNIFIED_ATTN_ARCH:
-        from aiter.ops.flydsl.unified_attention_kernels import (
-            flydsl_unified_attention,
-        )
+        # FlyDSL is an optional dependency (imports flydsl transitively). If it
+        # isn't installed, fall through to Triton rather than raising on the
+        # import -- the adapter's own is_flydsl_available() gate can only run
+        # once the module is imported, so the import itself must be guarded.
+        try:
+            from aiter.ops.flydsl.unified_attention_kernels import (
+                flydsl_unified_attention,
+            )
+        except ImportError:
+            flydsl_unified_attention = None
 
-        _flydsl_out = flydsl_unified_attention(
-            q,
-            k,
-            v,
-            out,
-            cu_seqlens_q,
-            max_seqlen_q,
-            seqused_k,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            window_size,
-            block_table,
-            softcap,
-            q_descale,
-            k_descale,
-            v_descale,
-            num_kv_heads=num_kv_heads,
-            block_size=block_size,
-            num_queries_per_kv=num_queries_per_kv,
-            num_seqs=num_seqs,
-            q_scales=q_scales,
-            alibi_slopes=alibi_slopes,
-            output_scale=output_scale,
-            qq_bias=qq_bias,
-            sinks=sinks,
-            shuffled_kv_cache=shuffled_kv_cache,
-            skip_reduce=skip_reduce,
-        )
-        if _flydsl_out is not None:
-            return _flydsl_out
+        if flydsl_unified_attention is not None:
+            _flydsl_out = flydsl_unified_attention(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                max_seqlen_q,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+                window_size,
+                block_table,
+                softcap,
+                q_descale,
+                k_descale,
+                v_descale,
+                num_kv_heads=num_kv_heads,
+                block_size=block_size,
+                num_queries_per_kv=num_queries_per_kv,
+                num_seqs=num_seqs,
+                q_scales=q_scales,
+                alibi_slopes=alibi_slopes,
+                output_scale=output_scale,
+                qq_bias=qq_bias,
+                sinks=sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
+                skip_reduce=skip_reduce,
+            )
+            if _flydsl_out is not None:
+                return _flydsl_out
 
     # FlyDSL declined (or this isn't gfx950); the Triton fallback below only
     # implements the causal mask.
