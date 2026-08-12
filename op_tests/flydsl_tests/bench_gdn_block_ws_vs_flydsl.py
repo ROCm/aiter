@@ -296,6 +296,45 @@ def buckets(row: dict) -> dict[str, float]:
     return out
 
 
+def per_case_table(data: dict, present: list[str], i: int, n: int) -> None:
+    """One table per case: a row per backend, a column per pipeline stage.
+
+    ``K1..K4`` is the front-end total, so it is comparable across backends
+    whether they split those stages or fuse them; the ``K1+K2``/``K3``/``K4``
+    columns then break it down for the ones that split.  ``total`` is the sum
+    of the profiler's per-kernel device time and ``wall`` the median end to
+    end, so their difference is the launch gap.
+    """
+    rows = {b: data[b]["rows"][i] for b in present}
+    bk = {b: buckets(rows[b]) for b in present}
+    cols = (
+        ("K1+K2", 8, lambda b: bk[b]["K1+K2 cumsum/KKT"]),
+        ("K3", 8, lambda b: bk[b]["K3 solve_tril"]),
+        ("K4", 8, lambda b: bk[b]["K4 W/U"]),
+        ("K1..K4", 9, lambda b: sum(bk[b][s] for s in FRONT_END)),
+        ("K5", 9, lambda b: bk[b]["K5 state scan"]),
+        ("K6", 9, lambda b: bk[b]["K6 output"]),
+        ("other", 7, lambda b: bk[b]["other"]),
+        ("total", 9, lambda b: rows[b]["kernel_sum_us"]),
+        ("wall", 9, lambda b: rows[b]["wall_us"]),
+    )
+    print(f"\n== N={n}, T={rows[present[0]]['total_tokens']} (us) ==")
+    hdr = f"{'scheme':<15}" + "".join(f"{name:>{w}}" for name, w, _ in cols)
+    if "ws" in rows:
+        hdr += f"{'vs WS':>8}"
+    print(hdr)
+    print("-" * len(hdr))
+    for b in present:
+        line = f"{LABEL[b]:<15}"
+        for _, w, get in cols:
+            us = get(b)
+            line += f"{us:{w}.1f}" if us else f"{'-':>{w}}"
+        if "ws" in rows:
+            ratio = rows[b]["wall_us"] / rows["ws"]["wall_us"]
+            line += f"{ratio:7.2f}x"
+        print(line)
+
+
 def report(outdir: str) -> None:
     data = {}
     for b in BACKENDS:
@@ -343,44 +382,7 @@ def report(outdir: str) -> None:
         print(line)
 
     for i, n in enumerate(n_list):
-        if n not in (n_list[0], n_list[-1]):
-            continue
-        rows = {b: data[b]["rows"][i] for b in present}
-        bk = {b: buckets(rows[b]) for b in present}
-        print(f"\n== per-stage device time (us), N={n}, T={rows[present[0]]['total_tokens']} ==")
-        hdr = f"{'stage':<18}" + "".join(f"{LABEL[b]:>15}" for b in present)
-        print(hdr)
-        print("-" * len(hdr))
-        for s in STAGES:
-            if all(bk[b][s] == 0.0 for b in present):
-                continue
-            print(
-                f"{s:<18}"
-                + "".join(
-                    (f"{bk[b][s]:15.1f}" if bk[b][s] else f"{'-':>15}") for b in present
-                )
-            )
-        print("-" * len(hdr))
-        for label, get in (
-            ("kernel total", lambda r: r["kernel_sum_us"]),
-            ("wall total", lambda r: r["wall_us"]),
-            ("launch gap", lambda r: r["wall_us"] - r["kernel_sum_us"]),
-        ):
-            print(f"{label:<18}" + "".join(f"{get(rows[b]):15.1f}" for b in present))
-
-    print("\n== front end (K1..K4), K5, K6 across the sweep (us) ==")
-    hdr = f"{'N':>2} {'T':>6}"
-    for part in ("front", "K5", "K6"):
-        hdr += "".join(f"{SHORT[b] + ' ' + part:>12}" for b in present)
-    print(hdr)
-    print("-" * len(hdr))
-    for i, n in enumerate(n_list):
-        bk = {b: buckets(data[b]["rows"][i]) for b in present}
-        line = f"{n:2d} {ref['rows'][i]['total_tokens']:6d}"
-        line += "".join(f"{sum(bk[b][s] for s in FRONT_END):12.1f}" for b in present)
-        line += "".join(f"{bk[b]['K5 state scan']:12.1f}" for b in present)
-        line += "".join(f"{bk[b]['K6 output']:12.1f}" for b in present)
-        print(line)
+        per_case_table(data, present, i, n)
 
     print(f"\n== raw kernel names, N={n_list[0]} ==")
     for b in present:
