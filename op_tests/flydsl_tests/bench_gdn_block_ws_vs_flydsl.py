@@ -22,13 +22,23 @@ Usage:
 
     # one backend at a time, then report from the saved JSON
     python <this> --backend ws
-    python <this> --backend flydsl
+    python <this> --backend prepare
     python <this> --report --compare
 
 Backends:
-    ws      opus_gdn_wu_prefill_fwd, packed varlen => WS (split K2) family
-    flydsl  chunk_gated_delta_rule_opt_vk(use_chunk_flydsl=True)  (FlyDSL K5)
-    triton  chunk_gated_delta_rule_opt_vk(use_chunk_flydsl=False) (Triton K5)
+    ws       opus_gdn_wu_prefill_fwd, packed varlen => WS (split K2) family.
+             One HIP kernel for K1..K4, then the split scan and output kernels.
+    flydsl   chunk_gated_delta_rule_opt_vk(use_chunk_flydsl=True): Triton
+             prepare pair for K1..K4, FlyDSL K5, Triton K6.
+    prepare  the same, plus use_prepare_flydsl=True: the Triton prepare pair is
+             replaced by the fused FlyDSL K1..K4 kernel, so only K6 is Triton.
+    triton   chunk_gated_delta_rule_opt_vk(use_chunk_flydsl=False), all Triton.
+
+Every ``chunk_gated_delta_rule_opt_vk`` backend gets a prebuilt
+``prefill_metadata``, which is how these paths are driven in production and is a
+precondition of the fused prepare kernel on a varlen batch (it sizes its
+rectangular grid from the host-resident schedule).  opus takes ``cu_seqlens``
+only and derives its own schedule on the host.
 """
 
 from __future__ import annotations
@@ -54,13 +64,19 @@ NUM_WARMUP = 5
 NUM_ITERS = 50
 PROF_ITERS = 20
 
-BACKENDS = ("ws", "flydsl", "triton")
-LABEL = {"ws": "opus WS", "flydsl": "flydsl+triton", "triton": "triton only"}
-SHORT = {"ws": "WS", "flydsl": "fly", "triton": "tri"}
+BACKENDS = ("ws", "flydsl", "prepare", "triton")
+LABEL = {
+    "ws": "opus WS",
+    "flydsl": "tri K14+fly K5",
+    "prepare": "fly K14+fly K5",
+    "triton": "triton only",
+}
+SHORT = {"ws": "WS", "flydsl": "fly", "prepare": "prep", "triton": "tri"}
 
-# Ordered (substring, stage) attribution rules; first match wins.  opus fuses
-# K1..K4 into one kernel, so its front end is a single row.
+# Ordered (substring, stage) attribution rules; first match wins.  opus and the
+# FlyDSL prepare kernel each fuse K1..K4, so their front end is a single row.
 RULES = (
+    ("gdn_prepare", "K1-K4 fused"),
     ("gdn_k1_neumann_kernel", "K1-K4 fused"),
     ("gdn_k1_", "K1-K4 fused"),
     ("cumsum_scaled_dot_kkt", "K1+K2 cumsum/KKT"),
@@ -105,19 +121,28 @@ def build_inputs(n_seqs: int) -> dict:
     GatedDeltaNet block feeds the kernel.  The seed depends only on n_seqs, so
     separate backend processes see bit-identical inputs.
     """
+    from aiter.ops.prefill_batch_metadata import (
+        build_gated_delta_rule_prefill_metadata,
+    )
+
     torch.manual_seed(20260811 + n_seqs)
     lens = [FULL_PROMPT_LEN] * n_seqs
     total = sum(lens)
     cu = torch.tensor(
         [0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda"
     )
+    # Built once per shape, as a serving layer would, and reused by every
+    # timed iteration.
+    meta = build_gated_delta_rule_prefill_metadata(lens, cu_seqlens=cu, chunk_size=64)
     q = F.normalize(torch.randn(1, total, HG, D, device="cuda"), dim=-1).to(torch.bfloat16)
     k = F.normalize(torch.randn(1, total, HG, D, device="cuda"), dim=-1).to(torch.bfloat16)
     v = (torch.randn(1, total, H, D, device="cuda") * 0.1).to(torch.bfloat16)
     g = F.logsigmoid(torch.randn(1, total, H, device="cuda", dtype=torch.float32))
     beta = torch.sigmoid(torch.randn_like(g)).to(torch.bfloat16)
     h0 = torch.randn(n_seqs, H, D, D, device="cuda", dtype=torch.float32) * 0.01
-    return dict(q=q, k=k, v=v, g=g, beta=beta, h0=h0, cu=cu, total=total)
+    return dict(
+        q=q, k=k, v=v, g=g, beta=beta, h0=h0, cu=cu, meta=meta, total=total
+    )
 
 
 def make_callable(backend: str, t: dict):
@@ -142,7 +167,8 @@ def make_callable(backend: str, t: dict):
 
     from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
 
-    use_flydsl = backend == "flydsl"
+    use_chunk_flydsl = backend in ("flydsl", "prepare")
+    use_prepare_flydsl = backend == "prepare"
 
     def run():
         return chunk_gated_delta_rule_opt_vk(
@@ -154,7 +180,9 @@ def make_callable(backend: str, t: dict):
             initial_state=t["h0"],
             output_final_state=True,
             cu_seqlens=t["cu"],
-            use_chunk_flydsl=use_flydsl,
+            use_chunk_flydsl=use_chunk_flydsl,
+            use_prepare_flydsl=use_prepare_flydsl,
+            prefill_metadata=t["meta"],
         )
 
     return run
@@ -217,6 +245,14 @@ def run_backend(backend: str, n_list: list[int], outdir: str) -> str:
             )
         wall = bench_wall_us(run)
         kernels = profile_kernels(run)
+        if backend == "prepare" and not any("gdn_prepare" in name for name in kernels):
+            # opt_vk falls back to the Triton prepare pair rather than failing
+            # when the request is outside the fused kernel's slice, which would
+            # silently make this column a copy of the flydsl one.
+            raise RuntimeError(
+                f"n={n}: the fused FlyDSL prepare kernel did not run; "
+                f"opt_vk fell back to Triton.  kernels: {sorted(kernels)}"
+            )
         rows.append(
             dict(
                 backend=backend,
@@ -282,7 +318,11 @@ def report(outdir: str) -> None:
         print(f"  {LABEL[b]:<14} <- {data[b]['aiter_path']}")
     print(
         f"\nwall = median of {NUM_ITERS} iters; per-kernel = {PROF_ITERS}-iter "
-        "torch.profiler device time\n"
+        "torch.profiler device time"
+    )
+    print(
+        "opt_vk backends run with a prebuilt prefill_metadata; opus derives its "
+        "own schedule from cu_seqlens\n"
     )
 
     print("== end to end (us) ==")
