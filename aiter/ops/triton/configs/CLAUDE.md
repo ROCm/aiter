@@ -193,13 +193,14 @@ files by the packed byte width will never be found.
 ## 5. MOE configs
 
 MOE does **not** go through `get_gemm_config()`. There is no probe order, no
-nested-layout support, and no `is_tuned` signal. Three independent loaders read
+nested-layout support, and no `is_tuned` signal. Four independent loaders read
 `configs/moe/` directly, each with its own schema:
 
 | Loader | File | Schema |
 | ------ | ---- | ------ |
 | `utils/moe_config_utils.py::get_moe_configs` | `moe/<arch>-MOE-<dtype_str>.json` | `small_M` / `medium_M` / `large_M` |
 | `moe/moe_op_gemm_a8w4.py::_get_a8w4_dispatch` | `moe/<arch>-A8W4.json` | `bm<block_m>_n<N>_k<K>` |
+| `moe/moe_op_gemm_a4w4.py::_get_a4w4_dispatch` | `moe/<arch>-A4W4.json` | `bm<block_m>_n<N>_k<K>_<bucket>` |
 | `_triton_kernels/moe/moe_routing_sigmoid_top1_fused.py` | `moe/<arch>-MOE_ROUTING_SIGMOID_TOPK1.json` | `N16` → `small` / `medium` / … |
 
 `<dtype_str>` comes from `get_config_dtype_str()`: `DEFAULT`, `FP8_W8A8`,
@@ -208,6 +209,14 @@ nested-layout support, and no `is_tuned` signal. Three independent loaders read
 `small_M` / `medium_M` / `large_M` split on `M_THRESHOLD_SMALL = 256` and
 `M_THRESHOLD_MEDIUM = 1024`, both module constants in `moe_config_utils.py`.
 This is **not** the GEMM `M_LEQ_x` / `M_GEQ_y` scheme — do not mix them.
+
+`A4W4` feeds the **gluon path only** (`get_kernel_config_gluon`); a4w4's triton
+path still computes its config in Python. Its `<bucket>` is a *third* M scheme —
+`m2bucket()` in `moe_op_gemm_a4w4.py`, splitting on 8 / 32 / 128 / 256 / 512 into
+`tiny` / `small` / `medium` / `medium2` / `large` / `xlarge`. Lookup is two tiers:
+`bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any`. Since a missing bucket
+falls all the way through to `_any` and loses the shape's tuning, a tuned shape
+must supply **all six** buckets, even where the values repeat.
 
 ### MOE is the main offender for tuning values in Python
 
