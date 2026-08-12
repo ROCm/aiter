@@ -16,9 +16,6 @@ Two levels:
   * ``test_fused_unit``     — call the fused wrapper directly.
   * ``test_fused_pipeline`` — call the end-to-end pipeline with
     ``use_chunk_flydsl_fused=True`` and compare to the Triton-only baseline.
-
-Phase 0: the fused wrapper delegates to an unfused placeholder (K5 then K6);
-these tests are the gate that keeps the real Phase-1 kernel honest.
 """
 
 from __future__ import annotations

@@ -55,6 +55,7 @@ from utils.bench_common import (
     print_result_table,
     write_bench_markdown,
 )
+from utils.plot_perf import make_fill_scatter, parse_bench_md
 
 # Reuse the K5 bench's shape presets, input builders, and HIP graph-capture
 # machinery so the two benches stay in lockstep (same shapes, same seqlen
@@ -471,6 +472,21 @@ def run(args):
             args.output, _BENCH_TITLE, all_rows, env, baseline_name=args.baseline,
         )
         print(f"\nMarkdown report written to {args.output}")
+
+        # Speedup-vs-grid-fill scatter (fused K5+K6 vs the baseline). Parse the
+        # just-written report so the figure reflects exactly what was saved.
+        modes_out = ["eager", "graph"] if args.mode == "all" else [args.mode]
+        plot_mode = "graph" if "graph" in modes_out else modes_out[0]
+        try:
+            results = parse_bench_md(args.output)
+            png = str(Path(args.output).with_suffix("")) + "-fill-scatter.png"
+            make_fill_scatter(
+                results, png,
+                title=f"{_BENCH_TITLE}: speedup vs grid fill ({plot_mode})",
+                mode=plot_mode,
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings.warn(f"fill-scatter generation failed: {e}")
 
 
 def main():

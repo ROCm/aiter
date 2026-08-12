@@ -294,6 +294,191 @@ def make_bar_chart(
 
 
 # --------------------------------------------------------------------------- #
+# Fusion speedup vs grid-fill scatter (fused K5+K6 bench)
+# --------------------------------------------------------------------------- #
+def _bv_of_impl(name: str) -> int | None:
+    """BV tile width from a fused impl name like ``K5K6_flydsl_fused:bv64w8``."""
+    m = re.search(r"bv(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+def make_fill_scatter(
+    results: list[dict],
+    out_png: str,
+    *,
+    title: str = "Fused K5+K6: speedup vs grid fill",
+    mode: str = "graph",
+    fused_prefix: str = "K5K6_flydsl_fused",
+    cu_count: int = 304,
+    fill_bv: int = 64,
+) -> None:
+    """Scatter of best-fused speedup vs grid fill factor, one point per shape.
+
+    x = grid fill at BV=``fill_bv`` = ``ceil(V/fill_bv) * N * H / cu_count``.
+    ``fill_bv`` defaults to 64 (the high-perf tile), giving ``fill64 = 2*N*H/CU``
+    -- a **shape-intrinsic** quantity computable from H, N alone (independent of
+    which BV the kernel ends up choosing). This is the practical selector axis:
+    the true fill at the best-fused BV mixes regimes (small problems only reach a
+    given fill by shrinking to BV=16, which is 4x more CTAs), so it does not
+    separate wins from losses cleanly; fill@BV=64 does.
+
+    y = the best fused variant's speedup vs the baseline (values < 1.0 -- where
+    fusion is slower -- are shown as-is, coloured/shaped distinctly, so the cost
+    of forcing fusion is visible). Data is taken from ``parse_bench_md`` output.
+    """
+    if not _HAS_MPL:
+        print("matplotlib not available; skipping fill scatter.")
+        return
+
+    WIN = "#2a78d6"; LOSS = "#eb6834"          # validated categorical slots 1 & 6
+    INK = "#0b0b0b"; SEC = "#52514e"; MUT = "#8a887f"; GRID = "#e5e4df"
+
+    # Marker per sequence pattern (shape encodes the input length distribution);
+    # colour encodes fusion faster/slower. "equal" is the default when a shape's
+    # heading carries no ``seqs=`` tag.
+    PAT_MARKER = {
+        "equal": "o", "ragged": "s", "bimodal": "D",
+        "skew": "^", "skew_last": "v",
+    }
+
+    pts = []
+    for r in results:
+        head = r["shape"]
+        mh = re.search(r"H=(\d+)", head); mn = re.search(r"N=(\d+)", head)
+        mv = re.search(r"V=(\d+)", head)
+        if not (mh and mn):
+            continue
+        H = int(mh.group(1)); N = int(mn.group(1))
+        V = int(mv.group(1)) if mv else 128
+        mp = re.search(r"seqs=(\w+)", head)
+        pat = mp.group(1) if mp else "equal"
+        # Best fused impl for this shape (max speedup over its variants).
+        best_sp = None
+        for name, modes in r["impls"].items():
+            if not name.startswith(fused_prefix):
+                continue
+            md = modes.get(mode)
+            if not md:
+                continue
+            vs = md.get("vs_baseline", "-")
+            m = re.search(r"([\d.]+)", vs.replace("×", "x")) if vs else None
+            if not m:
+                continue
+            sp = float(m.group(1))
+            if best_sp is None or sp > best_sp:
+                best_sp = sp
+        if best_sp is None:
+            continue
+        # Shape-intrinsic fill at BV=fill_bv (independent of the chosen variant).
+        fill = (-(-V // fill_bv)) * N * H / cu_count
+        pts.append({"H": H, "N": N, "sp": best_sp, "fill": fill, "pat": pat})
+
+    if not pts:
+        print("no fused points found; skipping fill scatter.")
+        return
+
+    win = [p for p in pts if p["sp"] >= 1.0]
+    loss = [p for p in pts if p["sp"] < 1.0]
+
+    fig, ax = plt.subplots(figsize=(9.8, 5.9), dpi=130)
+    fig.patch.set_facecolor("#fcfcfb"); ax.set_facecolor("#fcfcfb")
+    ax.axhspan(0.0, 1.0, color=LOSS, alpha=0.05, zorder=0)
+    ax.axhline(1.0, color=SEC, lw=1.5, ls=(0, (5, 4)), zorder=2)
+
+    # jitter identical (fill, side) groups so overlapping points stay visible
+    from collections import defaultdict
+    seen: dict = defaultdict(int)
+
+    # Plot per (win/loss colour) x (pattern marker); legends are built separately
+    # so identity is a colour-and-shape pair, never colour alone.
+    for p in pts:
+        key = (round(p["fill"], 3), p["sp"] < 1.0)
+        seen[key] += 1
+        j = seen[key] - 1
+        x = p["fill"] if j == 0 else p["fill"] * (
+            1.0 + ((1 if j % 2 else -1) * ((j + 1) // 2) * 0.02)
+        )
+        color = WIN if p["sp"] >= 1.0 else LOSS
+        marker = PAT_MARKER.get(p["pat"], "o")
+        ax.scatter([x], [p["sp"]], s=52, c=color, marker=marker,
+                   edgecolors="#fcfcfb", linewidths=1.1, zorder=3)
+
+    # Two legends: colour = outcome, shape = seq pattern.
+    import matplotlib.lines as _mlines
+    outcome_handles = [
+        _mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=WIN, mec="#fcfcfb",
+                       label=f"fusion faster ({len(win)})"),
+        _mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=LOSS, mec="#fcfcfb",
+                       label=f"fusion slower ({len(loss)})"),
+    ]
+    pats_present = [p for p in PAT_MARKER if any(x["pat"] == p for x in pts)]
+    pat_handles = [
+        _mlines.Line2D([], [], marker=PAT_MARKER[p], ls="", ms=8, mfc=SEC,
+                       mec="#fcfcfb", label=p)
+        for p in pats_present
+    ]
+
+    allfill = [p["fill"] for p in pts]; allsp = [p["sp"] for p in pts]
+    ax.set_xscale("log")
+    xlo, xhi = min(allfill) * 0.7, max(allfill) * 1.3
+    ax.set_xlim(xlo, xhi)
+    ax.set_ylim(min(0.4, min(allsp) - 0.05), max(allsp) + 0.15)
+    # Mark the empirical "fusion always wins" threshold on this intrinsic axis.
+    # Empirically all 66 fusion wins sit above fill@BV=64 ≈ 0.42 (round: 0.5);
+    # since fill scales as 1/BV, the equivalent threshold on the BV=``fill_bv``
+    # axis is 0.5 * (64 / fill_bv)  (= 0.5, 1.0, 2.0 for BV = 64, 32, 16).
+    thr = 0.5 * (64.0 / fill_bv)
+    if xlo < thr < xhi:
+        ax.axvspan(thr, xhi, color=MUT, alpha=0.06, zorder=0)
+        ax.axvline(thr, color=SEC, lw=1, ls=":", zorder=1)
+        ax.text(thr * 1.05, max(allsp) + 0.02,
+                f"fill ≥ {thr:g} → fusion wins",
+                fontsize=9.5, color=SEC, va="top")
+    bvlab = "2·N·H" if fill_bv == 64 else f"⌈V/{fill_bv}⌉·N·H"
+    ax.set_xlabel(
+        f"grid fill factor at BV={fill_bv}  (CTAs / CUs = {bvlab} / "
+        f"{cu_count};  shape-intrinsic, log scale)",
+        fontsize=11.5, color=INK, fontweight="bold",
+    )
+    ax.set_ylabel(f"fused speedup vs baseline ({mode})",
+                  fontsize=12, color=INK, fontweight="bold")
+    ax.set_title(title, fontsize=13, color=INK, fontweight="bold", pad=12)
+    # break-even label at the LEFT end of the dashed line (the pattern legend
+    # occupies the lower-right).
+    ax.text(xlo * 1.05, 1.02, "break-even 1.00×",
+            fontsize=9.5, color=SEC, ha="left", va="bottom")
+    ax.grid(True, which="major", color=GRID, lw=0.8, zorder=0)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color("#c3c2bb")
+    ax.tick_params(colors=SEC, labelsize=10.5)
+    leg1 = ax.legend(handles=outcome_handles, loc="upper left", frameon=False,
+                     fontsize=10.5, labelcolor=INK, title="outcome (colour)")
+    leg1.get_title().set_color(SEC); leg1.get_title().set_fontsize(9.5)
+    ax.add_artist(leg1)
+    leg2 = ax.legend(handles=pat_handles, loc="lower right", frameon=False,
+                     fontsize=9.5, labelcolor=INK, title="seq pattern (shape)",
+                     ncol=1, borderpad=0.3, handletextpad=0.4)
+    leg2.get_title().set_color(SEC); leg2.get_title().set_fontsize(9.5)
+
+    import statistics as _st
+    if win:
+        wsp = [p["sp"] for p in win]
+        foot = (f"Fusion faster: median {_st.median(wsp):.2f}× · "
+                f"max {max(wsp):.2f}× ({len(win)}).")
+        if loss:
+            lsp = [p["sp"] for p in loss]
+            foot += (f"   Fusion slower: worst {min(lsp):.2f}× · "
+                     f"best {max(lsp):.2f}× ({len(loss)}).")
+        fig.text(0.06, -0.02, foot, fontsize=9, color=MUT)
+
+    fig.savefig(out_png, dpi=130, bbox_inches="tight", facecolor="#fcfcfb")
+    plt.close(fig)
+    print(f"Fill scatter written to {out_png}")
+
+
+# --------------------------------------------------------------------------- #
 # Summary Markdown table
 # --------------------------------------------------------------------------- #
 def make_summary_md(
