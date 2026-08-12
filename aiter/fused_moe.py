@@ -81,6 +81,33 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
+# CK 2-stage kernel-instance names embed the activation token (see
+# gemm_moe_ck2stages_common.ACT_OP_NAME). Used to detect when the act-disabled
+# tuned-config fallback tier handed us another activation's CK kernel name.
+_CK2STAGES_ACT_TOKENS = {
+    int(_member): _token
+    for _name, _token in (
+        ("Silu", "silu"),
+        ("Gelu", "gelu"),
+        ("Swiglu", "swiglu"),
+        ("GeluTanh", "gelutanh"),
+    )
+    if (_member := getattr(ActivationType, _name, None)) is not None
+}
+
+
+def _ck2stages_kname_act_token(kname: str) -> str | None:
+    """Return the activation token embedded in a CK 2-stage kernel name, if any.
+
+    Order matters: check ``gelutanh`` before ``gelu`` so the shorter token does
+    not shadow the longer one.
+    """
+    for tok in ("gelutanh", "swiglu", "silu", "gelu"):
+        if f"_{tok}_" in kname:
+            return tok
+    return None
+
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
