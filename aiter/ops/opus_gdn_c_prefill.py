@@ -73,9 +73,11 @@ def opus_gdn_c_prefill_fwd(
     measured envelope to other architectures or broad unmeasured regions.
 
     Args:
-        q: Query tensor with shape [B, T, H, 128].
-        k: Key tensor with shape [B, T, H, 128].
-        v: Value tensor with shape [B, T, H, 128].
+        q: Query tensor with shape [B, T, Hg, 128].
+        k: Key tensor with shape [B, T, Hg, 128].
+        v: Value tensor with shape [B, T, H, 128]. H must be a multiple of the
+            q/k head count Hg; H > Hg selects GQA, where H / Hg value heads
+            share one key head.
         g: Log-space gate tensor with shape [B, T, H].
         beta: Update gate tensor with shape [B, T, H].
         scale: Query scale; defaults to 1 / sqrt(128).
@@ -99,7 +101,7 @@ def opus_gdn_c_prefill_fwd(
             f"{OPUS_GDN_C_SUPPORTED_MODES}"
         )
     if not isinstance(q, torch.Tensor) or q.ndim != 4:
-        raise ValueError("q must be a tensor with shape [B, T, H, 128]")
+        raise ValueError("q must be a tensor with shape [B, T, Hg, 128]")
     if q.shape[-1] != _DENSE_FEATURE_SIZE:
         raise ValueError(f"q feature size must be {_DENSE_FEATURE_SIZE}")
     if not q.is_cuda:
@@ -110,20 +112,39 @@ def opus_gdn_c_prefill_fwd(
             f"opus_gdn_c_prefill currently requires gfx942, got {device_gfx}"
         )
 
-    B, T, H, K = q.shape
-    if B <= 0 or T <= 0 or H <= 0:
-        raise ValueError(f"B, T, and H must be positive, got {(B, T, H)}")
+    B, T, Hg, K = q.shape
+    if B <= 0 or T <= 0 or Hg <= 0:
+        raise ValueError(f"B, T, and Hg must be positive, got {(B, T, Hg)}")
+    if (
+        not isinstance(v, torch.Tensor)
+        or v.ndim != 4
+        or (v.shape[0], v.shape[1], v.shape[3]) != (B, T, _DENSE_FEATURE_SIZE)
+    ):
+        raise ValueError(
+            f"v must have shape [{B}, {T}, H, {_DENSE_FEATURE_SIZE}], got "
+            f"{getattr(v, 'shape', None)}"
+        )
+    # H counts value heads; H > Hg selects GQA, where H / Hg value heads share
+    # one q/k head.  C, the gates, o and the state all stay value-head indexed.
+    H = v.shape[2]
+    if H <= 0 or H % Hg != 0:
+        raise ValueError(
+            f"v head count {H} must be a positive multiple of the q/k head "
+            f"count {Hg}"
+        )
     expected_vector_shape = (B, T, H, _DENSE_FEATURE_SIZE)
     expected_scalar_shape = (B, T, H)
+    if not isinstance(k, torch.Tensor) or tuple(k.shape) != (
+        B,
+        T,
+        Hg,
+        _DENSE_FEATURE_SIZE,
+    ):
+        raise ValueError(
+            f"k must have shape {(B, T, Hg, _DENSE_FEATURE_SIZE)}, got "
+            f"{getattr(k, 'shape', None)}"
+        )
     for name, tensor in (("k", k), ("v", v)):
-        if (
-            not isinstance(tensor, torch.Tensor)
-            or tuple(tensor.shape) != expected_vector_shape
-        ):
-            raise ValueError(
-                f"{name} must have shape {expected_vector_shape}, got "
-                f"{getattr(tensor, 'shape', None)}"
-            )
         if tensor.device != q.device:
             raise ValueError(f"{name} must be on the same device as q")
     for name, tensor in (("g", g), ("beta", beta)):

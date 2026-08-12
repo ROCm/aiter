@@ -192,14 +192,24 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must have dtype bfloat16");
     TORCH_CHECK(q.dim() == 4 && q.size(3) == 128,
-                "q must have shape [B, T, H, 128]");
+                "q must have shape [B, T, Hg, 128]");
+    TORCH_CHECK(v.defined() && v.dim() == 4 && v.size(3) == 128,
+                "v must have shape [B, T, H, 128]");
 
     const int64_t B = q.size(0);
     const int64_t T = q.size(1);
-    const int64_t H = q.size(2);
+    // H counts value heads (v/C/o/g/beta/state); Hg counts the q/k key heads
+    // that H / Hg value heads share.  Every grid and buffer below stays
+    // value-head indexed, so only q/k addressing changes for GQA.
+    const int64_t H = v.size(2);
+    const int64_t Hg = q.size(2);
     const c10::Device device = q.device();
 
-    TORCH_CHECK(B > 0 && T > 0 && H > 0, "B, T, and H must all be positive");
+    TORCH_CHECK(B > 0 && T > 0 && H > 0 && Hg > 0,
+                "B, T, H, and Hg must all be positive");
+    TORCH_CHECK(H % Hg == 0,
+                "v head count ", H,
+                " must be a multiple of the q/k head count ", Hg);
     TORCH_CHECK(T % 64 == 0,
                 "the K2-C prototype only supports sequence lengths divisible by 64");
     TORCH_CHECK(B <= std::numeric_limits<int>::max() &&
@@ -213,7 +223,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
     const int64_t bh64 = B * H;
     const unsigned int grid_bh = static_cast<unsigned int>(bh64);
 
-    check_bth(k, "k", at::kBFloat16, device, B, T, H, 128);
+    check_bth(k, "k", at::kBFloat16, device, B, T, Hg, 128);
     check_bth(v, "v", at::kBFloat16, device, B, T, H, 128);
     check_bth(c, "c", at::kBFloat16, device, B, T, H, 64);
     check_bth_scalar(beta, "beta", device, B, T, H);
@@ -245,6 +255,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         static_cast<int>(B),
         static_cast<int>(T),
         static_cast<int>(H),
+        static_cast<int>(Hg),
         128,
         128,
         NT,
@@ -323,9 +334,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         out_args.B = static_cast<int>(B);
         out_args.T = static_cast<int>(T);
         out_args.H = static_cast<int>(H);
-        // The C-input launcher is MHA-only: q/k carry one key head per value
-        // head, so K6's GQA addressing degenerates to its dense form.
-        out_args.Hg = static_cast<int>(H);
+        out_args.Hg = static_cast<int>(Hg);
         out_args.K = 128;
         out_args.V = 128;
         out_args.NT = NT;

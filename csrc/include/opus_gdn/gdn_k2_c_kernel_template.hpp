@@ -95,7 +95,11 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
     const int V = kargs.V;
     const int H = kargs.H;
     const int NT = kargs.NT;
-    const int stride_k = H * K;
+    // q/k are the only key-head inputs; v, C, the gates, o/v_new and the state
+    // stay value-head indexed.  GQA lets H / Hg value heads share one key head,
+    // and the uniform Hg == H branch keeps MHA on its original arithmetic.
+    const int Hg = kargs.Hg;
+    const int stride_k = Hg * K;
     const int stride_v = H * V;
     const int stride_c = H * BT;
     const int stride_g = H;
@@ -104,6 +108,9 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
     // has already overflowed a signed 32-bit intermediate.
     const int64_t token_head_base =
         (static_cast<int64_t>(i_n) * kargs.T) * H + i_h;
+    const int64_t token_key_head_base = (Hg == H)
+        ? token_head_base
+        : (static_cast<int64_t>(i_n) * kargs.T) * Hg + i_h / (H / Hg);
     const int64_t state_head_base = static_cast<int64_t>(i_n) * H + i_h;
 
     const int h_m_base = (warp_id / H_T_N) * W;
@@ -147,9 +154,9 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
     D_ATTN* s_pool = s_k + T::smem_k_bytes / sizeof(D_ATTN);
 
     const D_ATTN* q_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_q)
-                          + token_head_base * K;
+                          + token_key_head_base * K;
     const D_ATTN* k_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_k)
-                          + token_head_base * K;
+                          + token_key_head_base * K;
     const D_ATTN* v_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_v)
                           + token_head_base * V;
     const D_ATTN* c_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_c)

@@ -82,7 +82,13 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     const int H  = kargs.H;
     const int NT = kargs.NT;
 
-    const int stride_k = H * K;
+    // q/k are the only key-head inputs: w_bar/u_bar, the gates, o/v_new and
+    // the state all stay value-head indexed.  GQA lets H / Hg value heads
+    // share one key head; the uniform Hg == H branch keeps MHA on its
+    // original address arithmetic.
+    const int Hg = kargs.Hg;
+    const int stride_k = Hg * K;
+    const int stride_w = H * K;
     const int stride_v = H * V;
     const int stride_g = H;
 
@@ -90,7 +96,10 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     // indices fit in int.  Form the CTA-owned global bases in 64 bits once.
     const int64_t token_head_base =
         static_cast<int64_t>(i_n) * kargs.T * H + i_h;
-    const int64_t qkw_base = token_head_base * K;
+    const int64_t w_base = token_head_base * K;
+    const int64_t qk_base = (Hg == H)
+        ? w_base
+        : (static_cast<int64_t>(i_n) * kargs.T * Hg + i_h / (H / Hg)) * K;
     const int64_t uov_base = token_head_base * V;
     const int64_t state_base =
         (static_cast<int64_t>(i_n) * H + i_h) * V * K;
@@ -179,11 +188,11 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     // HBM base pointers
     // =====================================================================
     const D_ATTN* q_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_q)
-                          + qkw_base;
+                          + qk_base;
     const D_ATTN* k_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_k)
-                          + qkw_base;
+                          + qk_base;
     const D_ATTN* w_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_w_bar)
-                          + qkw_base;
+                          + w_base;
     const D_ATTN* u_hbm = reinterpret_cast<const D_ATTN*>(kargs.ptr_u_bar)
                           + uov_base;
     const D_ACC*  g_hbm = reinterpret_cast<const D_ACC*>(kargs.ptr_g_cumsum)
@@ -225,7 +234,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                 int col = (i % PF_NVEC) * PF_VEC;
                 if (DENSE || row < kargs.T) {
                     pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
-                        &w_hbm[static_cast<int64_t>(row) * stride_k + col]);
+                        &w_hbm[static_cast<int64_t>(row) * stride_w + col]);
                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                         &q_hbm[static_cast<int64_t>(row) * stride_k + col]);
                 }
@@ -240,13 +249,15 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
         const int t0 = i_t * BT;
         const int64_t chunk_k_offset =
             static_cast<int64_t>(t0) * stride_k;
+        const int64_t chunk_w_offset =
+            static_cast<int64_t>(t0) * stride_w;
         const int64_t chunk_v_offset =
             static_cast<int64_t>(t0) * stride_v;
 
         // P2: chunk base pointers — hoist t0*stride out of inner loops
         const D_ATTN* q_ch = q_hbm + chunk_k_offset;
         const D_ATTN* k_ch = k_hbm + chunk_k_offset;
-        const D_ATTN* w_ch = w_hbm + chunk_k_offset;
+        const D_ATTN* w_ch = w_hbm + chunk_w_offset;
         const D_ATTN* u_ch = u_hbm + chunk_v_offset;
         D_ATTN*       o_ch = o_hbm + chunk_v_offset;
         D_ATTN*       vn_ch = nullptr;
@@ -369,7 +380,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                         int col = (i % PF_NVEC) * PF_VEC;
                         if (full_chunk || row < T_rem) {
                             pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
-                                &w_ch[static_cast<int64_t>(row) * stride_k
+                                &w_ch[static_cast<int64_t>(row) * stride_w
                                       + k_off_next + col]);
                             pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                                 &q_ch[static_cast<int64_t>(row) * stride_k
@@ -728,7 +739,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                                 if (DENSE || next_t0 + row < kargs.T) {
                                     pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
                                         &w_hbm[static_cast<int64_t>(next_t0 + row)
-                                               * stride_k + col]);
+                                               * stride_w + col]);
                                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                                         &q_hbm[static_cast<int64_t>(next_t0 + row)
                                                * stride_k + col]);
@@ -867,7 +878,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                             if (DENSE || next_t0 + row < kargs.T) {
                                 pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
                                     &w_hbm[static_cast<int64_t>(next_t0 + row)
-                                           * stride_k + col]);
+                                           * stride_w + col]);
                                 pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                                     &q_hbm[static_cast<int64_t>(next_t0 + row)
                                            * stride_k + col]);

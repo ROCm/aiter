@@ -23,6 +23,7 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
     int B,
     int T,
     int H,
+    int Hg,
     hipStream_t stream);
 
 void opus_gdn_k2_c_fwd(
@@ -172,13 +173,24 @@ void opus_gdn_c_prefill_fwd(
     TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must have dtype bfloat16");
     TORCH_CHECK(
         q.dim() == 4 && q.size(3) == 128,
-        "q must have shape [B, T, H, 128]");
+        "q must have shape [B, T, Hg, 128]");
+    TORCH_CHECK(
+        v.defined() && v.dim() == 4 && v.size(3) == 128,
+        "v must have shape [B, T, H, 128]");
 
     const int64_t B = q.size(0);
     const int64_t T = q.size(1);
-    const int64_t H = q.size(2);
+    // H counts value heads; Hg counts the q/k key heads that H / Hg value
+    // heads share.  Hg == H is plain MHA.
+    const int64_t H = v.size(2);
+    const int64_t Hg = q.size(2);
     const c10::Device device = q.device();
-    TORCH_CHECK(B > 0 && T > 0 && H > 0, "B, T, and H must be positive");
+    TORCH_CHECK(B > 0 && T > 0 && H > 0 && Hg > 0,
+                "B, T, H, and Hg must be positive");
+    TORCH_CHECK(
+        H % Hg == 0,
+        "v head count ", H,
+        " must be a multiple of the q/k head count ", Hg);
     TORCH_CHECK(T % 64 == 0, "T must be divisible by the dense BT=64");
     TORCH_CHECK(std::isfinite(scale), "scale must be finite");
     TORCH_CHECK(
@@ -190,7 +202,7 @@ void opus_gdn_c_prefill_fwd(
         B <= std::numeric_limits<int>::max() / H,
         "B * H must fit in a signed kernel grid index");
 
-    check_bthd(k, "k", at::kBFloat16, device, B, T, H, 128);
+    check_bthd(k, "k", at::kBFloat16, device, B, T, Hg, 128);
     check_bthd(v, "v", at::kBFloat16, device, B, T, H, 128);
     check_bthd(o, "o", at::kBFloat16, device, B, T, H, 128);
     TORCH_CHECK(!o.is_alias_of(v), "out must not alias v storage");
@@ -224,6 +236,7 @@ void opus_gdn_c_prefill_fwd(
         static_cast<int>(B),
         static_cast<int>(T),
         static_cast<int>(H),
+        static_cast<int>(Hg),
         stream);
     TORCH_CHECK(
         k1_status == hipSuccess,
