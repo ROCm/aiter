@@ -464,8 +464,23 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int wm = warp / 4;
     const int wn = warp % 4;
     const int e = blockIdx.z;
-    const int m0 = blockIdx.y * BM;
-    const int n0 = blockIdx.x * BN;
+    int tile_m = blockIdx.y;
+    int tile_n = blockIdx.x;
+    if constexpr(FIXED_ROUTES > 0)
+    {
+        // Visit a 2x2 output-tile group together so one roughly 2 MiB panel
+        // from each operand can be reused before the 4 MiB L2 turns over.
+        constexpr int GROUP = 2;
+        const int tiles_n = FIXED_Q / BN;
+        const int linear = blockIdx.y * tiles_n + blockIdx.x;
+        const int group_id = linear / (GROUP * GROUP);
+        const int in_group = linear % (GROUP * GROUP);
+        const int groups_n = tiles_n / GROUP;
+        tile_m = (group_id / groups_n) * GROUP + in_group / GROUP;
+        tile_n = (group_id % groups_n) * GROUP + in_group % GROUP;
+    }
+    const int m0 = tile_m * BM;
+    const int n0 = tile_n * BN;
     const int r0 = FIXED_ROUTES > 0 ? e * FIXED_ROUTES : offs[e];
     const int r1 = FIXED_ROUTES > 0 ? r0 + FIXED_ROUTES : offs[e + 1];
     const int nroute = r1 - r0;
