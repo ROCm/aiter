@@ -265,12 +265,35 @@ def _hipeq_select_bv(
     return bv
 
 
+_HOST_CHUNK_META_ATTR = "_flydsl_host_chunk_meta"
+
+
 def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
-    """Total and maximum per-sequence chunk counts (one D2H transfer)."""
+    """Total and maximum per-sequence chunk counts, cached on the tensor.
+
+    ``chunk_offsets`` comes from the ``@tensor_cache``-decorated prologue (or
+    from prebuilt metadata), so its identity is stable across forwards and these
+    counts cannot change underneath the cache -- the same reasoning as
+    ``_as_int32``.
+
+    Caching matters beyond the copy itself. The ``tolist`` lands between the
+    K1..K4 launches and K5's, so an uncached forward blocks the host until the
+    whole front end has retired, and the GPU then idles through the remaining
+    host work for K5 and K6 instead of the host running ahead. On a T=8k
+    varlen GQA prefill that bubble was 66us of a 738us block.
+    """
+    cached = getattr(chunk_offsets, _HOST_CHUNK_META_ATTR, None)
+    if cached is not None:
+        return cached
     offsets = chunk_offsets.tolist()
     total_chunks = offsets[-1]
     max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
-    return total_chunks, max_seq_chunks
+    result = (total_chunks, max_seq_chunks)
+    try:
+        object.__setattr__(chunk_offsets, _HOST_CHUNK_META_ATTR, result)
+    except (AttributeError, TypeError):
+        pass
+    return result
 
 
 def _get_or_compile(
@@ -1021,6 +1044,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     if V != 128:
         raise ValueError(f"FlyDSL K5 mfma16_hip: only V=128 is supported, got V={V}.")
 
+    # Host-side (total_chunks, max_seq_chunks) for the BV selector, when the
+    # caller's metadata already carries them; None means read them off
+    # ``chunk_offsets``.
+    host_chunk_meta = None
     if cu_seqlens is None:
         N = B
         NT = triton.cdiv(T, BT)
@@ -1067,6 +1094,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             chunk_offsets = schedule.chunk_offsets
             kernel_cu_seqlens = schedule.kernel_cu_seqlens
             N = schedule.n_prefill
+            host_chunk_meta = (schedule.total_chunks, schedule.max_seq_chunks)
         else:
             NT, chunk_offsets, kernel_cu_seqlens, N, _min_seqlen = _resolve_prologue(
                 cu_seqlens, BT, num_decodes, num_decode_tokens, T_flat
@@ -1155,9 +1183,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # selector (``_hipeq_select_bv`` above) so this fork picks the same BV as
     # the hand-tuned HIP kernel today, without importing its private API.
     # dense: total_chunks = B*NT, max_seq_chunks = NT (NT = cdiv(T, BT));
-    # varlen: both come from chunk_offsets (one D2H transfer, like hip).
+    # varlen: prebuilt metadata carries both on the host, otherwise they are
+    # read off chunk_offsets once and cached on it.
     if is_varlen:
-        _total_chunks, _max_seq_chunks = _hipeq_varlen_host_metadata(chunk_offsets)
+        _total_chunks, _max_seq_chunks = (
+            host_chunk_meta
+            if host_chunk_meta is not None
+            else _hipeq_varlen_host_metadata(chunk_offsets)
+        )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
     BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
