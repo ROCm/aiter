@@ -15,6 +15,7 @@ This directory holds the C++ / JIT build inputs only.
 | `opus_gemm_common.py` | Kernel instance metadata — all kids (a16w16 split-barrier, flatmm, flatmm_splitk) live here |
 | `gen_instances.py` | JIT codegen driver; `--tune_file` bakes the tuned CSV into `opus_gemm_lookup.h` |
 | `opus_gemm_tune.py` | Offline tuner CLI (see `aiter/ops/opus/README.md` §3 for usage) |
+| `opus_bmm_mxscale_tune.py` | Offline tuner CLI for the a8w8 mxscale BMM (DSV4 wo_a), writing `dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv`. Its candidate pool is `_TUNE_POLICY` (kid -> split-K factors); tile shape, kernelName and M alignment come from `opus_gemm_common.py`, so a kid is never tuned on a shape its launcher rejects |
 | `include/opus_gemm.h`, `include/opus_gemm_arch.cuh` | Cross-arch declarations + `OpusGfxArch` enum + `opus_get_arch_info()` probe |
 | `include/opus_gemm_common.cuh`, `include/opus_gemm_utils.cuh` | Cross-arch traits umbrella + opus.hpp shim |
 | `include/gfx950/*.cuh` | gfx950-specific pipelines (a16w16 split-barrier / flatmm / flatmm_splitk, a8w8 noscale / scale), traits, splitk reduce, heuristic dispatch (`opus_a16w16_heuristic_dispatch_gfx950`), and the dispatch glue (`opus_gemm_arch_gfx950.cuh`). |

@@ -38,6 +38,9 @@ def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tens
     return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
+_captured_semaphore_keepalive: list[Tensor] = []
+
+
 def get_semaphore_workspace(device: torch.device) -> Tensor:
     """Return a per-(device, stream) zero-initialized semaphore workspace.
 
@@ -53,7 +56,19 @@ def get_semaphore_workspace(device: torch.device) -> Tensor:
     Workspace size is small (~4 KB) and stream count per process is typically
     < 8, so the LRU cap of 64 leaves plenty of headroom before any in-flight
     workspace risks being evicted.
+
+    Under CUDA graph capture this returns a fresh workspace per launch instead
+    of the cached one: a captured graph bakes in the pointer and replays on a
+    stream other than the capture stream, so the cached counter can be left
+    non-zero and the reduction never fires. Allocating under capture also
+    records the zero-fill as a graph node, re-establishing the counter==0 entry
+    invariant on every replay. It is retained for the process lifetime because
+    aiter cannot observe when a graph dies.
     """
+    if torch.cuda.is_current_stream_capturing():
+        w = torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
+        _captured_semaphore_keepalive.append(w)
+        return w
     stream = torch.cuda.current_stream(device)
     return _get_semaphore_workspace_keyed(device, stream.cuda_stream)
 
