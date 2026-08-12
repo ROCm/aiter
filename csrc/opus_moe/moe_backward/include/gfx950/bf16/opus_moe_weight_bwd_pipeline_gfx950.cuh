@@ -158,14 +158,16 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
-    static_assert((BM == 64 || BM == 128) &&
+    static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
-    static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
+    static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
+    static_assert(T::BLOCK_SIZE == 512 ? (BM == 256 && BN == 128)
+                                      : BM <= 128);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
     constexpr int a_m_slabs = BM / 64;
     constexpr int b_n_slabs = BN / 128;
-    static_assert(a_m_slabs * b_n_slabs <= 2,
-                  "only one doubled K4 output dimension is supported");
+    static_assert(a_m_slabs * b_n_slabs <= 4,
+                  "K4 supports at most four 64x128 operand slab pairs");
     static_assert(T::E_M * T::T_M == BM / T::W_M);
     static_assert(T::E_N * T::T_N == BN / T::W_N);
     static_assert((BM == 64 && BN == 128) || T::DIRECT_GMEM_TO_LDS,
@@ -281,14 +283,20 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     // existing shared swizzles when selecting each lane's global source so a
     // contiguous hardware deposit reconstructs exactly the same physical LDS
     // tile consumed by the transpose reads below.
+    constexpr bool wide_workgroup = T::BLOCK_SIZE == 512;
+    const int a_loader_linear_tid =
+        wide_workgroup ? (wave_id % 4) * opus::get_warp_size() + lane_id
+                       : tid;
     const int a_loader_tid =
-        T::DIRECT_GMEM_TO_LDS ? tid ^ ((tid >> 4) & 7) : tid;
+        T::DIRECT_GMEM_TO_LDS
+            ? a_loader_linear_tid ^ ((a_loader_linear_tid >> 4) & 7)
+            : a_loader_linear_tid;
     const int b_loader_tid =
         T::DIRECT_GMEM_TO_LDS ? tid ^ ((tid >> 4) & 15) : tid;
     const int a_local_k = a_loader_tid / 8;
     const int a_local_m = (a_loader_tid % 8) * VEC;
     const int b_local_k0 = b_loader_tid / 16;
-    const int b_local_k1 = b_local_k0 + 16;
+    const int b_local_k1 = wide_workgroup ? b_local_k0 : b_local_k0 + 16;
     const int b_local_n = (b_loader_tid % 16) * VEC;
     const int a_store_addr = (tid << 4) ^ (tid & 0x70);
     const int b_store_addr = (tid << 4) ^ (tid & 0xf0);
@@ -355,20 +363,44 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         OPUS_LDS_ADDR D_B* b_wave_dst =
             reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
             wave_id * opus::get_warp_size() * VEC;
-        opus::static_for<a_m_slabs>([&](auto slab) {
-            OPUS_LDS_ADDR D_A* a_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
-                slab.value * 64 * BK +
-                wave_id * opus::get_warp_size() * VEC;
-            g_a.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                (sources.a * kargs.stride_a_row + output_m_base +
-                 slab.value * 64 + a_local_m) *
-                    sizeof(D_A),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_A>{});
-        });
+        if constexpr(wide_workgroup)
+        {
+            // Eight waves form two four-wave loader groups.  Each group owns
+            // one slab in each half of BM256, so every lane issues exactly
+            // two dZ vectors and all four 64-row slabs are covered once.
+            opus::static_for<2>([&](auto half) {
+                const int slab = wave_id / 4 + half.value * 2;
+                OPUS_LDS_ADDR D_A* a_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                    slab * 64 * BK +
+                    (wave_id % 4) * opus::get_warp_size() * VEC;
+                g_a.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                    (sources.a * kargs.stride_a_row + output_m_base +
+                     slab * 64 + a_local_m) *
+                        sizeof(D_A),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_A>{});
+            });
+        }
+        else
+        {
+            opus::static_for<a_m_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR D_A* a_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                    slab.value * 64 * BK +
+                    wave_id * opus::get_warp_size() * VEC;
+                g_a.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                    (sources.a * kargs.stride_a_row + output_m_base +
+                     slab.value * 64 + a_local_m) *
+                        sizeof(D_A),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_A>{});
+            });
+        }
         opus::static_for<b_n_slabs>([&](auto slab) {
             OPUS_LDS_ADDR D_B* b_slab_dst =
                 b_wave_dst + slab.value * 128 * BK;
@@ -380,13 +412,15 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 0,
                 opus::number<0>{},
                 opus::number<T::CACHECTL_B>{});
-            g_b.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(
-                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) + 4096),
-                (sources.b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
+            if constexpr(!wide_workgroup)
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(
+                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) +
+                        4096),
+                    (sources.b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
         });
     };
 

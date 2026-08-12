@@ -200,6 +200,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     // inter-expert load balance without extending the source reuse window.
     constexpr int cohort2_kid = 8;
     constexpr int cohort2_bm128_double_lds_kid = 9;
+    constexpr int cohort2_bm256_double_lds_kid = 10;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -214,7 +215,31 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
         (2 * kargs.inter_dim) % 128 == 0 &&
         static_cast<uint64_t>(kargs.route.sorted_capacity) > two_tile_rows;
     if(bm128_compatible)
+    {
+        // BM256 keeps the same four native accumulator tiles per wave while
+        // eight waves share one gathered-X tile.  Its 512-thread workgroup
+        // needs either a sufficiently wide output grid or a long reduction
+        // to amortize the lower CTA residency.  Express the crossover using
+        // only host-visible grouped-GEMM geometry; no model tuple or routing
+        // distribution is synchronized back to the host.
+        const uint64_t average_padded_routes =
+            static_cast<uint64_t>(kargs.route.sorted_capacity) /
+            static_cast<uint64_t>(kargs.route.num_experts);
+        const bool bm256_compatible = (2 * kargs.inter_dim) % 256 == 0;
+        const uint64_t bm256_output_tiles =
+            static_cast<uint64_t>(kargs.route.num_experts) *
+            static_cast<uint64_t>((2 * kargs.inter_dim) / 256) *
+            static_cast<uint64_t>(kargs.model_dim / 128);
+        constexpr uint64_t min_average_routes = 2048;
+        constexpr uint64_t long_reduction_routes = 8192;
+        constexpr uint64_t min_output_tiles = 1536;
+        if(bm256_compatible && average_padded_routes >= min_average_routes &&
+           (bm256_output_tiles >= min_output_tiles ||
+            kargs.route.num_experts == 8 ||
+            average_padded_routes >= long_reduction_routes))
+            return cohort2_bm256_double_lds_kid;
         return cohort2_bm128_double_lds_kid;
+    }
     return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;
 }
 

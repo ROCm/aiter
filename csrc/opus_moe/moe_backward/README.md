@@ -73,11 +73,12 @@ fallback when a genuinely different working-set regime needs it.
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
-| K2 `route_dx` large working set | 8 | `BM32 x BN128 x BK32`, M3/six-route cohort |
+| K2 `route_dx` large working set | 9 | `BM32 x BN128 x BK32`, M5/ten-route cohort + dZ LDS padding |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |
 | K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
+| K4 `dw1` wide/long family | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
 | K5 `dw2` | 3 | `BM64 x BN64 x BK64` |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
@@ -87,7 +88,7 @@ compile-time layout gate, so compact route ids cannot be decoded as fixed
 packed token/slot ids.
 
 K2 auto-dispatch uses the combined runtime `dZ + W1` working set. Fixed routing
-with expert offsets selects M2 kid 7 at or below 128 MiB and M3 kid 8 above
+with expert offsets selects M2 kid 7 at or below 128 MiB and M5 kid 9 above
 that threshold. Both BK32 tiles retain two-stage async loads while reducing
 their LDS allocation and VGPR count relative to kid 6. Degenerate grids and
 callers without expert offsets retain kid 5.
@@ -100,11 +101,12 @@ Smaller working sets retain kid 8 because the extra LDS metadata is not yet
 amortized.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
-tuple. Kid 9 handles compatible BM128 problems with two LDS stages and a
-two-expert cohort; kid 8 covers large BM64 problems, and kid 5 remains the
-small/degenerate fallback. For empty experts, kid 9 coalesces two adjacent M
-tiles into one zeroing CTA. This preserves exact zero gradients while reducing
-epilogue-only workgroups without serializing the store stream.
+tuple. Kid 10 is selected once the average padded expert interval reaches 2048
+routes and either its BM256 output grid has at least 1536 tiles, there are
+eight experts, or the average interval reaches 8192 routes. Eight waves then
+share one gathered-X tile, while empty experts coalesce eight adjacent M tiles
+per zeroing CTA. Kid 9 retains short reductions and small output grids; kid 8
+covers large BM64 problems, and kid 5 remains the small/degenerate fallback.
 
 ## Shape contract
 
