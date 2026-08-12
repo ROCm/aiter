@@ -795,6 +795,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     };
 
     int dynamic_stage_start = 0;
+    constexpr int COMMON_FULL_STAGES = 59;
     if constexpr(FIXED_P == 2048 &&
                  (FIXED_Q == 1024 || FIXED_Q == 2048))
     {
@@ -803,7 +804,6 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         // dynamic loop only for the final 1--9 stages.  Stage 59 is prefetched
         // through the masked loader because it is a tail for the shortest
         // experts and a complete stage for the rest.
-        constexpr int COMMON_FULL_STAGES = 59;
         if(nroute > COMMON_FULL_STAGES * BK)
         {
             for(int stage = 0; stage < COMMON_FULL_STAGES - 1; ++stage)
@@ -820,7 +820,47 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
             dynamic_stage_start = COMMON_FULL_STAGES;
         }
     }
-    for(int stage = dynamic_stage_start; stage < full_k_stages; ++stage)
+    auto run_dynamic_suffix = [&](auto count_tag) {
+        constexpr int COUNT = decltype(count_tag)::value;
+        opus::static_for<COUNT>([&](auto i) {
+            constexpr int stage = COMMON_FULL_STAGES + i.value;
+            if constexpr(i.value + 1 < COUNT)
+                run_stage(
+                    opus::number<1>{},
+                    opus::number<0>{},
+                    opus::number<4>{},
+                    stage);
+            else if(has_tail_stage)
+                run_stage(
+                    opus::number<1>{},
+                    opus::number<1>{},
+                    opus::number<4>{},
+                    stage);
+            else
+                run_stage(
+                    opus::number<0>{},
+                    opus::number<0>{},
+                    opus::number<4>{},
+                    stage);
+        });
+    };
+    if(dynamic_stage_start == COMMON_FULL_STAGES)
+    {
+        const int residual_stages = full_k_stages - COMMON_FULL_STAGES;
+        switch(residual_stages)
+        {
+        case 0: run_dynamic_suffix(opus::number<0>{}); break;
+        case 1: run_dynamic_suffix(opus::number<1>{}); break;
+        case 2: run_dynamic_suffix(opus::number<2>{}); break;
+        case 3: run_dynamic_suffix(opus::number<3>{}); break;
+        case 4: run_dynamic_suffix(opus::number<4>{}); break;
+        case 5: run_dynamic_suffix(opus::number<5>{}); break;
+        case 6: run_dynamic_suffix(opus::number<6>{}); break;
+        case 7: run_dynamic_suffix(opus::number<7>{}); break;
+        default: run_dynamic_suffix(opus::number<8>{}); break;
+        }
+    }
+    else for(int stage = dynamic_stage_start; stage < full_k_stages; ++stage)
     {
         if(stage + 1 < full_k_stages)
             run_stage(
