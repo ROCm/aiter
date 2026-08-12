@@ -45,6 +45,15 @@ tree wins over any installed aiter):
 
     # from an untuned CSV (columns: b,m,n,k -- or g,m,n,k), 8-way parallel:
     ... opus_bmm_mxscale_tune.py -i my_untuned.csv -o /tmp/out.csv --mp 8
+
+    # the shipped shapes retuned into the second, preshuffle-inclusive table
+    # (BPRESHUFFLE_CSV below; leaves the shipped one alone):
+    ... opus_bmm_mxscale_tune.py --bpreshuffle --all --mp 8
+
+    # what preshuffling B is worth: the same shapes twice, pool split by B layout,
+    # then compare the two tables cell by cell:
+    ... opus_bmm_mxscale_tune.py -i shapes.csv -o /tmp/rowb.csv --pool rowb --mp 8
+    ... opus_bmm_mxscale_tune.py -i shapes.csv -o /tmp/preb.csv --pool preb --mp 8
 """
 
 import os
@@ -56,6 +65,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -71,7 +81,10 @@ for _p in (_HERE, _OPTESTS):
 
 # opus_gemm_common is pure python (stdlib only), so importing the codegen kid
 # table here does not pull in the build.
-from opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+from opus_gemm_common import (
+    _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
+    a8w8_mxscale_bmm_kernel_lists,
+)
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -140,6 +153,37 @@ _TUNE_POLICY = {
     151: [1],
     152: [1],
     158: [1],
+    # kid158's scale preload at the two half tiles. Narrow-N wo_a (n1024) gives
+    # the 256x256 tile only 4 N-tiles, so mid-M shapes leave half the CUs idle;
+    # these fill them from the M side (159) and the N side (164). kid164 also
+    # covers n128, which the 256-wide tiles reject outright.
+    159: [1],
+    164: [1],
+    # The preshuffled-B families, all of them, splitK=1 only: none carries the
+    # flatmm_splitk launcher's fused reduce tail. Nothing here was ever actually
+    # evaluated before -- B arrived row-major (see gen_bmm_mxscale_data) so every
+    # one of them failed the correctness gate silently, which is why the shipped
+    # table picks none of them despite three of them having been listed here.
+    #
+    # wave8n4, the 2x4 eight-wave grid: 256x256 for large M, 128x256 mid, and the
+    # 128x64x256 tile that carries the small-M end.
+    168: [1],
+    175: [1],
+    194: [1],
+    # wavetm1, the 1x8 / 1x4 grids. kid205 is kid203 plus the banded tile map.
+    202: [1],
+    203: [1],
+    205: [1],
+    # bdirect, B straight to registers with no LDS hop: the 16x32 and 64x32
+    # last-mile tiles, and the 128x128 tile that owns the mid band.
+    171: [1],
+    172: [1],
+    173: [1],
+    179: [1],
+    184: [1],
+    # kid158's pipeline with only B's layout flipped -- the direct A/B comparison
+    # for what preshuffling B is worth at the tile the shipped table leans on.
+    196: [1],
     # monolithic mouter / wave pipelines.
     131: [1],
     132: [1],
@@ -165,6 +209,45 @@ _TUNE_POLICY = {
     325: [1],
 }
 
+# The blds twins, derived rather than listed: a twin is its plain kid's tile with
+# B preshuffled and B's LDS staging kept, so wherever the plain kid is worth trying
+# the twin is the preshuffled pool's answer to that cell. Deriving it here is what
+# keeps the two in step -- the catalog asserts every plain flatmm tile has a twin,
+# and this makes every one of those twins a candidate, so neither half of the pair
+# can be added without the other reaching the sweep.
+#
+# splitK stays at 1 even where the plain kid sweeps the full _SK. Split-K has never
+# won a flatmm cell on this envelope (the only sk>1 winners are kid163's minterleave
+# rows), and sweeping four factors over 27 more kids is the bulk of the tuning time.
+# A plain kid that wins a cell at splitK>1 is therefore still a cell the preshuffled
+# pool cannot answer; widen this if one ever appears.
+_TUNE_POLICY.update({
+    twin: [1]
+    for plain, twin in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
+    if plain in _TUNE_POLICY
+})
+
+# Deliberately not candidates: kid208 (mpack_sfa) and kid210/213/214/215/216/217
+# (shuffle_scale) need A's scale panel, and for the shuffle_scale kids B's too, relaid out by
+# whatever produces them. That layout is fixed once per model, so a table meant
+# for a model whose quantiser emits plain scales cannot dispatch to them at all --
+# see the shuffle_scale notes in opus_gemm_common.py for what the switch would be worth.
+_RELAYOUT_KIDS = sorted(
+    kid
+    for kid, inst in _CODEGEN_BMM.items()
+    if inst.needs_mpacked_sfa is not None or inst.needs_shuffle_scale is not None
+)
+assert not (set(_TUNE_POLICY) & set(_RELAYOUT_KIDS)), (
+    f"kids {sorted(set(_TUNE_POLICY) & set(_RELAYOUT_KIDS))} need a producer-side "
+    "scale relayout and cannot be tuned against plain scales"
+)
+
+# A policy entry for a kid the codegen no longer emits used to KeyError inside
+# _applicable on the first shape, i.e. after the data was built. kid165, kid174
+# and kid192 sat here that way. Fail at import instead.
+_dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
+assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
+
 # Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
 for _kid, _sks in _TUNE_POLICY.items():
@@ -178,9 +261,26 @@ for _kid, _sks in _TUNE_POLICY.items():
         )
 
 
-def _applicable(kid, g, m, n, k):
-    """Split-K factors worth trying for this kid on this shape ([] == skip it)."""
+POOLS = ("all", "preb", "rowb")
+
+
+def _applicable(kid, g, m, n, k, pool="all"):
+    """Split-K factors worth trying for this kid on this shape ([] == skip it).
+
+    ``pool`` restricts by B's layout: "preb" to the preshuffled-B kids, "rowb" to
+    the row-major ones, "all" to both. A shipped table has to be all one layout to
+    be usable -- the weight is shuffled offline, so a deployment holds one form of
+    it, and a mixed table would need both resident. The first cut of the preshuffle
+    table did mix them, row-major kids winning 15 of 77 shapes on merit, and those
+    rows are exactly the ones a preshuffled deployment cannot dispatch. Tuning the
+    two pools separately over one shape set is also how the layouts get compared
+    at all: per shape, best row-major against best preshuffled.
+    """
     k_inst = _CODEGEN_BMM[kid]
+    if pool == "preb" and not k_inst.needs_preshuffled_b:
+        return []
+    if pool == "rowb" and k_inst.needs_preshuffled_b:
+        return []
     if n % k_inst.B_N or k % k_inst.B_K or m % k_inst.m_align:
         return []
     return _TUNE_POLICY[kid]
@@ -195,6 +295,26 @@ SHIPPED_CSV = os.path.join(
 )
 DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 
+# The same dsv4 shapes retuned with the preshuffled-B families in the pool, kept
+# as a second table rather than applied over the first.
+#
+# The name is load-bearing in a way worth spelling out. get_config_file globs
+# model_configs/ for "*batched_gemm_a8w8_blockscale_mxscale_tuned*.csv" and merges
+# every hit; two tables covering the same shapes would collide on the (gfx,b,m,n,k)
+# key, and update_config_files answers a collision by rewriting the source files
+# down to the lowest-us row each and then raising. Putting "bpreshuffle" before
+# "tuned" breaks the substring, so this file is invisible to that glob and cannot
+# take the shipped table with it. Select it explicitly:
+#
+#   AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE=<this file> python3 ...
+BPRESHUFFLE_CSV = os.path.join(
+    _REPO,
+    "aiter",
+    "configs",
+    "model_configs",
+    "dsv4_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv",
+)
+
 
 # ---------------------------------------------------------------------------
 # mp_tuner hooks (module-level so the spawn workers can import them by name).
@@ -207,7 +327,7 @@ def _gen_varied(shape, k, device):
 
 
 def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
-    """Return the 6-tuple mp_tuner indexes into:
+    """Return the 7-tuple mp_tuner indexes into:
 
     0 O_in   [m,g,k]     fp8 (mmajor transposed view, K contiguous)
     1 W_mx   [g,n,k]     fp8 (batch-major)
@@ -215,6 +335,7 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     3 xs_in  [m,g,k/128] uint8 e8m0 per-token scale (mmajor view)
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
     5 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
+    6 W_sh   [g,n,k]     the same B in the (16,16) preshuffled layout
     """
     torch.manual_seed(seed)
     O_bf16 = _gen_varied((batch, m, k), k, device)
@@ -225,12 +346,24 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     xs_in = xs_mx.transpose(0, 1)  # [m,g,k/128]
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
-    return (O_in, W_mx, Y, xs_in, ws_mx, ref)
+    # The preshuffled-B kids read B through the (16,16) MFMA-fragment layout that
+    # a serving stack bakes into the weight offline. It is a permutation, so the
+    # reference above covers both forms. Building it here rather than in the bench
+    # keeps it out of what is timed.
+    W_sh = shuffle_weight(W_mx, layout=(16, 16))
+    return (O_in, W_mx, Y, xs_in, ws_mx, ref, W_sh)
 
 
-def run_bmm_mxscale_bench(O_in, W_mx, Y, xs_in, ws_mx, kernelId, splitK):
-    """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
-    _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, splitK, kernelId)
+def run_bmm_mxscale_bench(O_in, W_mx, Y, xs_in, ws_mx, W_sh, kernelId, splitK):
+    """Tuner bench func: run the kid in-place, return Y for checkAllclose.
+
+    B's layout is per kid, so it is selected here rather than by the caller: a
+    preshuffled-B kid handed row-major B reads the right bytes in the wrong order
+    and fails the gate, which is how three of these kids sat in _TUNE_POLICY
+    without ever being able to win a shape.
+    """
+    Wb = W_sh if _CODEGEN_BMM[kernelId].needs_preshuffled_b else W_mx
+    _opus_bmm_a8w8_mxscale_raw(O_in, Wb, Y, xs_in, ws_mx, splitK, kernelId)
     return Y
 
 
@@ -367,6 +500,18 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             default=False,
             help="overwrite the shipped tuned CSV in place",
         )
+        self.parser.add_argument(
+            "--bpreshuffle",
+            action="store_true",
+            default=False,
+            help="write to the preshuffle-inclusive table (BPRESHUFFLE_CSV)",
+        )
+        self.parser.add_argument(
+            "--pool",
+            choices=POOLS,
+            default="all",
+            help="restrict candidates by B layout (--bpreshuffle implies preb)",
+        )
 
     # --- shape sourcing -----------------------------------------------------
     def _shapes_from_shipped(self):
@@ -379,8 +524,14 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         )
 
     def pre_process(self, args):
+        if args.apply and args.bpreshuffle:
+            raise SystemExit("--apply and --bpreshuffle write different tables")
         if args.apply:
             args.tune_file = SHIPPED_CSV
+        elif args.bpreshuffle:
+            args.tune_file = BPRESHUFFLE_CSV
+            if args.pool == "all":
+                args.pool = "preb"
 
         gfx = self.get_gfx()
         if args.batch_g and args.M:
@@ -439,7 +590,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
             n_cand = 0
             for kid in _TUNE_POLICY:
-                for sk in _applicable(kid, b, m, n, k):
+                for sk in _applicable(kid, b, m, n, k, args.pool):
                     info = (info_keys, kid, sk, "")
                     task.append(
                         (
@@ -447,7 +598,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                             gen_bmm_mxscale_data,
                             (b, m, n, k, seed, out_dtype),
                             run_bmm_mxscale_bench,
-                            ([0, 1, 2, 3, 4], kid, sk),
+                            ([0, 1, 2, 3, 4, 6], kid, sk),
                             perf_kwargs,
                             _bmm_ref_passthrough,
                             ([5],),
