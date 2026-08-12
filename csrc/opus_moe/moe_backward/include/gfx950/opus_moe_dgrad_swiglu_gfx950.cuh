@@ -22,6 +22,7 @@ struct opus_moe_dgrad_swiglu_kargs
     const void* __restrict__ ptr_act_input;
     void* __restrict__ ptr_dact;
     void* __restrict__ ptr_dscore_partials;
+    const int32_t* __restrict__ expert_offsets;
     int m;
     int n;
     int k;
@@ -35,6 +36,7 @@ struct opus_moe_dgrad_swiglu_kargs
     int stride_act_input_batch;
     int stride_dact_batch;
     int stride_dscore;
+    int ragged;
 };
 
 template<typename UserTraits, bool WRITE_DSCORE = false>
@@ -71,25 +73,40 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     const int col = tile_n * T::B_N;
 
     const int batch_id = block_id_z();
+    int batch_row_start = 0;
+    int batch_m = kargs.m;
+    if(kargs.ragged)
+    {
+        batch_row_start = kargs.expert_offsets[batch_id];
+        batch_m = kargs.expert_offsets[batch_id + 1] - batch_row_start;
+        if(row >= batch_m)
+            return;
+    }
     const int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / get_warp_size());
     const int lane_id = thread_id_x() % get_warp_size();
 
     auto g_a = make_gmem(
         reinterpret_cast<const D_A*>(kargs.ptr_a) +
-            batch_id * kargs.stride_a_batch + row * kargs.stride_a,
-        (kargs.m - row) * kargs.stride_a * sizeof(D_A));
+            (kargs.ragged ? batch_row_start * kargs.stride_a
+                          : batch_id * kargs.stride_a_batch) +
+            row * kargs.stride_a,
+        (batch_m - row) * kargs.stride_a * sizeof(D_A));
     auto g_b = make_gmem(
         reinterpret_cast<const D_B*>(kargs.ptr_b) +
             batch_id * kargs.stride_b_batch + col * kargs.stride_b,
         (kargs.n - col) * kargs.stride_b * sizeof(D_B));
     auto g_act_input = make_gmem(
         reinterpret_cast<const D_C*>(kargs.ptr_act_input) +
-            batch_id * kargs.stride_act_input_batch + row * kargs.stride_act_input,
-        (kargs.m - row) * kargs.stride_act_input * sizeof(D_C));
+            (kargs.ragged ? batch_row_start * kargs.stride_act_input
+                          : batch_id * kargs.stride_act_input_batch) +
+            row * kargs.stride_act_input,
+        (batch_m - row) * kargs.stride_act_input * sizeof(D_C));
     auto g_dact = make_gmem(
         reinterpret_cast<D_C*>(kargs.ptr_dact) +
-            batch_id * kargs.stride_dact_batch + row * kargs.stride_dact,
-        (kargs.m - row) * kargs.stride_dact * sizeof(D_C));
+            (kargs.ragged ? batch_row_start * kargs.stride_dact
+                          : batch_id * kargs.stride_dact_batch) +
+            row * kargs.stride_dact,
+        (batch_m - row) * kargs.stride_dact * sizeof(D_C));
 
     const int wave_id_m = wave_id / T::T_N;
     const int wave_id_n = wave_id % T::T_N;
@@ -312,15 +329,18 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         {
             const int local_row = thread_id_x();
             const int route_row = row + local_row;
-            if(route_row < kargs.m)
+            if(route_row < batch_m)
             {
                 float partial = 0.0f;
 #pragma unroll
                 for(int wn = 0; wn < T::T_N; ++wn)
                     partial += score_smem[local_row * T::T_N + wn];
                 const int n_tile = col / T::B_N;
+                const int compact_row = kargs.ragged
+                    ? batch_row_start + route_row
+                    : batch_id * kargs.m + route_row;
                 reinterpret_cast<float*>(kargs.ptr_dscore_partials)[
-                    (batch_id * kargs.m + route_row) * kargs.stride_dscore +
+                    compact_row * kargs.stride_dscore +
                     n_tile] = partial;
             }
         }

@@ -187,7 +187,8 @@ def _build_dgrad_block_meta(offs: Tensor, B_M: int):
     n = len(e_ids)
     lens = [o[e + 1] - o[e] for e in range(E)]
     uniform_m = lens[0] if lens and all(m == lens[0] for m in lens) else None
-    return meta[:n], meta[n:2 * n], meta[2 * n:], uniform_m
+    max_m = max(lens, default=0)
+    return meta[:n], meta[n:2 * n], meta[2 * n:], uniform_m, max_m
 
 
 def build_dgrad_block_meta(offs: Tensor, B_M: int):
@@ -196,7 +197,7 @@ def build_dgrad_block_meta(offs: Tensor, B_M: int):
     cumulative -> (sorted_expert_ids, block_m_start, block_m_end) [num_blocks] i32.
     Computed on host (E is tiny; ~10 GPU-op launches cost >150us here) then
     uploaded once."""
-    seid, bms, bme, _uniform_m = _build_dgrad_block_meta(offs, B_M)
+    seid, bms, bme, _uniform_m, _max_m = _build_dgrad_block_meta(offs, B_M)
     return seid, bms, bme
 
 
@@ -314,6 +315,22 @@ def _opus_moe_dgrad_swiglu_dscore_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_dgrad_swiglu_dscore_ragged_bf16",
+    develop=True,
+)
+def _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    d_act_input: Tensor,
+    dscore_partials: Tensor,
+    expert_offsets: Tensor,
+    max_m: int,
+) -> None: ...
+
+
 def opus_moe_dgrad_swiglu_uniform_prepared(
     dy: Tensor,
     w_bnk: Tensor,
@@ -372,6 +389,38 @@ def opus_moe_dgrad_swiglu_dscore_uniform_prepared(
         out,
         dscore_partials,
         uniform_m,
+    )
+    return out
+
+
+def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    expert_offsets: Tensor,
+    max_m: int,
+    out: Tensor,
+    dscore_partials: Tensor,
+) -> Tensor:
+    """Compact ragged stage-2 dgrad/SwiGLU with four dscore partials."""
+    E, N, K = w_bnk.shape
+    expected = (dy.shape[0], 2 * N)
+    if (
+        K != dy.shape[1]
+        or act_input.shape != expected
+        or out.shape != expected
+        or expert_offsets.shape != (E + 1,)
+        or dscore_partials.shape != (dy.shape[0], N // 256)
+    ):
+        raise ValueError("invalid ragged fused dgrad inputs")
+    _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
+        dy.contiguous(),
+        w_bnk.contiguous(),
+        act_input.contiguous(),
+        out,
+        dscore_partials,
+        expert_offsets,
+        max_m,
     )
     return out
 
@@ -799,7 +848,9 @@ class OpusMoERefFunc(torch.autograd.Function):
         x_g = x[x_gather_idx].contiguous()
 
         offs = _offs_from_lens(lens)
-        seid, bms, bme, uniform_m = _build_dgrad_block_meta(offs, _DGRAD_B_M)
+        seid, bms, bme, uniform_m, max_m = _build_dgrad_block_meta(
+            offs, _DGRAD_B_M
+        )
 
         def fwd_gemm(dy, w_nat):  # dh[m,n]=sum_k dy[m,k]*w_nat[e,n,k]
             out = torch.empty(dy.shape[0], w_nat.shape[1], device=dy.device, dtype=torch.bfloat16)
@@ -821,6 +872,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.act_type = act_type
         ctx.dgrad_meta = (seid, bms, bme)
         ctx.uniform_m = uniform_m
+        ctx.max_expert_m = max_m
         ctx.offs = offs
         # dx reverse map for the deterministic gather-sum (no atomics); built once
         # here (moe-sort semantics), reused in backward.
@@ -857,32 +909,42 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         def dgrad_actbwd_prepared(dy_op, w, act_input, act_type, lens):
             wt = w2t if w is w2_ref else w1t
-            if (
-                act_type in ("Silu", SONIC_SWIGLU)
-                and ctx.uniform_m is not None
-                and _mono_dgrad_shape_ok(dy_op, wt, ctx.uniform_m)
-            ):
+            if act_type in ("Silu", SONIC_SWIGLU):
                 out = torch.empty_like(act_input)
-                if dscore_partials is not None:
-                    return opus_moe_dgrad_swiglu_dscore_uniform_prepared(
+                if ctx.uniform_m is not None and _mono_dgrad_shape_ok(
+                    dy_op, wt, ctx.uniform_m
+                ):
+                    if dscore_partials is not None:
+                        return opus_moe_dgrad_swiglu_dscore_uniform_prepared(
+                            dy_op.contiguous(),
+                            wt,
+                            act_input,
+                            ctx.uniform_m,
+                            out,
+                            dscore_partials,
+                        )
+                    return opus_moe_dgrad_swiglu_uniform_prepared(
+                        dy_op.contiguous(), wt, act_input, ctx.uniform_m, out
+                    )
+                if (
+                    dscore_partials is not None
+                    and w is w2_ref
+                    and ctx.dims == (32768, 2048, 64, 1024, 8)
+                ):
+                    return opus_moe_dgrad_swiglu_dscore_ragged_prepared(
                         dy_op.contiguous(),
                         wt,
                         act_input,
-                        ctx.uniform_m,
+                        offs,
+                        ctx.max_expert_m,
                         out,
                         dscore_partials,
                     )
-                return opus_moe_dgrad_swiglu_uniform_prepared(
-                    dy_op.contiguous(), wt, act_input, ctx.uniform_m, out
-                )
             return _opus_actbwd(dgrad_prepared(dy_op, w, lens), act_input, act_type)
 
         def combine_bwd_prepared(dout, gather, p_sorted, y):
             nonlocal dscore_partials
-            if (
-                ctx.dims == (32768, 2048, 64, 1024, 8)
-                and ctx.uniform_m is not None
-            ):
+            if ctx.dims == (32768, 2048, 64, 1024, 8):
                 dy, dscore_partials = opus_moe_combine_scale_token8_h2048_bf16(
                     dout,
                     ctx.token_routes,

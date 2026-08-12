@@ -383,6 +383,16 @@ namespace py = pybind11;
           py::arg("d_act_input"), \
           py::arg("dscore_partials"), \
           py::arg("uniform_m")); \
+    m.def("opus_moe_dgrad_swiglu_dscore_ragged_bf16", \
+          &opus_moe_dgrad_swiglu_dscore_ragged_bf16, \
+          "MoE ragged dgrad + SwiGLU + dscore partials", \
+          py::arg("dy"), \
+          py::arg("w"), \
+          py::arg("act_input"), \
+          py::arg("d_act_input"), \
+          py::arg("dscore_partials"), \
+          py::arg("expert_offsets"), \
+          py::arg("max_m")); \
     m.def("opus_moe_wgrad_mfma_bf16", \
           &opus_moe_wgrad_mfma_bf16, \
           "MoE fused MFMA grouped wgrad (BF16->FP32, transposed+padded)", \

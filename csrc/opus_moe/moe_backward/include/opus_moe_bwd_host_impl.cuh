@@ -235,6 +235,57 @@ void opus_moe_dgrad_swiglu_dscore_bf16(aiter_tensor_t& dy,
         k, aiter::getCurrentHIPStream());
 }
 
+void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
+    aiter_tensor_t& dy,
+    aiter_tensor_t& w,
+    aiter_tensor_t& act_input,
+    aiter_tensor_t& d_act_input,
+    aiter_tensor_t& dscore_partials,
+    aiter_tensor_t& expert_offsets,
+    int max_m)
+{
+    const int E = static_cast<int>(w.size(0));
+    const int N = static_cast<int>(w.size(1));
+    const int K = static_cast<int>(w.size(2));
+    const int M = static_cast<int>(dy.size(0));
+    AITER_CHECK(max_m > 0, "max_m must be positive");
+    AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1,
+                "expert_offsets must have E + 1 elements");
+    AITER_CHECK(static_cast<int>(dy.size(1)) == K, "dy K must match weight K");
+    AITER_CHECK(static_cast<int>(act_input.size(0)) == M &&
+                    static_cast<int>(act_input.size(1)) == 2 * N,
+                "act_input must have shape [M, 2 * N]");
+    AITER_CHECK(static_cast<int>(d_act_input.size(0)) == M &&
+                    static_cast<int>(d_act_input.size(1)) == 2 * N,
+                "d_act_input must have shape [M, 2 * N]");
+    AITER_CHECK(static_cast<int>(dscore_partials.size(0)) == M &&
+                    static_cast<int>(dscore_partials.size(1)) == N / 256,
+                "dscore_partials must have shape [M, N / 256]");
+    AITER_CHECK(K >= 128 && K % 64 == 0 && N % 256 == 0,
+                "ragged fused dscore requires K%64==0 and N%256==0");
+
+    opus_moe_dgrad_swiglu_kargs k{};
+    k.ptr_a = dy.data_ptr();
+    k.ptr_b = w.data_ptr();
+    k.ptr_act_input = act_input.data_ptr();
+    k.ptr_dact = d_act_input.data_ptr();
+    k.ptr_dscore_partials = dscore_partials.data_ptr();
+    k.expert_offsets = reinterpret_cast<const int32_t*>(expert_offsets.data_ptr());
+    k.m = max_m;
+    k.n = N;
+    k.k = K;
+    k.batch = E;
+    k.stride_a = static_cast<int>(dy.stride(0));
+    k.stride_b = static_cast<int>(w.stride(1));
+    k.stride_act_input = static_cast<int>(act_input.stride(0));
+    k.stride_dact = static_cast<int>(d_act_input.stride(0));
+    k.stride_b_batch = static_cast<int>(w.stride(0));
+    k.stride_dscore = static_cast<int>(dscore_partials.stride(0));
+    k.ragged = 1;
+    opus_moe_dgrad_swiglu_dscore_launch_gfx950(
+        k, aiter::getCurrentHIPStream());
+}
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32). Feature-major transposed +
 // route-padded inputs (build_padded_transposed). dW[e]=dyT_e @ aT_e^T.
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,       // [P, Mp] bf16
