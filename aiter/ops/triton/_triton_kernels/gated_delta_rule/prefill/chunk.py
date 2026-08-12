@@ -380,11 +380,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             inplace_final_state=inplace_final_state,
         )
     elif use_chunk_flydsl:
-        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
-            raise ValueError(
-                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
-                "omit it or pass `k.dtype`."
-            )
         # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
         # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
         # mirrors the HIP g-layout contract (default token-major), so pass
@@ -409,6 +404,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             num_decode_tokens=num_decode_tokens,
             g_head_major=True,
             prefill_metadata=prefill_metadata,
+            snapshot_dtype=snapshot_dtype,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(

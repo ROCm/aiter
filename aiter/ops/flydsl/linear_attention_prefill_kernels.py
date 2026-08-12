@@ -763,6 +763,16 @@ def _resolve_state_dtype(initial_state, state_dtype):
     return resolved
 
 
+def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
+    """Resolve/validate the per-chunk snapshot dtype, matching the HIP policy in
+    ``aiter.ops.chunk_gated_delta_rule_fwd_h``: it defaults to ``k.dtype`` and is
+    independent of the persistent state dtype."""
+    resolved = input_dtype if snapshot_dtype is None else snapshot_dtype
+    if resolved not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"`snapshot_dtype` must be fp32 or bf16, got {resolved}.")
+    return resolved
+
+
 @functools.cache
 def _get_or_compile_mfma16_hip(
     K,
@@ -784,9 +794,14 @@ def _get_or_compile_mfma16_hip(
     sched_gfx942=False,
     g_head_major=False,
     bf16_convert_trunc=True,
+    snapshot_bf16=True,
 ):
     """Compile (and cache) the mfma16 / HIP-aligned K5 kernel: 16x16x16 bf16
     MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
+
+    ``snapshot_bf16`` selects the per-chunk ``h`` snapshot specialization and
+    joins the cache key, so the bf16 and fp32 snapshot variants are separate
+    compiled products and the bf16 one keeps its emitted code.
 
     ``use_state_indices`` compiles the indexed state-pool variant: the SSM
     ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence's slot
@@ -826,6 +841,7 @@ def _get_or_compile_mfma16_hip(
         IS_VARLEN=is_varlen,
         WU_CONTIGUOUS=wu_contig,
         STATE_DTYPE_BF16=state_bf16,
+        SNAPSHOT_DTYPE_BF16=snapshot_bf16,
         G_IS_LOG2_SCALED=g_log2_scaled,
         USE_STATE_INDICES=use_state_indices,
         SCHED_GFX942=sched_gfx942,
@@ -854,6 +870,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     g_head_major: bool = False,
     bf16_convert_trunc: bool = True,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
@@ -867,6 +884,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     of the hip K5 LDS/CU selector (``_hipeq_select_bv``) so it matches the
     hand-tuned HIP kernel today without importing its private API;
     ``FLYDSL_K5_MFMA16HIP_BV`` (in {16,32,64}) overrides it for A/B sweeps.
+
+    ``state_dtype`` controls the persistent initial/final state, while
+    ``snapshot_dtype`` independently controls the per-chunk ``h`` snapshots and
+    defaults to ``k.dtype`` (bf16 here), mirroring
+    ``chunk_gated_delta_rule_fwd_h_hip_fn``. fp32 snapshots are stored straight
+    from the f32 accumulators, as in the HIP kernel.
     """
     use_g = g is not None
     use_gk = gk is not None
@@ -905,6 +928,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
 
     resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
     state_bf16 = resolved_state_dtype is torch.bfloat16
+    resolved_snapshot_dtype = _resolve_snapshot_dtype(snapshot_dtype, k.dtype)
+    snapshot_bf16 = resolved_snapshot_dtype is torch.bfloat16
 
     # mfma16_hip keeps the token-major [B, T_flat, Hg, K] k layout (no
     # host-side pre-transpose), matching the Triton VK convention.
@@ -1178,6 +1203,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         sched_gfx942=_IS_GFX942,
         g_head_major=g_head_major,
         bf16_convert_trunc=bf16_convert_trunc,
+        snapshot_bf16=snapshot_bf16,
     )
 
     # Null-arg placeholder for the @flyc.jit slots ignored on this path. Sized
@@ -1236,7 +1262,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         if g_log2_scaled:
             gk = gk * _RCP_LN2
 
-    h = k.new_empty(h_shape)
+    h = k.new_empty(h_shape, dtype=resolved_snapshot_dtype)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
     if fs_shape is None:
         final_state = None
