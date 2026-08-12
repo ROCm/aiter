@@ -209,10 +209,10 @@ def bmm_a8w8_mxscale_opus(
     shuffled weight is the same shape, dtype and strides as the row-major one, so a
     mismatched kid returns a plausible wrong answer instead of failing. An id whose
     layout disagrees is therefore dropped like one that cannot run this M -- with
-    row-major B the heuristic then answers correctly, which is what pointing
-    AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE at a preshuffle table while
-    passing False does. Under True there is nothing to fall back to (every
-    heuristic kid reads B row-major), so that raises rather than run one.
+    row-major B the heuristic then answers correctly, which is what a caller
+    pinning a preshuffled id (or one read from a mismatched table) gets. Under
+    True there is nothing to fall back to (every heuristic kid reads B row-major),
+    so that raises rather than run one.
 
     The scales, by contrast, are always passed through as given, so an id wanting
     them rearranged on the host is dropped too (see _kid_takes_plain_scales).
@@ -242,9 +242,10 @@ def bmm_a8w8_mxscale_opus(
                 f"no preshuffled-B kid this entry can run for (g={g}, m={m}, "
                 f"n={n}, k={k}): the tuned row is absent, names a row-major kid, "
                 "or wants host-rearranged scales, and every heuristic fallback "
-                "reads B row-major. Tune this shape into a preshuffle table and "
-                "point AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE at it, "
-                "or pass b_preshuffled=False with row-major B."
+                "reads B row-major. Tune this shape into the preshuffle table "
+                "(AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE, "
+                "read only for b_preshuffled=True), or pass b_preshuffled=False "
+                "with row-major B."
             )
         kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:

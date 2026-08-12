@@ -305,10 +305,10 @@ DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 # every hit; two tables covering the same shapes would collide on the (gfx,b,m,n,k)
 # key, and update_config_files answers a collision by rewriting the source files
 # down to the lowest-us row each and then raising. Putting "bpreshuffle" before
-# "tuned" breaks the substring, so this file is invisible to that glob and cannot
-# take the shipped table with it. Select it explicitly:
-#
-#   AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE=<this file> python3 ...
+# "tuned" breaks the substring, so this file is invisible to that glob and is
+# instead the default table of the separate _BPRESHUFFLE config entry, which
+# batched_gemm_a8w8_mxscale reads only under b_preshuffled=True. Nothing has to
+# be set to pick it up; override that entry's env var to try another one.
 BPRESHUFFLE_CSV = os.path.join(
     _REPO,
     "aiter",

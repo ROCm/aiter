@@ -209,8 +209,10 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     ):
         return (
             "",
-            ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS,"
-            " bool SHUFFLE_SCALE",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SHUFFLE_SCALE"
+            ),
             kargs_name,
         )
     if kernel_tag in (
@@ -234,8 +236,11 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     ):
         return (
             "",
-            ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS,"
-            " bool SFA_MPACK_GLOBAL, int XCD_WGM, bool SHUFFLE_SCALE",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SFA_MPACK_GLOBAL, int XCD_WGM,"
+                " bool SHUFFLE_SCALE"
+            ),
             kargs_name,
         )
     # BMM M-tile-interleaved kernel: <Traits, D_OUT, bool SKIP_SCALE_WAIT>. The

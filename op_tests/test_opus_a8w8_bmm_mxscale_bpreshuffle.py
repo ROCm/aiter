@@ -20,16 +20,10 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
 import torch
-
-from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
-from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import run_perftest
 from test_opus_a8w8_bmm import (
     GROUP,
     _block_varied,
@@ -39,6 +33,13 @@ from test_opus_a8w8_bmm import (
     _scale_picker,
     run_torch,
 )
+
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import run_perftest
 
 torch.set_default_device("cuda")
 
@@ -93,11 +94,11 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
             skipped.append(kid)
     err_plain = _rel_err(_call(KID_PLAIN, W_mx), ref)
 
-    # The public entry end to end: guarded custom op -> tuned row -> a kid that
-    # wants the shuffled weight. Only a shape the active CSV covers with such a
-    # kid can run it (b_preshuffled=True raises by design otherwise), so point
-    # AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE at the preshuffle table
-    # to exercise it; an uncovered shape is reported as off, not failed.
+    # The public entry end to end: guarded custom op -> the preshuffle table
+    # (b_preshuffled=True reads that one, nothing to set) -> a kid that wants the
+    # shuffled weight. Only a shape that table covers can run it, since True
+    # raises by design rather than fall back; an uncovered shape is reported as
+    # off, not failed.
     err_pub = None
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
         try:
@@ -145,6 +146,39 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     tol = max(2.0 * err_plain, err_plain + 1e-4)
     ok = all(e <= tol for e in errs.values())
     return ok and (err_pub is None or err_pub <= tol)
+
+
+def _check_tables():
+    """One tuned table per B layout, each holding only kids that read that layout.
+
+    Keeping them apart is what keeps the row-major caller tuned: a shared table
+    would hand it rows naming preshuffled kids, every one of which it has to drop
+    for the heuristic, silently losing the shipped table's pick. So this reads
+    both tables the way the entry does and checks no row crosses over -- which
+    also catches a preshuffle CSV whose name lets the shipped table's glob merge
+    it in.
+    """
+    import aiter.ops.batched_gemm_op_a8w8 as bg
+    import aiter.ops.opus.bmm_op as bmm
+
+    gfx = get_gfx()
+    ok = True
+    for b_preshuffled in (False, True):
+        path = bg._mxscale_bmm_tuned_path(b_preshuffled)
+        rows = bg._load_mxscale_bmm_tuned(None, b_preshuffled)
+        # kernelId is only opus's to interpret, and the catalog behind the check
+        # is this arch's.
+        kids = {
+            int(row["kernelId"])
+            for key, row in rows.items()
+            if key[0] == gfx and row.get("libtype") == "opus"
+        }
+        bad = sorted(k for k in kids if not bmm._kid_takes_b_layout(k, b_preshuffled))
+        ok &= not bad
+        label = f"b_preshuffled={b_preshuffled!s:<5} -> {len(kids)} kid(s)"
+        note = f"wrong-layout kids {bad}" if bad else os.path.basename(path)
+        print(f"  {'ok  ' if not bad else 'FAIL'} {label}  [{note}]", flush=True)
+    return ok
 
 
 def _check_dispatch():
@@ -292,8 +326,10 @@ def main():
     assert args.k % 256 == 0, "these kids tile K by 256"
     assert args.k % GROUP == 0
 
+    print("tables: one tuned CSV per B layout", flush=True)
+    ok = _check_tables()
     print("dispatch: b_preshuffled routing at the public entry", flush=True)
-    ok = _check_dispatch()
+    ok &= _check_dispatch()
     for m in [int(x) for x in args.sizes.split(",")]:
         ok &= _run(args.g, m, args.n, args.k, ydt, args.bench, args.split_k)
     print("PASS" if ok else "FAIL")

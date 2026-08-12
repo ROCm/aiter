@@ -164,10 +164,26 @@ def batched_gemm_a8w8_CK(
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
+def _mxscale_bmm_tuned_path(b_preshuffled: bool = False) -> str:
+    """The tuned CSV for B in this layout; one table per layout, never merged.
+
+    A row's kernelId is only meaningful for the B layout it was tuned on, so the
+    layout the caller declares picks the table -- rather than one table plus an
+    env var, which would make a preshuffled table shadow the row-major one for
+    every caller in the process.
+    """
+    cfg = AITER_CONFIGS
+    if b_preshuffled:
+        return cfg.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+    return cfg.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+
+
 @functools.cache
-def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, b_preshuffled: bool = False
+) -> dict:
     """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    path = _mxscale_bmm_tuned_path(b_preshuffled)
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
@@ -180,9 +196,15 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
 
 @functools.lru_cache(maxsize=1024)
 def lookup_mxscale_bmm_config(
-    b: int, m: int, n: int, k: int, *, libtype: str | None = None
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    libtype: str | None = None,
+    b_preshuffled: bool = False,
 ):
-    """Exact tuned row for this shape, else one at a padded M.
+    """Exact tuned row for this shape, else one at a padded M, in B's layout table.
 
     Same exact-then-two-granularities walk over the shared C++ getPaddedM that
     the CK / asm / a16w16 lookups use. A bucket table built from the CSV's own M
@@ -202,8 +224,8 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-    tuned = _load_mxscale_bmm_tuned(libtype)
+    path = _mxscale_bmm_tuned_path(b_preshuffled)
+    tuned = _load_mxscale_bmm_tuned(libtype, b_preshuffled)
 
     row, padded_m = None, m
     for gl in (None, 0, 1):
@@ -276,7 +298,7 @@ def _batched_gemm_a8w8_mxscale_impl(
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
 
-    cfg = lookup_mxscale_bmm_config(g, m, n, k)
+    cfg = lookup_mxscale_bmm_config(g, m, n, k, b_preshuffled=b_preshuffled)
     libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
     if libtype != "opus":
         raise NotImplementedError(
@@ -356,9 +378,10 @@ def batched_gemm_a8w8_mxscale(
     does offline and cannot express any other way. It has to be declared rather
     than detected -- the shuffled weight has the same shape, dtype and strides as
     the row-major one, so a kernel mismatched to it reads the right bytes in the
-    wrong order and returns a plausible wrong answer instead of failing. Only
-    kids wanting the declared layout are taken, so the tuned CSV to point
-    AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE at has to agree with it.
+    wrong order and returns a plausible wrong answer instead of failing. It also
+    picks which tuned CSV is read (see ``_mxscale_bmm_tuned_path``), so the two
+    layouts cannot pull each other's rows, and only kids wanting the declared
+    layout are taken even then.
     """
     return _batched_gemm_a8w8_mxscale_impl(
         x, wo_a, x_scale, w_scale, dtype=dtype, b_preshuffled=b_preshuffled
