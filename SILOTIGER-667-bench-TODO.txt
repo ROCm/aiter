@@ -1,0 +1,254 @@
+TODO:
+- flip CK to cold.
+    Context: CK's make_cfg only sets cold_niters_ (warmup) + nrepeat_; stream_config
+    defaults flush_cache_=false, rotating_count_=1, so CK measures WARM (fixed random
+    router => selected TOPK experts stay MALL-resident where they fit). FlyDSL cold
+    rotates the router over disjoint expert groups (steady-state cold). Goal: make CK
+    truly cold so the G9 side-by-side is cold-vs-cold (apples-to-apples).
+    Sub-steps:
+    - In ck_bench_warp_decode.cpp make_cfg(): set flush_cache_=true and rotating_count_>1
+      (start small, e.g. 2-4); expose both via env (CK_WD_FLUSH, CK_WD_ROTATE).
+    - Check the rotating-buffer memory cost: CK rotates the kernel-arg buffers, so
+      rotating_count_ copies of the GB-scale weight pool can OOM. Confirm what
+      rotating_buffers.hpp actually duplicates; if it copies the weight pool, cap the
+      count or rotate only the weight pointer (deepseek gate_up pool is ~3.75GB x2).
+    - Rebuild via build_ck_bench.sh; re-run smoke test.
+    - Verify the flush works: cold numbers must DROP vs the current warm ones (esp. the
+      small Qwen down shape that was fully cache-resident); if unchanged, the flush isn't
+      hitting the weight reads -> revisit mechanism.
+    - Note residual mechanism difference in the plan: CK flush_cache_ flushes a scratch
+      buffer between iters vs FlyDSL's rotate-over-disjoint-experts; document as a
+      caveat even once both are "cold".
+- match scale layout for the G9 comparison.
+    Context: CK gate_up/down FP8 use Block2D<128,128> weight scales (WScaleAll), and
+    gate_up act uses PerTensor; our cold FP8 legs currently run pertensor. Block2D
+    streams extra scale bytes, so a pertensor-vs-block2d comparison isn't apples-to-
+    apples on the weight-scale traffic.
+    Sub-steps:
+    - Run the FlyDSL FP8 legs (bench_gate_up_cold / bench_down_cold) with
+      w_scale_mode="block2d", scale_block=(128,128) to mirror CK.
+    - FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block
+      scale (1,32); keep FlyDSL's e8m0 and document this as a perf-negligible difference
+      (the scale bytes are tiny vs the FP4 weight stream).
+- expand the CK B-set to cover the FlyDSL B-set.
+    Context: FlyDSL cold sweep covers B in {1,2,4,8,32}; CK defaults to {1,2,4,8}, so
+    B=32 is currently missing from the CK side (no matching row for the join).
+    Sub-steps:
+    - Run CK with CK_WD_BATCHES="1,2,4,8,32" (env already supported; no cpp change).
+    - Confirm each B passes CK's IsSupportedArgument for all shapes/kernels (skip-print
+      if not) and that B=32 doesn't OOM with the (later) cold flush/rotate buffers.
+    - Ensure compare_g9.py joins on the full B set so every FlyDSL row has a CK peer.
+- add a FlyDSL counterpart to CK's gate_fp8_d2.
+    Context: CK gate_fp8_d2 = FP8 activation x FP8 weight, dot2, with XScaleFP8 =
+    Block2D<1,128> on the activation. FlyDSL gate_up currently takes BF16 activations
+    only, so there's no peer for this CK row. This is the plan's "Follow-on: plain FP8
+    activation input" item, needed to complete the gate_up A/B against CK.
+    Sub-steps:
+    - Add an FP8-activation gate_up entry: quantize x BF16->FP8 (per the activation
+      scale contract) and feed the FP8 x + its (1,128) block scale through the same
+      cvt/dot2 path; fold the activation scale after dot2 (exponent-only convert, main
+      plan section 2).
+    - Match CK's layout: XScaleFP8 = Block2D<1,128> activation scale, FP8 weight
+      Block2D<128,128>, dot2 on.
+    - Add correctness (cos vs BF16-act reference) + a cold-bench field so compare_g9.py
+      can pair it with CK gate_fp8_d2.
+    - Note: distinct from MXFP8 (block-scaled) activation, which is a separate follow-on.
+- fix the DeepSeek-E256 FP8 hole in FlyDSL (K3 Tier-2 addressing).
+    Context: FlyDSL FP8 down/gate_up overflow the i32 byte offset at DeepSeek E=256
+    (w_row*INTER, ~3.76e9 > 2^31), so the FP8 legs report n/a there and CK (per-row i64
+    base) has no FlyDSL peer for that cell. K3 Tier-1 (algebraic restructure) already
+    unlocked FP4 (fits under 2^32); FP8 needs Tier-2 = a per-expert i64 base so the
+    dword index never has to fit i32.
+    Sub-steps:
+    - Add per-expert i64 base addressing to the FP8 down + gate_up builders (compute the
+      expert's row base in i64, keep the in-expert offset in i32); mirror the reference
+      per-row i64 base pattern.
+    - Guard so it's only paid when needed (E*H*I >= 2^31) to avoid regressing the common
+      i32-safe path; keep FP4 on the Tier-1 path.
+    - Correctness: E=256 DeepSeek FP8 down + gate_up cos vs torch (the current overflow
+      repro /tmp/repro_k3_addr.py should go from cos ~0.02 to ~1.0).
+    - Once fixed: drop the FP8 auto-skip in the cold harness for DeepSeek E256, fill the
+      G9 FP8 DeepSeek rows, and update the plan's G1/K3 status + section 8.2 matrix.
+    - Also unblocks the Kimi-K3 follow-on (E=896, the harshest overflow case).
+- extend the CK cpp with a gate_up FP4 bench (to pair with FlyDSL's gate_up FP4).
+    Context: FlyDSL has a gate_up FP4 path (flydsl_warp_decode_gate_up_fp4, the 1.44-
+    1.65x cold-A/B win) but the CK bench has no peer -- NOT a CK capability gap: the
+    underlying WarpDecodeGateUpKernel supports pk_fp4_t (unpack_fp4_nibble, is_packed_w),
+    it's only that ck_bench_warp_decode.cpp never instantiates a gate_up FP4 alias.
+    Sub-steps:
+    - Add GUProbFP4 = WarpDecodeGateUpProblem<bf16_t, pk_fp4_t, ...> + kernel alias, and
+      a bench block mirroring the existing down_fp4_h2 one (env-filterable row
+      "gate_up_fp4").
+    - Respect the NPerWarp=1 constraint: the kernel static-asserts NPerWarp=2 does not
+      support packed FP4, so use NPerWarp=1 for the FP4 gate_up instantiation.
+    - Pick a scale layout matching FlyDSL's e8m0 block scale (gate/up weight scale);
+      allocate the packed FP4 gate/up weight pools (E*I*H/2 bytes each).
+    - Rebuild; add the row to compare_g9.py's join so FlyDSL gate_up FP4 gets a CK peer.
+- make CK output machine-readable + compatible with FlyDSL (for compare.py join).
+    Context: CK prints a fixed-width human table (shape,B,kernel,ms,TFLOP/s,GB/s);
+    FlyDSL benches return dicts in us. Design decision: compare on TIME (us); derived
+    metrics (TB/s, TFLOPs) are recomputed from a SHARED pluggable helper (see the
+    "pluggable compute_metrics helper" item) applied identically to both sides, since
+    CK's gu_bytes/dn_bytes/gu_flops count different bytes/FLOPs than FlyDSL's weight
+    stream (not directly comparable). So CK only needs to emit raw time + dims.
+    Sub-steps:
+    - Add a machine-readable output mode behind an env flag (e.g. CK_WD_FORMAT=csv):
+      stable schema "shape,H,I,K,E,B,kernel,us". Keep the pretty table as default.
+    - Emit MICROSECONDS not ms (ms*1000) to match FlyDSL units.
+    - Emit the shape dims H,I,K,E as columns (CK already has them) so the join key is
+      dimension-based (H,I,E,K,B,op), not coupled to the "deepseek-v3" name strings.
+    - Emit a provenance line: CK commit (62e30c9098), arch, and the timing config
+      (cold/iters/flush/rotate) for reproducibility.
+- add TOPK to the FlyDSL cold-bench return dicts.
+    Context: bench_down_cold / bench_gate_up_cold already carry B/HIDDEN/INTER/E but not
+    TOPK; compare.py needs the full dimension join key (H,I,E,K,B) without hard-coding
+    per model. Tiny change: add "TOPK": TOPK to both return dicts.
+- factor a pluggable compute_metrics(...) helper in the FlyDSL module.
+    Context: time is method-independent; bytes/FLOPs are pure functions of
+    (dims, dtype, us, method). Centralize the accounting in ONE testable helper so it is
+    the single source of truth for both harnesses (compare.py imports it and applies the
+    chosen method to CK's raw time+dims too -- this is the "recompute once, one formula
+    for both" principle, living in a shared helper rather than duplicated in compare.py).
+    Two named methods:
+      weight_stream (DEFAULT) -- current FlyDSL accounting: only the weight bytes streamed
+        per launch + core MAC FLOPs (the weight-bandwidth-bound decode metric).
+      total_traffic -- mirrors CK 62e30c9098: all operands touched per launch (act + both
+        weights + intermediate + router + output) for bytes, and full epilogue (silu/scale
+        + router mul) for FLOPs. gu_bytes=B*K*I*(H*xe+2*H*we+2), dn_bytes=B*H*(K*I*2+K*I*we
+        +2*K*4+2), gu_flops=B*K*I*(4H+5), dn_flops=3*B*H*K*I.
+    Sub-steps:
+    - Add compute_metrics(B,H,I,K,dtype,us,method="weight_stream") -> {TFLOPS, TB/s, %peak};
+      keep raw us + dims + dtype as the source of truth (do NOT bake a mode into timing).
+    - Route the existing bench columns through it with the default => recorded numbers
+      unchanged. Keep to exactly these two methods (no general registry yet).
+    - Comment-pin total_traffic to CK commit 62e30c9098; flag it must be revisited if CK's
+      gu_bytes/dn_bytes/gu_flops change.
+- write compare.py (generate FlyDSL + CK benchmarks, then join/compare).
+    Context: mirror the reference implementation's compare_bart.py -- generate both
+    sides, join, emit a FlyDSL/CK ratio table. Primary metric = time ratio
+    flydsl_us/ck_us (unit-free, definition-free). Depends on: CK machine-readable
+    output, CK cold, TOPK field, the pluggable compute_metrics helper; fairness/
+    completeness also depends on scale-match, B=32, extra CK peers, and the DeepSeek
+    FP8 Tier-2 fix (those cells stay n/a until).
+    Sub-steps:
+    - Drive CK: subprocess the binary (path via CK_BENCH, exported by build_ck_bench.sh)
+      with CK_WD_SHAPES/BATCHES/ITERS/COLD/FORMAT; parse CSV into records keyed by
+      (H,I,E,K,B,kernel).
+    - Drive FlyDSL: import the op_test module (runs under flydsl_venv, GPU 6), call
+      bench_down_cold / bench_gate_up_cold over the same shapes/B/iters; "melt" the
+      two-op rows (fp4_us + fp8_us in one row) into per-op records (down_fp4, down_fp8,
+      gate_up_fp8, ...).
+    - Canonical op mapping dict: CK gate_bf16_d2 -> flydsl gate_up FP8; down_h2_d2 ->
+      down FP8; down_fp4_h2 -> down FP4; (later) gate_up_fp4 -> gate_up FP4;
+      gate_fp8_d2 -> gate_up FP8-act.
+    - Join on (H,I,E,K,B,op); emit ck_us, flydsl_us, ratio, and TB/s recomputed via the
+      SHARED compute_metrics helper (default weight_stream; total_traffic optional),
+      applied identically to both sides' raw times. Carry FlyDSL cos as a sanity column;
+      mark the CK side perf-only/unverified (CK runs uninitialized weights). Handle n/a
+      cells (DeepSeek FP8 hole until Tier-2).
+    - Output: markdown ratio table (for the plan) + optional CSV; print the provenance/
+      config header.
+- align timing methodology between FlyDSL and CK.
+    Context: both use GPU device timing but differ in statistics/counts -- FlyDSL
+    run_perftest is IQR-trimmed over ~100 iters; CK is_gpu_timer_ averages over nrepeat_.
+    Small ratios (+-10%) are only meaningful once these are aligned + clocks are stable.
+    Sub-steps:
+    - Match warmup/iter budgets on both sides (e.g. cold/warmup >=15, timed >=60-100).
+    - Document the residual stat difference (trimmed-median vs mean); pick one to report
+      or report both.
+    - Lock GPU clocks (rocm-smi fixed SCLK, disable boost) for both runs so boost
+      variance doesn't pollute the ratio; record the locked clock in provenance.
+    - Run both under the same device isolation (HIP_VISIBLE_DEVICES=6).
+- define the G9 comparison coverage matrix (the completion gate).
+    Context: the section-8.2-style single-source-of-truth for WHAT must be compared and
+    when G9 is done; also names the pairs that legitimately have no peer.
+    Sub-steps:
+    - Enumerate op x dtype x shape x B: gate_up {BF16-act x FP8-w, FP8-act, FP4-w} and
+      down {FP8, FP4} x {deepseek-v3, minimax, qwen3next} x {1,2,4,8,32}.
+    - Mark each cell covered / n/a (+reason): e.g. DeepSeek FP8 n/a until Tier-2;
+      gate_up FP4 / gate_fp8 peers pending their CK/FlyDSL items.
+    - G9 closes only when every non-n/a cell has a FlyDSL+CK pair in the table.
+- decide + document the FlyDSL config policy per op (default-vs-default).
+    Context: FlyDSL has perf knobs (prefetch for B<=2 FP4 down, kh_per_warp,
+    serialize_dot2/ILP); CK rows are fixed configs. Headline comparison = DEFAULT vs
+    DEFAULT to avoid tuning-asymmetry bias (we can deeply tune FlyDSL but not CK, so
+    best-vs-best would flatter FlyDSL) and to keep one well-defined, reproducible
+    operating point per row.
+    Sub-steps:
+    - Pin the exact config per side next to the table: FlyDSL default (prefetch off,
+      kh auto=2, serialize on); CK = the maintainer-intended recommended variant
+      (down_h2_d2, gate_bf16_d2), noting CK has no single runtime "default" (mild
+      asymmetry to disclose).
+    - Keep the tuned upside as a secondary/footnote row where a knob is the documented
+      recommendation (e.g. prefetch=True for B<=2 FP4 down, ~5%); headline stays default.
+- confirm functional equivalence between the two harnesses.
+    Context: an apples-to-apples PERF comparison is only valid if both compute the SAME
+    work. Verify (with code refs) before trusting ratios.
+    Sub-steps:
+    - Activation is SiLU on both; same silu(gate)*up (gate_up) and Sum rw*(inter*w)
+      (down) definitions.
+    - Same scale semantics (block2d weight scale, activation scale) and same output
+      dtype (bf16).
+    - Note any epilogue/scale differences as caveats; if the math differs, the pair is
+      not comparable and must be flagged n/a.
+- capture environment/provenance + run-to-run variance.
+    Context: strengthens credibility and reproducibility of every reported ratio.
+    Sub-steps:
+    - compare.py header records: GPU model, ROCm version, arch, locked clocks, CK commit
+      (62e30c9098), and the aiter commit.
+    - Run each config N times; report spread (CV or min/median/max) and flag noisy rows
+      rather than trusting a single sample.
+- add a one-command reproducible driver + checked-in artifact.
+    Context: the plan's table should be regenerable, not hand-copied.
+    Sub-steps:
+    - Top-level entry (script / Make target) that optionally rebuilds CK, locks clocks,
+      runs compare.py under flydsl_venv on GPU 6, and writes CSV + markdown into
+      tickets/667/.
+    - Reference the generated artifact from the plan doc.
+- (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs.
+    Context: both harnesses are currently perf-only (CK runs uninitialized weights);
+    proving they produce numerically close outputs on identical inputs would confirm
+    they compute the same thing, not just similar-looking kernels.
+    Sub-steps:
+    - Add a CK mode that accepts/initializes real inputs and dumps the output tensor.
+    - Feed identical inputs to both; compare (cos / checkAllclose). Heavier -- keep
+      explicitly optional / stretch.
+
+=== Full-MoE / AITER track (complementary to the per-stage FlyDSL-vs-CK G9 above) ===
+This track answers "how does FlyDSL compare vs whatever AITER dispatches by default",
+at the FULL fused-MoE level (routing + gate_up + activation + down), distinct from the
+per-stage cold FlyDSL-vs-CK comparison. Anchor = the existing reference script
+/workspaces/rocm-libraries/bench/bench_moe_warp_decode.py.
+- extend bench_moe_warp_decode.py with FlyDSL paths.
+    Context: that script already does the expensive full-MoE plumbing -- builds shared
+    weights, prepacks into BOTH the AITER fused layout (shuffle_weight (16,16), w1/w2
+    concat, 128x128 block quant) and the warp-decode flat scale layout, runs
+    fused_topk + aiter.fused_moe (the DEFAULT dispatch, QuantType.per_1x128), a
+    warp_decode_ext (bartified reference) FP8/BF16 path, a torch_moe_blockscale
+    reference + correctness (cos/err), per-stage timings, GB/s, ratio, CSV. So we ADD
+    FlyDSL as another path rather than build a harness. Est ~1-2 days (mostly wrappers +
+    scale/signature reconcile + env), vs ~4-6 to build from scratch.
+    Sub-steps:
+    - Add FlyDSL path wrappers mirroring wd_bf16_moe_block / down, calling the registered
+      aiter.ops.flydsl entries. Op mapping:
+        wd_bf16 gate_up (BF16 act x FP8 w) <-> flydsl_warp_decode_gate_up (block2d).
+        down <-> flydsl_warp_decode_down_reduce (block2d).
+        FP4 gate_up/down (flydsl_..._fp4) -> NEW columns the script lacks.
+        wd_fp8 gate_up is FP8-ACTIVATION x FP8-w -> FlyDSL has no peer yet; BLOCKED on the
+          "FlyDSL counterpart to gate_fp8_d2" item above.
+    - Reconcile signatures + scale layout: FlyDSL uses w_scale_mode="block2d",
+      scale_block=(128,128), out=; verify the script's w_*_scale_wd ([E*N/128, K/128])
+      matches FlyDSL's block2d expectation; confirm router_ids i32 / router_wts f32.
+    - Reconcile the environment (MAIN RISK): the script imports a locally-built
+      warp_decode_ext in the default env; FlyDSL needs flydsl_venv (triton 3.6). Need ONE
+      env with aiter+fused_moe + warp_decode_ext + flydsl importable together.
+    - Result is a 3-(or-4-)way table: AITER default vs warp_decode_ext (ref) vs FlyDSL
+      (+ CK if later merged); reuse default-vs-default config policy + provenance/variance.
+- REVISIT: warm-ish cold semantics of bench_moe_warp_decode.py (don't forget).
+    The script builds weights once per shape and reuses them across B/iters with a fixed
+    router (fused_topk on random gating) and run_perftest's default rotation -> selected
+    experts stay MALL-resident where they fit == WARM-ish, same caveat as CK's default
+    (before "flip CK to cold"). For decode realism the weight reads should be COLD.
+    Possibly worth revisiting: apply the same treatment as the FlyDSL cold harness
+    (oversized pool + router rotation over disjoint expert groups, or a cache flush) so
+    the full-MoE numbers are cold too; at minimum, label the regime in the output.
