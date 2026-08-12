@@ -155,6 +155,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     constexpr int BK = T::B_K;
     constexpr int ROUTE_M = T::ROUTE_M;
     constexpr int CTA_M = ROUTE_M * RouteTiles;
+    constexpr bool batch_sigmoid = []() constexpr {
+        if constexpr(requires { T::BATCH_SIGMOID; })
+            return T::BATCH_SIGMOID;
+        return false;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -689,6 +694,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         down_bwd_unpack_bf16x8(z_gate_prefetch[group]);
                     const down_bwd_f32x8 z_up =
                         down_bwd_unpack_bf16x8(z_up_prefetch[group]);
+                    down_bwd_f32x8 sigmoid_values;
+                    if constexpr(batch_sigmoid)
+                    {
+#pragma unroll
+                        for(int elem = 0; elem < 8; ++elem)
+                            sigmoid_values[elem] =
+                                down_bwd_sigmoid(z_gate[elem]);
+                    }
 #pragma unroll
                     for(int pair = 0; pair < 4; ++pair)
                     {
@@ -699,9 +712,15 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                             z_gate[elem], z_gate[elem + 1]};
                         const down_bwd_f32x2 z_up_pair{
                             z_up[elem], z_up[elem + 1]};
-                        const down_bwd_f32x2 sigmoid{
-                            down_bwd_sigmoid(z_gate_pair[0]),
-                            down_bwd_sigmoid(z_gate_pair[1])};
+                        down_bwd_f32x2 sigmoid;
+                        if constexpr(batch_sigmoid)
+                            sigmoid = down_bwd_f32x2{
+                                sigmoid_values[elem],
+                                sigmoid_values[elem + 1]};
+                        else
+                            sigmoid = down_bwd_f32x2{
+                                down_bwd_sigmoid(z_gate_pair[0]),
+                                down_bwd_sigmoid(z_gate_pair[1])};
                         const down_bwd_f32x2 silu = z_gate_pair * sigmoid;
                         const down_bwd_f32x2 activation = silu * z_up_pair;
                         const down_bwd_f32x2 g{

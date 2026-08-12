@@ -79,7 +79,7 @@ fallback when a genuinely different working-set regime needs it.
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
 | K1 `down_bwd` medium grid | 9 | `BM32 x BN128 x BK32`, M5/twenty-route cohort + CTA-local route metadata |
 | K1 `down_bwd` large grid | 10 | `BM32 x BN128 x BK32`, M6/twenty-four-route cohort + CTA-local route metadata |
-| K1 `down_bwd` wide-N grid | 11 | `BM32 x BN256 x BK32`, M6/twenty-four-route cohort + packed-Z epilogue |
+| K1 `down_bwd` wide-N grid | 11 | `BM32 x BN256 x BK32`, M6 cohort + packed-Z/batched-sigmoid epilogue |
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
@@ -131,6 +131,10 @@ keeps them packed as `u32x4`; each group is expanded to FP32 only when it is
 consumed. This preserves global-load overlap while removing the previous
 56-byte private segment per thread. The production code object remains at
 128 VGPRs, 128 accumulator VGPRs, and 60,928 bytes of LDS with zero scratch.
+Within each eight-column group, the eight independent `exp2`/reciprocal
+sigmoid chains are issued as a batch before the SwiGLU arithmetic. This gives
+the transcendental pipeline independent work without extending Z across an
+MFMA-result permutation or changing the activation's numerical order.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
 tuple. Kid 11 is selected once the average padded expert interval reaches

@@ -141,6 +141,7 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
 {
     static constexpr int B_N = 256;
     static constexpr int E_N = 2;
+    static constexpr bool BATCH_SIGMOID = true;
     static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
     static constexpr int SMEM_B_GROUP_DATA_BYTES =
         SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
