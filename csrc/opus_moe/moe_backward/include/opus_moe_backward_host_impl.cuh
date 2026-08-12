@@ -641,22 +641,26 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
            down,
            stream,
            Family::DownBwd);
-    // K5 consumes K1's a_scaled stream and is otherwise independent of the
-    // dZ consumers.  For the bounded power-of-two D family, launch K5 while
-    // that intermediate is youngest in cache; K2 then refreshes dZ before K4
-    // consumes it.  Wider/non-power-of-two grids retain the legacy launch
-    // path verbatim, including selector placement and host launch spacing.
+    // K4 and K2 both consume K1's much larger dZ stream.  For the bounded
+    // mid-width D family once dZ has outgrown the cache-friendly regime,
+    // consume it with K4 immediately, then let K2's read refresh dZ before
+    // route reduction.  K5 is independent and moves last; this ordering
+    // retains more of dZ across the two dominant grouped GEMMs than
+    // prioritizing the smaller a_scaled stream.  Small working sets and
+    // narrower or wider grids retain the legacy launch order.
     const int model_dim = dw1.model_dim;
-    const bool short_power_of_two_d =
-        model_dim >= 1024 && model_dim <= 2048 &&
-        (model_dim & (model_dim - 1)) == 0;
-    if(short_power_of_two_d)
+    const bool mid_width_d = model_dim >= 1536 && model_dim <= 2048;
+    constexpr uint64_t dz_reorder_min_bytes = 512ull * 1024ull * 1024ull;
+    const uint64_t dz_bytes =
+        static_cast<uint64_t>(down.route.sorted_capacity) *
+        static_cast<uint64_t>(2 * down.inter_dim) * sizeof(hip_bfloat16);
+    if(mid_width_d && dz_bytes >= dz_reorder_min_bytes)
     {
-        invoke(gfx950::dispatch_dw2(
-                   select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
-               dw2,
+        invoke(gfx950::dispatch_dw1(
+                   select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
+               dw1,
                stream,
-               Family::Dw2);
+               Family::Dw1);
         invoke(gfx950::dispatch_route_dx(selected_route_dx),
                route_dx,
                stream,
@@ -665,11 +669,11 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                route_reduce,
                stream,
                Family::RouteReduce);
-        invoke(gfx950::dispatch_dw1(
-                   select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
-               dw1,
+        invoke(gfx950::dispatch_dw2(
+                   select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+               dw2,
                stream,
-               Family::Dw1);
+               Family::Dw2);
     }
     else
     {

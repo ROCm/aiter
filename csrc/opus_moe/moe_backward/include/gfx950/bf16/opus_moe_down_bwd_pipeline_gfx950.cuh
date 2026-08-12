@@ -152,6 +152,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     constexpr int ROUTE_M = T::ROUTE_M;
     constexpr int CTA_M = ROUTE_M * RouteTiles;
     static_assert(RouteTiles > 0);
+    static_assert(CTA_M <= T::BLOCK_SIZE,
+                  "each predecoded route row requires one workgroup thread");
     constexpr bool fixed_shape = FixedD > 0;
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));

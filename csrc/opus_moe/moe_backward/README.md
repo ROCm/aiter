@@ -18,12 +18,13 @@ stream:
 | K4 `dw1` | expert-grouped varlen-K `dZ^T @ X` | `dW1` |
 | K5 `dw2` | expert-grouped varlen-K `dO^T @ (S * A)` | `dW2` |
 
-The host keeps both legal dependency orders flat.  For power-of-two model
-dimensions in `[1024, 2048]` it launches `K1 -> K5 -> K2 -> K3 -> K4`: K5
-consumes K1's `a_scaled` while it is cache-young, and K2 refreshes `dZ` before
-K4.  Other dimensions retain `K1 -> K2 -> K3 -> K4 -> K5`; wider and
-non-power-of-two grids did not benefit from the shorter K5 reuse distance.
-This policy uses runtime geometry, not an exact model shape.
+The host keeps both legal dependency orders flat.  When `1536 <= D <= 2048`
+and the runtime `dZ` working set is at least 512 MiB it launches
+`K1 -> K4 -> K2 -> K3 -> K5`: K4 consumes K1's large `dZ` stream immediately,
+then K2 refreshes the same stream before route reduction.  Smaller working
+sets and narrower or wider model dimensions retain
+`K1 -> K2 -> K3 -> K4 -> K5`.  This policy is derived from runtime dimensions
+and sorted capacity, not an exact model shape.
 
 Backward consumes the sorting metadata saved by forward. The low 24 bits of
 `sorted_token_ids` hold the token and the high 8 bits hold the top-k slot.
