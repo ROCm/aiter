@@ -21,6 +21,10 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_mxfp4_colmajor_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.quant.f4f4_solo import (
+    quantize_f4f4_solo_k,
+    quantize_f4f4_solo_v,
+)
 
 
 def fused_sage_quant_mxfp4(
