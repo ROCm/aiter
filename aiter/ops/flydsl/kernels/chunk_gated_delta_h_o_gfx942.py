@@ -130,14 +130,44 @@ def compile_chunk_gated_delta_h_o_gfx942(
     # the gated copy in lds_vnt -- so both must be kept.
     LDS_VN_RAW_ELEMS = BV * BT
 
-    @fx.struct
-    class SharedStorage:
-        lds_w: fx.Array[fx.BFloat16, LDS_W_ELEMS, 16]
-        lds_kt: fx.Array[fx.BFloat16, LDS_KT_ELEMS, 16]
-        lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
-        lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
-        lds_A: fx.Array[fx.BFloat16, LDS_A_ELEMS, 16]
-        lds_vn_raw: fx.Array[fx.BFloat16, LDS_VN_RAW_ELEMS, 16]
+    # LDS budget: the six buffers at BV=64 (K=128) total 72 KiB > 64 KiB. lds_A
+    # (BT*BT = 4096 bf16 = 8 KiB) is written by GEMM4a, which runs strictly after
+    # GEMM3 -- the last reader of lds_h -- so lds_A can reuse lds_h's storage once
+    # a barrier separates the two. lds_A (4096 elems) fits inside lds_h
+    # (BV*K = 8192 elems at BV=64). Alias only when needed (BV would otherwise
+    # overflow); BV<=32 has room and keeps the buffers distinct (no extra barrier).
+    _lds_total_kib = (
+        LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS
+        + LDS_A_ELEMS + LDS_VN_RAW_ELEMS
+    ) * 2 / 1024
+    # Alias lds_A onto lds_h only when (a) the un-aliased layout would overflow
+    # 64 KiB AND (b) lds_A actually fits inside lds_h. The latter holds only for
+    # BV >= 32 (lds_h = BV*K; lds_A = BT*BT): at BV=16, lds_h = 2048 < lds_A =
+    # 4096, so aliasing is impossible -- but BV=16 also never overflows, so it
+    # keeps distinct buffers and no aliasing is needed.
+    ALIAS_A_ONTO_H = _lds_total_kib > 64.0 and LDS_A_ELEMS <= LDS_H_ELEMS
+    assert not (_lds_total_kib > 64.0 and not ALIAS_A_ONTO_H), (
+        f"fused LDS {_lds_total_kib:.0f} KiB > 64 KiB and lds_A ({LDS_A_ELEMS}) "
+        f"does not fit lds_h ({LDS_H_ELEMS}) to alias (BV={BV}, K={K})"
+    )
+
+    if ALIAS_A_ONTO_H:
+        @fx.struct
+        class SharedStorage:
+            lds_w: fx.Array[fx.BFloat16, LDS_W_ELEMS, 16]
+            lds_kt: fx.Array[fx.BFloat16, LDS_KT_ELEMS, 16]
+            lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
+            lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
+            lds_vn_raw: fx.Array[fx.BFloat16, LDS_VN_RAW_ELEMS, 16]
+    else:
+        @fx.struct
+        class SharedStorage:
+            lds_w: fx.Array[fx.BFloat16, LDS_W_ELEMS, 16]
+            lds_kt: fx.Array[fx.BFloat16, LDS_KT_ELEMS, 16]
+            lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
+            lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
+            lds_A: fx.Array[fx.BFloat16, LDS_A_ELEMS, 16]
+            lds_vn_raw: fx.Array[fx.BFloat16, LDS_VN_RAW_ELEMS, 16]
 
     # Cooperative load parameters (bf16x8 = dwordx4) -- identical to K5.
     LOAD_VEC_WIDTH = 8
@@ -242,8 +272,13 @@ def compile_chunk_gated_delta_h_o_gfx942(
         lds_kt_ptr = lds.lds_kt.ptr
         lds_vnt_ptr = lds.lds_vnt.ptr
         lds_h_ptr = lds.lds_h.ptr
-        lds_A_ptr = lds.lds_A.ptr
         lds_vn_raw_ptr = lds.lds_vn_raw.ptr
+        # lds_A aliases lds_h when LDS is tight (BV=64): GEMM3 (last lds_h reader)
+        # runs before GEMM4a (lds_A writer), separated by a barrier below.
+        if const_expr(ALIAS_A_ONTO_H):
+            lds_A_ptr = lds_h_ptr
+        else:
+            lds_A_ptr = lds.lds_A.ptr
         # q aliases w: w is dead after GEMM1, q is loaded after GEMM2.
         lds_q_ptr = lds_w_ptr
 
@@ -687,7 +722,9 @@ def compile_chunk_gated_delta_h_o_gfx942(
             gpu.barrier()
 
             # -- GEMM3: o = q @ h^T  (contraction over K) --
-            # Same fragment structure as GEMM1: A-frag=q (like w), B-frag=h.
+            # Run FIRST so lds_h is fully consumed before GEMM4a writes lds_A;
+            # this is what lets Lever 2 alias lds_A onto the (now-dead) lds_h at
+            # BV=64. Same fragment structure as GEMM1: A-frag=q, B-frag=h.
             # Output o_accs[nr][e] = o[m=wid_m*16+lane_m_base*4+e, n=nr*16+lane_n].
             o_accs = []
             for _nr in range_constexpr(N_REPEAT_LOCAL):
@@ -707,19 +744,19 @@ def compile_chunk_gated_delta_h_o_gfx942(
                         )
                         o_accs[nr] = _mfma_bf16_16x16x16(qa_frag, hb_frag, o_accs[nr])
 
-            # -- GEMM4a: A = q @ k^T  (contraction over K) --
-            # A[i,j] = sum_k q[i,k] * k[j,k]. MFMA m=i (query row), n=j (key
-            # row), contraction=k. A-operand = q[i,k] (from lds_q, same frag as
-            # GEMM3). B-operand element e = k[j=lane_n, k_contract=
-            # kb*64+ks*16+lane_m_base*4+e].
-            #
-            # lds_kt is stored [K, BT] (BT contiguous), so the 4 contraction
-            # elements (consecutive K at fixed BT) are NOT contiguous -- they sit
-            # one lds_kt row apart. Gather them as 4 scalar reads and assemble the
-            # B-frag. (Phase 1: correctness first; this is the one non-vectorized
-            # LDS read in the K6 stage, a Phase-2 layout target.)
+            # When lds_A aliases lds_h, all waves must finish reading lds_h
+            # (GEMM1 + GEMM3 above) before GEMM4a overwrites it as lds_A.
+            if const_expr(ALIAS_A_ONTO_H):
+                gpu.barrier()
+
+            # -- GEMM4a: A = q @ k^T, fused per key-tile (compute -> gate/mask ->
+            #    store to lds_A -> free), so at most one f32x4 A tile is live. --
+            # A[i,j] = sum_k q[i,k]*k[j,k]. MFMA m=i (query row), n=j (key row),
+            # contraction=k. A-op = q[i,k] (lds_q); B-op element e = k[j=lane_n,
+            # k=kb*64+ks*16+lane_m_base*4+e]. lds_kt is [K,BT] (BT contiguous),
+            # so the 4 contraction elems are one row apart -> 4 scalar reads
+            # (Lever 3 target).
             def _kt_scalar(k_row, bt):
-                # one bf16 at lds_kt[k_row, bt]: group base + (bt % 4).
                 bt_g = bt // fx.Int32(4)
                 bt_e = bt % fx.Int32(4)
                 return fx.ptr_load(
@@ -727,18 +764,17 @@ def compile_chunk_gated_delta_h_o_gfx942(
                     result_type=T.bf16,
                 )
 
-            A_accs = []
-            for _bt_n in range_constexpr(BT_STEPS):
-                A_accs.append(fx.full(4, 0.0, fx.Float32))
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    q_row = wid_m * fx.Int32(16) + lane_n
-                    q_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
-                    qa_frag = fx.ptr_load(
-                        lds_q_ptr + _lds_w_idx(q_row, q_g), result_type=v4bf16_type
-                    )
-                    for bt_n in range_constexpr(BT_STEPS):
-                        bt_col = fx.Int32(bt_n * 16) + lane_n  # n = key row j
+            for bt_n in range_constexpr(BT_STEPS):
+                a_acc = fx.full(4, 0.0, fx.Float32)
+                bt_col = fx.Int32(bt_n * 16) + lane_n  # n = key row j
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for ks in range_constexpr(K_STEPS_PER_BLOCK):
+                        q_row = wid_m * fx.Int32(16) + lane_n
+                        q_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
+                        qa_frag = fx.ptr_load(
+                            lds_q_ptr + _lds_w_idx(q_row, q_g),
+                            result_type=v4bf16_type,
+                        )
                         kb_frag = fx.Vector.from_elements(
                             [
                                 _kt_scalar(
@@ -751,72 +787,38 @@ def compile_chunk_gated_delta_h_o_gfx942(
                             ],
                             dtype=fx.BFloat16,
                         )
-                        A_accs[bt_n] = _mfma_bf16_16x16x16(qa_frag, kb_frag, A_accs[bt_n])
+                        a_acc = _mfma_bf16_16x16x16(qa_frag, kb_frag, a_acc)
 
-            # -- GEMM4a gate + causal mask, then stage A into lds_A --
-            # A[i,j] *= exp(g_i - g_j) for j<=i, else 0.  Row i owned by this
-            # lane's accumulator: i = wid_m*16 + lane_m_base*4 + e.  Col
-            # j = bt_n*16 + lane_n.  g_i are this wave's g_row_raw (4 rows);
-            # g_j must be gathered per (bt_n, lane_n).
-            if const_expr(USE_G):
-                for bt_n in range_constexpr(BT_STEPS):
-                    # g at column token j = bt_n*16 + lane_n
-                    col_tok = fx.Int32(bt_n * 16) + lane_n
-                    col_abs = i_t_i32 * fx.Int32(BT) + col_tok
+                # gate (USE_G only) + causal mask, then store this tile to lds_A.
+                # acc element e is the query ROW i = wid_m*16+lane_m_base*4+e;
+                # column j = bt_n*16+lane_n is fixed per lane.
+                col_abs = i_t_i32 * fx.Int32(BT) + bt_col
+                if const_expr(USE_G):
                     col_safe = (col_abs < T_local).select(col_abs, fx.Int32(0))
                     g_col = _as_f32(g_[fx.Int64(i_h * T_flat + (bos + col_safe))])
-                    a_elems = []
-                    for e in range_constexpr(4):
-                        row_tok = (
-                            wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
-                        )
-                        row_abs = i_t_i32 * fx.Int32(BT) + row_tok
-                        causal = (row_tok >= col_tok) & (row_abs < T_local) & (
-                            col_abs < T_local
-                        )
+                for e in range_constexpr(4):
+                    row_tok = (
+                        wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
+                    )
+                    row_abs = i_t_i32 * fx.Int32(BT) + row_tok
+                    causal = (row_tok >= bt_col) & (row_abs < T_local) & (
+                        col_abs < T_local
+                    )
+                    if const_expr(USE_G):
                         gate = _fast_exp(g_row_raw[e] - g_col)
-                        a_val = A_accs[bt_n][e] * causal.select(gate, fx.Float32(0.0))
-                        a_elems.append(a_val)
-                    A_masked = fx.Vector.from_elements(a_elems, dtype=fx.Float32)
-                    # Store to lds_A[row, col]: row = wid_m*16 + lane_m_base*4 + e
-                    # (4 consecutive rows = one row-group is NOT what we have;
-                    # accumulator element e is the ROW here, col fixed per lane),
-                    # so this is a transposed store like the h snapshot: the 4
-                    # e-elements are 4 consecutive ROWS at fixed col.  Write each
-                    # scalar (Phase 1: correctness over width).
-                    for e in range_constexpr(4):
-                        a_row = wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
-                        a_col = fx.Int32(bt_n * 16) + lane_n
-                        a_g = a_col // fx.Int32(4)
-                        a_e = a_col % fx.Int32(4)
-                        fx.ptr_store(
-                            _to_bf16_fast(A_masked[e]),
-                            lds_A_ptr + _lds_A_idx(a_row, a_g) + a_e,
-                        )
-            else:
-                # gk path: no output gate; still causal-mask A.
-                for bt_n in range_constexpr(BT_STEPS):
-                    col_tok = fx.Int32(bt_n * 16) + lane_n
-                    col_abs = i_t_i32 * fx.Int32(BT) + col_tok
-                    for e in range_constexpr(4):
-                        row_tok = (
-                            wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
-                        )
-                        row_abs = i_t_i32 * fx.Int32(BT) + row_tok
-                        causal = (row_tok >= col_tok) & (row_abs < T_local) & (
-                            col_abs < T_local
-                        )
-                        a_val = A_accs[bt_n][e] * causal.select(
+                        a_val = a_acc[e] * causal.select(gate, fx.Float32(0.0))
+                    else:
+                        # gk path: no output gate; causal mask only.
+                        a_val = a_acc[e] * causal.select(
                             fx.Float32(1.0), fx.Float32(0.0)
                         )
-                        a_row = wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
-                        a_col = fx.Int32(bt_n * 16) + lane_n
-                        a_g = a_col // fx.Int32(4)
-                        a_e = a_col % fx.Int32(4)
-                        fx.ptr_store(
-                            _to_bf16_fast(a_val),
-                            lds_A_ptr + _lds_A_idx(a_row, a_g) + a_e,
-                        )
+                    a_row = row_tok
+                    a_g = bt_col // fx.Int32(4)
+                    a_e = bt_col % fx.Int32(4)
+                    fx.ptr_store(
+                        _to_bf16_fast(a_val),
+                        lds_A_ptr + _lds_A_idx(a_row, a_g) + a_e,
+                    )
 
             # -- Inter-chunk gate on o: o *= exp(g_row) (per query row) --
             if const_expr(USE_G):

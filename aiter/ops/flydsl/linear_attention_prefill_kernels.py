@@ -707,18 +707,15 @@ _compiled_fused_kernels: dict = {}
 
 
 def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
-    """BV for the fused kernel, constrained to NR_SPLIT==1 (Phase 1).
+    """BV for the fused kernel (NR_SPLIT==1; wave-widened variants deferred).
 
-    The fused kernel does not yet support wave-widened variants, so the K5
-    tuned table (which can return bv64w8) is bypassed here. An explicit
-    ``variant`` is honoured if it is a plain bvNN tag; otherwise the largest
-    legal BV whose grid clears the fill bar is chosen, then capped at 32 so
-    the extra lds_A buffer fits the 64 KiB LDS budget at K=128.
+    Phase 2 (Lever 2) enabled BV=64: the kernel aliases ``lds_A`` onto the dead
+    ``lds_h`` region, so all three of {16, 32, 64} now fit the 64 KiB LDS budget
+    at K=128. The K5 tuned table (which can emit ``bv64w8``) is still bypassed --
+    the fused kernel has no wave-widened path yet. An explicit ``variant`` is
+    honoured; otherwise the largest legal BV whose grid clears the fill bar wins.
     """
-    # Phase 1 caps BV at 32: the fused kernel adds lds_A (BT*BT*2 = 8 KiB) and
-    # lds_vn_raw (BV*BT*2) on top of the four K5 buffers, so BV=64 overflows the
-    # 64 KiB/CU LDS budget at K=128. Phase 2 revisits BV=64 via LDS aliasing.
-    _FUSED_MAX_BV = 32
+    _FUSED_MAX_BV = 64
     legal = sorted(
         (b for b in _legal_bv_candidates(V) if b <= _FUSED_MAX_BV), reverse=True
     )
@@ -728,12 +725,6 @@ def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
         )
     if variant is not None:
         bv = _bv_of_variant(variant)
-        if bv > _FUSED_MAX_BV:
-            raise NotImplementedError(
-                f"fused GDN K5+K6 variant {variant!r} (BV={bv}) is not supported "
-                f"in Phase 1: BV>{_FUSED_MAX_BV} overflows the LDS budget with the "
-                f"added lds_A/lds_vn_raw buffers. Use bv16 or bv32."
-            )
         if bv not in legal:
             raise ValueError(
                 f"fused GDN K5+K6 variant {variant!r} illegal for V={V}; "

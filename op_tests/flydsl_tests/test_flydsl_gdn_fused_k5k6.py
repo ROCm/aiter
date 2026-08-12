@@ -135,15 +135,15 @@ def _reference_o(inp, *, scale, use_exp2):
 # --------------------------------------------------------------------------- #
 # Unit test: fused wrapper vs reference
 # --------------------------------------------------------------------------- #
-# Phase 1 supports BV in {16, 32} (bv64 overflows LDS with the added
-# lds_A / lds_vn_raw buffers). ``None`` exercises the auto BV heuristic.
+# BV in {16, 32, 64} are all supported (Phase 2 Lever 2 enabled bv64 by aliasing
+# lds_A onto the dead lds_h region). ``None`` exercises the auto BV heuristic.
 @pytest.mark.parametrize("gate", ["g", "gk"])
 @pytest.mark.parametrize(
     "H,Hg",
     [(12, 12), (24, 24), (4, 2)],  # MHA (KDA), MHA (KDA TP4), GQA (GDN)
 )
 @pytest.mark.parametrize("seq_lens", [[512], [512, 512], [640, 384, 512]])
-@pytest.mark.parametrize("variant", ["bv16", "bv32", None])
+@pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", None])
 def test_fused_unit(gate, H, Hg, seq_lens, variant):
     """Fused wrapper output matches pure-PyTorch K5 ref + Triton K6."""
     K = V = 128
@@ -191,21 +191,6 @@ def test_fused_final_state():
     assert fs_fused is not None
     ratio = _rmse_ratio(fs_fused, fs_ref)
     assert ratio < _RMSE_TOL, f"final_state mismatch: rmse_ratio={ratio:.3e}"
-
-
-def test_fused_bv64_not_implemented():
-    """Phase 1: an explicit bv64 request raises NotImplementedError (LDS budget)."""
-    H = Hg = 12
-    K = V = 128
-    seq_lens = [512]
-    inp = _make_inputs(H, Hg, K, V, sum(seq_lens), seq_lens, "g")
-    with pytest.raises(NotImplementedError):
-        chunk_gated_delta_rule_fwd_h_o_flydsl(
-            q=inp["q"], k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-            g=inp["g"], scale=K ** -0.5, initial_state=inp["h0"],
-            output_final_state=False, cu_seqlens=inp["cu"], use_exp2=False,
-            variant="bv64",
-        )
 
 
 # --------------------------------------------------------------------------- #

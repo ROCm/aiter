@@ -111,6 +111,38 @@ _IMPL_KEYS = (
     "K5K6_flydsl_fused",
 )
 
+# Fused K5+K6 kernel variants (BV = V-tile width). ``auto`` defers to the
+# kernel's shape-adaptive BV selection (the historical single-row behaviour).
+# All of {bv16, bv32, bv64} are supported (Phase 2 enabled bv64 by aliasing
+# lds_A onto lds_h). These variants apply ONLY to K5K6_flydsl_fused -- the
+# separate paths are not variant-parametrized here.
+FUSED_PREFIX = "K5K6_flydsl_fused"
+AUTO_VARIANT = "auto"
+FUSED_VARIANTS = ("bv16", "bv32", "bv64")
+
+
+def _fused_auto_variant_for_shape(shape, cu) -> str | None:
+    """The bv tag the fused kernel's auto BV selection picks for this shape.
+
+    Lets the auto row's label show the concrete instance it actually ran, e.g.
+    ``K5K6_flydsl_fused (bv32)`` -- so a sweep records what ran, and the auto
+    row is directly comparable to an explicit ``--fused-variants`` row. Returns
+    None if it cannot be determined (label then stays the bare prefix).
+    """
+    _tag, H, Hg, T_flat, N, _K, V, _BT, gate, _pat = shape
+    try:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            _fused_bv_for_shape,
+        )
+
+        bv = _fused_bv_for_shape(
+            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
+            is_varlen=cu is not None, gate=gate, variant=None,
+        )
+        return f"bv{bv}"
+    except Exception:
+        return None
+
 
 def _make_q(shape, device="cuda"):
     """Query tensor [B, T_flat, Hg, K] matching the k layout in _make_inputs."""
@@ -146,8 +178,26 @@ def _separate_runner(k5_fn, k6_fn, is_hip=False):
     return _run
 
 
-def _load_impls(which: str) -> dict:
+def _make_fused_runner(fused_fn, variant):
+    """Closure running the fused K5+K6 kernel with a fixed ``variant`` (or None
+    for auto). Returns o. ``variant`` is baked in so each row benchmarks exactly
+    one BV tag."""
+    def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
+        meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
+        fused_fn(
+            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
+            initial_state=h0, output_final_state=True,
+            cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
+            prefill_metadata=meta, variant=variant,
+        )
+        return o
+    return _run
+
+
+def _load_impls(which: str, fused_variants: list[str] | None = None) -> dict:
     requested = {s.strip() for s in which.split(",")} if which != "all" else None
+    if fused_variants is None:
+        fused_variants = [AUTO_VARIANT]
 
     def _want(name):
         return requested is None or name in requested
@@ -204,18 +254,25 @@ def _load_impls(which: str) -> dict:
                 chunk_gated_delta_rule_fwd_h_o_flydsl,
             )
 
-            def _fused_run(*, q, k, w, u, g, gk, h0, cu, scale, o,
-                           _fn=chunk_gated_delta_rule_fwd_h_o_flydsl):
-                meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
-                _fn(
-                    q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
-                    initial_state=h0, output_final_state=True,
-                    cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
-                    prefill_metadata=meta,
+            tags = list(fused_variants)
+            if tags == ["all"]:
+                tags = list(FUSED_VARIANTS)
+            for tag in tags:
+                if tag == AUTO_VARIANT:
+                    # variant=None -> the kernel's shape-adaptive BV selection.
+                    # Keyed as the bare impl name (historical single-row label).
+                    impls[FUSED_PREFIX] = _make_fused_runner(
+                        chunk_gated_delta_rule_fwd_h_o_flydsl, None
+                    )
+                    continue
+                if tag not in FUSED_VARIANTS:
+                    raise SystemExit(
+                        f"[error] unknown fused variant {tag!r}; available: "
+                        f"{list(FUSED_VARIANTS)} (or {AUTO_VARIANT!r})."
+                    )
+                impls[f"{FUSED_PREFIX}:{tag}"] = _make_fused_runner(
+                    chunk_gated_delta_rule_fwd_h_o_flydsl, tag
                 )
-                return o
-
-            impls["K5K6_flydsl_fused"] = _fused_run
         except ImportError as e:
             warnings.warn(f"FlyDSL fused K5+K6 not available: {e}")
 
@@ -273,19 +330,33 @@ def _run_one(idx, impls, shape, args, cfg) -> dict:
     results_by_impl: dict = {}
     o_ref = None
 
+    # Relabel the auto fused row (bare "K5K6_flydsl_fused") to reveal the concrete
+    # BV instance it runs for THIS shape, e.g. "K5K6_flydsl_fused (bv32)", so the
+    # sweep records what actually ran -- like the explicit-variant rows. The base
+    # name is kept (only a suffix is added). ``baseline_name`` still matches the
+    # original key, so the speedup baseline is unaffected.
+    auto_display = None
+    if FUSED_PREFIX in impls:
+        resolved = _fused_auto_variant_for_shape(shape, cu)
+        if resolved:
+            auto_display = f"{FUSED_PREFIX} ({resolved})"
+
     for impl_name, fn in impls.items():
-        print(f"  {impl_name}...", end=" ", flush=True)
+        display_name = (
+            auto_display if (impl_name == FUSED_PREFIX and auto_display) else impl_name
+        )
+        print(f"  {display_name}...", end=" ", flush=True)
         closure = _make_closure(fn, q, k, w_hm, u_hm, g, gk, h0, cu, scale, o)
         try:
             closure()
             torch.cuda.synchronize()
         except NotImplementedError as e:
             print("NOT_IMPL")
-            results_by_impl[impl_name] = {"error": f"NOT_IMPL: {e}"}
+            results_by_impl[display_name] = {"error": f"NOT_IMPL: {e}"}
             continue
         except Exception as e:
             print(f"PROBE-FAIL: {e}")
-            results_by_impl[impl_name] = {"error": str(e)}
+            results_by_impl[display_name] = {"error": str(e)}
             continue
 
         # Cross-impl verification: first successful impl is the reference.
@@ -317,7 +388,7 @@ def _run_one(idx, impls, shape, args, cfg) -> dict:
                 timing[mode] = f"ERROR: {e}"
                 tflops_d[mode] = None
 
-        results_by_impl[impl_name] = {
+        results_by_impl[display_name] = {
             "timing": timing, "tflops": tflops_d, "verify": verify_str,
         }
         if impl_name == baseline_name:
@@ -350,7 +421,7 @@ def _run_one(idx, impls, shape, args, cfg) -> dict:
 # Main
 # --------------------------------------------------------------------------- #
 def run(args):
-    impls = _load_impls(args.impl)
+    impls = _load_impls(args.impl, getattr(args, "fused_variants", None))
     if not impls:
         print("No implementations available.", file=sys.stderr)
         sys.exit(1)
@@ -431,12 +502,37 @@ def main():
                         help=f"Comma-separated impls: {', '.join(_IMPL_KEYS)}. Default: all.")
     parser.add_argument("--baseline", default="K5_flydsl+K6_triton", choices=_IMPL_KEYS,
                         help="Speedup baseline (default: K5_flydsl+K6_triton).")
+    parser.add_argument(
+        "--fused-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
+        help=(
+            "Comma-separated FUSED-kernel BV-variant tags to benchmark, each as "
+            "its own row (see --list-fused-variants). 'all' runs every variant; "
+            "'auto' (default) defers to the kernel's shape-adaptive BV selection. "
+            "Applies only to K5K6_flydsl_fused; the separate K5+K6 paths are not "
+            "variant-parametrized."
+        ),
+    )
+    parser.add_argument("--list-fused-variants", action="store_true",
+                        help="List the fused-kernel BV variants and exit.")
     parser.add_argument("--gate", default="all", choices=("g", "gk", "all"),
                         help="Filter shapes by gate type.")
     add_timing_args(parser)
     add_output_args(parser)
     add_verification_args(parser)
     args = parser.parse_args()
+
+    if args.list_fused_variants:
+        print("Fused GDN K5+K6 kernel BV variants:")
+        for v in FUSED_VARIANTS:
+            note = "  (aliases lds_A onto lds_h to fit LDS)" if v == "bv64" else ""
+            print(f"    {v}{note}")
+        print(f"  * {AUTO_VARIANT}  (shape-adaptive: picks a BV per shape)")
+        return
+
+    # Resolve the requested fused variants (comma list); validated in _load_impls.
+    args.fused_variants = [
+        v.strip() for v in args.fused_variants.split(",") if v.strip()
+    ] or [AUTO_VARIANT]
 
     if args.list:
         print(f"{'#':>3}  {'label':<60}  gate")
