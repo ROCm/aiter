@@ -536,12 +536,18 @@ def make_b_loader(
     sw_read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
 
     # ---- per-lane N addressing -------------------------------------------------
-    if const_expr(_is_int4):
-        # int4 groupwise scale is the OLD-kernel (E, G//2, N, 2) layout: its N index is
-        # WITHIN the expert, so the expert term is a separate G//2*N_OUT stride.
-        scale_expert_base = rocdl.readfirstlane(
-            T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
-        )
+    # int4 groupwise scale is the OLD-kernel (E, G//2, N, 2) layout: its N index is
+    # WITHIN the expert, so the expert term is a separate G//2*N_OUT stride. Materialized
+    # on first use (not here): it is loop-invariant, and emitting it up front instead
+    # perturbs downstream scheduling in the int4 upconvert loop.
+    _scale_base = []
+
+    def scale_expert_base():
+        if not _scale_base:
+            _scale_base.append(
+                rocdl.readfirstlane(T.i32, _raw(e * fx.Int32(_g_half * N_OUT)))
+            )
+        return _scale_base[0]
 
     def _sum(first, terms):
         v = first
@@ -713,7 +719,7 @@ def make_b_loader(
             _k0_blk = ku // 4
             adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
             pair_idx = adj_ku // fx.Int32(2)
-            dword = scale_expert_base + pair_idx * fx.Int32(N_OUT) + n_full
+            dword = scale_expert_base() + pair_idx * fx.Int32(N_OUT) + n_full
             packed = _buffer_i32_scalar_read(sw_tiles, dword, sw_read_atom)
             # even adj_ku -> low bf16, odd -> high.
             lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
