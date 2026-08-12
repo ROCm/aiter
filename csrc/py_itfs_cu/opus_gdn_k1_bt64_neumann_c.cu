@@ -22,11 +22,16 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
     int B,
     int T,
     int H,
+    int Hg,
     hipStream_t stream) {
     if (ptr_k == nullptr || ptr_g == nullptr || ptr_beta == nullptr
         || ptr_c == nullptr || ptr_g_cumsum == nullptr
         || B <= 0 || T <= 0 || H <= 0
         || H > std::numeric_limits<int>::max() / (64 * 128)) {
+        return hipErrorInvalidValue;
+    }
+    // H value heads share Hg key heads; Hg == H is plain MHA.
+    if (Hg <= 0 || Hg > H || H % Hg != 0) {
         return hipErrorInvalidValue;
     }
 
@@ -66,6 +71,7 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
         B,
         T,
         H,
+        Hg,
         NT};
 
     hipLaunchKernelGGL(

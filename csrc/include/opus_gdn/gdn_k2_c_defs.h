@@ -13,8 +13,8 @@
 
 struct gdn_k2_c_kargs {
     // Token-major dense inputs.
-    const void* __restrict__ ptr_q;       // [B, T, H, K]   bf16
-    const void* __restrict__ ptr_k;       // [B, T, H, K]   bf16
+    const void* __restrict__ ptr_q;       // [B, T, Hg, K]  bf16
+    const void* __restrict__ ptr_k;       // [B, T, Hg, K]  bf16
     const void* __restrict__ ptr_v;       // [B, T, H, V]   bf16
     const void* __restrict__ ptr_c;       // [B, T, H, BT]  bf16, C=(I+L)^-1
     const void* __restrict__ ptr_beta;    // [B, T, H]      fp32
@@ -25,6 +25,7 @@ struct gdn_k2_c_kargs {
     int B;
     int T;
     int H;
+    int Hg;  // key/query heads; H / Hg value heads share one, Hg == H for MHA
     int K;
     int V;
     int NT;

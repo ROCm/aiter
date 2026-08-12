@@ -14,7 +14,7 @@
 #include <hip/hip_runtime.h>
 
 struct gdn_k1_neumann_c_kargs {
-    const void* __restrict__ ptr_k;       // bf16 [B, T, H, 128]
+    const void* __restrict__ ptr_k;       // bf16 [B, T, Hg, 128]
     const void* __restrict__ ptr_g;       // fp32 [B, T, H]
     const void* __restrict__ ptr_beta;    // fp32 [B, T, H]
     void* __restrict__ ptr_c;             // bf16 [B, T, H, 64]
@@ -22,6 +22,7 @@ struct gdn_k1_neumann_c_kargs {
     int B;
     int T;
     int H;
+    int Hg;  // key heads; H / Hg value heads share one key head, Hg == H for MHA
     int NT;                               // ceil(T / 64), per batch
 };
 
@@ -72,6 +73,17 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
         static_cast<int64_t>(i_b) * kargs.T + chunk_start;
     const int64_t global_head_base =
         global_token_base * kargs.H + i_h;
+    // k is the only key-head input; g/beta/g_cumsum/C stay value-head indexed.
+    // GQA lets H / Hg value heads share one key head, and the uniform Hg == H
+    // branch keeps MHA on its original address arithmetic.
+    const int Hg = kargs.Hg;
+    int64_t global_key_head_base = global_head_base;
+    int k_token_stride = kargs.H * K;
+    if (Hg != kargs.H) {
+        const int i_hg = i_h / (kargs.H / Hg);
+        global_key_head_base = global_token_base * Hg + i_hg;
+        k_token_stride = Hg * K;
+    }
 
     // Dynamic LDS supplied by the host is the existing BT64 K1 trait size
     // (18176 bytes). The live data below peaks at the phase-1 K allocation:
@@ -130,7 +142,7 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
     // ---------------------------------------------------------------------
     const D_ATTN* k_base =
         reinterpret_cast<const D_ATTN*>(kargs.ptr_k)
-        + global_head_base * K;
+        + global_key_head_base * K;
     constexpr int K_VECS_PER_ROW = K / 8;
     for (int i = tid; i < BT * K_VECS_PER_ROW; i += BS) {
         const int row = i / K_VECS_PER_ROW;
@@ -139,7 +151,7 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
         v8bf16_t value{};
         if (token < kargs.T) {
             value = *reinterpret_cast<const v8bf16_t*>(
-                &k_base[row * kargs.H * K + col]);
+                &k_base[row * k_token_stride + col]);
         }
         *reinterpret_cast<v8bf16_t*>(&s_k[row * K_STRIDE + col]) =
             value;

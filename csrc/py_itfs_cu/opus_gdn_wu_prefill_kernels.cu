@@ -601,11 +601,6 @@ void launch_gdn_prefill_impl(
             return;
         }
     }
-    // Only the split (WS) K2 family carries key-head addressing; the fused
-    // kernel below reads q/k with the value-head stride.
-    TORCH_CHECK(!is_gqa,
-                "GQA (Hg != H) requires the W/U split path; select k2_mode=2 "
-                "(WS)");
     // Runtime A/B switch for the gfx942 dense fused W/U kernel.  The public
     // wrapper above guarantees complete BT and BV tiles; split K2 has already
     // returned, so none of its scan/output specializations are affected.
@@ -756,8 +751,6 @@ void opus_gdn_wu_prefill_fwd(
     if (is_gqa) {
         TORCH_CHECK(BT == 64 && k1_algo == 1,
                     "GQA requires BT=64 and k1_algo=1 (Neumann)");
-        TORCH_CHECK(is_varlen || k2_mode == 2,
-                    "GQA requires the W/U split path; pass k2_mode=2 (WS)");
     }
     check_hip_tensor(o, "o");
     TORCH_CHECK(o.dim() == 4 && o.sizes() == v.sizes(),

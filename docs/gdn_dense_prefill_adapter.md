@@ -65,8 +65,11 @@ sequence 都 64 对齐时，K6 保留 varlen metadata 寻址但移除 token-tail
 
 `path="auto"` 在已验证的 gfx942/80-CU 环境选择 WS；`path="wu"` 和
 `path="ws"` 可显式选择该路径（gfx942/gfx950）。packed varlen 暂不支持
-CF/CS/WF，显式请求会报错；auto 遇到 GQA/MQA、BF16 state、decode prefix、
-kernel 内 Q/K L2Norm、`use_exp2=False` 或其他未支持条件时仍原样回退 Triton。
+CF/CS/WF，显式请求会报错；auto 遇到 BF16 state、decode prefix、kernel 内
+Q/K L2Norm、`use_exp2=False` 或其他未支持条件时仍原样回退 Triton。GQA/MQA
+不会回退（Triton fallback 会按 value head 数读 q/k，结果是错的而不只是更慢）：
+auto 固定选 WS，因为 dense winner table 是在等 head 数上测的；显式指定家族
+时 WF/CF/CS 也都按 key head 寻址 q/k。
 WS 可复用与 `v` 完全相同的 output view；任何 partial overlap，以及 output 与
 `q/k` 等后续仍需读取的输入共享 storage，都会被拒绝。
 
@@ -173,6 +176,7 @@ shape 静默插值。
 
 Dense 非 64 对齐输入仅在显式 Opus 路径中由 wrapper padding；dense auto 仍只
 进入已验证的 64 对齐范围。Packed varlen 当前固定为 BT64 Neumann K1 + WS，
-只支持等 head 数和 FP32 state；BF16 state、GQA/MQA、内核内 Q/K L2Norm 和
-decode prefix 仍走现有实现。显式 Opus 路径若输入不受支持会直接报错，不会
-悄悄换成另一条实现。
+只支持 FP32 state；BF16 state、内核内 Q/K L2Norm 和 decode prefix 仍走现有
+实现。GQA/MQA 需要 BT=64 + `k1_algo=1`（只有 BT64 Neumann K1 按 key head
+读 k），dense 与 packed varlen 都可用；WS 的 GQA 走 reference state scan。
+显式 Opus 路径若输入不受支持会直接报错，不会悄悄换成另一条实现。

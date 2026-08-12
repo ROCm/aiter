@@ -293,17 +293,15 @@ def select_gdn_prefill_path(
         return "triton"
 
     if gqa:
-        # WS is the only family whose K1 / state scan / K6 all address q and k
-        # per key head, so GQA selects it regardless of the dense envelope.
-        if normalized_path in ("c", "cf", "cs", "wf"):
-            raise ValueError(
-                f"path={normalized_path!r} is unavailable: GQA is supported by "
-                "the W/U split (ws) path only"
-            )
         gqa_gfx, _ = _runtime_target(q)
         if gqa_gfx not in ("gfx942", "gfx950"):
             raise ValueError(f"GQA GDN prefill requires gfx942/gfx950, got {gqa_gfx}")
-        return "ws"
+        if not explicit:
+            # Every family now addresses q/k per key head, but the dense winner
+            # table below was measured on MHA shapes.  Auto therefore stays on
+            # the validated WS family; ask for a family explicitly to use the
+            # dense envelope with grouped value heads.
+            return "ws"
 
     gfx, cu_count = _runtime_target(q)
     if explicit:
@@ -319,7 +317,10 @@ def select_gdn_prefill_path(
     elif gfx != _MEASURED_GFX or cu_count != _MEASURED_CU_COUNT:
         return "triton"
 
-    B, T, H, _ = q.shape
+    # Grid size and the dense envelope both scale with the value heads, so the
+    # family selection below keys on v rather than on q's key-head count.
+    B, T, _, _ = q.shape
+    H = v.shape[2]
     if is_varlen:
         # Ragged workloads are not keys in the dense winner table.  The
         # metadata-aware native implementation is the W/U split family.

@@ -213,8 +213,8 @@ def opus_gdn_wu_prefill_fwd(
         k: [B, T, Hg, K] bf16
         v: [B, T, H, V] bf16. H must be a multiple of the q/k head count Hg;
             H > Hg selects GQA, where H / Hg value heads share one key head.
-            GQA is available on the WS path only (BT=64, k1_algo=1), and a
-            dense k2_mode=0 request is promoted to WS.
+            GQA requires the BT64 Neumann K1 (BT=64, k1_algo=1) and, on the
+            split path, the reference state scan.
         g: [B, T, H] — gate (log-space decay). BT64 Neumann kernels load
             bf16/fp32 directly; other dtypes are cast to fp32.
         beta: [B, T, H] — sigmoid gating. BT64 Neumann kernels load
@@ -299,14 +299,10 @@ def opus_gdn_wu_prefill_fwd(
             f"{OPUS_GDN_SUPPORTED_K2_MODES}"
         )
     if is_gqa:
-        # Only the WS family carries key-head addressing end to end (K1 reads k
-        # per key head, the reference state scan takes Hg, and K6 re-reads q/k
-        # with the key-head stride).
+        # Only the BT64 Neumann K1 reads k per key head; the legacy K1 variants
+        # would read it with the value-head stride.
         if BT != 64 or k1_algo != 1:
             raise ValueError("GQA requires BT=64 and k1_algo=1")
-        if k2_mode == OPUS_GDN_K2_WU_FUSED:
-            raise ValueError("GQA supports the WS path only")
-        k2_mode = OPUS_GDN_K2_SPLIT
     if k2_mode == OPUS_GDN_K2_SPLIT and BT != 64:
         raise ValueError("k2_mode=2 (WS) requires BT=64")
     if is_varlen:
