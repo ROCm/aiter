@@ -1858,10 +1858,7 @@ def mla_decode_stage1_opus_fwd_ds32(
 ) -> None: ...
 
 
-MD_NAME_OPUS = "module_opus_mla"
-
-
-@compile_ops(MD_NAME_OPUS, ffi_type="ctypes")
+@compile_ops("module_opus_mla", ffi_type="ctypes")
 def mla_decode_fwd_opus_stage1(
     q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
     kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)

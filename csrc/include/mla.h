@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <torch/extension.h>
-
 #include <cstddef>
 #include <cstdint>
 

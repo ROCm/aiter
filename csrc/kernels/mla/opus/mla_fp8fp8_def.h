@@ -143,7 +143,6 @@ struct mla_16mx8_32nx1_fp8fp8_ps_traits
     //       so we treat one 64-wide "128B-like" chunk per row. -----
     static constexpr int D_128B_ROPE_SIZE      = D_ROPE_SIZE; // 64
     static constexpr int smem_linear_wave_rope = WARP_SIZE * VEC_KV_ROPE_LD / sizeof(D_K);
-    ; // 4*64 = 256
     static constexpr int smem_d_rpt_rope   = 1;
     static constexpr int smem_padding_rope = 16 / sizeof(D_K); // 16
     // New rope layout: one warp per LDS line (4 tokens/line), NUM_WARPS lines
