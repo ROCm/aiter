@@ -761,8 +761,7 @@ void opus_moe_combine_bwd_token8_h2048_bf16(
 }
 
 // Stage dy only; dscore is reconstructed from the fused stage-2 epilogue.
-// Four tokens share one CTA and each wave writes two routes, halving the grid
-// relative to a dedicated wave for every route.
+// Two tokens share one CTA and each wave writes two routes.
 __global__ __launch_bounds__(512, 2)
 void opus_moe_combine_scale_token8_h2048_bf16_kernel(
     const __bf16* __restrict__ dout,
