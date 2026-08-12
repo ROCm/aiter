@@ -101,7 +101,10 @@ def _select_internal_fixed_route_pair(
         and enough_route_tiles
         and working_set_bytes > l2_friendly_bytes
     ):
-        return 11, 1
+        # Match the native full-pipeline selector: the BN256 route kernel
+        # halves dZ rereads when D is tile aligned, while BN128 remains the
+        # remainder-safe large-working-set path.
+        return (14 if w1.shape[2] % 256 == 0 else 11), 1
     return -1, -1
 
 

@@ -227,6 +227,34 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPadSortedOutput
     static constexpr bool WRITE_SORTED_ROUTES = true;
 };
 
+// Double the output-N tile so each dZ slab feeds twice as many columns.  Four
+// waves retain the 32-column MFMA mapping and each compute two N repeats; the
+// B transfer uses two direct-to-LDS vectors per lane to fill each padded
+// 4x256 row group.  Three route tiles balance W1 reuse against the extra N
+// accumulators without binding the geometry to a model tuple.
+struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPad
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPad
+{
+    static constexpr int B_N = 256;
+    static constexpr int E_N = 2;
+    static constexpr int ROUTE_COHORT_TILES = 6;
+    static constexpr int ROUTE_M_TILES = 3;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES =
+        SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
+    static constexpr int SMEM_B_GROUP_BYTES =
+        SMEM_B_GROUP_DATA_BYTES + SMEM_B_GROUP_PAD_BYTES;
+    static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
+    static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+    static_assert(B_N == T_N * W_N * E_N);
+};
+
+struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPadSortedOutput
+    : RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPad
+{
+    static constexpr bool WRITE_SORTED_ROUTES = true;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,

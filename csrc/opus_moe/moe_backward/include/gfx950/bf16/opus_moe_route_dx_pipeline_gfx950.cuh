@@ -348,35 +348,50 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
 
         constexpr int vectors_per_group =
             T::SMEM_B_GROUP_DATA_BYTES / (T::VEC_B * sizeof(D_B));
-        static_assert(vectors_per_group == opus::get_warp_size());
+        static_assert(vectors_per_group % opus::get_warp_size() == 0);
+        constexpr int b_loads_per_wave =
+            vectors_per_group / opus::get_warp_size();
+        constexpr int n_vectors = BN / T::VEC_B;
+        static_assert(opus::get_warp_size() % n_vectors == 0);
+        constexpr int source_rows_per_issue =
+            opus::get_warp_size() / n_vectors;
+        static_assert(source_rows_per_issue * b_loads_per_wave ==
+                      T::SMEM_B_GROUP_ROWS);
         constexpr int mfma_stage_groups =
             T::W_K / T::SMEM_B_GROUP_ROWS;
         constexpr int mfma_stage_bytes =
             mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
         constexpr int mfma_stage_rows = T::W_K;
-        const int b_local_k =
-            wave_id +
-            (lane_id / (BN / T::VEC_B)) * T::SMEM_B_GROUP_ROWS;
         const int b_local_n =
-            (lane_id % (BN / T::VEC_B)) * T::VEC_B;
-        const int b_global_offset =
-            (tile_k * BK + b_local_k) * stride_w1_i + col_base +
-            b_local_n;
+            (lane_id % n_vectors) * T::VEC_B;
         OPUS_LDS_ADDR char* b_wave_dst =
             reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
             wave_id * T::SMEM_B_GROUP_BYTES;
         opus::static_for<T::E_K>([&](auto stage) {
             constexpr int stage_offset =
                 stage.value * mfma_stage_bytes;
-            g_b.template _async_load<T::VEC_B>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(
-                    b_wave_dst + stage_offset),
-                (b_global_offset +
-                 stage.value * mfma_stage_rows * stride_w1_i) *
-                    sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
+            opus::static_for<b_loads_per_wave>([&](auto load) {
+                constexpr int load_byte_offset =
+                    load.value * opus::get_warp_size() * T::VEC_B *
+                    sizeof(D_B);
+                const int b_local_k =
+                    wave_id +
+                    ((lane_id / n_vectors) +
+                     load.value * source_rows_per_issue) *
+                        T::T_N;
+                const int b_global_offset =
+                    (tile_k * BK + b_local_k +
+                     stage.value * mfma_stage_rows) *
+                        stride_w1_i +
+                    col_base + b_local_n;
+                g_b.template _async_load<T::VEC_B>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(
+                        b_wave_dst + stage_offset + load_byte_offset),
+                    b_global_offset * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+            });
         });
     };
 
@@ -453,8 +468,12 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             __syncthreads();
         }
     }
-    static_assert(BM == 32 && BN == 128 && T::T_M == 1 && T::T_N == 4);
-    static_assert(T::E_M == 1 && T::E_N == 1 && T::VEC_C == 4);
+    static_assert(BM == 32 && T::T_M == 1 && T::T_N == 4);
+    static_assert(BN == T::T_N * T::W_N * T::E_N);
+    static_assert(T::E_M == 1 && T::VEC_C == 4);
+    static_assert(sizeof(typename decltype(mma)::vtype_c) /
+                          sizeof(D_ACC) ==
+                      16 * T::E_N);
     using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
 
     // A swap-ab MFMA lane owns four adjacent columns in each of four C
@@ -462,49 +481,55 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     // four columns.  Pair the two halves exactly as gfx950 Triton does:
     // eight packed BF16 dwords -> four permlane swaps -> two dwordx4 stores.
     const int local_m = lane_id % 32;
-    const int local_n0 = wave_id_n * 32 + (lane_id / 32) * 8;
-    const int local_n1 = local_n0 + 16;
     opus::static_for<RouteTiles>([&](auto route_group) {
-        uint32_t packed[8];
+        opus::static_for<T::E_N>([&](auto en) {
+            uint32_t packed[8];
 #pragma unroll
-        for(int i = 0; i < 8; ++i)
-            packed[i] = route_dx_cvt_pk_bf16_f32(
-                static_cast<float>(v_c[route_group.value][2 * i]),
-                static_cast<float>(v_c[route_group.value][2 * i + 1]));
+            for(int i = 0; i < 8; ++i)
+                packed[i] = route_dx_cvt_pk_bf16_f32(
+                    static_cast<float>(
+                        v_c[route_group.value][en.value * 16 + 2 * i]),
+                    static_cast<float>(
+                        v_c[route_group.value][en.value * 16 + 2 * i + 1]));
 
-        auto swap02 = __builtin_amdgcn_permlane32_swap(
-            packed[0], packed[2], false, true);
-        auto swap13 = __builtin_amdgcn_permlane32_swap(
-            packed[1], packed[3], false, true);
-        auto swap46 = __builtin_amdgcn_permlane32_swap(
-            packed[4], packed[6], false, true);
-        auto swap57 = __builtin_amdgcn_permlane32_swap(
-            packed[5], packed[7], false, true);
-        packed[0] = swap02[0];
-        packed[2] = swap02[1];
-        packed[1] = swap13[0];
-        packed[3] = swap13[1];
-        packed[4] = swap46[0];
-        packed[6] = swap46[1];
-        packed[5] = swap57[0];
-        packed[7] = swap57[1];
+            auto swap02 = __builtin_amdgcn_permlane32_swap(
+                packed[0], packed[2], false, true);
+            auto swap13 = __builtin_amdgcn_permlane32_swap(
+                packed[1], packed[3], false, true);
+            auto swap46 = __builtin_amdgcn_permlane32_swap(
+                packed[4], packed[6], false, true);
+            auto swap57 = __builtin_amdgcn_permlane32_swap(
+                packed[5], packed[7], false, true);
+            packed[0] = swap02[0];
+            packed[2] = swap02[1];
+            packed[1] = swap13[0];
+            packed[3] = swap13[1];
+            packed[4] = swap46[0];
+            packed[6] = swap46[1];
+            packed[5] = swap57[0];
+            packed[7] = swap57[1];
 
-        const int route_row =
-            smem_route_row[route_group.value * BM + local_m];
-        // smem_route_row is -1 for both the tail of the final sorted tile
-        // and token/slot sentinels.  D is an exact multiple of BN.
-        if(route_row >= 0)
-        {
-            const int64_t out_row =
-                static_cast<int64_t>(route_row) * stride_dx_route_r +
-                col_base;
-            *reinterpret_cast<u32x4*>(
-                kargs.d_x_route + out_row + local_n0) =
-                u32x4{packed[0], packed[1], packed[2], packed[3]};
-            *reinterpret_cast<u32x4*>(
-                kargs.d_x_route + out_row + local_n1) =
-                u32x4{packed[4], packed[5], packed[6], packed[7]};
-        }
+            const int route_row =
+                smem_route_row[route_group.value * BM + local_m];
+            // smem_route_row is -1 for both the tail of the final sorted tile
+            // and token/slot sentinels.  D is an exact multiple of BN.
+            if(route_row >= 0)
+            {
+                const int repeat_n = en.value * T::T_N * T::W_N;
+                const int local_n0 =
+                    repeat_n + wave_id_n * T::W_N + (lane_id / 32) * 8;
+                const int local_n1 = local_n0 + 16;
+                const int64_t out_row =
+                    static_cast<int64_t>(route_row) * stride_dx_route_r +
+                    col_base;
+                *reinterpret_cast<u32x4*>(
+                    kargs.d_x_route + out_row + local_n0) =
+                    u32x4{packed[0], packed[1], packed[2], packed[3]};
+                *reinterpret_cast<u32x4*>(
+                    kargs.d_x_route + out_row + local_n1) =
+                    u32x4{packed[4], packed[5], packed[6], packed[7]};
+            }
+        });
     });
 #else
     (void)kargs;

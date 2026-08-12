@@ -123,6 +123,7 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
     constexpr int legacy_kid = 5;
     constexpr int cohort4_m2_kid = 7;
     constexpr int cohort10_m5_kid = 9;
+    constexpr int bn256_m3_kid = 13;
     constexpr int output_n_tile = 128;
     // A cohort is useful only when there are enough route and N tiles to
     // trade a bounded amount of W1 reuse for much shorter dZ reuse distance.
@@ -145,8 +146,9 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
     const uint64_t w1_bytes =
         static_cast<uint64_t>(kargs.route.num_experts) * gate_up_dim *
         static_cast<uint64_t>(kargs.model_dim) * sizeof(hip_bfloat16);
-    return dz_bytes + w1_bytes > l2_friendly_bytes ? cohort10_m5_kid
-                                                   : cohort4_m2_kid;
+    if(dz_bytes + w1_bytes <= l2_friendly_bytes)
+        return cohort4_m2_kid;
+    return kargs.model_dim % 256 == 0 ? bn256_m3_kid : cohort10_m5_kid;
 }
 
 inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
@@ -586,23 +588,40 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
 
     // Large K>=4 route families benefit from keeping K2's output in natural
     // expert-sorted order and moving the inverse permutation to K3.  Reuse
-    // the existing working-set selector: kid 9 identifies the M5 path whose
-    // dZ+W1 footprint is beyond the L2-friendly regime.  Explicit selection
-    // of either half also completes the pair, while incompatible explicit
-    // pairs fail instead of silently interpreting the workspace incorrectly.
+    // the existing working-set selector: kids 9 and 13 identify the large M5
+    // and BN256-M3 paths whose dZ+W1 footprint exceeds the L2-friendly regime.
+    // Explicit selection of either half also completes the pair, while
+    // incompatible explicit pairs fail instead of silently interpreting the
+    // workspace incorrectly.
     constexpr int logical_route_dx_kid = 9;
     constexpr int sorted_route_dx_kid = 11;
+    constexpr int logical_bn256_route_dx_kid = 13;
+    constexpr int sorted_bn256_route_dx_kid = 14;
     constexpr int sorted_route_reduce_kid = 1;
+    const auto sorted_route_kid = [&](int logical_kid) {
+        return logical_kid == logical_bn256_route_dx_kid
+                   ? sorted_bn256_route_dx_kid
+                   : sorted_route_dx_kid;
+    };
+    const auto is_logical_large_route_kid = [&](int kid) {
+        return kid == logical_route_dx_kid ||
+               kid == logical_bn256_route_dx_kid;
+    };
+    const auto is_sorted_route_kid = [&](int kid) {
+        return kid == sorted_route_dx_kid ||
+               kid == sorted_bn256_route_dx_kid;
+    };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&
         route_reduce_kernel_id == kKernelAuto &&
-        selected_route_dx == logical_route_dx_kid && route_dx.route.topk >= 4;
+        is_logical_large_route_kid(selected_route_dx) &&
+        route_dx.route.topk >= 4;
     if(auto_sorted_route_pair)
     {
-        selected_route_dx = sorted_route_dx_kid;
+        selected_route_dx = sorted_route_kid(selected_route_dx);
         selected_route_reduce = sorted_route_reduce_kid;
     }
-    else if(route_dx_kernel_id == sorted_route_dx_kid &&
+    else if(is_sorted_route_kid(route_dx_kernel_id) &&
             route_reduce_kernel_id == kKernelAuto)
     {
         selected_route_reduce = sorted_route_reduce_kid;
@@ -610,12 +629,12 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     else if(route_reduce_kernel_id == sorted_route_reduce_kid &&
             route_dx_kernel_id == kKernelAuto)
     {
-        selected_route_dx = sorted_route_dx_kid;
+        selected_route_dx = sorted_route_kid(selected_route_dx);
     }
-    AITER_CHECK((selected_route_dx == sorted_route_dx_kid) ==
+    AITER_CHECK(is_sorted_route_kid(selected_route_dx) ==
                     (selected_route_reduce == sorted_route_reduce_kid),
-                "fixed route pipeline: sorted workspace kernel ids 11 and 1 "
-                "must be selected together");
+                "fixed route pipeline: a sorted route workspace kernel and "
+                "route-reduce kernel id 1 must be selected together");
 
     invoke(gfx950::dispatch_down_bwd(
                select_fixed_down_kernel_id(down, down_kernel_id)),
