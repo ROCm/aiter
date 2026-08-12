@@ -27,6 +27,7 @@ The atomic / ordered-store / fence / volatile-load ops stay on
 flydsl._mlir.dialects.llvm: the high-level FlyDSL API exposes no memory ordering,
 sync-scope, volatile, or non-temporal control, which these primitives require.
 """
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _rocdl_d
@@ -44,7 +45,9 @@ def _gptr(addr_i64):
 
 def _ptr_plus(base_i64, offset, elem_bytes):
     """Global pointer for base + offset*elem_bytes (offset may be i32 or i64)."""
-    addr = fx.Int64(arith.unwrap(base_i64)) + fx.Int64(arith.unwrap(offset)) * elem_bytes
+    addr = (
+        fx.Int64(arith.unwrap(base_i64)) + fx.Int64(arith.unwrap(offset)) * elem_bytes
+    )
     return _gptr(addr)
 
 
@@ -80,26 +83,14 @@ def store_i64_system(addr_i64, offset, val):
     )
 
 
-def _is_gfx12():
-    try:
-        from mori.jit.config import detect_gpu_arch
-
-        return detect_gpu_arch().startswith("gfx12")
-    except Exception:
-        return False
-
-
 def waitcnt_all():
     """Drain all outstanding memory counters (no cache management, unlike a
     release fence). gpu.barrier/s_barrier only syncs wavefronts and does NOT
     wait for in-flight memory ops, so this must precede a grid barrier when the
     stores before it need to be complete. gfx12/gfx1250 split the legacy
     s_waitcnt into per-kind counters."""
-    if _is_gfx12():
-        _rocdl_d.s_wait_storecnt(0)
-        _rocdl_d.s_wait_loadcnt(0)
-    else:
-        _rocdl_d.s_waitcnt(0)
+    _rocdl_d.s_wait_storecnt(0)
+    _rocdl_d.s_wait_loadcnt(0)
 
 
 def fence_system_acquire():
@@ -159,8 +150,7 @@ def load_v4i32_nt(base_i64, offset):
 
 def _spin(addr_i64, keep_waiting, *, width=32):
     """Spin on a volatile/atomic load at addr_i64 until keep_waiting(cur) is false;
-    returns the awaited value. Self-contained (mori's wait_until_* need ShmemStates
-    and cannot run on a cco-only stack)."""
+    returns the awaited value without higher-level shared-memory state."""
     if width == 64:
         ty, load, wrap = T.i64, load_i64_acquire, fx.Int64
     else:
