@@ -161,6 +161,9 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
     constexpr int pair_route_tiles_kid = 5;
     constexpr int triple_route_tiles_kid = 6;
     constexpr int five_route_tiles_bk32_kid = 8;
+    constexpr int five_route_tiles_predecoded_kid = 9;
+    constexpr uint64_t predecode_working_set_bytes =
+        192ull * 1024ull * 1024ull;
     const uint64_t z_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         2ull * static_cast<uint64_t>(kargs.inter_dim) *
@@ -173,7 +176,9 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
     // boundaries, so this is both exact and faster once the routed tensor no
     // longer fits in L2.  Odd part counts retain the K64 pair/triple kernels.
     if(kargs.d_scores_parts % 2 == 0)
-        return five_route_tiles_bk32_kid;
+        return z_bytes > predecode_working_set_bytes
+                   ? five_route_tiles_predecoded_kid
+                   : five_route_tiles_bk32_kid;
     return z_bytes > large_working_set_bytes ? triple_route_tiles_kid
                                              : pair_route_tiles_kid;
 }

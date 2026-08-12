@@ -277,7 +277,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     // GEMM operands die before the fused epilogue starts, so the FP32 dScore
     // scratch aliases the same LDS allocation.
     __shared__ __align__(16) char tile_storage[tile_storage_bytes];
-    __shared__ int32_t smem_packed_route[CTA_M];
+    __shared__ int32_t
+        smem_packed_route[T::PREDECODE_ROUTE_METADATA ? 1 : CTA_M];
+    __shared__ int32_t
+        smem_route_token[T::PREDECODE_ROUTE_METADATA ? CTA_M : 1];
+    __shared__ int32_t
+        smem_logical_route[T::PREDECODE_ROUTE_METADATA ? CTA_M : 1];
+    __shared__ float
+        smem_route_score[T::PREDECODE_ROUTE_METADATA ? CTA_M : 1];
 
     if(tid < CTA_M)
     {
@@ -286,21 +293,62 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             sorted_row < valid_rows && sorted_row < expert_end_row;
         const int32_t packed =
             row_in_range ? kargs.route.sorted_token_ids[sorted_row] : 0;
-        bool valid;
-        if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+        if constexpr(T::PREDECODE_ROUTE_METADATA)
         {
-            const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
-                kargs.route, packed, row_in_range);
-            valid = decoded.valid;
+            int token;
+            int slot;
+            int logical_route;
+            bool valid;
+            if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+            {
+                const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
+                    kargs.route, packed, row_in_range);
+                token = decoded.token;
+                slot = decoded.slot;
+                logical_route = decoded.logical;
+                valid = decoded.valid;
+            }
+            else
+            {
+                token = packed_token_id(packed);
+                slot = packed_topk_slot(packed);
+                valid = row_in_range && token < kargs.route.token_num &&
+                        slot < topk;
+                logical_route = valid ? token * topk + slot : -1;
+            }
+            float score = 0.0f;
+            if(valid)
+            {
+                if constexpr(T::ROUTE_LAYOUT ==
+                             RouteLayout::CompactRouteMajor)
+                    score = kargs.scores[logical_route];
+                else
+                    score = kargs.scores[
+                        static_cast<int64_t>(token) * stride_score_t + slot];
+            }
+            smem_route_token[tid] =
+                valid ? token : kargs.route.token_num;
+            smem_logical_route[tid] = valid ? logical_route : -1;
+            smem_route_score[tid] = score;
         }
         else
         {
-            const int token = packed_token_id(packed);
-            const int slot = packed_topk_slot(packed);
-            valid = row_in_range && token < kargs.route.token_num &&
-                    slot < topk;
+            bool valid;
+            if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+            {
+                const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
+                    kargs.route, packed, row_in_range);
+                valid = decoded.valid;
+            }
+            else
+            {
+                const int token = packed_token_id(packed);
+                const int slot = packed_topk_slot(packed);
+                valid = row_in_range && token < kargs.route.token_num &&
+                        slot < topk;
+            }
+            smem_packed_route[tid] = valid ? packed : -1;
         }
-        smem_packed_route[tid] = valid ? packed : -1;
     }
     __syncthreads();
 
@@ -359,12 +407,17 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                     const int a_element = a_vector * T::VEC_A;
                     const int local_m = a_element / BK;
                     const int local_k = a_element % BK;
-                    const int32_t packed = smem_packed_route[local_m];
                     int token;
                     bool valid;
-                    if constexpr(T::ROUTE_LAYOUT ==
-                                 RouteLayout::CompactRouteMajor)
+                    if constexpr(T::PREDECODE_ROUTE_METADATA)
                     {
+                        token = smem_route_token[local_m];
+                        valid = token < kargs.route.token_num;
+                    }
+                    else if constexpr(T::ROUTE_LAYOUT ==
+                                      RouteLayout::CompactRouteMajor)
+                    {
+                        const int32_t packed = smem_packed_route[local_m];
                         const auto decoded =
                             decode_sorted_route<T::ROUTE_LAYOUT>(
                                 kargs.route, packed, true);
@@ -373,6 +426,7 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                     }
                     else
                     {
+                        const int32_t packed = smem_packed_route[local_m];
                         token = packed_token_id(packed);
                         const int slot = packed_topk_slot(packed);
                         valid = token < kargs.route.token_num && slot < topk;
@@ -512,13 +566,20 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         const int sorted_row = route_base + local_m;
         const bool row_in_range =
             sorted_row < valid_rows && sorted_row < expert_end_row;
-        const int32_t packed = smem_packed_route[local_m];
         int token;
         int slot;
         int logical_route;
         bool valid;
-        if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+        if constexpr(T::PREDECODE_ROUTE_METADATA)
         {
+            token = smem_route_token[local_m];
+            logical_route = smem_logical_route[local_m];
+            valid = logical_route >= 0;
+            slot = valid ? logical_route - token * topk : 0;
+        }
+        else if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+        {
+            const int32_t packed = smem_packed_route[local_m];
             const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
                 kargs.route, packed, row_in_range);
             token = decoded.token;
@@ -528,21 +589,28 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
         else
         {
+            const int32_t packed = smem_packed_route[local_m];
             token = packed_token_id(packed);
             slot = packed_topk_slot(packed);
             valid = token < kargs.route.token_num && slot < topk;
             logical_route =
                 static_cast<int>(logical_route_id(token, slot, topk));
         }
-        float score = 0.0f;
-        if(valid)
+        float score;
+        if constexpr(T::PREDECODE_ROUTE_METADATA)
+            score = smem_route_score[local_m];
+        else
         {
-            if constexpr(T::ROUTE_LAYOUT ==
-                         RouteLayout::CompactRouteMajor)
-                score = kargs.scores[logical_route];
-            else
-                score = kargs.scores[
-                    static_cast<int64_t>(token) * stride_score_t + slot];
+            score = 0.0f;
+            if(valid)
+            {
+                if constexpr(T::ROUTE_LAYOUT ==
+                             RouteLayout::CompactRouteMajor)
+                    score = kargs.scores[logical_route];
+                else
+                    score = kargs.scores[
+                        static_cast<int64_t>(token) * stride_score_t + slot];
+            }
         }
         const down_bwd_f32x2 score2{score, score};
         const down_bwd_f32x2 one{1.0f, 1.0f};
@@ -652,10 +720,24 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 #pragma unroll
         for(int wave = 1; wave < T::T_N; ++wave)
             partial += smem_ds[wave * CTA_M + tid];
-        const int32_t packed = smem_packed_route[tid];
-        if constexpr(T::ROUTE_LAYOUT ==
-                     RouteLayout::CompactRouteMajor)
+        if constexpr(T::PREDECODE_ROUTE_METADATA)
         {
+            const int logical_route = smem_logical_route[tid];
+            if(logical_route >= 0)
+            {
+                if(kargs.d_scores_parts == 1)
+                    kargs.d_scores[logical_route] = partial;
+                else
+                    kargs.d_scores_workspace[
+                        static_cast<int64_t>(logical_route) *
+                            stride_ds_workspace_r +
+                        part] = partial;
+            }
+        }
+        else if constexpr(T::ROUTE_LAYOUT ==
+                          RouteLayout::CompactRouteMajor)
+        {
+            const int32_t packed = smem_packed_route[tid];
             const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
                 kargs.route, packed, true);
             if(decoded.valid)
@@ -672,6 +754,7 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
         else
         {
+            const int32_t packed = smem_packed_route[tid];
             const int token = packed_token_id(packed);
             const int slot = packed_topk_slot(packed);
             if(token < kargs.route.token_num && slot < topk)
