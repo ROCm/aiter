@@ -155,32 +155,32 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
     if(requested_kernel_id != kKernelAuto)
         return requested_kernel_id;
 
-    constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
-    constexpr uint64_t large_working_set_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 2;
-    constexpr int pair_route_tiles_kid = 5;
-    constexpr int triple_route_tiles_kid = 6;
-    constexpr int five_route_tiles_bk32_kid = 8;
     constexpr int five_route_tiles_predecoded_kid = 9;
-    constexpr uint64_t predecode_working_set_bytes =
-        192ull * 1024ull * 1024ull;
-    const uint64_t z_bytes =
-        static_cast<uint64_t>(kargs.route.sorted_capacity) *
-        2ull * static_cast<uint64_t>(kargs.inter_dim) *
-        sizeof(hip_bfloat16);
-    if(kargs.route.expert_offsets == nullptr || kargs.d_scores_parts <= 1 ||
-       z_bytes <= l2_friendly_bytes)
+    constexpr int six_route_tiles_predecoded_kid = 10;
+    constexpr uint64_t grouped_min_ctas = 256;
+    constexpr uint64_t six_route_min_ctas = 640;
+    if(kargs.route.expert_offsets == nullptr || kargs.d_scores_parts <= 1)
         return legacy_kid;
-    // BK32 leaves enough LDS to reuse W2 across five adjacent route tiles.
-    // An even number of d-score parts preserves the native K64 accumulation
-    // boundaries, so this is both exact and faster once the routed tensor no
-    // longer fits in L2.  Odd part counts retain the K64 pair/triple kernels.
-    if(kargs.d_scores_parts % 2 == 0)
-        return z_bytes > predecode_working_set_bytes
-                   ? five_route_tiles_predecoded_kid
-                   : five_route_tiles_bk32_kid;
-    return z_bytes > large_working_set_bytes ? triple_route_tiles_kid
-                                             : pair_route_tiles_kid;
+
+    // Select from the useful M6 launch geometry rather than a model tuple or
+    // an indirect tensor-byte proxy.  Each compact group owns up to six
+    // sorted route tiles; the extra expert groups preserve boundaries when a
+    // group straddles two experts.  Small grids need the legacy kernel's finer
+    // load balance, medium grids favor M5, and large grids have enough CTAs to
+    // amortize M6's wider W2 reuse without starving the 256 gfx950 CUs.
+    const uint64_t sorted_blocks =
+        static_cast<uint64_t>(kargs.route.sorted_block_capacity);
+    const uint64_t m6_groups =
+        (sorted_blocks + 5ull) / 6ull +
+        static_cast<uint64_t>(kargs.route.num_experts);
+    const uint64_t m6_ctas =
+        m6_groups * static_cast<uint64_t>(kargs.d_scores_parts);
+    if(m6_ctas < grouped_min_ctas)
+        return legacy_kid;
+    return m6_ctas < six_route_min_ctas
+               ? five_route_tiles_predecoded_kid
+               : six_route_tiles_predecoded_kid;
 }
 
 inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,

@@ -126,6 +126,13 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort20Predecoded
     static constexpr bool PREDECODE_ROUTE_METADATA = true;
 };
 
+struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM6Cohort24Predecoded
+    : DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort20Predecoded
+{
+    static constexpr int ROUTE_M_TILES = 6;
+    static constexpr int ROUTE_COHORT_TILES = 24;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>

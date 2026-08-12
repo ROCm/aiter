@@ -69,7 +69,8 @@ fallback when a genuinely different working-set regime needs it.
 | Family | Kid | Tile |
 | --- | ---: | --- |
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
-| K1 `down_bwd` large metadata working set | 9 | `BM32 x BN128 x BK32`, M5/twenty-route cohort + CTA-local route metadata |
+| K1 `down_bwd` medium grid | 9 | `BM32 x BN128 x BK32`, M5/twenty-route cohort + CTA-local route metadata |
+| K1 `down_bwd` large grid | 10 | `BM32 x BN128 x BK32`, M6/twenty-four-route cohort + CTA-local route metadata |
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
@@ -93,12 +94,15 @@ that threshold. Both BK32 tiles retain two-stage async loads while reducing
 their LDS allocation and VGPR count relative to kid 6. Degenerate grids and
 callers without expert offsets retain kid 5.
 
-K1 keeps token, logical-route, and score metadata CTA-local once the routed
-`Z` working set exceeds 192 MiB. Kid 9 then avoids repeating route decode and
-score loads in the gathered-dO producer and four fused epilogue waves while
-preserving the original BK32 MFMA and 128-column dScore reduction order.
-Smaller working sets retain kid 8 because the extra LDS metadata is not yet
-amortized.
+K1 auto-dispatch uses the useful M6 launch geometry instead of an exact model
+tuple or a tensor-byte proxy. It estimates
+`(ceil(sorted_block_capacity / 6) + E) * ceil(I / 128)` CTAs. Fewer than 256
+CTAs retain kid 2 for load balance, 256--639 CTAs use the predecoded M5 kid 9,
+and 640 or more use the predecoded M6 kid 10. Both grouped kernels keep token,
+logical-route, and score metadata CTA-local and preserve the BK32 MFMA and
+128-column dScore reduction order. M6 covers 192 route rows per CTA, making
+its gathered-dO vector work exactly three loads per thread; the CTA threshold
+prevents that wider reuse window from starving gfx950 on smaller grids.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
 tuple. Kid 10 is selected once the average padded expert interval reaches 2048
