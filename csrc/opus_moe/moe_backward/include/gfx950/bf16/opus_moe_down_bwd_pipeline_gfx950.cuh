@@ -34,11 +34,15 @@ using down_bwd_f32x2 = float __attribute__((ext_vector_type(2)));
 using down_bwd_f32x8 = float __attribute__((ext_vector_type(8)));
 using down_bwd_u32x4 = uint32_t __attribute__((ext_vector_type(4)));
 
-inline __device__ down_bwd_f32x8
-down_bwd_load_bf16x8(const hip_bfloat16* values)
+inline __device__ down_bwd_u32x4
+down_bwd_load_bf16x8_packed(const hip_bfloat16* values)
 {
-    const down_bwd_u32x4 packed =
-        *reinterpret_cast<const down_bwd_u32x4*>(values);
+    return *reinterpret_cast<const down_bwd_u32x4*>(values);
+}
+
+inline __device__ down_bwd_f32x8
+down_bwd_unpack_bf16x8(const down_bwd_u32x4& packed)
+{
     return down_bwd_f32x8{
         __builtin_bit_cast(float, packed[0] << 16),
         __builtin_bit_cast(float, packed[0] & 0xffff0000u),
@@ -646,11 +650,13 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 repeat * T::T_N * T::W_N + wave_id_n * T::W_N +
                 (lane_id / 32) * 8;
 
-            // Fetch both non-adjacent eight-column fragments before starting
-            // the activation math.  Four independent 128-bit loads replace
-            // eight serial 64-bit loads and overlap their global latency.
-            down_bwd_f32x8 z_gate_prefetch[2];
-            down_bwd_f32x8 z_up_prefetch[2];
+            // Keep all four 128-bit Z loads in flight, but retain their BF16
+            // payload in packed dwords.  Expanding only the group currently
+            // consumed by the activation epilogue halves the prefetch live
+            // range and avoids private-segment spills without serializing the
+            // global loads.
+            down_bwd_u32x4 z_gate_prefetch[2];
+            down_bwd_u32x4 z_up_prefetch[2];
 
             if(valid)
             {
@@ -661,8 +667,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                     const int64_t z_base =
                         static_cast<int64_t>(sorted_row) * stride_z_r + col;
                     z_gate_prefetch[group] =
-                        down_bwd_load_bf16x8(kargs.z + z_base);
-                    z_up_prefetch[group] = down_bwd_load_bf16x8(
+                        down_bwd_load_bf16x8_packed(kargs.z + z_base);
+                    z_up_prefetch[group] = down_bwd_load_bf16x8_packed(
                         kargs.z + z_base + inter_dim);
                 }
             }
@@ -679,6 +685,10 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 
                 if(valid)
                 {
+                    const down_bwd_f32x8 z_gate =
+                        down_bwd_unpack_bf16x8(z_gate_prefetch[group]);
+                    const down_bwd_f32x8 z_up =
+                        down_bwd_unpack_bf16x8(z_up_prefetch[group]);
 #pragma unroll
                     for(int pair = 0; pair < 4; ++pair)
                     {
@@ -686,11 +696,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         const int acc_idx =
                             repeat * 16 + group * 8 + elem;
                         const down_bwd_f32x2 z_gate_pair{
-                            z_gate_prefetch[group][elem],
-                            z_gate_prefetch[group][elem + 1]};
+                            z_gate[elem], z_gate[elem + 1]};
                         const down_bwd_f32x2 z_up_pair{
-                            z_up_prefetch[group][elem],
-                            z_up_prefetch[group][elem + 1]};
+                            z_up[elem], z_up[elem + 1]};
                         const down_bwd_f32x2 sigmoid{
                             down_bwd_sigmoid(z_gate_pair[0]),
                             down_bwd_sigmoid(z_gate_pair[1])};
