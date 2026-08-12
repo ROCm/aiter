@@ -3712,7 +3712,12 @@ def torch_moe_stage2(
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
     if doweight:
-        out = out * topk_weights.view(token_num, -1, 1)
+        # In-place: out and topk_weights are both fp32 (ctype), so this is
+        # numerically identical to `out = out * ...` but avoids allocating a
+        # second full (token_num, topk, model_dim) fp32 tensor. That transient
+        # is the largest single allocation in the stage-2 reference (tens of GiB
+        # for large-token FP4 shapes) and was the site of the CI OOM.
+        out.mul_(topk_weights.view(token_num, -1, 1))
     return out.sum(1).to(dtype)
 
 
