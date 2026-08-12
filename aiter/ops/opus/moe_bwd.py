@@ -756,6 +756,25 @@ def opus_moe_router_bwd_bf16(dp_sorted: Tensor, order: Tensor, topk_ids: Tensor,
 
 
 _DGRAD_B_M = 128
+_WGRAD_STREAMS = {}
+
+
+def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
+    """Reuse one asynchronous dW2 stream per device.
+
+    Creating a stream and two events in every training forward leaks a large
+    number of HIP resources across the 500-repeat Sonic derived benchmark.
+    Stream ordering is sufficient here; per-call dependencies are inserted by
+    ``wait_stream`` in backward.
+    """
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    stream = _WGRAD_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _WGRAD_STREAMS[index] = stream
+    return stream
 
 
 class OpusMoERefFunc(torch.autograd.Function):
@@ -809,9 +828,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.w1t = w1.transpose(1, 2).contiguous()
         ctx.w2t = w2.transpose(1, 2).contiguous()
         ctx.w2_ref = w2
-        ctx.wgrad_stream = torch.cuda.Stream(device=x.device)
-        ctx.wgrad_ready = torch.cuda.Event()
-        ctx.wgrad_done = torch.cuda.Event()
+        ctx.wgrad_stream = _get_wgrad_stream(x.device)
         return out
 
     @staticmethod
@@ -941,8 +958,7 @@ class OpusMoERefFunc(torch.autograd.Function):
                 device=dy_op.device,
                 dtype=torch.bfloat16,
             )
-            ctx.wgrad_ready.record(current)
-            ctx.wgrad_stream.wait_event(ctx.wgrad_ready)
+            ctx.wgrad_stream.wait_stream(current)
             with torch.cuda.stream(ctx.wgrad_stream):
                 _opus_moe_wgrad_tn_bf16_raw(
                     dy_op,
@@ -951,12 +967,11 @@ class OpusMoERefFunc(torch.autograd.Function):
                     out,
                     ctx.uniform_m or 0,
                 )
-                ctx.wgrad_done.record(ctx.wgrad_stream)
             return out
 
         def stage2_wgrad_finish(out):
             current = torch.cuda.current_stream(out.device)
-            current.wait_event(ctx.wgrad_done)
+            current.wait_stream(ctx.wgrad_stream)
             return out
 
         return _moe_ref_backward_impl(
