@@ -13,7 +13,7 @@ Usage:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -446,6 +446,14 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
+        model_name="varlen-64k-qwen-ptpc-ali-tp1-bf16snapshot",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[8192],
+        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        max_num_batched_tokens=[8192],
+    ),
+    PrefillGroup(
         # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
         # all %64!=0, so the last chunk has padding rows -- validates the masking
         # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
@@ -566,6 +574,22 @@ STATE_BF16_PARAMS = [
     ),
 ]
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
+
+
+# -- fp32 chunk-snapshot params (paired with TestSnapshotDtype below) ---
+
+# The snapshot dtype is an independent policy from the SSM state dtype, so these
+# reuse the small bf16-state shapes (one dense, one varlen launch route) with the
+# default fp32 state and vary only ``snapshot_dtype``.
+SNAPSHOT_DTYPE_PARAMS = [
+    replace(
+        p,
+        model_name=f"{p.model_name}-fp32snapshot",
+        ssm_state_dtype=torch.float32,
+    )
+    for p in STATE_BF16_PARAMS
+]
+SNAPSHOT_DTYPE_TEST_IDS = [repr(p) for p in SNAPSHOT_DTYPE_PARAMS]
 
 
 # -- Helper functions ---------------------------------------------------
@@ -822,6 +846,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
     initial_state=None,
     output_final_state=False,
     cu_seqlens=None,
+    snapshot_dtype=None,
 ):
     """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
 
@@ -862,6 +887,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
         cu_seqlens=cu_seqlens,
         use_exp2=False,
         g_head_major=True,
+        snapshot_dtype=snapshot_dtype,
     )
 
 
@@ -937,6 +963,12 @@ def _assert_mean_abs_within(out, ref, *, mean_atol, label):
         f"{mean_atol:.3e} (per-element atol may still pass; this guards "
         f"whole-distribution drift)"
     )
+
+
+def _truncate_to_bf16(x):
+    """Keep the high 16 bits of an fp32 tensor, i.e. the HIP ``float_to_bf16``
+    truncation the bf16 snapshot specialization applies to its accumulators."""
+    return (x.contiguous().view(torch.int32) >> 16).to(torch.int16).view(torch.bfloat16)
 
 
 def _assert_close_lowmem(a, b, *, atol, rtol, msg, chunk_rows=1 << 22):
@@ -1161,6 +1193,186 @@ class TestCorrectness:
             output_final_state=True,
             label="flydsl_mfma16_hip_bf16_state",
         )
+
+    @pytest.mark.parametrize("args", SNAPSHOT_DTYPE_PARAMS, ids=SNAPSHOT_DTYPE_TEST_IDS)
+    def test_correctness_fp32_snapshot(self, args: PrefillArgs):
+        """fp32 per-chunk snapshots on the dense and varlen launch paths.
+
+        The fp32 specialization stores the f32 accumulators straight from
+        registers while the bf16 one truncates the very same registers through
+        the [V][K] LDS transpose buffer, so truncating the fp32 snapshots must
+        reproduce the bf16 ones bit for bit. Everything else the kernel writes
+        (``v_new``, ``final_state``) must be untouched by the snapshot policy.
+        """
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        def run(snapshot_dtype):
+            return chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=cu,
+                g_head_major=args.g_head_major,
+                use_exp2=False,
+                snapshot_dtype=snapshot_dtype,
+            )
+
+        h_bf16, vn_bf16, fs_bf16 = run(torch.bfloat16)
+        h_f32, vn_f32, fs_f32 = run(torch.float32)
+
+        assert h_bf16.dtype == torch.bfloat16
+        assert h_f32.dtype == torch.float32
+        assert fs_bf16.dtype == torch.float32 and fs_f32.dtype == torch.float32
+        assert torch.equal(vn_bf16, vn_f32), "snapshot dtype perturbed v_new"
+        assert torch.equal(fs_bf16, fs_f32), "snapshot dtype perturbed final_state"
+        assert torch.equal(_truncate_to_bf16(h_f32), h_bf16), (
+            "fp32 snapshots do not truncate back to the bf16 specialization's "
+            "snapshots; the two paths are storing different accumulators"
+        )
+
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=args.g_head_major,
+        )
+        _assert_k5_outputs_match_ref(
+            h_f32,
+            vn_f32,
+            fs_f32,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=True,
+            label="flydsl_mfma16_hip_fp32_snapshot",
+        )
+
+    def test_snapshot_dtype_defaults_to_k_dtype(self):
+        """The persistent state dtype must not change the snapshot policy."""
+        k, w, u = self._minimal_inputs()
+        for state_dtype in (torch.float32, torch.bfloat16):
+            h, _, fs = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                output_final_state=True,
+                state_dtype=state_dtype,
+                use_exp2=False,
+            )
+            assert h.dtype == k.dtype, f"state_dtype={state_dtype} moved h.dtype"
+            assert fs.dtype == state_dtype
+
+    def test_snapshot_dtype_rejects_unsupported_dtype(self):
+        k, w, u = self._minimal_inputs()
+        with pytest.raises(ValueError, match="snapshot_dtype"):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k, w, u, use_exp2=False, snapshot_dtype=torch.float16
+            )
+
+    @pytest.mark.skipif(not _HAS_HIP_K5, reason="HIP K5 kernel unavailable")
+    @pytest.mark.parametrize(
+        "snapshot_dtype",
+        [torch.bfloat16, torch.float32],
+        ids=["snapshot_bf16", "snapshot_fp32"],
+    )
+    def test_snapshot_dtype_matches_hip(self, snapshot_dtype):
+        """Both snapshot specializations must track the HIP K5 kernel.
+
+        ``snapshot_dtype`` is the same knob on both wrappers, so each dtype has
+        to come back in the same layout and dtype and agree numerically. The
+        comparison band follows ``_MFMA16_HIP_VS_HIP_BITEXACT``: this fork is not
+        yet bit-exact against HIP on every shape, independently of the snapshot
+        policy.
+        """
+        args = replace(SNAPSHOT_DTYPE_PARAMS[0], g_head_major=True)
+        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            args.resolve_context_lens(), args=args
+        )
+        common = {
+            "g": g,
+            "initial_state": h0,
+            "output_final_state": True,
+            "cu_seqlens": cu,
+        }
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w_c,
+            u_c,
+            g_head_major=True,
+            use_exp2=False,
+            snapshot_dtype=snapshot_dtype,
+            **common,
+        )
+        h_hip, vn_hip, fs_hip = chunk_gated_delta_rule_fwd_h_hip_k5(
+            k, w_c, u_c, snapshot_dtype=snapshot_dtype, **common
+        )
+
+        assert h_fly.dtype == h_hip.dtype == snapshot_dtype
+        assert h_fly.shape == h_hip.shape
+        if _MFMA16_HIP_VS_HIP_BITEXACT:
+            assert torch.equal(h_fly, h_hip)
+        else:
+            _assert_close_lowmem(
+                h_fly,
+                h_hip,
+                atol=2e-2,
+                rtol=2e-2,
+                msg=f"flydsl vs HIP snapshot ({snapshot_dtype})",
+            )
+        _assert_close_lowmem(
+            vn_fly, vn_hip, atol=2e-2, rtol=2e-2, msg="flydsl vs HIP v_new"
+        )
+        _assert_close_lowmem(
+            fs_fly, fs_hip, atol=2e-2, rtol=2e-2, msg="flydsl vs HIP final_state"
+        )
+
+    def test_e2e_dispatch_fp32_snapshot_matches_triton(self):
+        """``snapshot_dtype=fp32`` must reach the FlyDSL K5 path (it used to be
+        rejected) and leave the K6 output matching the Triton backend."""
+        torch.manual_seed(42)
+        B, T, H, D = 1, 128, 4, 128
+        q = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1
+        ).to(torch.bfloat16)
+        v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        g = torch.nn.functional.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+        beta = torch.rand(B, T, H, dtype=torch.bfloat16).sigmoid()
+        h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+        kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
+            "beta": beta,
+            "scale": D**-0.5,
+            "initial_state": h0,
+            "output_final_state": True,
+            "use_exp2": True,
+            "snapshot_dtype": torch.float32,
+        }
+
+        _, out_fly, fs_fly = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, use_chunk_flydsl=True
+        )
+        _, out_tri, fs_tri = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, use_chunk_flydsl=False
+        )
+        torch.testing.assert_close(
+            out_fly.float(), out_tri.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(fs_fly.float(), fs_tri.float(), atol=2e-2, rtol=2e-2)
 
     def test_e2e_dispatch_matches_triton(self):
         """Exercise K1-K6 with use_chunk_flydsl=True through public dispatch."""
