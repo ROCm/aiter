@@ -1132,7 +1132,6 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
-                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -1944,6 +1943,10 @@ def _mxfp4_scale_u8(scale):
     return scale
 
 
+def _flydsl_stage2_fp8_enabled():
+    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -1966,6 +1969,7 @@ def _flydsl_v2_stage2_wrapper(
     block_m=None,
     expert_mask=None,
     topk_ids=None,
+    topk_weights=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
@@ -1984,17 +1988,39 @@ def _flydsl_v2_stage2_wrapper(
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
     target = out
-    _s2_fp8_inter = (
-        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    )
+    _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
+    if _s2_fp8_inter and _kstatic:
+        _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
+    _defer_w = _s2_fp8_inter and _kstatic
+    _fp8_scale_blk = None
+    _fp8_pitch_align = None
     if epilog == "reduce":
         if _s2_fp8_inter:
-            if model_dim_runtime % 8 != 0:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+                FP8OUT_PITCH_ALIGN,
+                FP8OUT_SCALE_BLK_MIN,
+                fp8out_row_bytes,
+                fp8out_scale_blk,
+            )
+
+            if model_dim_runtime % FP8OUT_SCALE_BLK_MIN != 0:
                 raise ValueError(
-                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
+                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
+                    f"by {FP8OUT_SCALE_BLK_MIN}"
                 )
+            _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime) if _kstatic else 8
+            _fp8_pitch_align = FP8OUT_PITCH_ALIGN if _kstatic else 0
+
             target = torch.empty(
-                (token_num * topk, model_dim_runtime + model_dim_runtime // 8),
+                (
+                    token_num * topk,
+                    fp8out_row_bytes(
+                        model_dim_runtime,
+                        scale_blk=_fp8_scale_blk,
+                        pitch_align=_fp8_pitch_align,
+                    ),
+                ),
                 dtype=torch.uint8,
                 device=out.device,
             )
@@ -2035,6 +2061,8 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
+        g2_bf16_lds=cfg["bf16_lds"],
+        g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if epilog == "reduce":
@@ -2049,6 +2077,9 @@ def _flydsl_v2_stage2_wrapper(
             expert_mask=expert_mask,
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
+            topk_weights=topk_weights if _defer_w else None,
+            fp8_scale_blk=_fp8_scale_blk,
+            fp8_pitch_align=_fp8_pitch_align,
         )
     return out
 
@@ -3117,6 +3148,12 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if (
+        stage2_func is _flydsl_v2_stage2_wrapper
+        and not doweight_stage1
+        and _flydsl_stage2_fp8_enabled()
+    ):
+        extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
