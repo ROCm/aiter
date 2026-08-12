@@ -1279,11 +1279,22 @@ def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
 # Tier-1 offset restructure (w_row*(DIM//WPACK) + k_base//WPACK) FP4 addresses up
 # to E*HIDDEN*INTER < 2^32; FP8's byte offset is 2x larger, so its E=256 leg
 # (3.76 GB, needs the K3 Tier-2 per-expert i64 base) is skipped and reported n/a.
+# Real-E decode models for the widened cold-HBM sweep (Phase F, ?8.2 coverage
+# gate).  Each model contributes both a down (B,INTER,HIDDEN,E,TOPK) and a
+# gate_up (B,HIDDEN,INTER,E,TOPK) row across the full batch axis B?{1,2,4,8,32}.
+# FP8 legs auto-skip where E*H*I >= 2^31 (DeepSeek E=256); FP4 measures for all.
+# TP2/TP4 Qwen (INTER%512!=0) and Kimi-K3 (follow-on) are intentionally excluded.
+# name, HIDDEN, INTER, E, TOPK.
+_COLD_MODELS = [
+    ("deepseek_v3", 7168, 2048, 256, 8),
+    ("minimax", 3072, 1536, 256, 8),
+    ("qwen3next_tp1", 2048, 512, 512, 10),
+]
+_COLD_BATCHES = [1, 2, 4, 8, 32]
 COLD_DOWN_SHAPES = [
-    (1, 2048, 7168, 256, 8),
-    (2, 2048, 7168, 256, 8),
-    (4, 2048, 7168, 256, 8),
-    (8, 2048, 7168, 256, 8),
+    (B, INTER, HIDDEN, E, TOPK)
+    for (_name, HIDDEN, INTER, E, TOPK) in _COLD_MODELS
+    for B in _COLD_BATCHES
 ]
 # i32 addressing limits on E*HIDDEN*INTER (see K3 scope): FP4's hardware byte
 # offset is w_row*INTER/2 (dword*4), so it overflows at E*H*I >= 2^32; FP8's is
@@ -1479,6 +1490,8 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     return {
         "gfx": get_gfx(),
         "B": B,
+        "INTER": INTER,
+        "HIDDEN": HIDDEN,
         "E": E,
         "fp4_us": us4,
         "fp8_us": us8,
@@ -1501,10 +1514,9 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
 # pool ~3.76 GB >> MALL).  FP4 addresses up to E*INTER*HIDDEN < 2^32; FP8's byte
 # offset is 2x, so its E=256 leg is skipped (needs K3 Tier-2) and reported n/a.
 COLD_GATE_UP_SHAPES = [
-    (1, 7168, 2048, 256, 8),
-    (2, 7168, 2048, 256, 8),
-    (4, 7168, 2048, 256, 8),
-    (8, 7168, 2048, 256, 8),
+    (B, HIDDEN, INTER, E, TOPK)
+    for (_name, HIDDEN, INTER, E, TOPK) in _COLD_MODELS
+    for B in _COLD_BATCHES
 ]
 
 
@@ -1683,6 +1695,8 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     return {
         "gfx": get_gfx(),
         "B": B,
+        "HIDDEN": HIDDEN,
+        "INTER": INTER,
         "E": E,
         "fp4_us": us4,
         "fp8_us": us8,
@@ -1744,9 +1758,9 @@ def _run_perf_sweeps(args) -> None:
             for (B, INTER, HIDDEN, E, TOPK) in args.cold_down_shapes
         ]
         aiter.logger.info(
-            "warp-decode down_reduce COLD-HBM E=%d A/B FP4-vs-FP8 (%s timing, "
-            "router rotated over the pool):\n%s",
-            args.cold_down_shapes[0][3],
+            "warp-decode down_reduce COLD-HBM A/B FP4-vs-FP8 (real-E decode models "
+            "x B in {1,2,4,8,32}; %s timing; FP8 n/a where E*H*I>=2^31; router "
+            "rotated over the pool):\n%s",
             args.timing,
             _fmt_table(cold_rows),
         )
@@ -1755,9 +1769,9 @@ def _run_perf_sweeps(args) -> None:
             for (B, HIDDEN, INTER, E, TOPK) in args.cold_gate_up_shapes
         ]
         aiter.logger.info(
-            "warp-decode gate_up COLD-HBM E=%d A/B FP4-vs-FP8 (%s timing, "
-            "router rotated over the pool):\n%s",
-            args.cold_gate_up_shapes[0][3],
+            "warp-decode gate_up COLD-HBM A/B FP4-vs-FP8 (real-E decode models "
+            "x B in {1,2,4,8,32}; %s timing; FP8 n/a where E*H*I>=2^31; router "
+            "rotated over the pool):\n%s",
             args.timing,
             _fmt_table(cold_gu_rows),
         )
