@@ -448,7 +448,9 @@ def fhmoe_(
         bias2,
     )
     if q_dtype_a is None:
-        q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+        q_dtype_a = (
+            dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+        )
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,

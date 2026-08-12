@@ -913,9 +913,7 @@ def _iter_csv_cases(csv_path=None, force_check_aot_cache=False):
         kwargs["strict_accuracy"] = True
         # Targeted configs may compile on demand during normal runs. Explicit
         # cache verification requires a hit for every selected CSV case.
-        kwargs["check_aot_cache"] = (
-            force_check_aot_cache or args.csv_filter is None
-        )
+        kwargs["check_aot_cache"] = force_check_aot_cache or args.csv_filter is None
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
