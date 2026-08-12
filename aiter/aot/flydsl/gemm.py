@@ -49,12 +49,12 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+    parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
+)
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     compile_8wave_gemm,
     parse_8wave_kernel_name,
-)
-from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
-    parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
