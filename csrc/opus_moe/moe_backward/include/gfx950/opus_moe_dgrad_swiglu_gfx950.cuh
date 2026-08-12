@@ -21,6 +21,7 @@ struct opus_moe_dgrad_swiglu_kargs
     const void* __restrict__ ptr_b;
     const void* __restrict__ ptr_act_input;
     void* __restrict__ ptr_dact;
+    void* __restrict__ ptr_dscore_partials;
     int m;
     int n;
     int k;
@@ -33,9 +34,10 @@ struct opus_moe_dgrad_swiglu_kargs
     int stride_b_batch;
     int stride_act_input_batch;
     int stride_dact_batch;
+    int stride_dscore;
 };
 
-template<typename UserTraits>
+template<typename UserTraits, bool WRITE_DSCORE = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -231,6 +233,13 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     auto offsets = layout_to_offsets<T::VEC_C>(u_gc);
     const int output_offset =
         wave_id_m * (T::B_M / T::T_M) * kargs.stride_dact + col;
+    constexpr int rows_per_lane =
+        (T::B_M / T::T_M) / T::W_M;
+    constexpr int vecs_per_row = r_elem.value / rows_per_lane;
+    float route_dot[rows_per_lane] = {};
+    auto score_storage = opus::make_smem(smem_a);
+    auto* score_smem = reinterpret_cast<OPUS_LDS_ADDR float*>(
+        reinterpret_cast<__UINTPTR_TYPE__>(score_storage.ptr));
 #pragma unroll
     for(index_t i = 0; i < r_elem.value; ++i)
     {
@@ -238,6 +247,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         auto up = g_act_input.template load<T::VEC_C>(offsets[i], output_offset + kargs.n);
         vector_t<D_C, T::VEC_C> dgate;
         vector_t<D_C, T::VEC_C> dup;
+        float vec_dot = 0.0f;
 #pragma unroll
         for(index_t j = 0; j < T::VEC_C; ++j)
         {
@@ -250,9 +260,50 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             const float silu = g * sig;
             dgate[j] = static_cast<D_C>(dh * u * (sig + silu * (1.0f - sig)));
             dup[j] = static_cast<D_C>(dh * silu);
+            if constexpr(WRITE_DSCORE)
+                vec_dot = fmaf(dh, silu * u, vec_dot);
         }
+        if constexpr(WRITE_DSCORE)
+            route_dot[i / vecs_per_row] += vec_dot;
         g_dact.template store<T::VEC_C>(dgate, offsets[i], output_offset);
         g_dact.template store<T::VEC_C>(dup, offsets[i], output_offset + kargs.n);
+    }
+    if constexpr(WRITE_DSCORE)
+    {
+        // The mono mainloop intentionally lets its wave groups progress
+        // independently.  Do not reuse the A ping-pong storage until every
+        // wave has consumed its final LDS tile and finished the epilogue.
+        __syncthreads();
+#pragma unroll
+        for(int r = 0; r < rows_per_lane; ++r)
+        {
+            route_dot[r] += __shfl_down(route_dot[r], 16, 64);
+            route_dot[r] += __shfl_down(route_dot[r], 32, 64);
+            if(lane_id < T::W_M)
+            {
+                const int local_row =
+                    wave_id_m * (T::B_M / T::T_M) +
+                    r * T::W_M + lane_id;
+                score_smem[local_row * T::T_N + wave_id_n] = route_dot[r];
+            }
+        }
+        __syncthreads();
+        if(thread_id_x() < T::B_M)
+        {
+            const int local_row = thread_id_x();
+            const int route_row = row + local_row;
+            if(route_row < kargs.m)
+            {
+                float partial = 0.0f;
+#pragma unroll
+                for(int wn = 0; wn < T::T_N; ++wn)
+                    partial += score_smem[local_row * T::T_N + wn];
+                const int n_tile = col / T::B_N;
+                reinterpret_cast<float*>(kargs.ptr_dscore_partials)[
+                    (batch_id * kargs.m + route_row) * kargs.stride_dscore +
+                    n_tile] = partial;
+            }
+        }
     }
 #else
     (void)kargs;
@@ -275,5 +326,18 @@ inline void opus_moe_dgrad_swiglu_launch_gfx950(
     dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<opus_moe_dgrad_swiglu_traits_gfx950>
+        <<<grid, block, 0, stream>>>(kargs);
+}
+
+inline void opus_moe_dgrad_swiglu_dscore_launch_gfx950(
+    const opus_moe_dgrad_swiglu_kargs& kargs,
+    hipStream_t stream)
+{
+    const int num_tiles_m = (kargs.m + 191) / 192;
+    const int num_tiles_n = kargs.n / 256;
+    dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
+    dim3 block(512);
+    opus_moe_dgrad_swiglu_kernel_gfx950<
+        opus_moe_dgrad_swiglu_traits_gfx950, true>
         <<<grid, block, 0, stream>>>(kargs);
 }

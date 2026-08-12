@@ -299,6 +299,21 @@ def _opus_moe_dgrad_swiglu_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_dgrad_swiglu_dscore_bf16",
+    develop=True,
+)
+def _opus_moe_dgrad_swiglu_dscore_bf16_raw(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    d_act_input: Tensor,
+    dscore_partials: Tensor,
+    uniform_m: int,
+) -> None: ...
+
+
 def opus_moe_dgrad_swiglu_uniform_prepared(
     dy: Tensor,
     w_bnk: Tensor,
@@ -327,6 +342,36 @@ def opus_moe_dgrad_swiglu_uniform_prepared(
         )
     _opus_moe_dgrad_swiglu_bf16_raw(
         dy.contiguous(), w_bnk.contiguous(), act_input.contiguous(), out, uniform_m
+    )
+    return out
+
+
+def opus_moe_dgrad_swiglu_dscore_uniform_prepared(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    uniform_m: int,
+    out: Tensor,
+    dscore_partials: Tensor,
+) -> Tensor:
+    """Fused stage-2 dgrad/SwiGLU with four dscore partials per route."""
+    if not _mono_dgrad_shape_ok(dy, w_bnk, uniform_m):
+        raise ValueError("dscore path requires the uniform mono dgrad shape")
+    E, N, _K = w_bnk.shape
+    expected = (E * uniform_m, 2 * N)
+    if (
+        act_input.shape != expected
+        or out.shape != expected
+        or dscore_partials.shape != (E * uniform_m, N // 256)
+    ):
+        raise ValueError("invalid output or dscore partial shape")
+    _opus_moe_dgrad_swiglu_dscore_bf16_raw(
+        dy.contiguous(),
+        w_bnk.contiguous(),
+        act_input.contiguous(),
+        out,
+        dscore_partials,
+        uniform_m,
     )
     return out
 
@@ -421,6 +466,31 @@ def _opus_moe_combine_router_bwd_token8_h2048_e64_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_combine_scale_token8_h2048_bf16",
+    develop=True,
+)
+def _opus_moe_combine_scale_token8_h2048_bf16_raw(
+    dout: Tensor, token_routes: Tensor, p: Tensor, dy: Tensor
+) -> None: ...
+
+
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_dscore_router_bwd_token8_e64_bf16",
+    develop=True,
+)
+def _opus_moe_dscore_router_bwd_token8_e64_bf16_raw(
+    token_routes: Tensor,
+    p: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_scatter_add_bf16", develop=True)
 def _opus_moe_scatter_add_bf16_raw(
     src: Tensor, gather: Tensor, dst: Tensor
@@ -487,6 +557,41 @@ def opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
         dlogits,
     )
     return dy, dlogits
+
+
+def opus_moe_combine_scale_token8_h2048_bf16(
+    dout: Tensor, token_routes: Tensor, p_sorted: Tensor
+):
+    """Write route-scaled dout while deferring dscore to stage 2."""
+    assert dout.shape[1] == 2048 and token_routes.shape[1] == 8
+    M = token_routes.numel()
+    dy = torch.empty(M, 2048, device=dout.device, dtype=torch.bfloat16)
+    partials = torch.empty(M, 4, device=dout.device, dtype=torch.float32)
+    _opus_moe_combine_scale_token8_h2048_bf16_raw(
+        dout.contiguous(), token_routes, p_sorted.contiguous(), dy
+    )
+    return dy, partials
+
+
+def opus_moe_dscore_router_bwd_token8_e64_bf16(
+    token_routes: Tensor,
+    p_sorted: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+) -> Tensor:
+    """Finalize four dscore partials and apply the top-k softmax Jacobian."""
+    T = token_routes.shape[0]
+    dlogits = torch.empty(T, 64, device=partials.device, dtype=torch.bfloat16)
+    _opus_moe_dscore_router_bwd_token8_e64_bf16_raw(
+        token_routes,
+        p_sorted.contiguous(),
+        partials,
+        order.contiguous(),
+        topk_ids.contiguous(),
+        dlogits,
+    )
+    return dlogits
 
 
 def opus_moe_scatter_add_bf16(src: Tensor, gather: Tensor, T: int) -> Tensor:
@@ -628,6 +733,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         w1t, w2t, w2_ref = ctx.w1t, ctx.w2t, ctx.w2_ref
         order = ctx.saved_tensors[8]
         topk_ids = ctx.saved_tensors[10]
+        dscore_partials = None
 
         def dgrad_prepared(dy_op, w, lens):
             wt = w2t if w is w2_ref else w1t
@@ -649,24 +755,32 @@ class OpusMoERefFunc(torch.autograd.Function):
                 and _mono_dgrad_shape_ok(dy_op, wt, ctx.uniform_m)
             ):
                 out = torch.empty_like(act_input)
+                if dscore_partials is not None:
+                    return opus_moe_dgrad_swiglu_dscore_uniform_prepared(
+                        dy_op.contiguous(),
+                        wt,
+                        act_input,
+                        ctx.uniform_m,
+                        out,
+                        dscore_partials,
+                    )
                 return opus_moe_dgrad_swiglu_uniform_prepared(
                     dy_op.contiguous(), wt, act_input, ctx.uniform_m, out
                 )
             return _opus_actbwd(dgrad_prepared(dy_op, w, lens), act_input, act_type)
 
         def combine_bwd_prepared(dout, gather, p_sorted, y):
+            nonlocal dscore_partials
             if (
                 ctx.dims == (32768, 2048, 64, 1024, 8)
                 and ctx.uniform_m is not None
             ):
-                return opus_moe_combine_router_bwd_token8_h2048_e64_bf16(
+                dy, dscore_partials = opus_moe_combine_scale_token8_h2048_bf16(
                     dout,
                     ctx.token_routes,
                     p_sorted,
-                    y,
-                    order,
-                    topk_ids,
                 )
+                return dy, dscore_partials
             if dout.shape[1] == 2048 and ctx.token_routes.shape[1] == 8:
                 return opus_moe_combine_bwd_token8_h2048_bf16(
                     dout, ctx.token_routes, p_sorted, y
@@ -678,6 +792,14 @@ class OpusMoERefFunc(torch.autograd.Function):
             # The exact combine specialization returns its already-computed
             # [T,E] router gradient in this payload slot.
             if dp_sorted.ndim == 2:
+                if dp_sorted.shape[1] == 4:
+                    return opus_moe_dscore_router_bwd_token8_e64_bf16(
+                        ctx.token_routes,
+                        ctx.saved_tensors[6],
+                        dp_sorted,
+                        order,
+                        topk_ids,
+                    )
                 return dp_sorted
             return opus_moe_router_bwd_bf16(
                 dp_sorted, order, topk_ids, topk_w, T, topk, E

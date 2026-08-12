@@ -186,6 +186,55 @@ void opus_moe_dgrad_swiglu_bf16(aiter_tensor_t& dy,
     opus_moe_dgrad_swiglu_launch_gfx950(k, aiter::getCurrentHIPStream());
 }
 
+void opus_moe_dgrad_swiglu_dscore_bf16(aiter_tensor_t& dy,
+                                       aiter_tensor_t& w,
+                                       aiter_tensor_t& act_input,
+                                       aiter_tensor_t& d_act_input,
+                                       aiter_tensor_t& dscore_partials,
+                                       int uniform_m)
+{
+    const int E = static_cast<int>(w.size(0));
+    const int N = static_cast<int>(w.size(1));
+    const int K = static_cast<int>(w.size(2));
+    AITER_CHECK(uniform_m > 0, "uniform_m must be positive");
+    AITER_CHECK(static_cast<int>(dy.size(0)) == E * uniform_m &&
+                    static_cast<int>(dy.size(1)) == K,
+                "dy must have shape [E * uniform_m, K]");
+    AITER_CHECK(static_cast<int>(act_input.size(0)) == E * uniform_m &&
+                    static_cast<int>(act_input.size(1)) == 2 * N,
+                "act_input must have shape [E * uniform_m, 2 * N]");
+    AITER_CHECK(static_cast<int>(d_act_input.size(0)) == E * uniform_m &&
+                    static_cast<int>(d_act_input.size(1)) == 2 * N,
+                "d_act_input must have shape [E * uniform_m, 2 * N]");
+    AITER_CHECK(static_cast<int>(dscore_partials.size(0)) == E * uniform_m &&
+                    static_cast<int>(dscore_partials.size(1)) == N / 256,
+                "dscore_partials must have shape [E * uniform_m, N / 256]");
+    AITER_CHECK(K >= 128 && K % 64 == 0 && N % 256 == 0,
+                "fused dscore path requires K%64==0 and N%256==0");
+
+    opus_moe_dgrad_swiglu_kargs k{};
+    k.ptr_a = dy.data_ptr();
+    k.ptr_b = w.data_ptr();
+    k.ptr_act_input = act_input.data_ptr();
+    k.ptr_dact = d_act_input.data_ptr();
+    k.ptr_dscore_partials = dscore_partials.data_ptr();
+    k.m = uniform_m;
+    k.n = N;
+    k.k = K;
+    k.batch = E;
+    k.stride_a = static_cast<int>(dy.stride(0));
+    k.stride_b = static_cast<int>(w.stride(1));
+    k.stride_act_input = static_cast<int>(act_input.stride(0));
+    k.stride_dact = static_cast<int>(d_act_input.stride(0));
+    k.stride_a_batch = uniform_m * k.stride_a;
+    k.stride_b_batch = static_cast<int>(w.stride(0));
+    k.stride_act_input_batch = uniform_m * k.stride_act_input;
+    k.stride_dact_batch = uniform_m * k.stride_dact;
+    k.stride_dscore = static_cast<int>(dscore_partials.stride(0));
+    opus_moe_dgrad_swiglu_dscore_launch_gfx950(
+        k, aiter::getCurrentHIPStream());
+}
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32). Feature-major transposed +
 // route-padded inputs (build_padded_transposed). dW[e]=dyT_e @ aT_e^T.
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,       // [P, Mp] bf16
@@ -602,6 +651,138 @@ void opus_moe_combine_bwd_token8_h2048_bf16(
         reinterpret_cast<const __bf16*>(y.data_ptr()),
         reinterpret_cast<__bf16*>(dy.data_ptr()),
         reinterpret_cast<float*>(dp.data_ptr()));
+}
+
+// Stage dy only; dscore is reconstructed from the fused stage-2 epilogue.
+__global__ __launch_bounds__(512, 1)
+void opus_moe_combine_scale_token8_h2048_bf16_kernel(
+    const __bf16* __restrict__ dout,
+    const int32_t* __restrict__ token_routes,
+    const float* __restrict__ p,
+    __bf16* __restrict__ dy)
+{
+    constexpr int H = 2048;
+    constexpr int TOPK = 8;
+    constexpr int VEC = 8;
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+    __shared__ __align__(16) __bf16 dout_shared[H];
+    __shared__ int32_t routes[TOPK];
+    __shared__ float scores[TOPK];
+    if(tid < TOPK)
+    {
+        const int32_t route = token_routes[static_cast<int64_t>(t) * TOPK + tid];
+        routes[tid] = route;
+        scores[tid] = p[route];
+    }
+    if(tid < H / VEC)
+    {
+        const int h = tid * VEC;
+        *reinterpret_cast<opus_bf16x8*>(dout_shared + h) =
+            *reinterpret_cast<const opus_bf16x8*>(
+                dout + static_cast<int64_t>(t) * H + h);
+    }
+    __syncthreads();
+    const int32_t route = routes[wave];
+    const float score = scores[wave];
+    for(int h = lane * VEC; h < H; h += 64 * VEC)
+    {
+        const int64_t offset = static_cast<int64_t>(route) * H + h;
+        const opus_bf16x8 dv =
+            *reinterpret_cast<const opus_bf16x8*>(dout_shared + h);
+        opus_bf16x8 dyv;
+#pragma unroll
+        for(int i = 0; i < VEC; ++i)
+            dyv[i] = static_cast<__bf16>(static_cast<float>(dv[i]) * score);
+        *reinterpret_cast<opus_bf16x8*>(dy + offset) = dyv;
+    }
+}
+
+void opus_moe_combine_scale_token8_h2048_bf16(
+    aiter_tensor_t& dout,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& dy)
+{
+    const int T = static_cast<int>(dout.size(0));
+    if(T == 0)
+        return;
+    opus_moe_combine_scale_token8_h2048_bf16_kernel<<<
+        dim3(T), dim3(512), 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(dout.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(p.data_ptr()),
+        reinterpret_cast<__bf16*>(dy.data_ptr()));
+}
+
+__global__ __launch_bounds__(64, 1)
+void opus_moe_dscore_router_bwd_token8_e64_bf16_kernel(
+    const int32_t* __restrict__ token_routes,
+    const float* __restrict__ p,
+    const float* __restrict__ partials,
+    const int64_t* __restrict__ order,
+    const int64_t* __restrict__ topk_ids,
+    __bf16* __restrict__ dlogits)
+{
+    constexpr int TOPK = 8;
+    constexpr int E = 64;
+    constexpr int PARTIALS = 4;
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float scaled_dp_rank[TOPK];
+    __shared__ float score_rank[TOPK];
+    if(tid < E)
+        dlogits[static_cast<int64_t>(t) * E + tid] = static_cast<__bf16>(0.0f);
+    if(tid < TOPK)
+    {
+        const int32_t route = token_routes[static_cast<int64_t>(t) * TOPK + tid];
+        float scaled_dp = 0.0f;
+#pragma unroll
+        for(int i = 0; i < PARTIALS; ++i)
+            scaled_dp += partials[static_cast<int64_t>(route) * PARTIALS + i];
+        const float score = p[route];
+        const int rank = static_cast<int>(order[route] & (TOPK - 1));
+        scaled_dp_rank[rank] = scaled_dp;
+        score_rank[rank] = score;
+    }
+    __syncthreads();
+    if(tid == 0)
+    {
+        float dot = 0.0f;
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+            dot += scaled_dp_rank[k];
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+        {
+            const int64_t expert = topk_ids[static_cast<int64_t>(t) * TOPK + k];
+            dlogits[static_cast<int64_t>(t) * E + expert] =
+                static_cast<__bf16>(scaled_dp_rank[k] - score_rank[k] * dot);
+        }
+    }
+}
+
+void opus_moe_dscore_router_bwd_token8_e64_bf16(
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(token_routes.size(0));
+    if(T == 0)
+        return;
+    opus_moe_dscore_router_bwd_token8_e64_bf16_kernel<<<
+        dim3(T), dim3(64), 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(p.data_ptr()),
+        reinterpret_cast<const float*>(partials.data_ptr()),
+        reinterpret_cast<const int64_t*>(order.data_ptr()),
+        reinterpret_cast<const int64_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()));
 }
 
 // Exact parity path: consume each route's dot product inside the token CTA and

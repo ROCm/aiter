@@ -43,6 +43,14 @@ void opus_moe_dgrad_swiglu_bf16(aiter_tensor_t& dy,
                                 aiter_tensor_t& d_act_input,
                                 int uniform_m);
 
+// Equal-routes stage-2 dgrad/SwiGLU plus per-route, per-N-tile dscore partials.
+void opus_moe_dgrad_swiglu_dscore_bf16(aiter_tensor_t& dy,
+                                       aiter_tensor_t& w,
+                                       aiter_tensor_t& act_input,
+                                       aiter_tensor_t& d_act_input,
+                                       aiter_tensor_t& dscore_partials,
+                                       int uniform_m);
+
 // Fused opus-MFMA grouped wgrad (BF16->FP32), transposed+padded inputs.
 //   dyT [P,Mp] bf16, aT [Q,Mp] bf16, pad_offs [E+1] i32, dW [E,P,Q] fp32
 void opus_moe_wgrad_mfma_bf16(aiter_tensor_t& dyT,
@@ -93,6 +101,20 @@ void opus_moe_combine_bwd_token8_h2048_bf16(aiter_tensor_t& dout,
                                              aiter_tensor_t& y,
                                              aiter_tensor_t& dy,
                                              aiter_tensor_t& dp);
+
+void opus_moe_combine_scale_token8_h2048_bf16(
+    aiter_tensor_t& dout,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& dy);
+
+void opus_moe_dscore_router_bwd_token8_e64_bf16(
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& p,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& dlogits);
 
 // Exact Sonic-parity combine + softmax-router backward. In addition to sharing
 // dout[t,:] across the token's eight routes, the route-dot reductions are
