@@ -892,6 +892,32 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         static_cast<unsigned long long>(kargs.stride_b_row) * sizeof(D_B));
     auto g_a = make_gmem(a, a_bytes);
     auto g_b = make_gmem(b, b_bytes);
+    auto async_load_b = [&](auto lds_dst, int byte_offset)
+        __attribute__((always_inline)) {
+        if constexpr(requires { T::RUNTIME_SHORT_ROUTE_CACHE_B; })
+        {
+            static_assert(T::RUNTIME_SHORT_ROUTE_CACHE_B);
+            if(route_count <= T::SHORT_ROUTE_CACHE_B_MAX_ROUTES)
+                g_b.template _async_load<VEC>(
+                    lds_dst,
+                    byte_offset,
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::SHORT_ROUTE_CACHECTL_B>{});
+            else
+                g_b.template _async_load<VEC>(lds_dst,
+                                              byte_offset,
+                                              0,
+                                              opus::number<0>{},
+                                              opus::number<T::CACHECTL_B>{});
+        }
+        else
+            g_b.template _async_load<VEC>(lds_dst,
+                                          byte_offset,
+                                          0,
+                                          opus::number<0>{},
+                                          opus::number<T::CACHECTL_B>{});
+    };
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
@@ -1022,18 +1048,12 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_A>{});
-                g_b.template _async_load<VEC>(
+                async_load_b(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
-                    (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
-                g_b.template _async_load<VEC>(
+                    (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B));
+                async_load_b(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst + 4096),
-                    (source_b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
+                    (source_b1 * kargs.stride_b_row + source_n) * sizeof(D_B));
             }
             else
             {
@@ -1071,21 +1091,15 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                         slab.value * 64 * BK * sizeof(D_B);
                     const int source_n =
                         output_n_base + slab.value * 64 + local_vec;
-                    g_b.template _async_load<VEC>(
+                    async_load_b(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
                         (source_b0 * kargs.stride_b_row + source_n) *
-                            sizeof(D_B),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_B>{});
-                    g_b.template _async_load<VEC>(
+                            sizeof(D_B));
+                    async_load_b(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst +
                                                               4096),
                         (source_b1 * kargs.stride_b_row + source_n) *
-                            sizeof(D_B),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_B>{});
+                            sizeof(D_B));
                 });
             }
             s_waitcnt_vmcnt(0_I);
@@ -1238,21 +1252,15 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
             OPUS_LDS_ADDR D_B* wave_dst =
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile.ptr) +
                 wave_id * opus::get_warp_size() * VEC;
-            g_b.template _async_load<VEC>(
+            async_load_b(
                 reinterpret_cast<OPUS_LDS_ADDR void*>(wave_dst),
                 (source_b0 * kargs.stride_b_row + output_n_base + local_vec) *
-                    sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
-            g_b.template _async_load<VEC>(
+                    sizeof(D_B));
+            async_load_b(
                 reinterpret_cast<OPUS_LDS_ADDR void*>(
                     reinterpret_cast<OPUS_LDS_ADDR char*>(wave_dst) + 4096),
                 (source_b1 * kargs.stride_b_row + output_n_base + local_vec) *
-                    sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
+                    sizeof(D_B));
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
         }

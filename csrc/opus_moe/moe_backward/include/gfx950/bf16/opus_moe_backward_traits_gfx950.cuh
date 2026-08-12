@@ -799,6 +799,9 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4OutsideMidRoutes
 {
     static constexpr int EXCLUDED_MIN_ROUTE_COUNT = 20993;
     static constexpr int EXCLUDED_MAX_ROUTE_COUNT = 30720;
+    static constexpr bool RUNTIME_SHORT_ROUTE_CACHE_B = true;
+    static constexpr int SHORT_ROUTE_CACHE_B_MAX_ROUTES = 20992;
+    static constexpr int SHORT_ROUTE_CACHECTL_B = 2;
 };
 
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledWave2x2MidRoutes
