@@ -502,6 +502,13 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4DoubleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
+{
+    static constexpr int EXPERT_COHORT = 4;
+    static constexpr bool REVERSE_EXPERT_ORDER = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

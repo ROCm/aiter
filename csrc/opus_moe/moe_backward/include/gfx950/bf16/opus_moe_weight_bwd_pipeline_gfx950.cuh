@@ -192,9 +192,19 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int cohort_id = linear_block / blocks_per_cohort;
         const int within_cohort = linear_block % blocks_per_cohort;
         const int output_tile = within_cohort / cohort;
-        expert = cohort_id * cohort + within_cohort % cohort;
-        if(expert >= kargs.route.num_experts)
+        const int scheduled_expert =
+            cohort_id * cohort + within_cohort % cohort;
+        if(scheduled_expert >= kargs.route.num_experts)
             return;
+        if constexpr(requires { T::REVERSE_EXPERT_ORDER; })
+        {
+            static_assert(T::REVERSE_EXPERT_ORDER);
+            expert = kargs.route.num_experts - 1 - scheduled_expert;
+        }
+        else
+        {
+            expert = scheduled_expert;
+        }
         output_m_base = (output_tile % m_tiles) * BM;
         output_n_base = (output_tile / m_tiles) * BN;
     }

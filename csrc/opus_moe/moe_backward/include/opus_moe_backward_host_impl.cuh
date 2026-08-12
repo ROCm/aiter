@@ -201,6 +201,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     constexpr int cohort2_kid = 8;
     constexpr int cohort2_bm128_double_lds_kid = 9;
     constexpr int cohort2_bm256_wave4_double_lds_kid = 11;
+    constexpr int reverse_cohort4_bm256_wave4_double_lds_kid = 12;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -242,7 +243,19 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
         if(bm256_compatible && average_padded_routes >= min_average_routes &&
            (bm256_output_tiles >= min_output_tiles ||
             compact_full_residency_grid))
+        {
+            // K2 walks sorted routes from low to high expert IDs.  With a
+            // long reduction, start K4 at the newest dZ rows and interleave
+            // four experts so producer-consumer L2 reuse does not fight
+            // route-count imbalance.  Shorter reductions and wider I retain
+            // cohort2, whose smaller live expert set wins those families.
+            constexpr uint64_t reverse_min_average_routes = 3072;
+            constexpr int reverse_max_inter_dim = 1024;
+            if(average_padded_routes >= reverse_min_average_routes &&
+               kargs.inter_dim <= reverse_max_inter_dim)
+                return reverse_cohort4_bm256_wave4_double_lds_kid;
             return cohort2_bm256_wave4_double_lds_kid;
+        }
         return cohort2_bm128_double_lds_kid;
     }
     return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;
