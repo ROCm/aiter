@@ -114,15 +114,11 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x4(const S& s, float inverted_scale)
 // Keep the signed range symmetric with the qmax=127 scale contract.
 OPUS_D i8_t fp32_to_i8_rne_sat(float x)
 {
-    x                  = __builtin_rintf(x);
-    constexpr float lo = -127.0f;
-    constexpr float hi = 127.0f;
-    asm volatile("v_med3_f32 %0, %0, %1, %2" : "+v"(x) : "v"(lo), "v"(hi));
-    return static_cast<i8_t>(x);
+    return static_cast<i8_t>(fminf(fmaxf(__builtin_rintf(x), -127.0f), 127.0f));
 }
 
 // fp32x2 -> i8x2 with scale
-// ISA: v_pk_mul_f32 + v_rndne_f32 x2 + v_med3_f32 x2 + v_cvt_i32_f32 x2
+// The compiler selects the ISA lowering for the standard min/max saturation.
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_i8_scaled_x2(const S& s, float inverted_scale)
 {

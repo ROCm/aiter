@@ -81,11 +81,7 @@ __device__ inline out_t quant_cast(float v)
 {
     if constexpr(std::is_same_v<out_t, signed char>)
     {
-        v                  = __builtin_rintf(v);
-        constexpr float lo = -127.0f;
-        constexpr float hi = 127.0f;
-        asm volatile("v_med3_f32 %0, %0, %1, %2" : "+v"(v) : "v"(lo), "v"(hi));
-        return static_cast<signed char>(v);
+        return static_cast<signed char>(fminf(fmaxf(__builtin_rintf(v), -127.0f), 127.0f));
     }
     else
         return opus::fp32_to_fp8(v);
