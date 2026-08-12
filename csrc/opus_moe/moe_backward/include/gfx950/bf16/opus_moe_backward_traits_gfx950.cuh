@@ -41,6 +41,7 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
 {
     static constexpr int ROUTE_COHORT_TILES = 0;
     static constexpr int ROUTE_M_TILES = 1;
+    static constexpr bool COMPACT_ROUTE_GROUP_GRID = false;
     static constexpr int ROUTE_M = 32;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -115,6 +116,7 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort20
     static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
     static constexpr int ROUTE_M_TILES = 5;
     static constexpr int ROUTE_COHORT_TILES = 20;
+    static constexpr bool COMPACT_ROUTE_GROUP_GRID = true;
 };
 
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
