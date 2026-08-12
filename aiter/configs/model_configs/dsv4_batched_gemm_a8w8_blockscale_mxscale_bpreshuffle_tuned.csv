@@ -31,7 +31,7 @@ gfx950,2,8192,1024,1024,opus,194,1,28.584,opus_bmm_a8w8_mxscale_bpreshuffle_wave
 gfx950,2,8192,1024,4096,opus,205,1,75.3791,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,1823.3,1446.71,0.0003
 gfx950,2,16384,1024,1024,opus,203,1,55.5369,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload,1237.4,1850.31,0.0
 gfx950,2,16384,1024,4096,opus,194,1,132.8355,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,2069.3,1578.76,0.0004
-gfx950,2,32768,1024,4096,opus,194,1,262.6508,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,2093.1,1564.97,0.0003
+gfx950,2,32768,1024,4096,opus,205,1,258.3696,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,2127.8,1590.91,0.0
 gfx950,4,1,1024,1024,opus,243,1,4.4888,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x16x32x256_1x2_16x16x128_1x128x128_wgpcu4,1.9,937.13,0.0
 gfx950,4,1,1024,4096,opus,236,1,7.6675,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x16x32x512_1x2_16x16x128_1x128x128_wgpcu2_scaleprefetch,4.4,2191.3,0.0005
 gfx950,4,4,1024,1024,opus,226,1,4.5247,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x32x32x256_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,7.4,937.84,0.0
@@ -126,7 +126,7 @@ gfx950,16,2560,1024,4096,opus,205,1,177.7595,opus_bmm_a8w8_mxscale_bpreshuffle_w
 gfx950,16,3072,1024,4096,opus,194,1,205.1066,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,2010.3,1799.55,0.0001
 gfx950,16,3584,1024,4096,opus,205,1,244.364,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,1968.5,1716.42,0.0001
 gfx950,16,4096,1024,1024,opus,194,1,106.2588,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,1293.4,2052.57,0.0001
-gfx950,16,4096,1024,4096,opus,194,1,264.3153,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,2079.9,1777.28,0.0
+gfx950,16,4096,1024,4096,opus,196,1,260.4081,opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_512x256x256x128_2x1_16x16x128_1x128x128_preload_sf,2111.1,1803.95,0.0002
 gfx950,16,8192,1024,1024,opus,194,1,205.4815,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,1337.7,2041.21,0.0
 gfx950,16,8192,1024,4096,opus,196,1,503.0953,opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_512x256x256x128_2x1_16x16x128_1x128x128_preload_sf,2185.5,1734.1,0.0001
 gfx950,16,16384,1024,1024,opus,203,1,384.4826,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload,1429.9,2138.16,0.0002

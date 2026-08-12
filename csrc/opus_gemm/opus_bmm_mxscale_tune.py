@@ -310,16 +310,38 @@ DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 # batched_gemm_a8w8_mxscale reads only under b_preshuffled=True. Nothing has to
 # be set to pick it up; override that entry's env var to try another one.
 #
-# Five of the 133 cells are slower here than the shipped table is with row-major
+# Four of the 133 cells are slower here than the shipped table is with row-major
 # B, and they stay in anyway: a b_preshuffled=True caller has no row-major kernel
 # to fall back to, and each row already names the fastest preshuffled kid the
-# entry can dispatch (re-swept over the whole pool, 7 alternating rounds). Two of
+# entry can dispatch (re-swept over the whole pool at re-drawn placements). Two of
 # them are twin-vs-twin, which is what makes them worth recording rather than
-# re-tuning: g16/m128/k4096 is kid326 against kid230 (+11.8%) and g16/m256/k4096
-# is kid325 against kid229 (+14.7%) -- same tile, same sfpreload, only B's layout
-# and its LDS hop differ, so that is what preshuffling costs at the 128-wide
-# tiles rather than a tuning miss. The others are g2/m512/k1024 (+6.3%),
-# g2/m1024/k1024 (+4.7%) and g2/m32768/k4096 (+2.4%).
+# re-tuning: g16/m128/k4096 is kid326 against kid230 (+11%) and g16/m256/k4096 is
+# kid325 against kid229 (+14%) -- same tile, same sfpreload, only B's layout and
+# its LDS hop differ, so that is what preshuffling costs at the 128-wide tiles
+# rather than a tuning miss. The other two are g2/m512/k1024 (+6.4%) and
+# g2/m1024/k1024 (+4.2%), where the row-major side is the heuristic, not a row.
+#
+# g2/m32768/k4096 was a fifth at +2.4%, and was not a layout cost at all: kid196
+# (kid158's own pipeline reading a preshuffled B) and kid205 both land within 1%
+# of row-major there, and the row named kid194, the slowest of the three. It now
+# names kid205, and g16/m4096/k4096 -- same family, same mis-rank -- now names
+# kid196. Neither was visible to the sweep that wrote them, because the candidates
+# sit inside 2% of each other and a single pass ranks them by luck. The other 15
+# rows naming kid194 were re-checked and it is the right pick on all of them.
+#
+# Two measurement traps here, each of which inverted an answer before it was found:
+#   * run_perftest deep-copies the arguments it is handed into rotate_args sets and
+#     cycles them, so the timed kernel reads a weight it did not just read.
+#     Operands captured in a zero-argument closure are not arguments, and all 101
+#     iterations then hit one cache-resident copy -- worth 14% to the 8-wave kids,
+#     enough to make kid175 look like it beat row-major at g16/m128 by 1.4% when
+#     it and kid230 are a wash.
+#   * the placement note in opus_gemm_common.py, that at K=4096 a kernel's time
+#     depends on where its weight buffer landed, does not cover these cells, but
+#     had to be ruled out rather than assumed: the two sides necessarily hold
+#     different buffers, so a single allocation bakes one placement difference into
+#     the comparison. Over 8 draws that move both buffers, every gap above holds
+#     its sign and no kernel varies by more than 4%.
 BPRESHUFFLE_CSV = os.path.join(
     _REPO,
     "aiter",
