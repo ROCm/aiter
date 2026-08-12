@@ -1,6 +1,6 @@
-name: FFM Aiter UT
+name: FFM Triton Tests
 
-run-name: FFM aiter UT on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
 
 on:
   pull_request:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Self-hosted runner label to use for the FFM UT.
+        description: Self-hosted runner label to use for the FFM Triton tests.
         required: true
         default: linux-aiter-do-mi350x-1
         type: string
@@ -38,15 +38,15 @@ env:
   FFM_TRITON_COMMIT: 6cf030fe7bffce12a5712e20fb507a51d5123f10
 
 jobs:
-  ffm-aiter-ut:
+  ffm-triton-tests:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
         github.event.action == 'labeled' &&
-        github.event.label.name == 'ci:gfx1250-ffm' &&
+        github.event.label.name == 'ci:gfx1250-ffm-triton' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    name: FFM Aiter UT (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
+    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
     runs-on: ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
     timeout-minutes: 7200
     strategy:
