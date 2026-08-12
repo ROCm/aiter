@@ -1039,7 +1039,11 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 # Single kernel: last split WG folds bias + reduces the SplitK-1 partials in-kernel
 # (cluster-barrier sync), no separate reduce kernel. SplitK / MClusterWg are
 # COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)); DataWs (bf16/fp32) is a kid
-# property. B is TDM-multicast across the MClusterWg M-peers. Kids: [21000, 22000).
+# property. B is TDM-multicast across the MClusterWg M-peers.
+#
+# CURRENTLY UNREGISTERED (see GFX1250_SPLITK_FUSE_ENABLED below): the pipeline is
+# still being fixed, so the family contributes no kid and the [21000, ...) band it
+# used to hold is free for another kernel family to take.
 def _a16w16_splitk_fuse_gfx1250(
     bm, bn, bk, layout, split_k, m_cluster, ws_dtype="bf16_t",
     num_slots=3, wg_per_cu=2,
@@ -1066,7 +1070,17 @@ def _a16w16_splitk_fuse_gfx1250(
     )
 
 
+# Registration switch for the whole fused family. False sweeps no (tile, split_k,
+# n_cluster, ws) combination at all, so gfx1250_splitk_fuse_kernels_list stays
+# empty: no kid to look up, nothing for the tuner to pick, nothing for the codegen
+# to emit, and the kid band below is unclaimed. The factory above, the emitter in
+# codegen/gen_instances_gfx1250.py and the device pipeline are all still here --
+# flipping this back to True is the only step needed to bring the family back.
+GFX1250_SPLITK_FUSE_ENABLED = False
+
 gfx1250_splitk_fuse_kernels_list = {}
+# Kid band the family claims WHEN ENABLED. It reaches 22377 at the current sweep;
+# while disabled the whole range is free.
 GFX1250_SPLITK_FUSE_KID_BASE = 21000
 _sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
 # (B_M, B_N, B_K, layout, split_k, m_cluster, ws_dtype) -> kid, for the tuner /
@@ -1113,7 +1127,8 @@ _FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))  # (ws_dtype, elem_bytes,
 # must satisfy SplitK*n_cluster <= 16 (16-bit workgroup_mask / 16-WG budget).
 _FUSE_MAX_NCLUSTER = 5
 _fuse_tiles_seen = set()
-for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
+_fuse_tiles = _GFX1250_CLUSTERLAUNCH_TILES if GFX1250_SPLITK_FUSE_ENABLED else ()
+for _bm, _bn, _bk, _wg in _fuse_tiles:
     if (_bm, _bn, _bk) in _fuse_tiles_seen:
         continue
     _fuse_tiles_seen.add((_bm, _bn, _bk))

@@ -88,6 +88,7 @@ from opus_gemm_common import (
     BIAS_AWARE_KIDS,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
+    GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
     GFX1250_SPLITK_FUSE_KIDS,
     HEURISTIC_DEFAULT_KIDS,
@@ -430,9 +431,9 @@ def _gfx1250_select_candidates(
     # tiles x occupancy-fit split_k x {baseline, max A-multicast n_cluster} x ws),
     # instead of dumping all ~1.4k fuse kids (which explodes to ~900 candidates for
     # wide-N small-M shapes). kid_rejects_shape still prunes any residual invalids.
-    # Set OPUS_TUNE_NO_FUSE=1 to sweep only plain + clusterlaunch, which keeps the
-    # compile set to the 496 non-fuse kids (the fuse family adds ~1.4k more).
-    if os.environ.get("OPUS_TUNE_NO_FUSE") != "1":
+    # The family is unregistered while its pipeline is being fixed, which is why
+    # the sweep is 496 kids (28 plain + 468 clusterlaunch) and not ~1.9k.
+    if GFX1250_SPLITK_FUSE_ENABLED:
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
     return frozenset(sel)
 
