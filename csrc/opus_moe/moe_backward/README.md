@@ -93,7 +93,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` long-reduction production | 13 | kid 11 geometry + reverse cohort4 + A-fragment prefetch |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
-| K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments + route-length hybrid |
+| K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
 
@@ -141,12 +141,13 @@ K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 tiles per expert, and at least 128 average padded routes.  Its four waves share
 one 128-column `a_scaled` slab across 256 `dO` rows; each wave owns eight native
 C tiles and consumes the K64 reduction as four K16 transpose-load/MFMA
-fragments.  Two device kernels partition experts without a host readback:
-route intervals from 20993 through 30720 use the BM128 kid-10 kernel, while
-all other intervals use BM256.  The target wide-grid kernel uses 178 VGPRs and
-48 KiB LDS with no scratch or spills; the BM128 fallback uses 146 VGPRs and
-32 KiB LDS.  Shapes outside that launch regime retain kid 10 or the existing
-smaller fallbacks.
+fragments.  The production kid launches BM256 directly for every expert
+interval without a host readback.
+The retired BM128 mid-route fallback was slower not only for balanced and
+skewed routing but also for its intended 20993--30720 interval after the K16
+pipeline landed.  The target code object uses 52 arch VGPRs, 132 accum VGPRs,
+112 SGPRs, and 48 KiB LDS with no scratch or spills.  Shapes outside that
+launch regime retain kid 10 or the existing smaller fallbacks.
 
 ## Shape contract
 

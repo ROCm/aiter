@@ -894,29 +894,11 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     auto g_b = make_gmem(b, b_bytes);
     auto async_load_b = [&](auto lds_dst, int byte_offset)
         __attribute__((always_inline)) {
-        if constexpr(requires { T::RUNTIME_SHORT_ROUTE_CACHE_B; })
-        {
-            static_assert(T::RUNTIME_SHORT_ROUTE_CACHE_B);
-            if(route_count <= T::SHORT_ROUTE_CACHE_B_MAX_ROUTES)
-                g_b.template _async_load<VEC>(
-                    lds_dst,
-                    byte_offset,
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::SHORT_ROUTE_CACHECTL_B>{});
-            else
-                g_b.template _async_load<VEC>(lds_dst,
-                                              byte_offset,
-                                              0,
-                                              opus::number<0>{},
-                                              opus::number<T::CACHECTL_B>{});
-        }
-        else
-            g_b.template _async_load<VEC>(lds_dst,
-                                          byte_offset,
-                                          0,
-                                          opus::number<0>{},
-                                          opus::number<T::CACHECTL_B>{});
+        g_b.template _async_load<VEC>(lds_dst,
+                                      byte_offset,
+                                      0,
+                                      opus::number<0>{},
+                                      opus::number<T::CACHECTL_B>{});
     };
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
@@ -1392,17 +1374,6 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     static_assert(T::B_K == 64, "dw2 registers the K64 kernel");
     AITER_CHECK(kargs.split_k == 1,
                 "dw2: first Opus instance requires split_k=1");
-    if constexpr(requires { T::ADAPTIVE_BM256_ROUTE_SPLIT; })
-    {
-        static_assert(T::ADAPTIVE_BM256_ROUTE_SPLIT);
-        dw2_launch_gfx950<
-            Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4OutsideMidRoutes>(
-            kargs, stream);
-        dw2_launch_gfx950<
-            Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledWave2x2MidRoutes>(
-            kargs, stream);
-        return;
-    }
     if constexpr(requires { T::ADAPTIVE_ROUTE_SPLIT; })
     {
         static_assert(T::ADAPTIVE_ROUTE_SPLIT);
