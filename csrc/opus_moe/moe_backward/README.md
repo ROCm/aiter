@@ -84,6 +84,9 @@ fallback when a genuinely different working-set regime needs it.
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
 | K2 `route_dx` large working set | 9 | `BM32 x BN128 x BK32`, M5/ten-route cohort + dZ LDS padding |
+| K2 `route_dx` large sorted output | 11 | kid 9 geometry, sorted route workspace for K3 reverse gather |
+| K2 `route_dx` wide-N logical output | 13 | `BM32 x BN256 x BK32`, M3/six-route cohort + 96-byte A-slab rotation |
+| K2 `route_dx` wide-N sorted output | 14 | kid 13 geometry, sorted route workspace for K3 reverse gather |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |
@@ -102,10 +105,13 @@ compile-time layout gate, so compact route ids cannot be decoded as fixed
 packed token/slot ids.
 
 K2 auto-dispatch uses the combined runtime `dZ + W1` working set. Fixed routing
-with expert offsets selects M2 kid 7 at or below 128 MiB and M5 kid 9 above
-that threshold. Both BK32 tiles retain two-stage async loads while reducing
-their LDS allocation and VGPR count relative to kid 6. Degenerate grids and
-callers without expert offsets retain kid 5.
+with expert offsets selects M2 kid 7 at or below 128 MiB. Above that threshold,
+`D % 256 == 0` selects the BN256-M3 kid 13; other widths retain BN128-M5 kid 9.
+The full K>=4 pipeline pairs their sorted-output variants (kids 14 and 11)
+with K3 reverse gather. The BN256 tile rotates successive 16-row dZ slabs by
+96 bytes in LDS, which preserves the generic runtime geometry while lowering
+LDS wait pressure. Degenerate grids and callers without expert offsets retain
+kid 5.
 
 K1 auto-dispatch uses useful launch geometry instead of an exact model tuple
 or a tensor-byte proxy. For `I >= 512` divisible by 256, it estimates the

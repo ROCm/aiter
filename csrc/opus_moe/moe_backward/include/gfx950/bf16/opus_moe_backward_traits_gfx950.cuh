@@ -257,6 +257,10 @@ struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPad
     static constexpr int E_N = 2;
     static constexpr int ROUTE_COHORT_TILES = 6;
     static constexpr int ROUTE_M_TILES = 3;
+    // The wide-N M3 tile uses six consecutive 16-row A slabs.  A 96-byte
+    // inter-slab rotation lowers gfx950 LDS dependency waits and compiler
+    // address-register pressure while retaining two resident workgroups.
+    static constexpr int SMEM_A_SLAB_PAD = 48;
     static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
     static constexpr int SMEM_B_GROUP_DATA_BYTES =
         SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
