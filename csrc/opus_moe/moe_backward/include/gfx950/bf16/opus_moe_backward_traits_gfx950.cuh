@@ -330,16 +330,16 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort2DirectLds
 };
 
 // Keep the four-wave workgroup used by the BM64 kernel, but let every lane
-// load two 64-row dZ slabs and accumulate four native M tiles.  This shares
-// each gathered X tile across twice as many dW1 rows without the occupancy
-// and scheduling cost of the rejected 512-thread BM128 experiment.
+// load two 64-row dZ slabs.  A 2x2 wave grid balances dZ and gathered-X
+// transpose reads while sharing each X tile across twice as many dW1 rows,
+// without the occupancy cost of a 512-thread BM128 workgroup.
 struct Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DirectLds
     : Bf16Traits<Family::Dw1, 128, 128, 32, 256, 2, false>
 {
     static constexpr int EXPERT_COHORT = 2;
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
-    static constexpr int T_M = 1;
-    static constexpr int T_N = 4;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
     static constexpr int T_K = 1;
     static constexpr int W_M = 32;
     static constexpr int W_N = 32;
@@ -349,8 +349,8 @@ struct Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DirectLds
     using D_B = opus::bf16_t;
     using D_ACC = opus::fp32_t;
 
-    static constexpr int E_M = 4;
-    static constexpr int E_N = 1;
+    static constexpr int E_M = 2;
+    static constexpr int E_N = 2;
     static constexpr int E_K = 2;
     static constexpr int VEC_A = 16 / sizeof(D_A);
     static constexpr int VEC_B = 16 / sizeof(D_B);

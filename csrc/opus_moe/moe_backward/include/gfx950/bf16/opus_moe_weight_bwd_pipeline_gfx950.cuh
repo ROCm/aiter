@@ -166,8 +166,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int b_n_slabs = BN / 128;
     static_assert(a_m_slabs * b_n_slabs <= 2,
                   "only one doubled K4 output dimension is supported");
-    static_assert(T::E_M == 2 * a_m_slabs);
-    static_assert(T::E_N == b_n_slabs);
+    static_assert(T::E_M * T::T_M == BM / T::W_M);
+    static_assert(T::E_N * T::T_N == BN / T::W_N);
     static_assert((BM == 64 && BN == 128) || T::DIRECT_GMEM_TO_LDS,
                   "wide K4 tiles require direct GMEM-to-LDS loads");
     int expert;
@@ -258,10 +258,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int a_read_base =
         (lane_mix << 5) |
         (((tid << 1) & 0x70) ^ ((tid << 3) & 0x18));
-    const int b_read_base =
+    const int b_read_lane_base =
         ((lane_mix << 2) ^ ((tid << 1) & 0x20) ^
-         ((lane_mix << 6) | ((tid << 3) & 0x18))) ^
-        (tid & 0xc0);
+         ((lane_mix << 6) | ((tid << 3) & 0x18)));
+    const int b_read_base = b_read_lane_base ^ (tid & 0xc0);
     // Expert offsets are padded to the sorter block size, which is BK=32 for
     // this kernel, so every reduction tile has exactly 32 addressable rows.
     const int loops = route_count / BK;
@@ -374,13 +374,24 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int slab = em.value / 2;
-                constexpr int em_in_slab = em.value % 2;
-                constexpr int byte_offset = slab * 4096 + ek.value * 2048;
-                const int base = a_read_base ^ (em_in_slab * 0x40);
-                auto lo = s_a.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    base);
-                auto hi = s_a.template _tr_load<T::VEC_TR_B, byte_offset>(
+                constexpr int k_byte_offset = ek.value * 2048;
+                int base;
+                if constexpr(T::T_M == 1)
+                {
+                    constexpr int slab = em.value / 2;
+                    constexpr int em_in_slab = em.value % 2;
+                    base = a_read_base + slab * 4096;
+                    base ^= em_in_slab * 0x40;
+                }
+                else
+                {
+                    const int native_m = em.value * T::T_M + wave_id_m;
+                    base = a_read_base + (native_m / 2) * 4096;
+                    base ^= (native_m % 2) * 0x40;
+                }
+                auto lo =
+                    s_a.template _tr_load<T::VEC_TR_B, k_byte_offset>(base);
+                auto hi = s_a.template _tr_load<T::VEC_TR_B, k_byte_offset>(
                     base ^ 0x220);
                 constexpr int fragment = em.value * T::E_K + ek.value;
 #pragma unroll
@@ -395,11 +406,22 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_b v_b;
         opus::static_for<T::E_N>([&](auto en) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int byte_offset = en.value * 8192 + ek.value * 4096;
-                auto lo = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    b_read_base);
-                auto hi = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    b_read_base ^ 0x440);
+                constexpr int k_byte_offset = ek.value * 4096;
+                int base;
+                if constexpr(T::T_N == 4)
+                {
+                    base = b_read_base + en.value * 8192;
+                }
+                else
+                {
+                    const int native_n = en.value * T::T_N + wave_id_n;
+                    base = b_read_lane_base + (native_n / 4) * 8192;
+                    base ^= (native_n % 4) * 0x40;
+                }
+                auto lo =
+                    s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(base);
+                auto hi = s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(
+                    base ^ 0x440);
                 constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
                 for(int j = 0; j < T::VEC_TR_B; ++j)

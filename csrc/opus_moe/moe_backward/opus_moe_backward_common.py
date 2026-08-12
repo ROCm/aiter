@@ -258,7 +258,7 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
     ),
     OpusMoeBackwardInstance(
         kid=9,
-        name="dw1_bf16_gfx950_bm128_bn128_bk32_swizzled_cohort2_direct_lds",
+        name="dw1_bf16_gfx950_bm128_bn128_bk32_swizzled_cohort2_wave2x2",
         family=OpusMoeBackwardFamily.DW1,
         arch="gfx950",
         dtype="bf16",
