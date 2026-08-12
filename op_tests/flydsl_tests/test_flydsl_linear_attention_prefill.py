@@ -100,6 +100,10 @@ class PrefillArgs:
     # accumulator unchanged for both choices; bf16 only affects HBM
     # bandwidth/footprint of the SSM state.
     ssm_state_dtype: torch.dtype = torch.float32
+    # Per-chunk h-snapshot dtype, an independent policy from the SSM state
+    # dtype. None (the default) resolves to k.dtype (bf16 here), which is the
+    # bf16 store specialization; torch.float32 selects the fp32 one.
+    snapshot_dtype: object = None  # torch.dtype | None
     # If set, override ``_build_context_lens(full_prompt_len,
     # max_num_batched_tokens)`` and use these segment lengths verbatim.
     # Used by trace-derived ragged-batch cases (e.g. the prefill_gdr.log
@@ -185,6 +189,8 @@ class PrefillArgs:
             tag += "_nofs"
         if self.ssm_state_dtype == torch.bfloat16:
             tag += "_stateBF16"
+        if self.snapshot_dtype == torch.float32:
+            tag += "_snapFP32"
         return tag
 
 
@@ -223,6 +229,8 @@ class PrefillGroup:
     is_varlen: bool = True
     output_final_state: bool = True
     ssm_state_dtype: torch.dtype = torch.float32
+    # Per-chunk h-snapshot dtype; None -> k.dtype (bf16). See PrefillArgs.
+    snapshot_dtype: object = None  # torch.dtype | None
     # Semantics for ``max_num_batched_tokens``:
     #   - list/tuple : sweep -- materialise one case per element (Cartesian with
     #           tps x full_prompt_lens). Each element is itself one of the specs
@@ -321,6 +329,7 @@ def expand_groups(groups):
                                 is_varlen=g.is_varlen,
                                 output_final_state=g.output_final_state,
                                 ssm_state_dtype=g.ssm_state_dtype,
+                                snapshot_dtype=g.snapshot_dtype,
                                 bt_tag=bt_tag,
                                 dense_batch=g.dense_batch,
                                 use_g=g.use_g,
@@ -376,6 +385,7 @@ def expand_groups(groups):
                                     is_varlen=g.is_varlen,
                                     output_final_state=g.output_final_state,
                                     ssm_state_dtype=g.ssm_state_dtype,
+                                    snapshot_dtype=g.snapshot_dtype,
                                     context_lens=context_lens,
                                     trace_tag=tag,
                                     dense_batch=g.dense_batch,
@@ -438,7 +448,7 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen-ptpc-ali",
+        model_name="varlen-64k-qwen3.5-397b-ptpc-ali-bf16snapshot",
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
@@ -446,12 +456,28 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen-ptpc-ali-tp1-bf16snapshot",
+        model_name="varlen-64k-qwen3.5-397b-ptpc-ali-fp32snapshot",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[8192],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        snapshot_dtype=torch.float32,
+    ),
+    PrefillGroup(
+        model_name="varlen-64k-qwen-ali-tp1-bf16snapshot",
         Hv=32,
         tps=[1],
         full_prompt_lens=[8192],
-        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        max_num_batched_tokens=[8192],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        # max_num_batched_tokens=[8192],
+    ),
+    PrefillGroup(
+        model_name="varlen-64k-qwen-ali-tp1-fp32snapshot",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[8192],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        snapshot_dtype=torch.float32,
     ),
     PrefillGroup(
         # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
@@ -1129,7 +1155,9 @@ class TestCorrectness:
             # ``use_exp2=True`` the kernel would treat ``g`` as log2-space and
             # compute ``exp2(x)``, a mismatch masked only by gates decaying to 0.
             use_exp2=False,
+            snapshot_dtype=args.snapshot_dtype,
         )
+        assert h_fly.dtype == (args.snapshot_dtype or k.dtype)
         h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
             k,
             w_orig,
@@ -1731,6 +1759,7 @@ def _run_perf_comparison(args: PrefillArgs):
         output_final_state=ofs,
         cu_seqlens=cu,
         g_head_major=args.g_head_major,
+        snapshot_dtype=args.snapshot_dtype,
     )
     us_tri = _bench_fn(
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -1741,6 +1770,7 @@ def _run_perf_comparison(args: PrefillArgs):
         initial_state=h0,
         output_final_state=ofs,
         cu_seqlens=cu,
+        snapshot_dtype=args.snapshot_dtype,
     )
     if _HAS_HIP_K5 and _hip_k5_supported(args):
         us_hip = _bench_fn(
@@ -1752,6 +1782,7 @@ def _run_perf_comparison(args: PrefillArgs):
             initial_state=h0,
             output_final_state=ofs,
             cu_seqlens=cu,
+            snapshot_dtype=args.snapshot_dtype,
         )
     else:
         us_hip = float("nan")
@@ -1767,6 +1798,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "T": total_tokens,
             "varlen": args.is_varlen,
             "final_st": ofs,
+            "snap": "fp32" if args.snapshot_dtype == torch.float32 else "bf16",
             "fly_hip": us_fly,
             "HIP": us_hip,
             "Triton": us_tri,
@@ -1791,6 +1823,7 @@ def _print_perf_table():
         ("T", "T", 6),
         ("varlen", "varlen", 6),
         ("final_st", "final_st", 8),
+        ("snap", "snap", 4),
         ("FlyDSL_hip(us)", "fly_hip", 14),
         ("HIP(us)", "HIP", 8),
         ("Triton(us)", "Triton", 10),
