@@ -654,44 +654,51 @@ void opus_moe_combine_bwd_token8_h2048_bf16(
 }
 
 // Stage dy only; dscore is reconstructed from the fused stage-2 epilogue.
-__global__ __launch_bounds__(512, 1)
+__global__ __launch_bounds__(1024, 1)
 void opus_moe_combine_scale_token8_h2048_bf16_kernel(
     const __bf16* __restrict__ dout,
     const int32_t* __restrict__ token_routes,
     const float* __restrict__ p,
-    __bf16* __restrict__ dy)
+    __bf16* __restrict__ dy,
+    int T)
 {
     constexpr int H = 2048;
     constexpr int TOPK = 8;
     constexpr int VEC = 8;
-    const int t = blockIdx.x;
-    const int tid = threadIdx.x;
+    constexpr int THREADS_PER_TOKEN = 512;
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const int token_in_block = threadIdx.x / THREADS_PER_TOKEN;
+    const int tid = threadIdx.x % THREADS_PER_TOKEN;
+    const int t = blockIdx.x * TOKENS_PER_BLOCK + token_in_block;
+    const bool valid_token = t < T;
     const int lane = tid & 63;
     const int wave = tid >> 6;
-    __shared__ __align__(16) __bf16 dout_shared[H];
-    __shared__ int32_t routes[TOPK];
-    __shared__ float scores[TOPK];
-    if(tid < TOPK)
+    __shared__ __align__(16) __bf16 dout_shared[TOKENS_PER_BLOCK][H];
+    __shared__ int32_t routes[TOKENS_PER_BLOCK][TOPK];
+    __shared__ float scores[TOKENS_PER_BLOCK][TOPK];
+    if(valid_token && tid < TOPK)
     {
         const int32_t route = token_routes[static_cast<int64_t>(t) * TOPK + tid];
-        routes[tid] = route;
-        scores[tid] = p[route];
+        routes[token_in_block][tid] = route;
+        scores[token_in_block][tid] = p[route];
     }
-    if(tid < H / VEC)
+    if(valid_token && tid < H / VEC)
     {
         const int h = tid * VEC;
-        *reinterpret_cast<opus_bf16x8*>(dout_shared + h) =
+        *reinterpret_cast<opus_bf16x8*>(dout_shared[token_in_block] + h) =
             *reinterpret_cast<const opus_bf16x8*>(
                 dout + static_cast<int64_t>(t) * H + h);
     }
     __syncthreads();
-    const int32_t route = routes[wave];
-    const float score = scores[wave];
+    if(!valid_token)
+        return;
+    const int32_t route = routes[token_in_block][wave];
+    const float score = scores[token_in_block][wave];
     for(int h = lane * VEC; h < H; h += 64 * VEC)
     {
         const int64_t offset = static_cast<int64_t>(route) * H + h;
         const opus_bf16x8 dv =
-            *reinterpret_cast<const opus_bf16x8*>(dout_shared + h);
+            *reinterpret_cast<const opus_bf16x8*>(dout_shared[token_in_block] + h);
         opus_bf16x8 dyv;
 #pragma unroll
         for(int i = 0; i < VEC; ++i)
@@ -709,12 +716,15 @@ void opus_moe_combine_scale_token8_h2048_bf16(
     const int T = static_cast<int>(dout.size(0));
     if(T == 0)
         return;
+    constexpr int TOKENS_PER_BLOCK = 2;
     opus_moe_combine_scale_token8_h2048_bf16_kernel<<<
-        dim3(T), dim3(512), 0, aiter::getCurrentHIPStream()>>>(
+        dim3((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK),
+        dim3(TOKENS_PER_BLOCK * 512), 0, aiter::getCurrentHIPStream()>>>(
         reinterpret_cast<const __bf16*>(dout.data_ptr()),
         reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
         reinterpret_cast<const float*>(p.data_ptr()),
-        reinterpret_cast<__bf16*>(dy.data_ptr()));
+        reinterpret_cast<__bf16*>(dy.data_ptr()),
+        T);
 }
 
 __global__ __launch_bounds__(64, 1)
