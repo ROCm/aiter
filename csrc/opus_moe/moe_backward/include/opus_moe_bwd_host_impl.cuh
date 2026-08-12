@@ -934,20 +934,28 @@ void opus_moe_scatter_add_bf16(aiter_tensor_t& src,    // [M,H] bf16
 }
 
 // Deterministic dx gather-sum (replaces the atomic scatter for fixed top-k):
-// one block per token t sums its topk route rows of src -> dst[t]. No atomics
-// (each dst[t] written by exactly one block), no pre-zero. bf16x8 vectorized;
-// fp32 accumulate. token_routes[t,k] = compact route index of token t's k-th
-// selection (built once from routing). Requires H % 8 == 0.
+// Two tokens per block; an independent 256-thread half-block sums each token's
+// topk route rows of src -> dst[t]. No atomics (each dst[t] is written by one
+// half-block), no pre-zero. bf16x8 vectorized; fp32 accumulate.
+// token_routes[t,k] is the compact route index of token t's k-th selection
+// (built once from routing). Requires H % 8 == 0.
 __global__ void opus_moe_gather_sum_bf16_kernel(const __bf16* __restrict__ src,           // [M,H]
                                                 const int32_t* __restrict__ token_routes, // [T,topk]
                                                 __bf16* __restrict__ dst,                 // [T,H]
+                                                int T,
                                                 int H,
                                                 int topk)
 {
-    const int t          = blockIdx.x;
+    constexpr int THREADS_PER_TOKEN = 256;
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const int token_in_block = threadIdx.x / THREADS_PER_TOKEN;
+    const int token_thread = threadIdx.x % THREADS_PER_TOKEN;
+    const int t          = blockIdx.x * TOKENS_PER_BLOCK + token_in_block;
+    if(t >= T)
+        return;
     const int32_t* tr    = token_routes + static_cast<int64_t>(t) * topk;
     const int64_t dstrow = static_cast<int64_t>(t) * H;
-    for(int h = threadIdx.x * 8; h < H; h += blockDim.x * 8)
+    for(int h = token_thread * 8; h < H; h += THREADS_PER_TOKEN * 8)
     {
         float acc[8];
 #pragma unroll
@@ -975,11 +983,14 @@ void opus_moe_gather_sum_bf16(aiter_tensor_t& src,          // [M,H] bf16
     const int topk = static_cast<int>(token_routes.size(1));
     if(T == 0)
         return;
-    opus_moe_gather_sum_bf16_kernel<<<dim3(T), dim3(256), 0, aiter::getCurrentHIPStream()>>>(
+    constexpr int TOKENS_PER_BLOCK = 2;
+    opus_moe_gather_sum_bf16_kernel<<<
+        dim3((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK),
+        dim3(TOKENS_PER_BLOCK * 256), 0, aiter::getCurrentHIPStream()>>>(
         reinterpret_cast<const __bf16*>(src.data_ptr()),
         reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
         reinterpret_cast<__bf16*>(dst.data_ptr()),
-        H, topk);
+        T, H, topk);
 }
 
 // Router backward (M5 R7): softmax-over-topk Jacobian. Per token t (one thread):
