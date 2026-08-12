@@ -355,6 +355,7 @@ def fhmoe_fake(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    q_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     del (
         w1,
@@ -381,6 +382,7 @@ def fhmoe_fake(
         shared_w1_scale,
         shared_w2_scale,
         shared_expert_id,
+        q_dtype_a,
     )
     output_dtype = hidden_states.dtype if dtype is None else dtype
     return torch.empty(
@@ -420,6 +422,7 @@ def fhmoe_(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    q_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     from aiter.fused_moe import _fused_moe_impl
 
@@ -444,7 +447,8 @@ def fhmoe_(
         bias1,
         bias2,
     )
-    q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+    if q_dtype_a is None:
+        q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
@@ -469,7 +473,7 @@ def fhmoe_(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
-        _q_dtype_a=q_dtype_a,
+        q_dtype_a=q_dtype_a,
         _metadata_transform=_use_fhmoe_wrappers,
         _stage1_extra_args={
             "shared_w1": shared_w1,

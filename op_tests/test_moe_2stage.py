@@ -9,14 +9,14 @@ import os
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.aot.flydsl.common import override_env, run_only_env
+from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -228,13 +228,7 @@ def test_fmoe(
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
-    # Match fused_moe's runtime activation dtype. SiTUv2 can be requested as
-    # a16w4 by the caller but dispatched as a8w4 on gfx950.
     reference_aq_dtype = AQDType
-    if actType == aiter.ActivationType.Situv2:
-        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
-        if runtime_aq_dtype is not None:
-            reference_aq_dtype = runtime_aq_dtype
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -273,8 +267,6 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
         and actType == aiter.ActivationType.Situv2
     ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
-        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
-        # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
         exp_bias1_aiter = exp_bias2_aiter = None
     elif (
@@ -477,6 +469,9 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
+        # SiTUv2 activation precision is an explicit public API choice. Other
+        # activations retain fused_moe's existing automatic dispatch policy.
+        "q_dtype_a": AQDType if actType == aiter.ActivationType.Situv2 else None,
     }
 
     if kernel_bench:
@@ -887,14 +882,7 @@ def _iter_csv_cases(csv_path=None, force_check_aot_cache=False):
             kwargs["linear_beta"] = (
                 25.0 if args.linear_beta is None else float(args.linear_beta)
             )
-        # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
-        # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
         if kwargs["actType"] == aiter.ActivationType.Situv2:
-            expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
-                kwargs["qType"], kwargs["WQDType"]
-            )
-            runtime_mode = "SiTUv2 MXFP4"
             # SiTUv2 a16w4 never ran before this ordering fix and every row
             # fails: _effective_gate_mode asks for INTERLEAVE while stage1 binds
             # gate_mode="separated" for non-fp8 activations.
@@ -910,18 +898,18 @@ def _iter_csv_cases(csv_path=None, force_check_aot_cache=False):
                 kwargs["WQDType"],
             )
             runtime_mode = "Swiglu MXFP4"
-        if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
-            aiter.logger.info(
-                "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
-                "current %s runtime mode (expected %s)",
-                row.get("token"),
-                row.get("model_dim"),
-                row.get("inter_dim"),
-                kwargs["AQDType"],
-                runtime_mode,
-                expected_aq_dtype,
-            )
-            continue
+            if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
+                aiter.logger.info(
+                    "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
+                    "current %s runtime mode (expected %s)",
+                    row.get("token"),
+                    row.get("model_dim"),
+                    row.get("inter_dim"),
+                    kwargs["AQDType"],
+                    runtime_mode,
+                    expected_aq_dtype,
+                )
+                continue
         kwargs["strict_accuracy"] = True
         # Targeted configs may compile on demand during normal runs. Explicit
         # cache verification requires a hit for every selected CSV case.
@@ -975,29 +963,6 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
     return None
-
-
-def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
-    """Mirror fused_moe's SiTUv2 MXFP4 activation-dtype routing."""
-    if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
-        return None
-
-    if get_gfx() == "gfx1250":
-        return (
-            dtypes.fp8
-            if os.environ.get("AITER_FORCE_A8W4", "0") == "1"
-            else dtypes.fp4x2
-        )
-
-    # fused_moe tests SiTUv2 ahead of the Swiglu/INTERLEAVE branch, so gate mode
-    # and token count do not enter into it -- mirror that order here, otherwise
-    # a4w4/a8w4 rows are skipped as "mode mismatch" under gate_mode=INTERLEAVE
-    # and the opt-in paths go untested.
-    if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
-        return dtypes.fp8
-    if os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
-        return dtypes.fp4x2
-    return dtypes.bf16
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -1231,14 +1196,6 @@ def test_bm16_tiled_scale_boundary():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
-def _iter_with_env(case_iter, **env_overrides):
-    """Keep temporary environment overrides active while cases are consumed."""
-    with ExitStack() as stack:
-        for name, value in env_overrides.items():
-            stack.enter_context(override_env(name, value))
-        yield from case_iter
-
-
 def _prepare_aot_verify_cache(csv_path):
     csv_path = os.path.abspath(os.path.expanduser(csv_path))
     if not os.path.isfile(csv_path):
@@ -1279,24 +1236,11 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 elif args.verify_aot_cache:
     _verify_csv = _prepare_aot_verify_cache(args.verify_aot_cache)
-    # Match regular CSV CI coverage: enable SiTUv2 A8W4, keep A4W4 disabled,
-    # and do not append legacy cases.
-    _case_iters.append(
-        _iter_with_env(
-            _iter_csv_cases(_verify_csv, force_check_aot_cache=True),
-            AITER_SITUV2_A8W4="1",
-            AITER_SITUV2_A4W4=None,
-        )
-    )
+    # Match regular CSV CI coverage and do not append legacy cases.
+    _case_iters.append(_iter_csv_cases(_verify_csv, force_check_aot_cache=True))
 else:
     if not args.no_flydsl_csv:
-        _case_iters.append(
-            _iter_with_env(
-                _iter_csv_cases(),
-                AITER_SITUV2_A8W4="1",
-                AITER_SITUV2_A4W4=None,
-            )
-        )
+        _case_iters.append(_iter_csv_cases())
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
