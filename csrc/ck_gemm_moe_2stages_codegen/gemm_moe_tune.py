@@ -6155,12 +6155,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         is_a4w4 = "float4" in str(row["q_dtype_a"]) and "float4" in str(
             row["q_dtype_w"]
         )
+        if str(row["act_type"]).endswith("Situv2"):
+            act = "situv2"
+        elif str(row["act_type"]).endswith("Swiglu"):
+            act = "swiglu"
+        else:
+            act = "silu"
         locked_g2 = str(row.get("kernelName2", ""))
         if (is_a8w4 or is_a4w4) and locked_g2 and not locked_g2.startswith("flydsl_"):
             return []
         if is_a8w4:
             bm = int(row["block_m"])
-            act = "situv2" if str(row["act_type"]).endswith("Situv2") else "silu"
             for _, use_nt, inline_quant in sorted(
                 variant for variant in _SUPPORTED_BY_DTYPE["fp8"] if variant[0] == bm
             ):
@@ -6187,12 +6192,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ):
                 return []
             bm = int(row["block_m"])
-            if str(row["act_type"]).endswith("Situv2"):
-                act = "situv2"
-            elif str(row["act_type"]).endswith("Swiglu"):
-                act = "swiglu"
-            else:
-                act = "silu"
             for _, use_nt, inline_quant in sorted(
                 variant for variant in _SUPPORTED_BY_DTYPE["fp4"] if variant[0] == bm
             ):
@@ -6225,7 +6224,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                 n1,
                                 iq1,
                                 xcd_swizzle,
+                                act=act,
                                 interleave=interleave,
+                                enable_bias=act == "swiglu",
                             )
                             # (A) native mxmoe GEMM2 candidates.
                             if bm in g2_bms:
