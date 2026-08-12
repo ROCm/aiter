@@ -763,7 +763,7 @@ void opus_moe_combine_bwd_token8_h2048_bf16(
 // Stage dy only; dscore is reconstructed from the fused stage-2 epilogue.
 // Four tokens share one CTA and each wave writes two routes, halving the grid
 // relative to a dedicated wave for every route.
-__global__ __launch_bounds__(1024, 1)
+__global__ __launch_bounds__(512, 2)
 void opus_moe_combine_scale_token8_h2048_bf16_kernel(
     const __bf16* __restrict__ dout,
     const int32_t* __restrict__ token_routes,
@@ -775,7 +775,7 @@ void opus_moe_combine_scale_token8_h2048_bf16_kernel(
     constexpr int TOPK = 8;
     constexpr int VEC = 8;
     constexpr int THREADS_PER_TOKEN = 256;
-    constexpr int TOKENS_PER_BLOCK = 4;
+    constexpr int TOKENS_PER_BLOCK = 2;
     constexpr int WAVES_PER_TOKEN = THREADS_PER_TOKEN / 64;
     const int token_in_block = threadIdx.x / THREADS_PER_TOKEN;
     const int tid = threadIdx.x % THREADS_PER_TOKEN;
@@ -830,10 +830,10 @@ void opus_moe_combine_scale_token8_h2048_bf16(
     const int T = static_cast<int>(dout.size(0));
     if(T == 0)
         return;
-    constexpr int TOKENS_PER_BLOCK = 4;
+    constexpr int TOKENS_PER_BLOCK = 2;
     opus_moe_combine_scale_token8_h2048_bf16_kernel<<<
         dim3((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK),
-        dim3(1024), 0, aiter::getCurrentHIPStream()>>>(
+        dim3(TOKENS_PER_BLOCK * 256), 0, aiter::getCurrentHIPStream()>>>(
         reinterpret_cast<const __bf16*>(dout.data_ptr()),
         reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
         reinterpret_cast<const float*>(p.data_ptr()),
