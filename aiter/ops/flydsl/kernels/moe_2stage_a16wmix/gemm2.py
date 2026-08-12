@@ -11,11 +11,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .utils import (
-    _a16w4_swizzle_xor16,
     _gep,
     _global_base_ptr1,
     _global_i32_at,
-    _global_i32_buffer_view,
     _lds_ptr3,
     _mma_bf16,
     _raw,
@@ -145,10 +143,6 @@ def _gemm2_body_a16w4(
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
     """
-    _is_int4 = w_dtype == "int4"
-    _is_bf16 = (
-        w_dtype == "bf16"
-    )  # a16w16: raw bf16 W (unpacked, no scale, no upconvert)
     elem_bytes = 2
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
@@ -161,9 +155,6 @@ def _gemm2_body_a16w4(
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KH_TILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N
-    # int4 groupwise scale: bf16 pairs (E, G//2, N_OUT, 2). G//2*N_OUT is the per-expert
-    # stride the scale_expert_base term below is built from.
-    _g_half = (K // 32) // 2
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -173,7 +164,6 @@ def _gemm2_body_a16w4(
     e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
-    expert_off = e * fx.Int32(N_OUT)
 
     # ---- B (weight) operand path: layouts + buffer resources + load closures ----
     # Shared verbatim with gemm1 (see utils.make_b_loader); stage2's N is model_dim and
@@ -193,112 +183,35 @@ def _gemm2_body_a16w4(
         use_k16=use_k16,
     )
 
-    # ---- A gather (per-thread) -> LDS. A row = SORTED position m_row + row_local.
-    total_threads = 256
-    bytes_per_thread = (BM * TILE_K * elem_bytes) // total_threads
-    x_load_bytes = 16
-    num_x_loads = bytes_per_thread // x_load_bytes
-    tile_k_dwords = (TILE_K * elem_bytes) // 4
+    # ---- A path (shared with gemm1, see utils.make_a_loader) -------------------
+    # A row = SORTED position m_row + row_local; the whole block (256 threads) stages one
+    # BM x TILE_K tile. stage2 has a single unslotted A region and XOR-swizzles it to
+    # kill LDS bank conflicts.
     c_k_div4 = (K * elem_bytes) // 4
-    tx_i32 = fx.Int32(gpu.thread_id("x"))
-    chunk_i32 = x_load_bytes // 4
-    tx_base = tx_i32 * fx.Int32(chunk_i32)
-
-    x_row_local = []
-    x_col_dw = []
-    x_row_base_div4 = []
-    for i in range_constexpr(num_x_loads):
-        tile_idx = tx_base + fx.Int32(i * total_threads * chunk_i32)
-        row_local = tile_idx // fx.Int32(tile_k_dwords)
-        col_dw = tile_idx % fx.Int32(tile_k_dwords)
-        x_row_local.append(row_local)
-        x_col_dw.append(col_dw)
-        sorted_row = m_row + row_local
-        x_row_base_div4.append(sorted_row * fx.Int32(c_k_div4))
-
-    x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFFFFF))
-    x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
-    # gfx950 (K=32): BufferCopyLDS128b direct-to-LDS async copy. gfx942 (use_k16): CDNA3
-    # direct-to-LDS is 4 B/lane only (the 16 B form fails LLVM ISA lowering), so stage via
-    # VGPRs like the legacy kernel: buffer_load 16 B gmem->regs then ds_write 16 B regs->
-    # LDS (both b128, valid on CDNA3), preserving the same swizzled-src / linear-LDS layout.
-    if const_expr(use_k16):
-        x_dma_atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32
-        )  # gmem->regs
-        x_lds_store_atom = fx.make_copy_atom(
-            fx.UniversalCopy128b(), fx.Int32
-        )  # regs->LDS
-    else:
-        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
-
-    # Shared with gemm1 (see utils.make_a_loader); stage2 has a single unslotted A
-    # region and XOR-swizzles it to kill LDS bank conflicts.
     a_loader = make_a_loader(
         lds_raw_ptr,
         num_i32=BM * LDS_STRIDE // 2,
+        BM=BM,
+        TILE_K=TILE_K,
         KH_TILE_BYTES=KH_TILE_BYTES,
         k_blocks16=k_blocks16,
         lane_div_16=lane_div_16,
         lane_mod_16=lane_mod_16,
         swizzle=True,
+        a_ptr=arg_a,
+        a_num_bytes=fx.Int64(0xFFFFFFFF),
+        a_load_threads=256,
+        row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
+        dma_cache_mod=b_cache_mod,
+        dma_via_vgpr=use_k16,
     )
-
-    def dma_a_tile_to_lds(base_k):
-        base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
-        for i in range_constexpr(num_x_loads):
-            col_bytes = x_col_dw[i] * fx.Int32(4)
-            # A-LDS bank-conflict XOR swizzle: LDS dest stays LINEAR (buffer_load_lds
-            # ignores an arbitrary swizzled per-lane dest -> NaN); swizzle the GMEM
-            # source col instead, and lds_load_a applies the SAME swizzle on read.
-            col_sw = _a16w4_swizzle_xor16(
-                x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=True
-            )
-            row_k_dw = x_row_base_div4[i] + base_k_div4
-            global_byte = row_k_dw * fx.Int32(4) + col_sw
-            lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
-            if const_expr(use_k16):
-                # gfx942: buffer_load 16 B gmem->regs, then ds_write 16 B regs->LDS.
-                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                fx.copy(
-                    x_dma_atom,
-                    fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16))),
-                    r,
-                )
-                fx.copy(
-                    x_lds_store_atom,
-                    r,
-                    fx.slice(a_loader.tiles, (None, lds_byte // fx.Int32(16))),
-                )
-            else:
-                fx.copy(
-                    x_dma_atom,
-                    fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16))),
-                    fx.slice(a_loader.tiles, (None, lds_byte // fx.Int32(16))),
-                )
 
     # ---- N-column addressing (W2 cols of model_dim; wave owns _n_per_wave) ------
     n_tile_base = wave * fx.Int32(_n_per_wave)
-    col_g_list = []
-    n_blk_list, n_intra_list, scale_mni_list, scale_np_list = [], [], [], []
-    for ni in range_constexpr(num_acc_n):
-        col_g = by_n + n_tile_base + fx.Int32(ni * 16) + lane_mod_16
-        col_g_list.append(col_g)
-        # bf16 W folds expert_off into the resource base (utils.make_b_loader); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
-        row_w = _row_expert_off + col_g
-        n_blk_list.append(row_w // fx.Int32(16))
-        n_intra_list.append(row_w % fx.Int32(16))
-        ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)
-        scale_mni_list.append(ng // fx.Int32(32))
-        scale_np_list.append((ng // fx.Int32(16)) % fx.Int32(2))
-    # int4 groupwise scale (OLD-kernel (E, G//2, N, 2) layout): N = col_g is WITHIN-expert;
-    # the expert base is a separate G//2*N_OUT stride.
-    if const_expr(_is_int4):
-        _scale_expert_base = rocdl.readfirstlane(
-            T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
-        )
-        scale_n_list = [col_g_list[ni] for ni in range_constexpr(num_acc_n)]
+    cols = [
+        b_loader.col(by_n, n_tile_base, fx.Int32(ni * 16))
+        for ni in range_constexpr(num_acc_n)
+    ]
 
     # ---- accumulators: accm[mi][ni] f32[4] (layout the atomic epilog expects) --
     acc_layout = fx.make_layout(4, 1)
@@ -322,36 +235,13 @@ def _gemm2_body_a16w4(
 
     for kt in range_constexpr(K_TILES_TOTAL):
         base_k = fx.Int32(kt * TILE_K)
-        dma_a_tile_to_lds(base_k)
-        if const_expr(_is_bf16):
-            b_raw = [
-                b_loader.load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni])
-                for ni in range_constexpr(num_acc_n)
-            ]
-            b_sc = None
-        else:
-            _lbr = b_loader.load_raw
-            b_raw = [
-                _lbr(base_k, n_blk_list[ni], n_intra_list[ni])
-                for ni in range_constexpr(num_acc_n)
-            ]
-            if const_expr(_is_int4):
-                b_sc = [
-                    b_loader.load_b_scale_int4(
-                        base_k, scale_n_list[ni], _scale_expert_base
-                    )
-                    for ni in range_constexpr(num_acc_n)
-                ]
-            else:
-                b_sc = [
-                    b_loader.load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni])
-                    for ni in range_constexpr(num_acc_n)
-                ]
+        a_loader.store_tile(base_k)
+        b_raw = [b_loader.load_raw(base_k, c) for c in cols]
+        b_sc = [b_loader.load_scale(base_k, c) for c in cols]
         gpu.barrier()
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
-                _bsc = None if const_expr(_is_bf16) else b_sc[ni][ku]
-                bb = b_loader.upconvert_b(b_raw[ni], ku, _bsc)
+                bb = b_loader.upconvert(b_raw[ni], ku, b_sc[ni][ku])
                 for mi in range_constexpr(m_repeat):
                     a8 = a_loader.load(mi, ku)
                     _mma(accm[mi][ni], a8, bb)

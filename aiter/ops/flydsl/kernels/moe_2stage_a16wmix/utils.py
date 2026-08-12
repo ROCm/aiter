@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared low-level helpers for the a16w4/a16wi4/a16w16 fused MoE kernels.
+"""Shared operand paths and low-level helpers for the a16w4/a16wi4/a16w16 MoE kernels.
 
-Leaf helpers (pointer casts, byte GEPs, groupwise-scale unpack, int4->bf16
-upconvert, index math) used by both stage1 (:mod:`gemm1`) and stage2
-(:mod:`gemm2`).
+Used by both stage1 (:mod:`gemm1`) and stage2 (:mod:`gemm2`):
+
+  * :func:`make_a_loader`  the A (activation) path -- global->LDS staging plus the
+                           v8bf16 MMA-fragment reads that must match its LDS layout.
+  * :func:`make_b_loader`  the B (weight) path -- N addressing, raw W + scale gathers
+                           and the upconvert, all specialized for ``w_dtype`` so the
+                           stages carry no weight-dtype branches.
+  * leaf helpers           pointer casts, byte GEPs, groupwise-scale unpack,
+                           int4->bf16 upconvert, index math.
 """
 
 from collections.abc import Callable
@@ -13,7 +19,7 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -218,44 +224,133 @@ def _a_col_bytes_for_ku(col_base_bytes_L, ku):
 class _ALoader(NamedTuple):
     """The A (activation) LDS path, built by :func:`make_a_loader`."""
 
-    tiles: object  # 16 B tiles over the A-LDS region (the DMA write target too)
-    copy_atom: object  # UniversalCopy128b: ds_read_b128 / ds_write_b128
     load: Callable  # load(mi, ku, slot=0) -> v8bf16 A MMA fragment
+    store_tile: Callable  # store_tile(base_k, slot=0): global -> A-LDS, one K tile
 
 
 def make_a_loader(
     lds_raw_ptr,
     *,
     num_i32,
+    BM,
+    TILE_K,
     KH_TILE_BYTES,
     k_blocks16,
     lane_div_16,
     lane_mod_16,
     swizzle,
+    a_ptr,
+    a_num_bytes,
+    a_load_threads,
+    row_base_dwords,
+    dma_cache_mod,
+    dma_via_vgpr,
     k_grp_base_bytes=None,
     A_SLOT_BYTES=0,
 ):
-    """Build the shared A (activation) LDS view + fragment reader.
+    """Build the shared A (activation) LDS path: global->LDS staging + fragment reads.
 
-    Both stages stage A into LDS as BM x TILE_K bf16 and read it back as v8bf16 MMA
-    fragments through the CK sub-lane map (lane L covers K[L*32 .. L*32+31]); ``tiles``
-    is exposed because the global->LDS DMA writes through the same view.
+    Both stages stage A into LDS as BM x TILE_K bf16 (``store_tile``) and read it back
+    as v8bf16 MMA fragments through the CK sub-lane map (lane L covers
+    K[L*32 .. L*32+31], ``load``), so the two live together: they must agree on the
+    physical LDS layout, and both go through the same 16 B tile view.
 
-    The two stages differ only in how the LDS region is carved up:
-      * ``swizzle``          gemm2 XOR-swizzles A-LDS to kill bank conflicts; gemm1 is
-                             linear (its DMA source is already conflict-free).
+    Stage-specific parameters:
+      * ``row_base_dwords``  ``(row_local) -> global A row base in dwords``. stage1
+                             gathers the sorted token id out of ``m_indices``; stage2
+                             indexes the intermediate by sorted position directly.
+      * ``a_num_bytes``      buffer-resource extent. LOAD-BEARING in stage1: sizing it
+                             to the REAL [n_tokens, K] alloc HW-clamps padding-row loads
+                             (sentinel token id >= n_tokens) to 0. A ~4 GB resource
+                             would instead fault on unmapped memory.
+      * ``swizzle``          gemm2 XOR-swizzles A to kill LDS bank conflicts: the GMEM
+                             source column is swizzled on the write (buffer_load_lds
+                             ignores an arbitrary swizzled per-lane LDS dest -> NaN) and
+                             ``load`` applies the SAME swizzle on the read. gemm1 is
+                             linear -- its DMA source is already conflict-free.
       * ``k_grp_base_bytes`` gemm1 only: base of this wave's k_wave group. Combined with
                              ``A_SLOT_BYTES`` and the per-call ``slot`` it selects the
                              double-buffer ping/pong slot. None (gemm2) omits the term
                              entirely -- stage2 has a single, unslotted A region.
+      * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
+                             splits the block into per-k-group loader sets).
+      * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
     """
+    elem_bytes = 2  # bf16
+    # Per-thread A gather: each thread moves 16 B (v8bf16) per pass.
+    bytes_per_thread = (BM * TILE_K * elem_bytes) // a_load_threads
+    x_load_bytes = 16
+    num_x_loads = bytes_per_thread // x_load_bytes
+    tile_k_dwords = (TILE_K * elem_bytes) // 4
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    chunk_i32 = x_load_bytes // 4  # 4
+    if const_expr(a_load_threads < 256):
+        x_load_tid = tx_i32 % fx.Int32(a_load_threads)
+    else:
+        x_load_tid = tx_i32
+    tx_base = x_load_tid * fx.Int32(chunk_i32)
+
+    x_row_local = []
+    x_col_dw = []
+    x_row_base_div4 = []
+    for i in range_constexpr(num_x_loads):
+        tile_idx = tx_base + fx.Int32(i * a_load_threads * chunk_i32)
+        row_local = tile_idx // fx.Int32(tile_k_dwords)
+        x_row_local.append(row_local)
+        x_col_dw.append(tile_idx % fx.Int32(tile_k_dwords))
+        x_row_base_div4.append(row_base_dwords(row_local))
+
+    x_buf = _global_i32_buffer_view(a_ptr, a_num_bytes)
+    x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
+    # gfx950 (K=32): one BufferCopyLDS128b direct-to-LDS async copy (16 B / 8 bf16,
+    # VGPR-bypassing). gfx942 (dma_via_vgpr): CDNA3 direct-to-LDS moves only 4 B/lane;
+    # the 16 B dwordx4-to-LDS form does not exist and LLVM cannot legalize the s128 LDS
+    # store (ISA-lowering crash). A narrow 4x4 B direct-to-LDS split is also wrong
+    # because buffer_load_dword...lds writes lane L to M0+L*width -- four 4 B copies
+    # cannot reproduce the 16 B/lane layout the 128b copy (and the ds_read_b128 A-read)
+    # expect. So stage via VGPRs like the legacy kernel: buffer_load 16 B gmem->regs
+    # then ds_write 16 B regs->LDS (both b128, valid on CDNA3), same LDS layout.
+    if const_expr(dma_via_vgpr):
+        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(dma_cache_mod), fx.Int32)
+    else:
+        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
+
     s_x_i32_flat = fx.make_view(
         fx.recast_iter(fx.Int32, lds_raw_ptr), fx.make_layout(num_i32, 1)
     )
-    tiles = fx.logical_divide(s_x_i32_flat, fx.make_layout(4, 1))
-    copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+    tiles = fx.logical_divide(s_x_i32_flat, fx.make_layout(4, 1))  # 16 B A-LDS tiles
+    lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)  # ds_write/ds_read
     row_a_lds = lane_mod_16
     col_base_bytes_L = lane_div_16 * fx.Int32(64)  # 32 bf16 * 2 B
+
+    def store_a_tile(base_k, slot=0):
+        base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
+        if k_grp_base_bytes is None:
+            slot_byte = None
+        else:
+            slot_byte = k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES)
+        for i in range_constexpr(num_x_loads):
+            col_bytes = x_col_dw[i] * fx.Int32(4)
+            # Swizzle the GMEM source column; the LDS destination stays linear.
+            col_sw = _a16w4_swizzle_xor16(
+                x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=swizzle
+            )
+            row_k_dw = x_row_base_div4[i] + base_k_div4
+            global_byte = row_k_dw * fx.Int32(4) + col_sw
+            if const_expr(slot_byte is None):
+                lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+            else:
+                lds_byte = (
+                    slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+                )
+            src = fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16)))
+            dst = fx.slice(tiles, (None, lds_byte // fx.Int32(16)))
+            if const_expr(dma_via_vgpr):
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(x_dma_atom, src, r)
+                fx.copy(lds_atom, r, dst)
+            else:
+                fx.copy(x_dma_atom, src, dst)
 
     def lds_load_a(mi, ku, slot=0):
         row = row_a_lds + fx.Int32(mi * 16)
@@ -278,27 +373,39 @@ def make_a_loader(
             )
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         fx.copy_atom_call(
-            copy_atom, fx.slice(tiles, (None, byte_off // fx.Int32(16))), r
+            lds_atom, fx.slice(tiles, (None, byte_off // fx.Int32(16))), r
         )
         return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
 
-    return _ALoader(tiles=tiles, copy_atom=copy_atom, load=lds_load_a)
+    return _ALoader(load=lds_load_a, store_tile=store_a_tile)
+
+
+class _BCol(NamedTuple):
+    """This lane's addressing for one 16-wide N block of W, built by ``_BLoader.col``.
+
+    Only the scale fields of the active ``w_dtype`` are filled; the others stay None.
+    """
+
+    n_blk: object  # 16-row weight block index (expert-indexed for mxfp4/int4)
+    n_intra: object  # row within that block
+    sc_blk: object = None  # mxfp4: 32-col e8m0 scale block index
+    sc_pack: object = None  # mxfp4: N_Pack half selector (0/1) within that block
+    sc_n: object = None  # int4: N index WITHIN the expert
 
 
 class _BLoader(NamedTuple):
-    """The B (weight) operand loaders, built by :func:`make_b_loader`.
+    """The B (weight) operand path, built by :func:`make_b_loader`.
 
-    The ``*_int4`` fields are None unless ``w_dtype == "int4"``, so calling the wrong
-    one for the dtype is a TypeError rather than a silently wrong load.
+    All three callables are already specialized for ``w_dtype``, so the stages carry no
+    weight-dtype branches: they build ``col`` descriptors once outside the K loop, then
+    ``load_raw`` + ``load_scale`` + ``upconvert`` per tile.
     """
 
-    load_b_raw: Callable  # mxfp4: dwordx4 -> [k0][4] i32, 8 fp4 each
-    load_b_raw_int4: Callable | None  # int4: 2x dwordx2 -> [k0][4] i32
-    load_b_raw_bf16: Callable  # bf16: dwordx4 -> v8bf16 MMA operand
-    load_b_scale: Callable  # mxfp4: per-lane e8m0 -> f32
-    load_b_scale_int4: Callable | None  # int4: (E,G//2,N,2) bf16 pair -> f32
-    upconvert_b: Callable  # raw fragment (+scale) -> v8bf16
-    load_raw: Callable  # the non-bf16 raw loader for this w_dtype
+    col: Callable  # col(*n_terms) -> _BCol for one 16-wide N block
+    col_pair: Callable  # col_pair(*n_terms, shift=) -> (_BCol, _BCol) gate|up pair
+    load_raw: Callable  # load_raw(base_k, col) -> per-K-step raw fragments
+    load_scale: Callable  # load_scale(base_k, col) -> per-K-step f32 scales
+    upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
 
 
 def make_b_loader(
@@ -325,18 +432,22 @@ def make_b_loader(
     shared verbatim; keeping two copies only let their comments drift.
 
     ``w_dtype``:
-      ``"fp4"``  mxfp4 W + e8m0 per-1x32 scale (``load_b_raw`` / ``load_b_scale``)
+      ``"fp4"``  mxfp4 W + e8m0 per-1x32 scale
       ``"int4"`` OLD-kernel packed int4 W + (E, G//2, N, 2) bf16 groupwise scale
-                 (``load_b_raw_int4`` / ``load_b_scale_int4``)
-      ``"bf16"`` raw bf16 W, no scale, no upconvert (``load_b_raw_bf16``)
+      ``"bf16"`` raw bf16 W (no scale, no upconvert; ``load_scale`` yields all-None and
+                 ``upconvert`` returns the loaded fragment unchanged)
 
-    ``load_raw`` is the non-bf16 raw loader already selected for ``w_dtype``.
+    ``expert_off``/``inter``-style N arithmetic stays with the caller: it hands ``col``
+    the 16-wide N block base and gets back everything the loaders need.
 
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
+    # Emitted before the layouts/resources below: this is where the stages used to
+    # compute it, and the ISA is sensitive to the order operands are materialized in.
+    expert_off = e * fx.Int32(N_OUT)
     elem_bytes = 2
     K_HALF = K // 2
     k_unroll = (TILE_K * elem_bytes) // 64
@@ -423,6 +534,60 @@ def make_b_loader(
         else _global_i32_buffer_tiles(arg_bscale, min(_sw_bytes, 0xFFFFFFFF), 1)
     )
     sw_read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
+
+    # ---- per-lane N addressing -------------------------------------------------
+    if const_expr(_is_int4):
+        # int4 groupwise scale is the OLD-kernel (E, G//2, N, 2) layout: its N index is
+        # WITHIN the expert, so the expert term is a separate G//2*N_OUT stride.
+        scale_expert_base = rocdl.readfirstlane(
+            T.i32, _raw(e * fx.Int32(_g_half * N_OUT))
+        )
+
+    def _sum(first, terms):
+        v = first
+        for t in terms:
+            v = v + t
+        return v
+
+    def _scale_fields(ng, col_g):
+        if const_expr(_is_bf16):
+            return {}
+        if const_expr(_is_int4):
+            return {"sc_n": col_g}  # int4 indexes N WITHIN the expert
+        return {
+            "sc_blk": ng // fx.Int32(32),
+            "sc_pack": (ng // fx.Int32(16)) % fx.Int32(2),
+        }
+
+    # The N block base is passed as its SUMMANDS (tile base, wave base, ni*16) and the
+    # gate->up ``shift`` is applied last, so these build the same address expression
+    # trees -- and emit them in the same order -- as the inline code they replaced.
+    # Instruction selection is sensitive to both.
+    def col(*n_terms):
+        """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
+        col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
+        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
+        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        row = _row_expert_off + col_g
+        n_blk = row // fx.Int32(16)
+        n_intra = row % fx.Int32(16)
+        ng = _sum(expert_off, n_terms)
+        return _BCol(n_blk, n_intra, **_scale_fields(ng, col_g))
+
+    def col_pair(*n_terms, shift):
+        """Address a gate|up pair: one block, and the one ``shift`` further along N."""
+        col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
+        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        row_g = _row_expert_off + col_g
+        row_u = row_g + shift
+        blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)
+        blk_u, intra_u = row_u // fx.Int32(16), row_u % fx.Int32(16)
+        ng = _sum(expert_off, n_terms)
+        nu = ng + shift
+        return (
+            _BCol(blk_g, intra_g, **_scale_fields(ng, col_g)),
+            _BCol(blk_u, intra_u, **_scale_fields(nu, col_g + shift)),
+        )
 
     # ---- B (mxfp4 W) raw load: dwordx4 -> v4i32 (8 fp4 per i32) ----------------
     def load_b_raw(base_k, n_blk, n_intra):
@@ -539,11 +704,10 @@ def make_b_loader(
             scales.append((n_pack == fx.Int32(0)).select(se, so))
         return scales
 
-    def load_b_scale_int4(base_k, n_full, scale_expert_base):
+    def load_b_scale_int4(base_k, n_full):
         # int4 groupwise (bf16-pair) scale, OLD-kernel (E, G//2, N, 2) layout: dword =
         # e*(G//2*N) + (adj_ku//2)*N + n_full, half by parity. N-major, so 16 consecutive
-        # N-lanes share one 64 B line (vs a G//2-strided gather). ``scale_expert_base``
-        # is the readfirstlane'd e*(G//2*N_OUT) term; N (n_full) is WITHIN-expert.
+        # N-lanes share one 64 B line (vs a G//2-strided gather).
         scales = []
         for ku in range_constexpr(k_unroll):
             _k0_blk = ku // 4
@@ -577,12 +741,29 @@ def make_b_loader(
         v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
+    # ---- dtype-selected surface: the stages only ever see these ----------------
+    if const_expr(_is_bf16):
+        _load_raw = load_b_raw_bf16
+    elif const_expr(_is_int4):
+        _load_raw = load_b_raw_int4
+    else:
+        _load_raw = load_b_raw
+
+    def load_raw(base_k, col):
+        return _load_raw(base_k, col.n_blk, col.n_intra)
+
+    def load_scale(base_k, col):
+        if const_expr(_is_bf16):
+            # No scale: one None per K micro-step keeps the per-ku indexing uniform.
+            return [None] * k_unroll
+        if const_expr(_is_int4):
+            return load_b_scale_int4(base_k, col.sc_n)
+        return load_b_scale(base_k, col.sc_blk, col.sc_pack)
+
     return _BLoader(
-        load_b_raw=load_b_raw,
-        load_b_raw_int4=load_b_raw_int4 if _is_int4 else None,
-        load_b_raw_bf16=load_b_raw_bf16,
-        load_b_scale=load_b_scale,
-        load_b_scale_int4=load_b_scale_int4 if _is_int4 else None,
-        upconvert_b=upconvert_b,
-        load_raw=load_b_raw_int4 if _is_int4 else load_b_raw,
+        col=col,
+        col_pair=col_pair,
+        load_raw=load_raw,
+        load_scale=load_scale,
+        upconvert=upconvert_b,
     )
