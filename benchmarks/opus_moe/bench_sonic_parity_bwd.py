@@ -16,6 +16,7 @@ compilation happen before the timed region.  Defaults are 5 warmups/500 repeats.
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Tuple
 
@@ -125,12 +126,19 @@ def forward_and_derived_ms(
 
     def forward_backward() -> object:
         out = fn(*leaves, topk, ACT)
-        return torch.autograd.grad(out, leaves, dout)
+        out.backward(dout, retain_graph=True)
+        for leaf in leaves:
+            leaf.grad = None
+        return out
 
     # Exercise both paths once before their independent batched measurements.
     forward()
     forward_backward()
+    torch.cuda.synchronize()
+    time.sleep(0.5)
     fwd_ms = cuda_time_ms(forward, warmups, repeats)
+    torch.cuda.synchronize()
+    time.sleep(0.5)
     fwd_bwd_ms = cuda_time_ms(forward_backward, warmups, repeats)
     return fwd_ms, fwd_bwd_ms, fwd_bwd_ms - fwd_ms
 
