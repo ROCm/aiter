@@ -114,9 +114,9 @@ def test_fp8_mqa_logits(
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    # to respect the aseert in generate_cp_test_data
+    # to respect the assert in generate_cp_test_data
     if disable_cp or s_k % s_q != 0 or s_q % 2 != 0:
         ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
         ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
@@ -124,7 +124,7 @@ def test_fp8_mqa_logits(
         ks, ke = generate_cp_test_data(s_q, s_k)
 
     q_fp8 = q.to(e4m3_type)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    q = q_fp8.to(torch.float32)
 
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
@@ -148,7 +148,7 @@ def test_fp8_mqa_logits(
     diff = calc_diff(logits, ref_logits)
     if ref_neginf_mask.all():
         return  # nothing left to compare
-    assert diff < 1e-3, f"{diff=}"
+    assert diff < 1e-4, f"{diff=}"
 
 
 def ref_fp8_mqa_logits_row(q_row, kv, weight_row, start, end):
@@ -236,15 +236,18 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
 
     ks = torch.full((s_q,), cu_start, dtype=torch.int, device="cuda")
     ke = ks + torch.tensor(seg_lens, dtype=torch.int, device="cuda")
 
     q_fp8 = q.to(e4m3_type)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    q = q_fp8.to(torch.float32)
 
+    # kv_fp8/scales are the kernel's KV; kv is what they dequantize to, so the
+    # reference works from the same values. Re-quantizing kv here would rebind
+    # kv_fp8/scales and hand the kernel a slightly different KV.
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
     )
@@ -256,4 +259,4 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
-    assert diff < 1e-3, f"{diff=}"
+    assert diff < 1e-4, f"{diff=}"
