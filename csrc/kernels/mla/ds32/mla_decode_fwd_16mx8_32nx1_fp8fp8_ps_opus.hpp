@@ -67,13 +67,30 @@ constexpr int KEEP_DS_READ_ORDER = 0x67F;
 // accumulator chain). Skewing it toward the rope tail was measured: it does move the
 // fillers there, but the region only has ~36 of them for 12 MFMA, so the nope half
 // starves by exactly as much and nothing changes outside noise.
+//
+// The DS_READ budget is front-loaded: the region owns 12 reads (8 nope + 4 rope) for 12
+// MFMA, and one-per-MFMA left the four rope ds_read_b64 in the last four slots, one MFMA
+// ahead of the mfma consuming them, paying ~150 stalled cycles per tile on lgkmcnt. Asking
+// for two reads per MFMA over the first half aims them at the nope MFMA shadow instead.
+// Honest accounting: the trace still shows the rope waits, because the first-half budget
+// gets filled by the eight nope ds_read_b128 that come first in program order. What this
+// did buy, together with dropping the two hand-written rope waits below, is 2 VGPR and a
+// point or so on the largest shapes. It stays a preference rather than a hand-placed
+// fence: moving a real ds_read is correctness-safe because SIInsertWaitcnts re-derives the
+// wait, and if the allocator cannot afford the longer live range the scheduler declines --
+// which matters, because a spill here is not just slow, it corrupts results (scratch
+// traffic breaks the hand-written s_waitcnt_vmcnt(kv_buffer_load_insts) budget that guards
+// the KV LDS DMA).
 template <int Rpt, int G>
 __device__ inline void sched_compute_qk()
 {
     using namespace sched_masks;
-    opus::static_for<Rpt>([&](auto) {
+    opus::static_for<Rpt>([&](auto i) {
         __builtin_amdgcn_sched_group_barrier(MFMA, 1, G);
-        __builtin_amdgcn_sched_group_barrier(DS_READ, 1, G);
+        if constexpr(i.value < Rpt / 2)
+        {
+            __builtin_amdgcn_sched_group_barrier(DS_READ, 2, G);
+        }
         __builtin_amdgcn_sched_group_barrier(EXP, 1, G);
         __builtin_amdgcn_sched_group_barrier(VALU, 2, G);
     });
@@ -498,13 +515,28 @@ __device__ inline void attn_exp2_slice(V& v_s)
     });
 }
 
+// Reduced as a balanced tree, not the `row_sum += v_s[i]` chain the shape of the loop
+// suggests: float addition does not reassociate, so the chain form is s_len dependent
+// v_add_f32 back to back and the trace measured the eight of them at 52 cycles, all of it
+// on the critical path into the two permlane swaps below. The tree is 3 deep instead of 8
+// for the same instruction count. It is a different summation order and therefore a
+// different rounding, which is harmless here -- every term is a positive exp2 result.
 template <typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_sum(const V& v_s)
 {
     using D_ACC                   = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_sum                 = 0.0f;
-    opus::static_for<s_len>([&](auto i) { row_sum += v_s[i.value]; });
+    static_assert(s_len > 0 && (s_len & (s_len - 1)) == 0, "row sum tree wants a power of two");
+    D_ACC part[s_len];
+    opus::static_for<s_len>([&](auto i) { part[i.value] = v_s[i.value]; });
+    opus::static_for<s_len>([&](auto lvl) {
+        constexpr opus::index_t half = s_len >> (lvl.value + 1);
+        if constexpr(half >= 1)
+        {
+            opus::static_for<half>([&](auto i) { part[i.value] += part[i.value + half]; });
+        }
+    });
+    D_ACC row_sum = part[0];
 
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(
         std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
@@ -798,9 +830,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         load_k_rope(k[0], noff, sk_rope_slice(0_I));
         __builtin_amdgcn_sched_barrier(sched_masks::KEEP_DS_READ_ORDER);
         load_k_rope(k[1], noff, sk_rope_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_rope_ds_read_insts>{});
         s = mma0_rope(q[0], k[0], s);
-        s_waitcnt_lgkmcnt(0_I);
         s = mma0_rope(q[1], k[1], s);
     };
     // One PV pass over all d-slices; slice i is one mma1 (2 MFMA) plus the tr_load feeding
@@ -945,12 +975,12 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         sched_compute_qk<QK_MFMA_CNT, 1>();
         stage_end();
 
-        // stage2 [mem]: read V(t-1); prefetch tile t+2 into the slot tile t-2 vacated
-        // (its PV ran in the previous phase, two barriers back, which also absorbs the
-        // one-stage stagger skew). Mask S(t) here, before stage3 folds it into softmax.
+        // stage2 [mem]: read V(t-1). Mask S(t) here, before stage3 folds it into softmax --
+        // this one cannot move into the PV co-routine, because chunk 0 already reads
+        // vs_cur to start the row max. The tile t+2 prefetch does move; it now rides in
+        // PV chunk 1 (see below).
         load_v(v_v[0], prev_slot * kv_slot_off, sv_slice(0_I));
         load_v(v_v[1], prev_slot * kv_slot_off, sv_slice(1_I));
-        async_load_kv(((cur_slot + 2) & 3) * kv_slot_off, cur_page, cur_page_rope);
         mask_oob_scores(vs_cur, t);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         stage_end();
@@ -976,6 +1006,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             {
                 static_for<s_len - s_half_len>(
                     [&](auto i) { rmx = max(rmx, vs_cur[s_half_len + i.value]); });
+                // Prefetch tile t+2 into the slot tile t-2 vacated. This used to sit in
+                // stage2 as a straight-line block and it measured 136 cycles there with no
+                // MFMA anywhere near it: three buffer_load_lds each need m0 rewritten, and
+                // an s_mov to m0 followed by an LDS-DMA needs an s_nop between them, so the
+                // block is mostly issue latency that nothing covers. Riding a PV chunk puts
+                // all of it in the shadow of the MFMA pair that just issued. Chunk 1 keeps
+                // the request nearly as early as it was, which matters -- the prefetch is
+                // two tiles ahead and that distance is what hides gmem latency.
+                async_load_kv(((cur_slot + 2) & 3) * kv_slot_off, cur_page, cur_page_rope);
             }
             else if constexpr(k == 2)
             {
