@@ -210,19 +210,30 @@ def run_varlen_test(
     else:
         ref = ref_result
 
+    # A batch whose kv_len==0 attends to no keys: the kernel skips those work-
+    # groups and leaves their query-row output undefined. Mark those rows invalid
+    # so checkAllclose ignores them (True = compare, False = ignore).
+    kv_lens = [cu_k[b + 1] - cu_k[b] for b in range(B)]
+    o_f = o.float()
+    valid = torch.ones_like(o_f, dtype=torch.bool)
+    for b in range(B):
+        if kv_lens[b] == 0:
+            valid[cu_q[b] : cu_q[b + 1]] = False
+
     err = checkAllclose(
-        o.cpu().float(), ref.cpu().float(), rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: "
+        o_f, ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: ", mask=valid
     )
 
     if return_lse:
-        lse_f = lse.cpu().float()
         for b in range(B):
+            if kv_lens[b] == 0:
+                continue
             sq = cu_q[b + 1] - cu_q[b]
             ref_lse_b = ref_lses[b]
-            lse_b = lse_f[cu_q[b] : cu_q[b + 1]].permute(1, 0)
+            lse_b = lse[cu_q[b] : cu_q[b + 1]].permute(1, 0)
             lse_err = checkAllclose(
                 lse_b,
-                ref_lse_b.cpu(),
+                ref_lse_b,
                 rtol=1e-2,
                 atol=1e-2,
                 msg=f"  [{tag}] lse batch {b} (sq={sq}): ",
@@ -230,12 +241,12 @@ def run_varlen_test(
             err = max(err, lse_err)
 
     if err > 0.0 and B > 1:
-        o_f = o.cpu().float()
-        r_f = ref.cpu().float()
         for b in range(B):
+            if kv_lens[b] == 0:
+                continue
             sq = cu_q[b + 1] - cu_q[b]
             ob = o_f[cu_q[b] : cu_q[b + 1]]
-            rb = r_f[cu_q[b] : cu_q[b + 1]]
+            rb = ref[cu_q[b] : cu_q[b + 1]]
             isC = torch.isclose(ob, rb, rtol=1e-2, atol=1e-2)
             bad = (~isC).sum().item()
             if bad > 0:
@@ -372,14 +383,14 @@ def run_batch_test(
     assert tuple(o.shape) == (B, sq, H_q, d_v), f"[{tag}] bad out {tuple(o.shape)}"
 
     err = checkAllclose(
-        o.cpu().float(), ref.cpu().float(), rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: "
+        o.float(), ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: "
     )
 
     if return_lse:
         # Kernel LSE is [B, nheads_q, sq]; the reference matches that layout.
         lse_err = checkAllclose(
-            lse.cpu().float(),
-            ref_lse.cpu().float(),
+            lse,
+            ref_lse,
             rtol=1e-2,
             atol=1e-2,
             msg=f"  [{tag}] lse: ",
