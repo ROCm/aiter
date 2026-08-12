@@ -28,12 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
-from aiter.ops.shuffle import (
-    shuffle_scale_a,
-    shuffle_scale_b,
-    shuffle_scale_mxsk_mpack,
-    shuffle_weight,
-)
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
 from test_opus_a8w8_bmm import (
     GROUP,
@@ -41,6 +36,7 @@ from test_opus_a8w8_bmm import (
     _preshuffled_kids,
     _quant_block_e8m0,
     _quant_per_token_e8m0,
+    _scale_picker,
     run_torch,
 )
 
@@ -55,40 +51,6 @@ KIDS_BPRESHUFFLE = tuple(sorted(_preshuffled_kids()))
 KID_PLAIN = 320  # same tile, row-major B, broadcast scale pack
 
 
-def _mpack_kids():
-    """kid -> (B_M, SFA_MB) for the kids wanting a host M-packed A scale.
-
-    Same hazard as the preshuffled weight: the packed panel is a permutation of
-    the same bytes, so a kid handed the plain scale runs and answers wrongly.
-    Read from the catalog for the same reason the kid list is.
-    """
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
-
-    return {
-        int(kid): inst.needs_mpacked_sfa
-        for fam in a8w8_mxscale_bmm_kernel_lists
-        for kid, inst in fam.items()
-        if inst.needs_mpacked_sfa
-    }
-
-
-def _shuffle_scale_kids():
-    """kid -> shuffle_scale_a's ``sub`` for the kids wanting that layout.
-
-    Same hazard as _mpack_kids, and read from the catalog for the same reason.
-    """
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
-
-    return {
-        int(kid): inst.needs_shuffle_scale
-        for fam in a8w8_mxscale_bmm_kernel_lists
-        for kid, inst in fam.items()
-        if inst.needs_shuffle_scale
-    }
-
-
-MPACK_KIDS = _mpack_kids()
-SHUFFLE_SCALE_KIDS = _shuffle_scale_kids()
 # Extra row-major kids to time alongside, e.g. whichever the tuner actually
 # ships for the shape under test (kid158 is the large-M pick on many of them).
 KIDS_PLAIN_EXTRA = (311, 321, 653, 325, 158)
@@ -110,47 +72,12 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     xs_in = xs_mx.transpose(0, 1)  # [m, g, k/128] view
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)  # [m, g, n]
 
-    _sfa = {}
-
-    def _sfa_for(kid):
-        sub = SHUFFLE_SCALE_KIDS.get(kid)
-        if sub:
-            if kid not in _sfa:
-                # stride(0) is zeroed: the shuffle_scale layout folds the row into its own
-                # addressing, so the kernel takes only the per-batch slab from
-                # stride(1) and would otherwise add a bogus row offset.
-                slab = shuffle_scale_a(xs_mx, k, sub)
-                _sfa[kid] = slab.as_strided(
-                    (m, g, slab.shape[1]), (0, slab.shape[1], 1)
-                )
-            return _sfa[kid]
-        mpack = MPACK_KIDS.get(kid)
-        if not mpack:
-            return xs_in
-        if kid not in _sfa:
-            sk = xs_mx.shape[2]
-            _sfa[kid] = (
-                shuffle_scale_mxsk_mpack(xs_mx, *mpack).view(g, -1, sk).transpose(0, 1)
-            )
-        return _sfa[kid]
-
-    ws_shuf = None
-
-    def _sfb_for(kid):
-        nonlocal ws_shuf
-        if kid not in SHUFFLE_SCALE_KIDS:
-            return ws_mx
-        if ws_shuf is None:
-            # Kept 3-D with the N-block axis in the middle so stride(0) is the
-            # per-batch slab, which is the only term the shuffle_scale path reads.
-            ws_shuf = shuffle_scale_b(ws_mx, n, k).view(g, n // 128, -1)
-        return ws_shuf
+    scale_for = _scale_picker(xs_mx, ws_mx, n, k)
 
     def _call(kid, W):
         Y = torch.zeros((m, g, n), dtype=ydt)
-        _opus_bmm_a8w8_mxscale_raw(
-            O_in, W, Y, _sfa_for(kid), _sfb_for(kid), split_k, kid
-        )
+        xs_kid, ws_kid = scale_for(kid)
+        _opus_bmm_a8w8_mxscale_raw(O_in, W, Y, xs_kid, ws_kid, split_k, kid)
         torch.cuda.synchronize()
         return Y
 
@@ -192,13 +119,14 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     if bench:
 
         def _time(kid, W):
+            xs_kid, ws_kid = scale_for(kid)
             _, t = run_perftest(
                 _opus_bmm_a8w8_mxscale_raw,
                 O_in,
                 W,
                 torch.zeros((m, g, n), dtype=ydt),
-                _sfa_for(kid),
-                _sfb_for(kid),
+                xs_kid,
+                ws_kid,
                 split_k,
                 kid,
                 num_warmup=5,

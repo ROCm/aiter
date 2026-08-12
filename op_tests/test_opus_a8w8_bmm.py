@@ -32,7 +32,12 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw, bmm_a8w8_mxscale_opus
-from aiter.ops.shuffle import shuffle_scale_mxsk_mpack, shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_scale_a,
+    shuffle_scale_b,
+    shuffle_scale_mxsk_mpack,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -56,6 +61,69 @@ def _preshuffled_kids():
         for kid, inst in fam.items()
         if inst.needs_preshuffled_b
     }
+
+
+_SCALE_LAYOUT_KIDS = {}
+
+
+def _scale_layout_kids():
+    """kid -> (shuffle_scale ``sub``, mpacked-SFA args) for kids wanting either.
+
+    Imported lazily for the same reason as _preshuffled_kids.
+    """
+    if not _SCALE_LAYOUT_KIDS:
+        from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+        _SCALE_LAYOUT_KIDS.update(
+            {
+                int(kid): (inst.needs_shuffle_scale, inst.needs_mpacked_sfa)
+                for fam in a8w8_mxscale_bmm_kernel_lists
+                for kid, inst in fam.items()
+                if inst.needs_shuffle_scale or inst.needs_mpacked_sfa
+            }
+        )
+    return _SCALE_LAYOUT_KIDS
+
+
+def _scale_picker(xs_mx, ws_mx, n, k):
+    """Return kid -> the (A, B) scale buffers that kid reads, relaying out once.
+
+    Same hazard as the weight, one step worse: a shuffle_scale kid handed the
+    plain arrays reads the wrong elements, and an mpacked-SFA kid reads past the
+    end of them, which arrives as a GPU memory fault rather than as a bad number.
+    Either layout is fixed once per model, so it follows the kid.
+    """
+    cache = {}
+
+    def pick(kid):
+        key = _scale_layout_kids().get(int(kid), (None, None))
+        if key not in cache:
+            sub, mpack = key
+            g, _, sk = xs_mx.shape
+            if sub:
+                # stride(0) zeroed: the shuffle_scale layout folds the row into
+                # its own addressing, so the kernel takes only the per-batch slab
+                # from stride(1) and would otherwise add a bogus row offset.
+                slab = shuffle_scale_a(xs_mx, k, sub)
+                sfa = slab.as_strided(
+                    (xs_mx.shape[1], g, slab.shape[1]), (0, slab.shape[1], 1)
+                )
+                # Kept 3-D with the N-block axis in the middle so stride(0) is the
+                # per-batch slab, the only term the shuffle_scale path reads.
+                sfb = shuffle_scale_b(ws_mx, n, k).view(g, n // 128, -1)
+            elif mpack:
+                sfa = (
+                    shuffle_scale_mxsk_mpack(xs_mx, *mpack)
+                    .view(g, -1, sk)
+                    .transpose(0, 1)
+                )
+                sfb = ws_mx
+            else:
+                sfa, sfb = xs_mx.transpose(0, 1), ws_mx
+            cache[key] = (sfa, sfb)
+        return cache[key]
+
+    return pick
 
 
 def _weight_picker(W_mx):
@@ -370,43 +438,22 @@ def _align_inputs(m, n, k):
             O_mx.transpose(0, 1),
             W_mx,
             shuffle_weight(W_mx, layout=(16, 16)),
-            xs_mx,  # [g, m, k/32]; _align_sfa puts it in the layout each kid reads
-            ws_mx,
+            # The pickers are cached with the buffers they relay out, so each
+            # layout is built once per shape rather than once per kid and M.
+            _scale_picker(xs_mx, ws_mx, n, k),
             ref,
         )
     return _ALIGN_INPUTS[key]
 
 
-_ALIGN_SFA = {}
-
-
-def _align_sfa(xs_mx, mpack):
-    """The A scales as [m, g, ...], mpacked for the kids that read them that way.
-
-    Same reasoning as the weight in _align_run, and the case that was missing: an
-    sfmpack kid handed the unpacked scales does not raise, it reads the wrong
-    elements -- and reads past the end of them, which arrives as a GPU memory fault
-    rather than as a bad number. Cached because every kid repeats this per M.
-    """
-    if not mpack:
-        return xs_mx.transpose(0, 1)
-    key = (xs_mx.data_ptr(), mpack)
-    if key not in _ALIGN_SFA:
-        g, _, sk = xs_mx.shape
-        _ALIGN_SFA[key] = (
-            shuffle_scale_mxsk_mpack(xs_mx, *mpack).view(g, -1, sk).transpose(0, 1)
-        )
-    return _ALIGN_SFA[key]
-
-
 def _align_run(kid, inst, m, n, k):
     """Return (ok, rel_err). ok False means the launcher refused the shape."""
-    O_in, W_mx, W_sh, xs_mx, ws_mx, ref = _align_inputs(m, n, k)
+    O_in, W_mx, W_sh, scale_for, ref = _align_inputs(m, n, k)
     # A preshuffled kid reading the row-major buffer does not fail, it just
     # returns a wrong answer, so the weight has to follow the kid -- and so must
-    # the A scales.
+    # the scales.
     W_in = W_sh if inst.needs_preshuffled_b else W_mx
-    xs_in = _align_sfa(xs_mx, inst.needs_mpacked_sfa)
+    xs_in, ws_mx = scale_for(kid)
     # NaN-filled so a row the kernel never writes shows up as nan, not as a
     # plausible value that a mean error would dilute.
     Y = torch.full((m, _ALIGN_G, n), float("nan"), dtype=dtypes.bf16)
@@ -448,9 +495,9 @@ def check_m_align():
     fp32 reference; at an M it rejects, the launch must raise. Kids are never
     silently skipped -- an unrunnable kid is reported.
 
-    Each kid gets the B buffer its family reads (needs_preshuffled_b), so the
-    reference check is a real correctness gate for the preshuffled kids too and
-    not just an m_align check riding on a wrong answer.
+    Each kid gets the B buffer and the scale layout its family reads, so the
+    reference check is a real correctness gate for the preshuffled and
+    rearranged-scale kids too, and not an m_align check riding on a wrong answer.
     """
     kids = _align_kids()
     failures, unrunnable = [], []
