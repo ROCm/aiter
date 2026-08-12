@@ -8,7 +8,7 @@ poison columns would dominate the selection and break set-equivalence.
 
 The FlyDSL variant is selected entirely through the ``FLYDSL_TOPK_*``
 environment so this checker exercises whatever tier/scan/barrier configuration
-the caller sets (same contract as ``topk_decode_rocprof_runner.py``).
+the caller sets.
 
 Every flag accepts multiple values (``nargs="+"``) and the checker runs the full
 Cartesian product of ``distribution x k x num-rows x L``. Exit code is non-zero
