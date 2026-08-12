@@ -699,3 +699,107 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     )
 
     return h, v_new, final_state
+
+
+def chunk_gated_delta_rule_fwd_h_o_flydsl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    variant: str | None = None,
+    o: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """FlyDSL fused K5+K6 host wrapper (GDN inter-chunk scan + output).
+
+    Fuses the inter-chunk hidden-state recurrence (K5,
+    ``chunk_gated_delta_rule_fwd_h_flydsl``) with the inter/intra-chunk output
+    (K6, ``chunk_fwd_o_opt_vk``) into a single call. The fused kernel eliminates
+    the ``h`` snapshot and ``v_new`` HBM round-trips between the two stages.
+
+    Args:
+        q: [B, T, Hg, K] bf16. Query; K6 scales it by ``scale``. Token-major,
+            ``Hg``-strided (GQA: ``Hg`` may be < ``H``).
+        k: [B, T, Hg, K] bf16. Shared by K5 (state scan) and K6 (q @ k^T).
+        w: [B, H, T_flat, K] bf16, head-major contiguous (K5 input).
+        u: [B, H, T_flat, V] bf16, head-major contiguous (K5 input).
+        g: [B, H, T_flat] or [H, T_flat] f32 cumulative scalar gate, head-major
+            contiguous, or None. Same convention as
+            ``chunk_gated_delta_rule_fwd_h_flydsl``: when ``use_exp2=True`` the
+            caller must have pre-scaled ``g`` to log2 space. Drives both the K5
+            decay and the K6 output gate.
+        gk: [T_flat, H, K] f32 per-channel cumulative gate (KDA), or None.
+            Pre-scaled internally when ``use_exp2=True``. The per-channel decay
+            is folded into ``h``/``v_new`` by K5; the K6 output path is ungated
+            for the ``gk`` case (matches the Triton K6, which takes only scalar
+            ``g``).
+        scale: query scale for K6. Defaults to ``K ** -0.5`` when None.
+        initial_state: [N, H, V, K] f32, or None.
+        output_final_state: whether to return the final hidden state.
+        chunk_size: chunk size BT (default 64).
+        cu_seqlens: [N+1] LongTensor for variable-length batching, or None.
+        state_dtype: optional initial/final state dtype (float32 or bfloat16).
+        use_exp2: whether ``g``/``gk`` are in log2 space (see K5 wrapper).
+        num_decodes / num_decode_tokens: leading decode prefix skipped in
+            ``cu_seqlens`` (data tensors pre-sliced); see K5 wrapper.
+        prefill_metadata: prebuilt reusable schedule; see K5 wrapper.
+        variant: explicit K5 BV-variant tag, or None for the auto heuristic.
+        o: optional pre-allocated [B, T, H, V] output buffer, written in place.
+            A fresh buffer is allocated when None.
+
+    Returns:
+        (o, final_state) with ``o`` in token-major ``[B, T, H, V]`` (bf16) and
+        ``final_state`` in ``[N, H, V, K]`` (``state_dtype``) or None.
+    """
+    exactly_one_gate = (g is None) != (gk is None)
+    if not exactly_one_gate:
+        raise ValueError(
+            "chunk_gated_delta_rule_fwd_h_o_flydsl: exactly one of g, gk must be "
+            "provided."
+        )
+
+    B, T, Hg, K = q.shape
+    V = u.shape[-1]
+    if scale is None:
+        scale = K ** -0.5
+
+    if o is None:
+        # Token-major [B, T, H, V], matching the Triton K6 output layout.
+        H = w.shape[1]
+        o = u.new_empty(B, T, H, V, dtype=u.dtype)
+
+    from .kernels.chunk_gated_delta_h_o_gfx942 import (
+        chunk_gated_delta_h_o_placeholder,
+    )
+
+    return chunk_gated_delta_h_o_placeholder(
+        q=q,
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        gk=gk,
+        o=o,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
+        variant=variant,
+    )

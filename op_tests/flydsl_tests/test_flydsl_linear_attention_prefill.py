@@ -1871,3 +1871,106 @@ def chunk_gated_delta_rule_fwd_h_origin_opt(
         USE_EXP2=True,
     )
     return h, v_new, final_state
+
+
+# -- Variant auto-selection (pure function; no GPU launch) --------------------
+#
+# Ground truth = the robustness-weighted per-signature optimum from the MI325X
+# graph-mode full sweep (op_tests/dump_data/gda-gfx942-bench-full-sweep-final-run-1.md,
+# 75 shapes, all V=128). is_varlen is derived as ``N > 1`` (the wrapper sets it from
+# cu_seqlens, built for every N>1 batch). Each tuple is (H, Hg, T_flat, N, gate,
+# expected). One representative per tuned-table signature (T=8192; T=32768 is
+# T-invariant per the sweep). Ties across seq_pattern resolved to the robust variant
+# (see the tuned-table note in linear_attention_prefill_kernels.py).
+_SELECT_CASES = [
+    # KDA (gk)
+    (12, 12, 8192, 1, "gk", "bv16"),
+    (12, 12, 8192, 4, "gk", "bv32"),
+    (12, 12, 8192, 8, "gk", "bv64w8"),
+    (24, 24, 8192, 1, "gk", "bv16"),
+    (24, 24, 8192, 4, "gk", "bv64w8"),
+    (24, 24, 8192, 8, "gk", "bv64w8"),
+    (48, 48, 8192, 1, "gk", "bv32"),
+    (48, 48, 8192, 4, "gk", "bv64w8"),
+    (48, 48, 8192, 8, "gk", "bv64w8"),
+    (96, 96, 8192, 1, "gk", "bv64w8"),
+    (96, 96, 8192, 4, "gk", "bv64w8"),
+    (96, 96, 8192, 8, "gk", "bv64w8"),
+    # GDN (g)
+    (4, 2, 8192, 1, "g", "bv16"),
+    (4, 2, 8192, 4, "g", "bv16"),
+    (4, 2, 8192, 8, "g", "bv16"),
+    (8, 4, 8192, 1, "g", "bv16"),
+    (8, 4, 8192, 4, "g", "bv16"),
+    (8, 4, 8192, 8, "g", "bv32"),
+    (16, 16, 8192, 1, "g", "bv16"),
+    (16, 16, 8192, 4, "g", "bv32"),
+    (16, 16, 8192, 8, "g", "bv64w8"),  # min-mean: favors common equal case over rare skew
+    (32, 8, 8192, 1, "g", "bv16"),
+    (32, 8, 8192, 4, "g", "bv64w8"),
+    (32, 8, 8192, 8, "g", "bv64w8"),
+    # N=2 bucket: one tile below N=4 for mid-H, flat at the extremes.
+    (4, 2, 8192, 2, "g", "bv16"),
+    (8, 4, 8192, 2, "g", "bv16"),
+    (16, 16, 8192, 2, "g", "bv16"),   # vs N4->bv32
+    (32, 8, 8192, 2, "g", "bv32"),    # vs N4->bv64w8
+    (12, 12, 8192, 2, "gk", "bv16"),  # vs N4->bv32
+    (24, 24, 8192, 2, "gk", "bv32"),  # vs N4->bv64w8
+    (48, 48, 8192, 2, "gk", "bv64w8"),
+    (96, 96, 8192, 2, "gk", "bv64w8"),
+    # T-invariance spot-check (same signature at T=32768)
+    (12, 12, 32768, 8, "gk", "bv64w8"),
+    (32, 8, 32768, 8, "g", "bv64w8"),
+    (16, 16, 32768, 2, "g", "bv16"),
+    # N-bucketing: N=3->bucket4 (larger-tile side), N=5/7->bucket8 (gdn H4 stays bv16)
+    (4, 2, 8192, 3, "g", "bv16"),
+    (4, 2, 8192, 5, "g", "bv16"),
+    (4, 2, 8192, 7, "g", "bv16"),
+]
+
+
+class TestVariantSelection:
+    """Pure-function checks on ``_auto_variant`` -- no kernel launch."""
+
+    @pytest.mark.parametrize("H,Hg,T_flat,N,gate,expected", _SELECT_CASES)
+    def test_auto_variant_gfx942_matches_measured_optimum(
+        self, monkeypatch, H, Hg, T_flat, N, gate, expected
+    ):
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx942")
+        is_varlen = N > 1
+        got = k5._auto_variant(
+            H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=is_varlen, gate=gate
+        )
+        assert got == expected, (
+            f"gate={gate} H={H} N={N} varlen={is_varlen}: "
+            f"expected {expected}, got {got}"
+        )
+        # Whatever is emitted must be a legal variant for this V.
+        assert k5._bv_of_variant(got) in k5._legal_bv_candidates(128)
+
+    @pytest.mark.parametrize("H,Hg,T_flat,N,gate,expected", _SELECT_CASES)
+    def test_auto_variant_gfx950_never_wave_widened(
+        self, monkeypatch, H, Hg, T_flat, N, gate, expected
+    ):
+        """gfx950 uses the no-wave builder (asserts num_waves==4), so the selector
+        must never emit a ``w``-tag there -- the tuned table is gfx942-only."""
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx950")
+        got = k5._auto_variant(
+            H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=N > 1, gate=gate
+        )
+        assert "w" not in got, f"gfx950 must not wave-widen; got {got}"
+
+    def test_explicit_variant_overrides_auto(self, monkeypatch):
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx942")
+        # A KDA N8 shape that auto-selects bv64w8; explicit bv32 must win.
+        tag = k5._resolve_variant(
+            "bv32", H=12, Hg=12, V=128, T_flat=8192, N=8, is_varlen=True, gate="gk"
+        )
+        assert tag == "bv32"
+

@@ -226,6 +226,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_chunk_flydsl_fused: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
@@ -256,6 +257,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state (K5)
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
+        use_chunk_flydsl_fused: bool — use the FlyDSL fused K5+K6 kernel, which
+            computes both the hidden state and the output ``o`` in one dispatch.
+            Mutually exclusive with the other two flags; skips the separate K6
+            call and returns early.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -279,10 +284,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
     """
-    if use_chunk_hip and use_chunk_flydsl:
+    if sum([use_chunk_hip, use_chunk_flydsl, use_chunk_flydsl_fused]) > 1:
         raise ValueError(
-            "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
-            "set at most one."
+            "use_chunk_hip, use_chunk_flydsl, and use_chunk_flydsl_fused are "
+            "mutually exclusive; set at most one."
         )
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
@@ -326,6 +331,37 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         num_decode_tokens=num_decode_tokens,
         prefill_metadata=prefill_metadata,
     )
+
+    if use_chunk_flydsl_fused:
+        # Fused K5+K6: hidden-state scan and output ``o`` in one dispatch.
+        # ``g_cumsum`` from K1+K2 is head-major [B, H, T] (same convention as
+        # the K5 wrapper). K6 gating uses scalar ``g`` only; the KDA (gk) path
+        # folds its decay into K5 and is not routed through this scalar pipeline.
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            chunk_gated_delta_rule_fwd_h_o_flydsl,
+        )
+
+        if o is None:
+            o = v.new_empty(v.shape)
+
+        o, final_state = chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+            o=o,
+        )
+        return g_cumsum, o, final_state
 
     if use_chunk_hip:
         from aiter.ops.chunk_gated_delta_rule_fwd_h import (
