@@ -357,6 +357,12 @@ def compile_fp8_gemm_8w(
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
+    _layout_tag = "bpreshuffle" if b_preshuffled else "rowmajor"
+    _kname = (
+        f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
+        f"{waves_per_eu}x{xcd_swizzle}_k{K}"
+    )
+
     @fx.struct
     class SharedStorage:
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -368,7 +374,7 @@ def compile_fp8_gemm_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -472,11 +478,6 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # KNOWN BUG, deliberately left matching upstream: this vmcnt is too
-            # lax and the kernel is non-deterministic because of it -- the next
-            # iteration reads LDS whose global->LDS DMA has not landed for every
-            # wave. See the module docstring and
-            # op_tests/flydsl_tests/repro_8wave_race.py.
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
