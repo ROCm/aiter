@@ -2702,27 +2702,3 @@ namespace py = pybind11;
           py::arg("final_lse"),              \
           py::arg("q_scale"),                \
           py::arg("kv_scale"));
-
-
-#define MLA_DECODE_FWD_OPUS_PYBIND      \
-    m.def("mla_decode_fwd_opus_stage1", \
-          &mla_decode_fwd_opus_stage1,  \
-          "mla_decode_fwd_opus_stage1", \
-          py::arg("q"),                 \
-          py::arg("kv"),                \
-          py::arg("qo_indptr"),         \
-          py::arg("kv_indptr"),         \
-          py::arg("kv_indices"),        \
-          py::arg("kv_last_page_lens"), \
-          py::arg("work_indptr"),       \
-          py::arg("work_info_set"),     \
-          py::arg("max_seqlen_q"),      \
-          py::arg("page_size"),         \
-          py::arg("nhead_kv"),          \
-          py::arg("softmax_scale"),     \
-          py::arg("logits"),            \
-          py::arg("attn_lse"),          \
-          py::arg("out"),               \
-          py::arg("final_lse"),         \
-          py::arg("q_scale"),           \
-          py::arg("kv_scale"));

@@ -903,13 +903,10 @@ def mla_decode_fwd(
                 logits,
                 attn_lse,
                 o,
-                (
-                    final_lse
-                    if final_lse is not None
-                    else torch.empty(0, dtype=dtypes.fp32, device=device)
-                ),
+                final_lse,
                 q_scale,
                 kv_scale,
+                causal,
             )
         elif use_hk:
             aiter.hk_mla_decode_fwd(
