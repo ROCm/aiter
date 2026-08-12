@@ -155,13 +155,6 @@ __device__ inline void async_load_range(Mem& g, void* smem_base, const LayoutG& 
     }
 }
 
-// >4GiB KV: a descriptor's num_records is 32-bit, so one descriptor cannot span the whole
-// K/V row. Each tile gets its own descriptor based at the tile start (folded into the 64-bit
-// resource base), with num_records covering just that tile: a tile's gmem layout tops out at
-// (KV_TILE_SIZE-1)*stride_n + D elements and D <= stride_n, so no in-tile offset reaches the
-// tile extent, and the tail tile's short record count masks its padded rows exactly as a
-// head-spanning count would. Keeping the bound tile-local also keeps it 32-bit: bounding at
-// the head end needs a 64-bit clamp, which lowers to VALU compares in the pipeline loop.
 
 // ─── O store layout for a WIDENED (dwordx4 / VEC_O_X4) store ───
 // The GEMM1 (swap_ab) output has head_dim along registers, but a lane holds only VEC_O
@@ -546,21 +539,13 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     auto v_abs_elem = [&](int ti) {
         return v_gmem_offset + static_cast<int64_t>(ti) * T::KV_TILE_SIZE * kargs.stride_v_n;
     };
-    // Two ways to address a KV tile, picked at compile time per buffer by the host
-    // (T::LARGE_K for K, T::LARGE_V for V -- K's rows are 1.5x wider, so it can need the
-    // large form while V does not):
-    //
-    //   !LARGE: one descriptor per (b, h_kv) based at the head start with num_records
-    //   spanning the whole head, tile offset in soffset. Base and num_records are loop
-    //   invariant, so the descriptor is built once, right here, and the accessor below hands
-    //   the pipeline a reference to it -- the pre-large-KV addressing, unchanged. Needs the
-    //   head extent to fit the 32-bit num_records.
-    //
-    //   LARGE: one descriptor per tile, based at the tile start with num_records covering
-    //   that tile, soffset 0. num_records and the offsets the hardware range-checks then
-    //   share the tile-start origin, which lifts the 4GiB limit at the cost of rebuilding
-    //   base + num_records every tile. Splitting the offset across base and soffset instead
-    //   leaves those two origins mismatched and reads garbage.
+    // KV tile addressing, picked per buffer by the host (T::LARGE_K / T::LARGE_V; K's rows
+    // are 1.5x wider, so it can need the large form while V does not):
+    //   !LARGE: one descriptor per (b, h_kv) at the head start, tile offset in soffset. Loop
+    //   invariant, built once below; needs the head extent to fit the 32-bit num_records.
+    //   LARGE: one descriptor per tile at the tile start, soffset 0. Lifts the 4GiB limit,
+    //   rebuilt every tile. Never split the offset across base and soffset -- that mismatches
+    //   the two origins the hardware range-checks against and reads garbage.
     const unsigned int k_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_k_n);
     const unsigned int v_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_v_n);
     const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;

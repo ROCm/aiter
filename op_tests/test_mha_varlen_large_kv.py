@@ -136,7 +136,8 @@ def _run_varlen(q, k, v, cu_q, cu_k, max_seqlen, scale, causal):
 
 
 def _flops_bytes(S, nheads, nheads_k, dq, dv, causal, elem_size):
-    flops = 4.0 * nheads * S * S * (dq + dv)
+    # 2 flops per MAC, over QK^T (dq deep) and PV (dv deep); matches op_tests/test_mha.py.
+    flops = 2.0 * nheads * S * S * (dq + dv)
     if causal:
         flops /= 2.0
     nbytes = (
