@@ -608,6 +608,23 @@ def _opus_moe_gather_sum_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16",
+    develop=True,
+)
+def _opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16_raw(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+    dst: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 def build_token_routes(gather: Tensor, T: int, topk: int) -> Tensor:
     """Fixed top-k reverse map for the dx gather-sum: token_routes[t,k] = the
     compact route index of token t's k-th selection. Built once per moe-sort
@@ -624,6 +641,31 @@ def opus_moe_gather_sum_bf16(src: Tensor, token_routes: Tensor, T: int) -> Tenso
     dst = torch.empty(T, H, device=src.device, dtype=torch.bfloat16)
     _opus_moe_gather_sum_bf16_raw(src.contiguous(), token_routes, dst)
     return dst
+
+
+def opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+):
+    """Fuse exact-shape dx gather and selected-topk router Jacobian."""
+    T = token_routes.shape[0]
+    dx = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+    dlogits = torch.empty(T, 64, device=src.device, dtype=torch.bfloat16)
+    _opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16_raw(
+        src.contiguous(),
+        token_routes,
+        route_scores.contiguous(),
+        partials,
+        order.contiguous(),
+        topk_ids.contiguous(),
+        dx,
+        dlogits,
+    )
+    return dx, dlogits
 
 
 # --- M5 R7: router backward (opus kernel) ---
@@ -734,6 +776,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         order = ctx.saved_tensors[8]
         topk_ids = ctx.saved_tensors[10]
         dscore_partials = None
+        fused_dlogits = None
 
         def dgrad_prepared(dy_op, w, lens):
             wt = w2t if w is w2_ref else w1t
@@ -793,6 +836,8 @@ class OpusMoERefFunc(torch.autograd.Function):
             # [T,E] router gradient in this payload slot.
             if dp_sorted.ndim == 2:
                 if dp_sorted.shape[1] == 4:
+                    if fused_dlogits is not None:
+                        return fused_dlogits
                     return opus_moe_dscore_router_bwd_token8_e64_bf16(
                         ctx.token_routes,
                         ctx.saved_tensors[6],
@@ -807,6 +852,19 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
+            nonlocal fused_dlogits
+            if dscore_partials is not None:
+                dx, fused_dlogits = (
+                    opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
+                        src,
+                        ctx.token_routes,
+                        ctx.saved_tensors[6],
+                        dscore_partials,
+                        order,
+                        topk_ids,
+                    )
+                )
+                return dx
             return opus_moe_gather_sum_bf16(src, ctx.token_routes, T)
 
         def wgrad_prepared(dy_op, a_op, _lens):

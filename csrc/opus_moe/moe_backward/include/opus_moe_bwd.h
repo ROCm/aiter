@@ -142,6 +142,16 @@ void opus_moe_gather_sum_bf16(aiter_tensor_t& src,
                               aiter_tensor_t& token_routes,
                               aiter_tensor_t& dst);
 
+void opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits);
+
 // Router backward (M5 R7): softmax-over-topk Jacobian.
 // dp [T,topk] fp32, topk_w [T,topk] fp32, topk_ids [T,topk] i32 ->
 // dlogits [T,E] fp32 (pre-zeroed). dlogits[t,ids[t,k]] = pw*(dp - Σ dp·pw).
