@@ -309,6 +309,17 @@ DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 # instead the default table of the separate _BPRESHUFFLE config entry, which
 # batched_gemm_a8w8_mxscale reads only under b_preshuffled=True. Nothing has to
 # be set to pick it up; override that entry's env var to try another one.
+#
+# Five of the 133 cells are slower here than the shipped table is with row-major
+# B, and they stay in anyway: a b_preshuffled=True caller has no row-major kernel
+# to fall back to, and each row already names the fastest preshuffled kid the
+# entry can dispatch (re-swept over the whole pool, 7 alternating rounds). Two of
+# them are twin-vs-twin, which is what makes them worth recording rather than
+# re-tuning: g16/m128/k4096 is kid326 against kid230 (+11.8%) and g16/m256/k4096
+# is kid325 against kid229 (+14.7%) -- same tile, same sfpreload, only B's layout
+# and its LDS hop differ, so that is what preshuffling costs at the 128-wide
+# tiles rather than a tuning miss. The others are g2/m512/k1024 (+6.3%),
+# g2/m1024/k1024 (+4.7%) and g2/m32768/k4096 (+2.4%).
 BPRESHUFFLE_CSV = os.path.join(
     _REPO,
     "aiter",

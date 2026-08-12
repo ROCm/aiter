@@ -149,14 +149,22 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
 
 
 def _check_tables():
-    """One tuned table per B layout, each holding only kids that read that layout.
+    """One tuned table per B layout, holding only kids the entry can dispatch.
 
-    Keeping them apart is what keeps the row-major caller tuned: a shared table
-    would hand it rows naming preshuffled kids, every one of which it has to drop
-    for the heuristic, silently losing the shipped table's pick. So this reads
-    both tables the way the entry does and checks no row crosses over -- which
-    also catches a preshuffle CSV whose name lets the shipped table's glob merge
-    it in.
+    Keeping the tables apart is what keeps the row-major caller tuned: a shared
+    table would hand it rows naming preshuffled kids, every one of which it has
+    to drop for the heuristic, silently losing the shipped table's pick. So this
+    reads both tables the way the entry does and checks no row crosses over --
+    which also catches a preshuffle CSV whose name lets the shipped table's glob
+    merge it in.
+
+    The scale layout is checked on the same rows because it is the other way a
+    tuned row can name a kid the entry refuses. A tuner sweeping every codegen
+    instance sees the 8 that want their scales rearranged on the host, and they
+    do win cells; crowned there, the row is dead weight (b_preshuffled=False) or
+    raises (True). Both guards live in the backend, so a table that trips one is
+    a tuning bug, not a dispatch bug -- catch it here rather than in a serving
+    log.
     """
     import aiter.ops.batched_gemm_op_a8w8 as bg
     import aiter.ops.opus.bmm_op as bmm
@@ -173,11 +181,18 @@ def _check_tables():
             for key, row in rows.items()
             if key[0] == gfx and row.get("libtype") == "opus"
         }
-        bad = sorted(k for k in kids if not bmm._kid_takes_b_layout(k, b_preshuffled))
+        bad_b = sorted(k for k in kids if not bmm._kid_takes_b_layout(k, b_preshuffled))
+        bad_sf = sorted(k for k in kids if not bmm._kid_takes_plain_scales(k))
+        bad = bool(bad_b or bad_sf)
         ok &= not bad
         label = f"b_preshuffled={b_preshuffled!s:<5} -> {len(kids)} kid(s)"
-        note = f"wrong-layout kids {bad}" if bad else os.path.basename(path)
-        print(f"  {'ok  ' if not bad else 'FAIL'} {label}  [{note}]", flush=True)
+        if bad_b:
+            note = f"wrong B layout: {bad_b}"
+        elif bad_sf:
+            note = f"wants host-rearranged scales: {bad_sf}"
+        else:
+            note = os.path.basename(path)
+        print(f"  {'FAIL' if bad else 'ok  '} {label}  [{note}]", flush=True)
     return ok
 
 

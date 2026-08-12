@@ -76,7 +76,7 @@ gfx950,8,16,1024,4096,opus,236,1,10.0876,opus_bmm_a8w8_mxscale_bpreshuffle_blds_
 gfx950,8,32,1024,1024,opus,226,1,5.8265,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x32x32x256_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,92.1,1574.71,0.0
 gfx950,8,32,1024,4096,opus,226,1,12.1068,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x32x32x256_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,177.4,2901.45,0.0001
 gfx950,8,64,1024,1024,opus,171,1,6.0679,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2,177.0,1641.67,0.0
-gfx950,8,64,1024,4096,opus,172,1,13.2348,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2_sfpreload,324.5,2773.0,0.0003
+gfx950,8,64,1024,4096,opus,228,1,12.6989,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2_sfpreload,338.2,2890.02,0.0001
 gfx950,8,128,1024,1024,opus,227,1,7.7769,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x64x64x128_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,276.1,1483.15,0.0
 gfx950,8,128,1024,4096,opus,228,1,19.4035,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2_sfpreload,442.7,2053.54,0.0002
 gfx950,8,256,1024,1024,opus,175,1,9.9893,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x128x64x256_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,430.0,1469.58,0.0001
@@ -91,7 +91,7 @@ gfx950,8,2048,1024,4096,opus,205,1,77.3991,opus_bmm_a8w8_mxscale_bpreshuffle_wav
 gfx950,8,2560,1024,4096,opus,205,1,103.2042,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,1664.6,1544.35,0.0003
 gfx950,8,3072,1024,4096,opus,203,1,111.2831,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload,1852.6,1658.38,0.0003
 gfx950,8,3584,1024,4096,opus,205,1,131.0277,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,1835.6,1600.54,0.0001
-gfx950,8,4096,1024,1024,opus,203,1,56.9893,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload,1205.8,1913.55,0.0
+gfx950,8,4096,1024,1024,opus,194,1,54.3066,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,1265.4,2008.08,0.0
 gfx950,8,4096,1024,4096,opus,194,1,137.4027,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,2000.5,1709.44,0.0
 gfx950,8,8192,1024,1024,opus,194,1,102.7842,opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_512x256x256x128_2x4_16x16x128_1x128x128_wgpcu1_sfpreload,1337.2,2040.34,0.0
 gfx950,8,8192,1024,4096,opus,205,1,261.1546,opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1_256x128x256x128_1x4_16x16x128_1x128x128_wgpcu1_sfpreload_xcd4,2105.1,1670.3,0.0003
@@ -106,8 +106,8 @@ gfx950,16,8,1024,1024,opus,173,1,6.0184,opus_bmm_a8w8_mxscale_bpreshuffle_bdirec
 gfx950,16,8,1024,4096,opus,173,1,14.9559,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x16x32x256_1x2_16x16x128_1x128x128_wgpcu2,71.8,4539.7,0.0
 gfx950,16,16,1024,1024,opus,173,1,6.081,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x16x32x256_1x2_16x16x128_1x128x128_wgpcu2,88.3,2888.28,0.0
 gfx950,16,16,1024,4096,opus,179,1,15.6307,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x16x32x512_1x2_16x16x128_1x128x128_wgpcu2,137.4,4394.03,0.0003
-gfx950,16,32,1024,1024,opus,244,1,7.1258,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2,150.7,2575.16,0.0
-gfx950,16,32,1024,4096,opus,172,1,18.2992,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2_sfpreload,234.7,3839.22,0.0001
+gfx950,16,32,1024,1024,opus,226,1,6.7139,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x32x32x256_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,159.9,2733.14,0.0001
+gfx950,16,32,1024,4096,opus,226,1,15.9822,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x32x32x256_2x1_16x16x128_1x128x128_wgpcu2_scaleprefetch,268.7,4395.81,0.0005
 gfx950,16,48,1024,4096,opus,172,1,19.9114,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2_sfpreload,323.6,3607.35,0.0001
 gfx950,16,64,1024,1024,opus,171,1,8.4669,opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_256x64x32x256_2x1_16x16x128_1x128x128_wgpcu2,253.6,2353.04,0.0
 gfx950,16,64,1024,4096,opus,230,1,21.391,opus_bmm_a8w8_mxscale_bpreshuffle_blds_256x128x64x256_2x1_16x16x128_1x128x128_wgpcu1_sfpreload,401.6,3431.36,0.0004
