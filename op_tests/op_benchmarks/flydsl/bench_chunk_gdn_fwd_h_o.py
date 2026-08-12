@@ -118,7 +118,7 @@ _IMPL_KEYS = (
 # apply ONLY to K5K6_flydsl_fused -- the separate paths are not parametrized.
 FUSED_PREFIX = "K5K6_flydsl_fused"
 AUTO_VARIANT = "auto"
-FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8")
+FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8", "bv64w16")
 
 
 def _fused_auto_variant_for_shape(shape, cu) -> str | None:

@@ -139,27 +139,16 @@ def compile_chunk_gated_delta_h_o_gfx942(
     # lds_A: [BT, BT] attention matrix, group-major + XOR like the others.
     LDS_A_NG = BT // 4
     LDS_A_ELEMS = BT * BT
-    # lds_vn_raw: ungated v_new, transposed [BV, BT] exactly like lds_vnt. The
-    # K6 attention output A @ v_new uses the ungated v_new (what K5 writes to
-    # HBM before the exp(g_last - g) decay), whereas GEMM2's state update uses
-    # the gated copy in lds_vnt -- so both must be kept.
-    LDS_VN_RAW_ELEMS = BV * BT
 
-    # LDS budget: the six buffers at BV=64 (K=128) total 72 KiB > 64 KiB. lds_A
-    # (BT*BT = 4096 bf16 = 8 KiB) is written by GEMM4a, which runs strictly after
-    # GEMM3 -- the last reader of lds_h -- so lds_A can reuse lds_h's storage once
-    # a barrier separates the two. lds_A (4096 elems) fits inside lds_h
-    # (BV*K = 8192 elems at BV=64). Alias only when needed (BV would otherwise
-    # overflow); BV<=32 has room and keeps the buffers distinct (no extra barrier).
+    # LDS budget: five buffers. At BV=64 (K=128) the total is now exactly 64 KiB:
+    #   lds_w 16 + lds_kt 16 + lds_vnt 8 + lds_h 16 + lds_A 8 = 64 KiB.
+    # lds_A is written by GEMM4a (strictly after
+    # GEMM3, the last lds_h reader), so it may reuse lds_h's storage under a
+    # barrier when aliased. Aliasing needs lds_A (BT*BT) <= lds_h (BV*K), i.e.
+    # BV >= 32; BV=16 never overflows so it keeps buffers distinct.
     _lds_total_kib = (
-        LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS
-        + LDS_A_ELEMS + LDS_VN_RAW_ELEMS
+        LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS + LDS_A_ELEMS
     ) * 2 / 1024
-    # Alias lds_A onto lds_h only when (a) the un-aliased layout would overflow
-    # 64 KiB AND (b) lds_A actually fits inside lds_h. The latter holds only for
-    # BV >= 32 (lds_h = BV*K; lds_A = BT*BT): at BV=16, lds_h = 2048 < lds_A =
-    # 4096, so aliasing is impossible -- but BV=16 also never overflows, so it
-    # keeps distinct buffers and no aliasing is needed.
     ALIAS_A_ONTO_H = _lds_total_kib > 64.0 and LDS_A_ELEMS <= LDS_H_ELEMS
     assert not (_lds_total_kib > 64.0 and not ALIAS_A_ONTO_H), (
         f"fused LDS {_lds_total_kib:.0f} KiB > 64 KiB and lds_A ({LDS_A_ELEMS}) "
@@ -173,7 +162,6 @@ def compile_chunk_gated_delta_h_o_gfx942(
             lds_kt: fx.Array[fx.BFloat16, LDS_KT_ELEMS, 16]
             lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
             lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
-            lds_vn_raw: fx.Array[fx.BFloat16, LDS_VN_RAW_ELEMS, 16]
     else:
         @fx.struct
         class SharedStorage:
@@ -182,7 +170,6 @@ def compile_chunk_gated_delta_h_o_gfx942(
             lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
             lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
             lds_A: fx.Array[fx.BFloat16, LDS_A_ELEMS, 16]
-            lds_vn_raw: fx.Array[fx.BFloat16, LDS_VN_RAW_ELEMS, 16]
 
     # Cooperative load parameters (bf16x8 = dwordx4) -- identical to K5.
     LOAD_VEC_WIDTH = 8
@@ -297,7 +284,6 @@ def compile_chunk_gated_delta_h_o_gfx942(
         lds_kt_ptr = lds.lds_kt.ptr
         lds_vnt_ptr = lds.lds_vnt.ptr
         lds_h_ptr = lds.lds_h.ptr
-        lds_vn_raw_ptr = lds.lds_vn_raw.ptr
         # lds_A aliases lds_h when LDS is tight (BV=64): GEMM3 (last lds_h reader)
         # runs before GEMM4a (lds_A writer), separated by a barrier below.
         if const_expr(ALIAS_A_ONTO_H):
@@ -616,12 +602,15 @@ def compile_chunk_gated_delta_h_o_gfx942(
             for nr in range_constexpr(N_REPEAT_LOCAL):
                 vn_frags[nr] = vn_frags[nr] * row_mask_vec
 
-            # -- Snapshot the UNGATED v_new for K6's A @ v_new (GEMM4b) --
-            # K6 reads v_new before the exp(g_last - g) decay; keep a copy now,
-            # since the gate below mutates vn_frags in place for GEMM2.
-            vn_raw_frags = [vn_frags[nr] for nr in range_constexpr(N_REPEAT_LOCAL)]
-
             # -- Gating (state + v_new) --
+            # GEMM4b (K6 intra term) reuses the GATED v_new (lds_vnt), not a
+            # separate ungated copy: the K6 attention math
+            #   o_intra[i] = sum_j exp(g_i - g_j) (q k^T)[i,j] v_ungated[j]
+            # with v_ungated[j] = v_gated[j] exp(g_j - g_last) telescopes to
+            #   o_intra[i] = exp(g_i - g_last) sum_j (q k^T)[i,j] v_gated[j],
+            # i.e. an ungated causal A' @ v_gated scaled by the per-query-row
+            # factor exp(g_i - g_last). So GEMM4a needs no column gate and no
+            # ungated v_new snapshot (lds_vn_raw removed). See the o store below.
             if const_expr(USE_G):
                 exp_g_last = _fast_exp(g_last_val)
                 gate_elems = []
@@ -655,18 +644,15 @@ def compile_chunk_gated_delta_h_o_gfx942(
                         acc_idx = kb * N_REPEAT_LOCAL + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
 
-            # -- Store gated v_new (GEMM2) + ungated v_new (GEMM4b) transposed
-            #    as [V, BT] into lds_vnt / lds_vn_raw --
+            # -- Store gated v_new transposed as [V, BT] into lds_vnt --
+            # Consumed by both GEMM2 (state update) and GEMM4b (K6 intra term);
+            # see the gating note above for why the gated copy suffices for K6.
             for nr in range_constexpr(N_REPEAT_LOCAL):
                 vnt_v = _nr_v(nr) + lane_n
                 vnt_g = wid_m * fx.Int32(4) + lane_m_base
                 fx.ptr_store(
                     _to_bf16_fast(vn_frags[nr], 4),
                     lds_vnt_ptr + _lds_vnt_idx(vnt_v, vnt_g),
-                )
-                fx.ptr_store(
-                    _to_bf16_fast(vn_raw_frags[nr], 4),
-                    lds_vn_raw_ptr + _lds_vnt_idx(vnt_v, vnt_g),
                 )
 
             # -- Store k transposed as [K, BT] into lds_kt --
@@ -696,6 +682,18 @@ def compile_chunk_gated_delta_h_o_gfx942(
 
             gpu.barrier()
 
+            # Issue q's HBM loads before GEMM2 such that their global-memory
+            # latency hides behind GEMM2's MFMA chain. q is independent of GEMM2;
+            # only the lds_q store must wait for the barrier below (GEMM1's lds_w
+            # readers).
+            q_prefetch = []
+            for i_load in range_constexpr(W_LOADS_PER_THREAD):
+                row, col = _w_slot(i_load)
+                abs_row = i_t_i32 * fx.Int32(BT) + row
+                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                qoff = q_base + safe_row * stride_q + col
+                q_prefetch.append(q_.vec_load((fx.Int64(qoff),), LOAD_VEC_WIDTH))
+
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
@@ -722,15 +720,8 @@ def compile_chunk_gated_delta_h_o_gfx942(
             # gated v_new -- exactly the operands GEMM3/GEMM4 need.
             # =============================================================== #
 
-            # -- Load q into lds_q (aliases lds_w, dead after GEMM1) --
+            # -- Store prefetched q into lds_q (aliases lds_w, dead after GEMM1) --
             gpu.barrier()  # protect lds_w readers (GEMM1) before overwrite
-            q_prefetch = []
-            for i_load in range_constexpr(W_LOADS_PER_THREAD):
-                row, col = _w_slot(i_load)
-                abs_row = i_t_i32 * fx.Int32(BT) + row
-                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                qoff = q_base + safe_row * stride_q + col
-                q_prefetch.append(q_.vec_load((fx.Int64(qoff),), LOAD_VEC_WIDTH))
             for i_qp in range_constexpr(NUM_W_LOADS):
                 qvec = q_prefetch[i_qp]
                 row, col = _w_slot(i_qp)
@@ -827,13 +818,12 @@ def compile_chunk_gated_delta_h_o_gfx942(
                         )
                         a_acc = _mfma_bf16_16x16x16(qa_frag, kb_frag, a_acc)
 
-                # gate (USE_G only) + causal mask, then store this tile to lds_A.
-                # acc element e is the query ROW i = wid_m*16+lane_m_base*4+e;
-                # column j = bt_col is fixed per lane.
+                # Causal mask only (no per-column gate). The per-column exp(-g_j)
+                # decay that the naive A_gated would carry is cancelled by using
+                # the gated v_new in GEMM4b, leaving a per-query-row exp(g_i -
+                # g_last) factor applied to the intra output below. acc element e
+                # is the query row i = wid_m*16+lane_m_base*4+e; column j = bt_col.
                 col_abs = i_t_i32 * fx.Int32(BT) + bt_col
-                if const_expr(USE_G):
-                    col_safe = (col_abs < T_local).select(col_abs, fx.Int32(0))
-                    g_col = _as_f32(g_[fx.Int64(i_h * T_flat + (bos + col_safe))])
                 for e in range_constexpr(4):
                     row_tok = (
                         wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
@@ -842,14 +832,9 @@ def compile_chunk_gated_delta_h_o_gfx942(
                     causal = (row_tok >= bt_col) & (row_abs < T_local) & (
                         col_abs < T_local
                     )
-                    if const_expr(USE_G):
-                        gate = _fast_exp(g_row_raw[e] - g_col)
-                        a_val = a_acc[e] * causal.select(gate, fx.Float32(0.0))
-                    else:
-                        # gk path: no output gate; causal mask only.
-                        a_val = a_acc[e] * causal.select(
-                            fx.Float32(1.0), fx.Float32(0.0)
-                        )
+                    a_val = a_acc[e] * causal.select(
+                        fx.Float32(1.0), fx.Float32(0.0)
+                    )
                     a_row = row_tok
                     a_g = bt_col // fx.Int32(4)
                     a_e = bt_col % fx.Int32(4)
@@ -858,24 +843,17 @@ def compile_chunk_gated_delta_h_o_gfx942(
                         lds_A_ptr + _lds_A_idx(a_row, a_g) + a_e,
                     )
 
-            # -- Inter-chunk gate on o: o *= exp(g_row) (per query row) --
-            if const_expr(USE_G):
-                og_elems = []
-                for e in range_constexpr(4):
-                    og_elems.append(_fast_exp(g_row_raw[e]))
-                og_vec = fx.Vector.from_elements(og_elems, dtype=fx.Float32)
-                for nr in range_constexpr(N_REPEAT_LOCAL):
-                    o_accs[nr] = o_accs[nr] * og_vec
-
             gpu.barrier()
 
-            # -- GEMM4b: o += A @ v_new_ungated  (contraction over BT) --
-            # A-frag: A[m=query row, contraction=key BT] from lds_A.
-            # B-frag: v_new[contraction=key BT, n=V] from lds_vn_raw.
-            #   IMPORTANT: the K6 attention term uses the *ungated* v_new (the
-            #   value K5 writes to HBM, before the exp(g_last - g) decay), NOT
-            #   the gated v_new that GEMM2 consumes. lds_vnt holds the gated
-            #   copy; lds_vn_raw holds the ungated copy for exactly this GEMM.
+            # -- GEMM4b: o_intra = A' @ v_gated  (contraction over BT) --
+            # A-frag: A'[m=query row, contraction=key BT] from lds_A (ungated,
+            #   causal-masked). B-frag: gated v_new[contraction=key BT, n=V] from
+            #   lds_vnt. The intra term is accumulated separately so it can take
+            #   the per-query-row factor exp(g_i - g_last) at store time, while
+            #   the inter term (o_accs) takes exp(g_i). See the gating note above.
+            o_intra_accs = []
+            for _nr in range_constexpr(N_REPEAT_LOCAL):
+                o_intra_accs.append(fx.full(4, 0.0, fx.Float32))
             for bt_s in range_constexpr(BT_STEPS):
                 a_m = wid_m * fx.Int32(16) + lane_n
                 a_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
@@ -886,10 +864,33 @@ def compile_chunk_gated_delta_h_o_gfx942(
                     vn_v = _nr_v(nr) + lane_n
                     vn_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
                     vn_b_frag = fx.ptr_load(
-                        lds_vn_raw_ptr + _lds_vnt_idx(vn_v, vn_g),
+                        lds_vnt_ptr + _lds_vnt_idx(vn_v, vn_g),
                         result_type=v4bf16_type,
                     )
-                    o_accs[nr] = _mfma_bf16_16x16x16(a_frag, vn_b_frag, o_accs[nr])
+                    o_intra_accs[nr] = _mfma_bf16_16x16x16(
+                        a_frag, vn_b_frag, o_intra_accs[nr]
+                    )
+
+            # -- Combine inter + intra with their per-query-row gate factors --
+            # USE_G:  o = scale * (exp(g_i) * o_inter + exp(g_i - g_last) * o_intra)
+            # USE_GK: o = scale * (o_inter + o_intra)  (K6 output ungated; the
+            #         per-K gk decay is already folded into h/v_new by K5, and
+            #         v_gated == v_ungated on the gk path).
+            if const_expr(USE_G):
+                exp_gi = [_fast_exp(g_row_raw[e]) for e in range_constexpr(4)]
+                exp_gi_vec = fx.Vector.from_elements(exp_gi, dtype=fx.Float32)
+                exp_gi_gl = [
+                    _fast_exp(g_row_raw[e] - g_last_val) for e in range_constexpr(4)
+                ]
+                exp_gi_gl_vec = fx.Vector.from_elements(exp_gi_gl, dtype=fx.Float32)
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    o_accs[nr] = (
+                        o_accs[nr] * exp_gi_vec
+                        + o_intra_accs[nr] * exp_gi_gl_vec
+                    )
+            else:
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    o_accs[nr] = o_accs[nr] + o_intra_accs[nr]
 
             # -- Scale and store o -> HBM [T_flat, H, V] token-major --
             def _emit_o_store(off, value):
