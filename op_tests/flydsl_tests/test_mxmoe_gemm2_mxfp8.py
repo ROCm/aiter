@@ -32,7 +32,7 @@ def test_v2_gemm2_compile_rejects_bn64():
         compile_gemm2_a4w4_port,
     )
 
-    with pytest.raises(AssertionError, match=r"BN in \{128,256\}.*BN=64"):
+    with pytest.raises(AssertionError, match=r"BN in \{128,256,512\}.*BN=64"):
         compile_gemm2_a4w4_port(BN=64)
 
 
@@ -45,7 +45,7 @@ def test_v2_gemm2_wrapper_rejects_bn_outside_catalog(monkeypatch):
         lambda *_args, **_kwargs: pytest.fail("unsupported BN reached get_g2"),
     )
     with pytest.raises(
-        AssertionError, match=r"BN must be one of \(128, 256\), got 384"
+        AssertionError, match=r"BN must be one of \(128, 256, 512\), got 384"
     ):
         dispatcher.mxfp4_moe_gemm2(
             inter_sorted_quant=None,
