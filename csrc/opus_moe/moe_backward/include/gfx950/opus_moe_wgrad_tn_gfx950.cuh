@@ -466,7 +466,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int e = blockIdx.z;
     int tile_m = blockIdx.y;
     int tile_n = blockIdx.x;
-    if constexpr(FIXED_ROUTES > 0)
+    if constexpr(FIXED_P > 0 && FIXED_Q > 0)
     {
         // Keep two B panels shared while advancing all eight M tiles.  This
         // ordering improves L2 reuse for both exact balanced Sonic wgrads;
@@ -510,7 +510,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         auto load_valid = [&]() {
             const int mf = m0 + load_f;
             const int nf = n0 + load_f;
-            if constexpr(FIXED_ROUTES > 0)
+            if constexpr(FIXED_P > 0 && FIXED_Q > 0)
             {
                 const int local_route =
                     stage * BK + half * 32 + load_k;
@@ -712,6 +712,12 @@ inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
                 <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
         else if(uniform_m == 4096 && P == 2048 && Q == 2048)
             opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 4096>
+                <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        else if(P == 2048 && Q == 1024)
+            opus_moe_wgrad_tn_8wave_kernel<2048, 1024, 0>
+                <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        else if(P == 2048 && Q == 2048)
+            opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 0>
                 <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
         else
             opus_moe_wgrad_tn_8wave_kernel<><<<grid, 512, 0, stream>>>(
