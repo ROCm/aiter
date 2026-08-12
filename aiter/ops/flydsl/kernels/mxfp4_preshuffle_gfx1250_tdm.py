@@ -714,14 +714,14 @@ def launch_gemm_a8w4_tdm(
 
         def load_state(slot, buf, ksl):
             """Load one k128 of ``buf``'s A/B/scales into ``slot``."""
-            for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(buf, wm, ksl))
-            for wn in range_constexpr(wmma_n_rep):
-                slot.b[wn].store(load_b(buf, wn, ksl))
             sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
             sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
-            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+            for wn in range_constexpr(wmma_n_rep):
+                slot.b[wn].store(load_b(buf, wn, ksl))
+            for wm in range_constexpr(wmma_m_rep):
+                slot.a[wm].store(load_a(buf, wm, ksl))
             # Pin all four past the scale loads, or the allocator reuses a base
             # as a scale destination and the backend gates that WAR with vm_vsrc.
             lds_addr_keepalive(*lds_bases(buf))
