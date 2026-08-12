@@ -13,20 +13,9 @@
 #endif
 
 #ifndef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
-constexpr int kOpusMoeStage2RouteOutputReduceAutoBlockN = -1;
 constexpr int kOpusMoeStage2RouteOutputReduceBf16BlockN = 2048;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultBlockN = 4096;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultThreads = 256;
-
-inline int opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
-    int model_dim,
-    int requested_block_n)
-{
-    if(requested_block_n > 0)
-        return requested_block_n;
-    const int auto_block_n = opus_moe::stage2_a8w4_route_reduce_auto_block_n(model_dim);
-    return auto_block_n > 0 ? auto_block_n : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
-}
 #endif
 
 #ifdef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
@@ -351,8 +340,9 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
     hipStream_t stream,
     int requested_block_n)
 {
-    const int block_n = opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
-        kargs.model_dim, requested_block_n);
+    const int block_n = requested_block_n > 0
+                            ? requested_block_n
+                            : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
     dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
     // Specialize for common topk values (unrolls the slot loop -> all loads
     // issued up front, hiding latency); otherwise fall back to the runtime-topk

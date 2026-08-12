@@ -105,39 +105,18 @@ inline __device__ int opus_moe_stage2_a8w4_a_payload_byte_offset(int a_base,
 }
 
 template<typename T>
-inline __device__ constexpr auto opus_moe_stage2_a8w4_layout_scale_word()
-{
-    constexpr auto block_shape = opus::make_tuple(
-        opus::number<1>{},
-        opus::number<T::THREADS_K>{},
-        opus::number<T::MMA_M>{});
-
-    constexpr auto block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}));
-
-    return opus::make_layout<-1>(
-        block_shape,
-        opus::unfold_x_stride(
-            block_dim,
-            block_shape,
-            opus::tuple{opus::number<T::SCALE_WORDS_PER_ROW_PACK>{},
-                        opus::number<T::MMA_M>{},
-                        opus::number<1>{}}));
-}
-
-template<typename T>
 inline __device__ int opus_moe_stage2_a8w4_a_scale_base_word_offset(int route_base,
-                                                                    int ga_offset)
+                                                                    int ga_offset,
+                                                                    int scale_words_per_row_pack)
 {
     const int local_m = opus_moe_stage2_a8w4_a_local_m<T>(ga_offset);
     const int row_pack =
         route_base / T::SCALE_ROWS_PER_ROW_PACK +
         local_m / T::SCALE_ROWS_PER_ROW_PACK;
     const int row_lane = local_m % T::MMA_M;
-    constexpr auto u = opus_moe_stage2_a8w4_layout_scale_word<T>();
-    return static_cast<int>(u(row_pack, opus_moe_stage2_a8w4_a_lane_k<T>(ga_offset), row_lane));
+    return row_pack * scale_words_per_row_pack +
+           opus_moe_stage2_a8w4_a_lane_k<T>(ga_offset) * T::MMA_M +
+           row_lane;
 }
 
 template<typename T>
@@ -225,24 +204,25 @@ inline __device__ int opus_moe_stage2_a8w4_b_lane_k(int gb_offset)
 template<typename T>
 inline __device__ int opus_moe_stage2_a8w4_b_scale_base_word_offset(int scale_row_col_base,
                                                                     int gb_offset,
-                                                                    int wave_id_n)
+                                                                    int wave_id_n,
+                                                                    int scale_words_per_row_pack)
 {
     const int row_pack =
         scale_row_col_base / T::SCALE_ROWS_PER_ROW_PACK +
         wave_id_n * T::HALF_N_MFMA_PER_WAVE;
-    constexpr auto u = opus_moe_stage2_a8w4_layout_scale_word<T>();
-    return static_cast<int>(u(row_pack,
-                              opus_moe_stage2_a8w4_b_lane_k<T>(gb_offset),
-                              opus_moe_stage2_a8w4_b_lane_m<T>(gb_offset)));
+    return row_pack * scale_words_per_row_pack +
+           opus_moe_stage2_a8w4_b_lane_k<T>(gb_offset) * T::MMA_M +
+           opus_moe_stage2_a8w4_b_lane_m<T>(gb_offset);
 }
 
 template<typename T>
 inline __device__ int opus_moe_stage2_a8w4_b_scale_word_offset(int base_word_offset,
                                                                int k_group_word_base,
-                                                               int pair)
+                                                               int pair,
+                                                               int scale_words_per_row_pack)
 {
     return base_word_offset + k_group_word_base +
-           pair * T::SCALE_WORDS_PER_ROW_PACK;
+           pair * scale_words_per_row_pack;
 }
 
 template<typename T>
