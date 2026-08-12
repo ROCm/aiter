@@ -660,8 +660,10 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
             });
             if(has_next && kpack.value == 1)
             {
+                __builtin_amdgcn_s_setprio(0);
                 store_stage(cur ^ 1, 0, next);
                 load_global(stage + 1, 1, next);
+                __builtin_amdgcn_s_setprio(1);
             }
         });
         __builtin_amdgcn_s_setprio(0);
