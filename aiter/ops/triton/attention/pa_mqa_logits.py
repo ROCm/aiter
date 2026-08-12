@@ -181,7 +181,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
 
 def deepgemm_fp8_paged_mqa_logits_stage1(
     q_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_fp8: torch.Tensor,  # dtype = float8 [num_blocks, 1, 1, D+4]
+    kv_cache_fp8: torch.Tensor,  # dtype = float8 [num_blocks, block_size, 1, D+4]
     weights: torch.Tensor,  # dtype = float32
     out_qk: torch.Tensor,  # dtype = float32
     context_lens: torch.Tensor,
@@ -195,18 +195,25 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
+    num_blocks, block_size, num_kv_heads, packed_dim = kv_cache_fp8.size()
     _, max_blk_len = kv_indices.size()
+
+    assert num_kv_heads == 1
+    assert packed_dim == hidden_dim + 4, (
+        "The stage1 kernel expects one fp32 scale after each packed FP8 token; "
+        f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
+    )
 
     TileQCount = batch_size * next_n * (heads // ChunkQ)
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
-    kv_cache_fp8, kv_cache_scale = (
-        kv_cache_fp8[..., :hidden_dim],
-        kv_cache_fp8[..., hidden_dim:],
+    packed_kv_cache = kv_cache_fp8.view(num_blocks, -1)
+    value_elements = block_size * hidden_dim
+    kv_cache_values = packed_kv_cache[:, :value_elements].view(
+        num_blocks, block_size, hidden_dim
     )
-    # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
-    kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
+    kv_cache_scale = packed_kv_cache[:, value_elements:].view(torch.float32)
+    kv_cache_fp8 = kv_cache_values.view(dtypes.fp8)
 
     config = {
         "ChunkQ": ChunkQ,
@@ -227,8 +234,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         q_fp8.stride(2),
         kv_cache_fp8,
         kv_cache_fp8.stride(0),
+        kv_cache_fp8.stride(1),
         kv_cache_scale,
         kv_cache_scale.stride(0),
+        kv_cache_scale.stride(1),
         context_lens,
         kv_indices,
         weights,
@@ -240,6 +249,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         max_blk_len,
         waves_per_eu=WavePerEU,
         **config,
+        KVBlockSize=block_size,
     )
 
 
