@@ -554,14 +554,14 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int VEC = T::VEC_A;
     static_assert((BM == 64 || BM == 128) &&
                   (BN == 64 || BN == 128) && BK == 64);
-    static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
+    static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
     constexpr int a_m_slabs = BM / 64;
     constexpr int b_n_slabs = BN / 64;
-    static_assert(a_m_slabs * b_n_slabs <= 2,
-                  "only one doubled K5 output dimension is supported");
-    static_assert(T::E_M == a_m_slabs);
-    static_assert(T::E_N == b_n_slabs);
+    static_assert(a_m_slabs * b_n_slabs <= 4,
+                  "K5 supports at most a 128x128 output tile");
+    static_assert(T::E_M * T::T_M == BM / T::W_M);
+    static_assert(T::E_N * T::T_N == BN / T::W_N);
     static_assert((BM == 64 && BN == 64) || T::DUAL_OPERAND_LDS,
                   "wide K5 tiles require dual-operand LDS");
     int expert;
@@ -593,6 +593,16 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int route_start = kargs.route.expert_offsets[expert];
     const int route_end = kargs.route.expert_offsets[expert + 1];
     const int route_count = route_end - route_start;
+    if constexpr(requires { T::MIN_ROUTE_COUNT; })
+    {
+        if(route_count < T::MIN_ROUTE_COUNT)
+            return;
+    }
+    if constexpr(requires { T::MAX_ROUTE_COUNT; })
+    {
+        if(route_count > T::MAX_ROUTE_COUNT)
+            return;
+    }
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());
@@ -632,8 +642,12 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     clear(v_c);
 
     // Eight lanes cover one K row; every lane owns eight contiguous columns.
+    const int loader_linear_tid =
+        T::BLOCK_SIZE == 512 ? tid & 255 : tid;
     const int loader_tid =
-        T::DIRECT_GMEM_TO_LDS ? tid ^ ((tid >> 4) & 7) : tid;
+        T::DIRECT_GMEM_TO_LDS
+            ? loader_linear_tid ^ ((loader_linear_tid >> 4) & 7)
+            : loader_linear_tid;
     const int local_k0 = loader_tid / 8;
     const int local_k1 = local_k0 + 32;
     const int local_vec = (loader_tid % 8) * VEC;
@@ -644,10 +658,10 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     // shared encodings.  Wave bits select the 32-row M/N subtile.
     const int common_hi = (tid << 5) & 0x580;
     const int common_lo = (tid << 3) & 0x18;
-    const int a_read_base =
-        (((tid << 1) & 0x70) ^ ((tid & 0x80) >> 1)) ^ common_hi ^ common_lo;
-    const int b_read_base =
-        (common_hi | (((tid << 1) & 0x70) ^ common_lo)) ^ (tid & 0x40);
+    const int a_read_lane_base =
+        ((tid << 1) & 0x70) ^ common_hi ^ common_lo;
+    const int b_read_lane_base =
+        common_hi | (((tid << 1) & 0x70) ^ common_lo);
     const int full_loops = route_count / BK;
 
     // Expert offsets are padded to the sorting block (32 rows), whereas this
@@ -715,18 +729,22 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
             // two independent LDS destinations let all four K-half loads run
             // under one VMEM wait and one producer/consumer barrier.
             __builtin_amdgcn_s_barrier();
-            OPUS_LDS_ADDR D_A* a_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_tile.ptr) +
-                wave_id * opus::get_warp_size() * VEC;
-            OPUS_LDS_ADDR D_B* b_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile_b.ptr) +
-                wave_id * opus::get_warp_size() * VEC;
-            opus::static_for<a_m_slabs>([&](auto slab) {
+            if constexpr(T::BLOCK_SIZE == 512)
+            {
+                const int load_slab = wave_id / 4;
+                const int load_wave = wave_id % 4;
                 OPUS_LDS_ADDR char* a_slab_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR char*>(a_wave_dst) +
-                    slab.value * 64 * BK * sizeof(D_A);
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(s_tile.ptr) +
+                    load_slab * 64 * BK * sizeof(D_A) +
+                    load_wave * opus::get_warp_size() * VEC * sizeof(D_A);
+                OPUS_LDS_ADDR char* b_slab_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(s_tile_b.ptr) +
+                    load_slab * 64 * BK * sizeof(D_B) +
+                    load_wave * opus::get_warp_size() * VEC * sizeof(D_B);
                 const int source_m =
-                    output_m_base + slab.value * 64 + local_vec;
+                    output_m_base + load_slab * 64 + local_vec;
+                const int source_n =
+                    output_n_base + load_slab * 64 + local_vec;
                 g_a.template _async_load<VEC>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(a_slab_dst),
                     (source_a0 * kargs.stride_a_row + source_m) * sizeof(D_A),
@@ -739,13 +757,6 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_A>{});
-            });
-            opus::static_for<b_n_slabs>([&](auto slab) {
-                OPUS_LDS_ADDR char* b_slab_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_wave_dst) +
-                    slab.value * 64 * BK * sizeof(D_B);
-                const int source_n =
-                    output_n_base + slab.value * 64 + local_vec;
                 g_b.template _async_load<VEC>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
                     (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
@@ -758,7 +769,60 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_B>{});
-            });
+            }
+            else
+            {
+                OPUS_LDS_ADDR D_A* a_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_tile.ptr) +
+                    wave_id * opus::get_warp_size() * VEC;
+                OPUS_LDS_ADDR D_B* b_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile_b.ptr) +
+                    wave_id * opus::get_warp_size() * VEC;
+                opus::static_for<a_m_slabs>([&](auto slab) {
+                    OPUS_LDS_ADDR char* a_slab_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR char*>(a_wave_dst) +
+                        slab.value * 64 * BK * sizeof(D_A);
+                    const int source_m =
+                        output_m_base + slab.value * 64 + local_vec;
+                    g_a.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_slab_dst),
+                        (source_a0 * kargs.stride_a_row + source_m) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                    g_a.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_slab_dst +
+                                                              4096),
+                        (source_a1 * kargs.stride_a_row + source_m) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                });
+                opus::static_for<b_n_slabs>([&](auto slab) {
+                    OPUS_LDS_ADDR char* b_slab_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_wave_dst) +
+                        slab.value * 64 * BK * sizeof(D_B);
+                    const int source_n =
+                        output_n_base + slab.value * 64 + local_vec;
+                    g_b.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                        (source_b0 * kargs.stride_b_row + source_n) *
+                            sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+                    g_b.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst +
+                                                              4096),
+                        (source_b1 * kargs.stride_b_row + source_n) *
+                            sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+                });
+            }
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
         }
@@ -810,12 +874,16 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int byte_offset =
-                    em.value * 64 * BK * sizeof(D_A) + ek.value * 2048;
+                const int native_m = em.value * T::T_M + wave_id_m;
+                const int base =
+                    (a_read_lane_base +
+                     (native_m / 2) * 64 * BK * sizeof(D_A)) ^
+                    ((native_m % 2) * 0x40);
+                constexpr int byte_offset = ek.value * 2048;
                 auto lo = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    a_read_base);
+                    base);
                 auto hi = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    a_read_base ^ 0x220);
+                    base ^ 0x220);
                 constexpr int fragment = em.value * T::E_K + ek.value;
 #pragma unroll
                 for(int j = 0; j < T::VEC_TR_B; ++j)
@@ -879,12 +947,16 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_b v_b;
         opus::static_for<T::E_N>([&](auto en) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int byte_offset =
-                    en.value * 64 * BK * sizeof(D_B) + ek.value * 2048;
+                const int native_n = en.value * T::T_N + wave_id_n;
+                const int base =
+                    (b_read_lane_base +
+                     (native_n / 2) * 64 * BK * sizeof(D_B)) ^
+                    ((native_n % 2) * 0x40);
+                constexpr int byte_offset = ek.value * 2048;
                 auto lo = s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    b_read_base);
+                    base);
                 auto hi = s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                    b_read_base ^ 0x220);
+                    base ^ 0x220);
                 constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
                 for(int j = 0; j < T::VEC_TR_B; ++j)
@@ -984,6 +1056,15 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     static_assert(T::B_K == 64, "dw2 registers the K64 kernel");
     AITER_CHECK(kargs.split_k == 1,
                 "dw2: first Opus instance requires split_k=1");
+    if constexpr(requires { T::ADAPTIVE_ROUTE_SPLIT; })
+    {
+        static_assert(T::ADAPTIVE_ROUTE_SPLIT);
+        dw2_launch_gfx950<
+            Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720>(kargs, stream);
+        dw2_launch_gfx950<
+            Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteGt30720>(kargs, stream);
+        return;
+    }
     AITER_CHECK(kargs.model_dim % T::B_M == 0 &&
                     kargs.inter_dim % T::B_N == 0,
                 "dw2: first instance requires D%32==0 and I%128==0");

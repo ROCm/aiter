@@ -226,8 +226,27 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int cohort1_direct_lds_kid = 6;
     constexpr int cohort2_direct_lds_kid = 7;
     constexpr int cohort1_bm128_dual_lds_kid = 9;
+    constexpr int bm128x128_adaptive_routes_kid = 10;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
+    // A wide output grid amortizes the second device-side launch used to
+    // select 256- or 512-thread CTAs from each expert's actual route count.
+    // Require at least two K64 reduction tiles per expert on average so the
+    // larger output tile has enough source reuse to offset its wider LDS and
+    // accumulator footprint.  These tests use only host-visible geometry;
+    // routing skew remains a device-side decision with no synchronization.
+    const bool bm128x128_compatible =
+        kargs.model_dim % 128 == 0 && kargs.inter_dim % 128 == 0;
+    const uint64_t wide_output_blocks =
+        static_cast<uint64_t>(kargs.route.num_experts) *
+        static_cast<uint64_t>(kargs.model_dim / 128) *
+        static_cast<uint64_t>(kargs.inter_dim / 128);
+    const uint64_t average_padded_routes =
+        static_cast<uint64_t>(kargs.route.sorted_capacity) /
+        static_cast<uint64_t>(kargs.route.num_experts);
+    if(bm128x128_compatible && wide_output_blocks >= 512 &&
+       average_padded_routes >= 128)
+        return bm128x128_adaptive_routes_kid;
     const uint64_t source_row_elements =
         static_cast<uint64_t>(kargs.model_dim) +
         static_cast<uint64_t>(kargs.inter_dim);

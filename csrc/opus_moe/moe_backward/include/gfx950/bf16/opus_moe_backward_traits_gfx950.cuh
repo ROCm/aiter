@@ -473,6 +473,106 @@ struct Dw2Bf16Gfx950Bm128Bn64Bk64SwizzledCohort1DualLds
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+// Eight waves share a 128x128 output tile.  Four loader waves cover each
+// 64-column slab of both operands; the complete 32 KiB LDS tile remains
+// resident while every wave accumulates two native 32x32 outputs.
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave4x2
+    : Bf16Traits<Family::Dw2, 128, 128, 64, 512, 2, false>
+{
+    static constexpr int EXPERT_COHORT = 1;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DUAL_OPERAND_LDS = true;
+    static constexpr int T_M = 4;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 1;
+    static constexpr int E_N = 2;
+    static constexpr int E_K = 4;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 4;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
+    : Bf16Traits<Family::Dw2, 128, 128, 64, 256, 2, false>
+{
+    static constexpr int EXPERT_COHORT = 1;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DUAL_OPERAND_LDS = true;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 2;
+    static constexpr int E_N = 2;
+    static constexpr int E_K = 4;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 4;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
+    : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
+{
+    static constexpr int MAX_ROUTE_COUNT = 30720;
+};
+
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteGt30720
+    : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave4x2
+{
+    static constexpr int MIN_ROUTE_COUNT = 30721;
+};
+
+// Dispatch marker: the launcher emits the mutually exclusive short- and
+// long-reduction kernels above.  The route-count predicate is read on device,
+// so no host synchronization or routing-distribution assumption is needed.
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledAdaptiveRoutes
+    : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
+{
+    static constexpr bool ADAPTIVE_ROUTE_SPLIT = true;
+};
+
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled
     : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
 {
