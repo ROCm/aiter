@@ -791,7 +791,28 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         }
     };
 
-    for(int stage = 0; stage < full_k_stages; ++stage)
+    int dynamic_stage_start = 0;
+    if constexpr(FIXED_P == 2048 &&
+                 (FIXED_Q == 1024 || FIXED_Q == 2048))
+    {
+        // The target natural route has at least 3784 rows per expert.  Compile
+        // its common 59-stage prefix with a fixed loop bound, then enter the
+        // dynamic loop only for the final 1--9 stages.  Stage 59 is prefetched
+        // through the masked loader because it is a tail for the shortest
+        // experts and a complete stage for the rest.
+        constexpr int COMMON_FULL_STAGES = 59;
+        if(nroute > COMMON_FULL_STAGES * BK)
+        {
+            for(int stage = 0; stage < COMMON_FULL_STAGES - 1; ++stage)
+                run_stage(opus::number<1>{}, opus::number<0>{}, stage);
+            run_stage(
+                opus::number<1>{},
+                opus::number<1>{},
+                COMMON_FULL_STAGES - 1);
+            dynamic_stage_start = COMMON_FULL_STAGES;
+        }
+    }
+    for(int stage = dynamic_stage_start; stage < full_k_stages; ++stage)
     {
         if(stage + 1 < full_k_stages)
             run_stage(opus::number<1>{}, opus::number<0>{}, stage);
