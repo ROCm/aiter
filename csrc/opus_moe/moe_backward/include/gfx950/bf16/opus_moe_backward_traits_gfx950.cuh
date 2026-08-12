@@ -811,6 +811,11 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4DualLdsWave2x2
     : Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {
     static constexpr int EXPERT_COHORT = 4;
+    // Issue the next, larger dO fragment before the current MFMA chain, then
+    // read the matching a_scaled fragment.  The 48-KiB LDS footprint already
+    // fixes residency at one CTA/CU, so the extra 16 VGPRs hide transpose-read
+    // latency without reducing occupancy.
+    static constexpr bool PREFETCH_REDUCTION_A = true;
 };
 
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720

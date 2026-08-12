@@ -805,6 +805,11 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
+    constexpr bool prefetch_reduction_a = []() constexpr {
+        if constexpr(requires { T::PREFETCH_REDUCTION_A; })
+            return T::PREFETCH_REDUCTION_A;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 64 || BN == 128) && BK == 64);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -1139,8 +1144,8 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
             static_assert(std::is_same_v<
                           typename decltype(mma)::vtype_c,
                           typename decltype(mma_k_fragment)::vtype_c>);
-            opus::static_for<T::E_K>([&](auto ek) {
-                typename decltype(mma_k_fragment)::vtype_a v_a_fragment;
+            auto load_a_fragment = [&](auto ek, auto& v_a_fragment)
+                __attribute__((always_inline)) {
                 opus::static_for<T::E_M>([&](auto em) {
                     const int native_m = em.value * T::T_M + wave_id_m;
                     const int base =
@@ -1163,7 +1168,9 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                                      T::VEC_TR_B + j] = hi[j];
                     }
                 });
-                typename decltype(mma_k_fragment)::vtype_b v_b_fragment;
+            };
+            auto load_b_fragment = [&](auto ek, auto& v_b_fragment)
+                __attribute__((always_inline)) {
                 opus::static_for<T::E_N>([&](auto en) {
                     const int native_n = en.value * T::T_N + wave_id_n;
                     const int base =
@@ -1186,11 +1193,51 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
                                      T::VEC_TR_B + j] = hi[j];
                     }
                 });
+            };
+            auto load_fragment = [&](auto ek, auto& v_a, auto& v_b)
+                __attribute__((always_inline)) {
+                load_a_fragment(ek, v_a);
+                load_b_fragment(ek, v_b);
+            };
+            if constexpr(prefetch_reduction_a)
+            {
+                // Keep only the next A fragment live across each MFMA chain.
+                // A is twice as wide as B for the production 256x128 tile, so
+                // issuing it first hides the larger transpose-read group
+                // without paying the VGPR cost of a full A+B lookahead.
+                typename decltype(mma_k_fragment)::vtype_a v_a0;
+                typename decltype(mma_k_fragment)::vtype_a v_a1;
+                typename decltype(mma_k_fragment)::vtype_b v_b;
+                load_fragment(opus::number<0>{}, v_a0, v_b);
                 s_waitcnt_lgkmcnt(0_I);
+                load_a_fragment(opus::number<1>{}, v_a1);
                 __builtin_amdgcn_s_setprio(1);
-                v_c = mma_k_fragment(v_a_fragment, v_b_fragment, v_c);
+                v_c = mma_k_fragment(v_a0, v_b, v_c);
+                load_b_fragment(opus::number<1>{}, v_b);
+                s_waitcnt_lgkmcnt(0_I);
+                load_a_fragment(opus::number<2>{}, v_a0);
+                v_c = mma_k_fragment(v_a1, v_b, v_c);
+                load_b_fragment(opus::number<2>{}, v_b);
+                s_waitcnt_lgkmcnt(0_I);
+                load_a_fragment(opus::number<3>{}, v_a1);
+                v_c = mma_k_fragment(v_a0, v_b, v_c);
+                load_b_fragment(opus::number<3>{}, v_b);
+                s_waitcnt_lgkmcnt(0_I);
+                v_c = mma_k_fragment(v_a1, v_b, v_c);
                 __builtin_amdgcn_s_setprio(0);
-            });
+            }
+            else
+            {
+                opus::static_for<T::E_K>([&](auto ek) {
+                    typename decltype(mma_k_fragment)::vtype_a v_a_fragment;
+                    typename decltype(mma_k_fragment)::vtype_b v_b_fragment;
+                    load_fragment(ek, v_a_fragment, v_b_fragment);
+                    s_waitcnt_lgkmcnt(0_I);
+                    __builtin_amdgcn_s_setprio(1);
+                    v_c = mma_k_fragment(v_a_fragment, v_b_fragment, v_c);
+                    __builtin_amdgcn_s_setprio(0);
+                });
+            }
             __builtin_amdgcn_sched_barrier(0);
             return;
         }
