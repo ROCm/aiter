@@ -157,18 +157,11 @@ __device__ inline void async_load_range(Mem& g, void* smem_base, const LayoutG& 
 
 // >4GiB KV: a descriptor's num_records is 32-bit, so one descriptor cannot span the whole
 // K/V row. Each tile gets its own descriptor based at the tile start (folded into the 64-bit
-// resource base), with num_records covering the rest of this (b, h_kv) head from that start.
-template<typename D_ATTN>
-__device__ inline unsigned kv_num_records_bytes(int64_t abs_elem_off, int64_t head_end_elem) {
-    const int64_t remain_elems = head_end_elem - abs_elem_off;
-    if(remain_elems <= 0)
-    {
-        return 0;
-    }
-    const int64_t bytes = remain_elems * static_cast<int64_t>(sizeof(D_ATTN));
-    return bytes >= static_cast<int64_t>(0xffffffffu) ? 0xffffffffu
-                                                      : static_cast<unsigned>(bytes);
-}
+// resource base), with num_records covering just that tile: a tile's gmem layout tops out at
+// (KV_TILE_SIZE-1)*stride_n + D elements and D <= stride_n, so no in-tile offset reaches the
+// tile extent, and the tail tile's short record count masks its padded rows exactly as a
+// head-spanning count would. Keeping the bound tile-local also keeps it 32-bit: bounding at
+// the head end needs a 64-bit clamp, which lowers to VALU compares in the pipeline loop.
 
 // ─── O store layout for a WIDENED (dwordx4 / VEC_O_X4) store ───
 // The GEMM1 (swap_ab) output has head_dim along registers, but a lane holds only VEC_O
@@ -546,8 +539,6 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         const int64_t bytes = elems * (int64_t)sizeof(D_ATTN);
         return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
     };
-    const int64_t k_head_end_elem = k_gmem_offset + static_cast<int64_t>(seqlen_kv) * kargs.stride_k_n;
-    const int64_t v_head_end_elem = v_gmem_offset + static_cast<int64_t>(seqlen_kv) * kargs.stride_v_n;
 
     auto k_abs_elem = [&](int ti) {
         return k_gmem_offset + static_cast<int64_t>(ti) * T::KV_TILE_SIZE * kargs.stride_k_n;
@@ -561,48 +552,67 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     //
     //   !LARGE: one descriptor per (b, h_kv) based at the head start with num_records
     //   spanning the whole head, tile offset in soffset. Base and num_records are loop
-    //   invariant, so the descriptor is built once and hoisted out of the pipeline. Needs
-    //   the head extent to fit the 32-bit num_records.
+    //   invariant, so the descriptor is built once, right here, and the accessor below hands
+    //   the pipeline a reference to it -- the pre-large-KV addressing, unchanged. Needs the
+    //   head extent to fit the 32-bit num_records.
     //
     //   LARGE: one descriptor per tile, based at the tile start with num_records covering
-    //   the rest of the head, soffset 0. num_records and the offsets the hardware
-    //   range-checks then share the tile-start origin, which lifts the 4GiB limit at the cost
-    //   of rebuilding base + num_records every tile. Splitting the offset across base and
-    //   soffset instead leaves those two origins mismatched and reads garbage.
+    //   that tile, soffset 0. num_records and the offsets the hardware range-checks then
+    //   share the tile-start origin, which lifts the 4GiB limit at the cost of rebuilding
+    //   base + num_records every tile. Splitting the offset across base and soffset instead
+    //   leaves those two origins mismatched and reads garbage.
     const unsigned int k_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_k_n);
     const unsigned int v_head_records = rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_v_n);
     const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;
     const int v_tile_stride = T::KV_TILE_SIZE * kargs.stride_v_n;
 
-    auto k_gmem_at = [&]([[maybe_unused]] int ti) {
+    // Per-tile record counts for the LARGE forms: every tile but the last covers KV_TILE_SIZE
+    // rows, so the whole per-tile bound collapses to one scalar select on the tile index.
+    [[maybe_unused]] const int kv_last_tile = max(ceil_div(seqlen_kv, T::KV_TILE_SIZE) - 1, 0);
+    [[maybe_unused]] const int kv_tail_rows = max(seqlen_kv - kv_last_tile * T::KV_TILE_SIZE, 0);
+    [[maybe_unused]] const unsigned int k_tile_records_tail =
+        static_cast<unsigned int>(kv_tail_rows * kargs.stride_k_n) * sizeof(D_ATTN);
+    [[maybe_unused]] const unsigned int v_tile_records_tail =
+        static_cast<unsigned int>(kv_tail_rows * kargs.stride_v_n) * sizeof(D_ATTN);
+
+    // The !LARGE descriptors, built once for the whole kernel (dead-stripped in the LARGE
+    // instantiations, which never read them).
+    [[maybe_unused]] auto g_k_head =
+        make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_gmem_offset, k_head_records);
+    [[maybe_unused]] auto g_v_head =
+        make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_gmem_offset, v_head_records);
+
+    // decltype(auto): the LARGE branch returns a fresh descriptor by value, the !LARGE branch
+    // a reference to the one above, so the pipeline never rebuilds it. Bind with auto&&.
+    auto k_gmem_at = [&]([[maybe_unused]] int ti) -> decltype(auto) {
         if constexpr (T::LARGE_K) {
-            const int64_t abs = k_abs_elem(ti);
-            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + abs,
-                             kv_num_records_bytes<D_ATTN>(abs, k_head_end_elem));
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_abs_elem(ti),
+                             ti >= kv_last_tile
+                                 ? k_tile_records_tail
+                                 : static_cast<unsigned int>(k_tile_stride) * sizeof(D_ATTN));
         } else {
-            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_gmem_offset,
-                             k_head_records);
+            return (g_k_head);
         }
     };
-    auto v_gmem_at = [&]([[maybe_unused]] int ti) {
+    auto v_gmem_at = [&]([[maybe_unused]] int ti) -> decltype(auto) {
         if constexpr (T::LARGE_V) {
-            const int64_t abs = v_abs_elem(ti);
-            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + abs,
-                             kv_num_records_bytes<D_ATTN>(abs, v_head_end_elem));
+            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_abs_elem(ti),
+                             ti >= kv_last_tile
+                                 ? v_tile_records_tail
+                                 : static_cast<unsigned int>(v_tile_stride) * sizeof(D_ATTN));
         } else {
-            return make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_gmem_offset,
-                             v_head_records);
+            return (g_v_head);
         }
     };
     auto k_tile_soffset = [&](int ti) { return T::LARGE_K ? 0 : ti * k_tile_stride; };
     auto v_tile_soffset = [&](int ti) { return T::LARGE_V ? 0 : ti * v_tile_stride; };
 
     auto load_k_async = [&](void* smem, const auto& u_gk, const auto& u_sk, int ti) {
-        auto g = k_gmem_at(ti);
+        auto&& g = k_gmem_at(ti);
         async_load<T::VEC_KV>(g, smem, u_gk, u_sk, k_tile_soffset(ti));
     };
     auto load_v_async = [&](void* smem, const auto& u_gv, const auto& u_sv, int ti) {
-        auto g = v_gmem_at(ti);
+        auto&& g = v_gmem_at(ti);
         async_load<T::VEC_KV>(g, smem, u_gv, u_sv, v_tile_soffset(ti));
     };
 
@@ -831,7 +841,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             const int k_pf_ti = tile_idx(min(t + 2, max_num_tiles - 1));
             // Descriptor + soffset for the prefetched K tile; stage6 reuses both for the
             // remaining chunks (under !LARGE_K the descriptor is loop invariant).
-            auto g_k_pf = k_gmem_at(k_pf_ti);
+            auto&& g_k_pf = k_gmem_at(k_pf_ti);
             const int k_pf_os = k_tile_soffset(k_pf_ti);
             if constexpr(STAGGER) {
                 async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
