@@ -260,6 +260,7 @@ def _batched_gemm_a8w8_mxscale_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    b_preshuffled: bool = False,
 ) -> Tensor:
     """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
 
@@ -284,7 +285,8 @@ def _batched_gemm_a8w8_mxscale_impl(
         )
 
     # Reading opus columns is this branch's job; whether that kernel can run
-    # this M, and what to do when it cannot, is the backend's.
+    # this M, whether it reads B in the declared layout, and what to do when it
+    # cannot, is the backend's.
     return bmm_a8w8_mxscale_opus(
         x,
         wo_a,
@@ -294,6 +296,7 @@ def _batched_gemm_a8w8_mxscale_impl(
         dtype=dtype,
         kernelId=int(cfg["kernelId"]) if cfg is not None else None,
         splitK=int(cfg["splitK"]) if cfg is not None else None,
+        b_preshuffled=b_preshuffled,
     )
 
 
@@ -303,6 +306,7 @@ def _batched_gemm_a8w8_mxscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    b_preshuffled: bool = False,
 ) -> Tensor:
     # token-major [M, G, N]; mirrors the eager allocation in bmm_a8w8_mxscale_opus.
     return torch.empty(
@@ -319,6 +323,7 @@ def batched_gemm_a8w8_mxscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    b_preshuffled: bool = False,
 ) -> Tensor:
     """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
 
@@ -344,8 +349,20 @@ def batched_gemm_a8w8_mxscale(
     The shape is looked up in the tuned CSV and the winning row's libtype picks
     the backend. No kernel override lives on this entry: how a kernel is named is
     backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
+
+    ``b_preshuffled`` is the one exception, and not for tuning reasons: it
+    declares that ``wo_a`` was baked into the (16, 16) MFMA-fragment layout
+    (``aiter.ops.shuffle.shuffle_weight``) at load time, which a serving stack
+    does offline and cannot express any other way. It has to be declared rather
+    than detected -- the shuffled weight has the same shape, dtype and strides as
+    the row-major one, so a kernel mismatched to it reads the right bytes in the
+    wrong order and returns a plausible wrong answer instead of failing. Only
+    kids wanting the declared layout are taken, so the tuned CSV to point
+    AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE at has to agree with it.
     """
-    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+    return _batched_gemm_a8w8_mxscale_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype, b_preshuffled=b_preshuffled
+    )
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(
