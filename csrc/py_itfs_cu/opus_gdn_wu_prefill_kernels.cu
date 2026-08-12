@@ -347,7 +347,10 @@ void launch_gdn_prefill_impl(
     const int64_t fused_grid = static_cast<int64_t>(ceil_div(V, BV)) * nh64;
     bool use_split;
     if constexpr (IS_VARLEN) {
-        use_split = true;
+        // The fused K2 below is metadata-aware, but the split family is the one
+        // whose varlen envelope was measured, so auto keeps choosing it and only
+        // an explicit k2_mode=1 takes the packed fused path.
+        use_split = k2_mode != 1;
     } else if (k2_mode == 2) {
         use_split = true;
     } else if (k2_mode == 1) {
@@ -601,6 +604,47 @@ void launch_gdn_prefill_impl(
             return;
         }
     }
+    if constexpr (IS_VARLEN) {
+        // Packed fused W/U.  Every sequence is scanned by one CTA, so the only
+        // packed-specific work is the metadata addressing; when no sequence has
+        // a partial chunk the aligned wrapper also drops the token-tail
+        // predicates and can use the same BV128/NW16 shape as dense.
+        const bool all_chunks_aligned =
+            static_cast<int64_t>(total_chunks) * BT == T;
+        // Serial depth is set by the longest sequence, not by the packed total.
+        const int64_t wf_serial_work =
+            static_cast<int64_t>(varlen_max_chunks) * nh64;
+        int wf_variant = all_chunks_aligned
+            ? ((wf_serial_work >= 4096) ? 5 : 6) : 0;
+        if (const char* e = get_env_override("OPUS_GDN_WF_VARIANT")) {
+            wf_variant = atoi(e);
+        }
+        TORCH_CHECK(wf_variant == 0 || wf_variant == 5 || wf_variant == 6,
+                    "packed varlen fused W/U accepts OPUS_GDN_WF_VARIANT 0 "
+                    "(generic), 5 (aligned BV128/NW16 early prefetch), or "
+                    "6 (aligned BV128/NW16)");
+        TORCH_CHECK(wf_variant == 0 || all_chunks_aligned,
+                    "fused W/U variants 5 and 6 require every packed sequence "
+                    "length to be a multiple of BT=64; use "
+                    "OPUS_GDN_WF_VARIANT=0 for ragged batches");
+        using VWF_GENERIC = gdn_varlen_traits<
+            gdn_k2_fused_traits<K2Traits, false, true, true, true, false>>;
+        using VWF_ALIGNED_EARLY = gdn_varlen_aligned_traits<
+            gdn_k2_fused_traits<gdn_k2_traits<64, 128, 128, 128, 16>,
+                                true, true, true, true, true>>;
+        using VWF_ALIGNED = gdn_varlen_aligned_traits<
+            gdn_k2_fused_traits<gdn_k2_traits<64, 128, 128, 128, 16>,
+                                true, true, true, true, false>>;
+        #define LAUNCH_VARLEN_WF(TY) do { \
+            dim3 vg = gdn_grid_with_flat_y(ceil_div(V, TY::BV), nh64); \
+            gdn_k2_kernel<TY><<<vg, dim3(TY::BLOCK_SIZE), \
+                TY::smem_size_bytes(), stream>>>(k2args); } while (0)
+        if (wf_variant == 5) LAUNCH_VARLEN_WF(VWF_ALIGNED_EARLY);
+        else if (wf_variant == 6) LAUNCH_VARLEN_WF(VWF_ALIGNED);
+        else LAUNCH_VARLEN_WF(VWF_GENERIC);
+        #undef LAUNCH_VARLEN_WF
+        return;
+    }
     // Runtime A/B switch for the gfx942 dense fused W/U kernel.  The public
     // wrapper above guarantees complete BT and BV tiles; split K2 has already
     // returned, so none of its scan/output specializations are affected.
@@ -789,8 +833,6 @@ void opus_gdn_wu_prefill_fwd(
                     "packed varlen expects B=1 and T=total_tokens");
         TORCH_CHECK(BT == 64 && k1_algo == 1,
                     "packed varlen requires BT=64 and k1_algo=1 (Neumann)");
-        TORCH_CHECK(k2_mode != 1,
-                    "packed varlen currently supports the split WS path only");
         for (const auto& item : {
                  std::pair<const char*, torch::Tensor>("cu_seqlens", cu_seqlens),
                  std::pair<const char*, torch::Tensor>("chunk_indices", chunk_indices),

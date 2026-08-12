@@ -230,6 +230,58 @@ def test_packed_gqa_matches_expanded_mha(
         torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
 
 
+@pytest.mark.parametrize(
+    ("lens", "key_heads", "value_heads"),
+    (
+        pytest.param([1, 63, 64, 65, 129], 2, 4, id="boundary-mix"),
+        pytest.param([64, 128, 256], 2, 8, id="aligned-packed"),
+        pytest.param([15, 85, 200], 4, 4, id="mha-baseline"),
+    ),
+)
+def test_packed_gqa_fused_wu_matches_expanded_mha(
+    lens: list[int],
+    key_heads: int,
+    value_heads: int,
+) -> None:
+    _require_opus_device()
+    cu_seqlens = _cu_from_lens(lens)
+    q, k, v, g, beta, state = _make_inputs(
+        1,
+        sum(lens),
+        key_heads,
+        value_heads,
+        len(lens),
+        seed=20260812 + sum(lens) + value_heads,
+    )
+
+    actual, actual_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        k2_mode=1,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+    expected, expected_final = _expanded_mha_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    assert tuple(actual_final.shape) == (len(lens), value_heads, _D, _D)
+    torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+
+
 @pytest.mark.parametrize("k2_mode", (0, 1, 2), ids=("auto", "wf", "ws"))
 @pytest.mark.parametrize(
     ("B", "T", "key_heads", "value_heads"),

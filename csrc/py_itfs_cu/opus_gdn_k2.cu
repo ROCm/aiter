@@ -35,6 +35,17 @@ template __global__ void gdn_k2_kernel<K2_WF_V4>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<K2_WF_V5>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<K2_WF_V6>(gdn_k2_kargs);
 
+// Packed varlen fused W/U.  The generic form keeps the token-tail predicates a
+// ragged batch needs; the aligned forms mirror the dense BV128/NW16 defaults
+// because a BT-aligned packed batch has no partial chunk to predicate.
+using K2_VWF_GENERIC = gdn_varlen_traits<
+    gdn_k2_fused_traits<K2_WF_Base, false, true, true, true, false>>;
+using K2_VWF_ALIGNED_EARLY = gdn_varlen_aligned_traits<K2_WF_V5>;
+using K2_VWF_ALIGNED = gdn_varlen_aligned_traits<K2_WF_V6>;
+template __global__ void gdn_k2_kernel<K2_VWF_GENERIC>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<K2_VWF_ALIGNED_EARLY>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<K2_VWF_ALIGNED>(gdn_k2_kargs);
+
 // OCC=2 variant: separate function with forced VGPR limit
 using K2_OCC2_Traits = gdn_k2_traits<64, 128, 128, 64, 8, 2>;
 #ifdef __HIP_DEVICE_COMPILE__

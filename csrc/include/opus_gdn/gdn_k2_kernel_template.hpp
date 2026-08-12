@@ -28,6 +28,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     constexpr int WS     = T::WARP_SIZE;   // 64
     constexpr int PAD    = T::SMEM_PAD;    // 4
     constexpr bool DENSE = T::DENSE_ALIGNED;
+    constexpr bool IS_VARLEN = T::IS_VARLEN;
     constexpr bool NO_AUX = T::NO_AUX_OUTPUTS;
     constexpr bool CACHE_GATES = T::CACHE_GATES;
     constexpr bool REUSE_DE_K = T::REUSE_DE_K;
@@ -66,9 +67,20 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     constexpr int STRIDE_BK = BK_SUB + PAD;     // 68: for h^T, w_bar, q, k
     constexpr int STRIDE_BT = BT + PAD;         // 68 (BT=64) or 20 (BT=16): for k_T, v_T, A
 
-    // Thread identity
+    // Thread identity.  blockIdx.y alone cannot hold N * H once packed batches
+    // carry many sequences, so varlen slices the logical (sequence, head)
+    // extent across y and z the way K1 and K6 already do.
     const int i_v  = blockIdx.x;
-    const int i_nh = blockIdx.y;
+    int i_nh;
+    if constexpr (IS_VARLEN) {
+        const int64_t flat_nh =
+            static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+        if (flat_nh >= static_cast<int64_t>(kargs.B) * kargs.H)
+            return;
+        i_nh = static_cast<int>(flat_nh);
+    } else {
+        i_nh = blockIdx.y;
+    }
     const int i_n  = i_nh / kargs.H;
     const int i_h  = i_nh % kargs.H;
     const int tid  = threadIdx.x;
@@ -82,6 +94,20 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     const int H  = kargs.H;
     const int NT = kargs.NT;
 
+    // Each CTA scans one sequence.  Dense sequences all start at i_n * T and
+    // share the uniform chunk count; a packed batch starts at the sequence's
+    // own bos and stops after its own chunks, so every token bound below is
+    // expressed against seq_len rather than against the packed total.
+    int seq_len = kargs.T;
+    int num_chunks = NT;
+    int64_t token_row_base = static_cast<int64_t>(i_n) * kargs.T;
+    if constexpr (IS_VARLEN) {
+        const int bos = kargs.ptr_cu_seqlens[i_n];
+        seq_len = kargs.ptr_cu_seqlens[i_n + 1] - bos;
+        num_chunks = ceil_div(seq_len, BT);
+        token_row_base = bos;
+    }
+
     // q/k are the only key-head inputs: w_bar/u_bar, the gates, o/v_new and
     // the state all stay value-head indexed.  GQA lets H / Hg value heads
     // share one key head; the uniform Hg == H branch keeps MHA on its
@@ -94,17 +120,20 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
 
     // Flattened HBM offsets can exceed INT32 even though all tile-local
     // indices fit in int.  Form the CTA-owned global bases in 64 bits once.
-    const int64_t token_head_base =
-        static_cast<int64_t>(i_n) * kargs.T * H + i_h;
+    const int64_t token_head_base = token_row_base * H + i_h;
     const int64_t w_base = token_head_base * K;
     const int64_t qk_base = (Hg == H)
         ? w_base
-        : (static_cast<int64_t>(i_n) * kargs.T * Hg + i_h / (H / Hg)) * K;
+        : (token_row_base * Hg + i_h / (H / Hg)) * K;
     const int64_t uov_base = token_head_base * V;
     const int64_t state_base =
         (static_cast<int64_t>(i_n) * H + i_h) * V * K;
-    const int64_t snapshot_base =
-        (static_cast<int64_t>(i_n) * NT * H + i_h) * V * K;
+    // Dense snapshots are indexed per batch chunk; packed snapshots are a flat
+    // run over every sequence's chunks, which is what chunk_offsets records.
+    int64_t snapshot_chunk_base = static_cast<int64_t>(i_n) * NT;
+    if constexpr (IS_VARLEN)
+        snapshot_chunk_base = kargs.ptr_chunk_offsets[i_n];
+    const int64_t snapshot_base = (snapshot_chunk_base * H + i_h) * V * K;
 
     // =====================================================================
     // MFMA warp base offsets (2D tiling: warp_m tiles M, warp_n tiles N)
@@ -232,7 +261,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
             if (i < PF_ELEMS) {
                 int row = i / PF_NVEC;
                 int col = (i % PF_NVEC) * PF_VEC;
-                if (DENSE || row < kargs.T) {
+                if (DENSE || row < seq_len) {
                     pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
                         &w_hbm[static_cast<int64_t>(row) * stride_w + col]);
                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
@@ -245,7 +274,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     // =====================================================================
     // Chunk-serial main loop
     // =====================================================================
-    for (int i_t = 0; i_t < NT; i_t++) {
+    for (int i_t = 0; i_t < num_chunks; i_t++) {
         const int t0 = i_t * BT;
         const int64_t chunk_k_offset =
             static_cast<int64_t>(t0) * stride_k;
@@ -265,7 +294,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
             vn_ch = vn_hbm ? vn_hbm + chunk_v_offset : nullptr;
 
         // P4: uniform boundary flags → SALU branch, skip per-lane v_cmp
-        const int T_rem = DENSE ? BT : (kargs.T - t0);
+        const int T_rem = DENSE ? BT : (seq_len - t0);
         const bool full_chunk = DENSE || (T_rem >= BT);
         const bool v_full = DENSE || (v_off + BV <= V);
 
@@ -281,7 +310,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
         __syncthreads();
 
         int last_valid = DENSE ? (BT - 1)
-            : ((t0 + BT <= kargs.T) ? (BT - 1) : (kargs.T - t0 - 1));
+            : ((t0 + BT <= seq_len) ? (BT - 1) : (seq_len - t0 - 1));
         D_ACC g_last = s_g[last_valid];
         if constexpr (CACHE_GATES) {
             for (int i = tid; i < BT; i += BS)
@@ -726,7 +755,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                 // panel is consumed.  This overlaps VMEM with gate/mask, A
                 // conversion, GEMM5 and the output stores.
                 if constexpr (EARLY_NEXT_PREFETCH) {
-                    if (i_t + 1 < NT) {
+                    if (i_t + 1 < num_chunks) {
                         int next_t0 = (i_t + 1) * BT;
                         #pragma unroll
                         for (int li = 0; li < PF_LOADS; li++) {
@@ -736,7 +765,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                             if (i < PF_ELEMS) {
                                 int row = i / PF_NVEC;
                                 int col = (i % PF_NVEC) * PF_VEC;
-                                if (DENSE || next_t0 + row < kargs.T) {
+                                if (DENSE || next_t0 + row < seq_len) {
                                     pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
                                         &w_hbm[static_cast<int64_t>(next_t0 + row)
                                                * stride_w + col]);
@@ -865,7 +894,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
             // (pf_k deferred to between b' and d to reduce peak VGPR pressure)
             // (VMEM overlaps with GEMM5 + output store, ~556 cycles)
             if constexpr (!EARLY_NEXT_PREFETCH) {
-                if (i_t + 1 < NT) {
+                if (i_t + 1 < num_chunks) {
                     int next_t0 = (i_t + 1) * BT;
                     #pragma unroll
                     for (int li = 0; li < PF_LOADS; li++) {
@@ -875,7 +904,7 @@ __device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
                         if (i < PF_ELEMS) {
                             int row = i / PF_NVEC;
                             int col = (i % PF_NVEC) * PF_VEC;
-                            if (DENSE || next_t0 + row < kargs.T) {
+                            if (DENSE || next_t0 + row < seq_len) {
                                 pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
                                     &w_hbm[static_cast<int64_t>(next_t0 + row)
                                            * stride_w + col]);
