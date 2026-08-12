@@ -106,10 +106,11 @@ echo "== done"
 # Merge the 8 runs into one table: e2e us from runs 1-4, MoE1/MoE2 from 5-8.
 # FLOP/byte model matches op_tests/bench_gfx1250_combo.py (g1u1: stage1 n=2*inter,
 # a8w4 => 1 byte/act, 0.5 byte/weight, bf16 out).
-python3 - "$LOG" "$INTER_TP" "$EXPERTS_EP" <<'PYEOF'
+python3 - "$LOG" "$INTER_TP" "$EXPERTS_EP" "$EXPERTS_ACT" <<'PYEOF'
 import sys
 
 log, inter_tp, experts_ep = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+act = int(sys.argv[4])
 MD, TOPK, AQ, WQ, BO = 7168, 6, 1.0, 0.5, 2
 SHAPE = {"TP": (inter_tp, 384), "EP": (3072, experts_ep)}
 data, mode, init, kind, hdr = {}, None, None, None, None
@@ -138,20 +139,23 @@ for ln in open(log, errors="ignore"):
                     if d.get(k):
                         r[k] = float(d[k])
 
-cols = ("mode", "init", "tokens", "e2e us", "MoE1 us", "MoE1 TFLOPS", "MoE1 TB/s",
-        "MoE2 us", "MoE2 TFLOPS", "MoE2 TB/s", "MoE1+2 us")
+cols = ("mode", "init", "tokens", "E_act", "e2e us", "MoE1 us", "MoE1 TFLOPS",
+        "MoE1 TB/s", "MoE2 us", "MoE2 TFLOPS", "MoE2 TB/s", "MoE1+2 us")
 print("\n[DSv4-Pro MoE ubench summary]")
 print("| " + " | ".join(cols) + " |")
 print("|" + "|".join(["---:"] * len(cols)) + "|")
 for (mode, init, tok), r in sorted(data.items()):
     inter, E = SHAPE[mode]
+    # Only experts that actually receive routes stream their weights: the
+    # EXPERTS_ACT cap when set, else at most one expert per route.
+    E = act if act else min(E, tok * TOPK)
     n = inter * 2
     g1, g2 = r.get("gemm1_us"), r.get("gemm2_us")
     f1, f2 = tok * n * MD * TOPK * 2, TOPK * tok * MD * inter * 2
     b1 = tok * MD * AQ + tok * TOPK * n * BO + E * n * MD * WQ
     b2 = tok * TOPK * inter * AQ + tok * MD * BO + E * MD * inter * WQ
     f = lambda v, s="{:.2f}": s.format(v) if v else "-"
-    print(f"| {mode} | {init} | {tok} | {f(r.get('e2e'))} "
+    print(f"| {mode} | {init} | {tok} | {E} | {f(r.get('e2e'))} "
           f"| {f(g1)} | {f(f1 / g1 / 1e6, '{:.1f}') if g1 else '-'} "
           f"| {f(b1 / g1 / 1e6, '{:.3f}') if g1 else '-'} "
           f"| {f(g2)} | {f(f2 / g2 / 1e6, '{:.1f}') if g2 else '-'} "
