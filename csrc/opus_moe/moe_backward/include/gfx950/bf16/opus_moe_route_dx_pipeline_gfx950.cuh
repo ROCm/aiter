@@ -85,6 +85,36 @@ inline __device__ auto route_dx_load_rb_tr(
     return result;
 }
 
+template<typename T, typename Mma, typename Layout>
+inline __device__ auto route_dx_load_ra(
+    opus::smem<typename T::D_A>& s_a,
+    const Layout& u_ra)
+{
+    if constexpr(T::SMEM_A_SLAB_PAD == 0)
+    {
+        return s_a.template load<T::VEC_A>(u_ra);
+    }
+    else
+    {
+        constexpr int slab_rows = 16;
+        constexpr int slab_elements = slab_rows * T::B_K;
+        using LT = opus::layout_load_traits<Layout, T::VEC_A>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = opus::layout_to_offsets<T::VEC_A>(u_ra);
+        typename Mma::vtype_a result;
+        opus::static_for<r_elem.value>([&](auto issue) {
+            const int logical = offsets[issue.value];
+            const int physical =
+                logical + (logical / slab_elements) * T::SMEM_A_SLAB_PAD;
+            auto values = s_a.template load<T::VEC_A>(physical);
+#pragma unroll
+            for(int j = 0; j < T::VEC_A; ++j)
+                result[issue.value * T::VEC_A + j] = values[j];
+        });
+        return result;
+    }
+}
+
 #endif
 
 template<typename Traits,
@@ -125,7 +155,13 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
         fixed_shape ? FixedD : kargs.stride_w1_i;
     const int64_t stride_dx_route_r =
         fixed_shape ? FixedD : kargs.stride_dx_route_r;
-    constexpr int smem_a_bytes = CTA_M * BK * sizeof(D_A);
+    constexpr int smem_a_slab_rows = 16;
+    constexpr int smem_a_slab_elements = smem_a_slab_rows * BK;
+    constexpr int smem_a_slab_stride =
+        smem_a_slab_elements + T::SMEM_A_SLAB_PAD;
+    static_assert(CTA_M % smem_a_slab_rows == 0);
+    constexpr int smem_a_bytes =
+        (CTA_M / smem_a_slab_rows) * smem_a_slab_stride * sizeof(D_A);
     constexpr int smem_b_bytes = T::SMEM_B_BYTES;
     constexpr int stage_bytes = smem_a_bytes + smem_b_bytes;
 
@@ -245,7 +281,10 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                 // including the lane term here only makes LLVM reconstruct
                 // the same uniform m0 with v_readfirstlane for every issue.
                 OPUS_LDS_ADDR D_A* a_wave_dst =
-                    a_lds + wave_id * opus::get_warp_size() * T::VEC_A;
+                    a_lds +
+                    (T::SMEM_A_SLAB_PAD > 0
+                         ? wave_id * smem_a_slab_stride
+                         : wave_id * opus::get_warp_size() * T::VEC_A);
                 g_a.template _async_load<T::VEC_A>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
                     (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
@@ -258,7 +297,10 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                 const int local_k =
                     (tid % (BK / T::VEC_A)) * T::VEC_A;
                 OPUS_LDS_ADDR D_A* a_wave_dst =
-                    a_lds + wave_id * opus::get_warp_size() * T::VEC_A;
+                    a_lds +
+                    (T::SMEM_A_SLAB_PAD > 0
+                         ? wave_id * smem_a_slab_stride
+                         : wave_id * opus::get_warp_size() * T::VEC_A);
                 g_a.template _async_load<T::VEC_A>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
                     (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
@@ -285,9 +327,15 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                         static_cast<int64_t>(sorted_row) * stride_dz_r);
                     OPUS_LDS_ADDR D_A* a_wave_dst =
                         a_lds +
-                        (load.value * T::BLOCK_SIZE +
-                         wave_id * opus::get_warp_size()) *
-                            T::VEC_A;
+                        (T::SMEM_A_SLAB_PAD > 0
+                             ? (load.value *
+                                    (T::BLOCK_SIZE /
+                                     (smem_a_slab_elements / T::VEC_A)) +
+                                wave_id) *
+                                   smem_a_slab_stride
+                             : (load.value * T::BLOCK_SIZE +
+                                wave_id * opus::get_warp_size()) *
+                                   T::VEC_A);
                     g_a.template _async_load<T::VEC_A>(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
                         (source_base + tile_k * BK + local_k) * sizeof(D_A),
@@ -379,8 +427,10 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
         opus::static_for<RouteTiles>([&](auto route_group) {
             auto s_a_current = make_smem(reinterpret_cast<D_A*>(
                 tile_storage + buffer * stage_bytes +
-                route_group.value * BM * BK * sizeof(D_A)));
-            auto v_a = s_a_current.template load<T::VEC_A>(u_ra);
+                route_group.value * (BM / smem_a_slab_rows) *
+                    smem_a_slab_stride * sizeof(D_A)));
+            auto v_a = route_dx_load_ra<T, decltype(mma)>(
+                s_a_current, u_ra);
             v_c[route_group.value] =
                 mma(v_a, v_b, v_c[route_group.value]);
         });

@@ -126,6 +126,7 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     static constexpr int ROUTE_COHORT_TILES = 0;
     static constexpr int ROUTE_M_TILES = 2;
     static constexpr int ROUTE_M = 32;
+    static constexpr int SMEM_A_SLAB_PAD = 0;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -186,6 +187,16 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
 {
     static constexpr int ROUTE_COHORT_TILES = 10;
     static constexpr int ROUTE_M_TILES = 5;
+};
+
+// Match the forward GEMM-style LDS policy: add 32 bytes after each 16-row dZ
+// slab.  Direct global-to-LDS loads remain lane-linear inside a slab while
+// successive slabs rotate by eight banks.  The full double buffer still fits
+// four workgroups per CU.
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPad
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
+{
+    static constexpr int SMEM_A_SLAB_PAD = 16;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128
