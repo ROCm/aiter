@@ -841,6 +841,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         topk_ids = ctx.saved_tensors[10]
         dscore_partials = None
         fused_dlogits = None
+        ctx.fused_sparse_router_dx = False
 
         def dgrad_prepared(dy_op, w, lens):
             wt = w2t if w is w2_ref else w1t
@@ -917,7 +918,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             nonlocal fused_dlogits
-            if ctx.use_sparse_router_dx:
+            if ctx.use_sparse_router_dx and dscore_partials is not None:
                 dx, fused_dlogits = (
                     opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
                         src,
@@ -929,6 +930,7 @@ class OpusMoERefFunc(torch.autograd.Function):
                         ctx.full_router_w,
                     )
                 )
+                ctx.fused_sparse_router_dx = True
                 return dx
             if dscore_partials is not None:
                 dx, fused_dlogits = (
@@ -999,6 +1001,9 @@ class OpusMoEFullFunc(torch.autograd.Function):
         dx, dw1, dw2, dlogits, _dtopk, _dact = OpusMoERefFunc.backward(
             ctx, dout
         )
+        if not ctx.fused_sparse_router_dx:
+            dx_router = torch.mm(dlogits, ctx.full_router_w)
+            dx = (dx.float() + dx_router.float()).to(dx.dtype)
         drouter_w = torch.mm(dlogits.t(), ctx.full_x)
         return dx, dw1, dw2, drouter_w, None, None
 
