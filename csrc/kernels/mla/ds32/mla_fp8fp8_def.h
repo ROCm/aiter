@@ -26,7 +26,6 @@ struct mla_kargs
     const int* __restrict__ work_indptr;
     const int* __restrict__ work_info_set;
 
-    int B;
     int H;
     int total_tokens;
     int stride_q_b;
@@ -132,20 +131,6 @@ struct mla_16mx8_32nx1_fp8fp8_ps_traits
                                                 sizeof(D_K);
 
     // ----- V transpose-read bank swizzle -----
-    // gfx950 LDS runs at 256 B/clk and resolves ds_read_b64_tr_b8 in 8 B slots,
-    // slot = (addr >> 3) & 31. One V read spans 8 tokens of a line x 2 d-halves;
-    // the lanes carrying token-in-line t and t+4 are smem_n_rpt * D_128B_NOPE_SIZE
-    // = 512 B apart, which is 0 mod 256, so they always share a slot. That 2-way
-    // conflict costs a measured 3.0 vs 2.2 clk/inst and CANNOT be removed by
-    // reordering d: after the hardware transpose a lane's d is fixed by its output
-    // lane index, and the two colliding lanes share that index -- they differ only
-    // in the register (token) index, so any d offset moves both equally.
-    // The fix is a swizzle instead: tokens 4..7 of a line store their 16 B d-groups
-    // XORed by one, which shifts them 2 slots and fills the gaps. All three parties
-    // apply it (make_layout_gk_nope on the gmem source, make_layout_rk_nope and
-    // make_layout_rv on the read address), so the data each lane receives -- and
-    // therefore make_layout_o -- is unchanged. K's ds_read_b128 stays conflict-free
-    // because the XOR unit matches its VEC_KV_NOPE granularity.
     static constexpr int SWZ_D_BYTES = VEC_KV_NOPE;      // 16, one d-group
     static constexpr int SWZ_TOK_BIT = smem_n_per_wave / 2; // token-in-line bit 2
 
@@ -161,7 +146,7 @@ struct mla_16mx8_32nx1_fp8fp8_ps_traits
     // stride, and the store (make_layout_sk_rope) writes lines 0..7 via warp_id,
     // so the region must hold NUM_WARPS lines, not smem_n_rpt.
     static constexpr size_t smem_k_rope_bytes =
-        NUM_WARPS * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_rope) * sizeof(D_K);
+        NUM_WARPS * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_rope) * sizeof(D_K); //2176
 
     // V is NOT dequantized and NOT re-stored: it is transpose-read (fp8) straight
     // out of the K-nope LDS, so the per-slot KV footprint is just K (nope+rope).

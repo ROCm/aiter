@@ -79,7 +79,6 @@ void mla_decode_fwd_opus_stage1(torch::Tensor& q,
     TORCH_CHECK(kv_scale.scalar_type() == at::kFloat && kv_scale.numel() >= 1,
                 "mla_decode_fwd_opus_stage1: kv_scale must be a float scalar tensor");
 
-    const int B            = q.size(0);
     const int H            = q.size(1);
     const int total_tokens = kv.size(0);
     const int num_workers  = work_indptr.size(0) - 1;
@@ -98,7 +97,6 @@ void mla_decode_fwd_opus_stage1(torch::Tensor& q,
     kargs.kv_indices    = kv_indices.data_ptr<int>();
     kargs.work_indptr   = work_indptr.data_ptr<int>();
     kargs.work_info_set = work_info_set.data_ptr<int>();
-    kargs.B             = B;
     kargs.H             = H;
     kargs.total_tokens  = total_tokens;
 

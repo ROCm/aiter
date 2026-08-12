@@ -1,31 +1,45 @@
 #pragma once
 
-// ============================================================================
-// MLA decode forward, 16mx8 / 32nx1, fp8 Q x fp8 KV, persistent-scheduling (PS).
+// MLA decode forward on gfx950: fp8 Q x fp8 KV, 16mx8 / 32nx1, persistent scheduling.
+//   GEMM0 (Q*K^T): d = 576 = 512 nope + 64 rope      GEMM1 (P*V): d_v = 512
 //
-// Adapted from dsa_v32_splitkv.hpp. The two structural differences are:
+// Adapted from dsa_v32_splitkv.hpp; three departures from it drive most of the rest:
+//   (A) COMBINED d=576 fp8 BUFFER. q_buffer / kv_buffer are one contiguous fp8 tensor,
+//       row-major with row stride D_HEAD_SIZE = 576. There is no separate rope tensor:
+//       "nope" is d in [0, 512), "rope" is d in [512, 576) reached by a +D_NOPE_SIZE base
+//       offset on the same pointer. rope is fp8 here (bf16 in dsa_v32).
+//   (B) PER-TENSOR SCALAR DESCALE, no mxfp8 micro-scaling. q_scale_ptr / kv_scale_ptr are
+//       single floats whose product scales the scores, so the 16x16x128 f8f6f4 MFMA takes
+//       block scale `0` -- the literal, not 0_I (a number<0> makes the operand poison and
+//       DCEs the body down to .vgpr_count 4) and not the E8M0 identity 127 (arithmetically
+//       right, but only 0 selects the bare 8-byte form without v_mfma_ld_scale_b32).
+//   (C) NO V DEQUANT, NO V LDS. V is the fp8 nope of K, transpose-read out of the K-nope
+//       LDS by ds_read_b64_tr_b8 straight into the PV MFMA operand; descale_k is applied
+//       once, on the output.
 //
-//   (A) COMBINED d=576 fp8 BUFFER.
-//       q_buffer / kv_buffer are a single contiguous fp8 tensor of head dim
-//       D_HEAD_SIZE = 576 (row-major, d contiguous). There is no separate nope
-//       / rope tensor: the "nope" sub-range is d in [0, 512) and the "rope"
-//       sub-range is d in [512, 576). Both are read from the same base pointer
-//       with row stride D_HEAD_SIZE; the rope reads just add a +D_NOPE_SIZE
-//       byte/element base offset. rope is fp8 (dsa_v32 had it as bf16).
+// Software pipeline: 4 LDS slots, one phase per KV tile, 4 stages, exactly ONE s_barrier
+// per phase (stage0). Phases are unrolled in pairs so the two score buffers alternate as
+// compile-time v_s[0]/v_s[1], never a runtime index. Softmax is split head/tail so its
+// VALU rides in a neighbouring MFMA's shadow. Per phase, tile t:
+//   stage0 [mem]     s_waitcnt_vmcnt + barrier (publishes tile t+1); ds_read K(t); fetch
+//                    the page index for t+3, giving that gmem load a full phase of slack
+//   stage1 [compute] gemm0 QK(t) [12 MFMA]  || softmax-tail(t-1) [4 EXP + ~18 VALU]
+//   stage2 [mem]     tr_load V(t-1); mask S(t) before stage3 folds it into the softmax
+//   stage3 [compute] gemm1 PV(t-1) [32 MFMA] || softmax-head(t) + the tile t+2 prefetch,
+//                    chopped into per-d-slice chunks that ride the MFMA shadows
+// slot_of(t) = (t - tile_begin) & 3; four slots is the minimum for the distance-2
+// prefetch, since t-1 (PV still pending, and V reads out of that K slot), t (QK now),
+// t+1 (landed) and t+2 (in flight) are all resident at once. The prologue primes slots
+// 0..2 and runs a partial phase for tile_begin; the epilogue drains the last tail + PV.
 //
-//   (B) PER-TENSOR SCALAR DESCALE (no mxfp8 micro-scaling).
-//       q_scale_ptr / kv_scale_ptr each point to a single float (cf. the SP3
-//       kernel's s_descale_q / s_descale_k). The QK^T scores are scaled by
-//       descale_q * descale_k, and V (= the nope part of K, transposed) is
-//       dequantized fp8 -> bf16 with descale_k. The fp8 nope MFMA uses the
-//       gfx950 16x16x128 f8f6f4 instruction with its E8M0 block scale pinned to
-//       127 (= 2^0, no micro-scaling); the descale is applied on the scores.
-//
-// This header focuses on the Q/KV -> register read path (the make_layout_*
-// methods below); the compute loop is the straightforward non-pipelined variant
-// so the read path is easy to follow. A software-pipelined variant can be
-// layered on top exactly like dsa_v32_decode_pipelined.
-// ============================================================================
+// Where the time goes (ATT, b=256 c=8192): the MAI pipe is the binding resource at ~69%
+// occupancy and its idle time is diffuse -- ~30 gaps of ~25 cycles per phase, not one
+// hole -- so there is no single big win left here. Two corollaries worth not relearning.
+// PV spends 512 of the 832 MAI cycles per wave per phase on the HALF-RATE
+// v_mfma_f32_16x16x32_fp8_fp8; the full-rate f8f6f4 unit needs K = 128 tokens, i.e.
+// 4-tile softmax blocking at ~+30 VGPR, which does not fit at occupancy 2. And the
+// barrier is not a cost: of its 487-cycle arrival spread, 394 is between the two waves of
+// one SIMD (one computes while the other waits) and only ~46 cycles per SIMD are dead.
 
 #include "mla_fp8fp8_def.h"
 #include <bit>
@@ -36,51 +50,39 @@ using opus::operator""_I;
 
 namespace mla_decode_fwd_16mx8_32nx1_fp8fp8 {
 
-// [sched exp] instruction-group masks for __builtin_amdgcn_sched_group_barrier
+// --- IGLP co-execution scheduling (sched_group_barrier) ---
 namespace sched_masks {
 constexpr int MFMA    = 0x08;
 constexpr int VALU    = 0x02;
 constexpr int DS_READ = 0x100;
 constexpr int EXP     = 0x400;
-
-// sched_barrier mask that blocks only DS reads (0x80 all-DS + 0x100 DS-read) and lets
-// everything else cross. It keeps the load/store optimiser from re-associating two
-// ds_read_b64 into one ds_read2_b64, which measures ~16 LDS index cycles against 2 x 2
-// for the separate reads -- and does so even at a perfectly linear address, so the cost
-// is the paired instruction form, not the bank layout. The mask has to stay permissive
-// because this sits inside the GEMM0 region that sched_compute_qk() interleaves.
 constexpr int KEEP_DS_READ_ORDER = 0x67F;
 } // namespace sched_masks
 
-// Interleave the GEMM0 region (dsa_v32's sched_compute_qk_dsa applied to this kernel's
-// 12 QK MFMAs) so the long-latency fp8 128-K MFMAs hide the K / rope DS_READs and the
-// softmax-tail EXP/VALU. Expressed as a scheduler *preference* rather than the hand-placed
-// chunks stage3 uses for PV: GEMM0 reads K through load<>, i.e. real ds_read that the
-// compiler tracks and will re-waitcnt after reordering, whereas hard fences here lengthen
-// live ranges enough to spill at 256 VGPR. EXP precedes VALU in each group because the
-// row sum consumes the exps. Pairing each DS_READ with its MFMA matters: dropping the
-// DS_READ group lets the solver hoist the loads and costs both a spill and ~1.5% perf.
-// Rpt should cover the region's MFMA count; groups that cannot be filled are dropped.
+// Interleave the 12 GEMM0 MFMA (dsa_v32's sched_compute_qk_dsa, retuned) so the
+// long-latency fp8 128-K MFMAs hide the K/rope DS_READs and the softmax-tail EXP/VALU.
+// EXP precedes VALU in each group because the row sum consumes the exps; Rpt should cover
+// the region's MFMA count, and groups that cannot be filled are dropped.
 //
-// The budget is deliberately flat even though the region's two halves have different
-// shadows (nope is 16x16x128 / 8 passes, rope 16x16x32 / 4 passes on a serial
-// accumulator chain). Skewing it toward the rope tail was measured: it does move the
-// fillers there, but the region only has ~36 of them for 12 MFMA, so the nope half
-// starves by exactly as much and nothing changes outside noise.
+// A scheduler *preference*, not the hand-placed fences stage3 uses for PV. GEMM0 reads K
+// through load<>, i.e. real ds_read that SIInsertWaitcnts re-waits after any reorder, so
+// declining is safe -- and the scheduler must be free to decline, because a spill here
+// does not merely cost time, it corrupts results: scratch VMEM traffic breaks the
+// hand-written s_waitcnt_vmcnt(kv_buffer_load_insts) budget guarding the KV LDS DMA.
+// Hard fences in this region do spill at 256 VGPR.
 //
-// The DS_READ budget is front-loaded: the region owns 12 reads (8 nope + 4 rope) for 12
-// MFMA, and one-per-MFMA left the four rope ds_read_b64 in the last four slots, one MFMA
-// ahead of the mfma consuming them, paying ~150 stalled cycles per tile on lgkmcnt. Asking
-// for two reads per MFMA over the first half aims them at the nope MFMA shadow instead.
-// Honest accounting: the trace still shows the rope waits, because the first-half budget
-// gets filled by the eight nope ds_read_b128 that come first in program order. What this
-// did buy, together with dropping the two hand-written rope waits below, is 2 VGPR and a
-// point or so on the largest shapes. It stays a preference rather than a hand-placed
-// fence: moving a real ds_read is correctness-safe because SIInsertWaitcnts re-derives the
-// wait, and if the allocator cannot afford the longer live range the scheduler declines --
-// which matters, because a spill here is not just slow, it corrupts results (scratch
-// traffic breaks the hand-written s_waitcnt_vmcnt(kv_buffer_load_insts) budget that guards
-// the KV LDS DMA).
+// Two tuning results, both measured. Pairing a DS_READ with each MFMA is load-bearing:
+// drop the group and the solver hoists the loads, costing a spill and ~1.5%. Skewing the
+// budget toward the rope tail is not, even though the halves have different shadows (nope
+// 16x16x128 / 8 passes vs rope 16x16x32 / 4 on a serial accumulator chain) -- the region
+// has only ~36 fillers for 12 MFMA, so the nope half starves by whatever rope gains.
+//
+// DS_READ is front-loaded (2 per MFMA over the first half) to aim the four rope
+// ds_read_b64 at a nope MFMA shadow; one-per-MFMA left them in the last four slots, one
+// MFMA ahead of their consumer, at ~150 stalled lgkmcnt cycles per tile. Honest
+// accounting: the trace still shows those waits, because the eight nope ds_read_b128 come
+// first in program order and eat the first-half budget. What it did buy, together with
+// dropping the two hand-written rope waits, is 2 VGPR and ~1% on the largest shapes.
 template <int Rpt, int G>
 __device__ inline void sched_compute_qk()
 {
@@ -96,13 +98,11 @@ __device__ inline void sched_compute_qk()
     });
 }
 
-// ------------------------------------------------------------------ read path
+// --- Q gmem->register read (Q stays in registers for the whole request) ---
 
-// Q nope B-operand read: d in [0, D_NOPE_SIZE) of the combined buffer.
-// Row group seed = D_HEAD_SIZE (=576, the combined row stride) so that
-// consecutive q-rows are 576 fp8 apart; d group seed = 1 (d contiguous).
-// Per-thread register footprint: GEMM0_E_M * GEMM0_NOPE_E_K wave-tiles of
-// (W_M*W_K_NOPE/WARP_SIZE = 32) fp8 each -> the 4 nope MFMA B slices.
+// Q nope B-operand: d in [0, D_NOPE_SIZE) of the combined buffer. Row seed = D_HEAD_SIZE
+// (=576, the combined row stride), d seed = 1. Per lane this is GEMM0_E_M * GEMM0_NOPE_E_K
+// wave-tiles of W_M*W_K_NOPE/WARP_SIZE = 32 fp8, i.e. the 4 nope MFMA B slices.
 template <class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id)
 {
@@ -127,14 +127,12 @@ __device__ inline auto make_layout_q_nope(int warp_id, int lane_id)
                              opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// Q rope B-operand read: d in [D_NOPE_SIZE, D_HEAD_SIZE) of the combined buffer.
-// The caller offsets the gmem base pointer by +D_NOPE_SIZE, so the layout itself
-// covers a 64-wide d range. Structure mirrors dsa_v32's make_layout_q_rope: the
-// GEMM0_ROPE_E_K = 2 e_k slices are an explicit y-dim (strided W_K_ROPE = 32 in
-// d), each e_k slice distributes W_K_ROPE across WARP_SIZE/W_M = 4 lane-groups of
-// VEC_Q_ROPE = 8 contiguous fp8 -> W_M * W_K_ROPE / WARP_SIZE = 8 fp8 per lane per
-// e_k slice. The only difference vs. dsa_v32 is the row seed D_HEAD_SIZE (=576,
-// the combined row stride) instead of the split rope tensor's D_Q_SIZE.
+// Q rope B-operand: d in [D_NOPE_SIZE, D_HEAD_SIZE). The caller offsets the gmem base by
+// +D_NOPE_SIZE, so the layout covers a 64-wide d range. The GEMM0_ROPE_E_K = 2 e_k slices
+// are an explicit y-dim (stride W_K_ROPE = 32 in d); each spreads W_K_ROPE over
+// WARP_SIZE/W_M = 4 lane-groups of VEC_Q_ROPE = 8 contiguous fp8 -> 8 fp8 per lane per
+// slice. Only difference from dsa_v32's version is the row seed: D_HEAD_SIZE (the
+// combined row stride) instead of the split rope tensor's D_Q_SIZE.
 template <class T>
 __device__ inline auto make_layout_q_rope(int warp_id, int lane_id)
 {
@@ -157,8 +155,10 @@ __device__ inline auto make_layout_q_rope(int warp_id, int lane_id)
                              opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// Per-thread KV page index fetch: distributes the KV_TILE_SIZE tokens of a tile
-// across threads so each thread computes its own page/token base offset.
+// --- KV paged-index fetch ---
+// Distributes a tile's KV_TILE_SIZE tokens across threads so each computes its own
+// page/token base offset. The nope and rope variants differ only in how many lanes cover
+// one token's d (VEC_KV_NOPE vs VEC_KV_ROPE_LD), hence two layouts.
 template <class T>
 __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
 {
@@ -199,16 +199,19 @@ __device__ inline auto make_layout_kv_indices_rope(int warp_id, int lane_id)
             opus::tuple{warp_id / T::smem_n_rpt, lane_id / threads_d, warp_id % T::smem_n_rpt}));
 }
 
-// Global -> LDS map for the K nope sub-range (d in [0, 512), fp8). The token
-// dimension is folded into the per-thread page offset (see make_layout_kv_indices),
-// so this layout only describes the d / warp distribution. Row-major d, seed
-// {D_128B_NOPE_SIZE, 1}. Same scheme as dsa_v32 plus the V-read bank swizzle.
+// --- K global->LDS (async buffer_load_lds) ---
+
+// K nope sub-range, d in [0, 512), fp8. The token dimension is folded into the per-thread
+// page offset (make_layout_kv_indices), so this layout only describes the d / warp
+// distribution: row-major d, seed {D_128B_NOPE_SIZE, 1}. dsa_v32's scheme plus the V-read
+// bank swizzle.
 //
-// buffer_load_lds has no per-lane LDS address: the hardware writes lane l to
-// dst + l * VEC_KV_NOPE, so lane l owns d-group l % threads_d of token-in-line
-// l / threads_d. The swizzle (see T::SWZ_D_BYTES) therefore has to permute the
-// *source*: lanes on tokens 4..7 fetch the d-group the readers will ask that slot
-// for, and the fixed LDS destination then holds the permuted data.
+// The swizzle has to be applied on the SOURCE side, which is why it appears here and not
+// in the smem layout: buffer_load_lds takes no per-lane LDS address, the hardware simply
+// writes lane l to dst + l * VEC_KV_NOPE. So lane l owns d-group l % threads_d of
+// token-in-line l / threads_d, and the only free choice left is which d-group each lane
+// fetches. Lanes on tokens 4..7 therefore fetch the d-group that the V readers will later
+// ask that fixed slot for (T::SWZ_D_BYTES).
 template <typename T>
 __device__ inline auto make_layout_gk_nope(int warp_id, int lane_id)
 {
@@ -253,13 +256,11 @@ __device__ inline auto make_layout_sk_nope(int warp_id)
         opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id}));
 }
 
-// LDS -> register map for the K nope A-operand (fed to the 16x16x128 fp8 MFMA).
-//
-// EN is the GEMM0_E_N token tile, which used to be a y-dim of a single layout. It
-// is a template parameter now because it selects token-in-line 0..3 vs 4..7, and
-// only the latter carry swizzled d-groups (T::SWZ_D_BYTES): this tile's lane ->
-// d-group map is XORed to match, which no single product layout can express. The
-// caller adds the tile's own EN * smem_n_rpt * D_128B_NOPE_SIZE byte base.
+// K nope LDS->register, A-operand of the 16x16x128 f8f6f4 MFMA. EN is the GEMM0_E_N token
+// tile; it is a template parameter rather than a y-dim because it selects token-in-line
+// 0..3 vs 4..7 and only the latter carry swizzled d-groups, so this tile's lane->d-group
+// map is XORed to match -- which no single product layout can express. The caller adds the
+// tile's own EN * smem_n_rpt * D_128B_NOPE_SIZE base.
 template <typename T, int EN>
 __device__ inline auto make_layout_rk_nope(int lane_id)
 {
@@ -288,15 +289,15 @@ __device__ inline auto make_layout_rk_nope(int lane_id)
                                          (lane_id / T::W_N) ^ EN}));
 }
 
-// Global -> LDS map for the K rope sub-range (d in [512, 576), fp8). The caller
-// offsets the gmem base pointer by +D_NOPE_SIZE. rope d=64 fits a single line.
+// K rope sub-range, d in [512, 576), fp8; the caller offsets the gmem base by
+// +D_NOPE_SIZE. rope d=64 fits a single line.
 template <typename T>
 __device__ inline auto make_layout_gk_rope(int lane_id)
 {
-    // b32 load: 16 lanes cover one token's 64 rope-d (threads_d * VEC_LD = 64).
-    // gfx950 buffer_load...lds has no 8-byte (dwordx2) form, so rope must load
-    // via a supported b32 (4-byte) transfer; an 8B load emits no instruction and
-    // leaves s_k_rope uninitialised -> NaN.
+    // b32 transfer: 16 lanes cover one token's 64 rope-d (threads_d * VEC_LD = 64).
+    // gfx950 buffer_load...lds has NO 8-byte (dwordx2) form, so rope must go through a
+    // supported b32 width -- an 8 B load silently emits no instruction at all and leaves
+    // s_k_rope uninitialised, which shows up as NaN.
     constexpr int threads_d = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE_LD; // 16
 
     constexpr auto gk_block_shape = opus::make_tuple(opus::number<T::smem_d_rpt_rope>{},
@@ -331,14 +332,12 @@ __device__ inline auto make_layout_sk_rope(int warp_id)
         opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id}));
 }
 
-// LDS -> register map for the K rope A-operand (fed to the plain fp8 16x16x32 MFMA).
-//
-// One e_n token tile per layout, i.e. exactly one ds_read_b64 per load<>; the caller
-// adds the tile's own e_n base (rope_en_off below). GEMM0_E_N used to be a y-dim here,
-// so a single load<> emitted two DS reads and the load/store optimiser paired them --
-// with the two ek steps that gave two ds_read2_b64 per tile, 32 LDS index cycles where
-// four separate ds_read_b64 cost 8. Splitting the tile out is what lets the caller fence
-// the reads apart (sched_masks::KEEP_DS_READ_ORDER).
+// K rope LDS->register, A-operand of the plain fp8 16x16x32 MFMA. One e_n token tile per
+// layout, i.e. exactly one ds_read_b64 per load<>, with the caller adding the tile's own
+// e_n base (rope_en_off). GEMM0_E_N used to be a y-dim here, so one load<> emitted two DS
+// reads and the load/store optimiser paired them: two ds_read2_b64 per tile at 32 LDS
+// index cycles where four separate ds_read_b64 cost 8. Splitting the tile out is what
+// lets the caller fence the reads apart (sched_masks::KEEP_DS_READ_ORDER).
 template <typename T>
 __device__ inline auto make_layout_rk_rope(int lane_id)
 {
@@ -367,53 +366,45 @@ __device__ inline auto make_layout_rk_rope(int lane_id)
             opus::tuple{lane_id_n % T::smem_n_rpt, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
 }
 
-// ---- V read path: NO dequant, NO separate V LDS. V (= the fp8 nope of K) is
-//      transpose-read straight out of the K-nope LDS with ds_read_b64_tr_b8 and
-//      fed to the fp8 PV MFMA; the descale_k is applied once, on the output.
+// --- V LDS->register transpose read (ds_read_b64_tr_b8), fp8 PV MFMA 16x16x32 ---
 //
 // K-nope LDS block layout (fp8), per token tile:
 //   [d_rpt = 4][n_rpt = 4][smem_n_per_wave = 8 token x D_128B_NOPE = 128 dim + pad]
 //     d_rpt stride = smem_n_rpt * (smem_linear_wave_nope + pad)   (steps 128 dims)
 //     n_rpt stride = smem_linear_wave_nope + pad
-//     token-in-block stride = D_128B_NOPE_SIZE
-//     dim stride = 1
+//     token-in-block stride = D_128B_NOPE_SIZE       dim stride = 1
+// One PV d-slice covers SLICE_D dims (inside one d_rpt block) x KV_TILE tokens. The
+// layout below is a single d-slice; sv_slice() in the compute body steps the d_rpt block
+// plus the 32-dim sub-range. Each ds_read_b64_tr_b8 takes VEC_TR_V (=8) contiguous dims
+// for one (token, dim-group) and the hardware transposes them into a [dim, token] operand.
 //
-// One PV d-slice covers SLICE_D dims (inside a single d_rpt block) x KV_TILE
-// tokens (= smem_n_rpt n_rpt-blocks x smem_n_per_wave tokens). make_layout_rv
-// below describes a single d-slice; sv_slice() (in the compute body) steps the
-// d_rpt block + the 32-dim sub-range. Each ds_read_b64_tr_b8 reads VEC_TR_V (=8)
-// contiguous dims for one (token, dim-group) and the hardware transposes them
-// into the [dim, token] MFMA operand.
-// V transpose read for the fp8 PV MFMA (16x16x32) via ds_read_b64_tr_b8.
-//
-// V is the hardware A-operand of mma1 (mma1 is swap_ab, so logical B = v_v maps to
-// HW A). P (= cast(v_s)) is the HW B-operand, inherited from the QK C-output whose
-// token order is fixed by rk_nope + the accumulator layout. For the PV contraction
-// to pair V[token] with the SAME P[token], V must land, for MFMA element
-// (lane l, reg e) with klocal = e%8:
-//     n_rpt line       = klocal % smem_n_rpt              (= P's line, k%4)
-//     token-in-line    = (klocal / smem_n_rpt)*smem_n_rpt + l/16
-//     d                = l%16 + (e/8)*W_N
-// The ds_read_b64_tr_b8 transpose permutation (reverse-engineered with the LDS-ramp
-// bring-up opus_vtr_bringup.cu) then requires the stride assignment below. NOTE the
-// naive "grp->line, lane_hi->token" layout instead gives line=k/8,tok=k%8, which
-// paired V with the wrong P token; LSE (a token reduction) still passed, hiding it.
+// CORRECTNESS: V is the hardware A-operand of mma1 (mma1 is swap_ab, so logical B = v_v
+// maps to HW A), while P (= cast(v_s)) is HW B and inherits its token order from the QK
+// C-output, i.e. from rk_nope plus the accumulator layout. For the contraction to pair
+// V[token] with the SAME P[token], element (lane l, reg e) with klocal = e%8 must land at
+//     n_rpt line    = klocal % smem_n_rpt                       (= P's line, k%4)
+//     token-in-line = (klocal / smem_n_rpt)*smem_n_rpt + l/16
+//     d             = l%16 + (e/8)*W_N
+// which, under the ds_read_b64_tr_b8 permutation (reverse-engineered with the LDS-ramp
+// bring-up opus_vtr_bringup.cu), forces the stride assignment below. The natural-looking
+// "grp->line, lane_hi->token" alternative gives line = k/8, token = k%8 and pairs V with the
+// wrong P token; LSE is a token reduction and still passes, so it hides the bug.
 template <class T, int EN>
 __device__ inline auto make_layout_rv(int lane_id)
 {
     constexpr int lane_per_grp = 16;                     // ds_read_b64_tr_b8 group
     constexpr int lane_lo      = T::W_N / T::VEC_TR_V;   // W_N halves per 8x8 (2)
     constexpr int lane_hi      = lane_per_grp / lane_lo; // 8
-    constexpr int hi_lo        = T::smem_n_rpt;          // lane_hi % n_rpt -> line (2)
+    constexpr int hi_lo        = T::smem_n_rpt;          // lane_hi % n_rpt -> line (4)
     constexpr int hi_hi        = lane_hi / hi_lo;        // lane_hi / n_rpt -> token (2)
     constexpr int line         = T::smem_linear_wave_nope + T::smem_padding_32B_nope;
 
-    // Bank swizzle (T::SWZ_D_BYTES): tokens 4..7 of a line hold their 16 B d-groups
-    // XORed by one. G2 below *is* that token bit, and bit 4 of this instruction's
-    // byte address comes from EN alone -- the slice bases are multiples of SLICE_D,
-    // the line/token/slot strides are all 0 mod 32, and lane_lo/vec stay under 16 --
-    // so the XOR collapses to a compile-time +/- SWZ_D_BYTES on the token-high
-    // stride. This needs the LDS block to be 32 B aligned (see smem_kv).
+    // Bank swizzle (T::SWZ_D_BYTES): tokens 4..7 of a line hold their 16 B d-groups XORed
+    // by one. G2 below *is* that token bit, and bit 4 of this instruction's byte address
+    // comes from EN alone -- slice bases are multiples of SLICE_D, the line/token/slot
+    // strides are all 0 mod 32, and lane_lo/vec stay under 16 -- so the XOR collapses to a
+    // compile-time +/- SWZ_D_BYTES on the token-high stride. Requires the LDS block to be
+    // 32 B aligned (see the __align__ on smem_kv).
     constexpr int swz = ((EN * T::W_N) & T::SWZ_D_BYTES) ? -T::SWZ_D_BYTES : T::SWZ_D_BYTES;
 
     // Groups / stride seeds (EN's own W_N d-tile base is added by the caller):
@@ -452,6 +443,9 @@ __device__ inline auto make_layout_rv(int lane_id)
                              opus::tuple{grp_id, lh % hi_lo, lh / hi_lo, lane_in_grp % lane_lo}));
 }
 
+// O register->gmem store. stride_o_h is a parameter because the same layout serves both
+// destinations: the real output uses kargs.stride_o_h, while the split-KV partial writes
+// a densely packed D_NOPE_SIZE-strided o_accum.
 template <class T>
 __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h)
 {
@@ -475,7 +469,10 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h)
                              opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// --------------------------------------------------------------- softmax utils
+// --- softmax / scaling helpers ---
+// W_M = 16 with 64-wide waves, so a row spans four lane groups: both cross-lane
+// reductions need permlane32_swap followed by permlane16_swap (the d192 FMHA kernel, at
+// W_M = 32, gets away with the 32-swap alone).
 template <typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s)
 {
@@ -492,11 +489,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s)
     return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
 }
 
-// Fused `v_s * scale - row_max`. The caller takes the row max of the *raw* scores and
-// scales that single scalar instead (scale > 0, so the max commutes with it): the raw
-// scores then feed one v_fma each. Pre-scaling the tile before the reduction instead
-// costs a second pass of muls, because the subtract fuses the scale back in anyway,
-// and it puts those muls on the critical path ahead of the reduction.
+// Fused `v_s * scale - row_max`, one v_fma per element. The caller reduces the *raw*
+// scores and scales that single scalar instead (scale > 0, so max commutes with it):
+// pre-scaling the tile would cost a whole extra pass of muls -- the subtract fuses the
+// scale back in anyway -- and would put them on the critical path into the reduction.
 template <typename T, typename V>
 __device__ inline void
 attn_scale_sub_row(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max)
@@ -515,12 +511,12 @@ __device__ inline void attn_exp2_slice(V& v_s)
     });
 }
 
-// Reduced as a balanced tree, not the `row_sum += v_s[i]` chain the shape of the loop
-// suggests: float addition does not reassociate, so the chain form is s_len dependent
-// v_add_f32 back to back and the trace measured the eight of them at 52 cycles, all of it
-// on the critical path into the two permlane swaps below. The tree is 3 deep instead of 8
-// for the same instruction count. It is a different summation order and therefore a
-// different rounding, which is harmless here -- every term is a positive exp2 result.
+// Balanced tree, not the `row_sum += v_s[i]` chain the loop shape suggests: float addition
+// does not reassociate, so the chain compiles to s_len dependent v_add_f32 back to back --
+// the trace measured those eight at 52 cycles, all of it on the critical path into the
+// permlane swaps. The tree is 3 deep instead of 8 for the same instruction count. It sums
+// in a different order and therefore rounds differently, which is harmless here: every
+// term is a positive exp2 result.
 template <typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_sum(const V& v_s)
 {
@@ -553,6 +549,8 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale)
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
 }
 
+// Pin the O accumulator as a scheduling/materialization fence, chunked into 8-lane groups
+// so each `"+v"` operand can be allocated (a single one on the whole 128-VGPR v_o cannot).
 template <typename V>
 __device__ inline void pin_output_tile(V& v_o)
 {
@@ -568,6 +566,7 @@ __device__ inline void pin_output_tile(V& v_o)
     }
 }
 
+// --- score masking (out-of-range KV columns and, for CAUSAL, the diagonal) ---
 template <int THR_X, int THR_Y>
 __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                                           opus::u32_t neg_inf_vgpr,
@@ -584,10 +583,10 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                  : "vcc");
 }
 
-// Last KV position the diagonal lets this wave's query rows attend to. It is
-// loop-invariant and costs an integer division, so callers evaluate it once on
-// entry; the cheap out-of-bounds bound stays at the point of use, where it does
-// not have to be kept live across the pipeline.
+// Last KV position the diagonal lets this wave's query rows attend to. Loop-invariant and
+// costs an integer division, so it is evaluated once on entry (the pipelined body inlines
+// this expression); the cheap valid_kv_len bound stays at the point of use instead, where
+// it need not be kept live across the pipeline.
 template <typename T>
 __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_id)
 {
@@ -642,6 +641,10 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t ne
     });
 }
 
+// --- Pipelined KV-tile loop for one work item (see the stage map at the top) ---
+// Q, the O accumulator and the online-softmax state (m_row / l_row) are owned by the
+// caller and passed by reference, so a split-KV request can run several tile ranges into
+// the same accumulator.
 template <class Traits, bool STAGGER, class VQN, class VQR, class VO>
 __device__ __attribute__((always_inline)) void
 mla_decode_fwd_pipelined(mla_kargs kargs,
@@ -684,7 +687,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto s_k_nope = make_smem(reinterpret_cast<D_K*>(smem_kv));
     auto s_k_rope = make_smem(reinterpret_cast<D_K*>(smem_kv + T::smem_k_nope_bytes));
 
-    // Double-buffer slot stride (in elements) for each smem region.
+    // Stride (in elements) between the 4 ring slots. Both regions live inside one slot, so
+    // a slot's nope and rope parts move together under a single `n * kv_slot_off` offset.
     constexpr auto kv_slot_off = number<T::smem_kv_bytes() / sizeof(D_K)>{};
 
     auto u_kv_indices      = make_layout_kv_indices<T>(warp_id, lane_id);
@@ -694,15 +698,19 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto u_gk_rope         = make_layout_gk_rope<T>(lane_id);
     auto u_sk_rope         = make_layout_sk_rope<T>(warp_id);
     auto u_rk_rope         = make_layout_rk_rope<T>(lane_id);
-    // One layout per e_n token tile: the bank swizzle's XOR differs between
-    // token-in-line 0..3 and 4..7, which a single product layout cannot express.
+    // One layout per e_n token tile: the bank swizzle's XOR differs between token-in-line
+    // 0..3 and 4..7, which a single product layout cannot express.
     auto u_rk_nope0 = make_layout_rk_nope<T, 0>(lane_id);
     auto u_rk_nope1 = make_layout_rk_nope<T, 1>(lane_id);
     auto u_rv0      = make_layout_rv<T, 0>(lane_id);
     auto u_rv1      = make_layout_rv<T, 1>(lane_id);
 
+    // GEMM0 nope: bare 16x16x128 f8f6f4, driven one e_n tile at a time so each MFMA can be
+    // paired with the DS read feeding it (see compute_qk_nope).
     auto mfma0_nope =
         make_mfma<D_K, D_Q, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
+    // GEMM0 rope and GEMM1 PV both ride the 16x16x32 fp8 MFMA (W_K_ROPE = 32), which is the
+    // half-rate opcode -- see the ceiling note in the file header.
     auto mma0_rope = make_tiled_mma<D_K, D_Q, D_ACC>(seq<T::GEMM0_E_M, T::GEMM0_E_N, 1_I>{},
                                                      seq<1_I, 1_I, 1_I>{},
                                                      seq<T::W_M, T::W_N, T::W_K_ROPE>{},
@@ -718,8 +726,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     using s_tile_t      = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope[2];
-    // Two score buffers so the softmax VALU of the current tile can run alongside
-    // the QK/PV MFMA of the adjacent tile (see the cluster staging below).
+    // Two score buffers so tile t's softmax VALU can run alongside tile t-1's PV MFMA
+    // (and t-1's tail alongside t's QK). Indexed only by unrolled compile-time constants.
     typename decltype(mma0_rope)::vtype_c v_s[2];
     typename decltype(mma1)::vtype_a v_p;
     typename decltype(mma1)::vtype_b v_v[2];
@@ -731,6 +739,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto v_o_slices =
         reinterpret_cast<vector_t<D_ACC, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
+    // Element offsets of one K/V sub-range within a slot. K nope steps whole d_rpt blocks
+    // (one per e_k), K rope steps SLICE_D inside its single line, and V steps both: d_rpt
+    // block s / slices_per_drpt plus the 32-dim sub-range within it.
     auto sk_nope_slice = [](auto slice_idx) {
         constexpr int s = decltype(slice_idx)::value;
         return number<s * T::smem_n_rpt*(T::smem_linear_wave_nope + T::smem_padding_32B_nope)>{};
@@ -748,9 +759,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                       dim_in_blk * T::SLICE_D>{};
     };
 
-    // Both nope reads are issued per e_n tile so that each one carries the right
-    // compile-time swizzle. The instruction count per call is unchanged, so the
-    // k_nope_ds_read_insts / v_ds_read_insts waitcnt budgets still hold.
+    // Both nope reads are issued per e_n tile so each carries its own compile-time
+    // swizzle. Instruction count per call is unchanged, so the k_nope_ds_read_insts /
+    // v_ds_read_insts waitcnt budgets below still hold.
     constexpr auto k_en_off = number<T::smem_n_rpt * T::D_128B_NOPE_SIZE>{};
     constexpr auto v_en_off = number<T::W_N>{};
     constexpr auto rope_en_off =
@@ -772,6 +783,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // GEMM0 MFMA count: each e_k step (nope and rope alike) issues GEMM0_E_N of them.
     constexpr int QK_MFMA_CNT = T::GEMM0_E_N * (T::GEMM0_NOPE_E_K + T::GEMM0_ROPE_E_K);
 
+    // Online softmax: skip the O rescale entirely while every lane's new row max is within
+    // this much of the running one, so exp2(m_row - row_max) stays well inside fp32 range.
+    // Decided by a ballot, so the whole wave takes the same branch.
     constexpr D_ACC RESCALE_THRESHOLD = 8.0f;
     D_ACC rescale_m                   = 1.0f;
     D_ACC row_max;
@@ -785,6 +799,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     };
     auto kv_page_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
 
+    // Whole KV tile, gmem->LDS, no register round trip. Three buffer_load_lds in total, and
+    // each needs m0 rewritten with an s_nop after it, which is why this block is pure issue
+    // latency and why the caller hides it inside an MFMA shadow.
     auto async_load_kv = [&](auto slot_off, int kv_page, int kv_page_rope) {
         async_load<T::VEC_KV_NOPE>(
             g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(kv_page), u_sk_nope + slot_off);
@@ -792,10 +809,11 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page_rope), u_sk_rope + slot_off);
     };
 
-    // GEMM0. Deliberately left for the compiler to schedule: v_o alone is 128 VGPR, so at
-    // 256 there is no headroom here, and hand-fencing the softmax tail into these e_k steps
-    // (the way stage3 does for the PV loop) lengthens live ranges enough to spill. The
-    // scheduler already mixes the tail into the later QK MFMAs on its own.
+    // GEMM0 nope: 4 e_k steps of 2 MFMA, each prefetching the K tile two steps ahead.
+    // Instruction placement is deliberately left to the compiler (guided only by
+    // sched_compute_qk's preference): v_o alone is 128 of the 256 VGPR, and hand-fencing
+    // the softmax tail into these e_k steps the way stage3 does for PV was measured to
+    // spill 4-5 VGPR. The scheduler already mixes the tail into the later QK MFMAs.
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto noff) {
         clear(s);
         static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
@@ -803,6 +821,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             constexpr int slot = idx & 1;
             auto s_tile        = reinterpret_cast<s_tile_t*>(&s);
             auto k_nope_tile   = reinterpret_cast<k_nope_tile_t*>(&k[slot]);
+            // The trailing 0,0 are the f8f6f4 block scales; see (B) in the file header for
+            // why they must be literal zeros.
             s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], 0, 0);
             s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], 0, 0);
             if constexpr(idx + 2 < T::GEMM0_NOPE_E_K)
@@ -817,9 +837,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         });
     };
     // The four rope DS reads are fenced apart so the load/store optimiser cannot pair any
-    // two of them into a ds_read2_b64 (see sched_masks::KEEP_DS_READ_ORDER). Program order
-    // is e_n 0,1 of ek 0 then e_n 0,1 of ek 1, which is what makes the lgkmcnt budget below
-    // land on "k[0] complete, k[1] still in flight".
+    // two into a ds_read2_b64 (sched_masks::KEEP_DS_READ_ORDER). Program order is e_n 0,1
+    // of ek 0 then e_n 0,1 of ek 1, which is what makes the compiler-derived lgkmcnt land
+    // on "k[0] complete, k[1] still in flight".
     auto load_k_rope = [&](auto& dst, auto noff, auto slice) {
         auto* tile = reinterpret_cast<k_rope_tile_t*>(&dst);
         tile[0]    = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff + slice);
@@ -833,19 +853,18 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s = mma0_rope(q[0], k[0], s);
         s = mma0_rope(q[1], k[1], s);
     };
-    // One PV pass over all d-slices; slice i is one mma1 (2 MFMA) plus the tr_load feeding
+    // One PV pass over all d-slices: slice i is one mma1 (2 MFMA) plus the tr_load feeding
     // the slice two ahead. `co(i)` is emitted immediately after slice i, so its VALU issues
-    // while that MFMA pair is still occupying the MAI pipe.
+    // while that MFMA pair still occupies the MAI pipe.
     //
-    // The placement is by hand rather than left to sched_group_barrier because neither half
-    // of that works here. The scheduler keeps program order on its own: consecutive mma1
-    // accumulate into different registers, so it sees no stall worth filling. And it must
-    // not be given the freedom anyway -- tr_load lowers to inline asm (ds_read_b64_tr_b8),
-    // so the compiler does not see a DS read at all: sched_group_barrier's DS_READ class
-    // never matches it, SIInsertWaitcnts never emits a wait for it, and the s_waitcnt below
-    // is the only thing publishing its result. Let it drift by one slot and the MFMA reads
-    // stale LDS. Hence hard fences around each chunk; they cost nothing, since co-execution
-    // is a property of issue order, not of the scheduler's regions.
+    // Placed by hand rather than by sched_group_barrier, because neither half of that
+    // works here. The scheduler keeps program order on its own anyway (consecutive mma1
+    // accumulate into different registers, so it sees no stall worth filling), and it must
+    // not be given the freedom in any case: tr_load lowers to inline asm, so the compiler
+    // does not see a DS read at all -- the DS_READ class never matches it, SIInsertWaitcnts
+    // never emits a wait for it, and the s_waitcnt below is the only thing publishing its
+    // result. Let it drift one slot and the MFMA reads stale LDS. The hard fences cost
+    // nothing: co-execution is a property of issue order, not of scheduling regions.
     auto compute_pv = [&](const auto& p, auto& v, auto& o, auto noff, auto&& co) {
         static_for<T::NUM_D_SLICES>([&](auto i) {
             constexpr int idx  = i.value;
@@ -869,6 +888,12 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
+    // Only the tiles that can actually contain invalid columns pay for a mask: the last
+    // partial tile of the request always, and for CAUSAL also the tile holding the
+    // diagonal, which is the range's last one since a decode query attends to its whole
+    // prefix. `bound` is the tighter of the two limits; the diagonal one is per-warp
+    // (readfirstlane'd warp_id) and the rest workgroup-uniform, so it all stays in SGPRs
+    // and the branch is scalar.
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
         bool masked = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
         if constexpr(T::CAUSAL)
@@ -886,32 +911,36 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         }
     };
 
-    auto stage_end = [&]() {
-        __builtin_amdgcn_sched_barrier(0);
-        // __builtin_amdgcn_s_barrier();
-        // __builtin_amdgcn_sched_barrier(0);
-    };
+    // Stage boundary: a scheduler fence only. Everything a stage produces for the next one
+    // is in registers and therefore wave-private; the LDS slots are the only shared state,
+    // and one barrier per phase covers both hazards on them (see stage_end_2). Leaving the
+    // waves unsynchronised in between is what lets the two on a SIMD drift apart, so one
+    // computes through the other's stalls.
+    auto stage_end = [&]() { __builtin_amdgcn_sched_barrier(0); };
+    // Stage boundary WITH the workgroup barrier: fence, s_barrier, fence. Used once per
+    // phase, at stage0, where it does double duty: paired with the preceding
+    // s_waitcnt_vmcnt it publishes tile t+1's DMA (RAW), and it separates the previous
+    // phase's V reads of slot_of(t-2) from this phase's prefetch writing that slot (WAR).
     auto stage_end_2 = [&]() {
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
     };
 
-    // Tile t lives in LDS slot (t - tile_begin) & 3. Four slots are the minimum for a
-    // distance-2 prefetch: tile t-1 (PV pending), t (QK now), t+1 (fetched) and t+2
-    // (being fetched) are all resident during a phase.
     auto slot_of = [&](int tile_idx) { return (tile_idx - tile_begin) & 3; };
 
-    // --- Prologue: prime slots 0..2 ---
-    // A phase consumes one tile and therefore issues exactly one prefetch, so the first
-    // three tiles have to be in flight before the first phase runs.
+    // --- Prologue: prime slots 0..2, then QK + softmax-head of tile_begin ---
+    // A phase consumes one tile and issues exactly one prefetch, so three tiles must
+    // already be in flight before the first phase runs.
     int cur_page      = load_kv_page(tile_begin);
     int cur_page_rope = load_kv_page_rope(tile_begin);
     async_load_kv(0_I, cur_page, cur_page_rope);
-    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_waitcnt(0); // slot 0 is read below, so drain it outright
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
+    // Slots 1 and 2 stay in flight; the guards are the only tile-count branches here, and
+    // a short request simply leaves the unused slots unwritten.
     if(tile_begin + 1 < tile_end)
     {
         async_load_kv(kv_slot_off, load_kv_page(tile_begin + 1), load_kv_page_rope(tile_begin + 1));
@@ -934,6 +963,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int nxt_page      = cur_page;
     int nxt_page_rope = cur_page_rope;
 
+    // Partial phase for tile_begin: stage0/stage1 only, since there is no previous tile to
+    // run a tail or a PV for. Its softmax head runs to completion here (row max, subtract,
+    // and the first exp half); the second half is the tail that the first real phase's
+    // stage1 picks up out of v_s[0].
     load_k_nope(v_k_nope[0], 0_I, sk_nope_slice(0_I));
     load_k_nope(v_k_nope[1], 0_I, sk_nope_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
@@ -950,11 +983,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     stage_end();
 
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
-        // stage0 [mem]: K(t) was published by the barrier that closed the previous
-        // stage, so it can be read straight away. Fetch the page index that the *next*
-        // phase prefetches, which gives the gmem index load a full phase of slack.
-        // Everything older than the prefetch just issued has landed, so the barrier
-        // below publishes tile t+1 for the next phase's stage0 read.
+        // stage0 [mem]: wait out everything older than the prefetch just issued, then
+        // barrier -- which publishes K(t) for the ds_reads right below and, one phase
+        // later, K(t+1). Also fetch the page index the *next* phase will prefetch, giving
+        // that gmem index load a full phase of slack before it is needed.
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_2();
         __builtin_amdgcn_sched_barrier(0);
@@ -975,10 +1007,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         sched_compute_qk<QK_MFMA_CNT, 1>();
         stage_end();
 
-        // stage2 [mem]: read V(t-1). Mask S(t) here, before stage3 folds it into softmax --
-        // this one cannot move into the PV co-routine, because chunk 0 already reads
-        // vs_cur to start the row max. The tile t+2 prefetch does move; it now rides in
-        // PV chunk 1 (see below).
+        // stage2 [mem]: tr_load V(t-1); mask S(t). The mask has to stay here rather than
+        // ride a PV chunk like the prefetch does, because chunk 0 already reads vs_cur to
+        // start the row max.
         load_v(v_v[0], prev_slot * kv_slot_off, sv_slice(0_I));
         load_v(v_v[1], prev_slot * kv_slot_off, sv_slice(1_I));
         mask_oob_scores(vs_cur, t);
@@ -986,14 +1017,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         stage_end();
 
         // stage3 [compute]: gemm1 PV(t-1) [32 MFMA] with the softmax head of tile t chopped
-        // into per-d-slice chunks that ride in the MFMA shadows. The head reads only
-        // vs_cur, which stage1 finished, so nothing in it depends on the PV chain, and the
-        // ~25 VALU + 4 exp it used to run as a serial block after the last MFMA now cost
-        // nothing. Chunk k runs after PV slice k:
-        //   0,1  local row max          2,3  cross-lane max (permlane32 / permlane16)
-        //   4    rescale decision       5-8  fused scale-subtract   6-9  exp2
-        // Two MFMA (~32 cycles) separate consecutive chunks, which more than covers the
-        // 4-cycle dependent-VALU latency of the reduction chain.
+        // into per-d-slice chunks riding the MFMA shadows. The head reads only vs_cur,
+        // which stage1 finished, so nothing in it depends on the PV chain -- the ~25 VALU
+        // + 4 EXP that used to run as a serial block after the last MFMA now cost nothing.
+        // Chunk k is emitted after PV slice k:
+        //   0,1  local row max                  2,3  cross-lane max (permlane32/16)
+        //   1    tile t+2 prefetch              4    rescale decision
+        //   5-8  fused scale-subtract           6-9  exp2
+        // Consecutive chunks are two MFMA (~32 cycles) apart, well over the 4-cycle
+        // dependent-VALU latency of the reduction chain.
         D_ACC rmx;
         auto head_chunk = [&](auto slice) {
             constexpr int k = decltype(slice)::value;
@@ -1006,14 +1038,14 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             {
                 static_for<s_len - s_half_len>(
                     [&](auto i) { rmx = max(rmx, vs_cur[s_half_len + i.value]); });
-                // Prefetch tile t+2 into the slot tile t-2 vacated. This used to sit in
-                // stage2 as a straight-line block and it measured 136 cycles there with no
-                // MFMA anywhere near it: three buffer_load_lds each need m0 rewritten, and
-                // an s_mov to m0 followed by an LDS-DMA needs an s_nop between them, so the
-                // block is mostly issue latency that nothing covers. Riding a PV chunk puts
-                // all of it in the shadow of the MFMA pair that just issued. Chunk 1 keeps
-                // the request nearly as early as it was, which matters -- the prefetch is
-                // two tiles ahead and that distance is what hides gmem latency.
+                // Prefetch tile t+2 into the slot tile t-2 vacated. As a straight-line
+                // block in stage2 this measured 136 cycles with no MFMA anywhere near it:
+                // each of the three buffer_load_lds needs m0 rewritten, and an s_mov to m0
+                // followed by an LDS-DMA needs an s_nop between them, so it is almost pure
+                // issue latency that nothing was covering. Riding a PV chunk puts all of it
+                // in the shadow of the MFMA pair that just issued. It goes in chunk 1
+                // specifically to keep the request nearly as early as it was -- the
+                // two-tile prefetch distance is what hides gmem latency.
                 async_load_kv(((cur_slot + 2) & 3) * kv_slot_off, cur_page, cur_page_rope);
             }
             else if constexpr(k == 2)
@@ -1036,8 +1068,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                     (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
                 row_max = all_below ? m_row : max(m_row, row_max);
             }
-            // fma-subtract and exp2 overlap: exp of element e only needs its own subtract,
-            // which landed one chunk earlier.
+            // The subtract and the exp2 overlap by one chunk: exp of element e needs only
+            // its own subtract, which landed in the previous chunk.
             if constexpr(k >= 5 && k < 5 + s_len / 2) // two elements per chunk
             {
                 constexpr int b = (k - 5) * 2;
@@ -1068,8 +1100,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         cur_page_rope = nxt_page_rope;
     };
 
-    // One phase per tile after the first: gemm0+head(t) and tail+gemm1(t-1). Pairs are
-    // unrolled so the two score buffers alternate without a runtime index.
+    // --- Main loop: tiles tile_begin+1 .. tile_end-1, two phases unrolled per iteration ---
+    // Full pairs run unconditionally, so the hot loop carries no inner branch and the two
+    // score buffers alternate as compile-time indices; the single leftover phase (present
+    // only when the tile count is even) is peeled out below.
     int t = tile_begin + 1;
     for(; t + 1 < tile_end; t += 2)
     {
@@ -1090,14 +1124,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     }
 
     // --- Epilogue: softmax-tail + gemm1 of the last tile ---
-    // Phase t writes v_s[1] when (t - tile_begin) is odd and v_s[0] when it is even, so
-    // the last tile's scores sit in a buffer picked by the tile count's parity. Its LDS
-    // slot and its mask were already handled by the phase (or by the prologue when the
-    // request is a single tile).
-    // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
-    // this part depends on the parity; keeping the V read and the PV outside the branch
-    // is what keeps the 128-VGPR v_o off scratch -- inlining a compute_pv into both
-    // arms makes the allocator route v_o through the branch merge.
+    // Phase t writes v_s[1] for odd (t - tile_begin) and v_s[0] for even, so the last
+    // tile's scores sit in a buffer chosen by the tile count's parity. Its LDS slot and
+    // its mask were already handled by the phase (or by the prologue, for a one-tile
+    // request).
+    //
+    // stage0 [compute]: finish the softmax tail; the head exp already ran in the phase.
+    // Only this part is under the parity branch. Keeping the V read and the PV outside it
+    // is what keeps the 128-VGPR v_o off scratch: inline a compute_pv into both arms and
+    // the allocator routes v_o through the branch merge.
     auto epilogue_tail = [&](auto& vs_last) {
         attn_exp2_slice<T, s_half_len, s_half_len>(vs_last);
         l_row += attn_row_sum<T>(vs_last);
@@ -1109,14 +1144,14 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         epilogue_tail(v_s[0]);
     stage_end();
 
-    // stage1 [mem]: read V(T-1) su0
+    // stage1 [mem]: tr_load V of the last tile
     const int last_slot = slot_of(tile_end - 1);
     load_v(v_v[0], last_slot * kv_slot_off, sv_slice(0_I));
     load_v(v_v[1], last_slot * kv_slot_off, sv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     stage_end();
 
-    // stage2 [compute]: gemm1 su0
+    // stage2 [compute]: gemm1 PV of the last tile; no softmax head left to co-schedule
     compute_pv(v_p, v_v, v_o_slices, last_slot * kv_slot_off, no_co);
     __builtin_amdgcn_sched_barrier(0);
 
@@ -1127,6 +1162,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // }
 }
 
+// --- One work item: load Q, run the tile range, normalize and store O (+ LSE) ---
+// work_info_set is 8 ints per item, produced by the metadata kernel. A negative `slot`
+// means this item owns the whole request and writes the real output; otherwise it is one
+// split-KV partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits, bool STAGGER>
 __device__ __attribute__((always_inline)) void
 mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_scale)
@@ -1157,9 +1196,8 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
     if(num_kv_tiles == 0)
         return;
 
-    // const int nhead = kargs.H;
-    // Only the causal specialization needs the diagonal; the two indptr scalar
-    // loads it costs are skipped entirely in the decode-only build.
+    // Only the causal specialization needs the diagonal, so the two indptr scalar loads it
+    // costs disappear entirely from the decode-only build.
     int causal_diagonal = 0;
     if constexpr(T::CAUSAL)
     {
@@ -1168,6 +1206,9 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
                           __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
     }
 
+    // Per-tensor descale folded into the two places it can be a single scalar multiply:
+    // QK's descale_q*descale_k rides the softmax temperature, and V's descale_k is applied
+    // once on the finished O below (the PV MFMA itself consumes raw fp8).
     const float descale_q =
         __builtin_amdgcn_readfirstlane(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
     const float descale_k =
@@ -1203,6 +1244,8 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
                                               qk_scale,
                                               causal_diagonal);
 
+    // Softmax normalisation and the V descale in one multiply. l_row == 0 means every
+    // score was masked, so O must be 0 rather than NaN.
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (descale_k / l_row) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
     pin_output_tile(v_o);
@@ -1215,8 +1258,8 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
         auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
         auto v_o_out            = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
-        // lse_ptr is null when the caller did not ask for LSE; lse_accum below is
-        // always allocated, so only this branch needs the guard.
+        // lse_ptr is null when the caller did not ask for LSE; lse_accum in the split-KV
+        // branch is always allocated, so only this side needs the guard.
         if(kargs.lse_ptr != nullptr && lane_id < T::W_M)
         {
             const int lse_offset = q_len_ptr_s * kargs.H;
@@ -1251,6 +1294,9 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
 
 } // namespace mla_decode_fwd_16mx8_32nx1_fp8fp8
 
+// Persistent entry point: the grid is sized to the machine, not to the problem, and each
+// block drains the work items the metadata kernel assigned it through work_indptr. The
+// occupancy-2 launch bound is what caps the whole kernel at 256 VGPR.
 template <class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE,
                              2) void mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel(mla_kargs kargs)
@@ -1261,12 +1307,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
 
     const int work_id = block_id_x();
 
-    // 4 LDS slots: with a distance-2 prefetch a phase keeps tile t-1 (PV pending), t
-    // (QK now), t+1 (fetched) and t+2 (in flight) resident at the same time. 4 * ~18.6KB
-    // = ~74.5KB, which fits gfx950's LDS at 2 blocks/CU. Non-pipelined paths use slot 0.
-    // The alignment is load-bearing: make_layout_rv folds the bank swizzle's XOR into a
-    // +/- SWZ_D_BYTES stride, which is only equivalent to the XOR while bit 4 of the
-    // block's base address is zero.
+    // 4 LDS slots: with a distance-2 prefetch a phase keeps tile t-1 (PV pending), t (QK
+    // now), t+1 (landed) and t+2 (in flight) resident at once. 4 * ~18.6 KB = ~74.5 KB,
+    // which still fits gfx950's LDS at 2 blocks/CU. The alignment is load-bearing:
+    // make_layout_rv folds the bank swizzle's XOR into a +/- SWZ_D_BYTES stride, which is
+    // only equivalent to the XOR while bit 4 of the block's base address is zero.
     __shared__ __align__(128) char smem_kv[4 * T::smem_kv_bytes()];
 
     const int work_idx_start = kargs.work_indptr[work_id];
@@ -1279,11 +1324,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
     const int warp_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / Traits::WARP_SIZE);
     for(int w = work_idx_start; w < work_idx_end; ++w)
     {
-        // Fences LDS reuse across work items: every wave has finished the previous
-        // request's V reads before this one's async loads start writing the slots.
         // __builtin_amdgcn_sched_barrier(0);
         // __builtin_amdgcn_s_barrier();
-        // __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_sched_barrier(0);
         mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_kv, temperature_scale);
         // if(warp_id / 4)
