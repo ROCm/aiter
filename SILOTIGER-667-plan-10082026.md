@@ -399,8 +399,13 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `is_flydsl_available()`, added to `__all__`) — 2026-08-11. All **six** public entry points
       exported: `flydsl_warp_decode_{gate_up,down_reduce}` (FP8) + `_fp4` (MXFP4, ticket #1) +
       `_bf16` (unquantized oracle). Verified import + `__all__` membership in `flydsl_venv`.
-- [ ] Extend the op_test perf sweep to **B∈{1,2,4,8,32}** across MiniMax + Qwen3Next-TP1 and
-      all shipped dtypes, closing the coverage matrix (§8.2); feed the same shapes to CK.
+- [x] **Widened perf sweep (2026-08-11):** extended the cold-HBM A/B to **3 real-E decode models**
+      (DeepSeek-V3 E256, MiniMax E256, Qwen3Next-TP1 E512) × **B∈{1,2,4,8,32}**, both stages, FP4+FP8
+      (FP8 auto-skips at DeepSeek E256 per 2³¹). Driven by `_COLD_MODELS`/`_COLD_BATCHES` →
+      `COLD_{DOWN,GATE_UP}_SHAPES`; rows now carry HIDDEN/INTER. All **fp4_cos=1.0**. Headline (device
+      timing): gate_up FP4 beats FP8 **1.3–1.8×** (MiniMax) / **1.0–1.2×** (Qwen); down FP4 wins at
+      B≥2, ~neutral at B=1 for the smaller shapes. The **CK side-by-side (G9)** feed of the same shapes
+      is the remaining Phase F item.
 
 ### Follow-on (out of scope for this convergence)
 - [ ] **Plain FP8 activation** input (per-tensor / per-token): fuse input-side BF16→FP8 quant
@@ -487,9 +492,9 @@ the phase bullets reference it rather than re-listing shapes.
 
 | Model | H | I | TOPK | E | Runnable? | Status / owning phase |
 |---|---|---|---|---|---|---|
-| DeepSeek-V3 | 7168 | 2048 | 8 | **256** | ✅ (kv16) | ✅ **A** real-E correctness (both stages pass); ⏳ **B/F** perf |
-| MiniMax | 3072 | 1536 | 8 | **256** | ✅ (kv16/kv8) | ⏳ **B/F** (add correctness + perf rows) |
-| Qwen3Next TP1 | 2048 | 512 | 10 | **512** | ✅ (kv8) | ✅ **A** real-E correctness (both stages pass); ⏳ **B/F** perf |
+| DeepSeek-V3 | 7168 | 2048 | 8 | **256** | ✅ (kv16) | ✅ **A** real-E correctness (both stages); ✅ **F** cold perf B∈{1,2,4,8,32} (FP4; FP8 n/a at E256 — 2³¹, K3 Tier-2) |
+| MiniMax | 3072 | 1536 | 8 | **256** | ✅ (kv16/kv8) | ✅ **F** cold perf B∈{1,2,4,8,32} FP4+FP8 (cos 1.0 gate = correctness) |
+| Qwen3Next TP1 | 2048 | 512 | 10 | **512** | ✅ (kv8) | ✅ **A** real-E correctness (both stages); ✅ **F** cold perf B∈{1,2,4,8,32} FP4+FP8 |
 | Qwen3Next TP2 | 2048 | 256 | 10 | **512** | ⛔ | `INTER%512≠0`; needs short-INTER `kLanesPerOutput` path (see §6) |
 | Qwen3Next TP4 | 2048 | 128 | 10 | **512** | ⛔ | `INTER%512≠0`; same short-INTER gap |
 | Kimi-K3 (routed, latent MoE) | **3584** | 3072 | **16** | **896** | ✅ (gate_up kv8 / down kv16) | ⏳ **follow-on** (needs MXFP4 + FP8/MXFP8 act; E=896 max-stresses G1) |
@@ -509,7 +514,7 @@ bench/tune target; verify against the shipped weights before publishing numbers.
 
 | Axis | Target | Status / owning phase |
 |---|---|---|
-| **Batch B** | 1, 2, 4, 8, 32 | ✅ 1,4 · ⏳ **F** adds 2, 8, 32 |
+| **Batch B** | 1, 2, 4, 8, 32 | ✅ 1,2,4,8,32 (**F**, cold real-E FP4/FP8 sweep, both stages) |
 | **Scale layout** | pertensor, pertoken, block2d | ✅ all three (both stages) |
 | **Weight dtype** | FP8, MXFP4, BF16 | ✅ FP8 · ✅ MXFP4 **B** · ✅ BF16 **C** (oracle) |
 | **Activation** | BF16, FP8 | ✅ BF16 · ⏳ FP8 (follow-on) |
@@ -599,3 +604,7 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   (FP8 + MXFP4 + BF16, both stages) from `aiter/ops/flydsl/__init__.py` behind `is_flydsl_available()`
   and added to `__all__`; verified import + membership in `flydsl_venv`. **Remaining Phase F: G9 CK
   side-by-side + widen the perf sweep (§8.2).**
+- _Widened perf sweep done (2026-08-11)_ — cold-HBM FP4-vs-FP8 A/B now covers DeepSeek-V3/MiniMax/
+  Qwen3Next-TP1 × B∈{1,2,4,8,32}, both stages, via `_COLD_MODELS`/`_COLD_BATCHES`; FP8 legs auto-skip
+  at DeepSeek E256 (2³¹). All fp4_cos=1.0; gate_up FP4 wins 1.3–1.8× (MiniMax). §8.2 model rows +
+  Batch axis flipped ✅. **Only G9 (CK side-by-side) remains in Phase F.**
