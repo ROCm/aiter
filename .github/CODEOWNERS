@@ -2,4 +2,16 @@
 # Each line is a file pattern followed by one or more owners.
 # The last matching pattern takes precedence.
 
-/aiter/ops/triton/ @Dewei-Wang-sh @vgokhale @azaidy
+# These owners will be the default owners for everything in
+# the repo
+* @ROCm/TEAM_AITER
+
+/.github/CODEOWNERS @ROCm/TEAM_AITER @ROCm/Triton_Kernels_Team
+
+# Triton files/bench/tests
+/aiter/ops/triton/ @ROCm/Triton_Kernels_Team
+/op_tests/triton_tests/ @ROCm/Triton_Kernels_Team
+/op_tests/op_benchmarks/triton/ @ROCm/Triton_Kernels_Team
+
+# Gluon files
+/aiter/ops/triton/gluon/ @ROCm/Triton_Kernels_Team @coderfeli
