@@ -24,6 +24,9 @@ Usage
     PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h_o.py --list
     PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h_o.py \\
         --shape-index 1 --mode graph --verify
+    # A 1-based inclusive range of preset shapes:
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h_o.py \\
+        --shape-range 5-8 --mode graph
 """
 
 from __future__ import annotations
@@ -53,11 +56,18 @@ from utils.bench_common import (
     write_bench_markdown,
 )
 
-# Reuse the K5 bench's shape presets and input builders so the two benches stay
-# in lockstep (same shapes, same seqlen patterns, same TFLOPs chunk accounting).
+# Reuse the K5 bench's shape presets, input builders, and HIP graph-capture
+# machinery so the two benches stay in lockstep (same shapes, same seqlen
+# patterns, same TFLOPs chunk accounting, same capture-safe HIP metadata).
+#
+# ``_hip_meta_cache`` and ``_CaptureSafeMeta`` are imported by reference: the
+# K5 bench's ``_adapt_hip`` closure (used by our HIP runner) reads that same
+# module-level dict, so populating it here makes the HIP K5 path capture-safe.
 from bench_chunk_gdn_fwd_h import (  # noqa: E402
     PRESET_SHAPES,
     _USE_EXP2,
+    _CaptureSafeMeta,
+    _hip_meta_cache,
     _make_inputs,
     _make_seqlens,
     _shape_label,
@@ -113,8 +123,16 @@ def _separate_runner(k5_fn, k6_fn, is_hip=False):
 
     ``k5_fn`` must return ``(h, v_new, final_state)`` with v_new in head-major
     [B, H, T_flat, V] (both the Triton VK and FlyDSL K5 wrappers do).
+
+    Under graph capture with a varlen batch, Triton K6 (``chunk_fwd_o_opt_vk``)
+    would otherwise build chunk indices at launch (a device->host read that is
+    illegal while capturing). We pass the reusable ``prefill_metadata`` built
+    once in ``_run_one`` (looked up by ``cu`` identity, no sync) so the captured
+    call only reuses it. The HIP K5 path gets its own copy via ``_adapt_hip``,
+    which reads the same ``_hip_meta_cache``.
     """
     def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
+        meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
         h, v_new, _ = k5_fn(
             k=k, w=w, u=u, g=g, gk=gk, initial_state=h0,
             output_final_state=True, save_new_value=True,
@@ -122,7 +140,7 @@ def _separate_runner(k5_fn, k6_fn, is_hip=False):
         )
         k6_fn(
             q=q, k=k, v=v_new, o=o, h=h, g=g, scale=scale,
-            cu_seqlens=cu, use_exp2=_USE_EXP2,
+            cu_seqlens=cu, use_exp2=_USE_EXP2, prefill_metadata=meta,
         )
         return o
     return _run
@@ -188,10 +206,12 @@ def _load_impls(which: str) -> dict:
 
             def _fused_run(*, q, k, w, u, g, gk, h0, cu, scale, o,
                            _fn=chunk_gated_delta_rule_fwd_h_o_flydsl):
+                meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
                 _fn(
                     q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
                     initial_state=h0, output_final_state=True,
                     cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
+                    prefill_metadata=meta,
                 )
                 return o
 
@@ -224,6 +244,28 @@ def _run_one(idx, impls, shape, args, cfg) -> dict:
 
     scale = K ** -0.5
     o = u_hm.new_empty(1, T_flat, H, V)  # [B, T, H, V]
+
+    # Build reusable prefill metadata once (before any warmup/capture) for the
+    # varlen path, so neither the HIP K5 adapter nor Triton K6 builds chunk
+    # metadata / does a device->host read inside the graph-captured closure.
+    # Keyed by cu identity in the shared _hip_meta_cache; read back by the HIP
+    # adapter and by _separate_runner (for K6). Only needed when N>1.
+    if cu is not None:
+        try:
+            from aiter.ops.prefill_batch_metadata import (
+                build_gated_delta_rule_prefill_metadata,
+            )
+            _bounds = cu.detach().to("cpu", torch.int64)
+            _sl = (_bounds[1:] - _bounds[:-1]).tolist()
+            _meta = build_gated_delta_rule_prefill_metadata(
+                _sl, cu_seqlens=cu, chunk_size=BT,
+            )
+            _hip_meta_cache[id(cu)] = _CaptureSafeMeta(
+                _meta, cu, chunk_size=BT,
+                total_prefill_tokens=int(T_flat), num_sequences=len(_sl),
+            )
+        except Exception as e:
+            warnings.warn(f"prefill metadata build failed: {e}")
 
     modes = ["eager", "graph"] if args.mode == "all" else [args.mode]
     baseline_name = args.baseline
@@ -320,12 +362,22 @@ def run(args):
 
     cfg = make_measure_config(args)
 
+    n_shapes = len(PRESET_SHAPES)
     if args.shape_index is not None:
         idx = args.shape_index
-        if not (1 <= idx <= len(PRESET_SHAPES)):
-            print(f"--shape-index must be 1–{len(PRESET_SHAPES)}", file=sys.stderr)
+        if not (1 <= idx <= n_shapes):
+            print(f"--shape-index must be 1–{n_shapes}", file=sys.stderr)
             sys.exit(1)
         shapes_to_run = [(idx, PRESET_SHAPES[idx - 1])]
+    elif getattr(args, "shape_range", None) is not None:
+        lo, hi = args.shape_range
+        if not (1 <= lo <= hi <= n_shapes):
+            print(
+                f"--shape-range must satisfy 1 <= START <= END <= {n_shapes}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        shapes_to_run = [(i, PRESET_SHAPES[i - 1]) for i in range(lo, hi + 1)]
     else:
         gate_filter = getattr(args, "gate", "all")
         shapes_to_run = [
@@ -352,9 +404,27 @@ def main():
     parser = argparse.ArgumentParser(
         description="A/B benchmark: GDN K5+K6 fused forward."
     )
+    def _shape_range(s: str) -> tuple[int, int]:
+        """Parse ``START-END`` (1-based, inclusive) or a single ``N`` into (lo, hi)."""
+        parts = s.split("-")
+        try:
+            if len(parts) == 1:
+                v = int(parts[0]); return (v, v)
+            if len(parts) == 2:
+                return (int(parts[0]), int(parts[1]))
+        except ValueError:
+            pass
+        raise argparse.ArgumentTypeError(
+            f"--shape-range expects 'START-END' or 'N' (1-based); got {s!r}"
+        )
+
     shape_grp = parser.add_mutually_exclusive_group()
     shape_grp.add_argument("--shape-index", type=int, default=None, metavar="N",
                            help="Run one preset shape by 1-based index (see --list).")
+    shape_grp.add_argument("--shape-range", type=_shape_range, default=None,
+                           metavar="START-END",
+                           help="Run a 1-based inclusive range of preset shapes, "
+                                "e.g. '5-8' (or a single 'N').")
     shape_grp.add_argument("--list", action="store_true",
                            help="List all preset shapes with indices and exit.")
     parser.add_argument("--impl", default="all", metavar="IMPLS",

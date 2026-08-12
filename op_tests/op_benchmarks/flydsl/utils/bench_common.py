@@ -285,11 +285,18 @@ def print_result_table(row: dict) -> None:
     baseline_times = row.get("baseline_times", {})
 
     col_w = 36
+    # The speedup column must be at least as wide as its header label
+    # ("vs_<baseline_name>"), otherwise the header text overflows the fixed
+    # cell width and the data rows below no longer line up under it.
+    sp_w = max(14, len("vs_" + baseline_name))
     mode_cols = "".join(
-        f"  {'time_' + m + ' (us)':>14}  {'TFLOPs':>8}  {'vs_' + baseline_name:>14}"
+        f"  {'time_' + m + ' (us)':>14}  {'TFLOPs':>8}  {'vs_' + baseline_name:>{sp_w}}"
         for m in modes
     )
-    header = f"  {'impl':<{col_w}}{mode_cols}  {'verify':<24}"
+    # ``verify`` is the last column: left-aligned (no trailing pad) so its
+    # values sit flush under the header. ``impl`` is left-aligned; every numeric
+    # column (time/TFLOPs/vs_baseline) is right-aligned to its header width.
+    header = f"  {'impl':<{col_w}}{mode_cols}  verify"
     print(f"\n  {row['label']}")
     print("  " + "-" * (len(header) - 2))
     print(header)
@@ -315,8 +322,8 @@ def print_result_table(row: dict) -> None:
                 sp_str = "baseline"
             else:
                 sp_str = "—"
-            line += f"  {t_str}  {tf_str}  {sp_str:>14}"
-        line += f"  {verify:<24}"
+            line += f"  {t_str}  {tf_str}  {sp_str:>{sp_w}}"
+        line += f"  {verify}"
         print(line)
 
 

@@ -701,6 +701,183 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     return h, v_new, final_state
 
 
+# -- Fused K5+K6 compile cache + launch (gfx942) -------------------------
+
+_compiled_fused_kernels: dict = {}
+
+
+def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
+    """BV for the fused kernel, constrained to NR_SPLIT==1 (Phase 1).
+
+    The fused kernel does not yet support wave-widened variants, so the K5
+    tuned table (which can return bv64w8) is bypassed here. An explicit
+    ``variant`` is honoured if it is a plain bvNN tag; otherwise the largest
+    legal BV whose grid clears the fill bar is chosen, then capped at 32 so
+    the extra lds_A buffer fits the 64 KiB LDS budget at K=128.
+    """
+    # Phase 1 caps BV at 32: the fused kernel adds lds_A (BT*BT*2 = 8 KiB) and
+    # lds_vn_raw (BV*BT*2) on top of the four K5 buffers, so BV=64 overflows the
+    # 64 KiB/CU LDS budget at K=128. Phase 2 revisits BV=64 via LDS aliasing.
+    _FUSED_MAX_BV = 32
+    legal = sorted(
+        (b for b in _legal_bv_candidates(V) if b <= _FUSED_MAX_BV), reverse=True
+    )
+    if not legal:
+        raise ValueError(
+            f"fused GDN K5+K6: no legal BV <= {_FUSED_MAX_BV} for V={V}."
+        )
+    if variant is not None:
+        bv = _bv_of_variant(variant)
+        if bv > _FUSED_MAX_BV:
+            raise NotImplementedError(
+                f"fused GDN K5+K6 variant {variant!r} (BV={bv}) is not supported "
+                f"in Phase 1: BV>{_FUSED_MAX_BV} overflows the LDS budget with the "
+                f"added lds_A/lds_vn_raw buffers. Use bv16 or bv32."
+            )
+        if bv not in legal:
+            raise ValueError(
+                f"fused GDN K5+K6 variant {variant!r} illegal for V={V}; "
+                f"legal: {[f'bv{b}' for b in legal]}"
+            )
+        return bv
+    target = _select_bv_for_grid(
+        H=H, V=V, N=N, target_ctas=int(_GFX942_MIN_FILL * _device_cu_count())
+    )
+    return min(target, _FUSED_MAX_BV)
+
+
+def _run_fused_gfx942(
+    *, q, k, w, u, g, gk, o, scale, initial_state, output_final_state,
+    chunk_size, cu_seqlens, state_dtype, use_exp2, num_decodes,
+    num_decode_tokens, prefill_metadata, variant,
+):
+    """gfx942 fused K5+K6 launch. Mirrors the K5 wrapper's input prep."""
+    from .kernels.chunk_gated_delta_h_o_gfx942 import (
+        compile_chunk_gated_delta_h_o_gfx942,
+    )
+
+    g_log2_scaled = bool(use_exp2)
+
+    if initial_state is not None:
+        resolved_state_dtype = initial_state.dtype
+        if state_dtype is not None and state_dtype != resolved_state_dtype:
+            raise ValueError(
+                f"state_dtype={state_dtype} conflicts with "
+                f"initial_state.dtype={initial_state.dtype}."
+            )
+    elif state_dtype is not None:
+        resolved_state_dtype = state_dtype
+    else:
+        resolved_state_dtype = torch.float32
+    if resolved_state_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"SSM state dtype must be float32 or bfloat16, got {resolved_state_dtype}."
+        )
+    state_bf16 = resolved_state_dtype == torch.bfloat16
+
+    B, T, Hg, K = k.shape
+    BT = chunk_size
+    H = w.shape[1]
+    V = u.shape[-1]
+    T_flat = w.shape[2]
+
+    if cu_seqlens is None:
+        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        kernel_cu_seqlens = None
+    elif prefill_metadata is not None:
+        prefill_metadata.validate(
+            cu_seqlens=cu_seqlens, chunk_size=BT, num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens, total_prefill_tokens=T,
+            num_sequences=len(cu_seqlens) - 1,
+        )
+        schedule = prefill_metadata.get_chunk_schedule(
+            BT, num_decodes=num_decodes, num_decode_tokens=num_decode_tokens,
+        )
+        chunk_offsets = schedule.chunk_offsets
+        NT = schedule.total_chunks
+        kernel_cu_seqlens = schedule.kernel_cu_seqlens
+        N = schedule.n_prefill
+    else:
+        chunk_offsets = prepare_chunk_offsets(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+        N = len(kernel_cu_seqlens) - 1
+
+    assert K <= 256
+
+    use_g = g is not None
+    use_gk = gk is not None
+    use_h0 = initial_state is not None
+    is_varlen = cu_seqlens is not None
+
+    final_state = (
+        k.new_empty(N, H, V, K, dtype=resolved_state_dtype)
+        if output_final_state
+        else None
+    )
+
+    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
+
+    if g is not None:
+        assert g.is_contiguous(), "fused K5+K6: g must be contiguous head-major."
+        assert g.shape[-1] == T_flat and g.shape[-2] == H, (
+            f"fused K5+K6: g must be [.., H={H}, T_flat={T_flat}]; got {tuple(g.shape)}."
+        )
+    g_arg = g if g is not None else dummy
+
+    if gk is not None:
+        gk = gk.contiguous()
+        if g_log2_scaled:
+            gk = gk * _RCP_LN2
+    gk_arg = gk if gk is not None else dummy
+    h0_arg = initial_state if initial_state is not None else dummy
+    ht_arg = final_state if final_state is not None else dummy
+
+    cu_arg = (
+        kernel_cu_seqlens.to(torch.int32)
+        if kernel_cu_seqlens is not None
+        else dummy.to(torch.int32)
+    )
+    co_arg = (
+        chunk_offsets.to(torch.int32) if chunk_offsets is not None
+        else dummy.to(torch.int32)
+    )
+    stream = torch.cuda.current_stream()
+
+    BV = _fused_bv_for_shape(
+        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        gate=_gate_of(use_g, use_gk), variant=variant,
+    )
+
+    cache_key = (
+        K, V, BT, BV, H, Hg, float(scale), use_g, use_gk, use_h0,
+        output_final_state, is_varlen, state_bf16, g_log2_scaled,
+    )
+    if cache_key not in _compiled_fused_kernels:
+        _compiled_fused_kernels[cache_key] = compile_chunk_gated_delta_h_o_gfx942(
+            K=K, V=V, BT=BT, BV=BV, H=H, Hg=Hg, SCALE=float(scale),
+            USE_G=use_g, USE_GK=use_gk, USE_INITIAL_STATE=use_h0,
+            STORE_FINAL_STATE=output_final_state, IS_VARLEN=is_varlen,
+            WU_CONTIGUOUS=True, STATE_DTYPE_BF16=state_bf16,
+            G_IS_LOG2_SCALED=g_log2_scaled, NR_SPLIT=1,
+        )
+    launch_fn = _compiled_fused_kernels[cache_key]
+
+    grid_v = triton.cdiv(V, BV)
+    grid_nh = N * H
+    _run_compiled(
+        launch_fn,
+        q, k, w, u, g_arg, gk_arg, o, h0_arg, ht_arg, cu_arg, co_arg,
+        T, T_flat, N, grid_v, grid_nh, stream,
+    )
+
+    return o, final_state
+
+
 def chunk_gated_delta_rule_fwd_h_o_flydsl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -779,27 +956,30 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
         H = w.shape[1]
         o = u.new_empty(B, T, H, V, dtype=u.dtype)
 
-    from .kernels.chunk_gated_delta_h_o_gfx942 import (
-        chunk_gated_delta_h_o_placeholder,
-    )
+    # Bring-up escape hatch: FLYDSL_GDN_FUSED_PLACEHOLDER=1 forces the unfused
+    # K5->K6 orchestration (Phase 0 path) so the real kernel can be A/B'd
+    # against a known-correct baseline without editing call sites.
+    _force_placeholder = os.environ.get("FLYDSL_GDN_FUSED_PLACEHOLDER", "0") == "1"
 
-    return chunk_gated_delta_h_o_placeholder(
-        q=q,
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        gk=gk,
-        o=o,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        state_dtype=state_dtype,
-        use_exp2=use_exp2,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-        prefill_metadata=prefill_metadata,
+    if _force_placeholder or _ARCH != "gfx942":
+        from .kernels.chunk_gated_delta_h_o_gfx942 import (
+            chunk_gated_delta_h_o_placeholder,
+        )
+
+        return chunk_gated_delta_h_o_placeholder(
+            q=q, k=k, w=w, u=u, g=g, gk=gk, o=o, scale=scale,
+            initial_state=initial_state, output_final_state=output_final_state,
+            chunk_size=chunk_size, cu_seqlens=cu_seqlens, state_dtype=state_dtype,
+            use_exp2=use_exp2, num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
+            variant=variant,
+        )
+
+    return _run_fused_gfx942(
+        q=q, k=k, w=w, u=u, g=g, gk=gk, o=o, scale=scale,
+        initial_state=initial_state, output_final_state=output_final_state,
+        chunk_size=chunk_size, cu_seqlens=cu_seqlens, state_dtype=state_dtype,
+        use_exp2=use_exp2, num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
         variant=variant,
     )
