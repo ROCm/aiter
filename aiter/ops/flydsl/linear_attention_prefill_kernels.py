@@ -564,6 +564,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     v_new = v_new_buf if save_new_value else None
 
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
+    int32_dummy = torch.empty(1, device=k.device, dtype=torch.int32)
 
     # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK /
     # HIP). The kernel reads ``g`` with stride-1 along the T dim; require
@@ -598,19 +599,15 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
     # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
-    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
-    # resulting fresh objects are consumed only by the kernel launch, so their
-    # identity does not matter for the @tensor_cache helpers above.
+    # int32. The narrowing is a device-to-device cast (no host sync) cached on
+    # the source tensor, which comes from one of the @tensor_cache-decorated
+    # prologue helpers or from prebuilt metadata, so a steady-state forward
+    # launches no copy for it. The placeholder is allocated rather than cast
+    # off ``dummy`` because the kernel reads only a disabled slot's pointer.
     cu_arg = (
-        kernel_cu_seqlens.to(torch.int32)
-        if kernel_cu_seqlens is not None
-        else dummy.to(torch.int32)
+        _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
-    co_arg = (
-        chunk_offsets.to(torch.int32)
-        if chunk_offsets is not None
-        else dummy.to(torch.int32)
-    )
+    co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
