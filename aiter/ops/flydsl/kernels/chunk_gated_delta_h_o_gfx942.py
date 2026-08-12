@@ -502,7 +502,6 @@ def compile_chunk_gated_delta_h_o_gfx942(
                         lds_h_ptr + _lds_h_idx(lds_h_v, lds_h_g),
                     )
 
-            gpu.barrier()
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
             for i_wp in range_constexpr(NUM_W_LOADS):
@@ -721,7 +720,7 @@ def compile_chunk_gated_delta_h_o_gfx942(
             # =============================================================== #
 
             # -- Store prefetched q into lds_q (aliases lds_w, dead after GEMM1) --
-            gpu.barrier()  # protect lds_w readers (GEMM1) before overwrite
+
             for i_qp in range_constexpr(NUM_W_LOADS):
                 qvec = q_prefetch[i_qp]
                 row, col = _w_slot(i_qp)
