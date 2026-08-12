@@ -2699,7 +2699,10 @@ def get_2stage_cfgs(
                 f"MXMOE GEMM1 activation {_p1.get('act')!r} does not match "
                 f"runtime activation {expected_act!r}"
             )
-        if _is_mxfp4_kname(kernelName2):
+        is_layout_gemm2 = isinstance(kernelName2, str) and kernelName2.startswith(
+            "flydsl_moe2_layout_"
+        )
+        if _is_mxfp4_kname(kernelName2) or is_layout_gemm2:
             stage2_func = functools.partial(
                 _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
             )

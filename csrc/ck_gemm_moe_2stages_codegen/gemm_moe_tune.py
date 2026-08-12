@@ -6450,7 +6450,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # A4W4 may pair the replacement GEMM1 with either native MXMOE GEMM2
         # or the layout-API v2 GEMM2.
         g2 = parse_g2_kname_any(kn2)
-        BM = g2["BM"]
+        # Native MXMOE uses one shared BM. Layout GEMM2 may re-tile M, while
+        # sorting and GEMM1 must retain GEMM1's block size (encoded as SBM in
+        # the layout kernel name).
+        BM = BM1 if g2["v2"] else g2["BM"]
         atomic = g2["atomic"]
         w1_a16, w1s_a16 = Mxfp4FlydslTuner._a4w4_stage1_inputs(data, p1["interleave"])
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
