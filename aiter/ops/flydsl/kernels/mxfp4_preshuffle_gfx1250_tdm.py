@@ -163,10 +163,11 @@ def launch_gemm_a8w4_tdm(
 
     SC_INNER = tile_k // 4
     _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
-    AS_SUPERS = tile_m // wmma_m_rep
-    AS_INNER = (tile_k // 128) * wmma_m_rep
-    # AS_SUPERS*AS_INNER is the true A-scale footprint
-    # (SA_SUPERS*SC_INNER collapses for tile_m<32)
+    AS_KSTEPS = tile_k // 128
+    AS_INNER = AS_KSTEPS * wmma_m_rep * 16
+    AS_SUPERS = m_warp
+    # One outer row is one wave's M tile. Its inner (k128, wm, lane16)
+    # layout gives each WMMA scale operand a contiguous 16-dword block.
     STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -279,7 +280,7 @@ def launch_gemm_a8w4_tdm(
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
-        AS_ROW = (K // 128) * wmma_m_rep
+        AS_ROW = (K // 128) * wmma_m_rep * 16
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -395,16 +396,26 @@ def launch_gemm_a8w4_tdm(
             wv,
             pad=None,
             wg_mask=0,
+            split_inner=False,
         ):
-            seg = outer // len(wv)
-            # Slice start along the outer dim; compile-time 0 for a cooperative
-            # list. The LDS term is in lds_row's unit (bytes A/B, dwords scales).
-            wave_outer_off = (wave - wv[0]) * seg if const_expr(len(wv) > 1) else 0
+            split_i = split_inner and len(wv) > 1
+            seg = outer if split_i else outer // len(wv)
+            inner_seg = inner // len(wv) if split_i else inner
+            wave_outer_off = (
+                0
+                if split_i or len(wv) == 1
+                else (wave - wv[0]) * seg
+            )
+            wave_inner_off = (
+                (wave - wv[0]) * inner_seg if split_i else 0
+            )
             gt = global_view(
                 g_base,
-                g_off + fx.Int64(wave_outer_off) * g_stride,
-                (seg, inner),
-                (inner, 1),
+                g_off
+                + fx.Int64(wave_outer_off) * g_stride
+                + fx.Int64(wave_inner_off),
+                (seg, inner_seg),
+                (g_stride, 1),
             )
             ext = None if oob is None else oob - wave_outer_off
             pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
@@ -427,9 +438,9 @@ def launch_gemm_a8w4_tdm(
                     atom,
                     gt,
                     on_i32,
-                    lds_off + wave_outer_off * lds_row,
+                    lds_off + wave_outer_off * lds_row + wave_inner_off,
                     lds_row,
-                    inner,
+                    inner_seg,
                     seg,
                     k_adv,
                     wv,
@@ -466,7 +477,7 @@ def launch_gemm_a8w4_tdm(
         )
         add_tdm_loads(
             gSA_base,
-            (blk_m64 // wmma_m_rep) * AS_ROW,
+            (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
             AS_ROW,
             None,
             AS_INNER,
@@ -476,6 +487,7 @@ def launch_gemm_a8w4_tdm(
             lds_row=AS_INNER,
             k_adv=AS_INNER * 4,
             wv=waves[2],
+            split_inner=AS_SUPERS < len(waves[2]),
         )
         add_tdm_loads(
             gSB_base,
@@ -554,9 +566,9 @@ def launch_gemm_a8w4_tdm(
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
         lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
-        lds_sa_lane_off = (
-            SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + kgrp * 4
-        )
+        assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
+        sa_lane = lane16 if wmma_m_rep == 1 else lane
+        lds_sa_lane_off = SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
         # One full-wave load covers both 16-column halves of an N32 scale
         # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
         assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
@@ -607,8 +619,8 @@ def launch_gemm_a8w4_tdm(
                 Vec(lds_load_b128(base, fx.Int32(off + 512))), list(range(8))
             )
 
-        def load_sa(buf, wm, ksl):
-            off = (ksl * wmma_m_rep + wm) * 4
+        def load_sa(buf, sm, ksl):
+            off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
@@ -616,17 +628,21 @@ def launch_gemm_a8w4_tdm(
             return lds_load_b32(lds_sb_base(buf), fx.Int32(off))[0]
 
         wmma_atoms = [
-            fx.make_mma_atom(
-                fx.rocdl.WMMAScale(
-                    WMMA_M,
-                    WMMA_N,
-                    WMMA_K,
-                    fx.Float4E2M1FN,
-                    ACT_ELEM,
-                    fx.Float32,
-                    opsel_a=sb_sel,
+            [
+                fx.make_mma_atom(
+                    fx.rocdl.WMMAScale(
+                        WMMA_M,
+                        WMMA_N,
+                        WMMA_K,
+                        fx.Float4E2M1FN,
+                        ACT_ELEM,
+                        fx.Float32,
+                        opsel_a=sb_sel,
+                        opsel_b=sa_sel,
+                    )
                 )
-            )
+                for sa_sel in range_constexpr(2)
+            ]
             for sb_sel in range_constexpr(2)
         ]
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
@@ -652,22 +668,23 @@ def launch_gemm_a8w4_tdm(
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(
-                        wmma_atoms[wn % 2],
+                        wmma_atoms[wn % 2][wm % 2],
                         c_frags[idx],
                         wt[wn],
                         act[i],
                         c_frags[idx],
                         scale_a=sb_k[wn // 2],
-                        scale_b=sa_k[wm],
+                        scale_b=sa_k[wm // 2],
                     )
 
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
         sb_pairs = wmma_n_rep // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + wmma_m_rep
+        sa_pairs = (wmma_m_rep + 1) // 2
+        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
-        SA_WIDTH, SB_WIDTH = max(2, wmma_m_rep), max(2, sb_pairs)
+        SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
         RmemSlot = namedtuple("RmemSlot", "a b sa sb")
 
         def make_rmem_slot():
@@ -702,8 +719,8 @@ def launch_gemm_a8w4_tdm(
             for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(buf, wn, ksl))
             sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
-            sa_v = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
-            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - wmma_m_rep]))
+            sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
+            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             # Pin all four past the scale loads, or the allocator reuses a base
             # as a scale destination and the backend gates that WAR with vm_vsrc.
@@ -1013,7 +1030,9 @@ def launch_gemm_a8w4_tdm(
                 )
                 scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
-                q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
+                # i32_n is the pre-activation gate+up width; the quantized
+                # output has half as many columns and one scale dword per K128.
+                q_dst_scale_dwpr = i32_n // 256
 
                 v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
@@ -1030,8 +1049,7 @@ def launch_gemm_a8w4_tdm(
                         scale_tile = row_i32 >> QRPT_LOG2
                         row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
                         wmma_row = row_in_tile >> 4
-                        out_row = (scale_tile << 4) | (row_in_tile & 15)
-                        out_row_scaled = out_row * q_dst_scale_dwpr + wmma_row
+                        scale_lane = row_in_tile & 15
 
                         e8m0_bytes = []
                         mx_blk_is = []
@@ -1096,7 +1114,13 @@ def launch_gemm_a8w4_tdm(
                                 scale_dw = mx_blk_is[mx_blk] >> 2
                                 byte_in_dw = mx_blk_is[mx_blk] & 3
                                 dst_byte = (
-                                    out_row_scaled + scale_dw * quant_wmma_rep
+                                    (
+                                        (scale_tile * q_dst_scale_dwpr + scale_dw)
+                                        * quant_wmma_rep
+                                        + wmma_row
+                                    )
+                                    * 16
+                                    + scale_lane
                                 ) * 4 + byte_in_dw
                                 fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
             else:

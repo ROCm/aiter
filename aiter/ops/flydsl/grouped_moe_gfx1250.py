@@ -233,7 +233,9 @@ def _grouped_a8w4_preshuffle_e8m0_scale(
     k_groups = k_scale // scale_k_per_tile
     k_wmma_steps = scale_k_per_tile // 4
     g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
-    g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
+    # Keep one WMMA's 16 scale dwords contiguous. A full-wave LDS read then
+    # fills two adjacent M16 scale operands, selected by SCL_OPSEL_B.
+    g = g.permute(0, 1, 4, 5, 2, 3, 6).contiguous()
     return g.reshape(E, -1, k_groups * k_wmma_steps * wmma_rep * 4)
 
 
