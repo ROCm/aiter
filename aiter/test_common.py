@@ -485,8 +485,16 @@ def checkAllclose(
     printLog=True,
     max_abs_delta=None,
     catastrophic_check=False,
+    mask=None,
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+    # mask (bool, broadcastable to a/b): True = compare, False = ignore.
+    # Error ratio is taken over the checked elements only.
+    if mask is not None:
+        isClose = isClose | ~mask
+        denom = int(mask.sum().item())
+    else:
+        denom = a.numel()
 
     if isClose.all():
         if printLog:
@@ -497,7 +505,7 @@ def checkAllclose(
             mask = ~isClose
             num = mask.sum()
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = (num / denom).item()
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -512,7 +520,7 @@ def checkAllclose(
             mask = ~isClose.to("cpu")
             num = mask.sum()
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = (num / denom).item()
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -552,12 +560,12 @@ def checkAllclose(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
         logger.info(
-            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
+            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {denom}) elements"
         )
         if is_catastrophic:
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
-                f"{percent:.1%} ({num} of {a.numel()}) elements mismatch"
+                f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
         return percent
 
