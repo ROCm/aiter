@@ -95,6 +95,24 @@ def _scale_bytes(scale):
     return scale if scale.dtype == dtypes.u8 else scale.view(dtypes.u8)
 
 
+def _decode_shuffled_scale(scale_shuffled, S, G, Ks, group_size):
+    """Shuffled scale -> logical [S, G, Ks], picking the layout by group size.
+
+    scale_shuffle means the MX tile swizzle only at group_size 32; at 1x64/1x128
+    it is the plain transpose, since a scale byte then spans the whole MFMA K
+    step and is broadcast rather than op_sel-selected. Mirrors the store branch
+    in csrc/kernels/inverse_rope_group_quant.cu.
+    """
+    if group_size == 32:
+        return _unshuffle_mfma_scale(scale_shuffled, S, G, Ks)
+    return _untranspose_scale(scale_shuffled, S, Ks)
+
+
+def _untranspose_scale(scale_t, S, Ks):
+    """Transposed scale [G, Ks_pad, S_pad] -> logical [S, G, Ks]."""
+    return _scale_bytes(scale_t)[:, :Ks, :S].permute(2, 0, 1).contiguous()
+
+
 def _unshuffle_mfma_scale(scale_shuffled, S, G, Ks):
     """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks]."""
     flat = _scale_bytes(scale_shuffled).flatten().cpu()
@@ -152,9 +170,11 @@ def _alloc_outputs(s, g, d, group_size, scale_shuffle=False):
     x_fp8 = torch.empty((s, g, d), dtype=get_dtype_fp8())
     ks = d // group_size
     if scale_shuffle:
-        s_pad = ((s + 31) // 32) * 32
-        ks_pad = ((ks + 7) // 8) * 8
-        x_scale = torch.full((g, s_pad, ks_pad), 0x7F, dtype=dtypes.fp8_e8m0)
+        if group_size == 32:
+            shape = (g, ((s + 31) // 32) * 32, ((ks + 7) // 8) * 8)
+        else:
+            shape = (g, ks, s)
+        x_scale = torch.full(shape, 0x7F, dtype=dtypes.fp8_e8m0)
     else:
         x_scale = torch.empty((s, g, ks), dtype=dtypes.fp8_e8m0)
     return x_fp8, x_scale
@@ -345,7 +365,7 @@ def test_inverse_rope_group_quant(
         _, us = run_perftest(cand.bench)
         _check_scale_layout(x_scale, s, cand.scale_shuffle, name)
         if cand.scale_shuffle:
-            scale_u8 = _unshuffle_mfma_scale(x_scale, s, g, scale_n)
+            scale_u8 = _decode_shuffled_scale(x_scale, s, g, scale_n, group_size)
         else:
             scale_u8 = _scale_bytes(x_scale)
         dq = (
@@ -545,7 +565,9 @@ def main():
         default=["row", "shuffle"],
         help="""e8m0 scale storage:
         row = contiguous [s, g, ks],
-        shuffle = V_MFMA_SCALE_F32_16x16x128_F8 tile-shuffled [g, s_pad, ks_pad].
+        shuffle = group-size dependent -- at 32 the
+        V_MFMA_SCALE_F32_16x16x128_F8 tile swizzle [g, s_pad, ks_pad], at any
+        other group size the transpose [g, ks, s].
         e.g.: -l shuffle""",
     )
     parser.add_argument(
