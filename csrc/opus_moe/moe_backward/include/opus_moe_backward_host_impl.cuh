@@ -200,7 +200,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     // inter-expert load balance without extending the source reuse window.
     constexpr int cohort2_kid = 8;
     constexpr int cohort2_bm128_double_lds_kid = 9;
-    constexpr int cohort2_bm256_double_lds_kid = 10;
+    constexpr int cohort2_bm256_wave4_double_lds_kid = 11;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -216,12 +216,13 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
         static_cast<uint64_t>(kargs.route.sorted_capacity) > two_tile_rows;
     if(bm128_compatible)
     {
-        // BM256 keeps the same four native accumulator tiles per wave while
-        // eight waves share one gathered-X tile.  Its 512-thread workgroup
-        // needs either a sufficiently wide output grid or a long reduction
-        // to amortize the lower CTA residency.  Express the crossover using
-        // only host-visible grouped-GEMM geometry; no model tuple or routing
-        // distribution is synchronized back to the host.
+        // BM256 lets four waves share one gathered-X tile, with each wave
+        // owning eight independent native accumulator tiles.  The larger
+        // register footprint pays off once the reduction is long enough and
+        // the output grid either covers six CTAs per gfx950 CU or forms the
+        // smaller four-CTA-per-CU full-residency grid.  Express the crossover
+        // only in host-visible grouped-GEMM geometry; no model tuple or
+        // routing distribution is synchronized back to the host.
         const uint64_t average_padded_routes =
             static_cast<uint64_t>(kargs.route.sorted_capacity) /
             static_cast<uint64_t>(kargs.route.num_experts);
@@ -231,13 +232,17 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
             static_cast<uint64_t>((2 * kargs.inter_dim) / 256) *
             static_cast<uint64_t>(kargs.model_dim / 128);
         constexpr uint64_t min_average_routes = 2048;
-        constexpr uint64_t long_reduction_routes = 8192;
+        constexpr uint64_t compact_full_residency_tiles = 1024;
+        constexpr uint64_t compact_grid_alignment = 512;
         constexpr uint64_t min_output_tiles = 1536;
+        const bool compact_full_residency_grid =
+            bm256_output_tiles >= compact_full_residency_tiles &&
+            bm256_output_tiles < min_output_tiles &&
+            bm256_output_tiles % compact_grid_alignment == 0;
         if(bm256_compatible && average_padded_routes >= min_average_routes &&
            (bm256_output_tiles >= min_output_tiles ||
-            kargs.route.num_experts == 8 ||
-            average_padded_routes >= long_reduction_routes))
-            return cohort2_bm256_double_lds_kid;
+            compact_full_residency_grid))
+            return cohort2_bm256_wave4_double_lds_kid;
         return cohort2_bm128_double_lds_kid;
     }
     return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;

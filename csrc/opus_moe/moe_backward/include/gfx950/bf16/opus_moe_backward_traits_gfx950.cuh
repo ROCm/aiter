@@ -459,6 +459,49 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32SwizzledCohort2DoubleLds
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+// Cover the same BM256xBN128 tile with four waves.  Each wave owns twice as
+// many independent C fragments, trading VGPRs for fewer scheduled waves and
+// more MFMA chains between the transpose-LDS waits.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
+    : Bf16Traits<Family::Dw1, 256, 128, 32, 256, 1, false>
+{
+    static constexpr int EXPERT_COHORT = 2;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DOUBLE_BUFFER = true;
+    static constexpr bool PIPELINE_REDUCTION_FRAGMENTS = true;
+    static constexpr int EMPTY_M_TILES_PER_CTA = 8;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 4;
+    static constexpr int E_N = 2;
+    static constexpr int E_K = 2;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 0;
+    static constexpr int SMEM_B_ROW_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

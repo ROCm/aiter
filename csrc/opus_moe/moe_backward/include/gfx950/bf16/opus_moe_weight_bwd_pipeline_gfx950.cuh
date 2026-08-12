@@ -162,7 +162,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
     static_assert(T::BLOCK_SIZE == 512 ? (BM == 256 && BN == 128)
-                                      : BM <= 128);
+                                      : (BM <= 128 ||
+                                         (BM == 256 && BN == 128)));
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
     constexpr int a_m_slabs = BM / 64;
     constexpr int b_n_slabs = BN / 128;

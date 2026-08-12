@@ -86,7 +86,8 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |
 | K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
-| K4 `dw1` wide/long family | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
+| K4 `dw1` wide/long wave8 baseline | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
+| K4 `dw1` wide/long production | 11 | `BM256 x BN128 x BK32`, 256 threads + eight native C tiles per wave |
 | K5 `dw2` | 3 | `BM64 x BN64 x BK64` |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
@@ -112,12 +113,15 @@ its gathered-dO vector work exactly three loads per thread; the CTA threshold
 prevents that wider reuse window from starving gfx950 on smaller grids.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
-tuple. Kid 10 is selected once the average padded expert interval reaches 2048
-routes and either its BM256 output grid has at least 1536 tiles, there are
-eight experts, or the average interval reaches 8192 routes. Eight waves then
-share one gathered-X tile, while empty experts coalesce eight adjacent M tiles
-per zeroing CTA. Kid 9 retains short reductions and small output grids; kid 8
-covers large BM64 problems, and kid 5 remains the small/degenerate fallback.
+tuple. Kid 11 is selected once the average padded expert interval reaches
+2048 routes and its BM256 output grid either has at least 1536 tiles or forms
+the smaller 1024-tile full-residency grid. Four waves then share one gathered-X
+tile; each wave owns eight independent native C tiles, using 194 VGPRs and
+48 KiB LDS with no scratch or register spills. Kid 9 retains short reductions
+and smaller output grids; this avoids the old expert-count proxy selecting
+BM256 for narrow `2I` grids. Kid 8 covers large BM64 problems, and kid 5
+remains the small/degenerate fallback. Kid 10 remains available as the
+512-thread wave8 comparison instance but is not selected by production auto.
 
 ## Shape contract
 
