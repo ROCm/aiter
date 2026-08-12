@@ -47,11 +47,8 @@ except ImportError:
 
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
-    _make_mxfp4_g1_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
-    _select_mxfp4_a4w4_kernels,
-    _select_mxfp4_g1_kernel,
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
@@ -2020,79 +2017,6 @@ def _mxfp4_scale_u8(scale):
     return scale
 
 
-def _can_use_mxfp4_a4w4_backend(
-    *,
-    gfx,
-    activation,
-    dtype,
-    q_dtype_a,
-    q_dtype_w,
-    q_type,
-    use_g1u1,
-    doweight_stage1,
-    model_dim,
-    inter_dim,
-    expert,
-    topk,
-    is_shuffled,
-    is_ep,
-    has_stage2_bias,
-    flydsl_available,
-    replacement_enabled,
-):
-    """Return whether the complete MXFP4 sort/GEMM1/GEMM2 path is compatible."""
-    padded_inter = ((inter_dim + 255) // 256) * 256
-    shape = (expert, model_dim, padded_inter, topk)
-    dsv4_a8w4_shapes = {
-        (384, 7168, 512, 6),
-        (384, 7168, 768, 6),
-        (384, 7168, 1536, 6),
-        (385, 7168, 512, 7),
-        (385, 7168, 768, 7),
-        (385, 7168, 1536, 7),
-        (48, 7168, 3072, 6),
-        (256, 4096, 256, 6),
-    }
-    kimi_k3_shape = (896, 3584, 512, 16)
-    if q_dtype_a == dtypes.fp8:
-        supported_a8w4_variant = (
-            activation == ActivationType.Silu and shape in dsv4_a8w4_shapes
-        ) or (
-            activation == getattr(ActivationType, "Situv2", None)
-            and shape == kimi_k3_shape
-        )
-    else:
-        # KimiK3's FP4-input variant is intentionally unsupported.
-        supported_a8w4_variant = shape != kimi_k3_shape
-    return (
-        replacement_enabled
-        and flydsl_available
-        and gfx == "gfx950"
-        and (
-            activation == ActivationType.Silu
-            or activation == getattr(ActivationType, "Situv2", None)
-        )
-        and dtype == torch.bfloat16
-        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-        and q_dtype_w == dtypes.fp4x2
-        and (activation == ActivationType.Silu or q_dtype_a == dtypes.fp8)
-        and supported_a8w4_variant
-        and q_type == QuantType.per_1x32
-        and use_g1u1
-        and not doweight_stage1
-        and is_shuffled
-        and not is_ep
-        and not has_stage2_bias
-        and model_dim % 256 == 0
-        and aiter.is_mxfp4_moe_shape_supported(
-            expert,
-            model_dim,
-            inter_dim,
-            topk,
-        )
-    )
-
-
 def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
@@ -2545,112 +2469,6 @@ def get_2stage_cfgs(
             cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
             cfg_flat = 0
-
-    can_use_mxmoe = _can_use_mxfp4_a4w4_backend(
-        gfx=gfx,
-        activation=activation,
-        dtype=dtype,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        q_type=q_type,
-        use_g1u1=use_g1u1,
-        doweight_stage1=doweight_stage1,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        expert=expert,
-        topk=topk,
-        is_shuffled=is_shuffled,
-        is_ep=is_ep,
-        has_stage2_bias=has_stage2_bias,
-        flydsl_available=is_flydsl_available(),
-        replacement_enabled=os.environ.get("AITER_MXFP4_GEMM1_REPLACEMENT", "1").lower()
-        not in ("0", "false"),
-    )
-    is_a8w4_replacement = q_dtype_a == dtypes.fp8
-    locked_a8w4_g2 = isinstance(kernelName2, str) and kernelName2.startswith(
-        ("flydsl_moe2_afp8_wfp4_", "opus_moe2_afp8_wfp4_", "cktile_")
-    )
-    explicit_a8w4_replacement = _is_mxfp4_kname(kernelName1)
-    if can_use_mxmoe and (
-        not is_a8w4_replacement or (explicit_a8w4_replacement and locked_a8w4_g2)
-    ):
-        if is_a8w4_replacement:
-            act = (
-                "situv2"
-                if activation == getattr(ActivationType, "Situv2", None)
-                else "silu"
-            )
-            interleave = (
-                gate_mode == GateMode.INTERLEAVE or "_gui" in str(kernelName1).lower()
-            )
-            p1 = None
-            if _is_mxfp4_kname(kernelName1):
-                try:
-                    p1 = _parse_mxfp4_g1_kname(kernelName1)
-                except ValueError:
-                    # Older provisional a8w4 names did not encode SiTU betas.
-                    p1 = None
-            if p1 is not None and p1["a_dtype"] == "fp8":
-                interleave = p1["interleave"] or interleave
-                block_m = p1["BM"]
-                kernelName1 = _make_mxfp4_g1_kname(
-                    BM=p1["BM"],
-                    BN=p1["BN"],
-                    BK=p1["BK"],
-                    a_dtype="fp8",
-                    out_dtype=p1["out_dtype"],
-                    act=act,
-                    inline_quant=p1["inline_quant"],
-                    use_nt=p1["use_nt"],
-                    interleave=interleave,
-                    kSplitK=p1["kSplitK"],
-                    xcd_swizzle=p1["xcd_swizzle"],
-                    num_waves=p1.get("num_waves", 4),
-                )
-            else:
-                replacement = _select_mxfp4_g1_kernel(
-                    token=token,
-                    expert=expert,
-                    topk=topk,
-                    block_m=int(block_m),
-                    a_dtype="fp8",
-                    out_dtype="fp8",
-                    act=act,
-                    interleave=interleave,
-                )
-                block_m = replacement["BM"]
-                kernelName1 = replacement["kernelName1"]
-        else:
-            has_tuned_replacement = _is_mxfp4_kname(kernelName1) and bool(
-                str(kernelName2)
-            )
-            if has_tuned_replacement:
-                block_m = _parse_mxfp4_g1_kname(kernelName1)["BM"]
-            else:
-                replacement = _select_mxfp4_a4w4_kernels(
-                    token=token,
-                    expert=expert,
-                    topk=topk,
-                )
-                block_m = replacement["BM"]
-                kernelName1 = replacement["kernelName1"]
-                kernelName2 = replacement["kernelName2"]
-        ksplit = 0
-        run_1stage = False
-        run_1stage_xbf16 = False
-        cfg_flat = False
-        cfg = {
-            **(cfg or {}),
-            "block_m": block_m,
-            "ksplit": 0,
-            "kernelName1": kernelName1,
-            "kernelName2": kernelName2,
-            "run_1stage": False,
-        }
-        logger.info(
-            "[fused_moe] replacing tuned GEMM1 with MXMOE backend "
-            f"({kernelName1=}, {kernelName2=})"
-        )
 
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
