@@ -151,6 +151,27 @@ inline int select_fixed_route_dx_kernel_id(const RouteDxKargs& kargs,
     return kargs.model_dim % 256 == 0 ? bn256_m3_kid : cohort10_m5_kid;
 }
 
+inline bool select_fixed_down_bn256_geometry(const DownBwdKargs& kargs)
+{
+    if(kargs.route.expert_offsets == nullptr || kargs.inter_dim < 512 ||
+       kargs.inter_dim % 256 != 0)
+        return false;
+
+    // BN256/M6 groups six adjacent sorter tiles and the compact launcher
+    // rounds groups to four-group cohorts.  Below this grid size its wider
+    // accumulator footprint cannot hide the lower workgroup count; above it,
+    // halving gathered dO and dScore-part traffic wins across D/E/K families.
+    constexpr uint64_t min_ctas = 384;
+    const uint64_t sorted_blocks =
+        static_cast<uint64_t>(kargs.route.sorted_block_capacity);
+    const uint64_t groups =
+        (sorted_blocks + 5ull) / 6ull +
+        static_cast<uint64_t>(kargs.route.num_experts);
+    const uint64_t padded_groups = ((groups + 3ull) / 4ull) * 4ull;
+    const uint64_t parts = static_cast<uint64_t>(kargs.inter_dim / 256);
+    return padded_groups * parts >= min_ctas;
+}
+
 inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
                                        int requested_kernel_id)
 {
@@ -160,10 +181,14 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
     constexpr int legacy_kid = 2;
     constexpr int five_route_tiles_predecoded_kid = 9;
     constexpr int six_route_tiles_predecoded_kid = 10;
+    constexpr int bn256_six_route_tiles_predecoded_kid = 11;
     constexpr uint64_t grouped_min_ctas = 256;
     constexpr uint64_t six_route_min_ctas = 640;
     if(kargs.route.expert_offsets == nullptr || kargs.d_scores_parts <= 1)
         return legacy_kid;
+
+    if(select_fixed_down_bn256_geometry(kargs))
+        return bn256_six_route_tiles_predecoded_kid;
 
     // Select from the useful M6 launch geometry rather than a model tuple or
     // an indirect tensor-byte proxy.  Each compact group owns up to six
@@ -1316,7 +1341,19 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     const int inter_dim = static_cast<int>(w2.size(2));
     const int topk = static_cast<int>(scores.size(1));
     const int sorted_capacity = static_cast<int>(sorted_token_ids.size(0));
-    constexpr int kFirstDownBlockN = 128;
+    opus_moe_backward::DownBwdKargs geometry{};
+    geometry.route.expert_offsets = reinterpret_cast<const int32_t*>(
+        expert_padded_offsets.data_ptr());
+    geometry.route.num_experts = num_experts;
+    geometry.route.sorted_block_capacity =
+        static_cast<int>(sorted_expert_ids.size(0));
+    geometry.inter_dim = inter_dim;
+    const bool use_bn256 =
+        kernel_id == 11 ||
+        (kernel_id == opus_moe_backward::kKernelAuto &&
+         opus_moe_backward::detail::select_fixed_down_bn256_geometry(
+             geometry));
+    const int kFirstDownBlockN = use_bn256 ? 256 : 128;
     const int d_scores_parts =
         (inter_dim + kFirstDownBlockN - 1) / kFirstDownBlockN;
 
@@ -1352,7 +1389,8 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     {
         AITER_CHECK(d_scores_workspace.size(0) == route_count &&
                         d_scores_workspace.size(1) == d_scores_parts,
-                    "d_scores_workspace must have shape [T*K,ceil(I/128)]");
+                    "d_scores_workspace has the wrong shape for the selected "
+                    "down_bwd tile");
     }
 
     opus_moe_backward::DownBwdKargs kargs{};
@@ -2140,7 +2178,19 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
     const int inter_dim = gate_up_dim / 2;
     const int topk = static_cast<int>(scores.size(1));
     const int sorted_capacity = static_cast<int>(sorted_token_ids.size(0));
-    constexpr int kFirstDownBlockN = 128;
+    opus_moe_backward::DownBwdKargs down_geometry{};
+    down_geometry.route.expert_offsets = reinterpret_cast<const int32_t*>(
+        expert_padded_offsets.data_ptr());
+    down_geometry.route.num_experts = num_experts;
+    down_geometry.route.sorted_block_capacity =
+        static_cast<int>(sorted_expert_ids.size(0));
+    down_geometry.inter_dim = inter_dim;
+    const bool use_bn256 =
+        down_kernel_id == 11 ||
+        (down_kernel_id == opus_moe_backward::kKernelAuto &&
+         opus_moe_backward::detail::select_fixed_down_bn256_geometry(
+             down_geometry));
+    const int kFirstDownBlockN = use_bn256 ? 256 : 128;
     const int d_scores_parts =
         (inter_dim + kFirstDownBlockN - 1) / kFirstDownBlockN;
 
@@ -2204,7 +2254,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                             static_cast<int64_t>(token_num) * topk &&
                             d_scores_workspace.size(1) == d_scores_parts,
                         "d_scores_workspace must have shape "
-                        "[T*K,ceil(I/128)]");
+                        "[T*K,ceil(I/down_block_n)]");
         }
     }
 

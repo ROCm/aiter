@@ -108,6 +108,32 @@ def _select_internal_fixed_route_pair(
     return -1, -1
 
 
+def _select_fixed_down_block_n(
+    inter_dim: int,
+    sorted_expert_ids: Tensor,
+    expert_padded_offsets: Tensor,
+    kernel_id: int,
+) -> int:
+    """Mirror native K1 dispatch so workspace shape and kernel stay coupled."""
+
+    if kernel_id == 11:
+        if inter_dim % 256 != 0:
+            raise ValueError("down kernel 11 requires I divisible by 256")
+        return 256
+    if kernel_id != -1 or inter_dim < 512 or inter_dim % 256 != 0:
+        return 128
+
+    # BN256/M6 groups six adjacent sorter tiles.  The compact launcher adds
+    # one boundary group per expert, rounds the result to four-group cohorts,
+    # then launches one CTA per 256 intermediate columns.  A wider N tile
+    # wins only once this geometry exposes enough work for all gfx950 CUs.
+    groups = (sorted_expert_ids.numel() + 5) // 6
+    groups += expert_padded_offsets.numel() - 1
+    padded_groups = ((groups + 3) // 4) * 4
+    candidate_ctas = padded_groups * (inter_dim // 256)
+    return 256 if candidate_ctas >= 384 else 128
+
+
 @dataclass(frozen=True)
 class OpusMoeWeightBackwardOutput:
     d_w1: Tensor
@@ -521,7 +547,10 @@ def opus_moe_down_backward(
         )
 
     route_num = int(topk_weights.numel())
-    d_scores_parts = (inter_dim + 127) // 128
+    down_block_n = _select_fixed_down_block_n(
+        inter_dim, sorted_expert_ids, expert_padded_offsets, kernel_id
+    )
+    d_scores_parts = (inter_dim + down_block_n - 1) // down_block_n
     d_z = torch.empty_like(z_sorted)
     a_scaled = torch.empty(
         (z_sorted.shape[0], inter_dim),
@@ -1369,7 +1398,13 @@ def opus_moe_backward(
         d_out, x, z_sorted, w1, w2, route_weights, metadata, b1, b2
     )
     sorted_capacity = metadata.sorted_token_ids.numel()
-    d_scores_parts = (inter_dim + 127) // 128
+    down_block_n = _select_fixed_down_block_n(
+        inter_dim,
+        metadata.sorted_expert_ids,
+        metadata.expert_padded_offsets,
+        down_kernel_id,
+    )
+    d_scores_parts = (inter_dim + down_block_n - 1) // down_block_n
     d_scores_workspace = torch.empty(
         (route_weights.numel(), d_scores_parts)
         if d_scores_parts > 1

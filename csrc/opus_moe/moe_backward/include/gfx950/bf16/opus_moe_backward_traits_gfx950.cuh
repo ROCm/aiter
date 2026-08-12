@@ -133,6 +133,24 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM6Cohort24Predecoded
     static constexpr int ROUTE_COHORT_TILES = 24;
 };
 
+// Double the intermediate-column tile while retaining M6 W2 reuse.  Four
+// waves each own two 32-column MFMA repeats, halving gathered dO traffic and
+// dScore workspace/finalize traffic for sufficiently large launch grids.
+struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
+    : DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM6Cohort24Predecoded
+{
+    static constexpr int B_N = 256;
+    static constexpr int E_N = 2;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES =
+        SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
+    static constexpr int SMEM_B_GROUP_BYTES =
+        SMEM_B_GROUP_DATA_BYTES + SMEM_B_GROUP_PAD_BYTES;
+    static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
+    static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+    static_assert(B_N == T_N * W_N * E_N);
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>

@@ -462,33 +462,50 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 
             constexpr int vectors_per_group =
                 T::SMEM_B_GROUP_DATA_BYTES / (T::VEC_B * sizeof(D_B));
-            static_assert(vectors_per_group == opus::get_warp_size());
+            static_assert(vectors_per_group % opus::get_warp_size() == 0);
+            constexpr int b_loads_per_wave =
+                vectors_per_group / opus::get_warp_size();
+            constexpr int n_vectors = BN / T::VEC_B;
+            static_assert(opus::get_warp_size() % n_vectors == 0);
+            constexpr int source_rows_per_issue =
+                opus::get_warp_size() / n_vectors;
+            static_assert(source_rows_per_issue * b_loads_per_wave ==
+                          T::SMEM_B_GROUP_ROWS);
             static_assert(T::SMEM_B_GROUPS == 4 * T::E_K);
             constexpr int mfma_stage_groups =
                 T::W_K / T::SMEM_B_GROUP_ROWS;
             constexpr int mfma_stage_bytes =
                 mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
             constexpr int mfma_stage_rows = T::W_K;
-            const int b_local_k =
-                wave_id +
-                (lane_id / (BN / T::VEC_B)) * T::SMEM_B_GROUP_ROWS;
-            const int b_local_n = (lane_id % (BN / T::VEC_B)) * T::VEC_B;
-            const int b_global_offset =
-                (tile_k * BK + b_local_k) * stride_w2_d + col_base +
-                b_local_n;
+            const int b_local_n = (lane_id % n_vectors) * T::VEC_B;
             OPUS_LDS_ADDR char* b_wave_dst =
                 reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
                 wave_id * T::SMEM_B_GROUP_BYTES;
             opus::static_for<T::E_K>([&](auto ek) {
-                g_b.template _async_load<T::VEC_B>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(
-                        b_wave_dst + ek.value * mfma_stage_bytes),
-                    (b_global_offset +
-                     ek.value * mfma_stage_rows * stride_w2_d) *
-                        sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
+                constexpr int stage_offset =
+                    ek.value * mfma_stage_bytes;
+                opus::static_for<b_loads_per_wave>([&](auto load) {
+                    constexpr int load_byte_offset =
+                        load.value * opus::get_warp_size() * T::VEC_B *
+                        sizeof(D_B);
+                    const int b_local_k =
+                        wave_id +
+                        ((lane_id / n_vectors) +
+                         load.value * source_rows_per_issue) *
+                            T::T_N;
+                    const int b_global_offset =
+                        (tile_k * BK + b_local_k +
+                         ek.value * mfma_stage_rows) *
+                            stride_w2_d +
+                        col_base + b_local_n;
+                    g_b.template _async_load<T::VEC_B>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(
+                            b_wave_dst + stage_offset + load_byte_offset),
+                        b_global_offset * sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+                });
             });
         };
 
@@ -535,9 +552,10 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         reinterpret_cast<OPUS_LDS_ADDR float*>(s_ds.ptr);
 
     auto store_epilogue = [&](auto& accum, int route_group) {
-        static_assert(ROUTE_M == 32 && BN == 128);
+        static_assert(ROUTE_M == 32);
+        static_assert(BN == T::T_N * T::W_N * T::E_N);
         static_assert(T::T_M == 1 && T::T_N == 4);
-        static_assert(T::E_M == 1 && T::E_N == 1 && T::VEC_C == 4);
+        static_assert(T::E_M == 1 && T::E_N >= 1 && T::VEC_C == 4);
         using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
 
         // Preserve FP32 precision through the fused activation backward.
@@ -547,20 +565,24 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         // latter can coalesce its second result with the first when the
         // inputs come directly from an FP32 MFMA accumulator.
 #pragma unroll
-        for(int group = 0; group < 2; ++group)
+        for(int repeat = 0; repeat < T::E_N; ++repeat)
         {
 #pragma unroll
-            for(int i = 0; i < 4; ++i)
+            for(int group = 0; group < 2; ++group)
             {
-                const int lo = group * 8 + i;
-                const int hi = lo + 4;
-                uint32_t lo_bits = __builtin_bit_cast(
-                    uint32_t, static_cast<float>(accum[lo]));
-                uint32_t hi_bits = __builtin_bit_cast(
-                    uint32_t, static_cast<float>(accum[hi]));
-                down_bwd_permlane32_swap(lo_bits, hi_bits);
-                accum[lo] = __builtin_bit_cast(float, lo_bits);
-                accum[hi] = __builtin_bit_cast(float, hi_bits);
+#pragma unroll
+                for(int i = 0; i < 4; ++i)
+                {
+                    const int lo = repeat * 16 + group * 8 + i;
+                    const int hi = lo + 4;
+                    uint32_t lo_bits = __builtin_bit_cast(
+                        uint32_t, static_cast<float>(accum[lo]));
+                    uint32_t hi_bits = __builtin_bit_cast(
+                        uint32_t, static_cast<float>(accum[hi]));
+                    down_bwd_permlane32_swap(lo_bits, hi_bits);
+                    accum[lo] = __builtin_bit_cast(float, lo_bits);
+                    accum[hi] = __builtin_bit_cast(float, hi_bits);
+                }
             }
         }
 
@@ -616,94 +638,101 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
         const down_bwd_f32x2 score2{score, score};
         const down_bwd_f32x2 one{1.0f, 1.0f};
-        const int local_n0 = wave_id_n * 32 + (lane_id / 32) * 8;
-
-        // Fetch both non-adjacent eight-column fragments before starting
-        // the activation math.  Four independent 128-bit loads replace
-        // eight serial 64-bit loads and overlap their global latency.
-        down_bwd_f32x8 z_gate_prefetch[2];
-        down_bwd_f32x8 z_up_prefetch[2];
-        if(valid)
-        {
-#pragma unroll
-            for(int group = 0; group < 2; ++group)
-            {
-                const int col = col_base + local_n0 + group * 16;
-                const int64_t z_base =
-                    static_cast<int64_t>(sorted_row) * stride_z_r +
-                    col;
-                z_gate_prefetch[group] =
-                    down_bwd_load_bf16x8(kargs.z + z_base);
-                z_up_prefetch[group] = down_bwd_load_bf16x8(
-                    kargs.z + z_base + inter_dim);
-            }
-        }
-
         float ds_wave_partial = 0.0f;
 #pragma unroll
-        for(int group = 0; group < 2; ++group)
+        for(int repeat = 0; repeat < T::E_N; ++repeat)
         {
-            const int local_n = local_n0 + group * 16;
-            const int col = col_base + local_n;
-            u32x4 d_gate_store{};
-            u32x4 d_up_store{};
-            u32x4 scaled_store{};
-            float ds_partial = 0.0f;
+            const int local_n0 =
+                repeat * T::T_N * T::W_N + wave_id_n * T::W_N +
+                (lane_id / 32) * 8;
+
+            // Fetch both non-adjacent eight-column fragments before starting
+            // the activation math.  Four independent 128-bit loads replace
+            // eight serial 64-bit loads and overlap their global latency.
+            down_bwd_f32x8 z_gate_prefetch[2];
+            down_bwd_f32x8 z_up_prefetch[2];
 
             if(valid)
             {
 #pragma unroll
-                for(int pair = 0; pair < 4; ++pair)
+                for(int group = 0; group < 2; ++group)
                 {
-                    const int elem = pair * 2;
-                    const int acc_idx = group * 8 + elem;
-                    const down_bwd_f32x2 z_gate_pair{
-                        z_gate_prefetch[group][elem],
-                        z_gate_prefetch[group][elem + 1]};
-                    const down_bwd_f32x2 z_up_pair{
-                        z_up_prefetch[group][elem],
-                        z_up_prefetch[group][elem + 1]};
-                    const down_bwd_f32x2 sigmoid{
-                        down_bwd_sigmoid(z_gate_pair[0]),
-                        down_bwd_sigmoid(z_gate_pair[1])};
-                    const down_bwd_f32x2 silu = z_gate_pair * sigmoid;
-                    const down_bwd_f32x2 activation = silu * z_up_pair;
-                    const down_bwd_f32x2 g{
-                        static_cast<float>(accum[acc_idx]),
-                        static_cast<float>(accum[acc_idx + 1])};
-                    const down_bwd_f32x2 q = score2 * g;
-                    const down_bwd_f32x2 d_gate =
-                        q * z_up_pair * sigmoid *
-                        (one + z_gate_pair * (one - sigmoid));
-                    const down_bwd_f32x2 d_up = q * silu;
-                    const down_bwd_f32x2 scaled = score2 * activation;
-                    d_gate_store[pair] = down_bwd_cvt_pk_bf16_f32(
-                        d_gate[0], d_gate[1]);
-                    d_up_store[pair] =
-                        down_bwd_cvt_pk_bf16_f32(d_up[0], d_up[1]);
-                    scaled_store[pair] = down_bwd_cvt_pk_bf16_f32(
-                        scaled[0], scaled[1]);
-                    ds_partial += g[0] * activation[0] +
-                                  g[1] * activation[1];
+                    const int col = col_base + local_n0 + group * 16;
+                    const int64_t z_base =
+                        static_cast<int64_t>(sorted_row) * stride_z_r + col;
+                    z_gate_prefetch[group] =
+                        down_bwd_load_bf16x8(kargs.z + z_base);
+                    z_up_prefetch[group] = down_bwd_load_bf16x8(
+                        kargs.z + z_base + inter_dim);
                 }
             }
 
-            if(row_in_range && col + 8 <= inter_dim)
+#pragma unroll
+            for(int group = 0; group < 2; ++group)
             {
-                const int64_t dz_base =
-                    static_cast<int64_t>(sorted_row) * stride_dz_r +
-                    col;
-                *reinterpret_cast<u32x4*>(kargs.d_z + dz_base) =
-                    d_gate_store;
-                *reinterpret_cast<u32x4*>(
-                    kargs.d_z + dz_base + inter_dim) = d_up_store;
-                const int64_t a_scaled_base =
-                    static_cast<int64_t>(sorted_row) * stride_a_scaled_r +
-                    col;
-                *reinterpret_cast<u32x4*>(
-                    kargs.a_scaled + a_scaled_base) = scaled_store;
+                const int local_n = local_n0 + group * 16;
+                const int col = col_base + local_n;
+                u32x4 d_gate_store{};
+                u32x4 d_up_store{};
+                u32x4 scaled_store{};
+                float ds_partial = 0.0f;
+
+                if(valid)
+                {
+#pragma unroll
+                    for(int pair = 0; pair < 4; ++pair)
+                    {
+                        const int elem = pair * 2;
+                        const int acc_idx =
+                            repeat * 16 + group * 8 + elem;
+                        const down_bwd_f32x2 z_gate_pair{
+                            z_gate_prefetch[group][elem],
+                            z_gate_prefetch[group][elem + 1]};
+                        const down_bwd_f32x2 z_up_pair{
+                            z_up_prefetch[group][elem],
+                            z_up_prefetch[group][elem + 1]};
+                        const down_bwd_f32x2 sigmoid{
+                            down_bwd_sigmoid(z_gate_pair[0]),
+                            down_bwd_sigmoid(z_gate_pair[1])};
+                        const down_bwd_f32x2 silu = z_gate_pair * sigmoid;
+                        const down_bwd_f32x2 activation = silu * z_up_pair;
+                        const down_bwd_f32x2 g{
+                            static_cast<float>(accum[acc_idx]),
+                            static_cast<float>(accum[acc_idx + 1])};
+                        const down_bwd_f32x2 q = score2 * g;
+                        const down_bwd_f32x2 d_gate =
+                            q * z_up_pair * sigmoid *
+                            (one + z_gate_pair * (one - sigmoid));
+                        const down_bwd_f32x2 d_up = q * silu;
+                        const down_bwd_f32x2 scaled = score2 * activation;
+                        d_gate_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                            d_gate[0], d_gate[1]);
+                        d_up_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                            d_up[0], d_up[1]);
+                        scaled_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                            scaled[0], scaled[1]);
+                        ds_partial += g[0] * activation[0] +
+                                      g[1] * activation[1];
+                    }
+                }
+
+                if(row_in_range && col + 8 <= inter_dim)
+                {
+                    const int64_t dz_base =
+                        static_cast<int64_t>(sorted_row) * stride_dz_r + col;
+                    *reinterpret_cast<u32x4*>(kargs.d_z + dz_base) =
+                        d_gate_store;
+                    *reinterpret_cast<u32x4*>(
+                        kargs.d_z + dz_base + inter_dim) = d_up_store;
+                    const int64_t a_scaled_base =
+                        static_cast<int64_t>(sorted_row) *
+                            stride_a_scaled_r +
+                        col;
+                    *reinterpret_cast<u32x4*>(
+                        kargs.a_scaled + a_scaled_base) = scaled_store;
+                }
+                ds_wave_partial += ds_partial;
             }
-            ds_wave_partial += ds_partial;
         }
         ds_wave_partial += __shfl_xor(ds_wave_partial, 32, 64);
         if(lane_id < 32)
@@ -932,53 +961,61 @@ inline void down_bwd_launch_gfx950(const DownBwdKargs& kargs, hipStream_t stream
         kargs.stride_a_scaled_r == target_i &&
         kargs.stride_ds_t == target_topk &&
         kargs.stride_ds_workspace_r == target_i / T::B_N;
-    if(use_target_shape)
+    bool launched_target_shape = false;
+    if constexpr(target_i % T::B_N == 0)
     {
-        if(kargs.route.expert_offsets != nullptr)
-            hipLaunchKernelGGL(
-                (down_bwd_kernel_gfx950<
-                    T, target_d, target_i, target_topk, route_tiles>),
-                grid,
-                block,
-                0,
-                stream,
-                kargs);
-        else
-            hipLaunchKernelGGL(
-                (down_bwd_kernel_gfx950<
-                    T, target_d, target_i, target_topk, 1>),
-                grid,
-                block,
-                0,
-                stream,
-                kargs);
+        if(use_target_shape)
+        {
+            if(kargs.route.expert_offsets != nullptr)
+                hipLaunchKernelGGL(
+                    (down_bwd_kernel_gfx950<
+                        T, target_d, target_i, target_topk, route_tiles>),
+                    grid,
+                    block,
+                    0,
+                    stream,
+                    kargs);
+            else
+                hipLaunchKernelGGL(
+                    (down_bwd_kernel_gfx950<
+                        T, target_d, target_i, target_topk, 1>),
+                    grid,
+                    block,
+                    0,
+                    stream,
+                    kargs);
+            launched_target_shape = true;
+        }
     }
-    else if constexpr(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor)
+    if(!launched_target_shape)
     {
-        if(kargs.route.expert_offsets != nullptr)
-            hipLaunchKernelGGL(
-                (down_bwd_kernel_gfx950<T, 0, 0, 0, route_tiles>),
-                grid,
-                block,
-                0,
-                stream,
-                kargs);
+        if constexpr(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor)
+        {
+            if(kargs.route.expert_offsets != nullptr)
+                hipLaunchKernelGGL(
+                    (down_bwd_kernel_gfx950<T, 0, 0, 0, route_tiles>),
+                    grid,
+                    block,
+                    0,
+                    stream,
+                    kargs);
+            else
+                hipLaunchKernelGGL(
+                    (down_bwd_kernel_gfx950<T>),
+                    grid,
+                    block,
+                    0,
+                    stream,
+                    kargs);
+        }
         else
-            hipLaunchKernelGGL(
-                (down_bwd_kernel_gfx950<T>),
-                grid,
-                block,
-                0,
-                stream,
-                kargs);
+            hipLaunchKernelGGL((down_bwd_kernel_gfx950<T>),
+                               grid,
+                               block,
+                               0,
+                               stream,
+                               kargs);
     }
-    else
-        hipLaunchKernelGGL((down_bwd_kernel_gfx950<T>),
-                           grid,
-                           block,
-                           0,
-                           stream,
-                           kargs);
 
     if(expected_parts > 1)
     {

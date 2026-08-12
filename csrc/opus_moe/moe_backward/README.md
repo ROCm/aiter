@@ -79,6 +79,7 @@ fallback when a genuinely different working-set regime needs it.
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
 | K1 `down_bwd` medium grid | 9 | `BM32 x BN128 x BK32`, M5/twenty-route cohort + CTA-local route metadata |
 | K1 `down_bwd` large grid | 10 | `BM32 x BN128 x BK32`, M6/twenty-four-route cohort + CTA-local route metadata |
+| K1 `down_bwd` wide-N grid | 11 | `BM32 x BN256 x BK32`, M6/twenty-four-route cohort + two N repeats |
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
@@ -106,15 +107,19 @@ that threshold. Both BK32 tiles retain two-stage async loads while reducing
 their LDS allocation and VGPR count relative to kid 6. Degenerate grids and
 callers without expert offsets retain kid 5.
 
-K1 auto-dispatch uses the useful M6 launch geometry instead of an exact model
-tuple or a tensor-byte proxy. It estimates
-`(ceil(sorted_block_capacity / 6) + E) * ceil(I / 128)` CTAs. Fewer than 256
-CTAs retain kid 2 for load balance, 256--639 CTAs use the predecoded M5 kid 9,
-and 640 or more use the predecoded M6 kid 10. Both grouped kernels keep token,
-logical-route, and score metadata CTA-local and preserve the BK32 MFMA and
-128-column dScore reduction order. M6 covers 192 route rows per CTA, making
-its gathered-dO vector work exactly three loads per thread; the CTA threshold
-prevents that wider reuse window from starving gfx950 on smaller grids.
+K1 auto-dispatch uses useful launch geometry instead of an exact model tuple
+or a tensor-byte proxy. For `I >= 512` divisible by 256, it estimates the
+four-group-cohort BN256 grid as
+`round_up(ceil(sorted_block_capacity / 6) + E, 4) * (I / 256)` CTAs. At 384
+or more CTAs, kid 11 computes two adjacent 128-column N repeats per wave. The
+six-route M group still reuses W2 while the wider N tile halves gathered-dO
+rereads and dScore workspace/finalize traffic. Smaller or incompatible grids
+retain the BN128 policy: it estimates
+`(ceil(sorted_block_capacity / 6) + E) * ceil(I / 128)` CTAs, selects kid 2
+below 256 CTAs, predecoded M5 kid 9 from 256 through 639, and predecoded M6
+kid 10 at 640 or more. The 384-CTA BN256 threshold is a family-level gfx950
+occupancy boundary validated across D/E/K and expert-skew cases; it does not
+special-case a model shape.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
 tuple. Kid 11 is selected once the average padded expert interval reaches
