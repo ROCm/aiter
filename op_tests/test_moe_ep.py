@@ -33,6 +33,23 @@ BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
 
 
+# Force the fake-EP rolling window to activate only n of this rank's local
+# experts (ids [ep_id*L, ep_id*L+n)). 0 = unset (all L local experts).
+# Same env name as op_tests/test_flydsl_grouped_gemm_gfx1250.py and
+# op_tests/test_moe_2stage.py.
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
+
+
 @perftest(num_warmup=1, num_iters=2)
 def torch_moe_test(
     hidden_states,
@@ -517,9 +534,17 @@ def test_fmoe_ep_mxfp4(
         # topk <= L keeps the topk picks distinct within a token, and the window
         # advancing by topk each row keeps the L local experts balanced.
         assert topk <= L, f"fake-eplb requires topk({topk}) <= experts_per_rank({L})"
+        # AITER_MOE_NUM_EXPERT_ACTIVATED=n narrows the window to n local experts,
+        # so only ids [ep_id*L, ep_id*L+n) receive routes (the rest stay idle).
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED or L
+        if not (topk <= n_act <= L):
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
+                f"[topk={topk}, experts_per_rank={L}]"
+            )
         t = torch.arange(M, device="cuda").unsqueeze(1)
         k = torch.arange(topk, device="cuda").unsqueeze(0)
-        local_slot = (t * topk + k) % L
+        local_slot = (t * topk + k) % n_act
         expert_ids = ep_id * L + local_slot  # (M, topk) int64, all local
 
         # Faithful replay of moe.py:130-135 followed by the REAL routing primitive:
@@ -551,10 +576,16 @@ def test_fmoe_ep_mxfp4(
 
         print(
             f"  [EP sim/fake] per_rank_M={M} topk={topk} ep={ep} L={L} "
+            f"activated={n_act} "
             f"local_experts=[{local_expert_start},{local_expert_end}) "
             f"routes={M * topk} (all local, no mask/dedup) trim_M={trim_M}"
         )
     else:
+        if AITER_MOE_NUM_EXPERT_ACTIVATED:
+            raise ValueError(
+                "AITER_MOE_NUM_EXPERT_ACTIVATED is only supported with "
+                "--ep-mode fake (real mode routes randomly over all experts)"
+            )
         graph_bs = token // ep
         n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch)
         trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound (buffer rows)
