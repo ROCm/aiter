@@ -51,8 +51,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
     runs-on: build-only-aiter
     steps:
       - name: Checkout AITER
@@ -154,8 +153,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -266,8 +264,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm-di') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
     runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
     timeout-minutes: 600
     strategy:
