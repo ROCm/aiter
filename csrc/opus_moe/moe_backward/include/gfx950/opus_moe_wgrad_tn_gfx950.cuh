@@ -468,16 +468,18 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     int tile_n = blockIdx.x;
     if constexpr(FIXED_ROUTES > 0)
     {
-        // Visit a 2x2 output-tile group together so one roughly 2 MiB panel
-        // from each operand can be reused before the 4 MiB L2 turns over.
-        constexpr int GROUP = 2;
+        // Keep two B panels shared while advancing all eight M tiles.  This
+        // ordering improves L2 reuse for both exact balanced Sonic wgrads;
+        // the general ragged path below retains its original mapping.
+        constexpr int GROUP_M = 8;
+        constexpr int GROUP_N = 2;
         const int tiles_n = FIXED_Q / BN;
         const int linear = blockIdx.y * tiles_n + blockIdx.x;
-        const int group_id = linear / (GROUP * GROUP);
-        const int in_group = linear % (GROUP * GROUP);
-        const int groups_n = tiles_n / GROUP;
-        tile_m = (group_id / groups_n) * GROUP + in_group / GROUP;
-        tile_n = (group_id % groups_n) * GROUP + in_group % GROUP;
+        const int group_id = linear / (GROUP_M * GROUP_N);
+        const int in_group = linear % (GROUP_M * GROUP_N);
+        const int groups_n = tiles_n / GROUP_N;
+        tile_m = (group_id / groups_n) * GROUP_M + in_group / GROUP_N;
+        tile_n = (group_id % groups_n) * GROUP_N + in_group % GROUP_N;
     }
     const int m0 = tile_m * BM;
     const int n0 = tile_n * BN;
