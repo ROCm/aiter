@@ -6,6 +6,9 @@ import gc
 import itertools
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 from contextlib import ExitStack, nullcontext
 
 import pandas as pd
@@ -722,6 +725,13 @@ parser.add_argument(
     "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
 )
 parser.add_argument(
+    "--verify-aot-cache",
+    metavar="CSV",
+    default=None,
+    help="Build a fresh local FlyDSL AOT cache from CSV, then run only that "
+    "CSV's cases with JIT fallback disabled.",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -770,6 +780,8 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+if args.verify_aot_cache and args.bm16_scale_boundary:
+    parser.error("--verify-aot-cache cannot be combined with --bm16-scale-boundary")
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
@@ -837,11 +849,11 @@ def _row_to_kwargs(row):
     }
 
 
-def _iter_csv_cases():
-    """Yield FlyDSL/Opus cases from every selected model CSV."""
+def _iter_csv_cases(csv_path=None, force_check_aot_cache=False):
+    """Yield FlyDSL/Opus cases from the merged config or one selected CSV."""
     cu = get_cu_num()
-    merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
-    df_csv = pd.read_csv(merged_csv)
+    selected_csv = csv_path or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    df_csv = pd.read_csv(selected_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
     for _, row in rows.iterrows():
         tag = row.get("_tag", "")
@@ -912,8 +924,9 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
-        # AOT cache entry, so let those cases compile on demand.
-        kwargs["check_aot_cache"] = (
+        # AOT cache entry, so normal runs let them compile on demand. Explicit
+        # cache verification requires a hit for every selected CSV case.
+        kwargs["check_aot_cache"] = force_check_aot_cache or (
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
@@ -1227,9 +1240,55 @@ def _iter_with_env(case_iter, **env_overrides):
         yield from case_iter
 
 
+def _prepare_aot_verify_cache(csv_path):
+    csv_path = os.path.abspath(os.path.expanduser(csv_path))
+    if not os.path.isfile(csv_path):
+        parser.error(f"--verify-aot-cache CSV does not exist: {csv_path}")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cache_dir = tempfile.mkdtemp(prefix="aiter_flydsl_aot_verify_")
+    env = os.environ.copy()
+    env["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
+    env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+
+    aiter.logger.info(
+        "moe_2stage: building AOT verification cache at %s from %s",
+        cache_dir,
+        csv_path,
+    )
+    for module in ("aiter.aot.flydsl.moe", "aiter.aot.flydsl.mxfp4_moe"):
+        aiter.logger.info("moe_2stage: running AOT adapter %s", module)
+        subprocess.run(
+            [sys.executable, "-m", module, "--csv", csv_path],
+            check=True,
+            env=env,
+            cwd=repo_root,
+        )
+
+    # Each selected case enters run_only_env() through check_aot_cache=True.
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
+    aiter.logger.info(
+        "moe_2stage: AOT cache ready; verification will run without JIT fallback "
+        "(cache retained at %s)",
+        cache_dir,
+    )
+    return csv_path
+
+
 _case_iters = []
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
+elif args.verify_aot_cache:
+    _verify_csv = _prepare_aot_verify_cache(args.verify_aot_cache)
+    # Match regular CSV CI coverage: enable SiTUv2 A8W4, keep A4W4 disabled,
+    # and do not append legacy cases.
+    _case_iters.append(
+        _iter_with_env(
+            _iter_csv_cases(_verify_csv, force_check_aot_cache=True),
+            AITER_SITUV2_A8W4="1",
+            AITER_SITUV2_A4W4=None,
+        )
+    )
 else:
     if not args.no_flydsl_csv:
         _case_iters.append(
