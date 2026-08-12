@@ -829,6 +829,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         // experts and a complete stage for the rest.
         if(nroute > COMMON_FULL_STAGES * BK)
         {
+#pragma unroll 4
             for(int stage = 0; stage < COMMON_FULL_STAGES - 1; ++stage)
                 run_stage(
                     opus::number<1>{},
