@@ -89,6 +89,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
 | K4 `dw1` wide/long wave8 baseline | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
 | K4 `dw1` wide/long production | 11 | `BM256 x BN128 x BK32`, 256 threads + eight native C tiles per wave |
+| K4 `dw1` long-reduction production | 13 | kid 11 geometry + reverse cohort4 + A-fragment prefetch |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments + route-length hybrid |
@@ -125,6 +126,10 @@ and smaller output grids; this avoids the old expert-count proxy selecting
 BM256 for narrow `2I` grids. Kid 8 covers large BM64 problems, and kid 5
 remains the small/degenerate fallback. Kid 10 remains available as the
 512-thread wave8 comparison instance but is not selected by production auto.
+For average padded intervals of at least 3072 routes with `I <= 1024`, kid 13
+retains the reverse-cohort4 schedule and prefetches the second K16 dZ operand
+fragment before the first fragment's MFMA.  The narrower A-only prefetch hides
+part of the LDS latency without carrying the second X fragment early.
 
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output

@@ -539,6 +539,15 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4DoubleLds
     static constexpr bool REVERSE_EXPERT_ORDER = true;
 };
 
+// Keep the same output and LDS geometry as the production wave4 kernel, but
+// issue the second K16 dZ fragment before the first fragment's MFMA.  X is
+// read after that MFMA so only the larger A fragment remains live early.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchADoubleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4DoubleLds
+{
+    static constexpr bool PREFETCH_REDUCTION_A = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

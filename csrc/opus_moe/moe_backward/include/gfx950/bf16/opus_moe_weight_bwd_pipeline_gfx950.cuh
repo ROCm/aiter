@@ -164,6 +164,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::SPLIT_B_N64_SWIZZLE;
         return false;
     }();
+    constexpr bool prefetch_reduction_a = []() constexpr {
+        if constexpr(requires { T::PREFETCH_REDUCTION_A; })
+            return T::PREFETCH_REDUCTION_A;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -485,8 +490,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             static_assert(std::is_same_v<
                           typename decltype(mma)::vtype_c,
                           typename decltype(mma_k_fragment)::vtype_c>);
-            opus::static_for<T::E_K>([&](auto ek) {
-                typename decltype(mma_k_fragment)::vtype_a v_a;
+            auto load_a_fragment = [&](auto ek, auto& v_a)
+                __attribute__((always_inline)) {
                 opus::static_for<T::E_M>([&](auto em) {
                     constexpr int k_byte_offset = ek.value * 2048;
                     int base;
@@ -517,7 +522,9 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                             T::VEC_TR_B + j] = hi[j];
                     }
                 });
-                typename decltype(mma_k_fragment)::vtype_b v_b;
+            };
+            auto load_b_fragment = [&](auto ek, auto& v_b)
+                __attribute__((always_inline)) {
                 opus::static_for<T::E_N>([&](auto en) {
                     constexpr int k_byte_offset =
                         ek.value * (split_b_n64 ? 2048 : 4096);
@@ -554,11 +561,40 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                             T::VEC_TR_B + j] = hi[j];
                     }
                 });
+            };
+            auto load_fragment = [&](auto ek, auto& v_a, auto& v_b)
+                __attribute__((always_inline)) {
+                load_a_fragment(ek, v_a);
+                load_b_fragment(ek, v_b);
+            };
+            if constexpr(prefetch_reduction_a)
+            {
+                typename decltype(mma_k_fragment)::vtype_a v_a0;
+                typename decltype(mma_k_fragment)::vtype_b v_b0;
+                typename decltype(mma_k_fragment)::vtype_a v_a1;
+                typename decltype(mma_k_fragment)::vtype_b v_b1;
+                load_fragment(opus::number<0>{}, v_a0, v_b0);
                 s_waitcnt_lgkmcnt(0_I);
+                load_a_fragment(opus::number<1>{}, v_a1);
                 __builtin_amdgcn_s_setprio(1);
-                v_c = mma_k_fragment(v_a, v_b, v_c);
+                v_c = mma_k_fragment(v_a0, v_b0, v_c);
+                load_b_fragment(opus::number<1>{}, v_b1);
+                s_waitcnt_lgkmcnt(0_I);
+                v_c = mma_k_fragment(v_a1, v_b1, v_c);
                 __builtin_amdgcn_s_setprio(0);
-            });
+            }
+            else
+            {
+                opus::static_for<T::E_K>([&](auto ek) {
+                    typename decltype(mma_k_fragment)::vtype_a v_a;
+                    typename decltype(mma_k_fragment)::vtype_b v_b;
+                    load_fragment(ek, v_a, v_b);
+                    s_waitcnt_lgkmcnt(0_I);
+                    __builtin_amdgcn_s_setprio(1);
+                    v_c = mma_k_fragment(v_a, v_b, v_c);
+                    __builtin_amdgcn_s_setprio(0);
+                });
+            }
             __builtin_amdgcn_sched_barrier(0);
             return;
         }

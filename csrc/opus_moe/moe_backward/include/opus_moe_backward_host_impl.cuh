@@ -203,7 +203,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     constexpr int cohort2_kid = 8;
     constexpr int cohort2_bm128_double_lds_kid = 9;
     constexpr int cohort2_bm256_wave4_double_lds_kid = 11;
-    constexpr int reverse_cohort4_bm256_wave4_double_lds_kid = 12;
+    constexpr int reverse_cohort4_bm256_wave4_double_lds_kid = 13;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
