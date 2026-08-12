@@ -934,17 +934,29 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         def stage2_wgrad_start(dy_op, a_op, lens):
             current = torch.cuda.current_stream(dy_op.device)
+            out = torch.empty(
+                offs.numel() - 1,
+                dy_op.shape[1],
+                a_op.shape[1],
+                device=dy_op.device,
+                dtype=torch.bfloat16,
+            )
             ctx.wgrad_ready.record(current)
             ctx.wgrad_stream.wait_event(ctx.wgrad_ready)
             with torch.cuda.stream(ctx.wgrad_stream):
-                out = wgrad_prepared(dy_op, a_op, lens)
+                _opus_moe_wgrad_tn_bf16_raw(
+                    dy_op,
+                    a_op,
+                    offs,
+                    out,
+                    ctx.uniform_m or 0,
+                )
                 ctx.wgrad_done.record(ctx.wgrad_stream)
             return out
 
         def stage2_wgrad_finish(out):
             current = torch.cuda.current_stream(out.device)
             current.wait_event(ctx.wgrad_done)
-            out.record_stream(current)
             return out
 
         return _moe_ref_backward_impl(
