@@ -9,9 +9,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+# Match setup.py's build-time import path.  Importing ``aiter.jit`` would run
+# aiter/__init__.py and probe the live GPU while initializing runtime dtypes;
+# build-only CI runners intentionally have no GPU.
+sys.path.insert(0, str(REPO_ROOT / "aiter"))
 
-from aiter.jit import core  # noqa: E402
+from jit import core  # noqa: E402
 
 
 MODULE = "module_gemm_a8w8_blockscale_cktile"
