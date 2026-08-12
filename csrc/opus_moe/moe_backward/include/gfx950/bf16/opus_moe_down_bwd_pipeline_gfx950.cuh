@@ -133,7 +133,8 @@ __device__ __forceinline__ float down_bwd_sigmoid(float value)
 template<typename Traits,
          int FixedD = 0,
          int FixedI = 0,
-         int FixedTopK = 0>
+         int FixedTopK = 0,
+         int RouteTiles = 1>
 __device__ __forceinline__ void
 down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 {
@@ -149,7 +150,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int ROUTE_M = T::ROUTE_M;
-    constexpr int CTA_M = ROUTE_M;
+    constexpr int CTA_M = ROUTE_M * RouteTiles;
+    static_assert(RouteTiles > 0);
     constexpr bool fixed_shape = FixedD > 0;
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));
@@ -177,7 +179,7 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         fixed_shape ? FixedI / BN : kargs.stride_ds_workspace_r;
     constexpr int smem_a_elems = CTA_M * BK;
     constexpr int smem_b_elems = T::SMEM_B_BYTES / sizeof(D_B);
-    constexpr int ds_values = ROUTE_M * T::T_N;
+    constexpr int ds_values = CTA_M * T::T_N;
     constexpr int ds_bytes = ds_values * sizeof(float);
     constexpr int smem_a_bytes = smem_a_elems * sizeof(D_A);
     constexpr int smem_b_bytes = smem_b_elems * sizeof(D_B);
@@ -212,6 +214,20 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     const int expert_id = kargs.route.sorted_expert_ids[route_tile];
     if(expert_id < 0 || expert_id >= kargs.route.num_experts)
         return;
+    int expert_end_row = valid_rows;
+    if constexpr(RouteTiles > 1)
+    {
+        if(kargs.route.expert_offsets == nullptr)
+            return;
+        const int expert_first_tile =
+            kargs.route.expert_offsets[expert_id] / ROUTE_M;
+        if((route_tile - expert_first_tile) % RouteTiles != 0)
+            return;
+        // A final group may contain fewer than RouteTiles sorter blocks.
+        // Keep the shared W2/MFMA schedule uniform, but mask rows belonging
+        // to the next expert in the gather and fused epilogue.
+        expert_end_row = kargs.route.expert_offsets[expert_id + 1];
+    }
 
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
@@ -228,7 +244,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     if(tid < CTA_M)
     {
         const int sorted_row = route_base + tid;
-        const bool row_in_range = sorted_row < valid_rows;
+        const bool row_in_range =
+            sorted_row < valid_rows && sorted_row < expert_end_row;
         const int32_t packed =
             row_in_range ? kargs.route.sorted_token_ids[sorted_row] : 0;
         bool valid;
@@ -274,39 +291,13 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         wave_id_m, lane_id % mma.grpm_a, 0, lane_id / mma.grpm_a);
     auto u_ra = partition_layout_a<T::VEC_A>(
         mma, opus::make_tuple(BK, 1_I), p_coord_a);
-    typename decltype(mma)::vtype_c v_c;
-    clear(v_c);
+    typename decltype(mma)::vtype_c v_c[RouteTiles];
+    opus::static_for<RouteTiles>([&](auto tile) {
+        clear(v_c[tile.value]);
+    });
 
     constexpr int a_vectors = CTA_M * BK / T::VEC_A;
-    static_assert(a_vectors > 0 && a_vectors <= T::BLOCK_SIZE);
-
-    int a_loader_base = 0;
-    if(tid < a_vectors)
-    {
-        const int local_m = tid / (BK / T::VEC_A);
-        const int32_t packed = smem_packed_route[local_m];
-        int token;
-        bool valid;
-        if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
-        {
-            const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
-                kargs.route, packed, true);
-            token = decoded.token;
-            valid = decoded.valid;
-        }
-        else
-        {
-            token = packed_token_id(packed);
-            const int slot = packed_topk_slot(packed);
-            valid = token < kargs.route.token_num && slot < topk;
-        }
-        a_loader_base =
-            valid ? static_cast<int32_t>(static_cast<int64_t>(token) *
-                                         stride_do_t)
-                  : static_cast<int32_t>(
-                        static_cast<int64_t>(kargs.route.token_num) *
-                        stride_do_t);
-    }
+    static_assert(a_vectors > 0);
 
     {
         // Two K=32 stages occupy the same 20 KiB payload as one K=64 tile.
@@ -321,33 +312,59 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             OPUS_LDS_ADDR D_B* b_lds =
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(stage_lds + smem_a_bytes);
 
-            if constexpr(a_vectors == T::BLOCK_SIZE)
-            {
-                const int local_k = (tid % (BK / T::VEC_A)) * T::VEC_A;
-                // buffer_load_*_lds supplies the lane*vector stride in hardware;
-                // keeping the destination wave-uniform avoids a per-issue
-                // v_readfirstlane/m0 reconstruction in the 32-stage target loop.
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    a_lds + wave_id * opus::get_warp_size() * T::VEC_A;
-                g_a.template _async_load<T::VEC_A>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
-            }
-            else if(tid < a_vectors)
-            {
-                const int local_k = (tid % (BK / T::VEC_A)) * T::VEC_A;
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    a_lds + wave_id * opus::get_warp_size() * T::VEC_A;
-                g_a.template _async_load<T::VEC_A>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
-            }
+            constexpr int a_loads_per_thread =
+                (a_vectors + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
+            opus::static_for<a_loads_per_thread>([&](auto load) {
+                const int a_vector = load.value * T::BLOCK_SIZE + tid;
+                if(a_vector < a_vectors)
+                {
+                    const int a_element = a_vector * T::VEC_A;
+                    const int local_m = a_element / BK;
+                    const int local_k = a_element % BK;
+                    const int32_t packed = smem_packed_route[local_m];
+                    int token;
+                    bool valid;
+                    if constexpr(T::ROUTE_LAYOUT ==
+                                 RouteLayout::CompactRouteMajor)
+                    {
+                        const auto decoded =
+                            decode_sorted_route<T::ROUTE_LAYOUT>(
+                                kargs.route, packed, true);
+                        token = decoded.token;
+                        valid = decoded.valid;
+                    }
+                    else
+                    {
+                        token = packed_token_id(packed);
+                        const int slot = packed_topk_slot(packed);
+                        valid = token < kargs.route.token_num && slot < topk;
+                    }
+                    const int source_base =
+                        valid
+                            ? static_cast<int32_t>(
+                                  static_cast<int64_t>(token) * stride_do_t)
+                            : static_cast<int32_t>(
+                                  static_cast<int64_t>(
+                                      kargs.route.token_num) *
+                                  stride_do_t);
+                    // buffer_load_*_lds supplies the lane-vector offset.
+                    // Each load group owns one contiguous BLOCK_SIZE-vector
+                    // region, so the destination remains wave-uniform even
+                    // when RouteTiles makes A larger than the workgroup.
+                    OPUS_LDS_ADDR D_A* a_wave_dst =
+                        a_lds +
+                        (load.value * T::BLOCK_SIZE +
+                         wave_id * opus::get_warp_size()) *
+                            T::VEC_A;
+                    g_a.template _async_load<T::VEC_A>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                        (source_base + tile_k * BK + local_k) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                }
+            });
 
             constexpr int vectors_per_group =
                 T::SMEM_B_GROUP_DATA_BYTES / (T::VEC_B * sizeof(D_B));
@@ -397,13 +414,17 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 tile_storage + buffer * gemm_buffer_bytes + smem_a_bytes));
             auto v_b = down_bwd_load_rb_tr<T, decltype(mma)>(
                 s_b_current, lane_id, wave_id_n);
-            auto s_a = make_smem(reinterpret_cast<D_A*>(
-                tile_storage + buffer * gemm_buffer_bytes));
-            auto v_a = s_a.template load<T::VEC_A>(u_ra);
 
             s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_s_setprio(1);
-            v_c = mma(v_a, v_b, v_c);
+            opus::static_for<RouteTiles>([&](auto route_group) {
+                auto s_a = make_smem(reinterpret_cast<D_A*>(
+                    tile_storage + buffer * gemm_buffer_bytes +
+                    route_group.value * ROUTE_M * BK * sizeof(D_A)));
+                auto v_a = s_a.template load<T::VEC_A>(u_ra);
+                v_c[route_group.value] =
+                    mma(v_a, v_b, v_c[route_group.value]);
+            });
             __builtin_amdgcn_s_setprio(0);
 
             if(has_next)
@@ -419,7 +440,7 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     OPUS_LDS_ADDR float* smem_ds =
         reinterpret_cast<OPUS_LDS_ADDR float*>(s_ds.ptr);
 
-    auto store_epilogue = [&](auto& accum) {
+    auto store_epilogue = [&](auto& accum, int route_group) {
         static_assert(ROUTE_M == 32 && BN == 128);
         static_assert(T::T_M == 1 && T::T_N == 4);
         static_assert(T::E_M == 1 && T::E_N == 1 && T::VEC_C == 4);
@@ -449,9 +470,10 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             }
         }
 
-        const int local_m = lane_id % 32;
+        const int local_m = route_group * ROUTE_M + lane_id % ROUTE_M;
         const int sorted_row = route_base + local_m;
-        const bool row_in_range = sorted_row < valid_rows;
+        const bool row_in_range =
+            sorted_row < valid_rows && sorted_row < expert_end_row;
         const int32_t packed = smem_packed_route[local_m];
         int token;
         int slot;
@@ -577,19 +599,21 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
         ds_wave_partial += __shfl_xor(ds_wave_partial, 32, 64);
         if(lane_id < 32)
-            smem_ds[wave_id_n * ROUTE_M + local_m] = ds_wave_partial;
+            smem_ds[wave_id_n * CTA_M + local_m] = ds_wave_partial;
     };
 
-    store_epilogue(v_c);
+    opus::static_for<RouteTiles>([&](auto route_group) {
+        store_epilogue(v_c[route_group.value], route_group.value);
+    });
     __syncthreads();
 
     static_assert(T::T_N == 4);
-    if(tid < ROUTE_M)
+    if(tid < CTA_M)
     {
         float partial = smem_ds[tid];
 #pragma unroll
         for(int wave = 1; wave < T::T_N; ++wave)
-            partial += smem_ds[wave * ROUTE_M + tid];
+            partial += smem_ds[wave * CTA_M + tid];
         const int32_t packed = smem_packed_route[tid];
         if constexpr(T::ROUTE_LAYOUT ==
                      RouteLayout::CompactRouteMajor)
@@ -645,11 +669,13 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 template<typename Traits,
          int FixedD = 0,
          int FixedI = 0,
-         int FixedTopK = 0>
+         int FixedTopK = 0,
+         int RouteTiles = 1>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_BLOCKS_PER_CU)
 void down_bwd_kernel_gfx950(DownBwdKargs kargs)
 {
-    down_bwd_process_tile_gfx950<Traits, FixedD, FixedI, FixedTopK>(kargs);
+    down_bwd_process_tile_gfx950<
+        Traits, FixedD, FixedI, FixedTopK, RouteTiles>(kargs);
 }
 
 template<RouteLayout Layout, int Parts>
@@ -757,26 +783,54 @@ inline void down_bwd_launch_gfx950(const DownBwdKargs& kargs, hipStream_t stream
         kargs.stride_a_scaled_r == target_i &&
         kargs.stride_ds_t == target_topk &&
         kargs.stride_ds_workspace_r == target_i / T::B_N;
+    constexpr int route_tiles = T::ROUTE_M_TILES;
     if(use_target_shape)
     {
-        hipLaunchKernelGGL(
-            (down_bwd_kernel_gfx950<T, target_d, target_i, target_topk>),
-            grid,
-            block,
-            0,
-            stream,
-            kargs);
+        if(kargs.route.expert_offsets != nullptr)
+            hipLaunchKernelGGL(
+                (down_bwd_kernel_gfx950<
+                    T, target_d, target_i, target_topk, route_tiles>),
+                grid,
+                block,
+                0,
+                stream,
+                kargs);
+        else
+            hipLaunchKernelGGL(
+                (down_bwd_kernel_gfx950<
+                    T, target_d, target_i, target_topk, 1>),
+                grid,
+                block,
+                0,
+                stream,
+                kargs);
+    }
+    else if constexpr(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor)
+    {
+        if(kargs.route.expert_offsets != nullptr)
+            hipLaunchKernelGGL(
+                (down_bwd_kernel_gfx950<T, 0, 0, 0, route_tiles>),
+                grid,
+                block,
+                0,
+                stream,
+                kargs);
+        else
+            hipLaunchKernelGGL(
+                (down_bwd_kernel_gfx950<T>),
+                grid,
+                block,
+                0,
+                stream,
+                kargs);
     }
     else
-    {
-        hipLaunchKernelGGL(
-            (down_bwd_kernel_gfx950<T>),
-            grid,
-            block,
-            0,
-            stream,
-            kargs);
-    }
+        hipLaunchKernelGGL((down_bwd_kernel_gfx950<T>),
+                           grid,
+                           block,
+                           0,
+                           stream,
+                           kargs);
 
     if(expected_parts > 1)
     {

@@ -115,6 +115,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("sorted_token_ids"),
           py::arg("sorted_expert_ids"),
           py::arg("num_valid_ids"),
+          py::arg("expert_padded_offsets"),
           py::arg("d_scores_workspace"),
           py::arg("d_z"),
           py::arg("a_scaled"),

@@ -156,20 +156,26 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
         return requested_kernel_id;
 
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr uint64_t large_working_set_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 2;
-    constexpr int cohort2_kid = 4;
+    constexpr int pair_route_tiles_kid = 5;
+    constexpr int triple_route_tiles_kid = 6;
+    constexpr int five_route_tiles_bk32_kid = 8;
     const uint64_t z_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         2ull * static_cast<uint64_t>(kargs.inter_dim) *
         sizeof(hip_bfloat16);
-    if(kargs.d_scores_parts <= 1 || z_bytes <= l2_friendly_bytes)
+    if(kargs.route.expert_offsets == nullptr || kargs.d_scores_parts <= 1 ||
+       z_bytes <= l2_friendly_bytes)
         return legacy_kid;
-    // Keep two neighboring route tiles together while walking all dW2 N
-    // parts.  Compared with four tiles this shortens the dO/Z reuse window
-    // without giving up the W2 locality of the route-major cohort.  The
-    // working-set gate is geometry based and applies across expert counts
-    // and balanced or skewed routing distributions.
-    return cohort2_kid;
+    // BK32 leaves enough LDS to reuse W2 across five adjacent route tiles.
+    // An even number of d-score parts preserves the native K64 accumulation
+    // boundaries, so this is both exact and faster once the routed tensor no
+    // longer fits in L2.  Odd part counts retain the K64 pair/triple kernels.
+    if(kargs.d_scores_parts % 2 == 0)
+        return five_route_tiles_bk32_kid;
+    return z_bytes > large_working_set_bytes ? triple_route_tiles_kid
+                                             : pair_route_tiles_kid;
 }
 
 inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
@@ -183,6 +189,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     // cohort sharply shortens the dZ/X reuse distance.  This policy depends
     // only on the runtime working set, not on an exact model shape.
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
+    constexpr uint64_t large_working_set_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 5;
     // The large-working-set cohort also uses gfx950 buffer_load_*_lds so the
     // three K32 operand vectors land directly in the existing swizzled tile.
@@ -190,6 +197,7 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     // capacity while retaining enough inter-expert load balance.  Small
     // problems retain the register-load/LDS-store legacy kernel.
     constexpr int cohort2_kid = 8;
+    constexpr int cohort2_bm128_kid = 9;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -198,6 +206,8 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     const uint64_t source_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         source_row_elements * sizeof(hip_bfloat16);
+    if(source_bytes > large_working_set_bytes)
+        return cohort2_bm128_kid;
     return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;
 }
 
@@ -208,11 +218,12 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         return requested_kernel_id;
 
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
-    constexpr uint64_t single_expert_bytes = 512ull * 1024ull * 1024ull;
+    constexpr uint64_t large_working_set_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 3;
     constexpr int cohort4_direct_lds_kid = 5;
     constexpr int cohort1_direct_lds_kid = 6;
     constexpr int cohort2_direct_lds_kid = 7;
+    constexpr int cohort1_bm128_dual_lds_kid = 9;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -224,9 +235,12 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     if(source_bytes <= l2_friendly_bytes)
         return legacy_kid;
     // Once the combined gathered-dO/a_scaled working set is much larger
-    // than L2, finish one expert at a time to minimize source reuse distance.
-    if(source_bytes > single_expert_bytes)
-        return cohort1_direct_lds_kid;
+    // than L2, finish one expert at a time and double the output-M tile.  The
+    // larger tile halves the output grid while the dual LDS stages keep K64
+    // loads overlapped; it is also robust when only a subset of experts is
+    // active because the decision does not depend on host-visible counts.
+    if(source_bytes > large_working_set_bytes)
+        return cohort1_bm128_dual_lds_kid;
     // In the medium regime retain the largest bounded cohort that does not
     // pad the expert grid.  Empty expert CTAs are otherwise material at these
     // shorter runtimes (for example E=10/14 versus E=12/16).
@@ -1065,6 +1079,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
                        aiter_tensor_t& sorted_token_ids,
                        aiter_tensor_t& sorted_expert_ids,
                        aiter_tensor_t& num_valid_ids,
+                       aiter_tensor_t& expert_padded_offsets,
                        aiter_tensor_t& d_scores_workspace,
                        aiter_tensor_t& d_z,
                        aiter_tensor_t& a_scaled,
@@ -1081,6 +1096,11 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     check_down_tensor(
         sorted_expert_ids, "sorted_expert_ids", 1, AITER_DTYPE_i32, "int32");
     check_down_tensor(num_valid_ids, "num_valid_ids", 1, AITER_DTYPE_i32, "int32");
+    check_down_tensor(expert_padded_offsets,
+                      "expert_padded_offsets",
+                      1,
+                      AITER_DTYPE_i32,
+                      "int32");
     check_down_tensor(d_scores_workspace,
                       "d_scores_workspace",
                       2,
@@ -1096,6 +1116,8 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     check_down_same_device(d_out, sorted_token_ids, "sorted_token_ids");
     check_down_same_device(d_out, sorted_expert_ids, "sorted_expert_ids");
     check_down_same_device(d_out, num_valid_ids, "num_valid_ids");
+    check_down_same_device(
+        d_out, expert_padded_offsets, "expert_padded_offsets");
     check_down_same_device(d_out, d_scores_workspace, "d_scores_workspace");
     check_down_same_device(d_out, d_z, "d_z");
     check_down_same_device(d_out, a_scaled, "a_scaled");
@@ -1131,6 +1153,8 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
                 "d_scores must have the same shape as scores");
     AITER_CHECK(num_valid_ids.numel() >= 1,
                 "num_valid_ids must contain at least one element");
+    AITER_CHECK(expert_padded_offsets.numel() == num_experts + 1,
+                "expert_padded_offsets must have shape [E+1]");
     AITER_CHECK(block_m == 32,
                 "the first down_bwd kernel requires block_m=32, got ",
                 block_m);
@@ -1155,6 +1179,8 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
         reinterpret_cast<const int32_t*>(sorted_expert_ids.data_ptr());
     kargs.route.num_valid_ids =
         reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
+    kargs.route.expert_offsets = reinterpret_cast<const int32_t*>(
+        expert_padded_offsets.data_ptr());
     kargs.route.token_num = token_num;
     kargs.route.topk = topk;
     kargs.route.num_experts = num_experts;

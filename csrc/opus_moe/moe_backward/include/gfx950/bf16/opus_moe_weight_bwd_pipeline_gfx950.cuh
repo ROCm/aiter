@@ -132,9 +132,12 @@ inline __device__ void weight_bwd_store_wide(Accum& accum,
 #endif
 
 
-// Compact gfx950 K32 dW1 path.  The 64x32 and 32x128 logical operands occupy
-// 4 KiB and 8 KiB respectively.  Keep both swizzled tiles resident so their
-// stores and transpose reads share one pair of barriers per reduction tile.
+// Compact gfx950 K32 dW1 path.  A 64x32 dZ slab occupies 4 KiB and a
+// 32x128 gathered-X slab occupies 8 KiB.  BM128 keeps two independently
+// swizzled dZ slabs beside one X slab; BN256 keeps one dZ slab beside two X
+// slabs.  Both four-wave candidates double reuse without changing threads.
+// Keep the operands resident so their stores and transpose reads share one
+// pair of barriers per reduction tile.
 // The first shared encoding is
 // {vec=8, perPhase=2, maxPhase=8}; the second is
 // {vec=8, perPhase=1, maxPhase=16}.
@@ -155,9 +158,18 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
-    static_assert(BM == 64 && BN == 128 && BK == 32);
+    static_assert((BM == 64 || BM == 128) &&
+                  (BN == 128 || BN == 256) && BK == 32);
     static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
+    constexpr int a_m_slabs = BM / 64;
+    constexpr int b_n_slabs = BN / 128;
+    static_assert(a_m_slabs * b_n_slabs <= 2,
+                  "only one doubled K4 output dimension is supported");
+    static_assert(T::E_M == 2 * a_m_slabs);
+    static_assert(T::E_N == b_n_slabs);
+    static_assert((BM == 64 && BN == 128) || T::DIRECT_GMEM_TO_LDS,
+                  "wide K4 tiles require direct GMEM-to-LDS loads");
     int expert;
     int output_m_base;
     int output_n_base;
@@ -296,34 +308,43 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             // shared stage.  Destination bases are wave-uniform; gfx950 adds
             // the lane-vector displacement in buffer_load_b128_lds hardware.
             __builtin_amdgcn_s_barrier();
-            OPUS_LDS_ADDR D_A* a_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a.ptr) +
-                wave_id * opus::get_warp_size() * VEC;
             OPUS_LDS_ADDR D_B* b_wave_dst =
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b.ptr) +
                 wave_id * opus::get_warp_size() * VEC;
-            g_a.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                (source_a * kargs.stride_a_row + output_m_base + a_local_m) *
-                    sizeof(D_A),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_A>{});
-            g_b.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(b_wave_dst),
-                (source_b0 * kargs.stride_b_row + output_n_base + b_local_n) *
-                    sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
-            g_b.template _async_load<VEC>(
-                reinterpret_cast<OPUS_LDS_ADDR void*>(
-                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_wave_dst) + 4096),
-                (source_b1 * kargs.stride_b_row + output_n_base + b_local_n) *
-                    sizeof(D_B),
-                0,
-                opus::number<0>{},
-                opus::number<T::CACHECTL_B>{});
+            opus::static_for<a_m_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR D_A* a_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a.ptr) +
+                    slab.value * 64 * BK +
+                    wave_id * opus::get_warp_size() * VEC;
+                g_a.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                    (source_a * kargs.stride_a_row + output_m_base +
+                     slab.value * 64 + a_local_m) *
+                        sizeof(D_A),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_A>{});
+            });
+            opus::static_for<b_n_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR D_B* b_slab_dst =
+                    b_wave_dst + slab.value * 128 * BK;
+                const int source_n = output_n_base + slab.value * 128 +
+                                     b_local_n;
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                    (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(
+                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) +
+                        4096),
+                    (source_b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+            });
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
         }
@@ -353,8 +374,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int byte_offset = ek.value * 2048;
-                const int base = a_read_base ^ (em.value * 0x40);
+                constexpr int slab = em.value / 2;
+                constexpr int em_in_slab = em.value % 2;
+                constexpr int byte_offset = slab * 4096 + ek.value * 2048;
+                const int base = a_read_base ^ (em_in_slab * 0x40);
                 auto lo = s_a.template _tr_load<T::VEC_TR_B, byte_offset>(
                     base);
                 auto hi = s_a.template _tr_load<T::VEC_TR_B, byte_offset>(
@@ -370,18 +393,21 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             });
         });
         typename decltype(mma)::vtype_b v_b;
-        opus::static_for<T::E_K>([&](auto ek) {
-            constexpr int byte_offset = ek.value * 4096;
-            auto lo = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                b_read_base);
-            auto hi = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
-                b_read_base ^ 0x440);
+        opus::static_for<T::E_N>([&](auto en) {
+            opus::static_for<T::E_K>([&](auto ek) {
+                constexpr int byte_offset = en.value * 8192 + ek.value * 4096;
+                auto lo = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    b_read_base);
+                auto hi = s_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    b_read_base ^ 0x440);
+                constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
-            for(int j = 0; j < T::VEC_TR_B; ++j)
-            {
-                v_b[ek.value * 2 * T::VEC_TR_B + j] = lo[j];
-                v_b[ek.value * 2 * T::VEC_TR_B + T::VEC_TR_B + j] = hi[j];
-            }
+                for(int j = 0; j < T::VEC_TR_B; ++j)
+                {
+                    v_b[fragment * 2 * T::VEC_TR_B + j] = lo[j];
+                    v_b[fragment * 2 * T::VEC_TR_B + T::VEC_TR_B + j] = hi[j];
+                }
+            });
         });
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
@@ -436,9 +462,18 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
-    static_assert(BM == 64 && BN == 64 && BK == 64);
+    static_assert((BM == 64 || BM == 128) &&
+                  (BN == 64 || BN == 128) && BK == 64);
     static_assert(T::BLOCK_SIZE == 256 && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
+    constexpr int a_m_slabs = BM / 64;
+    constexpr int b_n_slabs = BN / 64;
+    static_assert(a_m_slabs * b_n_slabs <= 2,
+                  "only one doubled K5 output dimension is supported");
+    static_assert(T::E_M == a_m_slabs);
+    static_assert(T::E_N == b_n_slabs);
+    static_assert((BM == 64 && BN == 64) || T::DUAL_OPERAND_LDS,
+                  "wide K5 tiles require dual-operand LDS");
     int expert;
     int output_m_base;
     int output_n_base;
@@ -474,8 +509,16 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int wave_id_m = wave_id / T::T_N;
     const int wave_id_n = wave_id % T::T_N;
 
-    __shared__ __align__(16) char tile_storage[BK * BN * sizeof(D_A)];
+    constexpr int a_tile_bytes = BK * BM * sizeof(D_A);
+    constexpr int b_tile_bytes = BK * BN * sizeof(D_B);
+    constexpr int tile_storage_bytes =
+        T::DUAL_OPERAND_LDS
+            ? a_tile_bytes + b_tile_bytes
+            : (a_tile_bytes > b_tile_bytes ? a_tile_bytes : b_tile_bytes);
+    __shared__ __align__(16) char tile_storage[tile_storage_bytes];
     auto s_tile = make_smem(reinterpret_cast<D_A*>(tile_storage));
+    auto s_tile_b = make_smem(reinterpret_cast<D_B*>(
+        tile_storage + (T::DUAL_OPERAND_LDS ? a_tile_bytes : 0)));
 
     const D_A* a = reinterpret_cast<const D_A*>(kargs.a);
     const D_B* b = reinterpret_cast<const D_B*>(kargs.b);
@@ -574,7 +617,62 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int source_b0 = sorted0;
         const int source_b1 = sorted1;
 
-        if constexpr(T::DIRECT_GMEM_TO_LDS)
+        if constexpr(T::DUAL_OPERAND_LDS)
+        {
+            static_assert(T::DIRECT_GMEM_TO_LDS,
+                          "dual operand LDS requires direct GMEM-to-LDS");
+            // Close the prior tile before overwriting either operand.  The
+            // two independent LDS destinations let all four K-half loads run
+            // under one VMEM wait and one producer/consumer barrier.
+            __builtin_amdgcn_s_barrier();
+            OPUS_LDS_ADDR D_A* a_wave_dst =
+                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_tile.ptr) +
+                wave_id * opus::get_warp_size() * VEC;
+            OPUS_LDS_ADDR D_B* b_wave_dst =
+                reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile_b.ptr) +
+                wave_id * opus::get_warp_size() * VEC;
+            opus::static_for<a_m_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR char* a_slab_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(a_wave_dst) +
+                    slab.value * 64 * BK * sizeof(D_A);
+                const int source_m =
+                    output_m_base + slab.value * 64 + local_vec;
+                g_a.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_slab_dst),
+                    (source_a0 * kargs.stride_a_row + source_m) * sizeof(D_A),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_A>{});
+                g_a.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_slab_dst + 4096),
+                    (source_a1 * kargs.stride_a_row + source_m) * sizeof(D_A),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_A>{});
+            });
+            opus::static_for<b_n_slabs>([&](auto slab) {
+                OPUS_LDS_ADDR char* b_slab_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_wave_dst) +
+                    slab.value * 64 * BK * sizeof(D_B);
+                const int source_n =
+                    output_n_base + slab.value * 64 + local_vec;
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                    (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+                g_b.template _async_load<VEC>(
+                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst + 4096),
+                    (source_b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
+                    0,
+                    opus::number<0>{},
+                    opus::number<T::CACHECTL_B>{});
+            });
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
+        else if constexpr(T::DIRECT_GMEM_TO_LDS)
         {
             // Invert the {vec=8, perPhase=2, maxPhase=8} shared swizzle in
             // the global vector owner.  gfx950 then deposits every 16-byte
@@ -620,23 +718,36 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         }
 
         typename decltype(mma)::vtype_a v_a;
-        opus::static_for<T::E_K>([&](auto ek) {
-            constexpr int byte_offset = ek.value * 2048;
-            auto lo = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                a_read_base);
-            auto hi = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                a_read_base ^ 0x220);
+        opus::static_for<T::E_M>([&](auto em) {
+            opus::static_for<T::E_K>([&](auto ek) {
+                constexpr int byte_offset =
+                    em.value * 64 * BK * sizeof(D_A) + ek.value * 2048;
+                auto lo = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    a_read_base);
+                auto hi = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    a_read_base ^ 0x220);
+                constexpr int fragment = em.value * T::E_K + ek.value;
 #pragma unroll
-            for(int j = 0; j < T::VEC_TR_B; ++j)
-            {
-                v_a[ek.value * 2 * T::VEC_TR_B + j] = lo[j];
-                v_a[ek.value * 2 * T::VEC_TR_B + T::VEC_TR_B + j] = hi[j];
-            }
+                for(int j = 0; j < T::VEC_TR_B; ++j)
+                {
+                    v_a[fragment * 2 * T::VEC_TR_B + j] = lo[j];
+                    v_a[fragment * 2 * T::VEC_TR_B + T::VEC_TR_B + j] =
+                        hi[j];
+                }
+            });
         });
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr(!T::DUAL_OPERAND_LDS)
+        {
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
 
-        if constexpr(T::DIRECT_GMEM_TO_LDS)
+        if constexpr(T::DUAL_OPERAND_LDS)
+        {
+            // Both operands were produced together above.  Keeping this
+            // branch empty is what removes the overwrite barrier pair.
+        }
+        else if constexpr(T::DIRECT_GMEM_TO_LDS)
         {
             OPUS_LDS_ADDR D_B* wave_dst =
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_tile.ptr) +
@@ -676,18 +787,23 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         }
 
         typename decltype(mma)::vtype_b v_b;
-        opus::static_for<T::E_K>([&](auto ek) {
-            constexpr int byte_offset = ek.value * 2048;
-            auto lo = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                b_read_base);
-            auto hi = s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
-                b_read_base ^ 0x220);
+        opus::static_for<T::E_N>([&](auto en) {
+            opus::static_for<T::E_K>([&](auto ek) {
+                constexpr int byte_offset =
+                    en.value * 64 * BK * sizeof(D_B) + ek.value * 2048;
+                auto lo = s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    b_read_base);
+                auto hi = s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                    b_read_base ^ 0x220);
+                constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
-            for(int j = 0; j < T::VEC_TR_B; ++j)
-            {
-                v_b[ek.value * 2 * T::VEC_TR_B + j] = lo[j];
-                v_b[ek.value * 2 * T::VEC_TR_B + T::VEC_TR_B + j] = hi[j];
-            }
+                for(int j = 0; j < T::VEC_TR_B; ++j)
+                {
+                    v_b[fragment * 2 * T::VEC_TR_B + j] = lo[j];
+                    v_b[fragment * 2 * T::VEC_TR_B + T::VEC_TR_B + j] =
+                        hi[j];
+                }
+            });
         });
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);

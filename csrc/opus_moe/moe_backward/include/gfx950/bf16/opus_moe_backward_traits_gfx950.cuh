@@ -40,6 +40,7 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
     : Bf16Traits<Family::DownBwd, 32, 128, 64, 256, 2, false>
 {
     static constexpr int ROUTE_COHORT_TILES = 0;
+    static constexpr int ROUTE_M_TILES = 1;
     static constexpr int ROUTE_M = 32;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
@@ -77,16 +78,41 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
     static_assert(SMEM_B_GROUPS == 16);
 };
 
-struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort4
-    : DownBwdBf16Gfx950Bm32Bn128Bk64Padded
-{
-    static constexpr int ROUTE_COHORT_TILES = 4;
-};
-
 struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
     : DownBwdBf16Gfx950Bm32Bn128Bk64Padded
 {
     static constexpr int ROUTE_COHORT_TILES = 2;
+};
+
+// Reuse one W2 tile across two adjacent 32-route tiles of the same expert.
+// The physical sorter granularity remains 32 rows, so this works with the
+// existing forward metadata and masks the final half when an expert owns an
+// odd number of padded tiles.
+struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedM2Cohort2
+    : DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
+{
+    static constexpr int ROUTE_M_TILES = 2;
+};
+
+// The largest reuse factor that keeps the two-stage dO/W2 payload below the
+// 64 KiB per-workgroup LDS boundary: 2 * (3 * 4 KiB + 17 KiB) ~= 58 KiB.
+struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedM3Cohort2
+    : DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
+{
+    static constexpr int ROUTE_M_TILES = 3;
+};
+
+// Halving BK leaves enough LDS to keep five adjacent route tiles live while
+// reusing one W2 tile.  The extra K-loop boundaries are amortized once the
+// routed activation footprint is beyond L2.
+struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort2
+    : DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
+{
+    static constexpr int B_K = 32;
+    static constexpr int E_K = 2;
+    static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
+    static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+    static constexpr int ROUTE_M_TILES = 5;
 };
 
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
@@ -153,13 +179,6 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
     static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
     static constexpr int SMEM_B_BYTES =
         SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
-};
-
-struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM3Cohort6
-    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
-{
-    static constexpr int ROUTE_COHORT_TILES = 6;
-    static constexpr int ROUTE_M_TILES = 3;
 };
 
 struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
@@ -292,22 +311,52 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
-struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4
+struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort2DirectLds
     : Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
 {
-    static constexpr int EXPERT_COHORT = 4;
-};
-
-struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4DirectLds
-    : Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4
-{
+    static constexpr int EXPERT_COHORT = 2;
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
-struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort2DirectLds
-    : Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort4DirectLds
+// Keep the four-wave workgroup used by the BM64 kernel, but let every lane
+// load two 64-row dZ slabs and accumulate four native M tiles.  This shares
+// each gathered X tile across twice as many dW1 rows without the occupancy
+// and scheduling cost of the rejected 512-thread BM128 experiment.
+struct Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DirectLds
+    : Bf16Traits<Family::Dw1, 128, 128, 32, 256, 2, false>
 {
     static constexpr int EXPERT_COHORT = 2;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr int T_M = 1;
+    static constexpr int T_N = 4;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 4;
+    static constexpr int E_N = 1;
+    static constexpr int E_K = 2;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 0;
+    static constexpr int SMEM_B_ROW_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
@@ -316,6 +365,7 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
 {
     static constexpr int EXPERT_COHORT = 0;
     static constexpr bool DIRECT_GMEM_TO_LDS = false;
+    static constexpr bool DUAL_OPERAND_LDS = false;
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
     static constexpr int T_K = 1;
@@ -348,15 +398,10 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
-struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4
+struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
     : Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
 {
     static constexpr int EXPERT_COHORT = 4;
-};
-
-struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
-    : Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4
-{
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
 };
 
@@ -370,6 +415,47 @@ struct Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort2DirectLds
     : Dw2Bf16Gfx950Bm64Bn64Bk64SwizzledCohort4DirectLds
 {
     static constexpr int EXPERT_COHORT = 2;
+};
+
+// Accumulate two native output-M tiles per workgroup while keeping both
+// operands resident in LDS.  This halves the output grid and shares one
+// a_scaled tile across two D slabs for large routed working sets.
+struct Dw2Bf16Gfx950Bm128Bn64Bk64SwizzledCohort1DualLds
+    : Bf16Traits<Family::Dw2, 128, 64, 64, 256, 2, false>
+{
+    static constexpr int EXPERT_COHORT = 1;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DUAL_OPERAND_LDS = true;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 2;
+    static constexpr int E_N = 1;
+    static constexpr int E_K = 4;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 4;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled
