@@ -60,13 +60,18 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_Q_     = fp8_t,
           typename D_K_     = fp8_t,
           typename D_OUT_   = bf16_t,
-          bool CAUSAL_      = false>
+          bool CAUSAL_      = false,
+          bool LARGE_KV_    = false>
 struct mla_16mx8_32nx1_fp8fp8_ps_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
+    // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
+    // mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp. Costs ~1-2% and 3 spilled VGPR, so
+    // the host only turns it on for the caches that need it.
+    static constexpr bool LARGE_KV = LARGE_KV_;
 
     static constexpr int WARP_SIZE  = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

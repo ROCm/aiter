@@ -42,6 +42,7 @@
 // one SIMD (one computes while the other waits) and only ~46 cycles per SIMD are dead.
 
 #include "mla_fp8fp8_def.h"
+#include "mla_global_load.hpp"
 #include <bit>
 #include <cstdint>
 #include <opus/opus.hpp>
@@ -49,6 +50,15 @@
 using opus::operator""_I;
 
 namespace mla_decode_fwd_16mx8_32nx1_fp8fp8 {
+
+// Moves a wave-uniform float into an SGPR. gfx950 has no scalar float ALU, so anything
+// computed from uniform inputs still lands in a VGPR and stays live there. The bit_cast is
+// required, not cosmetic: __builtin_amdgcn_readfirstlane takes an int, so handing it a float
+// converts the value instead of moving it, silently truncating it towards zero.
+__device__ inline float readfirstlane_f32(float v)
+{
+    return std::bit_cast<float>(__builtin_amdgcn_readfirstlane(std::bit_cast<int>(v)));
+}
 
 // --- IGLP co-execution scheduling (sched_group_barrier) ---
 namespace sched_masks {
@@ -678,10 +688,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         diag_kv_bound = (warp_id * T::W_M) / kargs.H + causal_diagonal;
     }
 
-    auto g_k_nope = make_gmem(reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr),
-                              kargs.total_tokens * kargs.stride_kv_page * sizeof(D_K));
-    auto g_k_rope = make_gmem(reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr) + T::D_NOPE_SIZE,
-                              kargs.total_tokens * kargs.stride_kv_page * sizeof(D_K));
+    const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr);
+    // kv_indices always stays on a descriptor -- it is int-indexed and never large.
     auto g_kv_indices = make_gmem(kargs.kv_indices + kv_ind_ptr_s, valid_kv_len * sizeof(int));
 
     auto s_k_nope = make_smem(reinterpret_cast<D_K*>(smem_kv));
@@ -704,6 +712,20 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto u_rk_nope1 = make_layout_rk_nope<T, 1>(lane_id);
     auto u_rv0      = make_layout_rv<T, 0>(lane_id);
     auto u_rv1      = make_layout_rv<T, 1>(lane_id);
+
+    // Under LARGE_KV the K handle is a bare 64-bit pointer for global_load_lds, resolved down
+    // to this lane's slot in the tile; otherwise it is a buffer descriptor, whose 32-bit
+    // num_records caps the cache at 4 GiB and which carries the lane offset in the layout.
+    auto kv_handle = [&](const D_K* base, const auto& u_g, auto vec) {
+        if constexpr(T::LARGE_KV)
+            return global_load_base<decltype(vec)::value>(base, u_g);
+        else
+            return make_gmem(base,
+                             static_cast<unsigned>(static_cast<size_t>(kargs.total_tokens) *
+                                                   kargs.stride_kv_page * sizeof(D_K)));
+    };
+    auto g_k_nope = kv_handle(kv_base, u_gk_nope, number<T::VEC_KV_NOPE>{});
+    auto g_k_rope = kv_handle(kv_base + T::D_NOPE_SIZE, u_gk_rope, number<T::VEC_KV_ROPE_LD>{});
 
     // GEMM0 nope: bare 16x16x128 f8f6f4, driven one e_n tile at a time so each MFMA can be
     // paired with the DS read feeding it (see compute_qk_nope).
@@ -797,16 +819,41 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     auto load_kv_page_rope = [&](int tile_idx) {
         return load(g_kv_indices, u_kv_indices_rope, tile_idx * T::KV_TILE_SIZE)[0];
     };
-    auto kv_page_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+    // The 32-bit form wraps at 4 GiB, exactly the descriptor's own reach, so it stays exact
+    // wherever the small path is legal -- but it has to wrap in unsigned arithmetic: the
+    // hardware reads voffset as unsigned, while signed overflow is UB the compiler may fold
+    // on. The 64-bit form is per-lane (pages are scattered), so it lands in the address VGPR
+    // pair; a descriptor base could not carry it.
+    auto kv_page_offset = [&](int token_idx) {
+        if constexpr(T::LARGE_KV)
+            return static_cast<int64_t>(token_idx) * kargs.stride_kv_page;
+        else
+            return static_cast<int>(static_cast<unsigned>(token_idx) *
+                                    static_cast<unsigned>(kargs.stride_kv_page));
+    };
 
-    // Whole KV tile, gmem->LDS, no register round trip. Three buffer_load_lds in total, and
-    // each needs m0 rewritten with an s_nop after it, which is why this block is pure issue
-    // latency and why the caller hides it inside an MFMA shadow.
+    // Whole KV tile, gmem->LDS, no register round trip. Three LDS-DMA instructions in total,
+    // and each needs m0 rewritten with an s_nop after it, which is why this block is pure
+    // issue latency and why the caller hides it inside an MFMA shadow.
     auto async_load_kv = [&](auto slot_off, int kv_page, int kv_page_rope) {
-        async_load<T::VEC_KV_NOPE>(
-            g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(kv_page), u_sk_nope + slot_off);
-        async_load<T::VEC_KV_ROPE_LD>(
-            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page_rope), u_sk_rope + slot_off);
+        if constexpr(T::LARGE_KV)
+        {
+            global_load<T::VEC_KV_NOPE>(
+                g_k_nope + kv_page_offset(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope + slot_off);
+            global_load<T::VEC_KV_ROPE_LD>(g_k_rope + kv_page_offset(kv_page_rope),
+                                           s_k_rope.ptr,
+                                           u_gk_rope,
+                                           u_sk_rope + slot_off);
+        }
+        else
+        {
+            async_load<T::VEC_KV_NOPE>(
+                g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(kv_page), u_sk_nope + slot_off);
+            async_load<T::VEC_KV_ROPE_LD>(g_k_rope,
+                                          s_k_rope.ptr,
+                                          u_gk_rope + kv_page_offset(kv_page_rope),
+                                          u_sk_rope + slot_off);
+        }
     };
 
     // GEMM0 nope: 4 e_k steps of 2 MFMA, each prefetching the K tile two steps ahead.
@@ -1210,10 +1257,10 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
     // QK's descale_q*descale_k rides the softmax temperature, and V's descale_k is applied
     // once on the finished O below (the PV MFMA itself consumes raw fp8).
     const float descale_q =
-        __builtin_amdgcn_readfirstlane(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
+        readfirstlane_f32(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
     const float descale_k =
-        __builtin_amdgcn_readfirstlane(reinterpret_cast<const float*>(kargs.kv_scale_ptr)[0]);
-    const float qk_scale = temperature_scale * descale_q * descale_k;
+        readfirstlane_f32(reinterpret_cast<const float*>(kargs.kv_scale_ptr)[0]);
+    const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
     auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_buffer_ptr) + q_gmem_offset,
@@ -1320,7 +1367,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         return;
 
     constexpr float LOG2_E        = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    const float temperature_scale = readfirstlane_f32(kargs.softmax_scale * LOG2_E);
     const int warp_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / Traits::WARP_SIZE);
     for(int w = work_idx_start; w < work_idx_end; ++w)
     {

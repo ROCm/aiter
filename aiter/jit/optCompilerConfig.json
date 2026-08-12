@@ -1684,8 +1684,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/defs.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -1700,8 +1700,9 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_opus_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/mla_decode_fwd_opus.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/mla_fp8fp8_def.h'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_fp8fp8_def.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

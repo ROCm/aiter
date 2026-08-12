@@ -18,16 +18,17 @@
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 
-#include "ds32/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp"
+#include "opus/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp"
 #include "mla.h"
 #include "aiter_hip_common.h"
 
 // Causal is a compile-time specialization: a request only needs the causal
 // diagonal when it carries more than one query token, so a pure decode launch
 // (max_seqlen_q == 1) picks the build that masks out-of-bounds columns only.
-template <bool CAUSAL>
-using OpusTraitsC = mla_16mx8_32nx1_fp8fp8_ps_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL>;
-using OpusTraits  = OpusTraitsC<false>;
+template <bool CAUSAL, bool LARGE_KV = false>
+using OpusTraitsC =
+    mla_16mx8_32nx1_fp8fp8_ps_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
+using OpusTraits = OpusTraitsC<false>;
 
 // q       : [B, H, D_HEAD]           fp8 (merged nope+rope, d = 576)
 // kv      : [total_tokens, D_HEAD]   fp8 (merged nope+rope, d = 576)
@@ -108,15 +109,34 @@ void mla_decode_fwd_opus_stage1(torch::Tensor& q,
     kargs.stride_kv_page = T::D_HEAD_SIZE;
     kargs.softmax_scale  = static_cast<float>(softmax_scale);
 
+    // A buffer descriptor's num_records is 32 bits, so it cannot span a KV cache of 4 GiB
+    // or more; past that the bound wraps and every load beyond it silently returns zero.
+    // Unlike the contiguous fmha case there is no way to rebase the descriptor per tile
+    // here: page_size is 1, so one KV tile's 32 tokens sit at unrelated, per-lane offsets
+    // while a descriptor base is wave-uniform. The large path addresses KV with a flat
+    // 64-bit pointer (global_load_lds) instead, which costs ~1-2%, hence the gate.
+    const int64_t kv_bytes = static_cast<int64_t>(total_tokens) *
+                             static_cast<int64_t>(kargs.stride_kv_page) *
+                             static_cast<int64_t>(sizeof(fp8_t));
+    const bool large_kv = kv_bytes >= (int64_t{1} << 32);
+
     auto stream = at::cuda::getCurrentHIPStream().stream();
+    auto launch = [&](auto traits) {
+        mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<decltype(traits)>
+            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+    };
     if(max_seqlen_q > 1)
     {
-        mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<OpusTraitsC<true>>
-            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+        if(large_kv)
+            launch(OpusTraitsC<true, true>{});
+        else
+            launch(OpusTraitsC<true, false>{});
     }
     else
     {
-        mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<OpusTraitsC<false>>
-            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+        if(large_kv)
+            launch(OpusTraitsC<false, true>{});
+        else
+            launch(OpusTraitsC<false, false>{});
     }
 }
