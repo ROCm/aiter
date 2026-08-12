@@ -13,10 +13,26 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+# gfx1250 gluon forward. Signature-compatible with `_attn_fwd`, so dispatch is a
+# callable swap at the launch site (same pattern as attention/pa_decode_sparse.py).
+_gluon_attn_fwd = None
+if arch_info.get_arch() == "gfx1250":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha import (
+            _attn_fwd as _gluon_attn_fwd,
+        )
+    except Exception:  # noqa: BLE001 - any import/compile issue falls back to Triton
+        _gluon_attn_fwd = None
+
+# Escape hatch for benchmarking/debugging: 0 forces Triton, 1 forces gluon
+# (subject to the support gate below), unset auto-selects.
+_MHA_GLUON_ENV = os.environ.get("AITER_TRITON_MHA_GLUON")
 
 _USE_FUSED_BWD_KERNEL = False
 
@@ -37,6 +53,39 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
     global _MHA_IMPL
     _MHA_IMPL = impl
+
+
+def _use_gluon_fwd(
+    q, k, v, o, alibi_slopes, sink, enable_dropout, return_softmax, IS_FP8,
+    pe_head_dim, v_head_dim, BLOCK_DMODEL_POW2, config,
+) -> bool:
+    """Whether the gfx1250 gluon forward can serve this call.
+
+    The kernel is bf16-only and implements causal / varlen / GQA / sliding
+    window / sink / LSE. Everything it does not implement stays on Triton.
+    """
+    if _gluon_attn_fwd is None or _MHA_GLUON_ENV == "0":
+        return False
+    if _MHA_SWIZZLE != "default":
+        return False
+    if not all(t.dtype is torch.bfloat16 for t in (q, k, v)):
+        return False
+    if enable_dropout or return_softmax or IS_FP8:
+        return False
+    if alibi_slopes is not None or pe_head_dim != 0:
+        return False
+    # No padded head: the kernel indexes the full BLOCK_DMODEL_POW2 columns.
+    if v_head_dim != BLOCK_DMODEL_POW2:
+        return False
+    # The K/V TDM descriptors hardcode a unit innermost stride
+    # (`strides=[stride_kn, 1]`). Q and O are indexed with explicit strides, so
+    # only K/V are constrained.
+    if not all(t.stride(-1) == 1 for t in (k, v)):
+        return False
+    # Each warp needs at least one 16-row WMMA M-tile.
+    if config["BLOCK_M"] // 16 < config["num_warps"]:
+        return False
+    return True
 
 
 _USE_INT64_STRIDES = True
@@ -279,7 +328,16 @@ def _flash_attn_forward(
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
-        _attn_fwd[grid](
+        fwd_impl = (
+            _gluon_attn_fwd
+            if _use_gluon_fwd(
+                q, k, v, o, alibi_slopes, sink, enable_dropout, return_softmax,
+                IS_FP8, pe_head_dim, v_head_dim, BLOCK_DMODEL_POW2, config,
+            )
+            else _attn_fwd
+        )
+
+        fwd_impl[grid](
             q,
             k,
             v,
