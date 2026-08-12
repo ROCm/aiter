@@ -1,18 +1,20 @@
-import sys
 import argparse
+import sys
+
 import torch
 import triton
-from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+
+from aiter.ops.triton.activation import fused_silu_mul
 from aiter.ops.triton.moe.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
-from aiter.ops.triton.activation import fused_silu_mul
-from op_tests.triton_tests.moe.test_moe import input_helper, input_helper_int4_w4a16
+from aiter.ops.triton.utils.types import str_to_torch_dtype, torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
-    print_vgpr,
     get_caller_name_no_ext,
+    get_model_configs,
+    print_vgpr,
 )
+from op_tests.triton_tests.moe.test_moe import input_helper, input_helper_int4_w4a16
 
 
 def model_benchmark_configs(args):
@@ -123,7 +125,7 @@ def fused_moe(
             has_zp=has_zp,
         )
 
-        return lambda: moe_fn(  # noqa: E731
+        return lambda: moe_fn(
             a,
             b,
             triton_out_silu if silu_fused else triton_out,
@@ -211,9 +213,8 @@ def run_benchmark(args):
     if int4_w4a16:
         assert group_size is not None, "set group_size with -group_size"
 
-    kernel_name = "_fused_moe_kernel"
     if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
-        kernel_name = "_fused_moe_kernel_gptq_awq"
+        pass
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]

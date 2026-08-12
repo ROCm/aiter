@@ -13,14 +13,16 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.9.dev599"
+FLYDSL_VERSION = "flydsl==0.3.0"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
-PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
-if IS_WINDOWS:
+# Single skip-C++/HIP-build gate; Windows enables it automatically.
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
 
@@ -46,22 +48,20 @@ def getMaxJobs():
 
 def is_develop_mode():
     for arg in sys.argv:
-        if arg == "develop":
-            return True
-        # pip install -e
-        elif "editable" in arg:
+        if arg == "develop" or "editable" in arg:
             return True
     return False
 
 
-if not IS_WINDOWS and is_develop_mode():
+if not AITER_TRITON_ONLY and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
+
         from packaging.version import Version
 
         if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
-    except Exception:
+    except Exception:  # noqa: BLE001
         subprocess.check_call(
             [
                 sys.executable,
@@ -85,7 +85,7 @@ def _is_triton_installed():
     ]:
         try:
             return pkg, pkg_version(pkg)
-        except Exception:
+        except Exception:  # noqa: BLE001,S110
             pass
     return None
 
@@ -96,7 +96,7 @@ def _run_install_triton():
     subprocess.check_call(["bash", install_triton])
 
 
-AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
 
 
 def _torch_version_below(min_version):
@@ -107,20 +107,25 @@ def _torch_version_below(min_version):
         return Version(torch.__version__.split("+")[0].split("dev")[0]) < Version(
             min_version
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 _triton_info = _is_triton_installed()
 if _torch_version_below("2.9.1"):
     print(
-        f"[aiter] torch < 2.9.1 detected, skipping triton reinstall"
-        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}"
+        f"[aiter] torch < 2.9.1 detected, triton reinstall skipped for compatibility"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
+    )
+    print(
+        "[aiter] To use aiter-compatible triton, please upgrade torch to 2.9.1 or later."
     )
 elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
-        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
-        f" {_triton_info[0]}=={_triton_info[1]}"
+        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
+    )
+    print(
+        "[aiter] To ensure compatibility, consider running .github/scripts/install_triton.sh."
     )
 else:
     if _triton_info:
@@ -131,7 +136,7 @@ else:
         )
     try:
         _run_install_triton()
-    except Exception:
+    except Exception:  # noqa: BLE001
         print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
@@ -154,7 +159,7 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    if not IS_WINDOWS:
+    if not AITER_TRITON_ONLY:
         shutil.copytree("hsa", "aiter_meta/hsa")
     else:
         os.makedirs("aiter_meta/hsa", exist_ok=True)
@@ -192,7 +197,7 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only() and not IS_WINDOWS:
+if not _is_metadata_only() and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -225,7 +230,7 @@ def _load_modules_from_config():
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
     if isinstance(data, dict):
         return list(data.keys())
@@ -271,7 +276,7 @@ if PREBUILD_KERNELS != 0:
     has_torch = True
     try:
         import torch as _
-    except Exception:
+    except Exception:  # noqa: BLE001
         has_torch = False
 
     if not has_torch:
@@ -280,11 +285,12 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
+        import glob
+
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
         from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
-        import glob
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
@@ -347,7 +353,7 @@ if PREBUILD_KERNELS != 0:
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
                 os.remove(f)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
         def build_one_module(one_opt_args):
@@ -385,11 +391,10 @@ if PREBUILD_KERNELS != 0:
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
         os.environ["AITER_AOT_IMPORT"] = "1"
         try:
-            from aiter.aot.flydsl.common import start_aot, wait_aot
+            from aiter.aot.flydsl.common import run_aot
 
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            pool, futures = start_aot(flydsl_cache_dir)
-            wait_aot(pool, futures)
+            run_aot(flydsl_cache_dir)
         finally:
             if _prev_aot_import is None:
                 os.environ.pop("AITER_AOT_IMPORT", None)
@@ -402,7 +407,7 @@ if PREBUILD_KERNELS != 0:
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
-            from aiter.utility.pretune import run_pretune_modules  # noqa: E402
+            from aiter.utility.pretune import run_pretune_modules
 
             cfg_path = OPT_COMPILER_CONFIG
             with open(cfg_path, "r", encoding="utf-8") as _f:
@@ -454,7 +459,7 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-if IS_WINDOWS:
+if AITER_TRITON_ONLY:
     install_requires = ["einops", "packaging", "psutil"]
 else:
     install_requires = [
@@ -481,7 +486,11 @@ setup(
         "Operating System :: Unix",
     ],
     cmdclass={"build_ext": NinjaBuildExtension},
-    python_requires=">=3.8",
+    # 3.8/3.9 have not actually worked for a long time: 81 modules already use
+    # PEP 604 annotations (`X | None`) without `from __future__ import
+    # annotations`, so they raise TypeError at import time on <3.10. Keep in sync
+    # with `target-version` under [tool.ruff] in pyproject.toml.
+    python_requires=">=3.10",
     install_requires=install_requires,
     extras_require={
         # Triton-based communication using Iris

@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_mha_common import (
     attention_ref,
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
 from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
-
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 arch = get_arch()
 

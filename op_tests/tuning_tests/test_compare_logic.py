@@ -9,6 +9,7 @@ Covers: _build_compare_update_plan, _merge_compare_filtered_results.
 import os
 import tempfile
 import unittest
+
 import pandas as pd
 
 TEST_GFX = "gfx942"

@@ -1,32 +1,41 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
 import os
 import sys
-import aiter
+from typing import Any, ClassVar
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, AITER_CSRC_DIR
-from aiter.utility.base_tuner import GemmCommonTuner
-from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_ck
 
-import argparse
+import aiter
+from aiter import dtypes
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+    AITER_CSRC_DIR,
+    get_asm_dir,
+)
+from aiter.ops.shuffle import shuffle_weight
+from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.jit.core import get_asm_dir
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
 from gemm_a8w8_bpreshuffle_cktile_common import (
-    kernels_list as kernels_list_cktile,
     BLOCK_PER_CU_MAX,
+)
+from gemm_a8w8_bpreshuffle_cktile_common import (
+    kernels_list as kernels_list_cktile,
 )
 
 try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         kernel_instance_estimated_lds_bytes,
-        kernels_list as kernels_list_flydsl,
         max_lds_bytes_for_tune,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl,
     )
 except ImportError:
     print(
@@ -77,10 +86,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
@@ -136,7 +142,6 @@ def run_gemm_a8w8_asm(
 
 def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     ki = kernels_list_flydsl[kernel_id]
-    xcd = getattr(ki, "xcd_swizzle", 0)
     flydsl_preshuffle_gemm_a8(
         x,
         weight_shuffle,
@@ -146,11 +151,39 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         ki.tile_m,
         ki.tile_n,
         ki.tile_k,
-        ki.lds_stage,
-        ki.use_cshuffle_epilog,
         ki.use_async_copy,
         ki.waves_per_eu,
-        xcd,
+        ki.xcd_swizzle,
+        ki.lds_stage,
+        ki.enable_scheduler,
+    )
+    return out
+
+
+def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+        run_preshuffle_gemm_a8_gfx1250,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+        kernels_list as kernels_list_flydsl_wmma,
+    )
+
+    ki = kernels_list_flydsl_wmma[kernel_id]
+    run_preshuffle_gemm_a8_gfx1250(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        num_buffers=ki.num_buffers,
+        split_k=ki.split_k,
+        cluster_m=ki.cluster_m,
+        cluster_n=ki.cluster_n,
+        m_warp=ki.m_warp,
+        n_warp=ki.n_warp,
     )
     return out
 
@@ -198,7 +231,7 @@ def libtype_list(string):
 
 
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
@@ -271,12 +304,12 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
 
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         task = []
-        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.i8:
             return task
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
-        asm_tiles = [key for key in asm_kernels.keys()]
+        asm_tiles = [key for key in asm_kernels]
 
         gemm_asm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out", "bias_f32"]
         ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
@@ -335,7 +368,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -401,7 +434,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -463,11 +496,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         seed,
     ):
-        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, _cu_num, M, N, K, q_dtype_w = info_keys
+
+        if gfx == "gfx1250":
+            return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
+
         q_dtype_eval = eval(q_dtype_w)
-        if q_dtype_eval == dtypes.fp8:
-            pass
-        elif q_dtype_eval == dtypes.i8:
+        if q_dtype_eval == dtypes.fp8 or q_dtype_eval == dtypes.i8:
             pass
         else:
             print(f"[FlyDSL] unsupported q_dtype_w {q_dtype_w}, skipping")
@@ -502,13 +537,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 continue
             if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
                 continue
-            # XCD workgroup-id swizzle needs enough workgroups to leave room
-            # for cross-XCD remapping. With <64 wg the swizzle degenerates
-            # into noise (empirically <1.5% of picked-xcd4 winners fall below
-            # this threshold), so skip xcd>0 candidates to halve the
-            # candidate count on small shapes.
-            if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
-                continue
             kernel_name = ki.name
             info = (info_keys, i, 0, kernel_name, "flydsl")
             tasks.append(
@@ -519,6 +547,65 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     run_gemm_flydsl,
                     (
                         gemm_flydsl_keys,
+                        i,
+                    ),
+                    {
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                    },
+                    run_torch,
+                    (
+                        ref_keys,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
+    def _get_flydsl_tune_task_gfx1250(self, info_keys, seed):
+        """gfx1250 WMMA ptpc tuning tasks for the FlyDSL libtype."""
+        _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
+        if eval(q_dtype_w) != dtypes.fp8:
+            print(
+                f"[FlyDSL][gfx1250] WMMA ptpc supports fp8 only, skipping {q_dtype_w}"
+            )
+            return []
+        if not is_flydsl_available():
+            return []
+        try:
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+                kernel_fits_shape as kernel_fits_shape_wmma,
+            )
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+                kernels_list as kernels_list_flydsl_wmma,
+            )
+        except ImportError:
+            return []
+        if not kernels_list_flydsl_wmma:
+            return []
+        gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
+        tasks = []
+        for i in sorted(kernels_list_flydsl_wmma.keys()):
+            ki = kernels_list_flydsl_wmma[i]
+            if not kernel_fits_shape_wmma(ki, M, N, K):
+                continue
+            info = (info_keys, i, 0, ki.name, "flydsl")
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed, dtypes.bf16, dtypes.fp8),
+                    run_gemm_flydsl_gfx1250,
+                    (
+                        gemm_keys,
                         i,
                     ),
                     {
@@ -649,8 +736,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         return resultdf
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle, gemm_a8w8_ASM
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_ASM, gemm_a8w8_bpreshuffle
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
@@ -713,7 +800,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )

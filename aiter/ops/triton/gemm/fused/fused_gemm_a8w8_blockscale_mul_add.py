@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Union
 import torch
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
     _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -61,12 +60,12 @@ def fused_gemm_a8w8_blockscale_mul_add(
     w,
     x_scales,
     w_scales,
-    a: Union[torch.Tensor, float, int],
-    b: Union[torch.Tensor, float, int],
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    fuse_type: Optional[int] = 0,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    fuse_type: int | None = 0,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP8 activations and FP8 weights.
@@ -95,7 +94,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
         f"FUSED_GEMM_A8W8_BLOCKSCALE_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
-    if isinstance(a, float) or isinstance(a, int):
+    if isinstance(a, (float, int)):
         IS_A_SCALAR = True
         IS_A_TENSOR = False
     elif isinstance(a, torch.Tensor) and a.is_contiguous():
@@ -104,7 +103,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
             IS_A_SCALAR = True
         else:
             IS_A_SCALAR = False
-    if isinstance(b, float) or isinstance(b, int):
+    if isinstance(b, (float, int)):
         IS_B_SCALAR = True
         IS_B_TENSOR = False
     elif isinstance(b, torch.Tensor) and b.is_contiguous():
@@ -128,7 +127,9 @@ def fused_gemm_a8w8_blockscale_mul_add(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        # fuse_type is passed so gfx950 can route fuse_type=1 to the base config
+        # (the dedicated fast 64x64 tile is miscompiled for fuse_type=1 on Triton 3.8).
+        config, _ = _get_config(M, N, K, fuse_type)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
@@ -157,7 +158,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

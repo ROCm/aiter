@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import triton
 import triton.language as tl
-import functools
+
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
@@ -617,7 +618,6 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     tl.store(c1_ptrs, y, mask=y_mask)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,

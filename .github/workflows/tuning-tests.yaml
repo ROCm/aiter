@@ -1,6 +1,9 @@
 name: Tuning Tests
 
 on:
+  schedule:
+    # Runs daily at 04:00 Beijing time.
+    - cron: "0 20 * * *"
   workflow_dispatch:
     inputs:
       suite:
@@ -26,7 +29,7 @@ env:
 
 jobs:
   cpu-validation:
-    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
     name: README Level 0+1
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 45
@@ -106,7 +109,7 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-pipeline:
-    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
     name: README Level 2 Pipeline
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 75
@@ -186,7 +189,7 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-run-config:
-    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
     name: README Level 2 Run Config
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 120

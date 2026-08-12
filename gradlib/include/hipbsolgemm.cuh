@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below
 // just for gfx908 and not for others
@@ -29,7 +29,7 @@
 #include <string>
 #include <tuple>
 #include <sstream>
-#include <fstream> 
+#include <fstream>
 #include <filesystem>
 #include <sys/file.h>
 #include <fcntl.h>
@@ -44,10 +44,11 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                       const int solution_index,
                       std::optional<torch::Tensor> bias        = std::nullopt,
                       std::optional<c10::ScalarType> out_dtype = std::nullopt,
-                      std::optional<torch::Tensor> scaleA = std::nullopt,
-                      std::optional<torch::Tensor> scaleB = std::nullopt,
-                      std::optional<torch::Tensor> scaleOut = std::nullopt,
-                      std::optional<bool> bpreshuffle = std::nullopt);
+                      std::optional<torch::Tensor> scaleA      = std::nullopt,
+                      std::optional<torch::Tensor> scaleB      = std::nullopt,
+                      std::optional<torch::Tensor> scaleOut    = std::nullopt,
+                      std::optional<bool> bpreshuffle          = std::nullopt,
+                      std::optional<bool> use_gelu             = std::nullopt);
 
 std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                   const torch::Tensor& mat2,
@@ -56,7 +57,8 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                   std::optional<torch::Tensor> scaleA      = std::nullopt,
                                   std::optional<torch::Tensor> scaleB      = std::nullopt,
                                   std::optional<torch::Tensor> scaleC      = std::nullopt,
-                                  bool bpreshuffle                         = false);
+                                  bool bpreshuffle                         = false,
+                                  bool use_gelu                            = false);
 
 std::string getHipblasltKernelName(int solution_index);
 

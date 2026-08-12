@@ -1029,6 +1029,10 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
     do
     {
         temp_storage.sampled_id = d;
+        // Initialize last_valid_id: when no thread satisfies the predicate
+        // (e.g. NaN/all-zero row), max_valid stays -1 and the writer below is
+        // skipped, so the fallback would read uninitialized shared memory.
+        if (tx == 0) temp_storage.last_valid_id = 0;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
         aggregate = 0;
@@ -1069,6 +1073,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
         {
             sampled_id = temp_storage.last_valid_id;
         }
+        // Defensive clamp: guarantee the index used below is in-range.
+        if (sampled_id < 0 || (uint32_t)sampled_id >= d) sampled_id = 0;
 
         float pivot_0_f = probs[row_idx * d + sampled_id];
         double pivot_0 = pivot_0_f;
@@ -1183,6 +1189,10 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     do
     {
         temp_storage.sampled_id = d;
+        // Initialize last_valid_id: when no thread satisfies the predicate
+        // (e.g. NaN/all-zero row), max_valid stays -1 and the writer below is
+        // skipped, so the fallback would read uninitialized shared memory.
+        if (tx == 0) temp_storage.last_valid_id = 0;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
         aggregate = 0;
@@ -1223,6 +1233,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         {
             sampled_id = temp_storage.last_valid_id;
         }
+        // Defensive clamp: guarantee the index used below is in-range.
+        if (sampled_id < 0 || (uint32_t)sampled_id >= d) sampled_id = 0;
 
         float pivot_0_f = probs[row_idx * d + sampled_id];
         double pivot_0 = pivot_0_f;

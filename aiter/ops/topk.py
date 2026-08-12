@@ -3,7 +3,7 @@
 
 # user interface
 
-from typing import Optional, Tuple
+import functools
 
 import torch
 
@@ -18,7 +18,7 @@ from ..utility import dtypes
 #   - accepts an Optional[Tensor] correction_bias (None => no bias)
 #   - validates score_func string
 #   - exposes the same C++ kernel under a more accurate name
-@compile_ops("module_moe_topk")
+@compile_ops("module_moe_topk", develop=True)
 def topk_softplus(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -37,7 +37,7 @@ def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: Optional[torch.Tensor] = None,
+    correction_bias: torch.Tensor | None = None,
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
@@ -74,7 +74,7 @@ def topk_gating(
     )
 
 
-@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+@compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True)
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -87,7 +87,7 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def grouped_topk(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -110,7 +110,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -120,7 +120,20 @@ def gen_moe_fused_gate_fake_tensor(
     return [output, indices]
 
 
-@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", fc_name="moe_fused_gate", develop=True)
+def _moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -131,7 +144,21 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # C side fills topk_weights / topk_ids in place and returns void; return the
+    # (aliased) tensors to preserve the original API.
+    _moe_fused_gate(
+        input,
+        bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk,
+        n_share_experts_fusion,
+        routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk(
@@ -259,18 +286,92 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill")
+def _top_k_per_row_prefill(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: torch.Tensor | None = None,
+) -> None: ...
+
+
 @compile_ops("module_top_k_per_row")
+def topk_mb_workspace_size(
+    numRows: int, stride0: int, k: int, is_decode: bool
+) -> int: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
+
+
+@functools.lru_cache(maxsize=16)
+def _get_topk_mb_workspace_keyed(
+    device: torch.device, stream_id: int, size: int
+) -> torch.Tensor:
+    return torch.zeros(size, dtype=torch.uint8, device=device)
+
+
+def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
+    """Return a per-(device, stream, bucketed-size) zero-initialized workspace
+    for the multi-block radix top-k path.
+
+    The mb kernel uses cross-block atomic counters / histograms that must start
+    at zero; instead of a per-call ``hipMemset`` the kernel resets the scratch
+    back to zero after each launch, so a cached zeroed buffer can be reused.
+    Concurrent launches on different streams must not share the buffer, or their
+    atomic counters get mixed. Do not call from paths that violate the kernel's
+    self-reset invariant.
+
+    ``size`` is data-dependent (batch / seq_len / k), so it is rounded up to the
+    next power of two before keying/allocating. That bounds the number of
+    distinct cached buffers to ~log2(max_size) magnitudes (and the LRU cap of 16
+    bounds it further) instead of one buffer per exact shape, trading <=2x size
+    per buffer for far fewer retained buffers. The C++ side lays out its scratch
+    within the first ``size`` bytes, so a larger (rounded) buffer is fine.
+    """
+    # Round up to the next power of two (size >= 1) to bucket nearby shapes.
+    alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
+    stream = torch.cuda.current_stream(device)
+    return _get_topk_mb_workspace_keyed(device, stream.cuda_stream, alloc)
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
     k: int = 2048,
-) -> None: ...
+) -> None:
+    """Per-row top-k (prefill). The multi-block path runs on a persistent,
+    zero-initialized workspace (memset-free; see get_topk_mb_workspace); the
+    one-block path allocates its own scratch internally."""
+    workspace = None
+    if topk_use_mulblocks(numRows, stride0):
+        size = topk_mb_workspace_size(numRows, stride0, k, False)
+        workspace = get_topk_mb_workspace(logits.device, size)
+    return _top_k_per_row_prefill(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+    )
 
 
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
@@ -279,14 +380,27 @@ def top_k_per_row_prefill_fast(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode")
+def _top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: torch.Tensor | None = None,
+) -> None: ...
+
+
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -296,7 +410,18 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
-) -> None: ...
+) -> None:
+    """Per-row top-k (decode). Always uses the one-block kernel — the C++
+    side ignores the workspace argument for decode."""
+    # Decode always takes the ob path (see topk_per_row_kernels.cu).
+    # The original mb dispatch is commented out below for reference:
+    #   workspace = None
+    #   if topk_use_mulblocks(numRows, stride0):
+    #       size = topk_mb_workspace_size(numRows, stride0, k, True)
+    #       workspace = get_topk_mb_workspace(logits.device, size)
+    return _top_k_per_row_decode(
+        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
+    )
 
 
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")

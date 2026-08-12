@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
 import torch.nn.functional as F
+
 import aiter
-from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
-import argparse
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -42,7 +44,7 @@ def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
             residual_out,
             weight,
             eps,
-            use_model_sensitive_rmsnorm,
+            use_model_sensitive_rmsnorm=use_model_sensitive_rmsnorm,
         )
     return output, residual_out
 
@@ -69,7 +71,7 @@ def test_rmsnorm2d(dtype, m, n):
     (a, *_), avg_a = run_torch(input, weight, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
     checkAllclose(a, c, msg="cu")
 
@@ -86,9 +88,9 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     (c, res_c, *_), avg_c = run_ck(
         input, weight, 1e-5, residual=res, use_model_sensitive_rmsnorm=1
     )
-    (d, res_d, *_), avg_d = run_cu(input, weight, 1e-5, residual=res)
+    (_d, _res_d, *_), _avg_d = run_cu(input, weight, 1e-5, residual=res)
 
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg="ck res check (NO_SPECIFIC_MODEL)")
 
@@ -97,13 +99,24 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # checkAllclose(a, d, atol=0.03, msg='cu')
     # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
+    # gemma_norm: opus folds (weight + 1); reference uses weight (w + 1). Fresh tensors
+    # because run_cu above rewrites input/res in place.
+    gx = torch.randn(dim, dtype=dtype, device="cuda")
+    gr = torch.randn(dim, dtype=dtype, device="cuda")
+    gout = torch.empty_like(gx)
+    gres = torch.empty_like(gx)
+    aiter.rmsnorm2d_fwd_with_add(gout, gx, gr, gres, weight, 1e-5, gemma_norm=True)
+    (g, gres_ref, *_), _ = run_torch(gx, (weight + 1).to(dtype), 1e-5, residual=gr)
+    checkAllclose(g, gout, atol=0.03, msg="gemma out")
+    checkAllclose(gres_ref, gres, msg="gemma res check")
+
 
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_rmsnorm2d(dtype, m, n)
 
-l_dtype = ["fp16", "bf16"]
+l_dtype = ["fp16", "bf16", "fp32"]
 l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 l_n = [4096, 8192, 16384, 32768, 65536]
 parser = argparse.ArgumentParser(

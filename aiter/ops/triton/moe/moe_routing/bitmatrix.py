@@ -1,10 +1,12 @@
+from dataclasses import dataclass
+
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
     _sum_bitmatrix_rows,
 )
-from dataclasses import dataclass
 
 
 @dataclass

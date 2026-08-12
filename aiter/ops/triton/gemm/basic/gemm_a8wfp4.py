@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _gemm_a8wfp4_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -31,8 +30,8 @@ def gemm_a8wfp4(
     y,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    config: dict | None = None,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP8 activations and FP4 weights.
@@ -100,7 +99,7 @@ def gemm_a8wfp4(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             config["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

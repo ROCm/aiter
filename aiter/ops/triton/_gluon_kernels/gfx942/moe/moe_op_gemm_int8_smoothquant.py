@@ -44,7 +44,7 @@ def _gluon_moe_gemm_int8_smoothquant(
     limit,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     APPLY_ACTIVATION: gl.constexpr,
-    ADD_RESIDUAL: gl.constexpr,
+    SWIGLU_ADD_RESIDUAL: gl.constexpr,
     # MoE config
     N_EXPTS_ACT: gl.constexpr,
     # optimization config

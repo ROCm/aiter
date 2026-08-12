@@ -1,7 +1,8 @@
-import torch
-
 import importlib.util
 from pathlib import Path
+
+import torch
+
 from aiter.ops.triton._triton_kernels.quant.quant import (
     pod_persistent,
 )
@@ -121,7 +122,7 @@ def pod_attention(
         max_tiles_per_wg,
         tiles_per_head,
         num_splits,
-        even_split,
+        _even_split,
     ) = get_num_splits_and_buffer_sizes(
         False,  # causal
         batch_size,
@@ -162,7 +163,7 @@ def pod_attention(
         max_tiles_per_wg_pf,
         tiles_per_head_pf,
         num_splits_pf,
-        even_split_pf,
+        _even_split_pf,
     ) = get_num_splits_and_buffer_sizes(
         True,  # causal,
         batch_size_pf,
@@ -338,7 +339,7 @@ def get_num_splits_and_buffer_sizes(
     tiles_per_head = 0
     if causal:
         # Prefill - Causal
-        for i in range(0, num_m_blocks):
+        for i in range(num_m_blocks):
             tiles_per_head += (((i + 1) * BLOCK_M) + BLOCK_N - 1) // BLOCK_N
     else:
         # Decode or Not Causal

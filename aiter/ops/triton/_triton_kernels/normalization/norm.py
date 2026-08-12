@@ -70,7 +70,7 @@ def _layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         _mean += x_block
@@ -86,7 +86,7 @@ def _layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         x_block = x_block - mean
@@ -109,7 +109,7 @@ def _layernorm_kernel(
 
     # Normalize and store
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -181,7 +181,7 @@ def _fused_add_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
         res_in_block = tl.load(res_in_ptr_start + col_offsets)
@@ -205,7 +205,7 @@ def _fused_add_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(res_out_ptr_start + col_offsets).to(
             tl.float32
@@ -230,7 +230,7 @@ def _fused_add_layernorm_kernel(
 
     # Normalize and store
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -306,7 +306,7 @@ def _quant_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         _mean += x_block
@@ -322,7 +322,7 @@ def _quant_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         x_block = x_block - mean
@@ -343,7 +343,7 @@ def _quant_layernorm_kernel(
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -385,7 +385,7 @@ def _quant_layernorm_kernel(
 
     # Apply quantization and write output
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
 
@@ -466,7 +466,7 @@ def _quant_fused_add_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
         res_in_block = tl.load(res_in_ptr_start + col_offsets)
@@ -490,7 +490,7 @@ def _quant_fused_add_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(res_out_ptr_start + col_offsets).to(
             tl.float32
@@ -513,7 +513,7 @@ def _quant_fused_add_layernorm_kernel(
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -557,7 +557,7 @@ def _quant_fused_add_layernorm_kernel(
 
     # Apply quantization and write output
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
 
@@ -609,7 +609,7 @@ def _layernorm_bwd_dx_fused_triton(
         num_col_blocks = tl.cdiv(N, BLOCK_SIZE_N) - 1
         row = pid
 
-        for _ in range(0, rows_per_tile):
+        for _ in range(rows_per_tile):
             # Load row statistics:
             mean = tl.load(Mean + row)
             rstd = tl.load(Rstd + row)
@@ -716,7 +716,7 @@ def _layernorm_bwd_dx_fused_triton(
             dw_row = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
             db_row = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
 
-        for _ in range(0, rows_per_tile):
+        for _ in range(rows_per_tile):
             # Compute pointers:
             x_ptrs = X + row * stride
             dy_ptrs = DY + row * stride

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _batched_gemm_afp4_wfp4_repr = make_kernel_repr(
     "_batched_gemm_afp4_wfp4_kernel",
@@ -328,7 +328,16 @@ def _get_config(
     K: int,
 ):
     # Note: Config files use K=2*K in their naming
-    config, is_tunned = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, 2 * K)
+    # Custom bounds add a dedicated M_LEQ_320 bucket (BLOCK_SIZE_M=128) so M~320
+    # avoids the ~37% tile padding of BLOCK_SIZE_M=256, without affecting M>320
+    # (which keeps BLOCK_SIZE_M=256 via the "any" bucket).
+    config, is_tunned = get_gemm_config(
+        "BATCHED_GEMM-AFP4WFP4",
+        M,
+        N,
+        2 * K,
+        bounds=(4, 8, 16, 32, 64, 128, 256, 320, 512, 1024, 2048, 4096, 8192),
+    )
 
     # Apply custom split-K logic for AFP4WFP4
     if config["NUM_KSPLIT"] > 1:

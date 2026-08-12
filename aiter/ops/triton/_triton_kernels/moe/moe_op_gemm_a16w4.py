@@ -4,12 +4,13 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]
@@ -136,7 +137,7 @@ def _moe_gemm_a16w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
-    ADD_RESIDUAL: tl.constexpr,
+    SWIGLU_ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
     # optimization config
@@ -347,7 +348,7 @@ def _moe_gemm_a16w4(
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",

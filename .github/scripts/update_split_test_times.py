@@ -129,7 +129,7 @@ def parse_aiter_log(path: Path) -> dict[str, int]:
         if not match:
             continue
         file_path = match.group(1).strip()
-        seconds = int(round(float(match.group(2))))
+        seconds = round(float(match.group(2)))
         file_time[file_path] = max(1, seconds)
     return file_time
 
@@ -155,8 +155,7 @@ def guess_test_file_from_testcase(
     file_attr = testcase.attrib.get("file", "").strip()
     if file_attr:
         normalized = file_attr.replace("\\", "/")
-        if normalized.startswith("./"):
-            normalized = normalized[2:]
+        normalized = normalized.removeprefix("./")
         if normalized in known_files:
             return normalized
         idx = normalized.find("op_tests/")
@@ -198,15 +197,15 @@ def parse_triton_junit(path: Path, known_files: set[str]) -> dict[str, int]:
         except ValueError:
             test_time = 0.0
         totals[test_file] += max(0.0, test_time)
-    return {k: max(1, int(round(v))) for k, v in totals.items()}
+    return {k: max(1, round(v)) for k, v in totals.items()}
 
 
 def aggregate_values(values: list[int], mode: str) -> int:
     if not values:
         raise ValueError("Cannot aggregate empty values")
     if mode == "mean":
-        return max(1, int(round(statistics.fmean(values))))
-    return max(1, int(round(statistics.median(values))))
+        return max(1, round(statistics.fmean(values)))
+    return max(1, round(statistics.median(values)))
 
 
 def parse_existing_file_times(script_path: Path, test_type: str) -> dict[str, int]:
@@ -551,6 +550,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover  # noqa: BLE001
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

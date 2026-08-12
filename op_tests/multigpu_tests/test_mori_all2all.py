@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-from aiter.dist.utils import get_distributed_init_method
-import torch
 import argparse
-import aiter
-from aiter import dtypes
-from aiter.fused_moe import fused_topk, fused_moe
-from aiter.ops.shuffle import shuffle_weight
 import multiprocessing as mp
-from aiter import get_hip_quant
+import os
+
+import torch
+
+import aiter
+from aiter import dtypes, get_hip_quant
+from aiter.dist.utils import get_distributed_init_method
+from aiter.fused_moe import fused_moe, fused_topk
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
 
 
@@ -125,24 +126,24 @@ def run_mori_with_manager(
             f"rank {rankID} auto-created MoriAll2AllManager: {type(mori_manager).__name__}"
         )
 
-        handle_kwargs = dict(
-            rank=rankID,
-            num_ep_ranks=world_size,
-            input_dtype=dtype,
-            quant_dtype=tokens_qt.dtype,
-            token_hidden_size=hdim,
-            scale_dim=scale.shape[-1] if scale is not None else 0,
-            scale_type_size=scale.dtype.itemsize if scale is not None else 0,
-            max_num_tokens_per_dp_rank=2
+        handle_kwargs = {
+            "rank": rankID,
+            "num_ep_ranks": world_size,
+            "input_dtype": dtype,
+            "quant_dtype": tokens_qt.dtype,
+            "token_hidden_size": hdim,
+            "scale_dim": scale.shape[-1] if scale is not None else 0,
+            "scale_type_size": scale.dtype.itemsize if scale is not None else 0,
+            "max_num_tokens_per_dp_rank": 2
             * 8192
             * 1024
             // tokens_qt.dtype.itemsize
             // hdim
             * 2,
-            num_local_experts=E // world_size,
-            num_experts_per_token=topk,
-            gpu_per_node=1,
-        )
+            "num_local_experts": E // world_size,
+            "num_experts_per_token": topk,
+            "gpu_per_node": 1,
+        }
 
         mori_op = mori_manager.get_handle(handle_kwargs)
 

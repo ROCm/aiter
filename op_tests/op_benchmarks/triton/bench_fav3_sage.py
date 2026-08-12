@@ -1,40 +1,42 @@
 from __future__ import annotations
-from typing import Literal, Optional, Tuple, List, Dict, Any, Union
-import csv
-import json
-import torch
-import os
-import glob
 
-import sys
 import argparse
-import aiter
-import triton
+import csv
+import glob
+import json
 import logging
+import os
+import sys
+from typing import Any, Literal
 
+import torch
+import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
 )
 
+import aiter
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
+)
+from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_block_sparse,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
 )
-from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
-
-from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_wrapper_func,
-    get_sage_fwd_configs,
+from op_tests.triton_tests.attention.test_fav3_sage import (
+    check_attention_outputs,
+    compare_accuracy,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False
 layout_converter = {
@@ -79,7 +81,7 @@ def layout_preprocess(
     return q, k, v
 
 
-def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
     """
     Load captured input tensors from disk.
 
@@ -104,8 +106,8 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 
 def _mask_array_to_tensor(
-    mask_arr: List, device: torch.device
-) -> Tuple[torch.Tensor, int, int, int]:
+    mask_arr: list, device: torch.device
+) -> tuple[torch.Tensor, int, int, int]:
     """Convert a mask array (2D or 3D list) to tensor and infer BATCH, num_q_blocks, num_kv_blocks."""
     if not mask_arr:
         raise ValueError("mask array is empty")
@@ -134,13 +136,11 @@ def _array_ndim(arr) -> int:
 
 
 def load_block_mask_from_json(
-    path: Optional[str],
+    path: str | None,
     device: torch.device,
-) -> Union[
-    None,
-    Tuple[torch.Tensor, int, int, int],
-    List[Tuple[torch.Tensor, int, int, int]],
-]:
+) -> (
+    None | tuple[torch.Tensor, int, int, int] | list[tuple[torch.Tensor, int, int, int]]
+):
     """
     Load block mask(s) from a JSON file.
 
@@ -194,7 +194,7 @@ def make_block_attn_mask(
     N_CTX_Q: int,
     N_CTX_K: int,
     device: torch.device,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Build block_attn_mask for single-shape benchmark flow.
 
@@ -241,16 +241,16 @@ def make_block_attn_mask(
 
 
 def sparse_flops_from_lut(
-    block_lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     BATCH: int,
     N_CTX_Q: int,
     N_CTX_K: int,
     HQ: int,
     D_HEAD: int,
     D_HEAD_V: int,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Return (sparse_flops, total_flops_dense). Uses config BLOCK_M, BLOCK_N."""
-    kv_block_indices, lut_start, lut_count = block_lut
+    _kv_block_indices, _lut_start, lut_count = block_lut
     num_sparse_pairs = lut_count.sum().item()
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
@@ -293,9 +293,8 @@ def run_aiter_fp8_flash_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     has_descale: bool = False,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
 ):
-    scale = scale
     q, k, v, q_descale, k_descale, v_descale = fp8_quantize(q, k, v, scale=scale)
     attn_kwargs = {}
     if has_descale:
@@ -355,14 +354,14 @@ def fav3_fp8_forward_func(
     q: torch.Tensor,  # High precision (BF16/FP32)
     k: torch.Tensor,  # High precision (BF16/FP32)
     v: torch.Tensor,  # High precision (BF16/FP32)
-    softmax_scale: Optional[float],
+    softmax_scale: float | None,
     causal: bool,
-    window_size: Tuple[int, int],
+    window_size: tuple[int, int],
     attention_chunk: int,
     softcap: float,
     sm_margin: int,
 ):
-    batch, seqlen, num_q_heads, head_dim = q.shape
+    batch, _seqlen, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
 
     # Quantize inputs to FP8
@@ -445,7 +444,7 @@ def fav2_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float,
-    softmax_scale: Optional[float],
+    softmax_scale: float | None,
     causal: bool,
     return_lse: bool,
     return_attn_probs: bool,
@@ -468,7 +467,10 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     causal: bool,
     layout: Literal["bshd", "bhsd"],
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    hadamard_rotation: bool = False,
+    R: torch.Tensor | None = None,
+    BLOCK_R: int | None = None,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -482,6 +484,9 @@ def fav3_sage_forward_func(
         return_lse=False,
         layout=layout,
         block_lut=block_lut,
+        hadamard_rotation=hadamard_rotation,
+        R=R,
+        BLOCK_R=BLOCK_R,
     )
 
 
@@ -551,7 +556,7 @@ def create_benchmark_configs(args):
 
 def create_benchmark_configs_masks(
     args,
-    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+    masks_list: list[tuple[torch.Tensor, int, int, int]],
 ):
     """Create Benchmark configs for list-of-masks flow: one x_val per mask index."""
     dtype = arg_to_torch_dtype[args.dtype]
@@ -610,7 +615,7 @@ def create_benchmark_configs_masks(
     return configs
 
 
-def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
+def create_benchmark_configs_from_captured(inputs: list[dict[str, Any]], args):
     """
     Create triton.testing.Benchmark configurations from captured inputs.
 
@@ -620,7 +625,7 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     x_vals_list = []
     for i, inp in enumerate(inputs):
         # Shape from BSHD format: (batch, seqlen, heads, dim)
-        x_vals_list.append((i))
+        x_vals_list.append(i)
 
     x_names = [
         "INPUT_IDX",
@@ -678,7 +683,18 @@ def primary_output(result):
 
 
 def attn_forward_func(
-    q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, block_lut=None
+    q,
+    k,
+    v,
+    func_name,
+    softmax_scale,
+    k_smooth,
+    layout,
+    dtype,
+    block_lut=None,
+    hadamard_rotation=False,
+    R=None,
+    BLOCK_R=None,
 ):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
@@ -688,6 +704,9 @@ def attn_forward_func(
             causal=False,
             layout=layout,
             block_lut=block_lut,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_R=BLOCK_R,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -734,8 +753,8 @@ def bench_kernel(
     v,
     args,
     provider,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    block_attn_mask: Optional[torch.Tensor] = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    block_attn_mask: torch.Tensor | None = None,
 ):
     # Default softmax scale
     if args.layout == "bshd":
@@ -747,6 +766,22 @@ def bench_kernel(
 
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
+
+    hadamard_rotation = getattr(args, "hadamard_rotate", False)
+    block_r = getattr(args, "BLOCK_R", None)
+    r = None
+    if hadamard_rotation:
+        if block_r is None:
+            block_r = D_HEAD
+        if block_r > D_HEAD:
+            raise ValueError(f"BLOCK_R ({block_r}) must be <= head dim ({D_HEAD})")
+        if D_HEAD % block_r != 0:
+            raise ValueError(
+                f"head dim ({D_HEAD}) must be divisible by BLOCK_R ({block_r})"
+            )
+        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+            block_r**0.5
+        )
 
     # FLOPS calculation variables (same OPS definition as plan)
     total_flops = 0.0
@@ -773,6 +808,9 @@ def bench_kernel(
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
         block_lut=block_lut,
+        hadamard_rotation=hadamard_rotation,
+        R=r,
+        BLOCK_R=block_r if hadamard_rotation else None,
     )
     rep = getattr(args, "rep", 100)
     warmup = getattr(args, "warmup", 25)
@@ -1158,7 +1196,7 @@ def run_benchmark_block_sparse_repetitions(args):
 
 def run_benchmark_masks_list(
     args,
-    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+    masks_list: list[tuple[torch.Tensor, int, int, int]],
 ):
     """Run benchmark for each mask in the list; each mask defines (BATCH, N_CTX_Q, N_CTX_K) from its shape."""
     torch.manual_seed(20)
@@ -1336,6 +1374,18 @@ def parse_args():
         help="When --block_sparsity is set: run this many times with new random mask each time; report throughput stats. Ignored with --block_mask_file.",
     )
     parser.add_argument(
+        "-hadamard_rotate",
+        type=lambda v: bool(int(v)),
+        default=False,
+        help="Apply Hadamard rotation before INT8 Q/K quant: 1/0 (default 0)",
+    )
+    parser.add_argument(
+        "-BLOCK_R",
+        type=int,
+        default=128,
+        help="Hadamard matrix size; must divide head dim",
+    )
+    parser.add_argument(
         "--rep",
         type=int,
         default=100,
@@ -1378,11 +1428,10 @@ def main():
     if block_sparse:
         args.fav3_sage = True
         args.fav3_fp8 = args.aiter_fp8 = args.aiter_bf16 = False
-        if args.block_sparsity is not None:
-            if not (0 <= args.block_sparsity <= 1):
-                raise ValueError(
-                    f"--block_sparsity must be in [0, 1], got {args.block_sparsity}"
-                )
+        if args.block_sparsity is not None and not (0 <= args.block_sparsity <= 1):
+            raise ValueError(
+                f"--block_sparsity must be in [0, 1], got {args.block_sparsity}"
+            )
         if getattr(args, "block_mask_file", None):
             if not os.path.isfile(args.block_mask_file.strip()):
                 raise FileNotFoundError(

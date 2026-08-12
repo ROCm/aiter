@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import triton
-import pytest
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-from typing import Union
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
@@ -18,7 +18,7 @@ def generate_batched_gemm_a16w8_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[torch.dtype, str],
+    dtype: torch.dtype | str,
     has_bias: bool,
     output: bool,
     layout: str = "TN",
@@ -139,8 +139,8 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(v**2, 128, 512) for v in range(0, 7)]
-    x_vals += [(v**2, 512, 128) for v in range(0, 7)]
+    x_vals += [(v**2, 128, 512) for v in range(7)]
+    x_vals += [(v**2, 512, 128) for v in range(7)]
     x_vals += [(1, 128, 1)]  # minimal case
     return x_vals
 

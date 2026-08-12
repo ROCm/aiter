@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import pytest
 import argparse
 import itertools
-import pandas as pd
 
+import pandas as pd
+import pytest
 import torch
+
 import aiter
 from aiter import dtypes
+from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
@@ -18,7 +20,6 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     pad_rearrange_dropout_mask_hts_to_bhss,
 )
-from aiter.test_common import benchmark, run_perftest
 
 
 def run_torch(
@@ -329,7 +330,7 @@ def run_ck_seq_padding(
     out_batches = []
     for i in range(batch_size):
         start = int(cu_seqlens_q_padded[i].item())
-        end = int(cu_seqlens_q_padded[i + 1].item())
+        int(cu_seqlens_q_padded[i + 1].item())
         keep = q_actual_lens[i]
         out_batch = torch.zeros(q.size(1), nheads, d_v, dtype=dtype, device=device)
         out_batch[:keep] = out_flat[start : start + keep]
@@ -1283,7 +1284,7 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
-    dq, dk, dv, _ = aiter.mha_varlen_bwd(
+    _dq, _dk, _dv, _ = aiter.mha_varlen_bwd(
         dout,
         q,
         k,

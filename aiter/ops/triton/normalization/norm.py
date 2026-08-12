@@ -3,18 +3,18 @@
 
 import torch
 import triton
-from typing import Optional
+
 from aiter.ops.triton._triton_kernels.normalization.norm import (
-    _layernorm_kernel,
     _fused_add_layernorm_kernel,
-    _quant_layernorm_kernel,
-    _quant_fused_add_layernorm_kernel,
-    _layernorm_bwd_dx_fused_triton,
     _layernorm_bwd_dwdb_triton,
     _layernorm_bwd_dwdb_triton_v2,
+    _layernorm_bwd_dx_fused_triton,
+    _layernorm_kernel,
+    _quant_fused_add_layernorm_kernel,
+    _quant_layernorm_kernel,
 )
-from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
@@ -38,8 +38,6 @@ def _layernorm_forward(
     _layernorm_kernel[(M,)](
         x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
     )
-
-    return
 
 
 def _layernorm_forward_with_add(
@@ -76,8 +74,6 @@ def _layernorm_forward_with_add(
         epsilon,
         BLOCK_SIZE,
     )
-
-    return
 
 
 def _layernorm_backward(
@@ -136,7 +132,7 @@ def _layernorm_backward(
         num_warps=num_warps,
         IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
     )
-    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)  # noqa: E731
+    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
     if not IGNORE_DW_DB_IN_FUSED:
         dwdb_block_n = max(16, N // 256)
         dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
@@ -250,7 +246,7 @@ def layer_norm(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization over a mini-batch of inputs.
@@ -276,7 +272,7 @@ def layernorm2d_fwd_with_add(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two inputs and then applies Layer Normalization
@@ -316,7 +312,7 @@ def layernorm2d_fwd_with_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -379,7 +375,7 @@ def layernorm2d_fwd_with_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -441,7 +437,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two input toegether, then does layer Normalization before quantizing the final output
@@ -510,7 +506,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output

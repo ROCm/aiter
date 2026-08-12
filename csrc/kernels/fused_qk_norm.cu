@@ -109,9 +109,16 @@ __global__ void fused_qk_rmsnorm_kernel(
         vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
         for(int i = 0; i < thread_data_size / 2; i++)
         {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
             asm volatile("v_pk_mul_f32 %0, %1, %2"
                          : "=v"(thread_data_float2[i])
                          : "v"(thread_data_float2[i]), "v"(rcp));
+#else
+            thread_data_float2[i][0] *= rcp[0];
+            thread_data_float2[i][1] *= rcp[1];
+#endif
         }
 
         for(int i = 0; i < thread_data_size / 2; i++)
@@ -119,9 +126,16 @@ __global__ void fused_qk_rmsnorm_kernel(
             vec2_f& thread_data_weight_float2 = rcp;
             thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
             thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
             asm volatile("v_pk_mul_f32 %0, %1, %2"
                          : "=v"(thread_data_float2[i])
                          : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+#else
+            thread_data_float2[i][0] *= thread_data_weight_float2[0];
+            thread_data_float2[i][1] *= thread_data_weight_float2[1];
+#endif
         }
 
         DTYPE_I* out_ptr = out_base + cur_idx * static_cast<int64_t>(out_stride);

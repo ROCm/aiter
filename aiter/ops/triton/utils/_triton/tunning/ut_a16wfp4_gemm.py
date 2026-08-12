@@ -1,12 +1,13 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 from op_tests.triton_tests.gemm.basic.test_gemm_a16wfp4 import (
     generate_gemm_a16wfp4_inputs,
@@ -36,7 +37,7 @@ x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
 
 for config in config_list:
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         # Signature: gemm_a16wfp4(x, w, w_scales, atomic_add, dtype, y, config)

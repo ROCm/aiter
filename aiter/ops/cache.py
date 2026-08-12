@@ -3,7 +3,7 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
@@ -27,8 +27,8 @@ def reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     asm_layout: bool = False,
 ) -> None: ...
 
@@ -98,6 +98,17 @@ def concat_and_cache_mla(
 
 
 @compile_ops("module_cache", develop=True)
+def concat_and_cache_mla_seg(
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank]
+    k_pe: Tensor,  # [num_tokens, pe_dim]
+    kv_cache: Tensor,  # [num_blocks, page_size*(kv_lora_rank + pe_dim)] flat (seg layout)
+    slot_mapping: Tensor,  # [num_tokens]
+    kv_cache_dtype: str,
+    scale: Tensor,  # [1] fp32 static scale
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def indexer_k_quant_and_cache(
     k: Tensor,
     kv_cache: Tensor,
@@ -158,4 +169,26 @@ def fused_qk_rope_concat_and_cache_mla(
     sin_cache: Tensor,  # [max_position, rot_dim//2]
     is_neox: bool,
     is_nope_first: bool,
+    # False (default, non-DCP): slot<0 tokens early-return (skip Q RoPE + q_out).
+    # True (DCP): compute Q RoPE for every token (needed after head all-gather).
+    compute_all_q_rope: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_rope_concat_and_cache_mla_seg(
+    q_nope: Tensor,  # [num_tokens, num_heads, kv_lora_rank=512]
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim=64]
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank=512]
+    k_pe: Tensor,  # [num_tokens, pe_dim=64]
+    kv_cache: Tensor,  # [num_blocks, page_size*kv_lora + page_size*pe] flat fp8
+    q_out: Tensor,  # [num_tokens, num_heads, q_out_dim>=576] fp8 (tail untouched)
+    slot_mapping: Tensor,  # [num_tokens]
+    k_scale: Tensor,  # [1] fp32 static scale
+    q_scale: Tensor,  # [1] fp32 static scale
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, pe_dim//2=32]
+    sin_cache: Tensor,  # [max_position, pe_dim//2=32]
+    is_neox: bool,
+    is_nope_first: bool = True,
 ) -> None: ...

@@ -2,12 +2,14 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8_blockscale import (
     _moe_gemm_a8w8_blockscale,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
 # -----------------------------------------------------------------------------
@@ -136,7 +138,7 @@ def moe_gemm_a8w8_blockscale(
     apply_swiglu=False,
     alpha=1.0,
     limit=None,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
@@ -253,7 +255,7 @@ def moe_gemm_a8w8_blockscale(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -290,7 +292,7 @@ def moe_gemm_a8w8_blockscale(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
     return y_final
 

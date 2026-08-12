@@ -1,22 +1,24 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import chain
-from pathlib import Path
-import triton.profiler as proton
-import torch
 import argparse
 import csv
-from aiter.ops.triton.moe.moe_routing.routing import routing
+import inspect
+import tempfile
+from itertools import chain
+from pathlib import Path
+
+import torch
+import triton.profiler as proton
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
-    swizzle_scales,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-import tempfile
+from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-import inspect
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -134,9 +136,11 @@ def compute_roofline(
             )
 
 
-def check_and_swizzle_scales(scale, N, K):
+def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales(scale)
+        scale = shuffle_scale_moe(
+            scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         return scale, "CDNA4_SCALE"
     else:
         return scale, None
@@ -187,8 +191,8 @@ def bench_mlp_single_weight_init(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, swizzle_mx_scale2 = check_and_swizzle_scales(
+    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
+    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
 
@@ -204,7 +208,7 @@ def bench_mlp_single_weight_init(
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+        rdata, gather_indx, _scatter_indx = routing(logits, n_expts_act)
         x = moe_gemm_a16w4(
             x,
             w1,

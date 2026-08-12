@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_stream.h"
 #include "rocm_ops.hpp"
 #include "aiter_unary.h"
 

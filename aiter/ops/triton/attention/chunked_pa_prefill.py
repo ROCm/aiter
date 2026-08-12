@@ -12,10 +12,10 @@
 
 import triton
 
-from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
+from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 
 
 def chunked_prefill_paged_decode(

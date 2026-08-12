@@ -41,11 +41,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Set up Python environment
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip3 install ruff
+        # Pinned on purpose. Unpinned, a ruff release that widens the default
+        # rule set turns unrelated PRs red with no change on our side (0.16.0
+        # did exactly that). Bump this deliberately, with the resulting
+        # findings burned down in the same or a follow-up PR.
+        run: pip3 install ruff==0.16.0
       - name: Install reviewdog
         uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
       - name: Run ruff with reviewdog

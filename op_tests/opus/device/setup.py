@@ -39,6 +39,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
+    "test_tdm_gfx1250.cu",
     "test_finfo.cu",
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",
@@ -60,7 +61,7 @@ def _detect_arch():
                 name = line.split()[-1].strip()
                 if name.startswith("gfx"):
                     return name
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return "native"
 
@@ -74,7 +75,7 @@ def _find_hipcc():
         return subprocess.check_output(
             ["which", "hipcc"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return "hipcc"
 

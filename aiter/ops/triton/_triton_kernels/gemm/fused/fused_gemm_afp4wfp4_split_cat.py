@@ -3,8 +3,9 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
     "_fused_gemm_afp4wfp4_split_cat",
