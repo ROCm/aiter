@@ -615,8 +615,6 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
             persist_m=persist_m,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
@@ -810,6 +808,8 @@ def _s1_args_fp4(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
@@ -834,7 +834,16 @@ def _s1_args_fp4(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
+        beta = float(situ_beta)
+        linear_beta = float(situ_linear_beta)
+        return args + (
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float(swiglu_limit),
+            stream,
+        )
     return args + (stream,)
 
 
@@ -1623,6 +1632,13 @@ def _flydsl_moe_stage1_impl(
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
+    _situ_beta_val = float(situ_beta)
+    _situ_linear_beta_val = float(situ_linear_beta)
+    if _situ_beta_val <= 0.0 or _situ_linear_beta_val <= 0.0:
+        raise ValueError(
+            "situ_beta/situ_linear_beta must be > 0, got "
+            f"{_situ_beta_val!r}/{_situ_linear_beta_val!r}"
+        )
 
     if use_mx_gemm:
         args = _build_mx_args(
@@ -1647,6 +1663,8 @@ def _flydsl_moe_stage1_impl(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
+            situ_beta=_situ_beta_val,
+            situ_linear_beta=_situ_linear_beta_val,
         )
     else:
         args = _s1_args_std(
@@ -1678,8 +1696,6 @@ def _flydsl_moe_stage1_impl(
         "b_dtype": b_dtype,
         "out_dtype": _gemm_out_dtype,
         "act": act,
-        "situ_beta": situ_beta,
-        "situ_linear_beta": situ_linear_beta,
         "persist_m": _persist_m,
         "use_async_copy": use_async_copy,
         "k_batch": k_batch,
