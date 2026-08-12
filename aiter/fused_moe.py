@@ -4,7 +4,10 @@
 import functools
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional
+
+import torch
 
 import aiter
 import torch
@@ -637,7 +640,19 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
-    fuse_fp4_quant: bool = False
+    fuse_quant: str = ""
+    stage2_has_bias: bool = False
+    flat: bool = False
+    # Feature flags:
+    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
+    #  - prequant: fused_moe_2stages quantizes a1 before stage1.
+    output_aux: bool = False
+    prequant: bool = True
+    skip_inter_quant: bool = False
+    route_bucket: str = ""
+    expected_sorted_blocks: int | None = None
+    min_sorted_blocks: int | None = None
+    max_sorted_blocks: int | None = None
     stage0: Callable = None
 
 
@@ -943,6 +958,28 @@ def get_2stage_cfgs(
         return MOEMetadata(None, None, block_m, ksplit, run_1stage,
                            stage0=functools.partial(fused_moe_asmjit_aot, config_string = kernelName1.split("__")[1]))
 
+    if kernelName1 and kernelName1.startswith("fused_moe_gfx942"):
+        kernel_name1_parts = kernelName1.split("__", 1)
+        if len(kernel_name1_parts) == 2:
+            if not is_flydsl_available():
+                logger.warning(
+                    "[fused_moe] tuned config requests FlyDSL gfx942 kernels but "
+                    "flydsl is not available; falling back to default dispatch."
+                )
+            else:
+                from aiter.fused_moe_gfx942 import fused_moe_gfx942
+
+                return MOEMetadata(
+                    None,
+                    None,
+                    block_m,
+                    ksplit,
+                    run_1stage,
+                    stage0=functools.partial(
+                        fused_moe_gfx942, config_string=kernel_name1_parts[1]
+                    ),
+                )
+
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
@@ -1008,7 +1045,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            fuse_fp4_quant=_s1_fq,
+            fuse_quant="fp4" if _s1_fq else "",
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1271,7 +1308,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if metadata.fuse_fp4_quant else a2,
+        None if metadata.fuse_quant == "fp4" else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1281,7 +1318,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+    if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
