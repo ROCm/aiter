@@ -1004,7 +1004,7 @@ def _moe_gemm_a8w4_decode(
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-    if Quant_static_scale is not None:
+    if Quant_static_scale is not None or HAS_MX_OUT:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
