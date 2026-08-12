@@ -427,6 +427,11 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         or dscore_partials.shape != (dy.shape[0], N // 256)
     ):
         raise ValueError("invalid ragged fused dgrad inputs")
+    # The target mono kernel's 2x2 L2 tile swizzle requires an even number of
+    # 192-row M tiles.  Round only the launch bound up to a 384-row multiple;
+    # each expert's true row count still comes from ``expert_offsets``, so the
+    # added grid tiles return before touching an operand.
+    grid_m = ((max_m + 383) // 384) * 384
     _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
         dy.contiguous(),
         w_bnk.contiguous(),
@@ -434,7 +439,7 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         out,
         dscore_partials,
         expert_offsets,
-        max_m,
+        grid_m,
     )
     return out
 
@@ -454,8 +459,9 @@ def opus_moe_dgrad_mono_ragged_prepared(
         or expert_offsets.shape != (E + 1,)
     ):
         raise ValueError("invalid ragged mono dgrad inputs")
+    grid_m = ((max_m + 383) // 384) * 384
     _opus_moe_dgrad_mono_ragged_bf16_raw(
-        dy.contiguous(), w_bnk.contiguous(), out, expert_offsets, max_m
+        dy.contiguous(), w_bnk.contiguous(), out, expert_offsets, grid_m
     )
     return out
 
