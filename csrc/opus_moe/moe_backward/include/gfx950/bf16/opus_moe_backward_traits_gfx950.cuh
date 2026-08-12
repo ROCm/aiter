@@ -103,9 +103,10 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedM3Cohort2
 };
 
 // Halving BK leaves enough LDS to keep five adjacent route tiles live while
-// reusing one W2 tile.  The extra K-loop boundaries are amortized once the
-// routed activation footprint is beyond L2.
-struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort2
+// reusing one W2 tile.  A twenty-tile launch cohort aligns four such groups,
+// keeping W2 reuse close without giving up dO locality.  The extra K-loop
+// boundaries are amortized once the routed activation footprint is beyond L2.
+struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort20
     : DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
 {
     static constexpr int B_K = 32;
@@ -113,6 +114,7 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort2
     static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
     static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
     static constexpr int ROUTE_M_TILES = 5;
+    static constexpr int ROUTE_COHORT_TILES = 20;
 };
 
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
