@@ -93,7 +93,7 @@ __device__ inline void opus_wgtn_clobber_fixed_regs()
     OPUS_WGTN_CLOBBER_V8(96, 97, 98, 99, 100, 101, 102, 103);
     OPUS_WGTN_CLOBBER_V8(104, 105, 106, 107, 108, 109, 110, 111);
     OPUS_WGTN_CLOBBER_V8(112, 113, 114, 115, 116, 117, 118, 119);
-    asm volatile("" ::: "v120", "v121", "v122", "v123");
+    OPUS_WGTN_CLOBBER_V8(120, 121, 122, 123, 124, 125, 126, 127);
     OPUS_WGTN_CLOBBER_A8(0, 1, 2, 3, 4, 5, 6, 7);
     OPUS_WGTN_CLOBBER_A8(8, 9, 10, 11, 12, 13, 14, 15);
     OPUS_WGTN_CLOBBER_A8(16, 17, 18, 19, 20, 21, 22, 23);
@@ -437,7 +437,7 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
 // halving operand traffic per output element.
 template<int FIXED_P = 0, int FIXED_Q = 0, int FIXED_ROUTES = 0>
 __global__ __launch_bounds__(512, 1)
-__attribute__((amdgpu_num_vgpr(124)))
+__attribute__((amdgpu_num_vgpr(128)))
 void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                                     const __bf16* __restrict__ a,
                                     const int32_t* __restrict__ offs,
@@ -706,11 +706,10 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
         __builtin_amdgcn_s_setprio(1);
         opus::static_for<NUM_KPACKS>([&](auto kpack) {
-            constexpr int b_reg = 108 + (kpack.value & 1) * 8;
-            // B is reused by all four M subtiles. Keep it resident, then
-            // rotate three A fragment slots so each read has two M-subtiles of
-            // MFMA latency to retire. K-packs after the first consume B/A0/A1
-            // fragments prefetched by the preceding pack.
+            constexpr int b_reg = 112 + (kpack.value & 1) * 8;
+            // Four A slots let the preceding pack prefetch every fragment of
+            // this pack after consuming the corresponding old slot. Only the
+            // first pack of a stage needs a local prologue.
             if constexpr(kpack.value == 0)
             {
                 opus::static_for<2>([&](auto sn) {
@@ -723,46 +722,39 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                     96, 0, TR_SECOND_BYTES>(a_base[cur]);
                 opus_wgtn_fixed_tr_fragment_offset<
                     100, SUBTILE_BYTES, TR_SECOND_BYTES>(a_base[cur]);
+                opus_wgtn_fixed_tr_fragment_offset<
+                    104, 2 * SUBTILE_BYTES, TR_SECOND_BYTES>(a_base[cur]);
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                opus_wgtn_fixed_tr_fragment_offset<
+                    108, 3 * SUBTILE_BYTES, TR_SECOND_BYTES>(a_base[cur]);
             }
             opus::static_for<4>([&](auto sm) {
                 constexpr int a_reg =
-                    96 + ((kpack.value + sm.value) % 3) * 4;
-                if constexpr(sm.value == 0)
+                    96 + ((kpack.value + sm.value) & 3) * 4;
+                if constexpr(kpack.value > 0 && sm.value == 1)
                 {
-                    opus_wgtn_fixed_tr_fragment_offset<
-                        96 + ((kpack.value + 2) % 3) * 4,
-                        kpack.value * KPACK_BYTES + 2 * SUBTILE_BYTES,
-                        TR_SECOND_BYTES>(a_base[cur]);
+                    if constexpr(kpack.value + 1 < NUM_KPACKS)
+                        // Current A1 is the oldest of eight outstanding reads.
+                        opus::s_waitcnt_lgkmcnt(opus::number<6>{});
+                    else
+                        opus::s_waitcnt_lgkmcnt(opus::number<2>{});
                 }
-                if constexpr(sm.value == 1)
+                if constexpr(kpack.value > 0 && sm.value == 2)
                 {
-                    opus_wgtn_fixed_tr_fragment_offset<
-                        96 + (kpack.value % 3) * 4,
-                        kpack.value * KPACK_BYTES + 3 * SUBTILE_BYTES,
-                        TR_SECOND_BYTES>(a_base[cur]);
+                    if constexpr(kpack.value + 1 < NUM_KPACKS)
+                        // Current A2 is now the oldest of ten outstanding reads.
+                        opus::s_waitcnt_lgkmcnt(opus::number<8>{});
+                    else
+                        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
                 }
-                if constexpr(sm.value == 2 && kpack.value + 1 < NUM_KPACKS)
+                if constexpr(kpack.value == 0 && sm.value == 3)
                 {
-                    constexpr int next_b_reg = 108 + ((kpack.value + 1) & 1) * 8;
-                    opus::static_for<2>([&](auto sn) {
-                        opus_wgtn_fixed_tr_fragment_offset<
-                            next_b_reg + sn.value * 4,
-                            (kpack.value + 1) * KPACK_BYTES +
-                                sn.value * SUBTILE_BYTES,
-                            TR_SECOND_BYTES>(b_base[cur]);
-                    });
-                    opus_wgtn_fixed_tr_fragment_offset<
-                        96 + ((kpack.value + 1) % 3) * 4,
-                        (kpack.value + 1) * KPACK_BYTES,
-                        TR_SECOND_BYTES>(a_base[cur]);
-                }
-                if constexpr(sm.value == 3 && kpack.value + 1 < NUM_KPACKS)
-                {
-                    opus_wgtn_fixed_tr_fragment_offset<
-                        96 + ((kpack.value + 2) % 3) * 4,
-                        (kpack.value + 1) * KPACK_BYTES + SUBTILE_BYTES,
-                        TR_SECOND_BYTES>(a_base[cur]);
+                    if constexpr(kpack.value + 1 < NUM_KPACKS)
+                        // The stage prologue issued current A3 immediately
+                        // before sm=0; ten next-pack reads stay queued.
+                        opus::s_waitcnt_lgkmcnt(opus::number<10>{});
+                    else
+                        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
                 }
                 if(stage == 0 && kpack.value == 0)
                 {
@@ -780,16 +772,29 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                             a_reg, b_reg + sn.value * 4, c, c>();
                     });
                 }
-                if constexpr(sm.value == 1)
-                    // A2 is older than A3; keep A3's two reads in flight.
-                    opus::s_waitcnt_lgkmcnt(opus::number<2>{});
-                else if constexpr(sm.value == 2 && kpack.value + 1 < NUM_KPACKS)
-                    // Retire A3 while next B/A0 (six reads) remain in flight.
-                    opus::s_waitcnt_lgkmcnt(opus::number<6>{});
-                else if constexpr(sm.value == 2)
-                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
-                else if constexpr(sm.value == 3 && kpack.value + 1 < NUM_KPACKS)
-                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                if constexpr(kpack.value + 1 < NUM_KPACKS)
+                {
+                    constexpr int next_b_reg =
+                        112 + ((kpack.value + 1) & 1) * 8;
+                    if constexpr(sm.value < 2)
+                        opus_wgtn_fixed_tr_fragment_offset<
+                            next_b_reg + sm.value * 4,
+                            (kpack.value + 1) * KPACK_BYTES +
+                                sm.value * SUBTILE_BYTES,
+                            TR_SECOND_BYTES>(b_base[cur]);
+                    constexpr int next_a_slot =
+                        (kpack.value + sm.value) & 3;
+                    constexpr int next_a_subtile = (sm.value + 3) & 3;
+                    opus_wgtn_fixed_tr_fragment_offset<
+                        96 + next_a_slot * 4,
+                        (kpack.value + 1) * KPACK_BYTES +
+                            next_a_subtile * SUBTILE_BYTES,
+                        TR_SECOND_BYTES>(a_base[cur]);
+                    if constexpr(sm.value == 3)
+                        // B/A0/A3 are ready for the next sm=0; A1/A2 may
+                        // continue in flight across the pack boundary.
+                        opus::s_waitcnt_lgkmcnt(opus::number<4>{});
+                }
             });
             if constexpr(HAS_NEXT && kpack.value == 1)
             {
