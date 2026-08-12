@@ -79,7 +79,8 @@ template<typename UserTraits,
          bool WRITE_DSCORE = false,
          bool APPLY_SWIGLU = true,
          bool RAGGED = false,
-         bool COMPACT_TILES = false>
+         bool COMPACT_TILES = false,
+         int FIXED_K = 0>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -194,7 +195,9 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     clear(v_c);
 
     auto k_offset = [&](int tile_k) { return tile_k * T::B_K; };
-    const int loops = (kargs.k + T::B_K - 1) / T::B_K;
+    const int loops = FIXED_K > 0
+        ? FIXED_K / T::B_K
+        : (kargs.k + T::B_K - 1) / T::B_K;
     int tic = 0;
     int toc = 1;
 
@@ -209,6 +212,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     if(wave_id_m == 1)
         __builtin_amdgcn_s_barrier();
 
+#pragma unroll 4
     for(int tile = 0; tile < loops - 2; tile += 2)
     {
         async_load<T::VEC_A>(g_a, s_a[toc].ptr, u_ga, u_sa, k_offset(tile + 1));
@@ -455,9 +459,16 @@ inline void opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
     const int num_tiles_n = kargs.n / 256;
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
-    opus_moe_dgrad_swiglu_kernel_gfx950<
-        opus_moe_dgrad_swiglu_traits_gfx950, true, true, true, true>
-        <<<grid, block, 0, stream>>>(kargs);
+    if(kargs.k == 2048)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true, 2048>
+            <<<grid, block, 0, stream>>>(kargs);
+    else
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true>
+            <<<grid, block, 0, stream>>>(kargs);
 }
 
 inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
@@ -467,7 +478,14 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
     const int num_tiles_n = kargs.n / 256;
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
-    opus_moe_dgrad_swiglu_kernel_gfx950<
-        opus_moe_dgrad_swiglu_traits_gfx950, false, false, true, true>
-        <<<grid, block, 0, stream>>>(kargs);
+    if(kargs.k == 2048)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 2048>
+            <<<grid, block, 0, stream>>>(kargs);
+    else
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true>
+            <<<grid, block, 0, stream>>>(kargs);
 }
