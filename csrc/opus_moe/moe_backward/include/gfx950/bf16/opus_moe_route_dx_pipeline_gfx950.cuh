@@ -214,8 +214,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     const int wave_id_n = wave_id % T::T_N;
 
     __shared__ __align__(16) char tile_storage[2 * stage_bytes];
-    // K2 consumes expert-sorted rows but writes the logical token/slot route
-    // order.  K3 can then reduce four adjacent rows without reverse_sorted.
+    // The baseline policy writes logical token/slot rows.  The large-route
+    // policy keeps sorted rows and moves the inverse permutation into K3.
     __shared__ int32_t smem_route_row[CTA_M];
 
     const D_A* d_z = reinterpret_cast<const D_A*>(kargs.d_z);
@@ -390,7 +390,19 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                     sorted_row < kargs.route.sorted_capacity
                 ? kargs.route.sorted_token_ids[sorted_row]
                 : static_cast<int32_t>(kPackedTokenMask);
-        if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+        if constexpr(T::WRITE_SORTED_ROUTES)
+        {
+            static_assert(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor);
+            const int token = packed_token_id(packed);
+            const int slot = packed_topk_slot(packed);
+            smem_route_row[tid] =
+                sorted_row < expert_end_row &&
+                        sorted_row < kargs.route.sorted_capacity &&
+                        token < kargs.route.token_num && slot < topk
+                    ? sorted_row
+                    : -1;
+        }
+        else if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
         {
             const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
                 kargs.route,

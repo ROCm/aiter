@@ -145,6 +145,7 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     static constexpr int ROUTE_M_TILES = 2;
     static constexpr int ROUTE_M = 32;
     static constexpr int SMEM_A_SLAB_PAD = 0;
+    static constexpr bool WRITE_SORTED_ROUTES = false;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -217,6 +218,15 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPad
     static constexpr int SMEM_A_SLAB_PAD = 16;
 };
 
+// Keep the grouped GEMM output in its natural expert-sorted order.  The
+// paired K3 instance uses reverse_sorted to gather the K routes for a token,
+// avoiding K2's random scatter without changing the routing ABI or GEMM.
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPadSortedOutput
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPad
+{
+    static constexpr bool WRITE_SORTED_ROUTES = true;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,
@@ -229,6 +239,13 @@ struct RouteReduceBf16Gfx950Bm16Bn128
 {
     static constexpr int VEC = 8;
     static constexpr int MAX_TOPK = 8;
+    static constexpr bool READ_SORTED_ROUTES = false;
+};
+
+struct RouteReduceBf16Gfx950Bm16Bn128SortedInput
+    : RouteReduceBf16Gfx950Bm16Bn128
+{
+    static constexpr bool READ_SORTED_ROUTES = true;
 };
 
 // Router scores and their gradients remain FP32 even though the surrounding

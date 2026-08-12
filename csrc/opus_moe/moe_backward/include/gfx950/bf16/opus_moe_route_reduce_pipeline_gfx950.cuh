@@ -73,8 +73,12 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
     static_assert(VEC == 8);
     route_reduce_f32x2 accum[VEC / 2];
 
+    const int logical_base = token * TopK;
+    const int first_route = T::READ_SORTED_ROUTES
+                                ? kargs.route.reverse_sorted[logical_base]
+                                : logical_base;
     const int64_t route_base =
-        static_cast<int64_t>(token * TopK) * kargs.stride_dx_route_r + col;
+        static_cast<int64_t>(first_route) * kargs.stride_dx_route_r + col;
     const auto first = *reinterpret_cast<const route_reduce_u32x4*>(
         kargs.d_x_route + route_base);
 #pragma unroll
@@ -84,9 +88,12 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
 #pragma unroll
     for(int slot = 1; slot < TopK; ++slot)
     {
+        const int route = T::READ_SORTED_ROUTES
+                              ? kargs.route.reverse_sorted[logical_base + slot]
+                              : logical_base + slot;
         const auto values = *reinterpret_cast<const route_reduce_u32x4*>(
-            kargs.d_x_route + route_base +
-            static_cast<int64_t>(slot) * kargs.stride_dx_route_r);
+            kargs.d_x_route +
+            static_cast<int64_t>(route) * kargs.stride_dx_route_r + col);
 #pragma unroll
         for(int pair = 0; pair < VEC / 2; ++pair)
             accum[pair] += route_reduce_unpack_bf16x2(values[pair]);
@@ -200,6 +207,9 @@ inline void route_reduce_launch_gfx950(const RouteReduceKargs& kargs,
                            kargs);
         return;
     }
+    if constexpr(T::READ_SORTED_ROUTES)
+        AITER_CHECK(kargs.route.reverse_sorted != nullptr,
+                    "route_reduce sorted input: reverse_sorted is required");
     AITER_CHECK(kargs.route.topk == 1 || kargs.route.topk == 2 ||
                     kargs.route.topk == 4 || kargs.route.topk == 8,
                 "route_reduce: first instance supports topk in {1,2,4,8}");

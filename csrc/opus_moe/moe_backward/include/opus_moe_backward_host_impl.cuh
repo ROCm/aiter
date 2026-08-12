@@ -536,17 +536,54 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                                   hipStream_t stream)
 {
     check_gfx950_or_fail();
+    int selected_route_dx =
+        select_fixed_route_dx_kernel_id(route_dx, route_dx_kernel_id);
+    int selected_route_reduce =
+        route_reduce_kernel_id == kKernelAuto ? 0 : route_reduce_kernel_id;
+
+    // Large K>=4 route families benefit from keeping K2's output in natural
+    // expert-sorted order and moving the inverse permutation to K3.  Reuse
+    // the existing working-set selector: kid 9 identifies the M5 path whose
+    // dZ+W1 footprint is beyond the L2-friendly regime.  Explicit selection
+    // of either half also completes the pair, while incompatible explicit
+    // pairs fail instead of silently interpreting the workspace incorrectly.
+    constexpr int logical_route_dx_kid = 9;
+    constexpr int sorted_route_dx_kid = 11;
+    constexpr int sorted_route_reduce_kid = 1;
+    const bool auto_sorted_route_pair =
+        route_dx_kernel_id == kKernelAuto &&
+        route_reduce_kernel_id == kKernelAuto &&
+        selected_route_dx == logical_route_dx_kid && route_dx.route.topk >= 4;
+    if(auto_sorted_route_pair)
+    {
+        selected_route_dx = sorted_route_dx_kid;
+        selected_route_reduce = sorted_route_reduce_kid;
+    }
+    else if(route_dx_kernel_id == sorted_route_dx_kid &&
+            route_reduce_kernel_id == kKernelAuto)
+    {
+        selected_route_reduce = sorted_route_reduce_kid;
+    }
+    else if(route_reduce_kernel_id == sorted_route_reduce_kid &&
+            route_dx_kernel_id == kKernelAuto)
+    {
+        selected_route_dx = sorted_route_dx_kid;
+    }
+    AITER_CHECK((selected_route_dx == sorted_route_dx_kid) ==
+                    (selected_route_reduce == sorted_route_reduce_kid),
+                "fixed route pipeline: sorted workspace kernel ids 11 and 1 "
+                "must be selected together");
+
     invoke(gfx950::dispatch_down_bwd(
                select_fixed_down_kernel_id(down, down_kernel_id)),
            down,
            stream,
            Family::DownBwd);
-    invoke(gfx950::dispatch_route_dx(
-               select_fixed_route_dx_kernel_id(route_dx, route_dx_kernel_id)),
+    invoke(gfx950::dispatch_route_dx(selected_route_dx),
            route_dx,
            stream,
            Family::RouteDx);
-    invoke(gfx950::dispatch_route_reduce(route_reduce_kernel_id),
+    invoke(gfx950::dispatch_route_reduce(selected_route_reduce),
            route_reduce,
            stream,
            Family::RouteReduce);
