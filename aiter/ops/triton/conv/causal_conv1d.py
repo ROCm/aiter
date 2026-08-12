@@ -1,3 +1,6 @@
+import functools
+import os
+
 import torch
 import triton
 
@@ -9,6 +12,30 @@ from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_conv1d_update_available() -> bool:
+    try:
+        from aiter.ops.flydsl.utils import is_flydsl_available
+
+        return is_flydsl_available()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _flydsl_conv1d_update_enabled() -> bool:
+    """Opt-in gate for the FlyDSL causal_conv1d update port.
+
+    Default behavior is unchanged: this module's Triton kernel serves every call.
+    Set ``AITER_CONV1D_UPDATE_FLYDSL=1`` to route the calls the port covers
+    through FlyDSL instead; the rest stay on Triton. Not memoized, so the env var
+    can be toggled at runtime -- only the package availability probe is cached.
+    """
+    return (
+        os.environ.get("AITER_CONV1D_UPDATE_FLYDSL", "") == "1"
+        and _flydsl_conv1d_update_available()
+    )
 
 
 def causal_conv1d_fn(
@@ -234,12 +261,62 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
+
+    # Refuse the widths the kernel does not implement, the way the HIP entry point
+    # does. STEP 1 loads a 4th history column at width 5, but STEP 4 never loads a
+    # 5th weight column and the STEP 5 tap loop only branches on 2/3/4, so a wider
+    # kernel used to return a silently wrong result rather than fail.
+    _, width = weight.shape
+    assert (
+        2 <= width <= 4
+    ), f"causal_conv1d_update: width must be 2, 3 or 4, got {width}"
+
+    # FlyDSL port (opt-in). This signature is SGLang's -- pad_slot_id as the skip
+    # sentinel plus the optional intermediate_conv_window -- so it maps onto the
+    # SGLang-shaped wrapper, not the vLLM-shaped one (whose sentinel is a valid
+    # block index). out=x keeps this function's write-over-x contract. Calls
+    # outside the port's scope (width 5/6, cache_seqlens, fp32, non-CDNA) fall
+    # through to Triton below.
+    if _flydsl_conv1d_update_enabled():
+        from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+            _causal_conv1d_update_sglang_flydsl_supported,
+            causal_conv1d_update_sglang_flydsl,
+        )
+
+        if (
+            x.dtype == conv_state.dtype
+            and _causal_conv1d_update_sglang_flydsl_supported(
+                x,
+                conv_state,
+                weight,
+                num_accept_tokens=num_accepted_tokens,
+                cache_seqlens=cache_seqlens,
+            )
+        ):
+            return causal_conv1d_update_sglang_flydsl(
+                x,
+                conv_state,
+                weight,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=conv_state_indices,
+                num_accept_tokens=num_accepted_tokens,
+                intermediate_conv_window=intermediate_conv_window,
+                # The two upstreams address the snapshot buffer differently:
+                # SGLang takes a separate intermediate_state_indices, while the
+                # Triton kernel below reuses the conv_state cache line. Forward
+                # the latter so both paths write the same slots.
+                intermediate_state_indices=conv_state_indices,
+                pad_slot_id=pad_slot_id,
+                validate_data=validate_data,
+                out=x,
+            )
+
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
-    _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
 
