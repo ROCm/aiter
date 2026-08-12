@@ -184,20 +184,17 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     if(requested_kernel_id != kKernelAuto)
         return requested_kernel_id;
 
-    // The legacy expert-fastest grid is best while all K4 sources fit in a
-    // conservative share of gfx950 L2.  Beyond that point a four-expert
-    // cohort sharply shortens the dZ/X reuse distance.  This policy depends
-    // only on the runtime working set, not on an exact model shape.
+    // Select only from runtime geometry and working-set size.  The BM128
+    // double-stage path needs roughly three BK32 reduction tiles per expert
+    // on average to hide its next-tile prefetch, and 2I must cover whole
+    // BM128 output tiles.  Short or incompatible problems retain BM64.
     constexpr uint64_t l2_friendly_bytes = 128ull * 1024ull * 1024ull;
-    constexpr uint64_t large_working_set_bytes = 512ull * 1024ull * 1024ull;
     constexpr int legacy_kid = 5;
-    // The large-working-set cohort also uses gfx950 buffer_load_*_lds so the
-    // three K32 operand vectors land directly in the existing swizzled tile.
-    // Two experts keep the reusable source window comfortably below L2
-    // capacity while retaining enough inter-expert load balance.  Small
-    // problems retain the register-load/LDS-store legacy kernel.
+    // The cohort paths use gfx950 buffer_load_*_lds so all three K32 operand
+    // vectors land directly in their swizzled tiles.  Two experts retain
+    // inter-expert load balance without extending the source reuse window.
     constexpr int cohort2_kid = 8;
-    constexpr int cohort2_bm128_kid = 9;
+    constexpr int cohort2_bm128_double_lds_kid = 9;
     if(kargs.route.num_experts < 2)
         return legacy_kid;
     const uint64_t source_row_elements =
@@ -206,8 +203,13 @@ inline int select_fixed_dw1_kernel_id(const Dw1Kargs& kargs,
     const uint64_t source_bytes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) *
         source_row_elements * sizeof(hip_bfloat16);
-    if(source_bytes > large_working_set_bytes)
-        return cohort2_bm128_kid;
+    const uint64_t two_tile_rows =
+        64ull * static_cast<uint64_t>(kargs.route.num_experts);
+    const bool bm128_compatible =
+        (2 * kargs.inter_dim) % 128 == 0 &&
+        static_cast<uint64_t>(kargs.route.sorted_capacity) > two_tile_rows;
+    if(bm128_compatible)
+        return cohort2_bm128_double_lds_kid;
     return source_bytes > l2_friendly_bytes ? cohort2_kid : legacy_kid;
 }
 

@@ -290,6 +290,7 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32Swizzled
     // expert.  Tuning candidates inherit this trait and override the policy.
     static constexpr int EXPERT_COHORT = 0;
     static constexpr bool DIRECT_GMEM_TO_LDS = false;
+    static constexpr bool DOUBLE_BUFFER = false;
     static constexpr int T_M = 1;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -327,17 +328,20 @@ struct Dw1Bf16Gfx950Bm64Bn128Bk32SwizzledCohort2DirectLds
 {
     static constexpr int EXPERT_COHORT = 2;
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DOUBLE_BUFFER = false;
 };
 
 // Keep the four-wave workgroup used by the BM64 kernel, but let every lane
 // load two 64-row dZ slabs.  A 2x2 wave grid balances dZ and gathered-X
-// transpose reads while sharing each X tile across twice as many dW1 rows,
-// without the occupancy cost of a 512-thread BM128 workgroup.
-struct Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DirectLds
+// transpose reads while sharing each X tile across twice as many dW1 rows.
+// Two LDS stages overlap the next gathered reduction tile with the current
+// MFMA, without the occupancy cost of a 512-thread BM128 workgroup.
+struct Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DoubleLds
     : Bf16Traits<Family::Dw1, 128, 128, 32, 256, 2, false>
 {
     static constexpr int EXPERT_COHORT = 2;
     static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DOUBLE_BUFFER = true;
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
     static constexpr int T_K = 1;

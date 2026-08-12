@@ -258,7 +258,7 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
     ),
     OpusMoeBackwardInstance(
         kid=9,
-        name="dw1_bf16_gfx950_bm128_bn128_bk32_swizzled_cohort2_wave2x2",
+        name="dw1_bf16_gfx950_bm128_bn128_bk32_cohort2_double_lds",
         family=OpusMoeBackwardFamily.DW1,
         arch="gfx950",
         dtype="bf16",
@@ -272,7 +272,7 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         split_k=1,
         trait=(
             "opus_moe_backward::gfx950::"
-            "Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DirectLds"
+            "Dw1Bf16Gfx950Bm128Bn128Bk32SwizzledCohort2DoubleLds"
         ),
         launcher="opus_moe_backward::gfx950::dw1_launch_gfx950",
     ),

@@ -212,10 +212,12 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
 
     constexpr int smem_a_bytes = BM * BK * sizeof(D_A);
     constexpr int smem_b_bytes = BN * BK * sizeof(D_B);
-    __shared__ __align__(16) char tile_storage[smem_a_bytes + smem_b_bytes];
+    constexpr int smem_stage_bytes = smem_a_bytes + smem_b_bytes;
+    constexpr int smem_stages = T::DOUBLE_BUFFER ? 2 : 1;
+    __shared__ __align__(16) char tile_storage[smem_stages * smem_stage_bytes];
     auto s_a = make_smem(reinterpret_cast<D_A*>(tile_storage));
-    auto s_b = make_smem(
-        reinterpret_cast<D_B*>(tile_storage + smem_a_bytes));
+    auto s_b =
+        make_smem(reinterpret_cast<D_B*>(tile_storage + smem_a_bytes));
 
     const D_A* a = reinterpret_cast<const D_A*>(kargs.a);
     const D_B* b = reinterpret_cast<const D_B*>(kargs.b);
@@ -266,8 +268,13 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     // this kernel, so every reduction tile has exactly 32 addressable rows.
     const int loops = route_count / BK;
 
-    for(int tile_k = 0; tile_k < loops; ++tile_k)
+    struct TileSources
     {
+        int a;
+        int b0;
+        int b1;
+    };
+    auto tile_sources = [&](int tile_k) __attribute__((always_inline)) {
         const int a_sorted_row = route_start + tile_k * BK + a_local_k;
         const int b_sorted_row0 = route_start + tile_k * BK + b_local_k0;
         const int b_sorted_row1 = route_start + tile_k * BK + b_local_k1;
@@ -301,76 +308,53 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int source_b1 = token_b1 < kargs.route.token_num
                                   ? token_b1
                                   : kargs.route.token_num;
+        return TileSources{source_a, source_b0, source_b1};
+    };
 
-        if constexpr(T::DIRECT_GMEM_TO_LDS)
-        {
-            // Close the prior tile before VMEM starts overwriting this single
-            // shared stage.  Destination bases are wave-uniform; gfx950 adds
-            // the lane-vector displacement in buffer_load_b128_lds hardware.
-            __builtin_amdgcn_s_barrier();
-            OPUS_LDS_ADDR D_B* b_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b.ptr) +
+    auto issue_direct_tile = [&](const TileSources& sources,
+                                 auto& s_a_tile,
+                                 auto& s_b_tile)
+        __attribute__((always_inline)) {
+        OPUS_LDS_ADDR D_B* b_wave_dst =
+            reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
+            wave_id * opus::get_warp_size() * VEC;
+        opus::static_for<a_m_slabs>([&](auto slab) {
+            OPUS_LDS_ADDR D_A* a_wave_dst =
+                reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                slab.value * 64 * BK +
                 wave_id * opus::get_warp_size() * VEC;
-            opus::static_for<a_m_slabs>([&](auto slab) {
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a.ptr) +
-                    slab.value * 64 * BK +
-                    wave_id * opus::get_warp_size() * VEC;
-                g_a.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (source_a * kargs.stride_a_row + output_m_base +
-                     slab.value * 64 + a_local_m) *
-                        sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
-            });
-            opus::static_for<b_n_slabs>([&](auto slab) {
-                OPUS_LDS_ADDR D_B* b_slab_dst =
-                    b_wave_dst + slab.value * 128 * BK;
-                const int source_n = output_n_base + slab.value * 128 +
-                                     b_local_n;
-                g_b.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
-                    (source_b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
-                g_b.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(
-                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) +
-                        4096),
-                    (source_b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
-            });
-            s_waitcnt_vmcnt(0_I);
-            __builtin_amdgcn_s_barrier();
-        }
-        else
-        {
-            auto a0 = g_a.template load<VEC>(
-                source_a * kargs.stride_a_row + output_m_base + a_local_m,
+            g_a.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                (sources.a * kargs.stride_a_row + output_m_base +
+                 slab.value * 64 + a_local_m) *
+                    sizeof(D_A),
                 0,
+                opus::number<0>{},
                 opus::number<T::CACHECTL_A>{});
-            auto b0 = g_b.template load<VEC>(
-                source_b0 * kargs.stride_b_row + output_n_base + b_local_n,
+        });
+        opus::static_for<b_n_slabs>([&](auto slab) {
+            OPUS_LDS_ADDR D_B* b_slab_dst =
+                b_wave_dst + slab.value * 128 * BK;
+            const int source_n =
+                output_n_base + slab.value * 128 + b_local_n;
+            g_b.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                (sources.b0 * kargs.stride_b_row + source_n) * sizeof(D_B),
                 0,
+                opus::number<0>{},
                 opus::number<T::CACHECTL_B>{});
-            auto b1 = g_b.template load<VEC>(
-                source_b1 * kargs.stride_b_row + output_n_base + b_local_n,
+            g_b.template _async_load<VEC>(
+                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_slab_dst) + 4096),
+                (sources.b1 * kargs.stride_b_row + source_n) * sizeof(D_B),
                 0,
+                opus::number<0>{},
                 opus::number<T::CACHECTL_B>{});
+        });
+    };
 
-            __builtin_amdgcn_s_barrier();
-            s_a.template _store<VEC>(a0, a_store_addr);
-            s_b.template _store<VEC>(b0, b_store_addr);
-            s_b.template _store<VEC>(b1, b_store_addr + 4096);
-            s_waitcnt_lgkmcnt(0_I);
-            __builtin_amdgcn_s_barrier();
-        }
-
+    auto compute_tile = [&](auto& s_a_tile, auto& s_b_tile)
+        __attribute__((always_inline)) {
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
@@ -389,9 +373,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     base = a_read_base + (native_m / 2) * 4096;
                     base ^= (native_m % 2) * 0x40;
                 }
-                auto lo =
-                    s_a.template _tr_load<T::VEC_TR_B, k_byte_offset>(base);
-                auto hi = s_a.template _tr_load<T::VEC_TR_B, k_byte_offset>(
+                auto lo = s_a_tile.template _tr_load<T::VEC_TR_B,
+                                                      k_byte_offset>(base);
+                auto hi = s_a_tile.template _tr_load<T::VEC_TR_B,
+                                                      k_byte_offset>(
                     base ^ 0x220);
                 constexpr int fragment = em.value * T::E_K + ek.value;
 #pragma unroll
@@ -418,9 +403,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     base = b_read_lane_base + (native_n / 4) * 8192;
                     base ^= (native_n % 4) * 0x40;
                 }
-                auto lo =
-                    s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(base);
-                auto hi = s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(
+                auto lo = s_b_tile.template _tr_load<T::VEC_TR_B,
+                                                      k_byte_offset>(base);
+                auto hi = s_b_tile.template _tr_load<T::VEC_TR_B,
+                                                      k_byte_offset>(
                     base ^ 0x440);
                 constexpr int fragment = en.value * T::E_K + ek.value;
 #pragma unroll
@@ -436,6 +422,88 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         v_c = mma(v_a, v_b, v_c);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
+    };
+
+    if constexpr(T::DOUBLE_BUFFER)
+    {
+        static_assert(T::DIRECT_GMEM_TO_LDS,
+                      "double-buffered K4 requires direct GMEM-to-LDS");
+        auto s_a_next = make_smem(
+            reinterpret_cast<D_A*>(tile_storage + smem_stage_bytes));
+        auto s_b_next = make_smem(reinterpret_cast<D_B*>(
+            tile_storage + smem_stage_bytes + smem_a_bytes));
+        if(loops > 0)
+        {
+            const auto first = tile_sources(0);
+            issue_direct_tile(first, s_a, s_b);
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+
+            int tile_k = 0;
+            for(; tile_k + 1 < loops; tile_k += 2)
+            {
+                const auto odd = tile_sources(tile_k + 1);
+                issue_direct_tile(odd, s_a_next, s_b_next);
+                compute_tile(s_a, s_b);
+                s_waitcnt_vmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+
+                if(tile_k + 2 < loops)
+                {
+                    const auto next_even = tile_sources(tile_k + 2);
+                    issue_direct_tile(next_even, s_a, s_b);
+                }
+                compute_tile(s_a_next, s_b_next);
+                if(tile_k + 2 < loops)
+                {
+                    s_waitcnt_vmcnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                }
+            }
+            if(tile_k < loops)
+                compute_tile(s_a, s_b);
+        }
+    }
+    else
+    {
+        for(int tile_k = 0; tile_k < loops; ++tile_k)
+        {
+            const auto sources = tile_sources(tile_k);
+
+            if constexpr(T::DIRECT_GMEM_TO_LDS)
+            {
+                // Close the prior tile before VMEM starts overwriting this
+                // single shared stage.  gfx950 adds the lane-vector
+                // displacement to the wave-uniform destination base.
+                __builtin_amdgcn_s_barrier();
+                issue_direct_tile(sources, s_a, s_b);
+                s_waitcnt_vmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+            }
+            else
+            {
+                auto a0 = g_a.template load<VEC>(
+                    sources.a * kargs.stride_a_row + output_m_base + a_local_m,
+                    0,
+                    opus::number<T::CACHECTL_A>{});
+                auto b0 = g_b.template load<VEC>(
+                    sources.b0 * kargs.stride_b_row + output_n_base + b_local_n,
+                    0,
+                    opus::number<T::CACHECTL_B>{});
+                auto b1 = g_b.template load<VEC>(
+                    sources.b1 * kargs.stride_b_row + output_n_base + b_local_n,
+                    0,
+                    opus::number<T::CACHECTL_B>{});
+
+                __builtin_amdgcn_s_barrier();
+                s_a.template _store<VEC>(a0, a_store_addr);
+                s_b.template _store<VEC>(b0, b_store_addr);
+                s_b.template _store<VEC>(b1, b_store_addr + 4096);
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+            }
+            compute_tile(s_a, s_b);
+        }
     }
     __syncthreads();
 
