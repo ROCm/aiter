@@ -237,6 +237,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
+    auto mma_k_fragment = make_tiled_mma<D_A, D_B, D_ACC>(
+        seq<T::E_M, T::E_N, 1>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K>{},
+        mfma_adaptor_swap_ab{});
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
 
@@ -355,6 +360,81 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
 
     auto compute_tile = [&](auto& s_a_tile, auto& s_b_tile)
         __attribute__((always_inline)) {
+        if constexpr(T::PIPELINE_REDUCTION_FRAGMENTS)
+        {
+            static_assert(T::E_K == 2);
+            static_assert(std::is_same_v<
+                          typename decltype(mma)::vtype_c,
+                          typename decltype(mma_k_fragment)::vtype_c>);
+            opus::static_for<T::E_K>([&](auto ek) {
+                typename decltype(mma_k_fragment)::vtype_a v_a;
+                opus::static_for<T::E_M>([&](auto em) {
+                    constexpr int k_byte_offset = ek.value * 2048;
+                    int base;
+                    if constexpr(T::T_M == 1)
+                    {
+                        constexpr int slab = em.value / 2;
+                        constexpr int em_in_slab = em.value % 2;
+                        base = a_read_base + slab * 4096;
+                        base ^= em_in_slab * 0x40;
+                    }
+                    else
+                    {
+                        const int native_m =
+                            em.value * T::T_M + wave_id_m;
+                        base = a_read_base + (native_m / 2) * 4096;
+                        base ^= (native_m % 2) * 0x40;
+                    }
+                    auto lo = s_a_tile.template _tr_load<T::VEC_TR_B,
+                                                          k_byte_offset>(base);
+                    auto hi = s_a_tile.template _tr_load<T::VEC_TR_B,
+                                                          k_byte_offset>(
+                        base ^ 0x220);
+#pragma unroll
+                    for(int j = 0; j < T::VEC_TR_B; ++j)
+                    {
+                        v_a[em.value * 2 * T::VEC_TR_B + j] = lo[j];
+                        v_a[em.value * 2 * T::VEC_TR_B +
+                            T::VEC_TR_B + j] = hi[j];
+                    }
+                });
+                typename decltype(mma_k_fragment)::vtype_b v_b;
+                opus::static_for<T::E_N>([&](auto en) {
+                    constexpr int k_byte_offset = ek.value * 4096;
+                    int base;
+                    if constexpr(T::T_N == 4)
+                    {
+                        base = b_read_base + en.value * 8192;
+                    }
+                    else
+                    {
+                        const int native_n =
+                            en.value * T::T_N + wave_id_n;
+                        base = b_read_lane_base + (native_n / 4) * 8192;
+                        base ^= (native_n % 4) * 0x40;
+                    }
+                    auto lo = s_b_tile.template _tr_load<T::VEC_TR_B,
+                                                          k_byte_offset>(base);
+                    auto hi = s_b_tile.template _tr_load<T::VEC_TR_B,
+                                                          k_byte_offset>(
+                        base ^ 0x440);
+#pragma unroll
+                    for(int j = 0; j < T::VEC_TR_B; ++j)
+                    {
+                        v_b[en.value * 2 * T::VEC_TR_B + j] = lo[j];
+                        v_b[en.value * 2 * T::VEC_TR_B +
+                            T::VEC_TR_B + j] = hi[j];
+                    }
+                });
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_setprio(1);
+                v_c = mma_k_fragment(v_a, v_b, v_c);
+                __builtin_amdgcn_s_setprio(0);
+            });
+            __builtin_amdgcn_sched_barrier(0);
+            return;
+        }
+
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
