@@ -642,7 +642,12 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     }
 
     const int lm = lane % 32;
-    const int64_t dW_e = static_cast<int64_t>(e) * P * Q;
+    // The specialized aligned shapes occupy at most 2^28 BF16 elements, so a
+    // 32-bit element offset covers the complete output.  Keep dW in a buffer
+    // resource and avoid rebuilding a 64-bit flat address for every scalar
+    // accumulator store.
+    auto g_dW = opus::make_gmem(reinterpret_cast<opus::bf16_t*>(dW));
+    const int dW_e = e * P * Q;
     opus::static_for<4>([&](auto sm) {
         const int p_base = m0 + wm * 128 + sm.value * 32 + (lane / 32) * 4;
         opus::static_for<2>([&](auto sn) {
@@ -652,7 +657,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 const int p = p_base + (i.value / 4) * 8 + (i.value % 4);
                 const uint32_t bits = opus_wgtn_read_acc<c>();
                 const float value = __builtin_bit_cast(float, bits);
-                dW[dW_e + static_cast<int64_t>(p) * Q + q] = (__bf16)value;
+                g_dW.store(opus::fp32_to_bf16(value), dW_e + p * Q + q);
             });
         });
     });
