@@ -1,6 +1,6 @@
 name: FFM Aiter UT
 
-run-name: FFM aiter UT on ${{ inputs.runner || 'build-only-aiter' }}
+run-name: FFM aiter UT on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
 
 on:
   pull_request:
@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Self-hosted CPU runner label to use for the FFM UT.
+        description: Self-hosted runner label to use for the FFM UT.
         required: true
-        default: build-only-aiter
+        default: linux-aiter-do-mi350x-1
         type: string
       docker_image:
         description: FFM image to pull and test.
@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'build-only-aiter' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
   cancel-in-progress: true
 
 env:
@@ -46,8 +46,8 @@ jobs:
         github.event.label.name == 'ci:gfx1250-ffm' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    name: FFM Aiter UT (${{ inputs.runner || 'build-only-aiter' }}) / Shard ${{ matrix.shard }}
-    runs-on: ${{ inputs.runner || 'build-only-aiter' }}
+    name: FFM Aiter UT (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
     timeout-minutes: 7200
     strategy:
       fail-fast: false
