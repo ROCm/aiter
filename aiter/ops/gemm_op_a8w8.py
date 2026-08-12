@@ -888,7 +888,13 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
+    # Must mirror the real signature (incl. out=): the abstract_impl forwards the
+    # out= kwarg here at trace time. When out is given the real fn returns it, so
+    # the fake returns it too (preserves tensor identity for mutation/aliasing).
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
@@ -899,6 +905,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -907,7 +914,20 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # `out`: optional caller-owned output buffer so the result lands at a FIXED
+    # address (needed to capture this GEMM's consumer into a cudagraph without a
+    # per-step input copy). The ck/cktile/asm/opus/flydsl paths below take Y
+    # positionally and write into it, so honoring `out` there is free. The
+    # triton-fallback branches self-allocate their output and CANNOT honor `out`
+    # -> assert loud rather than silently returning a different address.
+    if out is not None:
+        assert out.shape == (m, n) and out.dtype == dtype and out.device == XQ.device, (
+            f"gemm_a8w8_blockscale_bpreshuffle: out buffer {tuple(out.shape)}/"
+            f"{out.dtype} != expected ({m},{n})/{dtype}"
+        )
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     use_gfx1250_flydsl_mxfp8_128 = (
         get_gfx() == "gfx1250"
@@ -980,12 +1000,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             "NUM_KSPLIT": 1,
             "kpack": 2,
         }
+        # triton impl accepts a pre-allocated `y=` -> forward `out` (zero-copy).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
@@ -1008,12 +1030,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
         backend = kernelName if kernelName in ("triton", "gluon") else None
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        # The triton impl accepts a pre-allocated output via `y=`; forward `out`
+        # so the result lands at the caller's fixed address (zero-copy path).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             backend=backend,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )

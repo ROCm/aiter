@@ -11,6 +11,8 @@ import os
 import torch
 import triton
 
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters
 )
@@ -32,6 +34,15 @@ def chunk_delta_attn_autotune_configs(
     if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE:
         return configs
     return [default_config if default_config is not None else configs[0]]
+
+
+def chunk_delta_attn_tuned_config(
+    kernel_name: str, fallback: triton.Config
+) -> triton.Config:
+    """This family's tile for the current device, from its published config."""
+    return get_tuned_kernel_config(
+        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback
+    )
 
 
 RCP_LN2: float = math.log2(math.e)  # 1/ln(2), for log2-space gate arithmetic
