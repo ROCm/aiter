@@ -201,7 +201,7 @@ def decode_attention_fwd_grouped_rope(
     )
     if config is None:
         # _get_config() returns the shared cached dict and the launch helpers
-        # below write derived fields into its sub-configs -- work on a copy.
+        # below write derived fields into its sub-configs — work on a copy.
         config = copy.deepcopy(_get_config())
 
     is_fp32: bool = any(

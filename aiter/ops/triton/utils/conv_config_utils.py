@@ -98,10 +98,10 @@ def get_conv_config(
     """Load a conv kernel config for the running GPU arch.
 
     Walk order (first hit wins):
-        1. ``shapes[shape_key]`` -- exact-shape pin from the offline sweep.
-        2. ``M_LEQ_<n>`` -- row-count bucket walk (M_total for GEMM-like
+        1. ``shapes[shape_key]`` — exact-shape pin from the offline sweep.
+        2. ``M_LEQ_<n>`` — row-count bucket walk (M_total for GEMM-like
            kernels, T for Winograd).
-        3. ``"any"`` -- global fallback.
+        3. ``"any"`` — global fallback.
 
     Returns a fresh deep-copy of the config dict; safe to mutate.
 

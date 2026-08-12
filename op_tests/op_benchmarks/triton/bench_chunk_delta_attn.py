@@ -23,7 +23,7 @@ import math
 import os
 import sys
 
-# Skip CK/HIP native .so loading - Triton kernels only
+# Skip CK/HIP native .so loading – Triton kernels only
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 
@@ -39,7 +39,7 @@ import triton
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
-# (B, T, H, K, V)  - representative prefill shapes
+# (B, T, H, K, V)  – representative prefill shapes
 DEFAULT_SHAPES = [
     (1, 512, 16, 64, 64),
     (1, 1024, 16, 64, 64),

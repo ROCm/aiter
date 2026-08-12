@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 """A8W4 GEMM utilities for MegaMoE v2 stage1."""
 
 import flydsl.compiler as flyc

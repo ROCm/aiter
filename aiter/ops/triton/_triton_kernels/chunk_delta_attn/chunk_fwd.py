@@ -100,7 +100,7 @@ def chunk_delta_attn_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     # ------------------------------------------------------------------
-    # Step 0 -- Optional QK L2 normalization (matches FLA API)
+    # Step 0 — Optional QK L2 normalization (matches FLA API)
     # ------------------------------------------------------------------
     if use_qk_l2norm_in_kernel:
         q, _ = l2norm_fwd(q)
@@ -110,7 +110,7 @@ def chunk_delta_attn_fwd(
         beta = beta_sigmoid_fwd(beta)
 
     # ------------------------------------------------------------------
-    # Step 1 -- Gate cumsum
+    # Step 1 — Gate cumsum
     # ------------------------------------------------------------------
     if use_gate_in_kernel:
         assert A_log is not None, "A_log required when use_gate_in_kernel=True"
@@ -136,7 +136,7 @@ def chunk_delta_attn_fwd(
         )
 
     # ------------------------------------------------------------------
-    # Step 2 -- Intra-chunk (sub_chunk + inter_solve + recompute_w_u)
+    # Step 2 — Intra-chunk (sub_chunk + inter_solve + recompute_w_u)
     # ------------------------------------------------------------------
     w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_intra(
         q=q,
@@ -153,7 +153,7 @@ def chunk_delta_attn_fwd(
     )
 
     # ------------------------------------------------------------------
-    # Step 3 -- Inter-chunk hidden state update
+    # Step 3 — Inter-chunk hidden state update
     # ------------------------------------------------------------------
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
@@ -170,7 +170,7 @@ def chunk_delta_attn_fwd(
     )
 
     # ------------------------------------------------------------------
-    # Step 4 -- Output
+    # Step 4 — Output
     # ------------------------------------------------------------------
     o = chunk_gla_fwd_o(
         q=q,

@@ -3,12 +3,12 @@
 # Adapted from flash-linear-attention: Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """
-chunk_delta_attn - Triton kernels for the chunk-based delta-attention
+chunk_delta_attn – Triton kernels for the chunk-based delta-attention
 forward pass (prefill / training).
 
 Public API
 ----------
-chunk_delta_attn_fwd          Top-level forward: gate cumsum -> intra -> inter -> output.
+chunk_delta_attn_fwd          Top-level forward: gate cumsum → intra → inter → output.
 chunk_delta_attn_fwd_intra    Intra-chunk attention (Aqk/Akk + W/U recompute).
 chunk_gla_fwd_o               GLA output kernel (q*exp2(g)*h + A*v).
 recompute_w_u_fwd             W/U recompute from Akk inverse.

@@ -106,7 +106,7 @@ def l2norm_fwd(
     if need_rstd:
         rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     else:
-        rstd = y  # placeholder; STORE_RSTD=False -> never dereferenced
+        rstd = y  # placeholder; STORE_RSTD=False → never dereferenced
 
     if D <= 512:
         BT = _L2NORM_FWD_BT

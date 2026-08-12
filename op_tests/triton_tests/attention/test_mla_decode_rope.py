@@ -247,7 +247,7 @@ def ref_compute_full_fwd(
 
 def get_config(dtype: torch.dtype):
     # _get_config() returns the shared cached dict and the launch helpers
-    # write derived fields into its sub-configs -- work on a copy.
+    # write derived fields into its sub-configs — work on a copy.
     config: dict[str, Any] = copy.deepcopy(_get_config())
     base_config_key: str = "fwd_grouped_kernel_stage1_rope"
     fp32_config_key: str = f"{base_config_key}_fp32"

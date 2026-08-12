@@ -9,7 +9,7 @@ Three-step pipeline:
   1. Token-parallel kernel: computes diagonal Akk blocks + full Aqk row-by-row.
   2. Sub-chunk intra kernel (safe-gate path): alternative diagonal-block kernel.
   3. Fused inter + solve_tril kernel: computes off-diagonal Akk, then solves
-     the full chunk triangular system in one pass -> writes Akk_inv.
+     the full chunk triangular system in one pass → writes Akk_inv.
 
 The Python dispatch ``chunk_delta_attn_fwd_intra`` orchestrates all three steps
 and returns w, u, qg, kg, Aqk, Akk as required by the top-level forward.
@@ -137,7 +137,7 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
     p_beta = beta + i_t * HV + o_hv
     b_beta = tl.load(p_beta, mask=m_hv, other=0.0).to(tl.float32)
 
-    # Accumulate dot products across K-tiles (BK <= 64 to avoid slow tl.dot / huge scatter loads)
+    # Accumulate dot products across K-tiles (BK ≤ 64 to avoid slow tl.dot / huge scatter loads)
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
         b_Aqk_j = tl.zeros([BH], dtype=tl.float32)
         b_Akk_j = tl.zeros([BH], dtype=tl.float32)
@@ -294,7 +294,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     # Reference gate at the mid-point of this sub-chunk (same for all K tiles)
     i_gn = i_ti + min(BC // 2, T - i_ti - 1)
 
-    # Accumulate Aqk and Akk over K tiles (BK <= 64 to keep tl.dot shape small)
+    # Accumulate Aqk and Akk over K tiles (BK ≤ 64 to keep tl.dot shape small)
     b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
     b_Akk = tl.zeros([BC, BC], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
@@ -402,7 +402,7 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
     Fused kernel:
       1. Compute off-diagonal Aqk and Akk blocks (cross-sub-chunk).
       2. Load diagonal Akkd blocks (fp32) computed by the previous kernel.
-      3. Forward-substitute diagonals -> block-level Akk_inv.
+      3. Forward-substitute diagonals → block-level Akk_inv.
       4. Compute merged cross-diagonal Akk_inv blocks.
       5. Write full Akk_inv to Akk.
     """

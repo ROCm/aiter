@@ -1031,7 +1031,7 @@ def _get_config(
     N: int,
     K: int,
 ):
-    # Fresh copy per call, outside the lru boundary -- the caller writes
+    # Fresh copy per call, outside the lru boundary — the caller writes
     # derived fields (SPLITK_BLOCK_SIZE here, GROUP_K/GROUP_N at the call
     # site) into the returned dict.
     config = _get_config_cached(M, N, K).copy()

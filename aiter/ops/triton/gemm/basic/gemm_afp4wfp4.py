@@ -458,7 +458,7 @@ def gemm_afp4wfp4_preshuffle(
     K_elems = 2 * K_bytes
 
     if config is None:
-        # _get_config doubles K itself (logical K = 2 * K_bytes) -- pass bytes,
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
         # matching the non-preshuffled path.
         config, _ = _get_config(M, N, K_bytes, True)
 

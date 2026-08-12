@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import logging
@@ -81,7 +81,7 @@ def reduce_scatter(
 def _build_input(shape, dtype, tp_size, rand_seed):
     """Deterministic per-rank input: rand_seed[i] repeats over a chunk so
     each rank ends up with an identical tensor of shape `shape`. With all
-    ranks having identical input, sum_across_ranks = tp_size * input -- that
+    ranks having identical input, sum_across_ranks = tp_size * input — that
     gives us an analytic reference for any scatter dim (see _ref_output)."""
     n = 1
     for s in shape:
@@ -151,7 +151,7 @@ def run_case(
     force_fallback routes every reduce_scatter through the pynccl fallback
     (custom AR disabled) instead of the custom kernel.
 
-    No external-library comparison -- other libs (torch.distributed /
+    No external-library comparison — other libs (torch.distributed /
     pynccl) don't support scatter on non-zero dims, so latency-vs-them
     isn't meaningful for the new kernels."""
     rand_seed = torch.randint(1, 16, (tp_size,), dtype=dtype, device="cuda")
@@ -201,11 +201,11 @@ def build_cases(tp_size, dtype):
     last dimension with pack_size.
 
     Kernel branches:
-      first_dim_vec  : numel % (ngpus * pack_size) == 0  -> split_first_dim
-      last_dim_vec   : last % (ngpus * pack_size) == 0   -> split_lastdim (vec)
-      last_dim_naive : last % ngpus == 0 but % pack != 0 -> split_lastdim_naive
-      mid_dim_vec    : k % pack_size == 0                -> split_middim (vec)
-      mid_dim_naive  : k % pack_size != 0                -> split_middim_naive
+      first_dim_vec  : numel % (ngpus * pack_size) == 0  → split_first_dim
+      last_dim_vec   : last % (ngpus * pack_size) == 0   → split_lastdim (vec)
+      last_dim_naive : last % ngpus == 0 but % pack != 0 → split_lastdim_naive
+      mid_dim_vec    : k % pack_size == 0                → split_middim (vec)
+      mid_dim_naive  : k % pack_size != 0                → split_middim_naive
     """
     pack_size = 16 // dtype.itemsize
 

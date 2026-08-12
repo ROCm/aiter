@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: SIM102
 
 """FlyDSL intranode dispatch/combine kernels for EP MoE."""
@@ -560,7 +560,7 @@ def make_combine_kernel(
             return fx.Float32(0.0)
 
     elif hidden_elem_size == 1:  # fp8
-        # OCP vs FNUZ differ only by an extra x0.5 / x2.0 scale on
+        # OCP vs FNUZ differ only by an extra ×0.5 / ×2.0 scale on
         # load/store. Under ``fp8_direct_cast`` transport is always OCP fp8.
         _is_fnuz = _transport_dtype == torch.float8_e4m3fnuz
 

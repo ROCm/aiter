@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 """GEMM1 compute shared by fused MegaMoE v2 stage1 and its standalone interface."""
 
 import functools

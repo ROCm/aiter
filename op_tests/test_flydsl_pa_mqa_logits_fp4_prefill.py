@@ -63,7 +63,7 @@ _E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
 KVS_NTPW = 4
 
 
-# -- FP4 quant / dequant ----------------------------------------------
+# ── FP4 quant / dequant ──────────────────────────────────────────────
 
 
 def fp4_quant_e2m1_with_e8m0(x, block_size=SCALE_BLOCK):
@@ -101,7 +101,7 @@ def fp4_dequant_e2m1_with_e8m0(packed, e8m0, block_size=SCALE_BLOCK):
     ).reshape(*prefix, d)
 
 
-# -- Host-side FP4 layout writers (kernel ABI) ------------------------
+# ── Host-side FP4 layout writers (kernel ABI) ────────────────────────
 
 
 def quant_q_fp4_preshuffle(q):
@@ -145,7 +145,7 @@ def indexer_k_fp4_paged_preshuffle(k, slot_mapping, kv_cache, kv_scale, kv_block
     return kv_cache, kv_scale
 
 
-# -- Reference --------------------------------------------------------
+# ── Reference ────────────────────────────────────────────────────────
 
 
 def ref_prefill_logits(
@@ -170,7 +170,7 @@ def _cos(a, b):
     return (a * b).sum() / (a.norm() * b.norm() + 1e-12)
 
 
-# -- Driver -----------------------------------------------------------
+# ── Driver ───────────────────────────────────────────────────────────
 
 
 def run_case(
@@ -461,7 +461,7 @@ def _bench_vs_atom(
     print()
 
 
-# -- Variable-qlen (per-batch MTP) via cu_seq_q -----------------------
+# ── Variable-qlen (per-batch MTP) via cu_seq_q ───────────────────────
 
 _VARQLEN_PERF_SUMMARY = []
 
@@ -740,7 +740,7 @@ def main():
             warmup=args.warmup,
         )
 
-    # -- Variable-qlen (per-batch MTP via cu_seq_q) sweep + TFLOPS/bandwidth --
+    # ── Variable-qlen (per-batch MTP via cu_seq_q) sweep + TFLOPS/bandwidth ──
     print("=" * 80)
     print("[test] FP4 paged variable-qlen (per-batch MTP) MQA logits")
     print("=" * 80)

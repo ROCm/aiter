@@ -488,7 +488,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pre-quantization bf16/fp16 normed output.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
-        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` --
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
         used by GDN-style layers that have both an FP8 projection and a bf16
         gating projection consuming the same normed activation, so they can
         skip the separate per-group quant kernel entirely (see Qwen3.5).

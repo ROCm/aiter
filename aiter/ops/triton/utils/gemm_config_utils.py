@@ -34,7 +34,7 @@ def _get_gemm_config_cached(
     B: int | None = None,
 ) -> tuple[dict, bool]:
     """
-    Internal cached implementation. Do NOT use this directly -- use
+    Internal cached implementation. Do NOT use this directly — use
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
 
