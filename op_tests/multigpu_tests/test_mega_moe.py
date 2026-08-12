@@ -2,12 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Multi-layer EP MoE end-to-end perf + accuracy on the mori v2 cco/FlyDSL op-layer.
 
-N (default 61, DeepSeek-V4-Pro) MoE layers are chained: each layer runs
-mori ``dispatch`` (cross-rank all2all) -> aiter ``fused_moe`` (a8w4 mxfp4 grouped
-GEMM) -> mori ``combine``, and the combined output (plus residual) feeds the next
-layer. All layers SHARE one weight set; only the per-layer routing (topk ids +
-weights) is regenerated randomly per layer and retained, so the reference can
-replay the exact same routing.
+N (default 61, DeepSeek-V4-Pro) MoE layers are chained. Gather/scatter use Mori
+v2 dispatch -> AITER fused_moe -> Mori v2 combine. Scatter-fused calls only
+``MegaMoEGfx1250``, which owns AITER's dispatch -> fused_moe -> fused-combine
+pipeline. The combined output plus residual feeds the next layer.
 
 Two isolated paths (never touch each other's intermediates; they only share the
 config, the bf16 weights and the per-layer routings):
@@ -27,13 +25,12 @@ Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
     torchrun --standalone --nproc_per_node=4 test_mega_moe.py \
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
-    # cco v2 op-layer is vendored in aiter; only an installed mori (mori.cco) is
-    # required. Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip JIT.
+    # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -m -hd -id -e -k --shared_E -q
 """
-import os
 import argparse
+import os
 
 import torch
 import torch.distributed as dist
@@ -69,15 +66,9 @@ _FP8_KEYS = ("per_Token", "per_128x128")
 
 
 def _import_mori_v2():
-    """Import the vendored cco v2 op-layer (compiles FlyDSL on first use).
-
-    The dispatch/combine op + kernels are vendored into aiter
-    (aiter.ops.flydsl.dispatch_combine_v2). Only the cco communication substrate
-    (mori.cco.Communicator + libmori_cco*.{so,bc}) stays an installed-mori dep.
-    set_device / sync are inlined here on torch (they were trivial hip wrappers).
-    """
+    """Import Mori's non-fused dispatch/combine v2 path."""
     from mori.cco import Communicator
-    from aiter.ops.flydsl.dispatch_combine_v2 import (
+    from mori.ops.dispatch_combine_v2 import (
         EpDispatchCombineConfig,
         EpDispatchCombineOp,
     )
@@ -227,9 +218,19 @@ def quant_tokens_fp8(tokens, spec):
     return quant_func(tokens, quant_dtype=spec["fp8_dtype"])
 
 
-def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
-                expert_mask, spec, a1_scale=None, num_local_tokens=None,
-                ep_kwargs=None):
+def moe_forward(
+    hidden,
+    w1_a,
+    w2_a,
+    w1_s,
+    w2_s,
+    topk_weights,
+    topk_ids,
+    expert_mask,
+    spec,
+    a1_scale=None,
+    num_local_tokens=None,
+):
     """Single fused_moe call (device path). ``num_local_tokens`` (device int32
     scalar == total_recv) lets the caller feed the FULL, un-truncated dispatch
     buffer: routes past total_recv*topk are dropped in the grouped route kernel,
@@ -238,13 +239,7 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
         num_local_tokens = torch.tensor(
             [hidden.shape[0]], dtype=dtypes.i32, device=hidden.device
         )
-    ep_kwargs = ep_kwargs or {}
     if spec["is_mxfp4"]:
-        # scatter_fused (gemm2 P2P) rides the a8w4 grouped kernel (data_format
-        # "a8w4"): a8w4_mxfp4 = fp8 act + mxfp4 weight is supported; a4w4_mxfp4
-        # (data_format "fp4") is not.
-        if ep_kwargs and spec["key"] != "a8w4_mxfp4":
-            raise NotImplementedError("scatter_fused is a8w4-only (not a4w4/fp4)")
         return fused_moe(
             hidden, w1_a, w2_a, topk_weights, topk_ids,
             expert_mask=expert_mask,
@@ -254,7 +249,6 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
             w1_scale=w1_s, w2_scale=w2_s,
             dtype=dtypes.bf16,
             num_local_tokens=num_local_tokens,
-            **ep_kwargs,
         )
     return fused_moe(
         hidden, w1_a, w2_a, topk_weights, topk_ids, expert_mask,
@@ -263,7 +257,6 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
         quant_type=spec["aiter_qtype"],
         a1_scale=a1_scale,
         dtype=dtypes.bf16,
-        **ep_kwargs,
     )
 
 
@@ -291,8 +284,8 @@ def make_routings(n_layers, ct, E, topk, dev, seed):
     topk_ids are distinct experts per token (top-k over a random score); weights
     are random and renormalized. Returns list[(ids[ct,topk] i32, wts[ct,topk] f32)]."""
     routings = []
-    for l in range(n_layers):
-        gen = torch.Generator(device=dev).manual_seed(seed + l)
+    for layer_idx in range(n_layers):
+        gen = torch.Generator(device=dev).manual_seed(seed + layer_idx)
         score = torch.rand(ct, E, generator=gen, device=dev, dtype=torch.float32)
         _, ids = score.topk(topk, dim=-1)  # distinct experts per token
         wts = torch.rand(ct, topk, generator=gen, device=dev, dtype=torch.float32)
@@ -452,6 +445,7 @@ class DeviceMoEPipeline:
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
         self.op = None
+        self.mega = None
         self.graph = None
         self.x0_static = None
         self.out_static = None
@@ -481,62 +475,64 @@ class DeviceMoEPipeline:
         # identical). max_num_inp_token_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
-        win_bytes = (
-            self.dist_ctx.world * self.ct * self.hdim * self.transport_dtype.itemsize * 2
-            + (1 << 24)
-        )
         self.comm = Communicator.init(
             self.dist_ctx.world, r, uid
         )
-        cfg = EpDispatchCombineConfig(
-            rank=r,
-            world_size=self.dist_ctx.world,
-            hidden_dim=self.hdim,
-            max_num_inp_token_per_rank=self.ct,
-            num_experts_per_rank=self.EPR,
-            num_experts_per_token=self.topk,
-            data_type=self.transport_dtype,
-            combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
-        )
-        self.op = EpDispatchCombineOp(cfg, self.comm)
+        if self.combine_mode == "scatter_fused":
+            if self.spec["key"] != "a8w4_mxfp4":
+                raise NotImplementedError(
+                    "scatter_fused is available only for a8w4_mxfp4"
+                )
+            from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+
+            self.mega = MegaMoEGfx1250(
+                communicator=self.comm,
+                rank=r,
+                world_size=self.dist_ctx.world,
+                model_dim=self.hdim,
+                inter_dim=self.idim,
+                experts=self.E,
+                topk=self.topk,
+                w1=self.w1_a,
+                w1_scale=self.w1_s,
+                w2=self.w2_a,
+                w2_scale=self.w2_s,
+                max_tokens_per_rank=self.ct,
+            )
+        else:
+            cfg = EpDispatchCombineConfig(
+                rank=r,
+                world_size=self.dist_ctx.world,
+                hidden_dim=self.hdim,
+                max_num_inp_token_per_rank=self.ct,
+                num_experts_per_rank=self.EPR,
+                num_experts_per_token=self.topk,
+                data_type=self.transport_dtype,
+                combine_mode=self.combine_mode,
+            )
+            self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
-    def _layer_step(self, x, l):
-        ids, wts = self.routings[l]
+    def _layer_step(self, x, layer_idx):
+        ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
+        if self.mega is not None:
+            y = self.mega(xn, wts, ids)
+            if self.sw1 is not None:
+                y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
+            return x + y
+
         # Recompute routing every layer (mode A: atomic routing inside dispatch)
         # instead of replaying a precomputed handle. return_routing=True hands
         # back this layer's forward dest-slot map, which combine then consumes.
         recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
             xn, wts, None, ids, return_routing=True
         )
-        ep_kwargs = None
-        if self.op.cfg.is_fused:
-            # gemm2-fused scatter: zero the per-(token,k) comb_inp before gemm2's
-            # P2P writes (dropped/unwritten slots must read 0 in the combine sum),
-            # then hand gemm2 the arena handles + this rank's tis (recv->origin).
-            # EXPERIMENT: dropless + full-topk means every (token,k) slot is written
-            # by gemm2 each layer, so the per-layer zero is unnecessary here (arena is
-            # already zeroed once at setup). Skip it to measure the ~110us fill saving.
-            # self.op.zero_fused_staging()
-            ep_kwargs = dict(self.op.ep_scatter_params())
-            ep_tis = handle.disp_tok_id_to_src_tok_id_local
-            ep_kwargs = dict(
-                ep_scatter=True,
-                ep_arena_handle=ep_kwargs["ep_arena_handle"],
-                ep_comb_inp_off=ep_kwargs["ep_comb_inp_off"],
-                ep_wire_nbytes=ep_kwargs["ep_wire_nbytes"],
-                ep_rank=ep_kwargs["ep_rank"],
-                ep_max_tok=ep_kwargs["ep_max_tok"],
-                ep_topk=ep_kwargs["ep_topk"],
-                ep_tis=ep_tis,
-            )
         out = moe_forward(
             recv_x, self.w1_a, self.w2_a, self.w1_s, self.w2_s,
             recv_w, recv_idx.to(dtypes.i32), self.expert_mask, self.spec,
             num_local_tokens=total_recv_t,
-            ep_kwargs=ep_kwargs,
         )
         combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
         y = combine_out[: self.ct].to(dtypes.bf16)
@@ -546,8 +542,8 @@ class DeviceMoEPipeline:
 
     def _pipeline(self, x0):
         x = x0
-        for l in range(self.n_layers):
-            x = self._layer_step(x, l)
+        for layer_idx in range(self.n_layers):
+            x = self._layer_step(x, layer_idx)
         return x
 
     # ---- CUDA graph capture (all N layers in ONE graph) ---- #
@@ -623,6 +619,8 @@ class DeviceMoEPipeline:
 
     def teardown(self):
         self.graph = None
+        if self.mega is not None:
+            self.mega.close()
         if self.comm is not None:
             self.comm.destroy()
 
