@@ -4,9 +4,9 @@
 
 """Prebuild the CKTile module required by the vLLM disaggregated smoke test."""
 
+import importlib
 import sys
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # Match setup.py's build-time import path.  Importing ``aiter.jit`` would run
@@ -14,8 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # build-only CI runners intentionally have no GPU.
 sys.path.insert(0, str(REPO_ROOT / "aiter"))
 
-from jit import core  # noqa: E402
-
+core = importlib.import_module("jit.core")
 
 MODULE = "module_gemm_a8w8_blockscale_cktile"
 EXPECTED_ARCH = "gfx950"
@@ -43,11 +42,9 @@ def main() -> None:
     target = Path(core.get_user_jit_dir()) / f"{MODULE}.so"
     expected = REPO_ROOT / "aiter" / "jit" / target.name
     if target.resolve() != expected.resolve() or not target.is_file():
-        raise SystemExit(
-            f"targeted prebuild did not create {expected}: got {target}"
-        )
+        raise SystemExit(f"targeted prebuild did not create {expected}: got {target}")
 
-    arches = core._so_offload_archs(target)  # noqa: SLF001
+    arches = core._so_offload_archs(target)
     if arches != {EXPECTED_ARCH}:
         raise SystemExit(
             f"targeted prebuild has unexpected GPU arches: {sorted(arches)}"
