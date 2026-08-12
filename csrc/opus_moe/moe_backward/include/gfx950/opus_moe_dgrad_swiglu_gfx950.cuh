@@ -69,6 +69,28 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         tile_m = (group_id % groups_m) * GROUP + in_group % GROUP;
         tile_n = (group_id / groups_m) * GROUP + in_group / GROUP;
     }
+    else if(num_tiles_m > 1 && (num_tiles_n & 1) == 0)
+    {
+        // Swizzle the even M prefix in 2x2 groups and leave the final odd M
+        // tile as a compact remainder.  This keeps the same A/B panel reuse
+        // for ragged 23-tile launches without padding every expert grid to 24.
+        constexpr int GROUP = 2;
+        const int grouped_tiles_m = num_tiles_m - 1;
+        const int grouped_blocks = grouped_tiles_m * num_tiles_n;
+        if(wgid < grouped_blocks)
+        {
+            const int group_id = wgid / (GROUP * GROUP);
+            const int in_group = wgid % (GROUP * GROUP);
+            const int groups_m = grouped_tiles_m / GROUP;
+            tile_m = (group_id % groups_m) * GROUP + in_group % GROUP;
+            tile_n = (group_id / groups_m) * GROUP + in_group / GROUP;
+        }
+        else
+        {
+            tile_m = grouped_tiles_m;
+            tile_n = wgid - grouped_blocks;
+        }
+    }
     const int row = tile_m * T::B_M;
     const int col = tile_n * T::B_N;
 
