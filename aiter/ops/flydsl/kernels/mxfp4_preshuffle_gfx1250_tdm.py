@@ -557,10 +557,10 @@ def launch_gemm_a8w4_tdm(
         lds_sa_lane_off = (
             SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + kgrp * 4
         )
-        # wnb is 32-aligned and lane16 < 16, so col_rel//32 == wnb//32 + wn//2
-        # and col_rel%32 == (wn%2)*16 + lane16 -- lane and wn parts separate.
+        # One full-wave load covers both 16-column halves of an N32 scale
+        # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
         assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
-        lds_sb_lane_off = SB_OFF + ((wnb // 32) * SC_INNER + lane16) * 4
+        lds_sb_lane_off = SB_OFF + ((wnb // 32) * SC_INNER + lane) * 4
 
         def lds_a_base(buf):
             return buf + fx.index_cast(T.index, lds_a_lane_off)
@@ -611,15 +611,24 @@ def launch_gemm_a8w4_tdm(
             off = (ksl * wmma_m_rep + wm) * 4
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
-        def load_sb(buf, wn, ksl):
-            off = ((wn // 2) * SC_INNER + ksl * 32 + (wn % 2) * 16) * 4
+        def load_sb(buf, sn, ksl):
+            off = (sn * SC_INNER + ksl * 32) * 4
             return lds_load_b32(lds_sb_base(buf), fx.Int32(off))[0]
 
-        wmma_atom = fx.make_mma_atom(
-            fx.rocdl.WMMAScale(
-                WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32
+        wmma_atoms = [
+            fx.make_mma_atom(
+                fx.rocdl.WMMAScale(
+                    WMMA_M,
+                    WMMA_N,
+                    WMMA_K,
+                    fx.Float4E2M1FN,
+                    ACT_ELEM,
+                    fx.Float32,
+                    opsel_a=sb_sel,
+                )
             )
-        )
+            for sb_sel in range_constexpr(2)
+        ]
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
@@ -643,21 +652,22 @@ def launch_gemm_a8w4_tdm(
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(
-                        wmma_atom,
+                        wmma_atoms[wn % 2],
                         c_frags[idx],
                         wt[wn],
                         act[i],
                         c_frags[idx],
-                        scale_a=sb_k[wn],
+                        scale_a=sb_k[wn // 2],
                         scale_b=sa_k[wm],
                     )
 
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
-        BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
+        sb_pairs = wmma_n_rep // 2
+        BS_DS = wmma_n_rep * DS_B + sb_pairs + wmma_m_rep
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
-        SA_WIDTH, SB_WIDTH = max(2, wmma_m_rep), max(2, wmma_n_rep)
+        SA_WIDTH, SB_WIDTH = max(2, wmma_m_rep), max(2, sb_pairs)
         RmemSlot = namedtuple("RmemSlot", "a b sa sb")
 
         def make_rmem_slot():
@@ -691,10 +701,10 @@ def launch_gemm_a8w4_tdm(
                 slot.a[wm].store(load_a(buf, wm, ksl))
             for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(buf, wn, ksl))
-            sb_v = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
             sa_v = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - wmma_m_rep]))
-            slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - wmma_n_rep]))
+            slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             # Pin all four past the scale loads, or the allocator reuses a base
             # as a scale destination and the backend gates that WAR with vm_vsrc.
             lds_addr_keepalive(*lds_bases(buf))
