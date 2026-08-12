@@ -12,7 +12,7 @@ on:
         description: "SGLang ref to test"
         required: false
         type: string
-        default: "main"
+        default: "6174f1cad860fa8fa9114210cbc4e15b2f6f036d"
       image:
         description: "SGLang ROCm image override."
         required: false
@@ -70,7 +70,7 @@ permissions:
 
 env:
   SGLANG_REPOSITORY: sgl-project/sglang
-  SGLANG_REF_DEFAULT: main
+  SGLANG_REF_DEFAULT: 6174f1cad860fa8fa9114210cbc4e15b2f6f036d
   IMAGE_OVERRIDE_DEFAULT: "lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715"
   MODEL_PATH_DEFAULT: /data/models2/sgl-project/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
@@ -300,8 +300,10 @@ jobs:
 
           SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-mi355x-disagg"
           rm -rf "${SGLANG_WORKSPACE}"
-          git clone --depth 1 --branch "${SGLANG_REF}" \
+          git clone --filter=blob:none --no-checkout \
             "https://github.com/${SGLANG_REPOSITORY}.git" "${SGLANG_WORKSPACE}"
+          git -C "${SGLANG_WORKSPACE}" fetch --depth 1 origin "${SGLANG_REF}"
+          git -C "${SGLANG_WORKSPACE}" checkout --detach FETCH_HEAD
           test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/launch_mi355x.sh"
           test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml"
 
