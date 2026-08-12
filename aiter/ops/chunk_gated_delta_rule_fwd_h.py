@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -9,6 +10,10 @@ import triton
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from .triton._triton_kernels.gated_delta_rule.utils.prefill_metadata import (
+    GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
+)
 
 MD_NAME = "module_chunk_gdr_fwd_h"
 RCP_LN2 = 1.4426950408889634
@@ -76,18 +81,15 @@ def _select_bv(
     return bv
 
 
-def _select_bv_for_dense(
-    batch_size: int, seq_len: int, chunk_size: int, num_heads: int, device: torch.device
-) -> int:
-    nt = (seq_len + chunk_size - 1) // chunk_size
-    return _select_bv(device, num_heads, batch_size * nt, nt)
+def _get_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
+    """Return total and maximum per-sequence chunk counts.
 
-
-def _select_bv_for_varlen(chunk_offsets: torch.Tensor, num_heads: int) -> int:
+    Reading CUDA offsets requires one device-to-host transfer.
+    """
     offsets = chunk_offsets.tolist()
     total_chunks = offsets[-1]
     max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
-    return _select_bv(chunk_offsets.device, num_heads, total_chunks, max_seq_chunks)
+    return total_chunks, max_seq_chunks
 
 
 @compile_ops(MD_NAME, develop=True)
@@ -204,6 +206,10 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     state_dtype: Optional[torch.dtype] = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     HIP hidden-state forward with h layout [V, K].
@@ -217,6 +223,18 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     `g` is expected as a 3-D tensor in token-major [B, T, H] or
     head-major [B, H, T] layout according to `g_head_major`.
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
+    In varlen mode, pass ``prefill_metadata`` (preferred for reuse) or
+    ``seq_lens_cpu`` to avoid reading chunk scheduling values back from the GPU.
+
+    State handling:
+      * Dense (default): ``initial_state`` is ``[N, H, V, K]`` (``slot == i_n``)
+        and ``final_state`` is a freshly allocated ``[N, H, V, K]`` tensor.
+      * Indexed pool: pass ``initial_state`` as the pool ``[pool_size, H, V, K]``
+        plus ``initial_state_indices`` ``[N]`` (int32); each sequence's slot is
+        gathered from the index array.
+      * ``inplace_final_state`` (default: ``True`` when ``initial_state_indices``
+        is given) writes the final state back into ``initial_state`` in place and
+        returns that same buffer as ``final_state`` (no extra allocation).
     """
     if chunk_size != 64:
         raise ValueError("HIP kernel requires chunk_size=64.")
@@ -231,6 +249,16 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     T_flat = w.shape[2]
     is_varlen = cu_seqlens is not None
     NT = triton.cdiv(T, chunk_size)
+
+    if is_varlen and prefill_metadata is None and seq_lens_cpu is not None:
+        prefill_metadata = build_gated_delta_rule_prefill_metadata(
+            seq_lens_cpu,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+
     has_indices = initial_state_indices is not None
     inplace = has_indices if inplace_final_state is None else inplace_final_state
     if inplace and initial_state is None:
@@ -257,25 +285,51 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     if is_varlen:
         from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
             prepare_chunk_offsets,
+            prepare_rebased_cu_seqlens,
         )
 
         assert B == 1, "Varlen mode expects B=1 (flattened input)."
-        cu_seqlens_int32 = cu_seqlens.to(torch.int32)
-        chunk_offsets_int32 = prepare_chunk_offsets(
-            cu_seqlens_int32, chunk_size
-        ).to(torch.int32)
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T_flat,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                chunk_size,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            cu_seqlens_int32 = schedule.kernel_cu_seqlens
+            chunk_offsets_int32 = schedule.chunk_offsets
+            N = schedule.n_prefill
+            total_chunks = schedule.total_chunks
+            max_seq_chunks = schedule.max_seq_chunks
+        else:
+            cu_seqlens_int32 = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            ).to(torch.int32)
+            chunk_offsets_int32 = prepare_chunk_offsets(
+                cu_seqlens, chunk_size, num_decodes, num_decode_tokens
+            ).to(torch.int32)
+            N = len(cu_seqlens_int32) - 1
+            total_chunks, max_seq_chunks = _get_varlen_host_metadata(
+                chunk_offsets_int32
+            )
     else:
         cu_seqlens_int32 = torch.empty(0, device=k.device, dtype=torch.int32)
         chunk_offsets_int32 = torch.arange(
             0, (B + 1) * NT, NT, dtype=torch.int32, device=k.device
         )
+        N = B
+        total_chunks = B * NT
+        max_seq_chunks = NT
 
-    N = int(cu_seqlens_int32.numel() - 1) if is_varlen else B
     if selected_bv is None:
-        if is_varlen and N != 1:
-            selected_bv = _select_bv_for_varlen(chunk_offsets_int32, H)
-        else:
-            selected_bv = _select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
+        selected_bv = _select_bv(k.device, H, total_chunks, max_seq_chunks)
 
     if gk is not None:
         total_gk_tokens = T_flat if is_varlen else B * T_flat
@@ -292,9 +346,6 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     else:
         gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 
-    total_chunks = NT if is_varlen and N == 1 else (
-        int(chunk_offsets_int32[-1].item()) if is_varlen else B * NT
-    )
     h = torch.empty(
         (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
         device=k.device,
