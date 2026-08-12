@@ -579,24 +579,57 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
            down,
            stream,
            Family::DownBwd);
-    invoke(gfx950::dispatch_route_dx(selected_route_dx),
-           route_dx,
-           stream,
-           Family::RouteDx);
-    invoke(gfx950::dispatch_route_reduce(selected_route_reduce),
-           route_reduce,
-           stream,
-           Family::RouteReduce);
-    invoke(gfx950::dispatch_dw1(
-               select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
-           dw1,
-           stream,
-           Family::Dw1);
-    invoke(gfx950::dispatch_dw2(
-               select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
-           dw2,
-           stream,
-           Family::Dw2);
+    // K5 consumes K1's a_scaled stream and is otherwise independent of the
+    // dZ consumers.  For the bounded power-of-two D family, launch K5 while
+    // that intermediate is youngest in cache; K2 then refreshes dZ before K4
+    // consumes it.  Wider/non-power-of-two grids retain the legacy launch
+    // path verbatim, including selector placement and host launch spacing.
+    const int model_dim = dw1.model_dim;
+    const bool short_power_of_two_d =
+        model_dim >= 1024 && model_dim <= 2048 &&
+        (model_dim & (model_dim - 1)) == 0;
+    if(short_power_of_two_d)
+    {
+        invoke(gfx950::dispatch_dw2(
+                   select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+               dw2,
+               stream,
+               Family::Dw2);
+        invoke(gfx950::dispatch_route_dx(selected_route_dx),
+               route_dx,
+               stream,
+               Family::RouteDx);
+        invoke(gfx950::dispatch_route_reduce(selected_route_reduce),
+               route_reduce,
+               stream,
+               Family::RouteReduce);
+        invoke(gfx950::dispatch_dw1(
+                   select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
+               dw1,
+               stream,
+               Family::Dw1);
+    }
+    else
+    {
+        invoke(gfx950::dispatch_route_dx(selected_route_dx),
+               route_dx,
+               stream,
+               Family::RouteDx);
+        invoke(gfx950::dispatch_route_reduce(selected_route_reduce),
+               route_reduce,
+               stream,
+               Family::RouteReduce);
+        invoke(gfx950::dispatch_dw1(
+                   select_fixed_dw1_kernel_id(dw1, dw1_kernel_id)),
+               dw1,
+               stream,
+               Family::Dw1);
+        invoke(gfx950::dispatch_dw2(
+                   select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+               dw2,
+               stream,
+               Family::Dw2);
+    }
 }
 
 } // namespace detail
