@@ -150,22 +150,26 @@ def gen_cluster_tdm_splitk_ws_instance(
         if is_clusterlaunch
         else ""
     )
-    # Strict cluster-fill check emitted before the grid launch (the multicast mask
-    # names every WG of the cluster -> the grid must fill it exactly).
-    cluster_fill_check = ""
+    # Cluster round-up emitted before the grid launch: the runtime rejects a grid
+    # that is not a whole number of clusters. The surplus workgroups own no tile and
+    # return right after their one cluster-barrier arrival (tile_oob in the pipeline),
+    # so any (M, N) is launchable with any cluster dims -- no exact-fill assert.
+    cluster_grid_roundup = ""
+    grid_m_expr, grid_n_expr = "num_tiles_m", "num_tiles_n"
     if is_clusterlaunch:
-        cluster_fill_check = (
-            f"    // CLUSTER-LAUNCH: the multicast mask names EVERY WG of the "
-            f"{cwm}x{cwn} cluster,\n"
-            f"    // so ceil(M/B_M) and ceil(N/B_N) MUST be multiples of the "
-            f"cluster dims\n"
-            f"    // (no OOB tail WG, else the multicast + cluster barrier stalls).\n"
-            f"    AITER_CHECK(num_tiles_m % {cwm} == 0 && num_tiles_n % {cwn} == 0,\n"
-            f'        "gfx1250 clusterlaunch kid {cwm}x{cwn}: ceil(M/B_M)=", '
-            f"num_tiles_m,\n"
-            f'        " and ceil(N/B_N)=", num_tiles_n,\n'
-            f'        " must both fill the cluster (divisible by {cwm}/{cwn})");\n'
+        cluster_grid_roundup = (
+            f"    // CLUSTER-LAUNCH: the grid must be a whole number of "
+            f"{cwm}x{cwn} clusters, so\n"
+            f"    // round the tile counts up. The surplus workgroups have no tile and "
+            f"leave at\n"
+            f"    // the pipeline's tile_oob exit; the workspace strides below stay on "
+            f"the\n"
+            f"    // UNROUNDED counts, so the reduce kernel is unaffected by the "
+            f"padding.\n"
+            f"    int grid_tiles_m = (num_tiles_m + {cwm} - 1) / {cwm} * {cwm};\n"
+            f"    int grid_tiles_n = (num_tiles_n + {cwn} - 1) / {cwn} * {cwn};\n"
         )
+        grid_m_expr, grid_n_expr = "grid_tiles_m", "grid_tiles_n"
 
     # gfx1250-specific bias validation (does NOT use the shared BIAS_HOST_VALIDATE,
     # which forces bias.dtype == Y.dtype). The main kernel always writes an fp32
@@ -297,7 +301,7 @@ void
     auto stream = aiter::getCurrentHIPStream();
     void* ws_ptr_ = workspace.data_ptr();
 
-{cluster_fill_check}    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
+{cluster_grid_roundup}    dim3 grid_main({grid_m_expr}, {grid_n_expr}, split_k);
     dim3 block_main({k.BLOCK_SIZE});
 
     // VEC=8 -> each lane owns one dwordx4 of bf16 so the wave stores 512B fully

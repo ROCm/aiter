@@ -938,8 +938,9 @@ GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
 # (cluster_wg_m x cluster_wg_n x 1) workgroup CLUSTER: peers co-reside and share
 # A/B TDM loads via CLUSTER_LOAD_ASYNC multicast (named-barrier producer/consumer
 # handshake, same as the plain base). The host launcher rounds the grid up to the
-# cluster dims and asserts an exact cluster fill (no OOB tail WG). Distinct kid
-# band (20500+) so it never collides with the no-cluster base kids (20000..20087).
+# cluster dims; the workgroups that round-up adds own no tile and return at their
+# cluster-barrier arrival, so no shape needs an exact cluster fill. Distinct kid
+# band (20100+) so it never collides with the no-cluster base kids (20000..20099).
 def _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
     bm, bn, bk, layout, cwm, cwn, num_slots=3, wg_per_cu=2
 ):

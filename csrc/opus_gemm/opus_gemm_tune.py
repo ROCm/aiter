@@ -121,7 +121,14 @@ from aiter.utility.mp_tuner import mp_tuner
 
 # gfx1250 candidate-filter knobs (see _gfx1250_select_candidates).
 GFX1250_TOP_TILES = 8  # top-N tiles by grid-occupancy fit
-GFX1250_TOP_CLUSTERS = 3  # top-N cluster dims by |cwm*cwn - nearest(8,16)|
+GFX1250_MAX_CLUSTER_SIDE = 4  # sweep (cwm, cwn) over [1,4] x [1,4] minus (1,1)
+GFX1250_TOP_CLUSTERS = 6  # best-N cluster dims per tile (see the ranking below)
+# Round-up budget: a cluster dim may leave at most this share of the launched
+# workgroups tile-less (0.25 = at most one dead workgroup per three live ones).
+# Raise it to let looser-fitting clusters into the sweep, 0.0 to demand an exact
+# cluster fill.
+GFX1250_MAX_CLUSTER_WASTE = 0.25
+GFX1250_CLUSTER_WASTE_BUCKET = 0.05  # waste granularity the ranking distinguishes
 GFX1250_OCC_BETA_UNDER = 2.0  # under-occupancy penalty (idle CUs, linear loss)
 GFX1250_OCC_BETA_OVER = 1.0  # over-occupancy penalty (scheduling tail, sublinear)
 GFX1250_SPLITK_BIAS = 0.02  # tiny per-extra-split bias (splitk stays dynamic)
@@ -159,6 +166,10 @@ EVEN_LOOP_SPLITK_TAGS = frozenset(
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
+
+
+def _round_up(a: int, b: int) -> int:
+    return _ceil_div(a, b) * int(b)
 
 
 def _kid_uses_bf16_workspace(k_inst):
@@ -303,20 +314,87 @@ def _gfx1250_fuse_candidates(M, N, K, cu_num, top_tiles=GFX1250_TOP_TILES):
     return out
 
 
+def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
+    """Share of the launched workgroups that own no tile, in [0, 1).
+
+    The clusterlaunch launcher rounds the tile grid up to whole (cwm x cwn)
+    clusters; the surplus workgroups are dispatched, arrive at the cluster
+    barrier and leave at tile_oob without issuing a TDM. They are cheap
+    individually but they still occupy a cluster slot, and they shrink the
+    multicast group the survivors merge with, so the ratio is what the sweep
+    budgets on. split_k scales the launched grid and the tile count alike, so
+    the ratio does not depend on it.
+    """
+    launched = _round_up(gx, cwm) * _round_up(gy, cwn)
+    return (launched - gx * gy) / launched
+
+
+def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
+    """Rank the (cwm, cwn) worth benchmarking for a gx x gy tile grid.
+
+    ``avail`` maps (cwm, cwn) -> kid for one tile. Returns the selected dims,
+    best first, at most ``top_clusters`` of them (possibly none).
+
+    A cluster side wider than the grid it rides on is dropped outright: the
+    peers it would multicast to are exactly the workgroups that leave at
+    tile_oob, so it buys no extra sharing and only launches dead workgroups
+    (gx == 1 with cwm == 4 launches 4x the workgroups for a single M-tile
+    column). What is left must fit the GFX1250_MAX_CLUSTER_WASTE budget; if
+    nothing does, only the tightest-fitting dims stay, so a shape that cannot
+    fill any cluster still gets its least-wasteful candidate benchmarked.
+
+    Ranking is by waste first (bucketed, so a fit within a bucket does not
+    outrank a bigger multicast group over a rounding crumb), then by the size of
+    the multicast group, then by how well the cluster's aspect matches the tile
+    grid's. Measured on a 128x128x128 tile at K=1024..2048, cluster dims that
+    fill the grid exactly: a 12x12 grid runs 13.5 us at 1x2 and 10.7 us at 3x3, a
+    16x16 grid 27.6 us at 1x2 and 18.2 us at 4x4, so a wider cluster is worth
+    more than anything else here. Aspect breaks ties between equal-size dims and
+    is worth as much as a size step on a lopsided grid: on a 4x32 grid 2x4 runs
+    11.2 us against 13.3 us for 4x2, and 1x4 (11.4 us) beats both 2x2 (13.9 us)
+    and 4x1 (20.1 us).
+    """
+    feas = [
+        (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
+        for (cwm, cwn) in avail
+        if cwm <= gx and cwn <= gy
+    ]
+    if not feas:
+        return []
+    within = [f for f in feas if f[0] <= GFX1250_MAX_CLUSTER_WASTE]
+    if not within:
+        tightest = min(f[0] for f in feas)
+        within = [f for f in feas if f[0] <= tightest]
+    bucket = GFX1250_CLUSTER_WASTE_BUCKET
+    within.sort(
+        key=lambda f: (
+            f[0] if bucket <= 0 else int(f[0] / bucket),  # tile-less workgroups
+            -(f[1] * f[2]),  # widest multicast group
+            abs(f[1] * gy - f[2] * gx),  # 0 when cwm/cwn matches the grid aspect
+            (f[1], f[2]),  # keep the pick independent of the kid-table order
+        )
+    )
+    return [(cwm, cwn) for _w, cwm, cwn in within[:top_clusters]]
+
+
 def _gfx1250_select_candidates(
     M, N, K, cu_num, top_tiles=GFX1250_TOP_TILES, top_clusters=GFX1250_TOP_CLUSTERS
 ):
-    """gfx1250 candidate kid set for shape (M,N,K): top-N tiles x {plain + top-N
-    square cluster dims}.
+    """gfx1250 candidate kid set for shape (M,N,K): top-N tiles x {plain + cluster
+    dims}.
 
     1. Tile (top-8): score each plain tile by its best grid-occupancy fit over
        splitK in [1, min(16, k_steps)] (occ cost + tiny splitK bias). Smallest
        score wins; take top GFX1250_TOP_TILES.
     2. For each selected tile, always include its plain (P=3) kid.
-    3. Cluster (top-3): among cluster dims that satisfy cluster-fill for this
-       shape (ceil(M/B_M)%cwm==0 && ceil(N/B_N)%cwn==0), rank by
-       (|cwm*cwn - nearest(8,16)|, |cwm-cwn|) -- prefer products near 8/16 and
-       SQUARE clusters -- take top GFX1250_TOP_CLUSTERS clusterlaunch kids.
+    3. Cluster: any (cwm, cwn) in [1, GFX1250_MAX_CLUSTER_SIDE]^2 except (1,1) can
+       run this shape -- the clusterlaunch pipeline rounds the grid up to whole
+       clusters and the tile-less workgroups leave at their cluster barrier, so
+       cluster-fill divisibility is no longer a constraint. What the round-up costs
+       is workgroups, so the sweep is bounded by _gfx1250_cluster_dims_for_grid:
+       drop a cluster side wider than the grid it rides on, drop anything past the
+       GFX1250_MAX_CLUSTER_WASTE tile-less budget, then rank by (waste bucket,
+       widest multicast group, grid-aspect match) and keep top_clusters.
     """
 
     def _tile_score(bm, bn, bk):
@@ -329,11 +407,6 @@ def _gfx1250_select_candidates(
             best = c if best is None else min(best, c)
         return best if best is not None else float("inf")
 
-    # prev_m = lower edge of the runtime reuse bucket (prev_m, M]; a winner tuned at M
-    # is reused down to prev_m, so an M-cluster must stay full across that whole bucket.
-    # Computed directly as M // 2.
-    prev_m = max(1, M // 2)
-
     tiles = sorted(GFX1250_PLAIN_KID_OF.keys(), key=lambda t: _tile_score(*t))
     sel = set()
     for t in tiles[:top_tiles]:
@@ -341,46 +414,17 @@ def _gfx1250_select_candidates(
         bm, bn, _bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
-        # M-direction cluster (cwm) admission. A clusterlaunch kid groups cwm
-        # workgroups along M (spanning cwm*B_M rows) and the host rounds the M grid up
-        # to a multiple of cwm; a winner tuned at M is reused for the whole bucket
-        # (prev_m, M], so it must stay FULL (every cluster WG fed) for every M in that
-        # bucket -- otherwise the round-up idles half a cluster for the smaller M. Two
-        # reject rules:
-        #   1) cwm >= 3 -- dropped entirely (over-rounds the M grid badly).
-        #   2) M > 128 -- prohibit M-direction clusters (cwm>=2) entirely. For larger M
-        #      the runtime reuse bucket is wide and many c2x1 configs leave half a
-        #      cluster idle/unlaunched across it; only cwm==1 (no M-cluster) is allowed.
-        #   3) Not full across (prev_m, M]: ceil(m/B_M) must be the SAME multiple-of-cwm
-        #      value for every m in (prev_m, M]. Two consecutive tile-counts can never
-        #      both be multiples of cwm>=2, so this collapses to a single tile-count:
-        #          ceil((prev_m+1)/B_M) == ceil(M/B_M)  (== gx)
-        #      combined with gx % cwm == 0 below. cwm==1 (no M-cluster) is exempt.
-        # 2D-cluster lockout: only DEGENERATE clusters (cwm==1 or cwn==1) are tuned.
-        # Full 2D clusters (cwm>1 && cwn>1) GPU-hang at runtime on gfx1250 (verified
-        # c4x2 / c2x4 / c4x4 / c2x2 at M=128 N=128 K=2880), and the hang is NOT fixed
-        # by any cluster-barrier sync variant (wave0/all-waves wait, +/- trailing
-        # barrier) -- it is a deeper strided-A multicast issue. Keep 2D out of the
-        # sweep until that is root-caused. (Re-enable by dropping this clause.)
-        feas = [
-            (cwm, cwn, kid)
+        # The kid table also carries cwn==5 dims (TDM multicast fans out to 5 WGs);
+        # they are left out of the sweep by the [1, MAX_CLUSTER_SIDE]^2 bound.
+        avail = {
+            (cwm, cwn): kid
             for (tbm, tbn, tbk, cwm, cwn), kid in GFX1250_CLUSTERLAUNCH_KID_OF.items()
             if (tbm, tbn, tbk) == t
-            and gx % cwm == 0
-            and gy % cwn == 0
-            and cwm <= 2
-            and (cwm == 1 or M <= 128)
-            and (cwm == 1 or _ceil_div(prev_m + 1, bm) == gx)
-            and (cwm == 1 or cwn == 1)
-        ]
-        feas.sort(
-            key=lambda x: (
-                min(abs(x[0] * x[1] - 8), abs(x[0] * x[1] - 16)),  # near 8/16
-                abs(x[0] - x[1]),  # prefer square
-            )
-        )
-        for cwm, cwn, kid in feas[:top_clusters]:
-            sel.add(kid)
+            and cwm <= GFX1250_MAX_CLUSTER_SIDE
+            and cwn <= GFX1250_MAX_CLUSTER_SIDE
+        }
+        for dims in _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
+            sel.add(avail[dims])
 
     # FUSED single-kernel split-K kids: bounded per-shape selection (top-N fuse
     # tiles x occupancy-fit split_k x {baseline, max A-multicast n_cluster} x ws),
@@ -390,10 +434,6 @@ def _gfx1250_select_candidates(
     # compile set to the 496 non-fuse kids (the fuse family adds ~1.4k more).
     if os.environ.get("OPUS_TUNE_NO_FUSE") != "1":
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
-    # clusterlaunch_tdm_splitk_ws kids are RE-ENABLED: the feasibility filter
-    # above (cwm<=2, degenerate-only cwm==1|cwn==1 2D lockout, exact cluster
-    # fill) already keeps the sweep to the hang-free subset. (Previously the
-    # whole family was excluded here during hang bring-up.)
     return frozenset(sel)
 
 
@@ -642,22 +682,13 @@ def kid_rejects_shape(k_inst, M, N, K):
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
-        if 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES:  # batch=1 in tune path
-            return True
-        # Cluster-launch multicast names EVERY WG of the (cwm x cwn) cluster, so
-        # ceil(M/B_M) and ceil(N/B_N) MUST be exact multiples -- an OOB tail WG
-        # would still be named in its peers' multicast mask and stall/fault the
-        # cluster barrier. The candidate filter enforces this, but guard here too
-        # (kid may be forced via explicit id).
-        if (
-            _ceil_div(M, k_inst.B_M) % k_inst.cluster_wg_m != 0
-            or _ceil_div(N, k_inst.B_N) % k_inst.cluster_wg_n != 0
-        ):
-            return True
-        # 2D-cluster lockout (see candidate_kids_for_shape): 2D clusters (cwm>1 &&
-        # cwn>1) GPU-hang at runtime and no barrier-sync variant fixes it. Reject
-        # here too so an explicit-id / heuristic path can never launch a hanging kid.
-        # Override with OPUS_ALLOW_2D=1 for isolated root-cause probing only.
+        # No cluster-fill constraint: the launcher rounds the tile grid up to whole
+        # (cwm x cwn) clusters and a workgroup the round-up added returns at its
+        # cluster-barrier arrival, before issuing any TDM. Ragged M/N therefore run on
+        # any cluster dims, as does a shape whose whole grid is smaller than one
+        # cluster. 2D clusters (cwm>1 && cwn>1) are no longer locked out either: what
+        # they used to hang on was the tile-less workgroup streaming ZERO-EXTENT
+        # multicast loads at peers whose extents were real.
         # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used
         # to fault at runtime, but the root cause was a clang<=22 (HIP<=7.2)
         # codegen bug in the bounded-buffer C-store address lowering (it sank the
@@ -665,11 +696,8 @@ def kid_rejects_shape(k_inst, M, N, K):
         # bits). That is now worked around in opus.hpp::gmem::_store (inline-asm
         # voffset barrier, auto-gated to __clang_major__<=22), so large clusterlaunch
         # tiles are safe to tune again. No tile-area cap here.
-        return (
-            k_inst.cluster_wg_m > 1
-            and k_inst.cluster_wg_n > 1
-            and os.environ.get("OPUS_ALLOW_2D") != "1"
-        )
+        # batch=1 in tune path
+        return 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES
 
     # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
     # (both full and last) even AND >=2.
