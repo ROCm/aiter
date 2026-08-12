@@ -221,11 +221,13 @@ _TUNE_POLICY = {
 # rows), and sweeping four factors over 27 more kids is the bulk of the tuning time.
 # A plain kid that wins a cell at splitK>1 is therefore still a cell the preshuffled
 # pool cannot answer; widen this if one ever appears.
-_TUNE_POLICY.update({
-    twin: [1]
-    for plain, twin in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
-    if plain in _TUNE_POLICY
-})
+_TUNE_POLICY.update(
+    {
+        twin: [1]
+        for plain, twin in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
+        if plain in _TUNE_POLICY
+    }
+)
 
 # Deliberately not candidates: kid208 (mpack_sfa) and kid210/213/214/215/216/217
 # (shuffle_scale) need A's scale panel, and for the shuffle_scale kids B's too, relaid out by

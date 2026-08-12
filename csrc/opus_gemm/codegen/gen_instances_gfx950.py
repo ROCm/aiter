@@ -1890,7 +1890,9 @@ __global__ void opus_bmm_splitk_reduce_kernel(
         .replace("@@DIRECT@@", "true" if k.direct_only else "false")
         .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
         .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
-        .replace("@@PANEL@@", "true" if (k.preload_sf and not k.shuffle_scale) else "false")
+        .replace(
+            "@@PANEL@@", "true" if (k.preload_sf and not k.shuffle_scale) else "false"
+        )
         .replace("@@SFMPACK@@", sfmpack)
     )
 
