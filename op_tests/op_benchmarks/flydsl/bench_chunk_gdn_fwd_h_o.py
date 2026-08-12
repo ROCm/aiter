@@ -111,14 +111,14 @@ _IMPL_KEYS = (
     "K5K6_flydsl_fused",
 )
 
-# Fused K5+K6 kernel variants (BV = V-tile width). ``auto`` defers to the
-# kernel's shape-adaptive BV selection (the historical single-row behaviour).
-# All of {bv16, bv32, bv64} are supported (Phase 2 enabled bv64 by aliasing
-# lds_A onto lds_h). These variants apply ONLY to K5K6_flydsl_fused -- the
-# separate paths are not variant-parametrized here.
+# Fused K5+K6 kernel variants. ``auto`` defers to the kernel's shape-adaptive
+# BV/wave selection. {bv16, bv32, bv64} set the V-tile width (Phase 2 enabled
+# bv64 by aliasing lds_A onto lds_h); ``bv64w8`` additionally wave-widens
+# (num_waves=8 -> NR_SPLIT=2), splitting b_A across the V-split waves. These
+# apply ONLY to K5K6_flydsl_fused -- the separate paths are not parametrized.
 FUSED_PREFIX = "K5K6_flydsl_fused"
 AUTO_VARIANT = "auto"
-FUSED_VARIANTS = ("bv16", "bv32", "bv64")
+FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8")
 
 
 def _fused_auto_variant_for_shape(shape, cu) -> str | None:
@@ -135,11 +135,13 @@ def _fused_auto_variant_for_shape(shape, cu) -> str | None:
             _fused_bv_for_shape,
         )
 
-        bv = _fused_bv_for_shape(
+        bv, num_waves = _fused_bv_for_shape(
             H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
             is_varlen=cu is not None, gate=gate, variant=None,
         )
-        return f"bv{bv}"
+        # Render as the variant tag it corresponds to: bvNN, or bvNNw<waves>
+        # for the wave-widened pick (num_waves > the default 4).
+        return f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
     except Exception:
         return None
 

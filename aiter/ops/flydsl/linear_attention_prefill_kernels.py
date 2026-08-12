@@ -706,14 +706,20 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 _compiled_fused_kernels: dict = {}
 
 
-def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
-    """BV for the fused kernel (NR_SPLIT==1; wave-widened variants deferred).
+# Fused wave-widening: auto uses num_waves=8 (NR_SPLIT=2) when it selects BV=64
+# AND the bv64 grid fills the device well enough that the extra resident waves
+# have room to help.
+_FUSED_W8_MIN_FILL = 0.55
 
-    Phase 2 (Lever 2) enabled BV=64: the kernel aliases ``lds_A`` onto the dead
-    ``lds_h`` region, so all three of {16, 32, 64} now fit the 64 KiB LDS budget
-    at K=128. The K5 tuned table (which can emit ``bv64w8``) is still bypassed --
-    the fused kernel has no wave-widened path yet. An explicit ``variant`` is
-    honoured; otherwise the largest legal BV whose grid clears the fill bar wins.
+
+def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
+    """Return ``(BV, num_waves)`` for the fused kernel.
+
+    An explicit ``variant`` is honoured (incl. ``bv64w8``); 
+    otherwise the largest legal BV whose grid clears
+    the fill bar is chosen, with num_waves=8 when that BV is 64 and the grid is
+    high-fill. Wave-widening needs BT/16 (=4) divisible by NR_SPLIT and
+    N_REPEAT=BV/16 divisible by NR_SPLIT, so it only applies at BV=64 here.
     """
     _FUSED_MAX_BV = 64
     legal = sorted(
@@ -724,17 +730,33 @@ def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
             f"fused GDN K5+K6: no legal BV <= {_FUSED_MAX_BV} for V={V}."
         )
     if variant is not None:
-        bv = _bv_of_variant(variant)
+        bv, num_waves = _bv_waves_of_variant(variant)
         if bv not in legal:
             raise ValueError(
                 f"fused GDN K5+K6 variant {variant!r} illegal for V={V}; "
                 f"legal: {[f'bv{b}' for b in legal]}"
             )
-        return bv
-    target = _select_bv_for_grid(
-        H=H, V=V, N=N, target_ctas=int(_GFX942_MIN_FILL * _device_cu_count())
+        # NR_SPLIT = num_waves / (BT//16); the kernel asserts it divides
+        # N_REPEAT=BV/16 and BT//16, so w8 is only legal at BV=64.
+        # The fused kernel's b_A key-split needs N_REPEAT>=NR_SPLIT.
+        if num_waves > 4 and bv < 64:
+            raise NotImplementedError(
+                f"fused GDN K5+K6 variant {variant!r}: wave-widening is only "
+                f"supported at BV=64 (needs N_REPEAT >= NR_SPLIT); use bv64w8."
+            )
+        return bv, num_waves
+    bv = min(
+        _select_bv_for_grid(
+            H=H, V=V, N=N, target_ctas=int(_GFX942_MIN_FILL * _device_cu_count())
+        ),
+        _FUSED_MAX_BV,
     )
-    return min(target, _FUSED_MAX_BV)
+    num_waves = 4
+    if bv == 64:
+        fill64 = _grid_ctas(H=H, V=V, N=N, BV=64) / _device_cu_count()
+        if fill64 >= _FUSED_W8_MIN_FILL:
+            num_waves = 8
+    return bv, num_waves
 
 
 def _run_fused_gfx942(
@@ -839,14 +861,15 @@ def _run_fused_gfx942(
     )
     stream = torch.cuda.current_stream()
 
-    BV = _fused_bv_for_shape(
+    BV, num_waves = _fused_bv_for_shape(
         H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
         gate=_gate_of(use_g, use_gk), variant=variant,
     )
+    NR_SPLIT = num_waves // (BT // 16)
 
     cache_key = (
         K, V, BT, BV, H, Hg, float(scale), use_g, use_gk, use_h0,
-        output_final_state, is_varlen, state_bf16, g_log2_scaled,
+        output_final_state, is_varlen, state_bf16, g_log2_scaled, NR_SPLIT,
     )
     if cache_key not in _compiled_fused_kernels:
         _compiled_fused_kernels[cache_key] = compile_chunk_gated_delta_h_o_gfx942(
@@ -854,7 +877,7 @@ def _run_fused_gfx942(
             USE_G=use_g, USE_GK=use_gk, USE_INITIAL_STATE=use_h0,
             STORE_FINAL_STATE=output_final_state, IS_VARLEN=is_varlen,
             WU_CONTIGUOUS=True, STATE_DTYPE_BF16=state_bf16,
-            G_IS_LOG2_SCALED=g_log2_scaled, NR_SPLIT=1,
+            G_IS_LOG2_SCALED=g_log2_scaled, NR_SPLIT=NR_SPLIT,
         )
     launch_fn = _compiled_fused_kernels[cache_key]
 

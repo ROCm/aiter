@@ -135,15 +135,15 @@ def _reference_o(inp, *, scale, use_exp2):
 # --------------------------------------------------------------------------- #
 # Unit test: fused wrapper vs reference
 # --------------------------------------------------------------------------- #
-# BV in {16, 32, 64} are all supported (Phase 2 Lever 2 enabled bv64 by aliasing
-# lds_A onto the dead lds_h region). ``None`` exercises the auto BV heuristic.
+# BV in {16, 32, 64} plus the wave-widened bv64w8 (NR_SPLIT=2, splits b_A across
+# the V-split waves) are all supported. ``None`` exercises the auto heuristic.
 @pytest.mark.parametrize("gate", ["g", "gk"])
 @pytest.mark.parametrize(
     "H,Hg",
     [(12, 12), (24, 24), (4, 2)],  # MHA (KDA), MHA (KDA TP4), GQA (GDN)
 )
 @pytest.mark.parametrize("seq_lens", [[512], [512, 512], [640, 384, 512]])
-@pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", None])
+@pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", "bv64w8", None])
 def test_fused_unit(gate, H, Hg, seq_lens, variant):
     """Fused wrapper output matches pure-PyTorch K5 ref + Triton K6."""
     K = V = 128

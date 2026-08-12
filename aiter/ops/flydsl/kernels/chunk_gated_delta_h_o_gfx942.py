@@ -81,10 +81,6 @@ def compile_chunk_gated_delta_h_o_gfx942(
     assert BV <= 64, (
         f"gfx942 LDS budget caps BV at 64 (got BV={BV})."
     )
-    assert NR_SPLIT == 1, (
-        f"the fused K5+K6 kernel supports only NR_SPLIT==1 in Phase 1 "
-        f"(got NR_SPLIT={NR_SPLIT}); wave-widened variants are deferred."
-    )
     NUM_K_BLOCKS = K // 64
 
     GRID_V = (V + BV - 1) // BV
@@ -97,10 +93,29 @@ def compile_chunk_gated_delta_h_o_gfx942(
     WMMA_K = 16
     N_REPEAT = BV // WMMA_N
 
+    # -- Wave decomposition (NR_SPLIT: the wave-widening axis) --
+    # wid_m owns a BT tile (GEMM1) / K tile (GEMM2); wid_n owns a slice of the
+    # N_REPEAT (V) axis. NR_SPLIT=1 is the plain 4-wave kernel.
     M_WAVES = BT // 16
-    N_REPEAT_LOCAL = N_REPEAT  # NR_SPLIT == 1
-    NUM_WARPS = M_WAVES
+    assert N_REPEAT % NR_SPLIT == 0, (
+        f"NR_SPLIT={NR_SPLIT} must divide N_REPEAT={N_REPEAT} (=BV/16); "
+        f"BV={BV} supports NR_SPLIT in "
+        f"{[s for s in (1, 2, 4, 8) if N_REPEAT % s == 0]}"
+    )
+    N_REPEAT_LOCAL = N_REPEAT // NR_SPLIT
+    NUM_WARPS = M_WAVES * NR_SPLIT
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
+    assert BLOCK_THREADS <= 1024, (
+        f"BLOCK_THREADS={BLOCK_THREADS} exceeds the gfx942 workgroup limit; "
+        f"reduce NR_SPLIT."
+    )
+    # b_A (GEMM4a) is split across the wid_n waves by key-column tile; each wave
+    # writes BT_STEPS_LOCAL of the BT // WMMA_K key-tiles into the shared lds_A.
+    assert (BT // WMMA_K) % NR_SPLIT == 0, (
+        f"NR_SPLIT={NR_SPLIT} must divide BT_STEPS={BT // WMMA_K} to split b_A "
+        f"across the V-split waves"
+    )
+    BT_STEPS_LOCAL = (BT // WMMA_K) // NR_SPLIT
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
 
     # -- Loop-carried gate/u prefetch (as in K5) --
@@ -242,10 +257,20 @@ def compile_chunk_gated_delta_h_o_gfx942(
         wid = tid // fx.Int32(WARP_SIZE)
         lane = tid % fx.Int32(WARP_SIZE)
 
-        wid_m = wid  # NR_SPLIT == 1
+        # Wave split. 
+        #   wid_m: BT tile (GEMM1) / K tile (GEMM2)
+        #   wid_n: this wave's slice of the N_REPEAT (V) axis and of b_A's key-col tiles.
+        if const_expr(NR_SPLIT == 1):
+            wid_m = wid
+        else:
+            wid_m = wid % fx.Int32(M_WAVES)
+        wid_n = wid // fx.Int32(M_WAVES)
 
         def _nr_v(nr_local):
-            return fx.Int32(nr_local * 16)
+            """V-offset (elements) of this wave's local V tile ``nr_local``."""
+            if const_expr(NR_SPLIT == 1):
+                return fx.Int32(nr_local * 16)
+            return wid_n * fx.Int32(N_REPEAT_LOCAL * 16) + fx.Int32(nr_local * 16)
 
         q_ = GTensor(q_tensor, dtype=T.bf16, shape=(-1,))
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
@@ -754,8 +779,13 @@ def compile_chunk_gated_delta_h_o_gfx942(
             # A[i,j] = sum_k q[i,k]*k[j,k]. MFMA m=i (query row), n=j (key row),
             # contraction=k. A-op = q[i,k] (lds_q); B-op element e = k[j=lane_n,
             # k=kb*64+ks*16+lane_m_base*4+e]. lds_kt is [K,BT] (BT contiguous),
-            # so the 4 contraction elems are one row apart -> 4 scalar reads
-            # (Lever 3 target).
+            # so the 4 contraction elems are one row apart -> 4 scalar reads.
+            #
+            # Wave split (NR_SPLIT>1): b_A is V-independent, so instead of every
+            # wid_n wave recomputing all of A, each wid_n owns BT_STEPS_LOCAL of
+            # the BT_STEPS key-column tiles and writes its slice to the shared
+            # lds_A. Together the M_WAVES x NR_SPLIT waves fill all of A with no
+            # redundant compute; a barrier (below) precedes GEMM4b's full read.
             def _kt_scalar(k_row, bt):
                 bt_g = bt // fx.Int32(4)
                 bt_e = bt % fx.Int32(4)
@@ -764,9 +794,17 @@ def compile_chunk_gated_delta_h_o_gfx942(
                     result_type=T.bf16,
                 )
 
-            for bt_n in range_constexpr(BT_STEPS):
+            for bt_l in range_constexpr(BT_STEPS_LOCAL):
                 a_acc = fx.full(4, 0.0, fx.Float32)
-                bt_col = fx.Int32(bt_n * 16) + lane_n  # n = key row j
+                # runtime key-tile index for this wave (compile-time when
+                # NR_SPLIT==1, since wid_n is then identically 0).
+                if const_expr(NR_SPLIT == 1):
+                    bt_base = fx.Int32(bt_l * 16)
+                else:
+                    bt_base = (
+                        wid_n * fx.Int32(BT_STEPS_LOCAL * 16) + fx.Int32(bt_l * 16)
+                    )
+                bt_col = bt_base + lane_n  # n = key row j
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for ks in range_constexpr(K_STEPS_PER_BLOCK):
                         q_row = wid_m * fx.Int32(16) + lane_n
@@ -791,7 +829,7 @@ def compile_chunk_gated_delta_h_o_gfx942(
 
                 # gate (USE_G only) + causal mask, then store this tile to lds_A.
                 # acc element e is the query ROW i = wid_m*16+lane_m_base*4+e;
-                # column j = bt_n*16+lane_n is fixed per lane.
+                # column j = bt_col is fixed per lane.
                 col_abs = i_t_i32 * fx.Int32(BT) + bt_col
                 if const_expr(USE_G):
                     col_safe = (col_abs < T_local).select(col_abs, fx.Int32(0))
