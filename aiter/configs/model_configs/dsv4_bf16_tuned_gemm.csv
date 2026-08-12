@@ -968,6 +968,7 @@ gfx950,256,24,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,
 gfx950,256,32,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,287.5865,native,0.0,206.22,6474.89
 gfx950,256,48,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,293.3402,native,0.0,303.27,6362.77
 gfx950,256,64,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,293.6027,native,0.0,404.0,6371.96
+gfx950,256,80,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,304.732,native,0.0,486.55,6153.57
 gfx950,256,96,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,301.0177,native,0.0,591.07,6244.01
 gfx950,256,128,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,6401,0,329.3656,opus_gemm_mono_tile_512x128x256x64_2x4_16x16x32_0x0x0_nooob_4g_safe,0.0,720.26,5733.11
 gfx950,256,256,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,404.1535,native,0.0,1173.96,4758.64
