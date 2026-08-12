@@ -1578,6 +1578,7 @@ def _mxfp4_a4w4_stage1(
     device,
     use_nt=False,
     interleave=False,
+    num_waves=4,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -1673,6 +1674,7 @@ def _mxfp4_a4w4_stage1(
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
         bias=bias1,
+        num_waves=num_waves,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1907,6 +1909,7 @@ def _mxfp4_a4w4_stage1_fw(
         device=device,
         use_nt=p1["use_nt"],
         interleave=p1["interleave"] or interleave,
+        num_waves=p1.get("num_waves", 4),
     )
     return inter_sorted_quant, inter_sorted_scale
 
@@ -2602,6 +2605,7 @@ def get_2stage_cfgs(
                     interleave=interleave,
                     kSplitK=p1["kSplitK"],
                     xcd_swizzle=p1["xcd_swizzle"],
+                    num_waves=p1.get("num_waves", 4),
                 )
             else:
                 replacement = _select_mxfp4_g1_kernel(

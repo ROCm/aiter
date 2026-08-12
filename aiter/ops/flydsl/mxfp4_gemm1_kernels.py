@@ -3,6 +3,7 @@
 
 
 import functools
+import os
 
 import torch
 
@@ -58,6 +59,9 @@ def _get_compiled_mxfp4_gemm1_port(
     swiglu_limit=7.0,
     enable_bias=False,
     v2_output_layout=True,
+    wide_mfma=False,
+    wide_accumulators=1,
+    num_waves=4,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -81,6 +85,9 @@ def _get_compiled_mxfp4_gemm1_port(
         swiglu_limit=swiglu_limit,
         enable_bias=enable_bias,
         v2_output_layout=v2_output_layout,
+        wide_mfma=wide_mfma,
+        wide_accumulators=wide_accumulators,
+        num_waves=num_waves,
     )
 
 
@@ -101,6 +108,8 @@ def _assert_supported(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
+    interleave=False,
+    num_waves=4,
 ):
     if a_dtype not in _SUPPORTED_BY_DTYPE:
         raise NotImplementedError(
@@ -139,9 +148,29 @@ def _assert_supported(
             f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "
             f"got D_INTER={D_INTER}"
         )
-    if BN not in (128, 256):
+    if BN not in (64, 128, 256):
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 requires BN in (128, 256), got {BN}"
+            f"flydsl mxfp4 gemm1 requires BN in (64, 128, 256), got {BN}"
+        )
+    if BN == 64 and not (
+        BM == 32
+        and a_dtype == "fp4"
+        and out_dtype == "fp4"
+        and not inline_quant
+        and not interleave
+        and act == "situv2"
+    ):
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 BN64 is restricted to "
+            "BM32 A4W4 non-inline separated SiTUv2"
+        )
+    if num_waves not in (2, 4):
+        raise NotImplementedError(
+            f"flydsl mxfp4 GEMM1 requires num_waves in (2, 4), got {num_waves}"
+        )
+    if num_waves == 2 and BN != 64:
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 two-wave specialization requires effective BN64"
         )
     if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
         raise NotImplementedError(
@@ -185,8 +214,18 @@ def flydsl_mxfp4_gemm1(
     swiglu_limit=7.0,
     bias=None,
     stream=None,
+    wide_mfma=None,
+    wide_accumulators=1,
+    num_waves=4,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
+    if wide_mfma is None:
+        wide_mode = int(os.environ.get("AITER_MXFP4_G1_WIDE", "0"))
+        if wide_mode not in (0, 1, 2):
+            raise ValueError(f"AITER_MXFP4_G1_WIDE must be 0, 1, or 2, got {wide_mode}")
+        wide_mfma = wide_mode != 0
+        if wide_mfma:
+            wide_accumulators = wide_mode
     use_nt = _effective_use_nt(
         n_tokens=n_tokens,
         topk=topk,
@@ -211,6 +250,8 @@ def flydsl_mxfp4_gemm1(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
+        interleave=interleave,
+        num_waves=num_waves,
     )
     if not v2_output_layout and sorted_token_ids is None:
         raise ValueError(
@@ -238,6 +279,9 @@ def flydsl_mxfp4_gemm1(
         swiglu_limit,
         bias is not None,
         v2_output_layout,
+        wide_mfma,
+        wide_accumulators,
+        num_waves,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     if BM == 16:
