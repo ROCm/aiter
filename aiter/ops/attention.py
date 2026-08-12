@@ -1009,6 +1009,10 @@ def get_ps_metadata_info_v1(
     kvlen_granularity: int = 128,
 ):
     """
+    Note: If running with FULL graphs, max_kvlen must be static (a fixed upper
+    bound on kv length, e.g. from max model/context length), not the per-step
+    runtime kv max, so the returned buffer sizes stay constant across replays.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -1028,7 +1032,8 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
     # Causal case: set max_kvlen to None. Then it falls back to max_qlen, since
     #   the context is always <= the max query len.
-    # Non-causal case: set max_kvlen to the true KV length
+    # Non-causal case: set max_kvlen to a static upper bound on kv length (see
+    #   docstring; must be static under FULL graphs, not the per-step runtime max).
     effective_max_kvlen = max_kvlen if max_kvlen is not None else max_qlen
     max_kv_split_per_qtile = max(1, math.ceil(effective_max_kvlen / kvlen_granularity))
 
