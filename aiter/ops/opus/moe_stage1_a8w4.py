@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from ...jit.core import compile_ops
+from ..enum import ActivationType
 
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
 
@@ -47,10 +48,14 @@ def _opus_moe_stage1_a8w4_fwd_raw(
     num_valid_ids: Tensor,
     out: Tensor,
     out_scale: Tensor,
+    topk: int,
     block_m: int,
     kernelName: str,
     inter_dim_pad: int,
+    activation: int,
     swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> Tensor: ...
 
 
@@ -88,17 +93,37 @@ def opus_moe_stage1_a8w4_fwd(
     inter_dim_pad: int,
     block_m: int,
     kernelName: str,
+    activation: int = ActivationType.Silu.value,
     bias: Tensor | None = None,
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
+    output_sorted: bool = False,
     swiglu_limit: float | None = None,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ) -> tuple[Tensor, Tensor]:
     block_m = int(block_m)
     kernelName = str(kernelName)
+    activation = int(getattr(activation, "value", activation))
+    if swiglu_limit is None:
+        swiglu_limit = (
+            7.0 if activation == ActivationType.Swiglu.value else float("inf")
+        )
     inter_dim = int(w1.shape[1]) // 2
     if out is None:
+        out_shape = (
+            (
+                max(
+                    int(sorted_token_ids.numel()),
+                    int(sorted_expert_ids.numel()) * block_m,
+                ),
+                inter_dim,
+            )
+            if output_sorted
+            else (hidden_states.shape[0], int(topk), inter_dim)
+        )
         out = torch.empty(
-            (hidden_states.shape[0], int(topk), inter_dim),
+            out_shape,
             dtype=torch.float8_e4m3fn,
             device=hidden_states.device,
         )
@@ -121,10 +146,14 @@ def opus_moe_stage1_a8w4_fwd(
         _contiguous(num_valid_ids),
         _contiguous(out),
         _contiguous(out_scale),
+        int(topk),
         int(block_m),
         kernelName,
         int(inter_dim_pad),
-        float(swiglu_limit) if swiglu_limit else float("inf"),
+        activation,
+        float(swiglu_limit),
+        float(situ_beta),
+        float(situ_linear_beta),
     )
     return out, out_scale
 

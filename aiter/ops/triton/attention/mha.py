@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Literal
 
 import torch
@@ -45,6 +46,33 @@ def mha_set_use_int64_strides(value: bool):
     """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
+
+
+_MHA_SWIZZLE_VALUES = ("default", "spatial")
+
+_env_swizzle = os.environ.get("AITER_TRITON_MHA_SWIZZLE", "default")
+if _env_swizzle not in _MHA_SWIZZLE_VALUES:
+    raise ValueError(
+        f"Invalid AITER_TRITON_MHA_SWIZZLE value: {_env_swizzle!r}. "
+        f"Must be one of {_MHA_SWIZZLE_VALUES}."
+    )
+_MHA_SWIZZLE: Literal["default", "spatial"] = _env_swizzle
+del _env_swizzle
+
+
+def mha_set_swizzle(value: Literal["default", "spatial"]):
+    """Set MHA workgroup swizzle mode.
+
+    Args:
+        value: ``"default"`` preserves the existing remap_xcd behaviour.
+               ``"spatial"`` enables XCD-aware KV-head mapping for MHA and GQA.
+    """
+    if value not in _MHA_SWIZZLE_VALUES:
+        raise ValueError(
+            f"Invalid swizzle value: {value!r}. Must be one of {_MHA_SWIZZLE_VALUES}."
+        )
+    global _MHA_SWIZZLE
+    _MHA_SWIZZLE = value
 
 
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
@@ -243,7 +271,9 @@ def _flash_attn_forward(
             ), f"dao_ai softmax_lse shape {softmax_lse.shape} != expected (batch={batch}, nheads={num_q_heads}, ...)"
     else:
         if config is None:
-            config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
+            config = _get_config(
+                enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
+            )
 
         grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
@@ -299,6 +329,7 @@ def _flash_attn_forward(
             VARLEN=is_varlen,
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
+            SWIZZLE=_MHA_SWIZZLE,
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,

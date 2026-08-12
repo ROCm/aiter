@@ -30,7 +30,11 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    block_base_bytes_i64,
+    emit_group_fp8_nm_asm_scatter,
+    state_slot_byte_offset,
+)
 from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
@@ -208,9 +212,16 @@ def _build_compress_forward_kernel(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -329,15 +340,12 @@ def _build_compress_forward_kernel(
                 is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
                 s_safe = arith.select(is_pad, c_zero_i32, s)
                 ring = arith.remui(s_safe, c_state_size)
+                # Slot term already folded into the descriptor base.
                 base_kv_off = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
-                    + col_off_base
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride) + col_off_base
                 )
                 base_sc_off = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
-                    + col_off_base
+                    ArithValue(ring) * ArithValue(score_state_pos_stride) + col_off_base
                 )
                 kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
                 sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
@@ -900,17 +908,21 @@ def _build_norm_rope_scatter_kernel(
             physical_block = buffer_ops.buffer_load(
                 bt_rsrc, bt_off, vec_width=1, dtype=i32
             )
-            cache_base = ArithValue(physical_block) * ArithValue(
-                kv_cache_block_stride
-            ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-            out_rsrc = buffer_ops.create_buffer_resource(kv_cache, max_size=True)
+            # The block term rides on the descriptor's base, not on the
+            # 32-bit offset -- see `block_base_bytes_i64`.
+            cache_base = ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+            out_rsrc = buffer_ops.create_buffer_resource(
+                kv_cache,
+                max_size=True,
+                base_byte_offset=block_base_bytes_i64(
+                    physical_block, kv_cache_block_stride, 1 if quant else 2
+                ),
+            )
 
             if const_expr(quant):
                 # -- group_fp8 (V4 nm-asm) via shared emitter (wave32; same layout
                 # as wave64 CSA/HCA -- single source of truth). --
-                _krope_base = ArithValue(physical_block) * ArithValue(
-                    krope_block_stride
-                ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                _krope_base = ArithValue(slot_in_block) * ArithValue(krope_token_stride)
                 emit_group_fp8_nm_asm_scatter(
                     normed_lane=normed_lane,
                     rotated_lane=rotated_lane,
@@ -920,7 +932,11 @@ def _build_norm_rope_scatter_kernel(
                     out_rsrc=out_rsrc,
                     krope_base=_to_raw(_krope_base),
                     krope_rsrc=buffer_ops.create_buffer_resource(
-                        k_rope_buff, max_size=True
+                        k_rope_buff,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, krope_block_stride, 2
+                        ),
                     ),
                     VEC=VEC,
                     NOPE=NOPE,
@@ -1197,8 +1213,13 @@ def flydsl_hca_compress_attn_gfx1250(
         raise ValueError("score_state shape != kv_state")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
-    if not (kv_state.is_contiguous() and score_state.is_contiguous()):
-        raise ValueError("kv_state/score_state must be contiguous")
+    # Slot and ring strides are passed to the kernel and the descriptor is
+    # rebased per slot, so the states may be strided views — a per-request
+    # arena hands out a view whose slot stride is a whole entry. Only the
+    # innermost dim must be unit stride: the kernel addresses it as
+    # `col_off + lane`.
+    if kv_state.stride(-1) != 1 or score_state.stride(-1) != 1:
+        raise ValueError("kv_state/score_state inner stride must be 1")
     if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
         raise ValueError("state_slot_mapping must be 1D int32")
 
@@ -1217,8 +1238,8 @@ def flydsl_hca_compress_attn_gfx1250(
             raise ValueError(
                 f"k_rope_cache shape {tuple(k_rope_cache.shape)} != [NB, k_per_block, {rope_head_dim}]"
             )
-        if not k_rope_cache.is_contiguous():
-            raise ValueError("k_rope_cache must be contiguous")
+        if k_rope_cache.stride(2) != 1:
+            raise ValueError("k_rope_cache must be dense in the last dim")
     else:
         if kv_cache.dtype != torch.bfloat16:
             raise TypeError(f"HCA 2-kernel kv_cache must be bf16; got {kv_cache.dtype}")

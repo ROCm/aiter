@@ -591,6 +591,11 @@
             "'-ffast-math'",
             "'-mllvm -enable-post-misched=1'"
         ],
+        "flags_extra_hip_per_source": {
+            "*pa_sparse_prefill_opus_kernels.cu": [
+                "-mllvm -amdgpu-early-inline-all=false"
+            ]
+        },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -1675,6 +1680,22 @@
         ],
         "is_experimental": "True"
     },
+    "module_ds32_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_topk_plain": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",
@@ -1759,6 +1780,23 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gdr_decode_packed_bf16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gdr_decode_packed_bf16_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gdr_decode_packed_bf16.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_split_gdr_update": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
@@ -1780,7 +1818,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mwavefrontsize64'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

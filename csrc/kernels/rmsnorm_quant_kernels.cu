@@ -64,7 +64,12 @@ __global__ void add_rmsnorm_quant_kernel(
         auto buffer_i = opus::make_gmem<DTYPE_I>(input_ptr, oob_i * sizeof(DTYPE_I));
         auto weight_buffer = opus::make_gmem<DTYPE_I>(weight, oob_i * sizeof(DTYPE_I));
         
-        const int oob_o = (n + ooba_o - 1) / ooba_o * ooba_o;
+        // opus::fp4_t occupies one byte as a standalone C++ type, while the output
+        // packs two logical FP4 values per byte. Bound stores to the packed row so
+        // threads beyond n cannot write into the following row.
+        const int oob_o = std::is_same_v<DTYPE_O, opus::fp4_t>
+                            ? (n + 1) / 2
+                            : (n + ooba_o - 1) / ooba_o * ooba_o;
 
         constexpr int interleave_size = WARP_SIZE;
         int row_offset = (interleave && (num_load_inst > 1)) ? (tid % WARP_SIZE * load_vec_size + (tid / WARP_SIZE) * WARP_SIZE * thread_data_size) : (tid * thread_data_size);
