@@ -251,8 +251,22 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
 
     int wgid = block_id_x();
     const int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
-    int row = (wgid % num_tiles_m) * T::B_M;
-    int col = (wgid / num_tiles_m) * T::B_N;
+    const int num_tiles_n = kargs.n / T::B_N;
+    int tile_m = wgid % num_tiles_m;
+    int tile_n = wgid / num_tiles_m;
+    if((num_tiles_m & 1) == 0 && (num_tiles_n & 1) == 0)
+    {
+        // Group neighboring row/column tiles so both operand panels get L2
+        // reuse; the legacy linear mapping is retained for odd tile grids.
+        constexpr int GROUP = 2;
+        const int group_id = wgid / (GROUP * GROUP);
+        const int in_group = wgid % (GROUP * GROUP);
+        const int groups_m = num_tiles_m / GROUP;
+        tile_m = (group_id % groups_m) * GROUP + in_group % GROUP;
+        tile_n = (group_id / groups_m) * GROUP + in_group / GROUP;
+    }
+    int row = tile_m * T::B_M;
+    int col = tile_n * T::B_N;
 
     int batch_id = block_id_z();
     int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / get_warp_size());
