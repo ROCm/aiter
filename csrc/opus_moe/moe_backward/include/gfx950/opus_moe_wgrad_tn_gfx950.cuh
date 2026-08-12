@@ -688,9 +688,11 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     {
       auto run_stage = [&](auto has_next_tag,
                            auto masked_next_tag,
+                           auto num_kpacks_tag,
                            int stage) {
         constexpr bool HAS_NEXT = decltype(has_next_tag)::value != 0;
         constexpr bool MASKED_NEXT = decltype(masked_next_tag)::value != 0;
+        constexpr int NUM_KPACKS = decltype(num_kpacks_tag)::value;
         const int cur = stage & 1;
         load_regs next;
         if constexpr(HAS_NEXT)
@@ -702,7 +704,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         }
 
         __builtin_amdgcn_s_setprio(1);
-        opus::static_for<4>([&](auto kpack) {
+        opus::static_for<NUM_KPACKS>([&](auto kpack) {
             constexpr int b_reg = 104 + (kpack.value & 1) * 8;
             // B is reused by all four M subtiles. Keep it resident, then
             // ping-pong two A fragment slots so the next LDS transpose read
@@ -730,7 +732,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                             (sm.value + 1) * SUBTILE_BYTES,
                         TR_SECOND_BYTES>(a_base[cur]);
                 }
-                if constexpr(sm.value == 2 && kpack.value + 1 < 4)
+                if constexpr(sm.value == 2 && kpack.value + 1 < NUM_KPACKS)
                 {
                     constexpr int next_b_reg = 104 + ((kpack.value + 1) & 1) * 8;
                     opus::static_for<2>([&](auto sn) {
@@ -741,7 +743,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                             TR_SECOND_BYTES>(b_base[cur]);
                     });
                 }
-                if constexpr(sm.value == 3 && kpack.value + 1 < 4)
+                if constexpr(sm.value == 3 && kpack.value + 1 < NUM_KPACKS)
                 {
                     opus_wgtn_fixed_tr_fragment_offset<
                         96, (kpack.value + 1) * KPACK_BYTES,
@@ -763,11 +765,12 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                             a_reg, b_reg + sn.value * 4, c, c>();
                     });
                 }
-                if constexpr(sm.value == 2 && kpack.value + 1 < 4)
+                if constexpr(sm.value == 2 && kpack.value + 1 < NUM_KPACKS)
                     // A3 was issued before the four next-B reads. Waiting to
                     // lgkmcnt(4) makes A3 ready while B continues in flight.
                     opus::s_waitcnt_lgkmcnt(opus::number<4>{});
-                else if constexpr(sm.value + 1 < 4 || kpack.value + 1 < 4)
+                else if constexpr(
+                    sm.value + 1 < 4 || kpack.value + 1 < NUM_KPACKS)
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             });
             if constexpr(HAS_NEXT && kpack.value == 1)
@@ -804,10 +807,15 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         if(nroute > COMMON_FULL_STAGES * BK)
         {
             for(int stage = 0; stage < COMMON_FULL_STAGES - 1; ++stage)
-                run_stage(opus::number<1>{}, opus::number<0>{}, stage);
+                run_stage(
+                    opus::number<1>{},
+                    opus::number<0>{},
+                    opus::number<4>{},
+                    stage);
             run_stage(
                 opus::number<1>{},
                 opus::number<1>{},
+                opus::number<4>{},
                 COMMON_FULL_STAGES - 1);
             dynamic_stage_start = COMMON_FULL_STAGES;
         }
@@ -815,14 +823,44 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     for(int stage = dynamic_stage_start; stage < full_k_stages; ++stage)
     {
         if(stage + 1 < full_k_stages)
-            run_stage(opus::number<1>{}, opus::number<0>{}, stage);
+            run_stage(
+                opus::number<1>{},
+                opus::number<0>{},
+                opus::number<4>{},
+                stage);
         else if(has_tail_stage)
-            run_stage(opus::number<1>{}, opus::number<1>{}, stage);
+            run_stage(
+                opus::number<1>{},
+                opus::number<1>{},
+                opus::number<4>{},
+                stage);
         else
-            run_stage(opus::number<0>{}, opus::number<0>{}, stage);
+            run_stage(
+                opus::number<0>{},
+                opus::number<0>{},
+                opus::number<4>{},
+                stage);
     }
       if(has_tail_stage)
-          run_stage(opus::number<0>{}, opus::number<0>{}, full_k_stages);
+      {
+          const int tail_kpacks = (nroute - full_k_stages * BK + 15) / 16;
+          if(tail_kpacks == 1)
+              run_stage(
+                  opus::number<0>{}, opus::number<0>{}, opus::number<1>{},
+                  full_k_stages);
+          else if(tail_kpacks == 2)
+              run_stage(
+                  opus::number<0>{}, opus::number<0>{}, opus::number<2>{},
+                  full_k_stages);
+          else if(tail_kpacks == 3)
+              run_stage(
+                  opus::number<0>{}, opus::number<0>{}, opus::number<3>{},
+                  full_k_stages);
+          else
+              run_stage(
+                  opus::number<0>{}, opus::number<0>{}, opus::number<4>{},
+                  full_k_stages);
+      }
     }
 
     const int lm = lane % 32;
