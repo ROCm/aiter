@@ -290,7 +290,7 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     k.ragged = 1;
     k.compact_tiles = 1;
     k.num_tiles = num_tiles;
-    opus_moe_dgrad_swiglu_dscore_launch_gfx950(
+    opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());
 }
 

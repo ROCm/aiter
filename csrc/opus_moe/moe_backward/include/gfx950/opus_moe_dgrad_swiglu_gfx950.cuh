@@ -81,7 +81,11 @@ __device__ __forceinline__ void opus_moe_dgrad_tile_map(
     }
 }
 
-template<typename UserTraits, bool WRITE_DSCORE = false, bool APPLY_SWIGLU = true>
+template<typename UserTraits,
+         bool WRITE_DSCORE = false,
+         bool APPLY_SWIGLU = true,
+         bool RAGGED = false,
+         bool COMPACT_TILES = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -100,7 +104,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     int batch_id = block_id_z();
     int local_wgid = wgid;
     int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
-    if(kargs.compact_tiles)
+    if constexpr(COMPACT_TILES)
     {
         // Locate the expert whose variable-sized block interval owns this CTA.
         // tile_offsets is tiny (65 int32 values) and remains hot in cache.
@@ -128,7 +132,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 
     int batch_row_start = 0;
     int batch_m = kargs.m;
-    if(kargs.ragged)
+    if constexpr(RAGGED)
     {
         batch_row_start = kargs.expert_offsets[batch_id];
         batch_m = kargs.expert_offsets[batch_id + 1] - batch_row_start;
@@ -140,8 +144,8 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 
     auto g_a = make_gmem(
         reinterpret_cast<const D_A*>(kargs.ptr_a) +
-            (kargs.ragged ? batch_row_start * kargs.stride_a
-                          : batch_id * kargs.stride_a_batch) +
+            (RAGGED ? batch_row_start * kargs.stride_a
+                    : batch_id * kargs.stride_a_batch) +
             row * kargs.stride_a,
         (batch_m - row) * kargs.stride_a * sizeof(D_A));
     auto g_b = make_gmem(
@@ -150,14 +154,14 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         (kargs.n - col) * kargs.stride_b * sizeof(D_B));
     auto g_act_input = make_gmem(
         reinterpret_cast<const D_C*>(kargs.ptr_act_input) +
-            (kargs.ragged ? batch_row_start * kargs.stride_act_input
-                          : batch_id * kargs.stride_act_input_batch) +
+            (RAGGED ? batch_row_start * kargs.stride_act_input
+                    : batch_id * kargs.stride_act_input_batch) +
             row * kargs.stride_act_input,
         (batch_m - row) * kargs.stride_act_input * sizeof(D_C));
     auto g_dact = make_gmem(
         reinterpret_cast<D_C*>(kargs.ptr_dact) +
-            (kargs.ragged ? batch_row_start * kargs.stride_dact
-                          : batch_id * kargs.stride_dact_batch) +
+            (RAGGED ? batch_row_start * kargs.stride_dact
+                    : batch_id * kargs.stride_dact_batch) +
             row * kargs.stride_dact,
         (batch_m - row) * kargs.stride_dact * sizeof(D_C));
 
@@ -394,7 +398,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                 for(int wn = 0; wn < T::T_N; ++wn)
                     partial += score_smem[local_row * T::T_N + wn];
                 const int n_tile = col / T::B_N;
-                const int compact_row = kargs.ragged
+                const int compact_row = RAGGED
                     ? batch_row_start + route_row
                     : batch_id * kargs.m + route_row;
                 reinterpret_cast<float*>(kargs.ptr_dscore_partials)[
@@ -441,14 +445,24 @@ inline void opus_moe_dgrad_swiglu_dscore_launch_gfx950(
     const opus_moe_dgrad_swiglu_kargs& kargs,
     hipStream_t stream)
 {
+    const int num_tiles_m = (kargs.m + 191) / 192;
     const int num_tiles_n = kargs.n / 256;
-    const int num_blocks = kargs.compact_tiles
-        ? kargs.num_tiles * num_tiles_n
-        : ((kargs.m + 191) / 192) * num_tiles_n;
-    dim3 grid(num_blocks, 1, kargs.compact_tiles ? 1 : kargs.batch);
+    dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<
         opus_moe_dgrad_swiglu_traits_gfx950, true>
+        <<<grid, block, 0, stream>>>(kargs);
+}
+
+inline void opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
+    const opus_moe_dgrad_swiglu_kargs& kargs,
+    hipStream_t stream)
+{
+    const int num_tiles_n = kargs.n / 256;
+    dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
+    dim3 block(512);
+    opus_moe_dgrad_swiglu_kernel_gfx950<
+        opus_moe_dgrad_swiglu_traits_gfx950, true, true, true, true>
         <<<grid, block, 0, stream>>>(kargs);
 }
 
@@ -457,12 +471,9 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
     hipStream_t stream)
 {
     const int num_tiles_n = kargs.n / 256;
-    const int num_blocks = kargs.compact_tiles
-        ? kargs.num_tiles * num_tiles_n
-        : ((kargs.m + 191) / 192) * num_tiles_n;
-    dim3 grid(num_blocks, 1, kargs.compact_tiles ? 1 : kargs.batch);
+    dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<
-        opus_moe_dgrad_swiglu_traits_gfx950, false, false>
+        opus_moe_dgrad_swiglu_traits_gfx950, false, false, true, true>
         <<<grid, block, 0, stream>>>(kargs);
 }
