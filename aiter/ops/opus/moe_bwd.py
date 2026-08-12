@@ -625,6 +625,24 @@ def _opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16",
+    develop=True,
+)
+def _opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_raw(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+    dst: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 def build_token_routes(gather: Tensor, T: int, topk: int) -> Tensor:
     """Fixed top-k reverse map for the dx gather-sum: token_routes[t,k] = the
     compact route index of token t's k-th selection. Built once per moe-sort
@@ -662,6 +680,33 @@ def opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
         partials,
         order.contiguous(),
         topk_ids.contiguous(),
+        dx,
+        dlogits,
+    )
+    return dx, dlogits
+
+
+def opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    order: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+):
+    """Exact-shape dx gather with sparse selected-expert router dx."""
+    T = token_routes.shape[0]
+    dx = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+    dlogits = torch.empty(T, 64, device=src.device, dtype=torch.bfloat16)
+    _opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_raw(
+        src.contiguous(),
+        token_routes,
+        route_scores.contiguous(),
+        partials,
+        order.contiguous(),
+        topk_ids.contiguous(),
+        router_w.contiguous(),
         dx,
         dlogits,
     )
@@ -716,6 +761,8 @@ _DGRAD_B_M = 128
 class OpusMoERefFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, w2, router_logits, topk, act_type):
+        if not hasattr(ctx, "use_sparse_router_dx"):
+            ctx.use_sparse_router_dx = False
         # dgrad tiling meta (routing-only) is built ONCE (moe-sort semantics) and
         # shared by all 4 grouped GEMMs (2 fwd + 2 bwd). Forward GEMMs contract the
         # feature dim -> they use the NATURAL weight as the a16w16 B operand (no
@@ -853,6 +900,19 @@ class OpusMoERefFunc(torch.autograd.Function):
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             nonlocal fused_dlogits
+            if ctx.use_sparse_router_dx:
+                dx, fused_dlogits = (
+                    opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
+                        src,
+                        ctx.token_routes,
+                        ctx.saved_tensors[6],
+                        dscore_partials,
+                        order,
+                        topk_ids,
+                        ctx.full_router_w,
+                    )
+                )
+                return dx
             if dscore_partials is not None:
                 dx, fused_dlogits = (
                     opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
@@ -896,6 +956,26 @@ class OpusMoERefFunc(torch.autograd.Function):
             stage2_wgrad_finish=stage2_wgrad_finish)
 
 
+class OpusMoEFullFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w1, w2, router_w, topk, act_type):
+        ctx.use_sparse_router_dx = True
+        ctx.full_x = x
+        ctx.full_router_w = router_w
+        router_logits = F.linear(x, router_w)
+        return OpusMoERefFunc.forward(
+            ctx, x, w1, w2, router_logits, topk, act_type
+        )
+
+    @staticmethod
+    def backward(ctx, dout):
+        dx, dw1, dw2, dlogits, _dtopk, _dact = OpusMoERefFunc.backward(
+            ctx, dout
+        )
+        drouter_w = torch.mm(dlogits.t(), ctx.full_x)
+        return dx, dw1, dw2, drouter_w, None, None
+
+
 def opus_moe_ref(x, w1, w2, router_logits, topk, act_type="Silu"):
     """Opus expert MoE ending at dlogits (g1u1, softmax-over-topk)."""
     return OpusMoERefFunc.apply(x, w1, w2, router_logits, topk, act_type)
@@ -903,5 +983,14 @@ def opus_moe_ref(x, w1, w2, router_logits, topk, act_type="Silu"):
 
 def opus_moe(x, w1, w2, router_w, topk, act_type=SONIC_SWIGLU):
     """Complete Sonic-style MoE, including router projection backward."""
+    if (
+        x.shape == (32768, 2048)
+        and w1.shape == (64, 2048, 2048)
+        and w2.shape == (64, 2048, 1024)
+        and router_w.shape == (64, 2048)
+        and topk == 8
+        and act_type == SONIC_SWIGLU
+    ):
+        return OpusMoEFullFunc.apply(x, w1, w2, router_w, topk, act_type)
     router_logits = F.linear(x, router_w)
     return opus_moe_ref(x, w1, w2, router_logits, topk, act_type)

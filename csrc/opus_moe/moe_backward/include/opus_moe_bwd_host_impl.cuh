@@ -1112,6 +1112,134 @@ void opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
         T);
 }
 
+__global__ __launch_bounds__(512, 1)
+void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
+    const __bf16* __restrict__ src,
+    const int32_t* __restrict__ token_routes,
+    const float* __restrict__ route_scores,
+    const float* __restrict__ partials,
+    const int64_t* __restrict__ order,
+    const int64_t* __restrict__ topk_ids,
+    const __bf16* __restrict__ router_w,
+    __bf16* __restrict__ dst,
+    __bf16* __restrict__ dlogits,
+    int T)
+{
+    constexpr int H = 2048;
+    constexpr int TOPK = 8;
+    constexpr int E = 64;
+    constexpr int PARTIALS = 4;
+    constexpr int THREADS_PER_TOKEN = 256;
+    constexpr int TOKENS_PER_BLOCK = 2;
+    constexpr int WAVES_PER_TOKEN = 4;
+    const int token_in_block = threadIdx.x / THREADS_PER_TOKEN;
+    const int token_thread = threadIdx.x % THREADS_PER_TOKEN;
+    const int wave_in_token = token_thread / warpSize;
+    const int lane = token_thread % warpSize;
+    const int t = blockIdx.x * TOKENS_PER_BLOCK + token_in_block;
+    if(t >= T)
+        return;
+    const int32_t* tr =
+        token_routes + static_cast<int64_t>(t) * TOPK;
+    __shared__ float selected_grad_by_wave
+        [TOKENS_PER_BLOCK][WAVES_PER_TOKEN][TOPK];
+    if(wave_in_token == 0 && lane < E)
+        dlogits[static_cast<int64_t>(t) * E + token_thread] =
+            static_cast<__bf16>(0.0f);
+    float selected_grad = 0.0f;
+    int rank = 0;
+    if(lane < TOPK)
+    {
+        float scaled_dp = 0.0f;
+        const int32_t route = tr[lane];
+#pragma unroll
+        for(int i = 0; i < PARTIALS; ++i)
+            scaled_dp +=
+                partials[static_cast<int64_t>(route) * PARTIALS + i];
+        rank = static_cast<int>(order[route] & (TOPK - 1));
+        float dot = 0.0f;
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+            dot += __shfl(scaled_dp, k, TOPK);
+        selected_grad = scaled_dp - route_scores[route] * dot;
+        const __bf16 grad_bf16 = static_cast<__bf16>(selected_grad);
+        selected_grad_by_wave[token_in_block][wave_in_token][rank] =
+            static_cast<float>(grad_bf16);
+        if(wave_in_token == 0)
+        {
+            const int64_t expert =
+                topk_ids[static_cast<int64_t>(t) * TOPK + rank];
+            dlogits[static_cast<int64_t>(t) * E + expert] = grad_bf16;
+        }
+    }
+    __syncwarp();
+
+    const int64_t dstrow = static_cast<int64_t>(t) * H;
+    for(int h = token_thread * 8; h < H;
+        h += THREADS_PER_TOKEN * 8)
+    {
+        float acc[8] = {};
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+        {
+            const opus_bf16x8 v =
+                *reinterpret_cast<const opus_bf16x8*>(
+                    src + static_cast<int64_t>(tr[k]) * H + h);
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+                acc[i] += static_cast<float>(v[i]);
+        }
+#pragma unroll
+        for(int k = 0; k < TOPK; ++k)
+        {
+            const int64_t expert =
+                topk_ids[static_cast<int64_t>(t) * TOPK + k];
+            const opus_bf16x8 v =
+                *reinterpret_cast<const opus_bf16x8*>(
+                    router_w + expert * H + h);
+            // Each wave recomputes and rank-orders the eight selected
+            // gradients in its own tiny LDS slot.  The producer and consumers
+            // are in the same lockstep wave, so no whole-CTA barrier is needed.
+            const float grad =
+                selected_grad_by_wave[token_in_block][wave_in_token][k];
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+                acc[i] = fmaf(grad, static_cast<float>(v[i]), acc[i]);
+        }
+#pragma unroll
+        for(int i = 0; i < 8; ++i)
+            dst[dstrow + h + i] = static_cast<__bf16>(acc[i]);
+    }
+}
+
+void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& router_w,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(dst.size(0));
+    constexpr int TOKENS_PER_BLOCK = 2;
+    opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel<<<
+        dim3((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK),
+        dim3(512), 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(src.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(route_scores.data_ptr()),
+        reinterpret_cast<const float*>(partials.data_ptr()),
+        reinterpret_cast<const int64_t*>(order.data_ptr()),
+        reinterpret_cast<const int64_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<const __bf16*>(router_w.data_ptr()),
+        reinterpret_cast<__bf16*>(dst.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()),
+        T);
+}
+
 // Router backward (M5 R7): softmax-over-topk Jacobian. Per token t (one thread):
 // s = Σ_k dp[t,k]·pw[t,k]; dlogits[t, ids[t,k]] = pw[t,k]·(dp[t,k]-s). The topk
 // ids are distinct per token so writes don't collide (dlogits pre-zeroed).
