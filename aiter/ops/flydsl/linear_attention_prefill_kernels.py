@@ -1239,10 +1239,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         snapshot_bf16=snapshot_bf16,
     )
 
-    # Null-arg placeholder for the @flyc.jit slots ignored on this path. Sized
-    # 1 (not 0) so its ``data_ptr()`` is always a valid non-null device address.
+    # Null-arg placeholders for the @flyc.jit slots ignored on this path. Sized
+    # 1 (not 0) so their ``data_ptr()`` is always a valid non-null device
+    # address. Allocated rather than cast off ``dummy``: the kernel reads only
+    # the base pointer of a disabled slot, and a cast would launch a kernel to
+    # copy the one element it does not read.
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-    int32_dummy = dummy.to(torch.int32) if not is_varlen else None
+    int32_dummy = torch.empty(1, device=k.device, dtype=torch.int32)
     cu_arg = (
         _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
@@ -1328,7 +1331,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
     # arg): a real int32 [N] index array when indexed, else a 1-elem int32 dummy.
     if not use_state_indices:
-        si_i32 = dummy.to(torch.int32)
+        si_i32 = int32_dummy
     tensor_args = tensor_args + (si_i32,)
 
     _run_compiled(
