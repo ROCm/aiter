@@ -505,48 +505,43 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     auto g_a = opus::make_gmem(
         reinterpret_cast<const opus::bf16_t*>(a) +
         static_cast<int64_t>(r0) * Q + n0);
-    auto load_global = [&](int stage, int half, load_regs& x) {
+    auto load_global_valid = [&](int stage, int half, load_regs& x) {
         const int route = r0 + stage * BK + half * 32 + load_k;
-        auto load_valid = [&]() {
-            const int mf = m0 + load_f;
-            const int nf = n0 + load_f;
-            if constexpr(FIXED_P > 0 && FIXED_Q > 0)
-            {
-                const int local_route =
-                    stage * BK + half * 32 + load_k;
-                x.a0 = __builtin_bit_cast(
-                    opus_bf16x8,
-                    g_dy.template load<8>(local_route * P + load_f));
-                x.a1 = __builtin_bit_cast(
-                    opus_bf16x8,
-                    g_dy.template load<8>(local_route * P + load_f + 8));
-                x.b0 = __builtin_bit_cast(
-                    opus_bf16x8,
-                    g_a.template load<8>(local_route * Q + load_f));
-                x.b1 = __builtin_bit_cast(
-                    opus_bf16x8,
-                    g_a.template load<8>(local_route * Q + load_f + 8));
-            }
-            else
-            {
-                x.a0 = *reinterpret_cast<const opus_bf16x8*>(
-                    dy + static_cast<int64_t>(route) * P + mf);
-                x.a1 = *reinterpret_cast<const opus_bf16x8*>(
-                    dy + static_cast<int64_t>(route) * P + mf + 8);
-                x.b0 = *reinterpret_cast<const opus_bf16x8*>(
-                    a + static_cast<int64_t>(route) * Q + nf);
-                x.b1 = *reinterpret_cast<const opus_bf16x8*>(
-                    a + static_cast<int64_t>(route) * Q + nf + 8);
-            }
-        };
-        if constexpr(FIXED_ROUTES > 0)
-            load_valid();
+        const int mf = m0 + load_f;
+        const int nf = n0 + load_f;
+        if constexpr(FIXED_P > 0 && FIXED_Q > 0)
+        {
+            const int local_route = stage * BK + half * 32 + load_k;
+            x.a0 = __builtin_bit_cast(
+                opus_bf16x8,
+                g_dy.template load<8>(local_route * P + load_f));
+            x.a1 = __builtin_bit_cast(
+                opus_bf16x8,
+                g_dy.template load<8>(local_route * P + load_f + 8));
+            x.b0 = __builtin_bit_cast(
+                opus_bf16x8,
+                g_a.template load<8>(local_route * Q + load_f));
+            x.b1 = __builtin_bit_cast(
+                opus_bf16x8,
+                g_a.template load<8>(local_route * Q + load_f + 8));
+        }
         else
         {
-            x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
-            if(route < r1)
-                load_valid();
+            x.a0 = *reinterpret_cast<const opus_bf16x8*>(
+                dy + static_cast<int64_t>(route) * P + mf);
+            x.a1 = *reinterpret_cast<const opus_bf16x8*>(
+                dy + static_cast<int64_t>(route) * P + mf + 8);
+            x.b0 = *reinterpret_cast<const opus_bf16x8*>(
+                a + static_cast<int64_t>(route) * Q + nf);
+            x.b1 = *reinterpret_cast<const opus_bf16x8*>(
+                a + static_cast<int64_t>(route) * Q + nf + 8);
         }
+    };
+    auto load_global_tail = [&](int stage, int half, load_regs& x) {
+        const int route = r0 + stage * BK + half * 32 + load_k;
+        x.a0 = {}; x.a1 = {}; x.b0 = {}; x.b1 = {};
+        if(route < r1)
+            load_global_valid(stage, half, x);
     };
     auto store_stage = [&](int buf, int half, const load_regs& x) {
         auto as = opus::make_smem(&As[buf][0][0]);
@@ -558,12 +553,24 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         bs.template store<8>(x.b1, os + 8);
     };
 
+    const int full_k_stages = nroute / BK;
+    const bool has_tail_stage = full_k_stages < num_k_stages;
+    // Dynamic routing uses unmasked loads for every complete 64-route stage;
+    // only its final partial stage pays zero-fill and per-lane bounds checks.
+    // Keep the original inline loop for FIXED_ROUTES so its compile-time path
+    // and balanced-route scheduling remain unchanged.
     if(num_k_stages > 0)
     {
         load_regs first;
-        load_global(0, 0, first);
+        if(full_k_stages > 0)
+            load_global_valid(0, 0, first);
+        else
+            load_global_tail(0, 0, first);
         store_stage(0, 0, first);
-        load_global(0, 1, first);
+        if(full_k_stages > 0)
+            load_global_valid(0, 1, first);
+        else
+            load_global_tail(0, 1, first);
         store_stage(0, 1, first);
     }
     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -583,13 +590,116 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     constexpr int KPACK_BYTES = 16 * LD * sizeof(__bf16);
     constexpr int SUBTILE_BYTES = 32 * sizeof(__bf16);
     constexpr int TR_SECOND_BYTES = 4 * LD * sizeof(__bf16);
-    for(int stage = 0; stage < num_k_stages; ++stage)
+    if constexpr(FIXED_ROUTES > 0)
     {
+        for(int stage = 0; stage < num_k_stages; ++stage)
+        {
+            const int cur = stage & 1;
+            const bool has_next = stage + 1 < num_k_stages;
+            load_regs next;
+            if(has_next)
+                load_global_valid(stage + 1, 0, next);
+
+            __builtin_amdgcn_s_setprio(1);
+            opus::static_for<4>([&](auto kpack) {
+                constexpr int b_reg = 104 + (kpack.value & 1) * 8;
+                if constexpr(kpack.value == 0)
+                {
+                    opus::static_for<2>([&](auto sn) {
+                        opus_wgtn_fixed_tr_fragment_offset<
+                            b_reg + sn.value * 4,
+                            sn.value * SUBTILE_BYTES,
+                            TR_SECOND_BYTES>(b_base[cur]);
+                    });
+                    opus_wgtn_fixed_tr_fragment_offset<
+                        96, 0, TR_SECOND_BYTES>(a_base[cur]);
+                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                }
+                opus::static_for<4>([&](auto sm) {
+                    constexpr int a_reg = 96 + (sm.value & 1) * 4;
+                    if constexpr(sm.value + 1 < 4)
+                    {
+                        opus_wgtn_fixed_tr_fragment_offset<
+                            96 + ((sm.value + 1) & 1) * 4,
+                            kpack.value * KPACK_BYTES +
+                                (sm.value + 1) * SUBTILE_BYTES,
+                            TR_SECOND_BYTES>(a_base[cur]);
+                    }
+                    if constexpr(sm.value == 2 && kpack.value + 1 < 4)
+                    {
+                        constexpr int next_b_reg =
+                            104 + ((kpack.value + 1) & 1) * 8;
+                        opus::static_for<2>([&](auto sn) {
+                            opus_wgtn_fixed_tr_fragment_offset<
+                                next_b_reg + sn.value * 4,
+                                (kpack.value + 1) * KPACK_BYTES +
+                                    sn.value * SUBTILE_BYTES,
+                                TR_SECOND_BYTES>(b_base[cur]);
+                        });
+                    }
+                    if constexpr(sm.value == 3 && kpack.value + 1 < 4)
+                    {
+                        opus_wgtn_fixed_tr_fragment_offset<
+                            96, (kpack.value + 1) * KPACK_BYTES,
+                            TR_SECOND_BYTES>(a_base[cur]);
+                    }
+                    if(stage == 0 && kpack.value == 0)
+                    {
+                        opus::static_for<2>([&](auto sn) {
+                            constexpr int c =
+                                256 + (sm.value * 2 + sn.value) * 16;
+                            opus_wgtn_mfma_zero<
+                                a_reg, b_reg + sn.value * 4, c>();
+                        });
+                    }
+                    else
+                    {
+                        opus::static_for<2>([&](auto sn) {
+                            constexpr int c =
+                                256 + (sm.value * 2 + sn.value) * 16;
+                            opus_wgtn_mfma_accum<
+                                a_reg, b_reg + sn.value * 4, c, c>();
+                        });
+                    }
+                    if constexpr(sm.value == 2 && kpack.value + 1 < 4)
+                        opus::s_waitcnt_lgkmcnt(opus::number<4>{});
+                    else if constexpr(sm.value + 1 < 4 || kpack.value + 1 < 4)
+                        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                });
+                if(has_next && kpack.value == 1)
+                {
+                    __builtin_amdgcn_s_setprio(0);
+                    store_stage(cur ^ 1, 0, next);
+                    load_global_valid(stage + 1, 1, next);
+                    __builtin_amdgcn_s_setprio(1);
+                }
+            });
+            __builtin_amdgcn_s_setprio(0);
+
+            if(has_next)
+            {
+                store_stage(cur ^ 1, 1, next);
+                opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                __syncthreads();
+            }
+        }
+    }
+    else
+    {
+      auto run_stage = [&](auto has_next_tag,
+                           auto masked_next_tag,
+                           int stage) {
+        constexpr bool HAS_NEXT = decltype(has_next_tag)::value != 0;
+        constexpr bool MASKED_NEXT = decltype(masked_next_tag)::value != 0;
         const int cur = stage & 1;
-        const bool has_next = stage + 1 < num_k_stages;
         load_regs next;
-        if(has_next)
-            load_global(stage + 1, 0, next);
+        if constexpr(HAS_NEXT)
+        {
+            if constexpr(MASKED_NEXT)
+                load_global_tail(stage + 1, 0, next);
+            else
+                load_global_valid(stage + 1, 0, next);
+        }
 
         __builtin_amdgcn_s_setprio(1);
         opus::static_for<4>([&](auto kpack) {
@@ -660,22 +770,38 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                 else if constexpr(sm.value + 1 < 4 || kpack.value + 1 < 4)
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             });
-            if(has_next && kpack.value == 1)
+            if constexpr(HAS_NEXT && kpack.value == 1)
             {
                 __builtin_amdgcn_s_setprio(0);
                 store_stage(cur ^ 1, 0, next);
-                load_global(stage + 1, 1, next);
+                if constexpr(MASKED_NEXT)
+                    load_global_tail(stage + 1, 1, next);
+                else
+                    load_global_valid(stage + 1, 1, next);
                 __builtin_amdgcn_s_setprio(1);
             }
         });
         __builtin_amdgcn_s_setprio(0);
 
-        if(has_next)
+        if constexpr(HAS_NEXT)
         {
             store_stage(cur ^ 1, 1, next);
             opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             __syncthreads();
         }
+    };
+
+    for(int stage = 0; stage < full_k_stages; ++stage)
+    {
+        if(stage + 1 < full_k_stages)
+            run_stage(opus::number<1>{}, opus::number<0>{}, stage);
+        else if(has_tail_stage)
+            run_stage(opus::number<1>{}, opus::number<1>{}, stage);
+        else
+            run_stage(opus::number<0>{}, opus::number<0>{}, stage);
+    }
+      if(has_tail_stage)
+          run_stage(opus::number<0>{}, opus::number<0>{}, full_k_stages);
     }
 
     const int lm = lane % 32;
