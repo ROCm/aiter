@@ -75,9 +75,8 @@ fallback when a genuinely different working-set regime needs it.
 | K2 `route_dx` large working set | 8 | `BM32 x BN128 x BK32`, M3/six-route cohort |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
-| K4 `dw1` cohort baseline | 6 | `BM64 x BN128 x BK32`, four-expert cohort |
-| K4 `dw1` direct-LDS baseline | 7 | `BM64 x BN128 x BK32`, four-expert cohort |
-| K4 `dw1` large working set | 8 | `BM64 x BN128 x BK32`, two-expert cohort + direct GMEM-to-LDS |
+| K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |
+| K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
 | K5 `dw2` | 3 | `BM64 x BN64 x BK64` |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
@@ -92,13 +91,12 @@ that threshold. Both BK32 tiles retain two-stage async loads while reducing
 their LDS allocation and VGPR count relative to kid 6. Degenerate grids and
 callers without expert offsets retain kid 5.
 
-K4 auto-dispatch uses runtime source working-set size rather than an exact
-model tuple. Kid 5 remains selected when the combined padded `dZ` and `X`
-sources are at most 128 MiB (or only one expert is present). Larger working
-sets select two-expert kid 8: the shorter cohort keeps the reusable source
-window comfortably inside L2 without serializing the grid by expert. Kids 6
-and 7 are retained as register-load and four-expert direct-LDS baselines; they
-are not selected by auto-dispatch.
+K4 auto-dispatch uses runtime launch geometry rather than an exact model
+tuple. Kid 9 handles compatible BM128 problems with two LDS stages and a
+two-expert cohort; kid 8 covers large BM64 problems, and kid 5 remains the
+small/degenerate fallback. For empty experts, kid 9 coalesces two adjacent M
+tiles into one zeroing CTA. This preserves exact zero gradients while reducing
+epilogue-only workgroups without serializing the store stream.
 
 ## Shape contract
 

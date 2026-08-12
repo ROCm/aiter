@@ -205,6 +205,38 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int route_end = kargs.route.expert_offsets[expert + 1];
     const int route_count = route_end - route_start;
     const int tid = static_cast<int>(thread_id_x());
+    if constexpr(T::EMPTY_M_TILES_PER_CTA > 1)
+    {
+        if(route_count == 0)
+        {
+            // Coalesce a bounded number of adjacent empty-expert M tiles into
+            // one zeroing CTA.  The factor balances dispatch overhead against
+            // memory-level parallelism in the store stream.
+            constexpr int group = T::EMPTY_M_TILES_PER_CTA;
+            const int output_m_tile = output_m_base / BM;
+            if(output_m_tile % group != 0)
+                return;
+            using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+            constexpr int store_values = 8;
+            const u32x4 zeros{0, 0, 0, 0};
+            const int vectors_per_row = BN / store_values;
+            const int rows_left = kargs.output_m - output_m_base;
+            const int rows = rows_left < group * BM ? rows_left : group * BM;
+            const int total_vectors = rows * vectors_per_row;
+            for(int vector = tid; vector < total_vectors;
+                vector += T::BLOCK_SIZE)
+            {
+                const int row = output_m_base + vector / vectors_per_row;
+                const int col = (vector % vectors_per_row) * store_values;
+                const int64_t c_offset =
+                    static_cast<int64_t>(expert) * kargs.stride_c_expert +
+                    static_cast<int64_t>(row) * kargs.stride_c_m +
+                    output_n_base + col;
+                *reinterpret_cast<u32x4*>(kargs.c + c_offset) = zeros;
+            }
+            return;
+        }
+    }
     const int lane_id = tid % get_warp_size();
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());
     const int wave_id_m = wave_id / T::T_N;
