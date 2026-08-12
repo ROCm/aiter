@@ -511,6 +511,11 @@ def fmha_v3_fwd_f4f4_solo(
     v_descale: Tensor,            # uint8 E8M0 image, [b, hk, ceil(sk/128)*512]
     softmax_scale: float,
     out: Optional[Tensor] = None,
+    # Optional block-sparse LUT; 64-row query blocks (the solo tile size), so lut_start/lut_count
+    # hold b*hq*ceil(sq/64) int32 entries. Requires a SOLATTN_LUT code object in the slot.
+    kv_block_indices: Optional[Tensor] = None,
+    lut_start: Optional[Tensor] = None,
+    lut_count: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
 
 
@@ -4068,6 +4073,9 @@ def flash_attn_f4f4_solo_pertensor_func(
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    kv_block_indices: Optional[torch.Tensor] = None,
+    lut_start: Optional[torch.Tensor] = None,
+    lut_count: Optional[torch.Tensor] = None,
 ):
     """Dedicated persistent one-wave f4f4 FMHA forward (hd=128, gfx950).
 
@@ -4098,6 +4106,14 @@ def flash_attn_f4f4_solo_pertensor_func(
     if softmax_scale is None:
         head_dim_logical = q.shape[-1] * 2
         softmax_scale = head_dim_logical ** (-0.5)
+    if kv_block_indices is None:
+        # Pick up a block list left by sage_quant_f4f4_solo under AITER_SOLATTN_DENSITY. Keeps the
+        # routed path reachable from callers whose signature is pinned; a no-op when unset.
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import solattn_take_lut
+
+        stashed = solattn_take_lut(q.shape[0], q.shape[2], q.shape[1])
+        if stashed is not None:
+            kv_block_indices, lut_start, lut_count = stashed
     outs = fmha_v3_fwd_f4f4_solo(
         q,
         k,
@@ -4107,6 +4123,9 @@ def flash_attn_f4f4_solo_pertensor_func(
         v_descale,
         float(softmax_scale),
         None,
+        kv_block_indices,
+        lut_start,
+        lut_count,
     )
     return outs[0]
 

@@ -515,8 +515,16 @@ float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config&
         [&]() { return AiterAsmKernel(kDenseF4f4SoloKernelName, kDenseF4f4SoloCoName); });
 
     fmha_fwd_v3_sparse_args args{};
-    size_t arg_size = sizeof(fmha_fwd_v3_args);
+    // init_sparse_v3_args always fills the LUT tail; only the size decides whether it reaches the
+    // device. Dense callers pass no LUT and keep the historical 656-byte blob, so their launch is
+    // byte-for-byte unchanged. A block-sparse caller extends to 704 and the .co in the slot must be
+    // a SOLATTN_LUT build -- kernarg size and deployed code object are a matched pair.
+    const bool sparse = a.kv_block_indices_ptr != nullptr;
+    size_t arg_size = sparse ? sizeof(fmha_fwd_v3_sparse_args) : sizeof(fmha_fwd_v3_args);
     init_sparse_v3_args(args, a);
+    // s_Ts is deliberately left at the kSparseTileQ value init_sparse_v3_args writes: the solo
+    // kernel derives its Q tile offset from _s_Q_stride * kTileQ_eff and never uses s_Ts for it.
+    // The LUT row index is likewise the kernel's own flattened tile id, so nothing here changes.
 
     int device = 0;
     hipDeviceProp_t props{};

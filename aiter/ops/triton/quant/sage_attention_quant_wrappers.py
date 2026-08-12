@@ -1,6 +1,7 @@
 import functools
 import torch
 import triton
+import triton.language as tl
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
@@ -322,6 +323,250 @@ def sage_quant_f4f4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 
+SOLATTN_BLOCK_Q = 64        # the solo kernel's Q tile
+SOLATTN_BLOCK_KV = 128      # the solo kernel's KV tile
+_solattn_stash: dict = {}
+_solattn_beta_cache: dict = {}
+_solattn_calls: list = [0]      # attention-call counter, for the routing window
+
+
+@triton.jit
+def _solattn_threshold_pack_kernel(
+    SHAT, BETA, MASK, NK, NW, NQ,
+    ss_row, sm_row,
+    BLOCK: tl.constexpr, H: tl.constexpr,
+):
+    """Row statistics, query-dependent threshold, and bit packing in one launch.
+
+    Deliberately does NOT compute the proxy GEMM. A fused version that did was measured 68% slower
+    than handing the GEMM to rocBLAS -- 1176x588x128 per head is small, and a hand-rolled tl.dot at
+    the tile sizes this needs cannot match the library. What is worth fusing is the tail: the mean,
+    variance, max, compare and bit pack were six torch launches over a 13.8 MB proxy map.
+
+    The row max is tracked so the top block is always selected. An empty row would leave the FMHA
+    kernel with a zero-length block list, an L of zero, and a NaN output.
+    """
+    row = tl.program_id(0)
+    beta = tl.load(BETA + (row // NQ) % H)
+    base = SHAT + row * ss_row
+
+    ssum = tl.zeros([BLOCK], dtype=tl.float32)
+    ssq = tl.zeros([BLOCK], dtype=tl.float32)
+    smax = tl.full([BLOCK], float("-inf"), tl.float32)
+    for j0 in range(0, NK, BLOCK):
+        offs = j0 + tl.arange(0, BLOCK)
+        m = offs < NK
+        s = tl.load(base + offs, mask=m, other=0.0)
+        ssum += tl.where(m, s, 0.0)
+        ssq += tl.where(m, s * s, 0.0)
+        smax = tl.maximum(smax, tl.where(m, s, float("-inf")))
+    mu = tl.sum(ssum) / NK
+    var = tl.sum(ssq) / NK - mu * mu
+    tau = mu + beta * tl.sqrt(tl.maximum(var, 0.0))
+    rmax = tl.max(smax)
+
+    bit = (1 << tl.arange(0, 32)).to(tl.int32)
+    for w in range(0, NW):
+        offs = w * 32 + tl.arange(0, 32)
+        m = offs < NK
+        s = tl.load(base + offs, mask=m, other=float("-inf"))
+        sel = ((s > tau) | (s >= rmax)) & m
+        tl.store(MASK + row * sm_row + w, tl.sum(tl.where(sel, bit, 0)).to(tl.int32))
+
+
+def _solattn_route_fused(shat, beta, nq, nheads):
+    """Threshold + pack a proxy map [rows, NK] into a [rows, NW] int32 bitmask."""
+    rows, nk = shat.shape
+    nw = (nk + 31) // 32
+    nw = nw + (nw & 1)                    # whole 64-bit windows: the FMHA kernel walks them in pairs
+    mask = torch.empty((rows, nw), dtype=torch.int32, device=shat.device)
+    _solattn_threshold_pack_kernel[(rows,)](
+        shat, beta.contiguous(), mask, nk, nw, nq,
+        shat.stride(0), mask.stride(0),
+        BLOCK=256, H=nheads, num_warps=4,
+    )
+    return mask
+
+
+def _solattn_bitmask_mode() -> bool:
+    """Emit a bitmask (fused expansion in the kernel) rather than a ragged index list."""
+    import os
+
+    return os.environ.get("AITER_SOLATTN_BITMASK", "1") != "0"
+
+
+def _solattn_fused_mode() -> bool:
+    """Use the single-launch Triton router once beta is calibrated."""
+    import os
+
+    return os.environ.get("AITER_SOLATTN_FUSED", "1") != "0"
+
+
+def solattn_take_lut(b, hq, sq):
+    """Peek at the block list built by the most recent sage_quant_f4f4_solo call, if it matches.
+
+    Deliberately non-destructive. A SOLATTN_LUT_HBM code object always reads the LUT pointers, so
+    handing it a 656-byte kernarg on a repeat launch would send it after uninitialized pointers.
+    The stash is cleared by the next quantization call instead.
+    """
+    if _solattn_stash.get("shape") != (b, hq, sq):
+        return None
+    return _solattn_stash.get("lut")
+
+
+def _solattn_maybe_route(q, k, layout, sm_scale):
+    """Build a Sol-Attn block list from bf16 Q/K and stash it for the kernel launch.
+
+    AITER_SOLATTN_DENSITY is the target mean density in (0, 1]; >= 1 disables routing. beta is
+    calibrated per head to that density, which is what the paper's shared standardized cutoff
+    controls. Per-head rather than global because heads differ by ~2.6x in recovered attention mass
+    at fixed density on real Wan tensors.
+    """
+    import os
+
+    target = float(os.environ.get("AITER_SOLATTN_DENSITY", "1"))
+    mass_env = float(os.environ.get("AITER_SOLATTN_MASS", "0"))
+    _solattn_stash.clear()
+    if not (0.0 < target < 1.0) and mass_env <= 0.0:
+        return
+
+    # Call window. Diffusion output is far more sensitive to the early denoising steps, where
+    # attention is also most diffuse and least worth sparsifying, so the paper leaves the first 20%
+    # of steps dense. AITER_SOLATTN_FIRST/LAST bound the attention-call index that gets routed;
+    # outside the window this returns with an empty stash and the launch is dense.
+    _solattn_stash["calls"] = _solattn_calls[0] = _solattn_calls[0] + 1
+    idx = _solattn_calls[0] - 1
+    first = int(os.environ.get("AITER_SOLATTN_FIRST", "0"))
+    last = int(os.environ.get("AITER_SOLATTN_LAST", "0"))
+    if idx < first or (last > 0 and idx >= last):
+        return
+    if layout == "bhsd":
+        b, hq, sq, d = q.shape
+        hk, sk = k.shape[1], k.shape[2]
+    else:
+        b, sq, hq, d = q.shape
+        sk, hk = k.shape[1], k.shape[2]
+    nk = sk // SOLATTN_BLOCK_KV
+    if nk < 2:
+        return
+
+    def _pool(x, blk, seq_dim):
+        """Block-mean along the sequence axis IN THE NATIVE LAYOUT.
+
+        Pooling used to permute to bhsd and call .float() first, which materializes a ~190 MB fp32
+        copy of each of Q and K and dominated the whole routing pass. Reshaping the sequence axis in
+        place is a pure view, and mean(dtype=float32) accumulates in fp32 without ever writing the
+        upcast tensor.
+        """
+        n = x.shape[seq_dim] // blk
+        shape = list(x.shape)
+        shape[seq_dim : seq_dim + 1] = [n, blk]
+        pooled = x.narrow(seq_dim, 0, n * blk).reshape(shape).mean(
+            dim=seq_dim + 1, dtype=torch.float32
+        )
+        # -> [b, h, n, d]
+        return pooled if seq_dim == 2 else pooled.permute(0, 2, 1, 3)
+
+    seq_dim = 2 if layout == "bhsd" else 1
+    if sq % SOLATTN_BLOCK_Q:
+        pad = (-sq) % SOLATTN_BLOCK_Q
+        q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad) if seq_dim == 1 else (0, 0, 0, pad))
+    qbar = _pool(q, SOLATTN_BLOCK_Q, seq_dim)
+    kbar = _pool(k, SOLATTN_BLOCK_KV, seq_dim)
+    if hq != hk:
+        kbar = kbar.repeat_interleave(hq // hk, dim=1)
+    qbar = qbar.contiguous()
+    kbar = kbar.contiguous()
+    shat = torch.einsum("bhid,bhjd->bhij", qbar, kbar) * sm_scale
+    key = (b, hq, sq, sk, round(target, 4), round(mass_env, 4),
+           os.environ.get("AITER_SOLATTN_HEAD_DENSITY", ""))
+    entry = _solattn_beta_cache.get(key)
+    if entry is not None and _solattn_bitmask_mode() and _solattn_fused_mode():
+        # Steady state: beta is known, so the whole tail is one Triton launch.
+        entry[1] += 1
+        nq = shat.shape[2]
+        packed = _solattn_route_fused(shat.reshape(-1, shat.shape[-1]), entry[0], nq, hq)
+        _solattn_stash["lut"] = (packed, None, None)
+        _solattn_stash["shape"] = (b, hq, sq)
+        return
+
+    mu = shat.mean(dim=-1, keepdim=True)
+    sigma = shat.std(dim=-1, unbiased=False, keepdim=True)
+
+    # beta is a per-head scalar that drifts slowly across layers and denoising steps, so bisecting
+    # it on every call is the single most expensive thing routing did (30 passes over the proxy map,
+    # ~1.6 ms). Calibrate once per (shape, target) and reuse; AITER_SOLATTN_RECAL forces a refresh
+    # every N calls if the drift ever matters.
+    period = int(os.environ.get("AITER_SOLATTN_RECAL", "0"))
+    stale = entry is None or (period > 0 and entry[1] % period == 0)
+    if stale:
+        # AITER_SOLATTN_MASS equalizes retained PROXY attention mass across heads instead of
+        # density. Heads differ enormously in how concentrated their attention is, so a common
+        # density over-spends on the sparse heads and starves the diffuse ones; matching mass
+        # instead reaches the same output cosine for 15-18% less work, and it needs nothing the
+        # router does not already have -- softmax over the proxy row is the criterion.
+        mass_target = float(os.environ.get("AITER_SOLATTN_MASS", "0"))
+        if mass_target > 0.0:
+            pr = torch.softmax(shat, dim=-1)
+            floor = float(os.environ.get("AITER_SOLATTN_DMIN", "0.05"))
+            ceil = float(os.environ.get("AITER_SOLATTN_DMAX", "0.60"))
+        # AITER_SOLATTN_HEAD_DENSITY gives an explicit per-head budget, for testing whether a
+        # non-uniform allocation beats a flat one at matched quality.
+        per_head = os.environ.get("AITER_SOLATTN_HEAD_DENSITY", "")
+        if per_head:
+            tgt_vec = torch.tensor([float(x) for x in per_head.split(",")],
+                                   device=shat.device)[:hq]
+        else:
+            tgt_vec = torch.full((hq,), target, device=shat.device)
+        lo = torch.full((hq,), -4.0, device=shat.device)
+        hi = torch.full((hq,), 6.0, device=shat.device)
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            sel = shat > mu + mid.view(1, -1, 1, 1) * sigma
+            if mass_target > 0.0:
+                # bisect on retained mass, but keep the resulting density inside [floor, ceil]
+                got = (pr * sel).sum(dim=-1).mean(dim=(0, 2))
+                dens = sel.float().mean(dim=(0, 2, 3))
+                over = (got > mass_target) | (dens > ceil)
+                over = over & ~(dens < floor)
+            else:
+                over = sel.float().mean(dim=(0, 2, 3)) > tgt_vec
+            lo = torch.where(over, mid, lo)
+            hi = torch.where(over, hi, mid)
+        beta = 0.5 * (lo + hi)
+        _solattn_beta_cache[key] = [beta, 1]
+    else:
+        beta = entry[0]
+        entry[1] += 1
+    mask = shat > mu + beta.view(1, -1, 1, 1) * sigma
+    # Force each row's best block on unconditionally. The guarded form (`if bool(empty.any())`)
+    # needed a device-to-host sync every call, which cost more than the block it protects; the
+    # top block is above threshold in all but degenerate rows anyway, so the density change is
+    # nil and the guarantee the kernel needs -- never an empty list -- still holds.
+    mask.scatter_(-1, shat.argmax(dim=-1, keepdim=True), True)
+
+    flat = mask.reshape(-1, nk)
+    if _solattn_bitmask_mode():
+        # One bit per KV block, 64-bit windows. The kernel expands this into its block list with a
+        # lane-mask compaction, which is ~12 instructions per 64 blocks against the 0.170 ms that
+        # torch.nonzero costs here -- the single largest item in the routing budget.
+        nw64 = (nk + 63) // 64
+        pad = nw64 * 64 - nk
+        if pad:
+            flat = torch.nn.functional.pad(flat, (0, pad))
+        w = flat.reshape(-1, nw64 * 2, 32).int()
+        shifts = (torch.arange(32, device=w.device, dtype=torch.int32)).view(1, 1, 32)
+        packed = (w << shifts).sum(dim=2).to(torch.int32).contiguous()
+        _solattn_stash["lut"] = (packed, None, None)
+    else:
+        count = flat.sum(dim=1).to(torch.int32)
+        start = torch.zeros_like(count)
+        start[1:] = torch.cumsum(count, dim=0)[:-1].to(torch.int32)
+        idx = flat.nonzero(as_tuple=True)[1].to(torch.int32).contiguous()
+        _solattn_stash["lut"] = (idx, start.contiguous(), count.contiguous())
+    _solattn_stash["shape"] = (b, hq, sq)
+
+
 def sage_quant_f4f4_solo(
     q,
     k,
@@ -378,6 +623,13 @@ def sage_quant_f4f4_solo(
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+
+    # Sol-Attn routing (experimental; AITER_SOLATTN_DENSITY unset => untouched dense behaviour).
+    # This is the only point in the call chain that still holds bf16 Q/K, which is what the pooled
+    # proxy needs, so the block list is built here and handed to the kernel through a per-call stash
+    # rather than the return tuple -- callers of this function are pinned and unpack exactly seven
+    # values. See SOL_ATTN_PLAN.md; requires a SOLATTN_LUT_HBM code object in the slot.
+    _solattn_maybe_route(q, k, layout, sm_scale)
 
     q_rot, k_rot, delta_s = rotation_smooth_qk(
         q,

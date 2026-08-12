@@ -1035,7 +1035,10 @@ namespace py = pybind11;
           py::arg("k_descale"),                                                   \
           py::arg("v_descale"),                                                   \
           py::arg("softmax_scale"),                                               \
-          py::arg("out") = std::nullopt);                                         \
+          py::arg("out") = std::nullopt,                                          \
+          py::arg("kv_block_indices") = std::nullopt,                             \
+          py::arg("lut_start") = std::nullopt,                                    \
+          py::arg("lut_count") = std::nullopt);                                   \
     m.def("fmha_v3_fwd_fp8_sparse_persistent",                                    \
           &aiter::torch_itfs::fmha_v3_fwd_fp8_sparse_persistent,                  \
           py::arg("q"),                                                           \

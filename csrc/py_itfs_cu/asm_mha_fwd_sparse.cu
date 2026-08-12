@@ -18,6 +18,8 @@ namespace torch_itfs {
 static constexpr int ASM_SPARSE_BLOCK_M = 256; // kTileQ
 static constexpr int ASM_SPARSE_BLOCK_N = 128; // kTileKV
 static constexpr int ASM_SPARSE_HEAD_DIM = 128;
+// The f4f4 solo kernel routes per 64-row Q tile -- its own tile size -- not per ASM_SPARSE_BLOCK_M.
+static constexpr int kF4f4SoloLutTileQ = 64;
 
 std::vector<at::Tensor>
 fmha_v3_fwd_sparse(at::Tensor& q,
@@ -1833,7 +1835,10 @@ fmha_v3_fwd_f4f4_solo(at::Tensor& q,
                       const at::Tensor& k_descale,
                       const at::Tensor& v_descale,
                       float softmax_scale,
-                      std::optional<at::Tensor> out_)
+                      std::optional<at::Tensor> out_,
+                      std::optional<at::Tensor> kv_block_indices_,
+                      std::optional<at::Tensor> lut_start_,
+                      std::optional<at::Tensor> lut_count_)
 {
     auto is_byte = [](at::ScalarType d) {
         return d == at::ScalarType::Char || d == at::ScalarType::Byte;
@@ -1985,9 +1990,57 @@ fmha_v3_fwd_f4f4_solo(at::Tensor& q,
     a.block_scale_size_q = 128;
     a.block_scale_size_kv = 128;
 
+    // Optional block-sparse LUT. Absent => the historical dense 656-byte launch. Present => the
+    // 704-byte sparse launch, which requires a SOLATTN_LUT .co in the slot. Unlike the sibling
+    // sparse kernels the query block is 64 rows, matching the solo tile, not ASM_SPARSE_BLOCK_M.
     a.kv_block_indices_ptr = nullptr;
     a.lut_start_ptr = nullptr;
     a.lut_count_ptr = nullptr;
+    if(kv_block_indices_.has_value())
+    {
+        const at::Tensor& kv_block_indices = kv_block_indices_.value();
+        TORCH_CHECK(kv_block_indices.dtype() == torch::kInt32,
+                    "fmha_v3_fwd_f4f4_solo: kv_block_indices must be int32.");
+        CHECK_DEVICE(kv_block_indices);
+        TORCH_CHECK(kv_block_indices.is_contiguous(),
+                    "fmha_v3_fwd_f4f4_solo: kv_block_indices must be contiguous.");
+        const int64_t num_q_blocks =
+            (static_cast<int64_t>(seqlen_q) + kF4f4SoloLutTileQ - 1) / kF4f4SoloLutTileQ;
+        const int64_t rows = static_cast<int64_t>(batch_size) * num_heads * num_q_blocks;
+
+        if(lut_start_.has_value() || lut_count_.has_value())
+        {
+            // Ragged index list: kv_block_indices holds block numbers, lut_start/lut_count slice it.
+            TORCH_CHECK(lut_start_.has_value() && lut_count_.has_value(),
+                        "fmha_v3_fwd_f4f4_solo: lut_start and lut_count must be supplied together.");
+            const at::Tensor& lut_start = lut_start_.value();
+            const at::Tensor& lut_count = lut_count_.value();
+            TORCH_CHECK(lut_start.dtype() == torch::kInt32 && lut_count.dtype() == torch::kInt32,
+                        "fmha_v3_fwd_f4f4_solo: LUT tensors must be int32.");
+            CHECK_DEVICE(lut_start);
+            CHECK_DEVICE(lut_count);
+            TORCH_CHECK(lut_start.is_contiguous() && lut_count.is_contiguous(),
+                        "fmha_v3_fwd_f4f4_solo: LUT tensors must be contiguous.");
+            TORCH_CHECK(lut_start.numel() == rows && lut_count.numel() == rows,
+                        "fmha_v3_fwd_f4f4_solo: lut_start/lut_count must hold ", rows,
+                        " entries (batch*nhead_q*ceil(seqlen_q/", kF4f4SoloLutTileQ,
+                        ")); got ", lut_start.numel(), "/", lut_count.numel());
+            a.lut_start_ptr = lut_start.data_ptr();
+            a.lut_count_ptr = lut_count.data_ptr();
+        }
+        else
+        {
+            // Bitmask: one bit per KV block, 64-bit windows, expanded to a list inside the kernel.
+            const int64_t nblk  = static_cast<int64_t>(seqlen_k) / ASM_SPARSE_BLOCK_N;
+            const int64_t nw64  = (nblk + 63) / 64;
+            const int64_t words = rows * nw64 * 2;
+            TORCH_CHECK(kv_block_indices.numel() == words,
+                        "fmha_v3_fwd_f4f4_solo: block bitmask must hold ", words,
+                        " int32 words (rows*ceil(nblk/64)*2); got ",
+                        kv_block_indices.numel());
+        }
+        a.kv_block_indices_ptr = kv_block_indices.data_ptr();
+    }
 
     ck_tile::stream_config stream_config{stream};
     float t = aiter::fmha_fwd_v3_f4f4_solo(a, stream_config);

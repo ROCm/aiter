@@ -190,7 +190,13 @@ fmha_v3_fwd_f4f4_solo(at::Tensor& q,                  // [b, sq, hq, d/2], int8/
                       const at::Tensor& k_descale,     // E8M0 bytes, [b, sk, hk, d/32]
                       const at::Tensor& v_descale,     // uint8 E8M0 block-scale image
                       float softmax_scale,
-                      std::optional<at::Tensor> out_ = std::nullopt); // bf16
+                      std::optional<at::Tensor> out_ = std::nullopt,  // bf16
+                      // Optional block-sparse LUT. Query block is 64 rows (the solo tile), so
+                      // lut_start/lut_count hold batch*nhead_q*ceil(seqlen_q/64) int32 entries.
+                      // Supplying it selects the 704-byte kernarg and requires a SOLATTN_LUT .co.
+                      std::optional<at::Tensor> kv_block_indices_ = std::nullopt,
+                      std::optional<at::Tensor> lut_start_ = std::nullopt,
+                      std::optional<at::Tensor> lut_count_ = std::nullopt);
 
 } // namespace torch_itfs
 } // namespace aiter
