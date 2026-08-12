@@ -680,6 +680,76 @@ struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+// Four waves share one 128-column a_scaled slab across a 256-row dO output
+// tile.  Each wave owns eight native C tiles and pipelines one K16 fragment
+// at a time; compared with the two-wave BM128 candidate this halves the grid
+// and each thread's direct-to-LDS vector count while retaining four resident
+// waves in the 48 KiB workgroup.
+struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort1DualLdsWave2x2
+    : Bf16Traits<Family::Dw2, 256, 128, 64, 256, 1, false>
+{
+    static constexpr int EXPERT_COHORT = 1;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DUAL_OPERAND_LDS = true;
+    static constexpr bool PIPELINE_REDUCTION_FRAGMENTS = true;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 4;
+    static constexpr int E_N = 2;
+    static constexpr int E_K = 4;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 4;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
+struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4DualLdsWave2x2
+    : Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort1DualLdsWave2x2
+{
+    static constexpr int EXPERT_COHORT = 4;
+};
+
+struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4OutsideMidRoutes
+    : Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4DualLdsWave2x2
+{
+    static constexpr int EXCLUDED_MIN_ROUTE_COUNT = 20993;
+    static constexpr int EXCLUDED_MAX_ROUTE_COUNT = 30720;
+};
+
+struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledWave2x2MidRoutes
+    : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
+{
+    static constexpr int MIN_ROUTE_COUNT = 20993;
+    static constexpr int MAX_ROUTE_COUNT = 30720;
+};
+
+struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledAdaptiveOutsideMidRoutes
+    : Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4OutsideMidRoutes
+{
+    static constexpr bool ADAPTIVE_BM256_ROUTE_SPLIT = true;
+};
+
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
     : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {

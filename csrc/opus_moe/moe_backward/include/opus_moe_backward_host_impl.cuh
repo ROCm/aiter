@@ -262,6 +262,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int cohort2_direct_lds_kid = 7;
     constexpr int cohort1_bm128_dual_lds_kid = 9;
     constexpr int bm128x128_adaptive_routes_kid = 10;
+    constexpr int bm256x128_adaptive_routes_kid = 11;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the second device-side launch used to
@@ -276,12 +277,36 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         static_cast<uint64_t>(kargs.route.num_experts) *
         static_cast<uint64_t>(kargs.model_dim / 128) *
         static_cast<uint64_t>(kargs.inter_dim / 128);
+    const bool bm256x128_compatible =
+        kargs.model_dim % 256 == 0 && kargs.inter_dim % 128 == 0;
+    const uint64_t bm256_output_blocks =
+        static_cast<uint64_t>(kargs.route.num_experts) *
+        static_cast<uint64_t>(kargs.model_dim / 256) *
+        static_cast<uint64_t>(kargs.inter_dim / 128);
+    const uint64_t bm256_blocks_per_expert =
+        static_cast<uint64_t>(kargs.model_dim / 256) *
+        static_cast<uint64_t>(kargs.inter_dim / 128);
     const uint64_t average_padded_routes =
         static_cast<uint64_t>(kargs.route.sorted_capacity) /
         static_cast<uint64_t>(kargs.route.num_experts);
     if(bm128x128_compatible && wide_output_blocks >= 512 &&
        average_padded_routes >= 128)
+    {
+        // On a 256-CU gfx950, 4096 BM256xBN128 tiles provide sixteen CTA
+        // rounds.  Four waves then share a_scaled across twice as many dO
+        // rows, and each wave pipelines four K16 fragments through eight
+        // independent native C tiles.  Bound the per-expert run length so
+        // sparse routing cannot leave a very wide expert-major tail.  The
+        // selected kid retains a device-side mid-route fallback to the
+        // BM128 four-wave kernel; no host synchronization is introduced.
+        constexpr uint64_t bm256_min_output_blocks = 4096;
+        constexpr uint64_t bm256_max_blocks_per_expert = 64;
+        if(bm256x128_compatible &&
+           bm256_output_blocks >= bm256_min_output_blocks &&
+           bm256_blocks_per_expert <= bm256_max_blocks_per_expert)
+            return bm256x128_adaptive_routes_kid;
         return bm128x128_adaptive_routes_kid;
+    }
     const uint64_t source_row_elements =
         static_cast<uint64_t>(kargs.model_dim) +
         static_cast<uint64_t>(kargs.inter_dim);

@@ -699,14 +699,14 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int BN = T::B_N;
     constexpr int BK = T::B_K;
     constexpr int VEC = T::VEC_A;
-    static_assert((BM == 64 || BM == 128) &&
+    static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 64 || BN == 128) && BK == 64);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
     static_assert(T::VEC_B == VEC && T::VEC_TR_B == 4);
     constexpr int a_m_slabs = BM / 64;
     constexpr int b_n_slabs = BN / 64;
-    static_assert(a_m_slabs * b_n_slabs <= 4,
-                  "K5 supports at most a 128x128 output tile");
+    static_assert(a_m_slabs * b_n_slabs <= 8,
+                  "K5 supports at most eight 64x64 operand slab pairs");
     static_assert(T::E_M * T::T_M == BM / T::W_M);
     static_assert(T::E_N * T::T_N == BN / T::W_N);
     static_assert((BM == 64 && BN == 64) || T::DUAL_OPERAND_LDS,
@@ -750,6 +750,13 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         if(route_count > T::MAX_ROUTE_COUNT)
             return;
     }
+    if constexpr(requires { T::EXCLUDED_MIN_ROUTE_COUNT;
+                            T::EXCLUDED_MAX_ROUTE_COUNT; })
+    {
+        if(route_count >= T::EXCLUDED_MIN_ROUTE_COUNT &&
+           route_count <= T::EXCLUDED_MAX_ROUTE_COUNT)
+            return;
+    }
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());
@@ -782,6 +789,11 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K>{},
+        mfma_adaptor_swap_ab{});
+    auto mma_k_fragment = make_tiled_mma<D_A, D_B, D_ACC>(
+        seq<T::E_M, T::E_N, 1>{},
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
@@ -1018,6 +1030,69 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
             __builtin_amdgcn_s_barrier();
         }
 
+        if constexpr(requires { T::PIPELINE_REDUCTION_FRAGMENTS; })
+        {
+            static_assert(T::PIPELINE_REDUCTION_FRAGMENTS);
+            static_assert(T::DUAL_OPERAND_LDS && T::E_K == 4);
+            static_assert(std::is_same_v<
+                          typename decltype(mma)::vtype_c,
+                          typename decltype(mma_k_fragment)::vtype_c>);
+            opus::static_for<T::E_K>([&](auto ek) {
+                typename decltype(mma_k_fragment)::vtype_a v_a_fragment;
+                opus::static_for<T::E_M>([&](auto em) {
+                    const int native_m = em.value * T::T_M + wave_id_m;
+                    const int base =
+                        (a_read_lane_base +
+                         (native_m / 2) * 64 * BK * sizeof(D_A)) ^
+                        ((native_m % 2) * 0x40);
+                    constexpr int byte_offset = ek.value * 2048;
+                    auto lo =
+                        s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
+                            base);
+                    auto hi =
+                        s_tile.template _tr_load<T::VEC_TR_B, byte_offset>(
+                            base ^ 0x220);
+#pragma unroll
+                    for(int j = 0; j < T::VEC_TR_B; ++j)
+                    {
+                        v_a_fragment[em.value * 2 * T::VEC_TR_B + j] =
+                            lo[j];
+                        v_a_fragment[em.value * 2 * T::VEC_TR_B +
+                                     T::VEC_TR_B + j] = hi[j];
+                    }
+                });
+                typename decltype(mma_k_fragment)::vtype_b v_b_fragment;
+                opus::static_for<T::E_N>([&](auto en) {
+                    const int native_n = en.value * T::T_N + wave_id_n;
+                    const int base =
+                        (b_read_lane_base +
+                         (native_n / 2) * 64 * BK * sizeof(D_B)) ^
+                        ((native_n % 2) * 0x40);
+                    constexpr int byte_offset = ek.value * 2048;
+                    auto lo =
+                        s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                            base);
+                    auto hi =
+                        s_tile_b.template _tr_load<T::VEC_TR_B, byte_offset>(
+                            base ^ 0x220);
+#pragma unroll
+                    for(int j = 0; j < T::VEC_TR_B; ++j)
+                    {
+                        v_b_fragment[en.value * 2 * T::VEC_TR_B + j] =
+                            lo[j];
+                        v_b_fragment[en.value * 2 * T::VEC_TR_B +
+                                     T::VEC_TR_B + j] = hi[j];
+                    }
+                });
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_setprio(1);
+                v_c = mma_k_fragment(v_a_fragment, v_b_fragment, v_c);
+                __builtin_amdgcn_s_setprio(0);
+            });
+            __builtin_amdgcn_sched_barrier(0);
+            return;
+        }
+
         typename decltype(mma)::vtype_a v_a;
         opus::static_for<T::E_M>([&](auto em) {
             opus::static_for<T::E_K>([&](auto ek) {
@@ -1203,6 +1278,17 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     static_assert(T::B_K == 64, "dw2 registers the K64 kernel");
     AITER_CHECK(kargs.split_k == 1,
                 "dw2: first Opus instance requires split_k=1");
+    if constexpr(requires { T::ADAPTIVE_BM256_ROUTE_SPLIT; })
+    {
+        static_assert(T::ADAPTIVE_BM256_ROUTE_SPLIT);
+        dw2_launch_gfx950<
+            Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4OutsideMidRoutes>(
+            kargs, stream);
+        dw2_launch_gfx950<
+            Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledWave2x2MidRoutes>(
+            kargs, stream);
+        return;
+    }
     if constexpr(requires { T::ADAPTIVE_ROUTE_SPLIT; })
     {
         static_assert(T::ADAPTIVE_ROUTE_SPLIT);

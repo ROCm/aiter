@@ -88,7 +88,9 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
 | K4 `dw1` wide/long wave8 baseline | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
 | K4 `dw1` wide/long production | 11 | `BM256 x BN128 x BK32`, 256 threads + eight native C tiles per wave |
-| K5 `dw2` | 3 | `BM64 x BN64 x BK64` |
+| K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
+| K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
+| K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments + route-length hybrid |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
 
@@ -122,6 +124,18 @@ and smaller output grids; this avoids the old expert-count proxy selecting
 BM256 for narrow `2I` grids. Kid 8 covers large BM64 problems, and kid 5
 remains the small/degenerate fallback. Kid 10 remains available as the
 512-thread wave8 comparison instance but is not selected by production auto.
+
+K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
+`I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output
+tiles per expert, and at least 128 average padded routes.  Its four waves share
+one 128-column `a_scaled` slab across 256 `dO` rows; each wave owns eight native
+C tiles and consumes the K64 reduction as four K16 transpose-load/MFMA
+fragments.  Two device kernels partition experts without a host readback:
+route intervals from 20993 through 30720 use the BM128 kid-10 kernel, while
+all other intervals use BM256.  The target wide-grid kernel uses 178 VGPRs and
+48 KiB LDS with no scratch or spills; the BM128 fallback uses 146 VGPRs and
+32 KiB LDS.  Shapes outside that launch regime retain kid 10 or the existing
+smaller fallbacks.
 
 ## Shape contract
 
