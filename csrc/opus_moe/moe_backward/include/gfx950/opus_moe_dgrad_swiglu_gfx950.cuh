@@ -23,6 +23,7 @@ struct opus_moe_dgrad_swiglu_kargs
     void* __restrict__ ptr_dact;
     void* __restrict__ ptr_dscore_partials;
     const int32_t* __restrict__ expert_offsets;
+    const int32_t* __restrict__ tile_offsets;
     int m;
     int n;
     int k;
@@ -37,31 +38,21 @@ struct opus_moe_dgrad_swiglu_kargs
     int stride_dact_batch;
     int stride_dscore;
     int ragged;
+    int compact_tiles;
+    int num_tiles;
 };
 
-template<typename UserTraits, bool WRITE_DSCORE = false, bool APPLY_SWIGLU = true>
-__global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
-void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
+__device__ __forceinline__ void opus_moe_dgrad_tile_map(
+    int wgid,
+    int num_tiles_m,
+    int num_tiles_n,
+    int& tile_m,
+    int& tile_n)
 {
-#if defined(__gfx950__)
-    using namespace opus;
-    using namespace opus_mono_tile_gfx950;
-    using opus::operator""_I;
-    using T = kernel_traits<opus::remove_cvref_t<UserTraits>>;
-    using D_A = typename T::D_A;
-    using D_B = typename T::D_B;
-    using D_C = typename T::D_C;
-    using D_ACC = typename T::D_ACC;
-
-    const int wgid = block_id_x();
-    const int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
-    const int num_tiles_n = kargs.n / T::B_N;
-    int tile_m = wgid % num_tiles_m;
-    int tile_n = wgid / num_tiles_m;
+    tile_m = wgid % num_tiles_m;
+    tile_n = wgid / num_tiles_m;
     if((num_tiles_m & 1) == 0 && (num_tiles_n & 1) == 0)
     {
-        // Keep two A row panels and two B column panels live as one roughly
-        // 3.5 MiB working set instead of rereading A for every N tile.
         constexpr int GROUP = 2;
         const int group_id = wgid / (GROUP * GROUP);
         const int in_group = wgid % (GROUP * GROUP);
@@ -71,9 +62,6 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     }
     else if(num_tiles_m > 1 && (num_tiles_n & 1) == 0)
     {
-        // Swizzle the even M prefix in 2x2 groups and leave the final odd M
-        // tile as a compact remainder.  This keeps the same A/B panel reuse
-        // for ragged 23-tile launches without padding every expert grid to 24.
         constexpr int GROUP = 2;
         const int grouped_tiles_m = num_tiles_m - 1;
         const int grouped_blocks = grouped_tiles_m * num_tiles_n;
@@ -91,10 +79,53 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             tile_n = wgid - grouped_blocks;
         }
     }
+}
+
+template<typename UserTraits, bool WRITE_DSCORE = false, bool APPLY_SWIGLU = true>
+__global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
+void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
+{
+#if defined(__gfx950__)
+    using namespace opus;
+    using namespace opus_mono_tile_gfx950;
+    using opus::operator""_I;
+    using T = kernel_traits<opus::remove_cvref_t<UserTraits>>;
+    using D_A = typename T::D_A;
+    using D_B = typename T::D_B;
+    using D_C = typename T::D_C;
+    using D_ACC = typename T::D_ACC;
+
+    const int wgid = block_id_x();
+    const int num_tiles_n = kargs.n / T::B_N;
+    int batch_id = block_id_z();
+    int local_wgid = wgid;
+    int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
+    if(kargs.compact_tiles)
+    {
+        // Locate the expert whose variable-sized block interval owns this CTA.
+        // tile_offsets is tiny (65 int32 values) and remains hot in cache.
+        int lo = 0;
+        int hi = kargs.batch;
+        while(lo + 1 < hi)
+        {
+            const int mid = (lo + hi) / 2;
+            if(wgid >= kargs.tile_offsets[mid] * num_tiles_n)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        batch_id = lo;
+        const int first_tile = kargs.tile_offsets[batch_id];
+        num_tiles_m = kargs.tile_offsets[batch_id + 1] - first_tile;
+        local_wgid = wgid - first_tile * num_tiles_n;
+    }
+    int tile_m;
+    int tile_n;
+    opus_moe_dgrad_tile_map(
+        local_wgid, num_tiles_m, num_tiles_n, tile_m, tile_n);
     const int row = tile_m * T::B_M;
     const int col = tile_n * T::B_N;
 
-    const int batch_id = block_id_z();
     int batch_row_start = 0;
     int batch_m = kargs.m;
     if(kargs.ragged)
@@ -410,9 +441,11 @@ inline void opus_moe_dgrad_swiglu_dscore_launch_gfx950(
     const opus_moe_dgrad_swiglu_kargs& kargs,
     hipStream_t stream)
 {
-    const int num_tiles_m = (kargs.m + 191) / 192;
     const int num_tiles_n = kargs.n / 256;
-    dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
+    const int num_blocks = kargs.compact_tiles
+        ? kargs.num_tiles * num_tiles_n
+        : ((kargs.m + 191) / 192) * num_tiles_n;
+    dim3 grid(num_blocks, 1, kargs.compact_tiles ? 1 : kargs.batch);
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<
         opus_moe_dgrad_swiglu_traits_gfx950, true>
@@ -423,9 +456,11 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
     const opus_moe_dgrad_swiglu_kargs& kargs,
     hipStream_t stream)
 {
-    const int num_tiles_m = (kargs.m + 191) / 192;
     const int num_tiles_n = kargs.n / 256;
-    dim3 grid(num_tiles_m * num_tiles_n, 1, kargs.batch);
+    const int num_blocks = kargs.compact_tiles
+        ? kargs.num_tiles * num_tiles_n
+        : ((kargs.m + 191) / 192) * num_tiles_n;
+    dim3 grid(num_blocks, 1, kargs.compact_tiles ? 1 : kargs.batch);
     dim3 block(512);
     opus_moe_dgrad_swiglu_kernel_gfx950<
         opus_moe_dgrad_swiglu_traits_gfx950, false, false>

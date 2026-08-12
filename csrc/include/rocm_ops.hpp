@@ -392,6 +392,8 @@ namespace py = pybind11;
           py::arg("d_act_input"), \
           py::arg("dscore_partials"), \
           py::arg("expert_offsets"), \
+          py::arg("tile_offsets"), \
+          py::arg("num_tiles"), \
           py::arg("max_m")); \
     m.def("opus_moe_dgrad_mono_ragged_bf16", \
           &opus_moe_dgrad_mono_ragged_bf16, \
@@ -400,6 +402,8 @@ namespace py = pybind11;
           py::arg("w"), \
           py::arg("out"), \
           py::arg("expert_offsets"), \
+          py::arg("tile_offsets"), \
+          py::arg("num_tiles"), \
           py::arg("max_m")); \
     m.def("opus_moe_wgrad_mfma_bf16", \
           &opus_moe_wgrad_mfma_bf16, \

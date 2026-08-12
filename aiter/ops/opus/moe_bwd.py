@@ -183,12 +183,34 @@ def _build_dgrad_block_meta(offs: Tensor, B_M: int):
         while s < end:
             e_ids.append(e); bms.append(s); bme.append(end)
             s += B_M
-    meta = torch.tensor(e_ids + bms + bme, dtype=torch.int32, device=dev)
     n = len(e_ids)
     lens = [o[e + 1] - o[e] for e in range(E)]
     uniform_m = lens[0] if lens and all(m == lens[0] for m in lens) else None
     max_m = max(lens, default=0)
-    return meta[:n], meta[n:2 * n], meta[2 * n:], uniform_m, max_m
+
+    if uniform_m is None:
+        mono_tile_offsets = [0]
+        for m in lens:
+            mono_tile_offsets.append(mono_tile_offsets[-1] + (m + 191) // 192)
+        num_mono_tiles = mono_tile_offsets[-1]
+    else:
+        mono_tile_offsets = []
+        num_mono_tiles = 0
+    meta = torch.tensor(
+        e_ids + bms + bme + mono_tile_offsets,
+        dtype=torch.int32,
+        device=dev,
+    )
+    mono_tile_offsets = meta[3 * n:] if uniform_m is None else None
+    return (
+        meta[:n],
+        meta[n:2 * n],
+        meta[2 * n:],
+        uniform_m,
+        max_m,
+        mono_tile_offsets,
+        num_mono_tiles,
+    )
 
 
 def build_dgrad_block_meta(offs: Tensor, B_M: int):
@@ -197,7 +219,15 @@ def build_dgrad_block_meta(offs: Tensor, B_M: int):
     cumulative -> (sorted_expert_ids, block_m_start, block_m_end) [num_blocks] i32.
     Computed on host (E is tiny; ~10 GPU-op launches cost >150us here) then
     uploaded once."""
-    seid, bms, bme, _uniform_m, _max_m = _build_dgrad_block_meta(offs, B_M)
+    (
+        seid,
+        bms,
+        bme,
+        _uniform_m,
+        _max_m,
+        _tile_offs,
+        _num_tiles,
+    ) = _build_dgrad_block_meta(offs, B_M)
     return seid, bms, bme
 
 
@@ -327,6 +357,8 @@ def _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
     d_act_input: Tensor,
     dscore_partials: Tensor,
     expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    num_tiles: int,
     max_m: int,
 ) -> None: ...
 
@@ -341,6 +373,8 @@ def _opus_moe_dgrad_mono_ragged_bf16_raw(
     w_bnk: Tensor,
     out: Tensor,
     expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    num_tiles: int,
     max_m: int,
 ) -> None: ...
 
@@ -412,6 +446,8 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
     w_bnk: Tensor,
     act_input: Tensor,
     expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    num_tiles: int,
     max_m: int,
     out: Tensor,
     dscore_partials: Tensor,
@@ -424,6 +460,7 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         or act_input.shape != expected
         or out.shape != expected
         or expert_offsets.shape != (E + 1,)
+        or tile_offsets.shape != (E + 1,)
         or dscore_partials.shape != (dy.shape[0], N // 256)
     ):
         raise ValueError("invalid ragged fused dgrad inputs")
@@ -434,6 +471,8 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         out,
         dscore_partials,
         expert_offsets,
+        tile_offsets,
+        num_tiles,
         max_m,
     )
     return out
@@ -443,6 +482,8 @@ def opus_moe_dgrad_mono_ragged_prepared(
     dy: Tensor,
     w_bnk: Tensor,
     expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    num_tiles: int,
     max_m: int,
     out: Tensor,
 ) -> Tensor:
@@ -452,10 +493,17 @@ def opus_moe_dgrad_mono_ragged_prepared(
         dy.shape[1] != K
         or out.shape != (dy.shape[0], N)
         or expert_offsets.shape != (E + 1,)
+        or tile_offsets.shape != (E + 1,)
     ):
         raise ValueError("invalid ragged mono dgrad inputs")
     _opus_moe_dgrad_mono_ragged_bf16_raw(
-        dy.contiguous(), w_bnk.contiguous(), out, expert_offsets, max_m
+        dy.contiguous(),
+        w_bnk.contiguous(),
+        out,
+        expert_offsets,
+        tile_offsets,
+        num_tiles,
+        max_m,
     )
     return out
 
@@ -883,9 +931,15 @@ class OpusMoERefFunc(torch.autograd.Function):
         x_g = x[x_gather_idx].contiguous()
 
         offs = _offs_from_lens(lens)
-        seid, bms, bme, uniform_m, max_m = _build_dgrad_block_meta(
-            offs, _DGRAD_B_M
-        )
+        (
+            seid,
+            bms,
+            bme,
+            uniform_m,
+            max_m,
+            mono_tile_offsets,
+            num_mono_tiles,
+        ) = _build_dgrad_block_meta(offs, _DGRAD_B_M)
 
         def fwd_gemm(dy, w_nat):  # dh[m,n]=sum_k dy[m,k]*w_nat[e,n,k]
             out = torch.empty(dy.shape[0], w_nat.shape[1], device=dy.device, dtype=torch.bfloat16)
@@ -908,6 +962,8 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.dgrad_meta = (seid, bms, bme)
         ctx.uniform_m = uniform_m
         ctx.max_expert_m = max_m
+        ctx.mono_tile_offsets = mono_tile_offsets
+        ctx.num_mono_tiles = num_mono_tiles
         ctx.offs = offs
         # dx reverse map for the deterministic gather-sum (no atomics); built once
         # here (moe-sort semantics), reused in backward.
@@ -948,7 +1004,13 @@ class OpusMoERefFunc(torch.autograd.Function):
                 and wt.shape[1] % 256 == 0
             ):
                 return opus_moe_dgrad_mono_ragged_prepared(
-                    dy_op.contiguous(), wt, offs, ctx.max_expert_m, out
+                    dy_op.contiguous(),
+                    wt,
+                    offs,
+                    ctx.mono_tile_offsets,
+                    ctx.num_mono_tiles,
+                    ctx.max_expert_m,
+                    out,
                 )
             return opus_moe_dgrad_mfma_prepared(dy_op.contiguous(), wt, seid, bms, bme, out)
 
@@ -981,6 +1043,8 @@ class OpusMoERefFunc(torch.autograd.Function):
                         wt,
                         act_input,
                         offs,
+                        ctx.mono_tile_offsets,
+                        ctx.num_mono_tiles,
                         ctx.max_expert_m,
                         out,
                         dscore_partials,
