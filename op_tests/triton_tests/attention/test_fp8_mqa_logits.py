@@ -149,3 +149,50 @@ def test_fp8_mqa_logits(
     if ref_neginf_mask.all():
         return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.parametrize("cu_start", [1, 128, 2529])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("head_dim", [64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_nonzero_cu_start(
+    cu_start: int, num_heads: int, head_dim: int
+) -> None:
+    """Regression: rows whose kv window does not start at column 0 -- under
+    vLLM, every row of the 2nd+ prefill request packed into one indexer
+    chunk. The epilogue store masks scaled start_ind by BLOCK_KV."""
+    torch.manual_seed(0)
+    block_kv = 128  # BLOCK_KV on gfx1250
+    seg_lens = [
+        n * block_kv + tail
+        for n in range(6)
+        for tail in (0, 37)
+        if n * block_kv + tail > 0
+    ]
+    s_q = len(seg_lens)
+    s_k = cu_start + max(seg_lens)
+
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+
+    ks = torch.full((s_q,), cu_start, dtype=torch.int, device="cuda")
+    ke = ks + torch.tensor(seg_lens, dtype=torch.int, device="cuda")
+
+    q_fp8 = q.to(e4m3_type)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+
+    ref_logits, _ref_cost = ref_fp8_mqa_logits(
+        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
+    )
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+
+    ref_neginf_mask = ref_logits == float("-inf")
+    neginf_mask = logits == float("-inf")
+    assert torch.equal(neginf_mask, ref_neginf_mask)
+    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+    logits = logits.masked_fill(neginf_mask, 0)
+    diff = calc_diff(logits, ref_logits)
+    assert diff < 1e-3, f"{diff=}"
