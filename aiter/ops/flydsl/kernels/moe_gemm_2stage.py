@@ -107,13 +107,14 @@ def compile_moe_gemm1(
     scale_is_bf16: bool = False,
     k_batch: int = 1,
     act: str = "silu",
+    swiglu_limit: float = 7.0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
     act:
       - "silu":   out = silu(gate) * up
       - "swiglu": out = gate * sigmoid(1.702 * gate) * (clamp(up, -lim, lim) + 1)
-                  with gate clamped to [-inf, lim] and up to [-lim, lim] (lim=7.0).
+                  with gate clamped to [-inf, lim] and up to [-lim, lim].
                   Same formula as mixed_moe_gemm_2stage_common.swiglu_mul_vec4.
 
     in_dtype:
@@ -142,6 +143,11 @@ def compile_moe_gemm1(
     if act not in _valid_acts:
         raise ValueError(f"act must be one of {_valid_acts}, got {act!r}")
     is_swiglu = act == "swiglu"
+    swiglu_limit = float(swiglu_limit)
+    if is_swiglu and swiglu_limit <= 0.0:
+        raise ValueError(
+            f"swiglu_limit must be positive for swiglu, got {swiglu_limit}"
+        )
     is_int4_bf16 = (
         in_dtype == "int4_bf16"
     )  # W4A16: bf16 activations, packed int4 weights
@@ -314,7 +320,10 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    _act_tag = "" if act == "silu" else f"_{act}"
+    _limit_tag = (
+        f"_lim{format(swiglu_limit, 'g').replace('.', 'p')}" if is_swiglu else ""
+    )
+    _act_tag = "" if act == "silu" else f"_{act}{_limit_tag}"
     module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
@@ -411,8 +420,8 @@ def compile_moe_gemm1(
                 alpha = arith.constant(1.702)
                 one = arith.constant(1.0)
                 neg_log2e = arith.constant(-1.4426950408889634)
-                lim = arith.constant(7.0)
-                neg_lim = arith.constant(-7.0)
+                lim = arith.constant(swiglu_limit)
+                neg_lim = arith.constant(-swiglu_limit)
                 g = arith.minimumf(g, lim)
                 u = arith.minimumf(u, lim)
                 u = arith.maximumf(u, neg_lim)
@@ -1174,7 +1183,7 @@ def compile_moe_gemm1(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -2047,6 +2056,7 @@ def compile_moe_gemm2(
     use_cshuffle_epilog: bool | None = None,
     accumulate: bool = True,
     scale_is_bf16: bool = False,
+    sort_block_m: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2097,6 +2107,12 @@ def compile_moe_gemm2(
     w_is_int4 = is_int4 or is_int4_bf16
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = (in_dtype in ("int8", "int8smooth")) or is_int4
+    _sort_block_m = int(sort_block_m) if int(sort_block_m) > 0 else int(tile_m)
+    if _sort_block_m % int(tile_m) != 0:
+        raise ValueError(
+            "sort_block_m must be a multiple of tile_m for moe_gemm2, "
+            f"got sort_block_m={_sort_block_m}, tile_m={tile_m}"
+        )
 
     # Group-wise scale support for W4A16
     use_groupwise_scale = w_is_int4 and group_size > 0
@@ -2245,11 +2261,12 @@ def compile_moe_gemm2(
     # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
-    (
+    _sort_tag = f"_sbm{_sort_block_m}" if _sort_block_m != int(tile_m) else ""
+    module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}"
-        f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
+        f"{_gs_tag}{scale_tag}{_sort_tag}"
+        f"_abi3"
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -2280,7 +2297,7 @@ def compile_moe_gemm2(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm2(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
@@ -2439,8 +2456,13 @@ def compile_moe_gemm2(
             sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_idx)
             sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_idx)
 
-            # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
-            eid_nbytes_idx = size_expert_ids_in * fx.Index(4)
+            # ``size_expert_ids_in`` is the number of stage2 GEMM tiles. The
+            # routing buffer has one expert id per sorting block, which can
+            # cover multiple stage2 tiles when sort_block_m > tile_m.
+            sort_blocks_in = (size_expert_ids_in * fx.Index(tile_m)) // fx.Index(
+                _sort_block_m
+            )
+            eid_nbytes_idx = sort_blocks_in * fx.Index(4)
             expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_idx)
             bx_m = bx * fx.Index(tile_m)
 
@@ -2455,8 +2477,9 @@ def compile_moe_gemm2(
 
             def _moe_gemm2_then_body():
                 # Expert id for this M tile.
+                expert_block = bx_m // fx.Index(_sort_block_m)
                 expert_i32 = buffer_ops.buffer_load(
-                    expert_rsrc, bx, vec_width=1, dtype=T.i32
+                    expert_rsrc, expert_block, vec_width=1, dtype=T.i32
                 )
                 expert_idx = arith.index_cast(T.index, expert_i32)
                 n_idx = fx.Index(model_dim)
@@ -2993,7 +3016,7 @@ def compile_moe_gemm2(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
