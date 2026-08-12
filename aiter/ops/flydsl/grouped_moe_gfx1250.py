@@ -398,18 +398,13 @@ def _grouped_a8w4_tdm_moe(
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
-    # EP gemm2-fused scatter (combine_mode="scatter_fused"): the gemm2 TDM epilogue
-    # P2P-writes each route-weighted output row straight into peers' comb_inp; the
-    # fused combine kernel then sums it (no gather-reduce). Ported from the branch's
-    # non-TDM path onto main's TDM dispatch.
     ep_scatter=False,
     ep_arena_handle=0,
-    ep_comb_inp_off=0,
-    ep_wire_nbytes=0,
-    ep_rank=0,
-    ep_max_tok=0,
-    ep_topk=0,
-    ep_tis=None,
+    ep_combine_input_offset=0,
+    ep_slot_stride_bytes=0,
+    ep_max_tokens_per_rank=0,
+    ep_world_size=0,
+    ep_source_token_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -505,12 +500,12 @@ def _grouped_a8w4_tdm_moe(
         )
         _ep_remap = dict(
             gather_w=_gather_w_buf,
-            tis=ep_tis,
+            tis=ep_source_token_map,
             ep_rowmap=ep_rowmap,
             cap_rows=_cap_rows,
             topk=int(topk),
-            max_tok=int(ep_max_tok),
-            slot_stride=int(ep_max_tok) * int(ep_topk),
+            max_tok=int(ep_max_tokens_per_rank),
+            slot_stride=int(ep_max_tokens_per_rank) * int(topk),
         )
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
@@ -527,11 +522,12 @@ def _grouped_a8w4_tdm_moe(
     _ep_gemm2_kwargs = (
         dict(
             ep_p2p_write=1,
-            ep_off_comb_inp=int(ep_comb_inp_off),
-            ep_wire_nbytes=int(ep_wire_nbytes),
-            ep_slot_stride=int(ep_max_tok) * int(ep_topk),
             ep_arena_handle=int(ep_arena_handle),
-            ep_rowmap=ep_rowmap,
+            ep_combine_input_offset=int(ep_combine_input_offset),
+            ep_slot_stride_bytes=int(ep_slot_stride_bytes),
+            ep_destination_stride=int(ep_max_tokens_per_rank) * int(topk),
+            ep_world_size=int(ep_world_size),
+            ep_row_map=ep_rowmap,
         )
         if ep_scatter
         else {}
@@ -837,16 +833,13 @@ def grouped_gemm_gfx1250_a8w4(
     num_local_tokens: torch.Tensor | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    # EP gemm2-fused scatter (combine_mode="scatter_fused"): forwarded to the TDM
-    # path so the gemm2 epilogue P2P-scatters into peers' comb_inp.
     ep_scatter: bool = False,
     ep_arena_handle: int = 0,
-    ep_comb_inp_off: int = 0,
-    ep_wire_nbytes: int = 0,
-    ep_rank: int = 0,
-    ep_max_tok: int = 0,
-    ep_topk: int = 0,
-    ep_tis: torch.Tensor | None = None,
+    ep_combine_input_offset: int = 0,
+    ep_slot_stride_bytes: int = 0,
+    ep_max_tokens_per_rank: int = 0,
+    ep_world_size: int = 0,
+    ep_source_token_map: torch.Tensor | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the felix TDM batched GEMM (gfx1250).
 
@@ -1091,12 +1084,11 @@ def grouped_gemm_gfx1250_a8w4(
             num_local_tokens=num_local_tokens,
             ep_scatter=ep_scatter,
             ep_arena_handle=ep_arena_handle,
-            ep_comb_inp_off=ep_comb_inp_off,
-            ep_wire_nbytes=ep_wire_nbytes,
-            ep_rank=ep_rank,
-            ep_max_tok=ep_max_tok,
-            ep_topk=ep_topk,
-            ep_tis=ep_tis,
+            ep_combine_input_offset=ep_combine_input_offset,
+            ep_slot_stride_bytes=ep_slot_stride_bytes,
+            ep_max_tokens_per_rank=ep_max_tokens_per_rank,
+            ep_world_size=ep_world_size,
+            ep_source_token_map=ep_source_token_map,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             **_tdm_kw,
