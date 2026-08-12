@@ -6,20 +6,45 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 from itertools import product
+import json
 import re
 from typing import Iterator, TypeAlias
-
-from .gemm_decode_common import (
-    CACHE_POLICY_DEFAULT,
-    CACHE_POLICY_NON_TEMPORAL,
-    validate_cache_policy,
-)
 
 WAVE_SIZE = 64
 MFMA_K = 4
 BF16_BYTES = 2
 SIGNED_INT32_MAX = (1 << 31) - 1
+CACHE_POLICY_DEFAULT = 0
+CACHE_POLICY_NON_TEMPORAL = 0x2
+_CACHE_POLICY_MASK = 0x13
+def validate_cache_policy(cache_policy: int) -> None:
+    """Reject cache-policy bits that gfx942 lowering would silently discard."""
+    if not isinstance(cache_policy, int):
+        raise TypeError("cache policy must be an integer")
+    if cache_policy < 0 or cache_policy & ~_CACHE_POLICY_MASK:
+        raise ValueError(f"unsupported cache policy: {cache_policy:#x}")
+
+
+def make_decode_cache_tag(
+    *,
+    policy: str,
+    kernel_name: str,
+    arch: str,
+    num_cus: int,
+    compile_scalars: dict,
+) -> str:
+    """Return one scalar identity for explicit decode compile-time configuration."""
+    payload = {
+        "policy": policy,
+        "kernel_name": kernel_name,
+        "arch": arch,
+        "num_cus": num_cus,
+        "compile_scalars": compile_scalars,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 class DecodePolicy(str, Enum):
@@ -383,7 +408,7 @@ def block_mfma_staged_k(k: int) -> int:
 
 
 def block_mfma_lds_bytes(m: int, k: int) -> int:
-    return _align_up(m * block_mfma_staged_k(k) * BF16_BYTES, 128)
+    return m * block_mfma_staged_k(k) * BF16_BYTES
 
 
 def block_mfma_estimated_live_vgprs(

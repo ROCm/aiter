@@ -51,6 +51,10 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    UNIFIED_DECODE_TEST="op_tests/flydsl_tests/test_flydsl_gemm_decode_unified.py"
+    if [[ -f "$UNIFIED_DECODE_TEST" ]]; then
+        ALL_FILES+=("$UNIFIED_DECODE_TEST")
+    fi
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -82,6 +86,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_topk_per_row.py]=280
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=276
     FILE_TIMES[op_tests/test_gated_delta_rule.py]=232
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_gemm_decode_unified.py]=198
     FILE_TIMES[op_tests/test_pa_mtp.py]=136
     FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=101
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py]=96

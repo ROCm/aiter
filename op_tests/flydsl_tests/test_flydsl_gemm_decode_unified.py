@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
+import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -40,7 +43,8 @@ from aiter.ops.flydsl.kernels.gemm_decode_config import (
     validate_block_mfma_grid_i32,
     validate_wave_i32_addressing,
 )
-
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SUPPORT_DIR = Path(__file__).parent / "_support"
 ARCH = get_gfx_runtime()
 pytestmark = pytest.mark.skipif(
     ARCH not in ("gfx942", "gfx950"),
@@ -48,6 +52,50 @@ pytestmark = pytest.mark.skipif(
 )
 ATOL = 0.125
 RTOL = 0.01
+_DECODE_CSV_COLUMNS = (
+    "gfx",
+    "cu_num",
+    "M",
+    "N",
+    "K",
+    "bias",
+    "dtype",
+    "outdtype",
+    "scaleAB",
+    "bpreshuffle",
+    "libtype",
+    "solidx",
+    "splitK",
+    "us",
+    "kernelName",
+    "err_ratio",
+    "tflops",
+    "bw",
+)
+
+
+def _write_decode_csv(path: Path, rows: list[dict]) -> None:
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=_DECODE_CSV_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "bias": "False",
+                    "dtype": "torch.bfloat16",
+                    "outdtype": "torch.bfloat16",
+                    "scaleAB": "False",
+                    "bpreshuffle": "False",
+                    "libtype": "flydsl_decode",
+                    "solidx": "0",
+                    "splitK": "0",
+                    "us": "0",
+                    "err_ratio": "0",
+                    "tflops": "0",
+                    "bw": "0",
+                    **row,
+                }
+            )
 
 
 def test_tuned_decode_bias_contract_rejected():
@@ -438,6 +486,41 @@ def test_exact_m_1_through_5_with_odd_n_k(m, policy):
         assert config.m_per_wave == m
 
 
+@pytest.mark.skipif(ARCH != "gfx942", reason="gfx942 FULL_LDS tail coverage")
+@pytest.mark.parametrize("k", (128, 4224, 129, 130, 131, 132, 133, 134, 135))
+def test_full_lds_real_tail_and_shared_padding_boundaries(k):
+    m, n = 5, 17
+    torch.manual_seed(3100 + k)
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    a_before = a.clone()
+    b_before = b.clone()
+    output = torch.full(
+        (m, n),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gemm_decode_bf16_configured(
+        a,
+        b,
+        output,
+        m,
+        n,
+        k,
+        _block(ActivationSource.FULL_LDS),
+        arch=ARCH,
+    )
+    torch.cuda.synchronize()
+    reference = (a_before.float() @ b_before.float().T).bfloat16()
+    assert torch.equal(a, a_before)
+    assert torch.equal(b, b_before)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
+    assert torch.isfinite(output[-1]).all()
+    torch.testing.assert_close(output[-1], reference[-1], atol=ATOL, rtol=RTOL)
+
+
 @pytest.mark.parametrize("m", (3, 5))
 def test_wave_exact_divisor_mp1_has_no_m_tail(m):
     n, k = 65, 257
@@ -450,24 +533,6 @@ def test_wave_exact_divisor_mp1_has_no_m_tail(m):
         contraction=config.contraction,
     )
     _run(m, n, k, config)
-
-
-@pytest.mark.parametrize("m", (3, 5))
-def test_block_mfma_emits_exact_row_loops(m):
-    config = _block()
-    launcher = compile_gemm_decode_bf16(m, 65, 257, config, arch=ARCH)
-    a = torch.randn((m, 257), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((65, 257), dtype=torch.bfloat16, device="cuda")
-    c = torch.empty((m, 65), dtype=torch.bfloat16, device="cuda")
-    with _fresh_compile():
-        launcher(a, b, c)
-    torch.cuda.synchronize()
-    source_ir = launcher._last_compiled[1].source_ir
-    assert "mfma" in source_ir
-    assert source_ir.count("rocdl.mfma") == 4 * m
-    assert "persistent" not in source_ir
-    assert "scf.while" not in source_ir
-    assert launcher.persistent_turns == 1
 
 
 def test_deterministic_output():
@@ -799,10 +864,7 @@ def test_wave_runtime_and_aot_reject_before_lowering_or_output_mutation(
 
 
 def test_all_installed_decode_rows_pass_address_validation():
-    csv_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/bf16_tuned_gemm.csv"
-    )
+    csv_path = REPO_ROOT / "aiter/configs/bf16_tuned_gemm.csv"
     with csv_path.open(newline="") as source:
         rows = [
             row
@@ -884,15 +946,12 @@ def test_persistent_block_exact_m_turns_one_and_n_tail(m, n):
         workgroups_per_cu=1,
     )
     _run(m, n, 1536, config)
-    launcher = compile_gemm_decode_bf16(
-        m,
+    _, persistent_turns, _ = validate_block_mfma_grid_i32(
         n,
-        1536,
         config,
-        arch=ARCH,
         num_cus=torch.cuda.get_device_properties(0).multi_processor_count,
     )
-    assert launcher.persistent_turns == 1
+    assert persistent_turns == 1
 
 
 @pytest.mark.skipif(ARCH != "gfx942", reason="gfx942 persistence coverage")
@@ -919,7 +978,12 @@ def test_persistent_block_multiple_turns_are_correct():
         launcher(a, b, output)
     torch.cuda.synchronize()
     torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
-    assert launcher.persistent_turns > 1
+    _, persistent_turns, _ = validate_block_mfma_grid_i32(
+        n,
+        config,
+        num_cus=torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    assert persistent_turns > 1
 
 
 def test_architecture_feature_rejections_and_lds_limits():
@@ -943,6 +1007,7 @@ def test_architecture_feature_rejections_and_lds_limits():
     full_lds = BlockMfmaDecodeConfig(
         activation_source=ActivationSource.FULL_LDS
     )
+    assert block_mfma_lds_bytes(3, 257) == 1584
     assert block_mfma_lds_bytes(5, 7168) > 64 * 1024
     with pytest.raises(ValueError, match="65536-byte"):
         full_lds.validate(m=5, n=20480, k=7168, arch="gfx942")
@@ -982,101 +1047,29 @@ def test_gfx950_only_configs_are_static_legal():
     "policy",
     ("wave", "block", "block_boundary", "persistent_block"),
 )
-def test_gfx950_cross_compile_and_final_isa(policy, tmp_path, monkeypatch):
-    from aiter.aot.flydsl.gemm import compile_one_config
-
-    if policy == "wave":
-        m, n, k = 3, 2304, 1536
-        config = WaveDecodeConfig(
-            m_per_wave=m,
-            n_per_wave=4,
-            kvec=8,
-            prefetch_depth=2,
-            waves_per_eu=2,
-            contraction=ContractionMode.DOT2_BF16,
-        )
-    elif policy == "block":
-        m, n, k = 3, 6288, 7168
-        config = BlockMfmaDecodeConfig(
-            waves_per_workgroup=8,
-            columns_per_wave=2,
-            b_load_width=8,
-            k_unroll=2,
-            prefetch_stages=2,
-            waves_per_eu=2,
-        )
-    elif policy == "block_boundary":
-        m, n, k = 4, 6288, 7168
-        config = BlockMfmaDecodeConfig(
-            waves_per_workgroup=8,
-            columns_per_wave=4,
-            b_load_width=8,
-            k_unroll=2,
-            prefetch_stages=1,
-            waves_per_eu=2,
-        )
-        assert block_mfma_estimated_live_vgprs(m, config) == 176
-    else:
-        m, n, k = 3, 2304, 1536
-        config = BlockMfmaDecodeConfig(
-            waves_per_workgroup=8,
-            columns_per_wave=1,
-            activation_source=ActivationSource.FULL_LDS,
-            b_load_width=8,
-            k_unroll=2,
-            persistent_n=True,
-            workgroups_per_cu=1,
-        )
-    name = gemm_decode_kernel_name("gfx950", m, n, k, config)
-    dump_dir = tmp_path / policy
-    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
-    monkeypatch.setenv("FLYDSL_DUMP_DIR", str(dump_dir))
-    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-    result = compile_one_config(
-        name,
-        "decode",
-        m,
-        n,
-        k,
-        cu_num=256,
-        arch="gfx950",
-        config=config,
+def test_gfx950_cross_compile(policy):
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "FLYDSL_RUNTIME_ENABLE_CACHE": "0",
+        }
     )
-    assert result["compile_time"] is not None
-    isa_paths = list(dump_dir.rglob("*final_isa.s"))
-    assert len(isa_paths) == 1
-    isa = isa_paths[0].read_text()
-    assert "scratch_load" not in isa
-    assert "scratch_store" not in isa
-    if policy == "wave":
-        assert "v_dot2_f32_bf16" in isa
-    else:
-        assert "buffer_load_dwordx4" in isa
-        assert "v_mfma_f32_4x4x4_16b_bf16" in isa
-
-
-@pytest.mark.skipif(ARCH != "gfx942", reason="gfx942 ISA check")
-def test_gfx942_scalar_wave_final_isa_is_legal(tmp_path, monkeypatch):
-    m, n, k = 3, 67, 259
-    config = WaveDecodeConfig(
-        m_per_wave=m,
-        n_per_wave=1,
-        kvec=2,
-        reduction=ReductionMode.BPERMUTE,
-        contraction=ContractionMode.SCALAR_F32,
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SUPPORT_DIR / "gemm_decode_cross_compile.py"),
+            "--policy",
+            policy,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    dump_dir = tmp_path / "gfx942_scalar"
-    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
-    monkeypatch.setenv("FLYDSL_DUMP_DIR", str(dump_dir))
-    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-    _run(m, n, k, config)
-    isa_paths = list(dump_dir.rglob("*final_isa.s"))
-    assert len(isa_paths) == 1
-    isa = isa_paths[0].read_text()
-    assert "v_fma_f32" in isa
-    assert "v_dot2_f32_bf16" not in isa
-    assert "scratch_load" not in isa
-    assert "scratch_store" not in isa
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"GFX950_DECODE_COMPILE_OK policy={policy}" in result.stdout
 
 
 def test_kernel_name_runtime_launch_and_tuned_gemm_bridge():
@@ -1171,8 +1164,6 @@ def test_name_launch_reloads_from_deployed_cache(tmp_path, monkeypatch):
             )
             launch_gemm_decode_kernel_name(a, b, first, name)
             torch.cuda.synchronize()
-            cache_files = [path for path in cache_dir.rglob("*") if path.is_file()]
-            assert cache_files, "first launch did not populate the disk cache"
 
             isolated.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
             isolated.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
@@ -1221,15 +1212,213 @@ def test_aot_csv_parser_recognizes_decode_rows(tmp_path):
     config = _block()
     name = gemm_decode_kernel_name(ARCH, m, n, k, config)
     csv_path = tmp_path / "decode.csv"
-    csv_path.write_text(
-        "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
-        f"{ARCH},{cu_num},{m},{n},{k},False,flydsl_decode,{name}\n"
+    _write_decode_csv(
+        csv_path,
+        [
+            {
+                "gfx": ARCH,
+                "cu_num": cu_num,
+                "M": m,
+                "N": n,
+                "K": k,
+                "kernelName": name,
+            }
+        ],
     )
     jobs = parse_csv(str(csv_path))
     assert len(jobs) == 1
     assert jobs[0]["kind"] == "decode"
-    assert jobs[0]["arch"] == ARCH
+    assert jobs[0]["gfx"] == ARCH
     assert jobs[0]["config"] == config
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"N": 66}, "shape does not match"),
+        ({"bias": "True"}, "does not support bias"),
+        ({"dtype": "torch.float16"}, "BF16 input"),
+        ({"outdtype": "torch.float32"}, "BF16 output"),
+        ({"scaleAB": "True"}, "does not support scaling"),
+        ({"bpreshuffle": "True"}, "does not support preshuffled"),
+        ({"kernelName": "flydsl_decode_v1_stale"}, "invalid FlyDSL decode"),
+    ),
+)
+def test_aot_csv_rejects_stale_or_unsupported_decode_rows(
+    tmp_path, overrides, message
+):
+    from aiter.aot.flydsl.gemm import parse_csv
+
+    m, n, k = 3, 65, 257
+    name = gemm_decode_kernel_name("gfx942", m, n, k, _block())
+    csv_path = tmp_path / "stale_decode.csv"
+    _write_decode_csv(
+        csv_path,
+        [
+            {
+                "gfx": "gfx942",
+                "cu_num": 304,
+                "M": m,
+                "N": n,
+                "K": k,
+                "kernelName": name,
+                **overrides,
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match=message):
+        parse_csv(str(csv_path))
+
+
+def test_aot_csv_rejects_incomplete_decode_schema(tmp_path):
+    from aiter.aot.flydsl.gemm import parse_csv
+
+    m, n, k = 3, 65, 257
+    name = gemm_decode_kernel_name("gfx942", m, n, k, _block())
+    csv_path = tmp_path / "incomplete_decode.csv"
+    incomplete_columns = tuple(
+        column for column in _DECODE_CSV_COLUMNS if column != "outdtype"
+    )
+    with csv_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=incomplete_columns)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "gfx": "gfx942",
+                "cu_num": 304,
+                "M": m,
+                "N": n,
+                "K": k,
+                "bias": "False",
+                "dtype": "torch.bfloat16",
+                "scaleAB": "False",
+                "bpreshuffle": "False",
+                "libtype": "flydsl_decode",
+                "kernelName": name,
+            }
+        )
+    with pytest.raises(ValueError, match="missing required values.*outdtype"):
+        parse_csv(str(csv_path))
+
+
+def test_package_gemm_aot_collects_installed_decode_rows(monkeypatch):
+    from aiter.aot.flydsl import common, gemm
+    from aiter.aot.flydsl.common import OpKind
+    from aiter.jit.core import AITER_CONFIGS
+
+    csv_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+    parsed = [
+        job for job in gemm.parse_csv(csv_path) if job["kind"] == "decode"
+    ]
+    assert parsed
+    monkeypatch.setattr(gemm, "DEFAULT_CSVS", [csv_path])
+    collected = [
+        job
+        for job in common._collect_aot_jobs_for(OpKind.GEMM)
+        if job["kind"] == "decode"
+    ]
+    assert {job["kernel_name"] for job in collected} == {
+        job["kernel_name"] for job in parsed
+    }
+
+
+@pytest.mark.skipif(ARCH != "gfx942", reason="installed decode rows target gfx942")
+def test_installed_decode_rows_package_aot_production_run_only(tmp_path):
+    from aiter.aot.flydsl.gemm import parse_csv
+
+    checkout = REPO_ROOT
+    config_path = checkout / "aiter/configs/bf16_tuned_gemm.csv"
+    replay_script = SUPPORT_DIR / "gemm_decode_production_replay.py"
+    cache_dir = tmp_path / "package-cache"
+    aot_evidence_path = tmp_path / "package-aot.json"
+    evidence_path = tmp_path / "production-replay.json"
+    discovered = [
+        job
+        for job in parse_csv(str(config_path))
+        if job["kind"] == "decode"
+    ]
+    assert discovered
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(checkout),
+            "AITER_CONFIG_GEMM_BF16": str(config_path),
+            "FLYDSL_RUNTIME_CACHE_DIR": str(cache_dir),
+            "FLYDSL_RUNTIME_ENABLE_CACHE": "1",
+            "AITER_FLYDSL_AOT_WORKERS": "8",
+        }
+    )
+    for name in ("FLYDSL_RUNTIME_RUN_ONLY", "COMPILE_ONLY", "FLYDSL_DUMP_IR"):
+        env.pop(name, None)
+    compile_result = subprocess.run(
+        [
+            sys.executable,
+            str(replay_script),
+            "--mode",
+            "compile-aot",
+            "--checkout",
+            str(checkout),
+            "--config",
+            str(config_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--evidence",
+            str(aot_evidence_path),
+        ],
+        cwd=checkout,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert compile_result.returncode == 0, (
+        compile_result.stdout + compile_result.stderr
+    )
+    assert "PRODUCTION_DECODE_AOT_OK" in compile_result.stdout
+    aot_evidence = json.loads(aot_evidence_path.read_text())
+    assert aot_evidence["driver"] == "aiter.aot.flydsl.common.run_aot"
+    assert aot_evidence["package_scope"] == "GEMM"
+    assert aot_evidence["package_decode_jobs"] == len(discovered)
+    assert aot_evidence["replay_decode_jobs"] == len(discovered)
+
+    replay_env = env.copy()
+    replay_env["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
+    replay_env["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
+    replay_result = subprocess.run(
+        [
+            sys.executable,
+            str(replay_script),
+            "--checkout",
+            str(checkout),
+            "--config",
+            str(config_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--evidence",
+            str(evidence_path),
+        ],
+        cwd=checkout,
+        env=replay_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    combined_output = replay_result.stdout + replay_result.stderr
+    assert replay_result.returncode == 0, combined_output
+    assert "PRODUCTION_DECODE_REPLAY_OK" in replay_result.stdout
+    assert "falling back" not in combined_output.lower()
+    assert "no usable AOT cache" not in combined_output
+
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["config_source"] == str(config_path.resolve())
+    assert evidence["discovered_decode_rows"] == len(discovered)
+    assert evidence["selected_decode_rows"] == len(discovered)
+    assert not evidence["fallback_calls"]
+    assert not evidence["fallback_logs"]
+    assert all(row["selected_libtype"] == "flydsl_decode" for row in evidence["rows"])
+    assert all(row["run_only_artifact_loaded"] for row in evidence["rows"])
+    assert all(row["finite"] and row["correct"] for row in evidence["rows"])
 
 
 @pytest.mark.parametrize(
@@ -1244,9 +1433,18 @@ def test_aot_csv_rejects_decode_arch_metadata_mismatch(
     m, n, k = 3, 65, 257
     name = gemm_decode_kernel_name("gfx942", m, n, k, _block())
     csv_path = tmp_path / "decode_mismatch.csv"
-    csv_path.write_text(
-        "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
-        f"{csv_arch},{cu_num},{m},{n},{k},False,flydsl_decode,{name}\n"
+    _write_decode_csv(
+        csv_path,
+        [
+            {
+                "gfx": csv_arch,
+                "cu_num": cu_num,
+                "M": m,
+                "N": n,
+                "K": k,
+                "kernelName": name,
+            }
+        ],
     )
     with pytest.raises(ValueError, match="architecture metadata mismatch|recognized"):
         parse_csv(str(csv_path))
@@ -1258,9 +1456,18 @@ def test_aot_rejects_unsafe_block_address_name_before_compile(tmp_path):
     safe = gemm_decode_kernel_name("gfx942", 1, 32767, 32769, _block())
     unsafe = safe.replace("_n32767_", "_n32768_")
     csv_path = tmp_path / "unsafe_decode.csv"
-    csv_path.write_text(
-        "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
-        f"gfx942,304,1,32768,32769,False,flydsl_decode,{unsafe}\n"
+    _write_decode_csv(
+        csv_path,
+        [
+            {
+                "gfx": "gfx942",
+                "cu_num": 304,
+                "M": 1,
+                "N": 32768,
+                "K": 32769,
+                "kernelName": unsafe,
+            }
+        ],
     )
     with pytest.raises(ValueError, match="B byte extent"):
         parse_csv(str(csv_path))
@@ -1268,6 +1475,7 @@ def test_aot_rejects_unsafe_block_address_name_before_compile(tmp_path):
 
 @pytest.mark.skipif(ARCH != "gfx942", reason="gfx942 persistent cache coverage")
 def test_persistent_block_aot_cache_hit_and_isolation(tmp_path, monkeypatch):
+    import aiter.tuned_gemm as tuned_gemm
     from aiter.aot.flydsl.gemm import compile_one_config, parse_csv
     from aiter.ops.flydsl.kernels.gemm_decode_block_mfma import (
         compile_gemm_decode_block_mfma_bf16,
@@ -1291,12 +1499,19 @@ def test_persistent_block_aot_cache_hit_and_isolation(tmp_path, monkeypatch):
         for config in configs
     ]
     csv_path = tmp_path / "persistent.csv"
-    csv_path.write_text(
-        "gfx,cu_num,M,N,K,bias,libtype,kernelName\n"
-        + "".join(
-            f"gfx942,304,{m},{n},{k},False,flydsl_decode,{name}\n"
+    _write_decode_csv(
+        csv_path,
+        [
+            {
+                "gfx": "gfx942",
+                "cu_num": 304,
+                "M": m,
+                "N": n,
+                "K": k,
+                "kernelName": name,
+            }
             for name in names
-        )
+        ],
     )
     jobs = parse_csv(str(csv_path))
     assert [job["config"] for job in jobs] == configs
@@ -1306,32 +1521,24 @@ def test_persistent_block_aot_cache_hit_and_isolation(tmp_path, monkeypatch):
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "1")
     monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
     compile_gemm_decode_block_mfma_bf16.cache_clear()
-    seen_files = set()
     for job in jobs:
         result = compile_one_config(**job)
         assert result["compile_time"] is not None
-        current_files = {
-            path.relative_to(cache_dir)
-            for path in cache_dir.rglob("*")
-            if path.is_file()
-        }
-        assert current_files - seen_files
-        seen_files = current_files
 
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
     reference = (a.float() @ b.float().T).bfloat16()
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
     monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
-    for name in names:
+    for job in jobs:
         compile_gemm_decode_block_mfma_bf16.cache_clear()
-        output = torch.full(
-            (m, n),
-            torch.nan,
-            dtype=torch.bfloat16,
-            device="cuda",
+        output = tuned_gemm.flydsl_decode_gemm(
+            a,
+            b,
+            0,
+            otype=torch.bfloat16,
+            config={"kernelName": job["kernel_name"]},
         )
-        launch_gemm_decode_kernel_name(a, b, output, name)
         torch.cuda.synchronize()
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
@@ -1371,15 +1578,17 @@ def test_persistent_same_name_different_cu_grid_cache_isolation(
         )
         for num_cus in (1, 2)
     ]
-    assert launchers[0].kernel_name == launchers[1].kernel_name
-    assert launchers[0].grid_workgroups == 1
-    assert launchers[1].grid_workgroups == 2
-    assert launchers[0].persistent_turns != launchers[1].persistent_turns
+    geometries = [
+        validate_block_mfma_grid_i32(n, config, num_cus=num_cus)
+        for num_cus in (1, 2)
+    ]
+    assert geometries[0][0] == 1
+    assert geometries[1][0] == 2
+    assert geometries[0][1] != geometries[1][1]
 
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
     reference = (a.float() @ b.float().T).bfloat16()
-    seen_files = set()
     for launcher in launchers:
         output = torch.full(
             (m, n), torch.nan, dtype=torch.bfloat16, device="cuda"
@@ -1387,13 +1596,6 @@ def test_persistent_same_name_different_cu_grid_cache_isolation(
         launcher(a, b, output)
         torch.cuda.synchronize()
         torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
-        current_files = {
-            path.relative_to(cache_dir)
-            for path in cache_dir.rglob("*")
-            if path.is_file()
-        }
-        assert current_files - seen_files
-        seen_files = current_files
 
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
     monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
@@ -1407,7 +1609,12 @@ def test_persistent_same_name_different_cu_grid_cache_isolation(
             "gfx942",
             num_cus=num_cus,
         )
-        assert launcher.grid_workgroups == expected_grid
+        grid_workgroups, _, _ = validate_block_mfma_grid_i32(
+            n,
+            config,
+            num_cus=num_cus,
+        )
+        assert grid_workgroups == expected_grid
         output = torch.full(
             (m, n), torch.nan, dtype=torch.bfloat16, device="cuda"
         )

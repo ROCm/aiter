@@ -15,6 +15,7 @@ Supported kernel families:
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
+  - ``flydsl_decode_v1_*``                    exact-M BF16 decode GEMM kernels
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -55,6 +56,10 @@ from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
+from aiter.ops.flydsl.kernels.gemm_decode import compile_gemm_decode_bf16
+from aiter.ops.flydsl.kernels.gemm_decode_config import (
+    parse_gemm_decode_kernel_name,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -86,6 +91,20 @@ _SHORT_DTYPE = {
     "I8": "int8",
     "B16": "bf16",
     "F16": "fp16",
+}
+_DECODE_REQUIRED_COLUMNS = {
+    "gfx",
+    "cu_num",
+    "M",
+    "N",
+    "K",
+    "bias",
+    "dtype",
+    "outdtype",
+    "scaleAB",
+    "bpreshuffle",
+    "libtype",
+    "kernelName",
 }
 
 
@@ -132,6 +151,65 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
     }
 
 
+def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
+    missing = sorted(
+        column
+        for column in _DECODE_REQUIRED_COLUMNS
+        if not (row.get(column) or "").strip()
+    )
+    if missing:
+        raise ValueError(
+            "FlyDSL decode CSV row is missing required values: "
+            + ", ".join(missing)
+        )
+
+    m = int(row["M"])
+    n = int(row["N"])
+    k = int(row["K"])
+    cu_num = int(row["cu_num"])
+    csv_arch = row["gfx"].strip()
+    name_arch, name_m, name_n, name_k, config = (
+        parse_gemm_decode_kernel_name(kernel_name)
+    )
+    if (name_m, name_n, name_k) != (m, n, k):
+        raise ValueError(
+            "FlyDSL decode kernel name shape does not match CSV row: "
+            f"name={(name_m, name_n, name_k)}, row={(m, n, k)}"
+        )
+
+    cu_arch = cu_num_to_arch(cu_num, default="")
+    if not cu_arch:
+        raise ValueError(
+            f"FlyDSL decode row has unrecognized cu_num metadata: {cu_num}"
+        )
+    if len({name_arch, csv_arch, cu_arch}) != 1:
+        raise ValueError(
+            "FlyDSL decode architecture metadata mismatch: "
+            f"name={name_arch}, csv={csv_arch}, cu_num={cu_num} ({cu_arch})"
+        )
+    if _parse_bool(row["bias"]):
+        raise ValueError("FlyDSL decode AOT does not support bias")
+    if row["dtype"].strip() != "torch.bfloat16":
+        raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
+    if row["outdtype"].strip() != "torch.bfloat16":
+        raise ValueError("FlyDSL decode AOT requires BF16 output dtype")
+    if _parse_bool(row["scaleAB"]):
+        raise ValueError("FlyDSL decode AOT does not support scaling")
+    if _parse_bool(row["bpreshuffle"]):
+        raise ValueError("FlyDSL decode AOT does not support preshuffled weights")
+
+    return {
+        "kind": "decode",
+        "config": config,
+        "m": m,
+        "n": n,
+        "k": k,
+        "cu_num": cu_num,
+        "gfx": csv_arch,
+        "has_bias": False,
+    }
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -140,8 +218,21 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            kernel_name = row.get("kernelName", "").strip()
-            libtype = row.get("libtype", "").strip()
+            kernel_name = (row.get("kernelName") or "").strip()
+            libtype = (row.get("libtype") or "").strip()
+            if libtype == "flydsl_decode":
+                if not kernel_name:
+                    raise ValueError("FlyDSL decode CSV row requires kernelName")
+                params = _parse_decode_row(row, kernel_name)
+                job = {
+                    "kernel_name": kernel_name,
+                    **params,
+                }
+                key = job_identity(job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(job)
+                continue
             if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
                 continue
 
@@ -496,6 +587,51 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
 
 
+def _compile_decode_to_cache(
+    *,
+    kernel_name: str,
+    m: int,
+    n: int,
+    k: int,
+    arch: str,
+    cu_num: int,
+    config,
+    has_bias: bool = False,
+    **kwargs,
+) -> None:
+    del kwargs
+    if has_bias:
+        raise ValueError("FlyDSL decode AOT does not support bias")
+    name_arch, name_m, name_n, name_k, name_config = (
+        parse_gemm_decode_kernel_name(kernel_name)
+    )
+    if (name_arch, name_m, name_n, name_k, name_config) != (
+        arch,
+        m,
+        n,
+        k,
+        config,
+    ):
+        raise ValueError(
+            "FlyDSL decode compile metadata does not match encoded kernel name"
+        )
+    import torch
+
+    device = torch.device("cpu")
+    a = torch.empty((m, k), device=device, dtype=torch.bfloat16)
+    b = torch.empty((n, k), device=device, dtype=torch.bfloat16)
+    c = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    launcher = compile_gemm_decode_bf16(
+        m,
+        n,
+        k,
+        config,
+        arch=arch,
+        num_cus=cu_num,
+    )
+    _compile_executable_to_cache(launcher, a, b, c, fx.Stream(0))
+
+
 def compile_one_config(
     kernel_name: str,
     kind: str,
@@ -509,7 +645,20 @@ def compile_one_config(
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = job_arch(cu_num, gfx)
+    requested_arch = kwargs.pop("arch", None)
+    aot_arch = requested_arch or job_arch(cu_num, gfx)
+    if kind == "decode":
+        cu_arch = cu_num_to_arch(cu_num, default="")
+        if not cu_arch:
+            raise ValueError(
+                f"FlyDSL decode AOT has unrecognized cu_num metadata: {cu_num}"
+            )
+        if aot_arch != cu_arch or (gfx and gfx != aot_arch):
+            raise ValueError(
+                "FlyDSL decode AOT architecture metadata mismatch: "
+                f"arch={aot_arch}, gfx={gfx or '(unset)'}, "
+                f"cu_num={cu_num} ({cu_arch})"
+            )
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -535,6 +684,16 @@ def compile_one_config(
                 _compile_mxfp8_128_wmma_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "ptpc_wmma":
                 _compile_ptpc_wmma_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "decode":
+                _compile_decode_to_cache(
+                    kernel_name=kernel_name,
+                    m=m,
+                    n=n,
+                    k=k,
+                    arch=aot_arch,
+                    cu_num=cu_num,
+                    **kwargs,
+                )
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
@@ -585,6 +744,7 @@ def main():
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
     mxfp8_128_wmma_jobs = [j for j in all_jobs if j["kind"] == "mxfp8_128_wmma"]
     ptpc_wmma_jobs = [j for j in all_jobs if j["kind"] == "ptpc_wmma"]
+    decode_jobs = [j for j in all_jobs if j["kind"] == "decode"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -595,6 +755,7 @@ def main():
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  MXFP8_128 wmma jobs: {len(mxfp8_128_wmma_jobs)}")
     print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
+    print(f"  Decode jobs:      {len(decode_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
@@ -607,7 +768,11 @@ def main():
     print(f"\n--- Compiling {len(all_jobs)} kernels ---")
     results = run_jobs_parallel(
         compile_one_config,
-        hgemm_jobs + preshuffle_jobs + mxfp8_128_wmma_jobs + ptpc_wmma_jobs,
+        hgemm_jobs
+        + preshuffle_jobs
+        + mxfp8_128_wmma_jobs
+        + ptpc_wmma_jobs
+        + decode_jobs,
     )
 
     total_elapsed = time.time() - total_t0

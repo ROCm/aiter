@@ -8,9 +8,11 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, buffer_ops, range_constexpr, vector
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .gemm_decode_config import (
     ContractionMode,
@@ -18,6 +20,7 @@ from .gemm_decode_config import (
     OutputRounding,
     ReductionMode,
 )
+from .gemm_decode_layouts import load_scalar, store_scalar
 
 
 def raw(value):
@@ -182,9 +185,17 @@ def convert_bf16(value, element, rounding: OutputRounding):
     return ArithValue(converted).trunci(T.i16).bitcast(T.bf16)
 
 
-def store_bf16(value, resource, element, rounding: OutputRounding) -> None:
+def store_bf16(
+    value,
+    tensor,
+    row,
+    column,
+    row_stride: int,
+    rounding: OutputRounding,
+) -> None:
+    element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
     output = convert_bf16(value, element, rounding)
-    buffer_ops.buffer_store(output, resource, element)
+    store_scalar(tensor, row, column, row_stride, output)
 
 
 def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
@@ -241,8 +252,8 @@ def reduce_mfma_scalar(accumulator):
 
 
 def masked_bf16_vector(
-    resource,
-    row_base,
+    tensor,
+    row,
     column_base,
     width: int,
     row_size: int,
@@ -258,15 +269,15 @@ def masked_bf16_vector(
         if row_valid is not None:
             valid = valid & row_valid
         safe_column = ArithValue(raw(valid)).select(column, fx.Int32(0))
-        safe_row_base = row_base
+        safe_row = row
         if row_valid is not None:
-            safe_row_base = ArithValue(raw(row_valid)).select(row_base, fx.Int32(0))
-        loaded = buffer_ops.buffer_load(
-            resource,
-            safe_row_base + safe_column,
-            vec_width=1,
-            dtype=T.bf16,
-            cache_modifier=cache_modifier,
+            safe_row = ArithValue(raw(row_valid)).select(row, fx.Int32(0))
+        loaded = load_scalar(
+            tensor,
+            safe_row,
+            safe_column,
+            row_size,
+            cache_modifier,
         )
         values.append(ArithValue(raw(valid)).select(loaded, zero))
     return vector.from_elements(T.vec(width, T.bf16), values)

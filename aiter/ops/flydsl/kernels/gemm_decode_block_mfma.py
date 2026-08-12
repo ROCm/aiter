@@ -2,31 +2,40 @@
 
 """Multi-wave BlockMFMA BF16 decode GEMM policy."""
 
-from __future__ import annotations
-
 import functools
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .gemm_decode_config import (
     ActivationSource,
     BlockMfmaDecodeConfig,
     MFMA_K,
     WAVE_SIZE,
-    block_mfma_lds_bytes,
     block_mfma_staged_k,
     gemm_decode_kernel_name,
+    make_decode_cache_tag,
     validate_block_mfma_grid_i32,
+)
+from .gemm_decode_layouts import (
+    DecodeLayoutGeometry,
+    a_tail_coordinates,
+    a_vector_slot_coordinates,
+    k_element,
+    load_vector,
+    make_buffer_matrix,
+    make_shared_matrix,
+    make_vector_view,
+    n_owner_offset,
+    vector_value_offset,
+    wave_lane_coordinates,
 )
 from .gemm_decode_numeric import (
     bf16x4_slice,
@@ -36,11 +45,27 @@ from .gemm_decode_numeric import (
     raw,
     reduce_mfma_scalar,
 )
-from .tensor_shim import GTensor, STensor
+from .tensor_shim import _run_compiled
 
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+@dataclass(frozen=True)
+class BlockMfmaGeometry:
+    """Compile-time geometry and schedule for one BlockMFMA specialization."""
+
+    m: int
+    n: int
+    k: int
+    staged_k: int
+    width: int
+    full_chunks: int
+    tail_tiles: int
+    schedule_depth: int
+    schedule_batches: int
+    use_lds: bool
 
 
 def _accumulate_vectors(
@@ -56,11 +81,10 @@ def _accumulate_vectors(
         for column in range_constexpr(columns):
             b_fragment = bf16x4_slice(b_vectors[column], fragment)
             for row in range_constexpr(m):
-                index = row * columns + column
-                accumulators[index] = mfma_4x4x4_bf16(
+                accumulators[row][column] = mfma_4x4x4_bf16(
                     bf16x4_slice(a_vectors[row], fragment),
                     b_fragment,
-                    accumulators[index],
+                    accumulators[row][column],
                 )
     return accumulators
 
@@ -72,20 +96,17 @@ def _load_full_a_vectors(
     a_smem,
     k_base,
     m: int,
-    k: int,
-    staged_k: int,
+    row_stride: int,
     width: int,
 ):
-    if use_lds:
-        return [
-            a_smem.vec_load(
-                (fx.Index(fx.Int32(row * staged_k) + k_base),),
-                width,
-            )
-            for row in range_constexpr(m)
-        ]
     return [
-        a_global.vec_load((row, k_base), width)
+        load_vector(
+            a_smem if use_lds else a_global,
+            fx.Int32(row),
+            k_base,
+            row_stride,
+            width,
+        )
         for row in range_constexpr(m)
     ]
 
@@ -106,16 +127,19 @@ def _load_tail_a_vectors(
             valid = k_base < fx.Int32(k)
             safe_k = ArithValue(raw(valid)).select(k_base, fx.Int32(k))
             values.append(
-                a_smem.vec_load(
-                    (fx.Index(fx.Int32(row * staged_k) + safe_k),),
+                load_vector(
+                    a_smem,
+                    fx.Int32(row),
+                    safe_k,
+                    staged_k,
                     MFMA_K,
                 )
             )
         return values
     return [
         masked_bf16_vector(
-            a_global.rsrc,
-            fx.Int32(row * k),
+            a_global,
+            fx.Int32(row),
             k_base,
             MFMA_K,
             k,
@@ -124,79 +148,86 @@ def _load_tail_a_vectors(
     ]
 
 
-def _compiler_memory_barrier() -> None:
-    """Keep staged-A reads inside a runtime persistent-N loop."""
-    llvm_dialect.inline_asm(
-        None,
-        [],
-        "",
-        "~{memory}",
-        has_side_effects=True,
-    )
-
-
 def _compute_column_tile(
     *,
     config: BlockMfmaDecodeConfig,
-    use_lds: bool,
+    geometry: BlockMfmaGeometry,
     a_global,
     a_smem,
     b_global,
     c_global,
     column_base,
     lane,
-    m: int,
-    n: int,
-    k: int,
-    staged_k: int,
-    width: int,
-    full_chunks: int,
-    tail_tiles: int,
-    schedule_depth: int,
-    schedule_batches: int,
 ) -> None:
     """Compute one logical N tile with the existing BlockMFMA math."""
     columns = config.columns_per_wave
+    logical_columns = [
+        column_base + fx.Int32(column)
+        for column in range_constexpr(columns)
+    ]
+    output_coordinates = [
+        [
+            (fx.Int32(row), logical_columns[column])
+            for column in range_constexpr(columns)
+        ]
+        for row in range_constexpr(geometry.m)
+    ]
+    output_valid = [
+        [
+            column_coord < fx.Int32(geometry.n)
+            for row_coord, column_coord in row_coordinates
+        ]
+        for row_coordinates in output_coordinates
+    ]
     safe_columns = []
-    column_valid = []
-    for column_i in range_constexpr(columns):
-        column = column_base + fx.Int32(column_i)
-        valid = column < fx.Int32(n)
-        safe_columns.append(ArithValue(raw(valid)).select(column, fx.Int32(0)))
-        column_valid.append(valid)
+    for column in range_constexpr(columns):
+        column_coord = output_coordinates[0][column][1]
+        valid = output_valid[0][column]
+        safe_columns.append(
+            ArithValue(raw(valid)).select(column_coord, fx.Int32(0))
+        )
 
     accumulator_zero = arith.constant_vector(0.0, T.vec(4, T.f32))
-    accumulators = [accumulator_zero] * (m * columns)
-    for batch in range_constexpr(schedule_batches):
+    accumulators = [
+        [accumulator_zero for _ in range_constexpr(columns)]
+        for _ in range_constexpr(geometry.m)
+    ]
+    for batch in range_constexpr(geometry.schedule_batches):
         chunks = min(
-            schedule_depth,
-            full_chunks - batch * schedule_depth,
+            geometry.schedule_depth,
+            geometry.full_chunks - batch * geometry.schedule_depth,
         )
         prefetched_a = []
         prefetched_b = []
         for stage in range_constexpr(chunks):
-            chunk = batch * schedule_depth + stage
-            k_base = (
-                fx.Int32(chunk * WAVE_SIZE * width)
-                + lane * fx.Int32(width)
+            chunk = batch * geometry.schedule_depth + stage
+            k_base = k_element(
+                fx.Int32(chunk),
+                lane,
+                fx.Int32(0),
+                geometry.full_chunks,
+                geometry.width,
             )
             prefetched_a.append(
                 _load_full_a_vectors(
-                    use_lds=use_lds,
+                    use_lds=geometry.use_lds,
                     a_global=a_global,
                     a_smem=a_smem,
                     k_base=k_base,
-                    m=m,
-                    k=k,
-                    staged_k=staged_k,
-                    width=width,
+                    m=geometry.m,
+                    row_stride=geometry.staged_k if geometry.use_lds else geometry.k,
+                    width=geometry.width,
                 )
             )
             prefetched_b.append(
                 [
-                    b_global.vec_load(
-                        (safe_columns[column], k_base),
-                        width,
+                    load_vector(
+                        b_global,
+                        safe_columns[column],
+                        k_base,
+                        geometry.k,
+                        geometry.width,
+                        config.b_cache_modifier,
                     )
                     for column in range_constexpr(columns)
                 ]
@@ -206,35 +237,35 @@ def _compute_column_tile(
                 accumulators,
                 prefetched_a[stage],
                 prefetched_b[stage],
-                m=m,
+                m=geometry.m,
                 columns=columns,
-                width=width,
+                width=geometry.width,
             )
 
-    for tail in range_constexpr(tail_tiles):
-        k_base = (
-            fx.Int32(
-                full_chunks * WAVE_SIZE * width
-                + tail * WAVE_SIZE * MFMA_K
-            )
-            + lane * fx.Int32(MFMA_K)
+    for tail in range_constexpr(geometry.tail_tiles):
+        k_base = fx.Int32(geometry.full_chunks * WAVE_SIZE * geometry.width) + k_element(
+            fx.Int32(tail),
+            lane,
+            fx.Int32(0),
+            geometry.tail_tiles,
+            MFMA_K,
         )
         a_vectors = _load_tail_a_vectors(
-            use_lds=use_lds,
+            use_lds=geometry.use_lds,
             a_global=a_global,
             a_smem=a_smem,
             k_base=k_base,
-            m=m,
-            k=k,
-            staged_k=staged_k,
+            m=geometry.m,
+            k=geometry.k,
+            staged_k=geometry.staged_k,
         )
         b_vectors = [
             masked_bf16_vector(
-                b_global.rsrc,
-                safe_columns[column] * fx.Int32(k),
+                b_global,
+                safe_columns[column],
                 k_base,
                 MFMA_K,
-                k,
+                geometry.k,
                 config.b_cache_modifier,
             )
             for column in range_constexpr(columns)
@@ -243,53 +274,57 @@ def _compute_column_tile(
             accumulators,
             a_vectors,
             b_vectors,
-            m=m,
+            m=geometry.m,
             columns=columns,
             width=MFMA_K,
         )
 
     reduced = [
-        reduce_mfma_scalar(accumulator)
-        for accumulator in accumulators
+        [
+            reduce_mfma_scalar(accumulators[row][column])
+            for column in range_constexpr(columns)
+        ]
+        for row in range_constexpr(geometry.m)
     ]
-    for row in range_constexpr(m):
+    for row in range_constexpr(geometry.m):
         for column in range_constexpr(columns):
+            row_coord, column_coord = output_coordinates[row][column]
             store_valid = (
                 lane == fx.Int32(WAVE_SIZE - 1)
-            ) & column_valid[column]
+            ) & output_valid[row][column]
             store_if = scf.IfOp(
                 raw(store_valid),
                 results_=[],
                 has_else=False,
             )
             with ir.InsertionPoint(store_if.then_block):
+                element = (
+                    fx.Int32(row_coord) * fx.Int32(geometry.n)
+                    + fx.Int32(column_coord)
+                )
                 output = convert_bf16(
-                    reduced[row * columns + column],
-                    fx.Int32(row * n)
-                    + column_base
-                    + fx.Int32(column),
+                    reduced[row][column],
+                    element,
                     config.output_rounding,
                 )
-                c_global[
-                    row,
-                    column_base + fx.Int32(column),
-                ] = output
+                output_pointer = fx.add_offset(
+                    fx.get_iter(c_global),
+                    fx.make_int_tuple(element),
+                )
+                fx.make_view(output_pointer, fx.make_layout(1, 1))[0] = output
                 scf.YieldOp([])
 
 
 def _make_block_kernel(
     *,
-    arch: str,
     m: int,
     n: int,
     k: int,
     config: BlockMfmaDecodeConfig,
     kernel_name: str,
-    allocator,
-    activation_offset: int,
     persistent_turns: int,
 ):
-    """Build the already-selected architecture body without ambient detection."""
+    """Build one selected BlockMFMA specialization."""
     waves = config.waves_per_workgroup
     columns = config.columns_per_wave
     width = config.b_load_width
@@ -302,9 +337,36 @@ def _make_block_kernel(
     use_lds = config.activation_source == ActivationSource.FULL_LDS
     activation_vectors_per_row = k // 8
     activation_vectors = m * activation_vectors_per_row
-    activation_tail_per_row = staged_k - activation_vectors_per_row * 8
-    activation_tail_elements = m * activation_tail_per_row
+    vector_prefix = activation_vectors_per_row * 8
+    global_tail_per_row = k - vector_prefix
+    shared_padding_per_row = staged_k - k
+    global_tail_elements = m * global_tail_per_row
+    shared_padding_elements = m * shared_padding_per_row
     stage_iterations = _ceil_div(activation_vectors, block_threads)
+    layout_geometry = DecodeLayoutGeometry(
+        m=m,
+        n=n,
+        k=k,
+        waves=waves,
+        columns_per_wave=columns,
+        staged_k=staged_k,
+    )
+    compute_geometry = BlockMfmaGeometry(
+        m=m,
+        n=n,
+        k=k,
+        staged_k=staged_k,
+        width=width,
+        full_chunks=full_chunks,
+        tail_tiles=tail_tiles,
+        schedule_depth=schedule_depth,
+        schedule_batches=schedule_batches,
+        use_lds=use_lds,
+    )
+
+    @fx.struct
+    class SharedStorage:
+        activation: fx.Array[fx.BFloat16, m * staged_k, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def block_mfma_kernel(
@@ -315,100 +377,132 @@ def _make_block_kernel(
         runtime_persistent_turns: Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
-        wave = tid // fx.Int32(WAVE_SIZE)
-        lane = tid % fx.Int32(WAVE_SIZE)
+        wave, lane = wave_lane_coordinates(tid, waves)
         first_column = (
-            gpu.block_idx.x * fx.Int32(waves * columns)
-            + wave * fx.Int32(columns)
+            gpu.block_idx.x * fx.Int32(layout_geometry.columns_per_block)
+            + n_owner_offset(
+                wave,
+                fx.Int32(0),
+                waves,
+                columns,
+            )
         )
-        a_global = GTensor(A, dtype=T.bf16, shape=(m, k))
-        b_global = GTensor(
-            B,
-            dtype=T.bf16,
-            shape=(n, k),
-            cache_modifier=config.b_cache_modifier,
-        )
-        c_global = GTensor(C, dtype=T.bf16, shape=(m, n))
+        a_global = make_buffer_matrix(A, m, k)
+        b_global = make_buffer_matrix(B, n, k)
+        c_global = make_buffer_matrix(C, m, n)
         a_smem = None
         if use_lds:
-            a_smem_ptr = SmemPtr(
-                allocator.get_base(),
-                activation_offset,
-                T.bf16,
-                shape=(m * staged_k,),
-            )
-            a_smem = STensor(
-                a_smem_ptr,
-                T.bf16,
-                shape=(m * staged_k,),
+            shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+            a_smem = make_shared_matrix(
+                shared.activation,
+                m,
+                staged_k,
+                staged_k,
             )
             for iteration in range_constexpr(stage_iterations):
                 slot = tid + fx.Int32(iteration * block_threads)
                 slot_valid = slot < fx.Int32(activation_vectors)
                 safe_slot = ArithValue(raw(slot_valid)).select(slot, fx.Int32(0))
-                row = safe_slot // fx.Int32(activation_vectors_per_row)
-                row_vector = safe_slot % fx.Int32(activation_vectors_per_row)
-                column = row_vector * fx.Int32(8)
+                row, row_vector = a_vector_slot_coordinates(
+                    safe_slot,
+                    m,
+                    activation_vectors_per_row,
+                )
+                column = vector_value_offset(
+                    row_vector,
+                    fx.Int32(0),
+                    activation_vectors_per_row,
+                    8,
+                )
                 stage_if = scf.IfOp(
                     raw(slot_valid),
                     results_=[],
                     has_else=False,
                 )
                 with ir.InsertionPoint(stage_if.then_block):
-                    staged = a_global.vec_load((row, column), 8)
-                    a_smem.vec_store(
-                        (fx.Index(row * fx.Int32(staged_k) + column),),
-                        staged,
+                    staged = load_vector(a_global, row, column, k, 8)
+                    make_vector_view(
+                        a_smem,
+                        row,
+                        column,
+                        staged_k,
                         8,
-                    )
+                    ).store(staged)
                     scf.YieldOp([])
-            if activation_tail_elements:
+            if global_tail_elements:
+                a_global_tail = fx.make_view(
+                    fx.add_offset(
+                        fx.get_iter(a_global),
+                        fx.make_int_tuple(vector_prefix),
+                    ),
+                    fx.make_layout(
+                        (m, global_tail_per_row),
+                        (k, 1),
+                    ),
+                )
+                a_smem_tail = fx.make_view(
+                    fx.add_offset(
+                        fx.get_iter(a_smem),
+                        fx.make_int_tuple(vector_prefix),
+                    ),
+                    fx.make_layout(
+                        (m, global_tail_per_row),
+                        (staged_k, 1),
+                    ),
+                )
                 tail_if = scf.IfOp(
-                    raw(tid < fx.Int32(activation_tail_elements)),
+                    raw(tid < fx.Int32(global_tail_elements)),
                     results_=[],
                     has_else=False,
                 )
                 with ir.InsertionPoint(tail_if.then_block):
-                    row = tid // fx.Int32(activation_tail_per_row)
-                    row_tail = tid % fx.Int32(activation_tail_per_row)
-                    column = (
-                        fx.Int32(activation_vectors_per_row * 8) + row_tail
+                    row, row_tail = a_tail_coordinates(
+                        tid,
+                        m,
+                        global_tail_per_row,
                     )
-                    valid = column < fx.Int32(k)
-                    safe_column = ArithValue(raw(valid)).select(
-                        column,
-                        fx.Int32(0),
+                    a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
+                    scf.YieldOp([])
+            if shared_padding_elements:
+                a_smem_padding = fx.make_view(
+                    fx.add_offset(
+                        fx.get_iter(a_smem),
+                        fx.make_int_tuple(k),
+                    ),
+                    fx.make_layout(
+                        (m, shared_padding_per_row),
+                        (staged_k, 1),
+                    ),
+                )
+                padding_if = scf.IfOp(
+                    raw(tid < fx.Int32(shared_padding_elements)),
+                    results_=[],
+                    has_else=False,
+                )
+                with ir.InsertionPoint(padding_if.then_block):
+                    row, row_padding = a_tail_coordinates(
+                        tid,
+                        m,
+                        shared_padding_per_row,
                     )
-                    loaded = a_global[row, safe_column]
-                    zero = arith.constant(0.0, type=T.bf16)
-                    staged = ArithValue(raw(valid)).select(loaded, zero)
-                    a_smem_ptr.store(
-                        staged,
-                        [fx.Index(row * fx.Int32(staged_k) + column)],
+                    a_smem_padding[row, row_padding] = arith.constant(
+                        0.0,
+                        type=T.bf16,
                     )
                     scf.YieldOp([])
             gpu.barrier()
 
-        tile_kwargs = dict(
-            config=config,
-            use_lds=use_lds,
-            a_global=a_global,
-            a_smem=a_smem,
-            b_global=b_global,
-            c_global=c_global,
-            lane=lane,
-            m=m,
-            n=n,
-            k=k,
-            staged_k=staged_k,
-            width=width,
-            full_chunks=full_chunks,
-            tail_tiles=tail_tiles,
-            schedule_depth=schedule_depth,
-            schedule_batches=schedule_batches,
-        )
         if persistent_turns == 1:
-            _compute_column_tile(column_base=first_column, **tile_kwargs)
+            _compute_column_tile(
+                config=config,
+                geometry=compute_geometry,
+                a_global=a_global,
+                a_smem=a_smem,
+                b_global=b_global,
+                c_global=c_global,
+                column_base=first_column,
+                lane=lane,
+            )
         else:
             column_stride = (
                 runtime_grid_workgroups * fx.Int32(waves * columns)
@@ -416,21 +510,28 @@ def _make_block_kernel(
             turn = fx.Int32(0)
             while turn < runtime_persistent_turns:
                 column_base = first_column + turn * column_stride
-                _compiler_memory_barrier()
+                # Keep staged-A reads inside the runtime persistent-N loop.
+                llvm_dialect.inline_asm(
+                    None,
+                    [],
+                    "",
+                    "~{memory}",
+                    has_side_effects=True,
+                )
                 if column_base < fx.Int32(n):
-                    _compute_column_tile(column_base=column_base, **tile_kwargs)
+                    _compute_column_tile(
+                        config=config,
+                        geometry=compute_geometry,
+                        a_global=a_global,
+                        a_smem=a_smem,
+                        b_global=b_global,
+                        c_global=c_global,
+                        column_base=column_base,
+                        lane=lane,
+                    )
                 turn = turn + fx.Int32(1)
 
-    block_mfma_kernel.decode_arch = arch
     return block_mfma_kernel
-
-
-def _make_gfx942_block_kernel(**kwargs):
-    return _make_block_kernel(arch="gfx942", **kwargs)
-
-
-def _make_gfx950_block_kernel(**kwargs):
-    return _make_block_kernel(arch="gfx950", **kwargs)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -461,36 +562,46 @@ def compile_gemm_decode_block_mfma_bf16(
         grid_workgroups = logical_workgroups
         persistent_turns = 1
     use_lds = config.activation_source == ActivationSource.FULL_LDS
-    allocator = None
-    activation_offset = 0
-    if use_lds:
-        allocator = SmemAllocator(
-            None,
-            arch=arch,
-            global_sym_name=f"{kernel_name}_smem",
-        )
-        activation_offset = allocator._align(allocator.ptr, 16)
-        allocator.ptr = activation_offset + block_mfma_lds_bytes(m, k)
-
-    factory = (
-        _make_gfx942_block_kernel
-        if arch == "gfx942"
-        else _make_gfx950_block_kernel
+    cache_tag = make_decode_cache_tag(
+        policy="block_mfma",
+        kernel_name=kernel_name,
+        arch=arch,
+        num_cus=num_cus or 0,
+        compile_scalars={
+            "m": m,
+            "n": n,
+            "k": k,
+            "waves_per_workgroup": config.waves_per_workgroup,
+            "columns_per_wave": config.columns_per_wave,
+            "activation_source": config.activation_source.value,
+            "b_load_width": config.b_load_width,
+            "k_unroll": config.k_unroll,
+            "prefetch_stages": config.prefetch_stages,
+            "persistent_n": config.persistent_n,
+            "workgroups_per_cu": config.workgroups_per_cu,
+            "waves_per_eu": config.waves_per_eu,
+            "b_cache_modifier": config.b_cache_modifier,
+            "output_rounding": config.output_rounding.value,
+            "block_threads": block_threads,
+            "logical_workgroups": logical_workgroups,
+            "grid_workgroups": grid_workgroups,
+            "persistent_turns": persistent_turns,
+            "use_lds": use_lds,
+        },
     )
-    kernel = factory(
+
+    kernel = _make_block_kernel(
         m=m,
         n=n,
         k=k,
         config=config,
         kernel_name=kernel_name,
-        allocator=allocator,
-        activation_offset=activation_offset,
         persistent_turns=persistent_turns,
     )
-    cache_tag = (
-        kernel_name,
-        grid_workgroups,
-        persistent_turns,
+    kernel_attributes = (
+        {"rocdl.waves_per_eu": config.waves_per_eu}
+        if config.waves_per_eu
+        else {}
     )
 
     @flyc.jit
@@ -498,33 +609,28 @@ def compile_gemm_decode_block_mfma_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        cache_identity: fx.Constexpr[str],
         stream: fx.Stream = fx.Stream(None),
     ):
-        _ = cache_tag
-        if use_lds:
-            allocator.finalized = False
-            context = CompilationContext.get_current()
-            with ir.InsertionPoint(context.gpu_module_body):
-                allocator.finalize()
-        attributes = {}
-        if config.waves_per_eu:
-            attributes["rocdl.waves_per_eu"] = config.waves_per_eu
         kernel(
             A,
             B,
             C,
             fx.Int32(grid_workgroups),
             fx.Int32(persistent_turns),
-            value_attrs=attributes,
+            value_attrs=kernel_attributes,
         ).launch(
             grid=(grid_workgroups, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    launch.kernel_name = kernel_name
-    launch.lds_bytes = block_mfma_lds_bytes(m, k) if use_lds else 0
-    launch.grid_workgroups = grid_workgroups
-    launch.policy = "block_mfma"
-    launch.persistent_turns = persistent_turns
-    return launch
+    def launcher(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        return _run_compiled(launch, A, B, C, cache_tag, stream)
+
+    return launcher
