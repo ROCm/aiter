@@ -623,6 +623,16 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int logical_bn256_route_dx_kid = 13;
     constexpr int sorted_bn256_route_dx_kid = 14;
     constexpr int sorted_route_reduce_kid = 1;
+    constexpr int full_row_sorted_route_reduce_kid = 2;
+    const auto is_sorted_route_reduce_kid = [&](int kid) {
+        return kid == sorted_route_reduce_kid ||
+               kid == full_row_sorted_route_reduce_kid;
+    };
+    const auto select_sorted_route_reduce_kid = [&]() {
+        return route_reduce.model_dim == 2048
+                   ? full_row_sorted_route_reduce_kid
+                   : sorted_route_reduce_kid;
+    };
     const auto sorted_route_kid = [&](int logical_kid) {
         return logical_kid == logical_bn256_route_dx_kid
                    ? sorted_bn256_route_dx_kid
@@ -644,22 +654,22 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     if(auto_sorted_route_pair)
     {
         selected_route_dx = sorted_route_kid(selected_route_dx);
-        selected_route_reduce = sorted_route_reduce_kid;
+        selected_route_reduce = select_sorted_route_reduce_kid();
     }
     else if(is_sorted_route_kid(route_dx_kernel_id) &&
             route_reduce_kernel_id == kKernelAuto)
     {
-        selected_route_reduce = sorted_route_reduce_kid;
+        selected_route_reduce = select_sorted_route_reduce_kid();
     }
-    else if(route_reduce_kernel_id == sorted_route_reduce_kid &&
+    else if(is_sorted_route_reduce_kid(route_reduce_kernel_id) &&
             route_dx_kernel_id == kKernelAuto)
     {
         selected_route_dx = sorted_route_kid(selected_route_dx);
     }
     AITER_CHECK(is_sorted_route_kid(selected_route_dx) ==
-                    (selected_route_reduce == sorted_route_reduce_kid),
+                    is_sorted_route_reduce_kid(selected_route_reduce),
                 "fixed route pipeline: a sorted route workspace kernel and "
-                "route-reduce kernel id 1 must be selected together");
+                "a sorted route-reduce kernel must be selected together");
 
     invoke(gfx950::dispatch_down_bwd(
                select_fixed_down_kernel_id(down, down_kernel_id)),

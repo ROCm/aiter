@@ -286,12 +286,26 @@ struct RouteReduceBf16Gfx950Bm16Bn128
     static constexpr int VEC = 8;
     static constexpr int MAX_TOPK = 8;
     static constexpr bool READ_SORTED_ROUTES = false;
+    static constexpr bool BROADCAST_ROUTE_ID = false;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128SortedInput
     : RouteReduceBf16Gfx950Bm16Bn128
 {
     static constexpr bool READ_SORTED_ROUTES = true;
+};
+
+// When one 2048-column tile covers the complete token row, all four waves in
+// the CTA consume adjacent slices of the same reverse-gathered routes.  Each
+// wave broadcasts one route id instead of issuing 64 duplicate metadata
+// loads.  This keeps the same 2048 output elements per CTA as BM16xBN128 but
+// lowers both VGPR pressure and random-memory scheduling overhead.
+struct RouteReduceBf16Gfx950Bm1Bn2048SortedInput
+    : RouteReduceBf16Gfx950Bm16Bn128SortedInput
+{
+    static constexpr int B_M = 1;
+    static constexpr int B_N = 2048;
+    static constexpr bool BROADCAST_ROUTE_ID = true;
 };
 
 // Router scores and their gradients remain FP32 even though the surrounding

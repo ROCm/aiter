@@ -74,9 +74,19 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
     route_reduce_f32x2 accum[VEC / 2];
 
     const int logical_base = token * TopK;
-    const int first_route = T::READ_SORTED_ROUTES
-                                ? kargs.route.reverse_sorted[logical_base]
-                                : logical_base;
+    constexpr int route_broadcast_width =
+        threads_per_row < 64 ? threads_per_row : 64;
+    static_assert(!T::BROADCAST_ROUTE_ID ||
+                  (route_broadcast_width > 0 &&
+                   64 % route_broadcast_width == 0));
+    int first_route = T::READ_SORTED_ROUTES
+                          ? ((!T::BROADCAST_ROUTE_ID ||
+                              lane_n % route_broadcast_width == 0)
+                                 ? kargs.route.reverse_sorted[logical_base]
+                                 : 0)
+                          : logical_base;
+    if constexpr(T::BROADCAST_ROUTE_ID)
+        first_route = __shfl(first_route, 0, route_broadcast_width);
     const int64_t route_base =
         static_cast<int64_t>(first_route) * kargs.stride_dx_route_r + col;
     const auto first = *reinterpret_cast<const route_reduce_u32x4*>(
@@ -88,9 +98,14 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
 #pragma unroll
     for(int slot = 1; slot < TopK; ++slot)
     {
-        const int route = T::READ_SORTED_ROUTES
-                              ? kargs.route.reverse_sorted[logical_base + slot]
-                              : logical_base + slot;
+        int route = T::READ_SORTED_ROUTES
+                        ? ((!T::BROADCAST_ROUTE_ID ||
+                            lane_n % route_broadcast_width == 0)
+                               ? kargs.route.reverse_sorted[logical_base + slot]
+                               : 0)
+                        : logical_base + slot;
+        if constexpr(T::BROADCAST_ROUTE_ID)
+            route = __shfl(route, 0, route_broadcast_width);
         const auto values = *reinterpret_cast<const route_reduce_u32x4*>(
             kargs.d_x_route +
             static_cast<int64_t>(route) * kargs.stride_dx_route_r + col);
