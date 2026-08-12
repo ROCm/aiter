@@ -124,6 +124,7 @@ def test_fp8_mqa_logits(
         ks, ke = generate_cp_test_data(s_q, s_k)
 
     q_fp8 = q.to(e4m3_type)
+    q = q_fp8.to(torch.float32).to(torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
@@ -148,7 +149,7 @@ def test_fp8_mqa_logits(
     diff = calc_diff(logits, ref_logits)
     if ref_neginf_mask.all():
         return  # nothing left to compare
-    assert diff < 1e-3, f"{diff=}"
+    assert diff < 1e-4, f"{diff=}"
 
 
 @pytest.mark.parametrize("cu_start", [1, 128, 2529])
@@ -182,6 +183,7 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     ke = ks + torch.tensor(seg_lens, dtype=torch.int, device="cuda")
 
     q_fp8 = q.to(e4m3_type)
+    q = q_fp8.to(torch.float32).to(torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
@@ -195,4 +197,4 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
-    assert diff < 1e-3, f"{diff=}"
+    assert diff < 1e-4, f"{diff=}"
