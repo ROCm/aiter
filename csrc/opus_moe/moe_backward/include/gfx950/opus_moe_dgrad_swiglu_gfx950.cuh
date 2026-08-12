@@ -51,32 +51,26 @@ __device__ __forceinline__ void opus_moe_dgrad_tile_map(
 {
     tile_m = wgid % num_tiles_m;
     tile_n = wgid / num_tiles_m;
-    if((num_tiles_m & 1) == 0 && (num_tiles_n & 1) == 0)
+    constexpr int GROUP_M = 4;
+    constexpr int GROUP_N = 2;
+    const int grouped_tiles_m = (num_tiles_m / GROUP_M) * GROUP_M;
+    if(grouped_tiles_m > 0 && (num_tiles_n % GROUP_N) == 0)
     {
-        constexpr int GROUP = 2;
-        const int group_id = wgid / (GROUP * GROUP);
-        const int in_group = wgid % (GROUP * GROUP);
-        const int groups_m = num_tiles_m / GROUP;
-        tile_m = (group_id % groups_m) * GROUP + in_group % GROUP;
-        tile_n = (group_id / groups_m) * GROUP + in_group / GROUP;
-    }
-    else if(num_tiles_m > 1 && (num_tiles_n & 1) == 0)
-    {
-        constexpr int GROUP = 2;
-        const int grouped_tiles_m = num_tiles_m - 1;
         const int grouped_blocks = grouped_tiles_m * num_tiles_n;
         if(wgid < grouped_blocks)
         {
-            const int group_id = wgid / (GROUP * GROUP);
-            const int in_group = wgid % (GROUP * GROUP);
-            const int groups_m = grouped_tiles_m / GROUP;
-            tile_m = (group_id % groups_m) * GROUP + in_group % GROUP;
-            tile_n = (group_id / groups_m) * GROUP + in_group / GROUP;
+            const int group_id = wgid / (GROUP_M * GROUP_N);
+            const int in_group = wgid % (GROUP_M * GROUP_N);
+            const int groups_m = grouped_tiles_m / GROUP_M;
+            tile_m = (group_id % groups_m) * GROUP_M + in_group % GROUP_M;
+            tile_n = (group_id / groups_m) * GROUP_N + in_group / GROUP_M;
         }
         else
         {
-            tile_m = grouped_tiles_m;
-            tile_n = wgid - grouped_blocks;
+            const int remainder_m = num_tiles_m - grouped_tiles_m;
+            const int remainder_wgid = wgid - grouped_blocks;
+            tile_m = grouped_tiles_m + remainder_wgid % remainder_m;
+            tile_n = remainder_wgid / remainder_m;
         }
     }
 }
