@@ -279,6 +279,181 @@ def test_opus_gdn_varlen_matches_independent_dense_ws_sequences() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("lens", "heads"),
+    (
+        pytest.param([15], 1, id="single-tail"),
+        pytest.param([1, 63, 64, 65, 129], 2, id="boundary-mix"),
+        pytest.param([15, 85, 200, 900], 4, id="multi-chunk-ragged"),
+        pytest.param([64, 128, 256], 4, id="aligned-packed"),
+        pytest.param([64, 64, 64, 64, 64, 64], 2, id="aligned-many-sequences"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("with_initial_state", "output_final_state"),
+    (
+        pytest.param(False, False, id="stateless"),
+        pytest.param(True, True, id="state-io"),
+    ),
+)
+def test_opus_gdn_varlen_fused_matches_triton(
+    lens: list[int],
+    heads: int,
+    with_initial_state: bool,
+    output_final_state: bool,
+) -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(
+        lens, heads, seed=20260812 + sum(lens) + heads
+    )
+    initial_state = state if with_initial_state else None
+
+    actual, actual_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        k2_mode=1,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+    expected, expected_final = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    if output_final_state:
+        assert actual_final is not None and expected_final is not None
+        assert tuple(actual_final.shape) == (len(lens), heads, _D, _D)
+        torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+    else:
+        assert actual_final is None
+
+
+@pytest.mark.parametrize(
+    ("lens", "wf_variant"),
+    (
+        pytest.param([15, 85, 200], "0", id="ragged-generic"),
+        pytest.param([64, 128, 256], "0", id="aligned-generic"),
+        pytest.param([64, 128, 256], "5", id="aligned-early-prefetch"),
+        pytest.param([64, 128, 256], "6", id="aligned-bv128"),
+    ),
+)
+def test_opus_gdn_varlen_fused_variants_match_split(
+    lens: list[int],
+    wf_variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(lens, 3, seed=71)
+    expected, expected_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        k2_mode=2,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    monkeypatch.setenv("OPUS_GDN_WF_VARIANT", wf_variant)
+    actual, actual_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        k2_mode=1,
+        use_env_overrides=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+
+
+def test_opus_gdn_varlen_fused_rejects_aligned_variants_on_ragged_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([15, 65], 2, seed=72)
+    monkeypatch.setenv("OPUS_GDN_WF_VARIANT", "6")
+
+    with pytest.raises(RuntimeError, match="multiple of BT=64"):
+        opus_gdn_wu_prefill_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            k2_mode=1,
+            use_env_overrides=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+
+def test_opus_gdn_varlen_fused_matches_independent_dense_sequences() -> None:
+    _require_opus_device()
+    lens = [1, 63, 64, 65]
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(lens, 2, seed=73)
+    packed, packed_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        k2_mode=1,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    dense_outputs = []
+    dense_finals = []
+    start = 0
+    for sequence_id, length in enumerate(lens):
+        end = start + length
+        dense, dense_final = opus_gdn_wu_prefill_fwd(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            g[:, start:end],
+            beta[:, start:end],
+            initial_state=state[sequence_id : sequence_id + 1],
+            output_final_state=True,
+            k2_mode=1,
+            use_env_overrides=False,
+        )
+        dense_outputs.append(dense)
+        dense_finals.append(dense_final)
+        start = end
+
+    # The packed and dense fused launches pick different BV/warp shapes, so the
+    # accumulation order differs; only sequence isolation is asserted here.
+    torch.testing.assert_close(
+        packed, torch.cat(dense_outputs, dim=1), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        packed_final, torch.cat(dense_finals, dim=0), rtol=1e-2, atol=2e-3
+    )
+
+
 def test_opus_gdn_varlen_metadata_cache_tracks_inplace_mutation() -> None:
     _require_opus_device()
     q, k, v, g, beta, cu_seqlens, state = _make_inputs([64, 64], 2, seed=31)
@@ -679,7 +854,7 @@ def test_varlen_route_bypasses_dense_table(
         adapter.select_gdn_prefill_path(q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens)
         == "ws"
     )
-    with pytest.raises(ValueError, match="W/U split"):
+    assert (
         adapter.select_gdn_prefill_path(
             q,
             k,
@@ -689,6 +864,8 @@ def test_varlen_route_bypasses_dense_table(
             cu_seqlens=cu_seqlens,
             path="wf",
         )
+        == "wf"
+    )
 
 
 def test_varlen_auto_gfx950_falls_back_without_preparing_metadata(
@@ -730,6 +907,79 @@ def test_varlen_explicit_wu_paths_select_ws(
         )
         == "ws"
     )
+
+
+def test_varlen_explicit_wf_path_selects_wf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([32, 33], 1, seed=62)
+    monkeypatch.setattr(adapter, "_runtime_target", lambda _: ("gfx950", 120))
+
+    assert (
+        adapter.select_gdn_prefill_path(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            path="wf",
+        )
+        == "wf"
+    )
+
+
+@pytest.mark.parametrize("path", ("c", "cf", "cs"))
+def test_varlen_rejects_explicit_c_paths(path: str) -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 64], 1, seed=63)
+
+    with pytest.raises(ValueError, match="W/U families only"):
+        adapter.select_gdn_prefill_path(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            path=path,
+        )
+
+
+def test_gdn_prefill_explicit_wf_runs_packed_fused_kernel() -> None:
+    _require_opus_device()
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs([15, 65, 129], 2, seed=64)
+    expected, expected_final = opus_gdn_wu_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        k2_mode=1,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    out = torch.empty_like(v)
+    actual, actual_final = adapter.gdn_prefill(
+        q,
+        k,
+        v,
+        o=out,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        path="wf",
+    )
+
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_final, expected_final)
 
 
 def test_gdn_prefill_explicit_ws_runs_packed_kernel() -> None:

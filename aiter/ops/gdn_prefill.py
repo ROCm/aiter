@@ -284,11 +284,11 @@ def select_gdn_prefill_path(
         return "triton"
 
     is_varlen = cu_seqlens is not None
-    if is_varlen and normalized_path in ("c", "cf", "cs", "wf"):
+    if is_varlen and normalized_path in ("c", "cf", "cs"):
         if explicit:
             raise ValueError(
                 f"path={normalized_path!r} is unavailable: packed varlen "
-                "currently supports the W/U split path only"
+                "currently supports the W/U families only"
             )
         return "triton"
 
@@ -322,8 +322,9 @@ def select_gdn_prefill_path(
     B, T, _, _ = q.shape
     H = v.shape[2]
     if is_varlen:
-        # Ragged workloads are not keys in the dense winner table.  The
-        # metadata-aware native implementation is the W/U split family.
+        # Ragged workloads are not keys in the dense winner table, so auto and
+        # path='wu' both take WS, the measured packed family.  Both W/U kernels
+        # are metadata-aware, so an explicit 'wf' is honored.
         assert cu_seqlens is not None
         try:
             total_tokens, _, _, _, _ = _prepare_opus_gdn_varlen_metadata(
@@ -337,7 +338,7 @@ def select_gdn_prefill_path(
                     f"path={normalized_path!r} is unavailable: {exc}"
                 ) from exc
             return "triton"
-        return "ws"
+        return "wf" if normalized_path == "wf" else "ws"
     padded_T = ((T + _DENSE_BT - 1) // _DENSE_BT) * _DENSE_BT
     with_state_io = initial_state is not None or output_final_state
 

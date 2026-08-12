@@ -227,8 +227,9 @@ def opus_gdn_wu_prefill_fwd(
         num_warps: K2 wave count. If omitted, uses 8 for the tuned BT64
             WS/WF paths and 4 for the legacy BT16/32/128 configurations.
         k2_mode: 0 selects between the W/U fused and split families using the
-            measured gfx942 T/B*H/state envelope; 1 forces fused (WF); 2
-            forces split scan/output (WS). Forced split requires BT=64.
+            measured gfx942 T/B*H/state envelope, and resolves to split for
+            packed varlen; 1 forces fused (WF); 2 forces split scan/output
+            (WS). Forced split requires BT=64.
         out: optional preallocated contiguous bf16 output tensor. Dense padded
             calls require an already BT-aligned sequence length; packed varlen
             accepts arbitrary positive sequence lengths.
@@ -236,8 +237,10 @@ def opus_gdn_wu_prefill_fwd(
             OPUS_GDN_* benchmark overrides. Defaults to True for direct
             backend A/B compatibility; production adapters should pass False.
         cu_seqlens: optional cumulative sequence lengths [N+1]. When present,
-            q/k/v use packed [1, total_tokens, H, 128] layout and the native
-            BT64 Neumann + WS kernels reset recurrence at every sequence. HIP
+            q/k/v use packed [1, total_tokens, H, 128] layout, BT=64 with
+            k1_algo=1 is required, and the native kernels reset recurrence at
+            every sequence. k2_mode=0 resolves to WS, the measured packed
+            family; k2_mode=1 runs the packed fused W/U kernel instead. HIP
             Graph capture requires a cache-prewarm call with the same Tensor;
             retain it and do not modify its offsets for any replay. Recapture
             the graph when the packed partition changes.
@@ -310,9 +313,10 @@ def opus_gdn_wu_prefill_fwd(
             raise ValueError("packed varlen expects q/k/v batch dimension B=1")
         if BT != 64 or k1_algo != 1:
             raise ValueError("packed varlen requires BT=64 and k1_algo=1")
-        if k2_mode == OPUS_GDN_K2_WU_FUSED:
-            raise ValueError("packed varlen currently supports the WS path only")
-        k2_mode = OPUS_GDN_K2_SPLIT
+        if k2_mode == OPUS_GDN_K2_AUTO:
+            # WS is the measured varlen family; the fused kernel is packed-aware
+            # but only an explicit request selects it.
+            k2_mode = OPUS_GDN_K2_SPLIT
 
     if scale is None:
         scale = K**-0.5
