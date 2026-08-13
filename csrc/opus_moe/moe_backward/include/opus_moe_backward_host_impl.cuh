@@ -639,8 +639,10 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int sorted_bn256_b_first_route_dx_kid = 15;
     constexpr int sorted_bn256_m5_b_first_route_dx_kid = 16;
     constexpr int sorted_bn256_m5_binary_route_dx_kid = 17;
+    constexpr int sorted_bn512_m3_binary_route_dx_kid = 18;
     constexpr int b_first_min_routes = 250000;
     constexpr uint64_t m5_min_average_routes = 1536;
+    constexpr uint64_t bn512_min_dz_bytes = 1024ull * 1024ull * 1024ull;
     constexpr int sorted_route_reduce_kid = 1;
     constexpr int full_row_sorted_route_reduce_kid = 2;
     const auto is_sorted_route_reduce_kid = [&](int kid) {
@@ -660,7 +662,20 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
             static_cast<uint64_t>(route_dx.route.sorted_capacity) /
             static_cast<uint64_t>(route_dx.route.num_experts);
         if(average_padded_routes >= m5_min_average_routes)
+        {
+            const uint64_t route_dz_bytes =
+                static_cast<uint64_t>(route_dx.route.sorted_capacity) *
+                static_cast<uint64_t>(2 * route_dx.inter_dim) *
+                sizeof(hip_bfloat16);
+            // In the full mixed-kernel schedule, very large dZ streams can
+            // amortize BN512's one-workgroup residency by sharing each dZ
+            // load across twice as many output columns.  Keep the narrower
+            // M5 kernel for smaller working sets and standalone dispatch.
+            if(route_dx.model_dim % 512 == 0 &&
+               route_dz_bytes >= bn512_min_dz_bytes)
+                return sorted_bn512_m3_binary_route_dx_kid;
             return sorted_bn256_m5_binary_route_dx_kid;
+        }
 
         // The BN256/M3 stage moves about 16 KiB of W1 but only 6 KiB of dZ
         // per stage.  On long sorted streams, issuing W1 first starts the
@@ -680,7 +695,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                kid == sorted_bn256_route_dx_kid ||
                kid == sorted_bn256_b_first_route_dx_kid ||
                kid == sorted_bn256_m5_b_first_route_dx_kid ||
-               kid == sorted_bn256_m5_binary_route_dx_kid;
+               kid == sorted_bn256_m5_binary_route_dx_kid ||
+               kid == sorted_bn512_m3_binary_route_dx_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&

@@ -333,6 +333,25 @@ struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM5BinaryCompactCohort10ASlabPadSor
     static constexpr bool COMPACT_ROUTE_GROUP_GRID = true;
 };
 
+// Reuse each dZ slab across four N repeats.  M3 keeps the accumulator and
+// 80-KiB double-buffer footprint within one gfx950 workgroup while the compact
+// expert grid avoids launching inactive route groups.
+struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirst
+    : RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPadSortedOutputBFirst
+{
+    static constexpr int B_N = 512;
+    static constexpr int E_N = 4;
+    static constexpr bool COMPACT_ROUTE_GROUP_GRID = true;
+    static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
+    static constexpr int SMEM_B_GROUP_DATA_BYTES =
+        SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
+    static constexpr int SMEM_B_GROUP_BYTES =
+        SMEM_B_GROUP_DATA_BYTES + SMEM_B_GROUP_PAD_BYTES;
+    static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
+    static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
+    static_assert(B_N == T_N * W_N * E_N);
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,
