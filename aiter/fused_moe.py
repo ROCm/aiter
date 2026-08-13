@@ -71,18 +71,6 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-# Remove this warning after all callers pass q_dtype_a explicitly.
-if (
-    os.environ.get("AITER_SITUV2_A8W4") is not None
-    or os.environ.get("AITER_SITUV2_A4W4") is not None
-):
-    logger.warning(
-        "AITER_SITUV2_A8W4 and AITER_SITUV2_A4W4 are deprecated and ignored; "
-        "pass q_dtype_a explicitly to fused_moe_ instead. If q_dtype_a is not "
-        "provided, SiTUv2 defaults to the AITER_SITUV2_A8W4 behavior (FP8 "
-        "activations)."
-    )
-
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -498,7 +486,6 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
-    q_dtype_a: torch.dtype | None = None,
 ):
     if (
         any(
@@ -533,7 +520,6 @@ def fused_moe(
             bias2=bias2,
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
-            q_dtype_a=q_dtype_a,
             shared_w1=shared_w1,
             shared_w2=shared_w2,
             shared_w1_scale=shared_w1_scale,
@@ -568,7 +554,6 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        q_dtype_a=q_dtype_a,
     )
 
 
@@ -600,7 +585,6 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    q_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -639,7 +623,6 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    q_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -667,7 +650,6 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        q_dtype_a=q_dtype_a,
     )
 
 
@@ -697,8 +679,8 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    q_dtype_a: torch.dtype | None = None,
     *,
+    _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
@@ -730,7 +712,6 @@ def _fused_moe_impl(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    requested_q_dtype_a = q_dtype_a
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
@@ -749,7 +730,18 @@ def _fused_moe_impl(
         q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Situv2:
-            q_dtype_a = dtypes.fp8
+            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
+            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
+            # fp8 / fp4 activation instead; each has its own tuned config
+            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
+            # branch below, which would otherwise claim SiTUv2 and pick the
+            # activation dtype itself.
+            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+                q_dtype_a = dtypes.fp8
+            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+                q_dtype_a = dtypes.fp4x2
+            else:
+                q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
@@ -766,8 +758,8 @@ def _fused_moe_impl(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if requested_q_dtype_a is not None:
-        q_dtype_a = requested_q_dtype_a
+    if _q_dtype_a is not None:
+        q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
     if is_flydsl_available():
