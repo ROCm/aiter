@@ -1,32 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL Linear Attention Prefill K5 host wrapper (gated delta rule).
+"""FlyDSL host wrappers for GDN prefill.
 
-This module hosts ``chunk_gated_delta_rule_fwd_h_flydsl`` -- the host
-wrapper around the K5 hidden-state recurrence FlyDSL kernel
-(``compile_chunk_gated_delta_h``). It performs PyTorch tensor
-preparation, chooses ``BV`` with a rule-based grid/CU heuristic, manages
-the compiled kernel cache, and handles the launch stream. The kernel-
-compile module ``kernels.chunk_gated_delta_h`` is kept ``torch``-free,
-mirroring the layering used by ``kernels.gdr_decode``.
-
-* ``chunk_gated_delta_rule_fwd_h_flydsl`` -- hidden-state recurrence
-  (``compile_chunk_gated_delta_h``). Prepares tensors, chooses ``BV`` with a
-  rule-based grid/CU heuristic, manages the compiled kernel cache and stream.
-* ``gdn_prepare_fwd_flydsl`` -- cumsum, gated KKT, triangular inverse and the
-  WY ``w``/``u`` GEMMs fused into one kernel (``compile_gdn_prepare``).
-  Allocates the outputs and applies the anti-camping ``grid_x`` padding.
-
-For an end-to-end GDN forward, call
-``aiter.ops.triton.gated_delta_net.chunk_gated_delta_rule_opt_vk`` with
-``use_chunk_flydsl=True`` (hidden state) and/or ``use_prepare_flydsl=True``
-(prepare). The two are independent: the prepare wrapper matches the layout and
-exponent-domain contract of the Triton
-``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
-``fused_solve_tril_recompute_w_u`` pair it replaces, so it composes with any of
-the three ``chunk_gated_delta_rule_fwd_h`` backends. Use
-``gdn_prepare_flydsl_supported`` to check a problem shape before selecting it.
+The module exposes hidden-state and prepare kernels. The prepare wrapper matches
+the Triton prepare layout and exponent-domain contract, so both paths can be
+selected independently through ``chunk_gated_delta_rule_opt_vk``. Call
+``gdn_prepare_flydsl_supported`` before selecting the fused prepare path.
 """
 
 from __future__ import annotations
@@ -962,8 +942,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         )
     if k.shape[1] != T_flat:
         raise ValueError(
-            f"FlyDSL K5 mfma16_hip: k T dim ({k.shape[1]}) must equal w/u T "
-            f"({T_flat})."
+            f"FlyDSL K5 mfma16_hip: k T dim ({k.shape[1]}) must equal w/u T ({T_flat})."
         )
     if w.shape != (B, H, T_flat, K):
         raise ValueError(
@@ -987,7 +966,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             )
         if gk.dtype != torch.float32:
             raise ValueError(
-                f"FlyDSL K5 mfma16_hip: gk must be float32, got " f"{gk.dtype}."
+                f"FlyDSL K5 mfma16_hip: gk must be float32, got {gk.dtype}."
             )
         expected_gk_shape = (B, T_flat, H, K)
         if tuple(gk.shape) != expected_gk_shape:
@@ -1162,8 +1141,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             BV = int(_bv_env)
         except ValueError as exc:
             raise ValueError(
-                "FLYDSL_K5_MFMA16HIP_BV must be one of 16, 32, or 64, "
-                f"got {_bv_env!r}."
+                f"FLYDSL_K5_MFMA16HIP_BV must be one of 16, 32, or 64, got {_bv_env!r}."
             ) from exc
     if BV not in (16, 32, 64):
         raise ValueError(f"mfma16_hip BV must be in {{16,32,64}}, got {BV}.")
@@ -1235,8 +1213,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             g = g.to(torch.float32)
         if g.dim() != 3:
             raise ValueError(
-                f"FlyDSL K5 mfma16_hip: `g` must be 3-D, got shape "
-                f"{tuple(g.shape)}."
+                f"FlyDSL K5 mfma16_hip: `g` must be 3-D, got shape {tuple(g.shape)}."
             )
         expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
         if tuple(g.shape) != expected_g_shape:
@@ -1318,12 +1295,7 @@ def _pad_grid_x_odd(grid_x: int) -> int:
 
 @functools.cache
 def _is_cdna_mfma_arch() -> bool:
-    """Whether the live GPU has the CDNA bf16 MFMA the prepare kernel needs.
-
-    ``get_gfx_runtime`` is the repo's runtime dispatch helper (``get_gfx`` is
-    for build-time codegen and honors ``GPU_ARCHS``). It raises on archs it does
-    not know, which here just means the fused path is unavailable.
-    """
+    """Whether the current device supports the fused prepare kernel."""
     try:
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -1332,10 +1304,7 @@ def _is_cdna_mfma_arch() -> bool:
         return False
 
 
-# The launch hands flattened views to FlyDSL's C-ABI packer, which sizes them as
-# C ``int``, so a view of 2**31 elements or more raises ``struct.error`` before
-# the kernel runs. ``w_bar``/``u_bar`` are the widest views and match
-# ``v.numel()`` (the predicate pins ``K == V``), so bounding v bounds them.
+# The launch ABI uses 32-bit element counts; v also bounds the widest outputs.
 _MAX_FLAT_ELEMS = 2**31
 
 
@@ -1345,12 +1314,7 @@ def gdn_prepare_flydsl_supported(
     *,
     BT: int = 64,
 ) -> bool:
-    """Whether ``gdn_prepare_fwd_flydsl`` can serve this problem shape.
-
-    The fused kernel covers a deliberately narrow slice of what the Triton
-    prepare pair accepts. Callers gate on this to fall back to Triton
-    everywhere else instead of tripping an assert inside the compile.
-    """
+    """Whether ``gdn_prepare_fwd_flydsl`` supports this problem shape."""
     return (
         BT == 64
         and k.shape[-1] == 128
@@ -1379,13 +1343,10 @@ def gdn_prepare_fwd_flydsl(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FlyDSL GDN prepare host wrapper (cumsum, KKT, inverse and WY fused).
+    """Fused GDN prepare wrapper compatible with the Triton prepare pair.
 
-    Drop-in for the Triton ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
-    ``fused_solve_tril_recompute_w_u`` pair: same inputs, same output layouts
-    and exponent domain, one kernel instead of three dispatches. The
-    ``A_raw [B, T, H, BT]`` fp32 intermediate those two exchange never
-    materializes here.
+    It preserves input/output layouts and exponent semantics without
+    materializing ``A_raw``.
 
     Args:
         k: [B, T, Hg, K] bf16.
@@ -1396,32 +1357,18 @@ def gdn_prepare_fwd_flydsl(
             When given, ``B`` must be 1 and ``T`` is the packed token count.
         BT: chunk size (must be 64).
         Hg: number of K/V heads; defaults to ``k.shape[2]``. ``H % Hg == 0``.
-        use_exp2: when True, publish ``g_cumsum`` in log2 space (pre-scaled by
-            ``log2(e)``) so the downstream ``chunk_gated_delta_rule_fwd_h`` and
-            ``chunk_fwd_o`` kernels can use ``exp2``. Matches the ``use_exp2``
-            convention of the Triton pair above, including its default.
-            ``w_bar``/``u_bar`` are unaffected.
+        use_exp2: publish ``g_cumsum`` in log2 space when True.
+            ``w_bar`` and ``u_bar`` are unchanged.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
-            the ORIGINAL ``cu_seqlens`` (the data tensors are expected
-            pre-sliced to the prefill region). ``prefill_metadata`` carries the
-            rebased offsets, so no per-forward device-to-host read happens.
-        prefill_metadata: prebuilt reusable prefill schedule, required whenever
-            ``cu_seqlens`` is given and shareable across the GDR layers of one
-            batch. The grid shape comes straight off it, keeping the launch off
-            the device offsets. Raises when absent for a varlen batch, which the
-            ``chunk_gated_delta_rule_*`` entry points pre-empt by warning and
-            falling back to the Triton prepare pair.
+            ``cu_seqlens``; data tensors contain only prefill tokens.
+        prefill_metadata: reusable schedule required for variable-length input.
         stream: launch stream; defaults to the current stream.
 
     Returns:
-        (w_bar [B, H, T, K] bf16, u_bar [B, H, T, V] bf16,
-        g_cumsum [B, H, T] f32) -- all head-major contiguous, i.e. stride 1
-        along T within a head, as ``chunk_gated_delta_rule_fwd_h`` and
-        ``chunk_fwd_o`` require.
+        Head-major contiguous ``w_bar [B,H,T,K]`` bf16,
+        ``u_bar [B,H,T,V]`` bf16, and ``g_cumsum [B,H,T]`` fp32.
 
-    All three outputs are shaped on the caller's ``T``; ``T`` need not be a
-    multiple of ``BT``, as the kernel guards the ragged last chunk on
-    ``seqlen`` instead of requiring padded inputs.
+    ``T`` need not be a multiple of ``BT``.
     """
     B, T, Hg_in, K = k.shape
     H = v.shape[2]
@@ -1430,10 +1377,7 @@ def gdn_prepare_fwd_flydsl(
         Hg = Hg_in
     assert H % Hg == 0
 
-    # Casting a non-bf16 ``k``/``v`` here would leave ``w``/``u`` disagreeing
-    # with ``k``, which ``chunk_gated_delta_rule_fwd_h`` turns into silent
-    # mixed precision downstream rather than an error. Callers needing fp16
-    # should stay on the Triton prepare pair, which follows the input dtype.
+    # Reject mixed precision before it reaches downstream kernels.
     if k.dtype is not torch.bfloat16 or v.dtype is not torch.bfloat16:
         raise TypeError(
             "gdn_prepare_fwd_flydsl emits bf16 `w_bar`/`u_bar` and therefore "
@@ -1444,9 +1388,7 @@ def gdn_prepare_fwd_flydsl(
             "`num_decodes` / `num_decode_tokens` describe a packed varlen batch "
             "and require `cu_seqlens`."
         )
-    # Everything past this point assumes the supported slice; unchecked, an
-    # unsupported shape surfaces as a compile assert and a cross-device tensor
-    # as a segfault inside the launch.
+    # Validate the supported slice before compilation and launch.
     if not gdn_prepare_flydsl_supported(k, v, BT=BT):
         raise ValueError(
             "gdn_prepare_fwd_flydsl serves bf16 `k`/`v` with K=V=128 and BT=64, "
@@ -1465,12 +1407,7 @@ def gdn_prepare_fwd_flydsl(
     is_varlen = cu_seqlens is not None
     if is_varlen:
         assert B == 1
-        # The grid is rectangular -- ``NT`` chunk columns by ``num_seqs * H``
-        # rows -- so it needs the LONGEST sequence's chunk count, not the
-        # flattened total. Only the host-resident schedule carries that, and
-        # deriving it from ``cu_seqlens`` would cost a device-to-host read per
-        # layer per forward, so refuse it here. Callers coming through
-        # ``chunk_gated_delta_rule_*`` warn and use the Triton pair instead.
+        # The schedule supplies the maximum per-sequence chunk count.
         if prefill_metadata is None:
             raise ValueError(
                 "gdn_prepare_fwd_flydsl needs `prefill_metadata` for a varlen "
@@ -1499,17 +1436,13 @@ def gdn_prepare_fwd_flydsl(
             device=k.device, dtype=torch.int32
         ).contiguous()
     else:
-        # The dense build never dereferences ``cu``, so hand it ``k`` as the
-        # placeholder pointer instead of allocating a dummy buffer.
+        # Dense mode does not dereference ``cu``.
         cu = k
         num_seqs = B
-        # A ragged last chunk needs no input padding: the kernel bounds every
-        # global access on ``seqlen``, so a dense tail behaves exactly like
-        # varlen's ragged last chunk.
+        # Tail accesses are bounded, so no padding is required.
         NT = (T + BT - 1) // BT
 
-    # Every output position is written by exactly one block, so ``empty`` is
-    # safe and skips two fill kernels.
+    # Every output position is written once.
     w_bar = torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
     u_bar = torch.empty(B, H, T, V, dtype=torch.bfloat16, device=k.device)
     g_cumsum = torch.empty(B, H, T, dtype=torch.float32, device=k.device)
@@ -1517,11 +1450,7 @@ def gdn_prepare_fwd_flydsl(
     grid_x = NT
     grid_y = num_seqs * H
 
-    # Anti-camping. With an even grid_x, a skewed varlen batch -- one long
-    # sequence among short ones -- spreads its chunk columns unevenly and leaves
-    # much of the device idle: measured 25us against 17us at NT=32. An odd
-    # grid_x spreads them, and the extra column exceeds every seqlen, so it
-    # early-exits and the output is unchanged. Dense batches never skew.
+    # Odd width distributes skewed varlen chunks; the extra column exits early.
     if is_varlen and NT >= 2:
         grid_x = _pad_grid_x_odd(NT)
 

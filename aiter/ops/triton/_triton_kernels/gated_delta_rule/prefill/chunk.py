@@ -261,12 +261,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     instead of Triton. When use_chunk_flydsl=True, hidden state computation
     uses the FlyDSL kernel. The two flags are mutually exclusive.
 
-    When use_prepare_flydsl=True, the
-    fused_chunk_local_cumsum_scaled_dot_kkt_fwd +
-    fused_solve_tril_recompute_w_u pair is replaced by a single fused FlyDSL
-    kernel, which also avoids materializing their `A_raw [B, T, H, BT]` fp32
-    intermediate. It reproduces that pair's output layouts and exponent domain
-    exactly, so the flag is independent of the hidden-state choice above.
+    When use_prepare_flydsl=True, one FlyDSL kernel replaces the Triton prepare
+    pair without materializing `A_raw`. It preserves the pair's output contract
+    and is independent of the hidden-state choice.
 
     Args:
         q: [B, T, Hg, K]
@@ -280,26 +277,17 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state
-        use_prepare_flydsl: bool — use the fused FlyDSL kernel for the prepare
-            stages (cumsum + KKT + triangular solve + w/u) in place of the
-            Triton pair. Silently falls back to Triton outside the fused
-            kernel's support (bf16, K=V=128, CDNA). With cu_seqlens it also
-            needs a prefill schedule; without one it warns and falls back, so
-            pass seq_lens_cpu or prefill_metadata to actually get the kernel.
+        use_prepare_flydsl: bool — use the fused prepare kernel when supported.
+            Variable-length input also requires a prefill schedule; otherwise
+            the function warns and falls back to Triton.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by the output stage). If None, a fresh buffer is allocated.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
-            the ORIGINAL cu_seqlens (data tensors are expected pre-sliced).
-            Threaded into every stage; the cached prologue helpers
-            (prepare_chunk_indices / prepare_chunk_offsets /
-            prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
-            so chunk-index / offset builds stay cache-warm across forwards
-            (no per-forward .tolist() D2H).
-        seq_lens_cpu: Host-resident original sequence lengths. Builds one
-            schedule shared by every stage without device readback.
+            the original cu_seqlens; data tensors contain only prefill tokens.
+        seq_lens_cpu: Host-resident sequence lengths used to build a schedule.
         prefill_metadata: Prebuilt reusable host/device schedule. This is the
             preferred path when multiple layers process the same batch.
         initial_state_indices: Optional ``[N]`` state-pool slot indices. When
@@ -361,14 +349,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             gdn_prepare_flydsl_supported,
         )
 
-        # Outside the fused kernel's bf16 / K=V=128 / CDNA slice, keep Triton.
+        # Unsupported configurations keep the Triton prepare path.
         use_prepare_flydsl = gdn_prepare_flydsl_supported(k, v)
 
-    # Checked after the slice above so this only warns when the schedule is the
-    # one thing missing. The fused prepare sizes its grid by the longest
-    # sequence's chunk count, which only the host-resident schedule carries;
-    # deriving it from cu_seqlens would cost a device-to-host read per layer per
-    # forward. Warn rather than fail so such a caller still runs.
+    # Warn only when the prefill schedule is the missing requirement.
     if use_prepare_flydsl and cu_seqlens is not None and prefill_metadata is None:
         warnings.warn(
             "use_prepare_flydsl needs a prefill schedule for a varlen batch; "
@@ -383,9 +367,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             gdn_prepare_fwd_flydsl,
         )
 
-        # One kernel for all four prepare stages, emitting the same head-major
-        # layouts and exponent domain as the Triton pair, so everything
-        # downstream is unchanged.
         w, u, g_cumsum = gdn_prepare_fwd_flydsl(
             k=k,
             v=v,
@@ -451,12 +432,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "FlyDSL K5 does not support overriding `snapshot_dtype`; "
                 "omit it or pass `k.dtype`."
             )
-        # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
-        # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
-        # mirrors the HIP g-layout contract (default token-major), so pass
-        # g_head_major=True explicitly to select the head-major layout. The
-        # wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
-        # internally.
+        # Prepare emits head-major ``g_cumsum``.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )

@@ -499,28 +499,17 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state.
             Mutually exclusive with ``use_chunk_hip``.
         use_prepare_flydsl (bool): Use the fused FlyDSL kernel for the prepare
-            stages (cumsum + KKT + triangular solve + w/u) in place of the
-            Triton pair, which also drops their `A_raw` fp32 intermediate.
-            Independent of the two hidden-state flags; falls back to Triton
-            outside the fused kernel's support. With ``cu_seqlens`` it also
-            needs a prefill schedule; without one it warns and falls back, so
-            pass ``seq_lens_cpu`` or ``prefill_metadata`` to actually get the
-            kernel.
+            stages without materializing `A_raw`. It is independent of the
+            hidden-state flags and falls back to Triton when unsupported.
+            Variable-length input also requires a prefill schedule.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
-        num_decodes (int): number of leading decode-only sequences to skip in
-            ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
-            cache-stable ``cu_seqlens`` (decode prefix included) and the data
-            tensors (`q/k/v/g/beta/o`) pre-sliced to the prefill region; the
-            offsets are rebased internally by the cached prologue helpers, so
-            the chunk-index / offset builds stay cache-warm across forward
-            calls (no per-forward `.tolist()` D2H).
+        num_decodes (int): Leading decode-only sequences in the original
+            ``cu_seqlens``. Data tensors contain only prefill tokens.
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
-        seq_lens_cpu: Original sequence lengths on the host, including any
-            leading decode-only sequences. When supplied, one metadata schedule
-            shared by every stage is built without reading device values.
+        seq_lens_cpu: Original host sequence lengths used to build a schedule.
         prefill_metadata: Reusable schedule created by
             ``build_gated_delta_rule_prefill_metadata``. Prefer this over
             ``seq_lens_cpu`` when several GDR layers process the same batch.

@@ -35,7 +35,6 @@ BLOCK_THREADS = 256
 
 
 def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
-    """Apply one bf16 16x16x16 MMA with an fp32 accumulator."""
     frag_a = fx.make_rmem_tensor(4, fx.BFloat16)
     frag_b = fx.make_rmem_tensor(4, fx.BFloat16)
     frag_c = fx.make_rmem_tensor(4, fx.Float32)
@@ -48,17 +47,13 @@ def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
 
 
 def _acc16_n4():
-    """A zeroed accumulator over four N tiles, shaped for :func:`_gemm16_n4`."""
+    """Return a zeroed four-tile accumulator."""
     frag = fx.make_rmem_tensor((4, 1, 4), fx.Float32)
     frag.store(fx.Vector.filled(16, 0.0, fx.Float32))
     return frag
 
 
 def _gemm16_n4(frag_c, a_bf16x4, bs):
-    """Accumulate four N tiles while keeping A and B as rank-2 fragments.
-
-    Keep the static fragment fill in this helper so it remains register promoted.
-    """
     frag_a = fx.make_rmem_tensor((4, 1), fx.BFloat16)
     frag_b = fx.make_rmem_tensor((4, 4), fx.BFloat16)
     a_v = fx.BFloat16x4(a_bf16x4)
@@ -71,17 +66,16 @@ def _gemm16_n4(frag_c, a_bf16x4, bs):
 
 
 def _accum_to_bf16x4(d_f32x4):
-    """Convert an fp32 accumulator to a bf16 MMA operand."""
     d = fx.Float32x4(d_f32x4)
     return fx.BFloat16x4([d[p].to(fx.BFloat16) for p in range(4)])
 
 
-# Apply the same XOR layout to s_vT writes and reads.
+# Keep the staging layout consistent between writes and reads.
 SWZ_SR = 16
 
 
 def _swizzled_vt_view(s_t):
-    """Logical ``[feature, token]`` view over the XOR-swizzled s_vT storage."""
+    """Return the logical ``[feature, token]`` staging view."""
     coord_swizzle = fx.static(
         fx.CoordSwizzleType.get(2, SWZ_SR.bit_length() - 1, [0], 2, [1])
     )
@@ -97,9 +91,8 @@ def _swizzled_vt_view(s_t):
 
 
 def _load_mfma_tile_vt_tiled(s_t, n_tile, k_tile, lane, tiled_copy, copy_atom):
-    """Load a swizzled WY B tile through its MMA-matched copy."""
     tile = _tile16_view(s_t, n_tile * 16, k_tile * 16)
-    # Match the copy thread coordinate to the swizzled storage layout.
+    # Match the copy coordinate to the staging layout.
     thr_copy = tiled_copy.get_slice(lane ^ (n_tile * 16))
     part_src = thr_copy.partition_S(tile)
     frag = fx.make_fragment_like(part_src)
@@ -121,7 +114,7 @@ def _tile16_view(s_t, row_base, col_base, transpose=False):
 def _load_fp32_tile(
     s_t, row_base, col_base, thr_copy, copy_atom, transpose=False, negate=False
 ):
-    """Load one fp32 LDS tile through an MMA-matched copy and cast to bf16."""
+    """Load one fp32 tile and cast it to bf16."""
     src = _tile16_view(s_t, row_base, col_base, transpose)
     part_src = thr_copy.partition_S(src)
     frag = fx.make_fragment_like(part_src)
@@ -133,7 +126,7 @@ def _load_fp32_tile(
 
 
 def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, thr_copy, copy_atom):
-    """Store one MFMA accumulator through its matched C-copy layout."""
+    """Store one fp32 tile."""
     dst = _tile16_view(s_t, row_base, col_base)
     part_dst = thr_copy.partition_D(dst)
     frag = fx.make_fragment_like(part_dst)
@@ -142,7 +135,7 @@ def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, thr_copy, copy_atom):
 
 
 def _identity_frag(lane):
-    """v4f32 identity accumulator fragment for one 16x16 diagonal block."""
+    """Return the identity fragment for one diagonal block."""
     n = lane % 16
     mb4 = (lane // 16) * 4
     elems = [((mb4 + p) == n).select(1.0, 0.0) for p in range(4)]
@@ -150,7 +143,6 @@ def _identity_frag(lane):
 
 
 def _wy_prefetch(src, copy_atom, thr_copy):
-    """Prefetch one tiled WY RHS into registers."""
     part_src = thr_copy.partition_S(src)
     regs = fx.make_fragment_like(part_src)
     fx.copy(copy_atom, part_src, regs)
@@ -158,7 +150,6 @@ def _wy_prefetch(src, copy_atom, thr_copy):
 
 
 def _wy_epilogue_to_lds(wy, dst, copy_atom):
-    """Store a WY accumulator through its matched tiled copy."""
     for en in range_constexpr(4):
         for p in range_constexpr(4):
             dst_p = dst[(None, p), 0, en]
@@ -168,11 +159,7 @@ def _wy_epilogue_to_lds(wy, dst, copy_atom):
 
 
 def _wy_scatter(regs, s_vT, s_beta, gc, is_k, tid, stage_iters, svec_per_row, svec):
-    """Scale and transpose prefetched RHS values into ``s_vT``.
-
-    Scalar leaves are required because the composed transpose/swizzle cannot be
-    represented by the plain TV layout expected by ``TiledCopy``.
-    """
+    """Scale and transpose the RHS while preserving its staging layout."""
     for it in range(stage_iters):
         vals = fx.Vector(regs[None, it, 0].load())
         p = tid + it * BLOCK_THREADS
@@ -185,7 +172,6 @@ def _wy_scatter(regs, s_vT, s_beta, gc, is_k, tid, stage_iters, svec_per_row, sv
 
 
 def _wave_inclusive_scan(val, tid, width, zero):
-    """Inclusive prefix sum with a fixed stride-doubling addition order."""
     csum = val
     s = 1
     while s < width:
@@ -262,7 +248,6 @@ def compile_gdn_prepare(
         warp = tid // WARP_SIZE
         warp16 = warp * 16
 
-        # Map the workgroup to a sequence chunk and head.
         i_t = fx.Int32(gpu.block_id("x"))
         i_bh = fx.Int32(gpu.block_id("y"))
         i_b = i_bh // H
@@ -288,13 +273,12 @@ def compile_gdn_prepare(
         active = i_t < n_chunks
 
         if active:
-            # Keep handles inside this branch to avoid threading them through
-            # scf.if. Bounded descriptors handle ragged final chunks.
+            # Bounded views handle ragged final chunks.
             seq_end = bos + seqlen
             lim_gb = (seq_end * H * 4).ir_value()
             lim_k = (seq_end * Hg * K * 2).ir_value()
             lim_v = (seq_end * H * V * 2).ir_value()
-            # Head-major output slab owned by this workgroup.
+            # Head-major output range for this chunk.
             if const_expr(is_varlen):
                 hm_row = i_h * T + bos  # B == 1, T == T_flat
                 hm_end = i_h * T + seq_end
@@ -335,7 +319,7 @@ def compile_gdn_prepare(
             lds_copy16 = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
             lds_copy32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
             lds_copy128 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-            # KS=132 requires 64-bit copies for every s_k row to stay aligned.
+            # The padded row stride requires narrower aligned copies.
             lds_copy64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
 
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
@@ -372,7 +356,6 @@ def compile_gdn_prepare(
             )
             k_dst = k_store_copy.partition_D(s_k)
 
-            # Phase 1a: load g and beta, then scan g.
             if is_lane:
                 gi = base_gb + tid * H
                 g_src = fx.make_view(fx.get_iter(g_g) + gi, fx.make_layout(1, 1))
@@ -399,11 +382,11 @@ def compile_gdn_prepare(
             kregs = fx.make_fragment_like(k_src)
             fx.copy(buf_copy, k_src, kregs)
             gc = s_g
-            # Phase 1b: stage k. The following barrier also publishes g and beta.
+            # Publish k, g, and beta before forming KKT.
             fx.copy(lds_copy64, k_store_copy.retile(kregs), k_dst)
             gpu.barrier()
 
-            # Phase 1c: form the gated, strictly lower-triangular KKT matrix.
+            # Form the gated strictly lower-triangular KKT matrix.
             for ek in range_constexpr(K // 16):
                 s_k_tile = fx.make_view(
                     fx.get_iter(s_k) + ek * 16,
@@ -444,14 +427,13 @@ def compile_gdn_prepare(
             )
             gpu.barrier()
 
-            # Reuse dead g_cumsum storage for the K-side scale.
+            # Replace g_cumsum with the scale for the w_bar right-hand side.
             if is_lane:
                 gc_j = gc[tid]
                 beta_j = s_beta[tid]
                 gc[tid] = beta_j * _exp2_f32(gc_j * LOG2E)
 
-            # Phase 2a: invert each diagonal block using
-            # (I+B)(I+B^2)(I+B^4)(I+B^8), where B = -A.
+            # Invert each diagonal block with (I+B)(I+B^2)(I+B^4)(I+B^8).
             br = warp16
             neg_A = _load_fp32_tile(s_A, br, br, wave_copy_A32, lds_copy32, negate=True)
             I_acc = _identity_frag(lane)
@@ -486,7 +468,7 @@ def compile_gdn_prepare(
                     s_A[br + rr, br + cc] = zero_f
             gpu.barrier()
 
-            # Phase 2b: merge the diagonal inverses in place.
+            # Merge the diagonal inverses in place.
             sav_L32 = fx.BFloat16x4(0.0)
             sav_L43 = fx.BFloat16x4(0.0)
             sav_L42 = fx.BFloat16x4(0.0)
@@ -583,7 +565,6 @@ def compile_gdn_prepare(
                 _store_fp32_tile(s_A, 48, 0, c41, wave_copy_C32, lds_copy32)
             gpu.barrier()
 
-            # Phase 2c: compute u_bar and w_bar with prefetched, transposed RHS tiles.
             SVEC = 8
             SVEC_PER_ROW = BK_SUB // SVEC
             STAGE_ITERS = (BT * SVEC_PER_ROW + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -683,7 +664,6 @@ def compile_gdn_prepare(
                         for en in range(4)
                     ]
                     _gemm16_n4(wy, a, bs)
-                # Stage the accumulator for a coalesced global store.
                 _wy_epilogue_to_lds(wy, wy_lds_dst, lds_copy16)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 out_regs = fx.make_fragment_like(out_src)
