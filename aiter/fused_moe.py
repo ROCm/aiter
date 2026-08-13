@@ -552,15 +552,7 @@ def fused_moe(
     ):
         from aiter.fhmoe import _fhmoe
 
-        # fhmoe has no output slot of its own, so honor `output` with a copy.
-        _validate_output_buffer(
-            output,
-            (topk_ids.shape[0], w2.shape[1]),
-            hidden_states.dtype if dtype is None else dtype,
-            hidden_states.device,
-            hidden_states,
-        )
-        fhmoe_out = _fhmoe(
+        return _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -589,8 +581,8 @@ def fused_moe(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            output=output,
         )
-        return _return_output(fhmoe_out, output)
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(

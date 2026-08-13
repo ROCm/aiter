@@ -625,6 +625,21 @@ def test_heterogeneous_moe_matches_precision_oracles(
         assert torch.equal(
             forced, forced_repeat
         ), f"forced-reduce output changed on repeat {repeat + 1}"
+
+    # A caller-provided buffer is the tensor returned, and holds the result.
+    out_buf = torch.full_like(forced, -7.0)
+    forced_into_buf = fused_moe(
+        context["hidden"],
+        weights.routed_w1,
+        weights.routed_w2,
+        context["all_weight"],
+        context["all_ids"],
+        **context["hetero_kwargs"],
+        output=out_buf,
+    )
+    assert forced_into_buf is out_buf, "output buffer was not the tensor returned"
+    assert torch.equal(forced, out_buf), "output buffer holds a different result"
+
     high_precision, routed_high, shared_high = _torch_heterogeneous_reference(
         profile, weights, context
     )
