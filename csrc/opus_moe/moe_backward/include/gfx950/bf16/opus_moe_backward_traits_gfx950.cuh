@@ -142,6 +142,10 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
     static constexpr int B_N = 256;
     static constexpr int E_N = 2;
     static constexpr bool BATCH_SIGMOID = true;
+    // Each stage moves a wider W2 slab than the gathered dO slab.  Issue W2
+    // first so the transfer that gates vmcnt(0) starts as early as possible;
+    // this wins across the BN256 shape family without changing resources.
+    static constexpr bool ISSUE_B_FIRST = true;
     // After the GEMM mainloop, reuse its dead LDS allocation to coalesce the
     // otherwise lane-scattered Z reads.  One direct 16-byte global-to-LDS
     // issue per lane fills two adjacent route rows; a padded row-pair layout

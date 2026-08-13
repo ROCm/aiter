@@ -175,6 +175,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::DEFER_Z_LDS_WAIT;
         return false;
     }();
+    constexpr bool issue_b_first = []() constexpr {
+        if constexpr(requires { T::ISSUE_B_FIRST; })
+            return T::ISSUE_B_FIRST;
+        return false;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -439,6 +444,60 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             OPUS_LDS_ADDR D_B* b_lds =
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(stage_lds + smem_a_bytes);
 
+            auto issue_b = [&]() __attribute__((always_inline)) {
+                constexpr int vectors_per_group =
+                    T::SMEM_B_GROUP_DATA_BYTES /
+                    (T::VEC_B * sizeof(D_B));
+                static_assert(vectors_per_group % opus::get_warp_size() == 0);
+                constexpr int b_loads_per_wave =
+                    vectors_per_group / opus::get_warp_size();
+                constexpr int n_vectors = BN / T::VEC_B;
+                static_assert(opus::get_warp_size() % n_vectors == 0);
+                constexpr int source_rows_per_issue =
+                    opus::get_warp_size() / n_vectors;
+                static_assert(source_rows_per_issue * b_loads_per_wave ==
+                              T::SMEM_B_GROUP_ROWS);
+                static_assert(T::SMEM_B_GROUPS == 4 * T::E_K);
+                constexpr int mfma_stage_groups =
+                    T::W_K / T::SMEM_B_GROUP_ROWS;
+                constexpr int mfma_stage_bytes =
+                    mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
+                constexpr int mfma_stage_rows = T::W_K;
+                const int b_local_n =
+                    (lane_id % n_vectors) * T::VEC_B;
+                OPUS_LDS_ADDR char* b_wave_dst =
+                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
+                    wave_id * T::SMEM_B_GROUP_BYTES;
+                opus::static_for<T::E_K>([&](auto ek) {
+                    constexpr int stage_offset =
+                        ek.value * mfma_stage_bytes;
+                    opus::static_for<b_loads_per_wave>([&](auto load) {
+                        constexpr int load_byte_offset =
+                            load.value * opus::get_warp_size() * T::VEC_B *
+                            sizeof(D_B);
+                        const int b_local_k =
+                            wave_id +
+                            ((lane_id / n_vectors) +
+                             load.value * source_rows_per_issue) *
+                                T::T_N;
+                        const int b_global_offset =
+                            (tile_k * BK + b_local_k +
+                             ek.value * mfma_stage_rows) *
+                                stride_w2_d +
+                            col_base + b_local_n;
+                        g_b.template _async_load<T::VEC_B>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                b_wave_dst + stage_offset + load_byte_offset),
+                            b_global_offset * sizeof(D_B),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_B>{});
+                    });
+                });
+            };
+            if constexpr(issue_b_first)
+                issue_b();
+
             constexpr int a_loads_per_thread =
                 (a_vectors + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
             opus::static_for<a_loads_per_thread>([&](auto load) {
@@ -499,53 +558,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 }
             });
 
-            constexpr int vectors_per_group =
-                T::SMEM_B_GROUP_DATA_BYTES / (T::VEC_B * sizeof(D_B));
-            static_assert(vectors_per_group % opus::get_warp_size() == 0);
-            constexpr int b_loads_per_wave =
-                vectors_per_group / opus::get_warp_size();
-            constexpr int n_vectors = BN / T::VEC_B;
-            static_assert(opus::get_warp_size() % n_vectors == 0);
-            constexpr int source_rows_per_issue =
-                opus::get_warp_size() / n_vectors;
-            static_assert(source_rows_per_issue * b_loads_per_wave ==
-                          T::SMEM_B_GROUP_ROWS);
-            static_assert(T::SMEM_B_GROUPS == 4 * T::E_K);
-            constexpr int mfma_stage_groups =
-                T::W_K / T::SMEM_B_GROUP_ROWS;
-            constexpr int mfma_stage_bytes =
-                mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
-            constexpr int mfma_stage_rows = T::W_K;
-            const int b_local_n = (lane_id % n_vectors) * T::VEC_B;
-            OPUS_LDS_ADDR char* b_wave_dst =
-                reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
-                wave_id * T::SMEM_B_GROUP_BYTES;
-            opus::static_for<T::E_K>([&](auto ek) {
-                constexpr int stage_offset =
-                    ek.value * mfma_stage_bytes;
-                opus::static_for<b_loads_per_wave>([&](auto load) {
-                    constexpr int load_byte_offset =
-                        load.value * opus::get_warp_size() * T::VEC_B *
-                        sizeof(D_B);
-                    const int b_local_k =
-                        wave_id +
-                        ((lane_id / n_vectors) +
-                         load.value * source_rows_per_issue) *
-                            T::T_N;
-                    const int b_global_offset =
-                        (tile_k * BK + b_local_k +
-                         ek.value * mfma_stage_rows) *
-                            stride_w2_d +
-                        col_base + b_local_n;
-                    g_b.template _async_load<T::VEC_B>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(
-                            b_wave_dst + stage_offset + load_byte_offset),
-                        b_global_offset * sizeof(D_B),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_B>{});
-                });
-            });
+            if constexpr(!issue_b_first)
+                issue_b();
         };
 
         const int loops = model_dim / BK;
