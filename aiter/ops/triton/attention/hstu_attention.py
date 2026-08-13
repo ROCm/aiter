@@ -312,9 +312,7 @@ class _AttentionFunction(torch.autograd.Function):
 
     @staticmethod
     # pyre-ignore[14]
-    def backward(
-        ctx, dout: torch.Tensor
-    ) -> tuple[
+    def backward(ctx, dout: torch.Tensor) -> tuple[
         None,
         None,
         torch.Tensor,
