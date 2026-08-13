@@ -28,7 +28,6 @@ on:
       - '!LICENSE'
       - '!.gitignore'
       - '!.github/workflows/**'
-      - '.github/workflows/triton-test.yaml'
       - '!.github/scripts/sglang_downstream.py'
   workflow_dispatch:
 
