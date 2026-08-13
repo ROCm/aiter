@@ -195,9 +195,7 @@ def _moe_gemm_a16w4(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
-    start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
+    expt_id = expt_id.to(index_type)
 
     # X / gather offsets
     offs_x_m_scalar = BLOCK_M * block_id
@@ -260,7 +258,10 @@ def _moe_gemm_a16w4(
     if num_warps == 4:
         WARP_BASES: gl.constexpr = [[0, 1], [0, 2]]
     else:
-        WARP_BASES: gl.constexpr = [[0, 1], [0, 2], [1, 0]]
+        if BLOCK_M == 16:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+        else:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2], [1, 0]]
 
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
@@ -328,7 +329,7 @@ def _moe_gemm_a16w4(
         [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
     )
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 16]],
+        [[PACKED_MX_BLOCK, 16]],
         [SCALE_BLOCK_N, PACKED_MX_BLOCK],
         [1, 0],
     )
@@ -365,7 +366,6 @@ def _moe_gemm_a16w4(
         base=WMxScale,
         shape=(N // PRESHUFFLE_FACTOR, tl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
         strides=(stride_w_mx_n, stride_w_mx_k),
-        # block_shape=(BLOCK_N, BLOCK_K),
         block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
         layout=SHARED_LAYOUT_W_SCALES,
     )
@@ -525,6 +525,7 @@ def _moe_gemm_a16w4(
 
     if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        # out = _swiglu(acc, alpha=1.0, limit=1.0, ADD_RESIDUAL=ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -539,7 +540,9 @@ def _moe_gemm_a16w4(
     if Gammas is not None:
         offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         mask_m = offs_m < M
-        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        gammas = gl.amd.cdna3.buffer_load(
+            Gammas, start_m + offs_m, mask=mask_m, other=0.0
+        )
         out *= gammas[:, None]
 
     out = out.to(gl.bfloat16)

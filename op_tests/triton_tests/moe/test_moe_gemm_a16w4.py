@@ -212,6 +212,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", [None, "gluon", "triton"])
 def test_op(
     m,
     n,
@@ -223,11 +224,16 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
     device="cuda",
 ):
 
     if int(os.environ.get("AITER_IN_FFM_AM", "0")) == 1 and (
-        m > 1024 or n > 1024 or k > 1024 or n_expts_tot >= 128
+        m > 1024
+        or n > 1024
+        or k > 1024
+        or n_expts_tot > 128
+        or (m >= 1024 or n >= 1024 or k >= 1024 and n_expts_tot >= 128)
     ):
         pytest.skip("Test will take too long on FFM")
 
@@ -316,5 +322,6 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
