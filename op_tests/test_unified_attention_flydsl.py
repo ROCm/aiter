@@ -359,10 +359,24 @@ def test_sinks_route_and_agree_and_stay_single_pass():
     real_get_kernel = uak._get_kernel.__wrapped__
     seen = {}
 
-    def spy(num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits=1):
+    def spy(
+        num_heads,
+        num_kv_heads,
+        causal,
+        out_dtype_str,
+        use_sinks,
+        num_kv_splits=1,
+        shuffled_kv_cache=False,
+    ):
         seen["num_kv_splits"] = num_kv_splits
         return real_get_kernel(
-            num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits
+            num_heads,
+            num_kv_heads,
+            causal,
+            out_dtype_str,
+            use_sinks,
+            num_kv_splits,
+            shuffled_kv_cache,
         )
 
     # An all-decode shape that would otherwise take split-K (see
@@ -390,10 +404,24 @@ def test_fp16_output_with_packed_splitk():
     real_get_kernel = uak._get_kernel.__wrapped__
     seen = {}
 
-    def spy(num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits=1):
+    def spy(
+        num_heads,
+        num_kv_heads,
+        causal,
+        out_dtype_str,
+        use_sinks,
+        num_kv_splits=1,
+        shuffled_kv_cache=False,
+    ):
         seen["num_kv_splits"] = num_kv_splits
         return real_get_kernel(
-            num_heads, num_kv_heads, causal, out_dtype_str, use_sinks, num_kv_splits
+            num_heads,
+            num_kv_heads,
+            causal,
+            out_dtype_str,
+            use_sinks,
+            num_kv_splits,
+            shuffled_kv_cache,
         )
 
     # All-decode, deep context: the regime `flydsl_unified_attention` routes to
@@ -607,8 +635,12 @@ def test_predicate_declines_unsupported_geometry():
     assert not _supported(**{**base, "num_queries_per_kv": 3})
     # Triton-only layouts and flags.
     assert not _supported(**{**base, "block_table": None})
-    assert not _supported(**{**base, "shuffled_kv_cache": True})
     assert not _supported(**{**base, "skip_reduce": True})
+    # shuffled_kv_cache is supported as of Stage 4, but ONLY with a matching 5D
+    # cache. The flag on this base's 4D linear tensors is an inconsistent combo
+    # and must decline (the vectorized loader would mis-address 4D memory); a
+    # consistent 5D shuffled call is covered end-to-end in test_stage4_matrix.py.
+    assert not _supported(**{**base, "shuffled_kv_cache": True})
     # causal is intentionally unconstrained here -- non-causal is served (see
     # test_non_causal_routes_and_agrees below); the assert above only checks
     # structural geometry, not the mask mode.

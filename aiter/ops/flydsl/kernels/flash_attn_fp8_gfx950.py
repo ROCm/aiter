@@ -65,6 +65,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     paged=False,
     pv_spread=False,
     gqa_pack_m=None,
+    kv_cache_layout="linear",
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
@@ -74,7 +75,19 @@ def build_flash_attn_dualwave_swp_fp8_module(
     come from int32 ``cu_seqlens_q`` / ``cu_seqlens_kv``. ``paged`` addresses
     KV through a block table instead of contiguously, with page size fixed at
     BLOCK_N=64. fp8 supports all three of varlen, paged and split-K, including
-    in combination."""
+    in combination.
+
+    ``kv_cache_layout`` selects between the linear 4D KV cache (``"linear"``)
+    and the shuffled 5D vectorized one (``"vectorized"``); see the layout spec
+    in the shuffled-cache-support-investigation vault issue. As of Stage 3 of
+    that port, ``"vectorized"`` covers both K and V: the K loader reads the
+    5D shuffled layout (address-only, see ``load_k``'s ``KV_VECTORIZED``
+    branch), and all three fp8 V staging paths read the 5D shuffled layout
+    via the token-major-load/transpose-in-store scatter (see
+    ``_stage_v_fp8_vectorized``), both correctness-validated bit-identical
+    against the linear path. A caller building with
+    ``kv_cache_layout="vectorized"`` must pass 5D-shuffled K AND V at
+    runtime."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -129,6 +142,37 @@ def build_flash_attn_dualwave_swp_fp8_module(
             "attention sinks are not supported together with num_kv_splits > 1"
         )
 
+    # kv_cache_layout: "linear" (current 4D cache) or "vectorized" (shuffled
+    # 5D cache -- see the layout spec in the shuffled-cache-support-
+    # investigation vault issue). KV_VEC_SIZE=16 fp8 elements is the only width
+    # the layout spec defines (one dwordx4).
+    if kv_cache_layout not in ("linear", "vectorized"):
+        raise ValueError(
+            f"kv_cache_layout must be 'linear' or 'vectorized', got {kv_cache_layout!r}"
+        )
+    kv_vectorized = kv_cache_layout == "vectorized"
+    KV_VEC_SIZE = 16
+    if kv_vectorized:
+        if not paged:
+            # load_k's KV_VECTORIZED branch computes a region base from
+            # kv_head_idx (the paged per-page-per-head layout); the dense
+            # path has no such region and was never given vectorized
+            # addressing.
+            raise ValueError("kv_cache_layout='vectorized' requires paged=True")
+        if head_dim % KV_VEC_SIZE != 0:
+            raise ValueError(
+                f"vectorized KV cache requires head_dim % {KV_VEC_SIZE} == 0, "
+                f"got head_dim={head_dim}"
+            )
+        # page_size is structurally BLOCK_N=64 for this builder (see the
+        # `paged` note above) -- not a caller-facing parameter.
+        _PAGED_PAGE_SIZE = 64
+        if _PAGED_PAGE_SIZE % KV_VEC_SIZE != 0:
+            raise ValueError(
+                f"vectorized KV cache requires page_size % {KV_VEC_SIZE} == 0, "
+                f"got page_size={_PAGED_PAGE_SIZE}"
+            )
+
     # All compile-time tile/layout constants live in the fp8 traits object.
     traits = _make_dualwave_swp_fp8_traits(
         num_heads,
@@ -147,7 +191,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
         paged=paged,
         pv_spread=pv_spread,
         gqa_pack_m=gqa_pack_m,
+        kv_vectorized=kv_vectorized,
+        kv_vec_size=KV_VEC_SIZE,
     )
+    # STAGE 3 STATUS (shuffled-cache-support-investigation, stage 4):
+    # kv_vectorized now builds K AND V -- load_k's KV_VECTORIZED branch reads
+    # the 5D shuffled K layout (address-only, no sigma, no LDS/MFMA change;
+    # see DualwaveFp8KvGmemToLdsLoader.load_k), and all three fp8 V staging
+    # paths read the 5D shuffled V layout via _stage_v_fp8_vectorized. A
+    # kv_vectorized=True module expects 5D-shuffled K AND V at runtime (see
+    # this function's docstring).
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
     BLOCK_M = traits.BLOCK_M

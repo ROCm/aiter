@@ -50,6 +50,12 @@ _PAGE_SIZE = 64
 # Head dim is fixed by the kernel (it raises on anything else).
 _HEAD_DIM = 128
 
+# Vectorization width of the shuffled 5D KV cache (stage 4 of the shuffled-
+# cache-support-investigation port): 16 fp8 elements = one 128-bit dwordx4.
+# Backs the _strides_ok 5D validation branch and _get_kernel's layout
+# selection; _dispatch_mode_ok accepts shuffled_kv_cache as of Stage 3.
+_KV_VEC_SIZE = 16
+
 
 @cache
 def _target_num_prgms(device_index: int) -> int:
@@ -125,11 +131,13 @@ def _get_kernel(
     out_dtype_str: str,
     use_sinks: bool,
     num_kv_splits: int = 1,
+    shuffled_kv_cache: bool = False,
 ):
     """Build (and cache) the paged+varlen fp8 launcher.
 
-    Keyed on head counts, mask mode, output dtype, and split count; every
-    other builder argument is pinned by the support gate or left at default.
+    Keyed on head counts, mask mode, output dtype, split count, and the
+    shuffled-cache flag; every other builder argument is pinned by the
+    support gate or left at default.
 
     ``num_kv_splits`` selects the tier: at 1, the builder auto-enables
     M-dimension packing for GQA > 1:1 (``gqa_pack_m=None``) and builds the
@@ -140,6 +148,11 @@ def _get_kernel(
 
     ``causal``, ``out_dtype_str``, ``use_sinks`` key the cache too since each
     changes compiled code (mask path, store packer, sink init/epilogue).
+    ``shuffled_kv_cache`` selects ``kv_cache_layout`` -- it must key the cache
+    too, since it picks a different compiled binary (the traits factory's
+    ``cache_tag`` already keys the *builder's own* JIT cache on it, but
+    ``_get_kernel``'s ``lru_cache`` is a separate memo one layer up and would
+    otherwise alias linear and vectorized closures under the same key).
 
     Do not key on batch/seqlen/device: ``_run_compiled`` memoizes the
     compiled function on the returned closure, so a finer key would defeat
@@ -157,6 +170,7 @@ def _get_kernel(
         paged=True,
         num_kv_splits=num_kv_splits,
         gqa_pack_m=True if num_kv_splits > 1 else None,
+        kv_cache_layout="vectorized" if shuffled_kv_cache else "linear",
     )
 
 
@@ -178,8 +192,45 @@ def _split_count(num_2d_prgms: int, target_num_prgms: int) -> int:
     return n if n >= 2 else 1
 
 
+def _kv_strides_ok_5d(k, v, num_kv_heads, head_size) -> bool:
+    """Validate the shuffled 5D KV-cache shape/strides (stage 4 gate scaffolding).
+
+    Layout spec (shuffled-cache-support-investigation, "the layout spec"):
+    K = ``[num_blocks, kv_heads, head_size//x, block_size, x]``, V =
+    ``[num_blocks, kv_heads, block_size//x, head_size, x]``, x = _KV_VEC_SIZE.
+    Requires the trailing (vectorized) dim to be exactly ``x`` elements,
+    contiguous, and the whole tensor row-major in that 5D shape -- the
+    vectorized loaders (Stage 2/3) assume the fixed byte-offset formula that
+    only holds under that layout.
+    """
+    if k.dim() != 5 or v.dim() != 5:
+        return False
+    x = _KV_VEC_SIZE
+    if head_size % x != 0 or _PAGE_SIZE % x != 0:
+        return False
+    k_shape = (k.shape[0], num_kv_heads, head_size // x, _PAGE_SIZE, x)
+    v_shape = (v.shape[0], num_kv_heads, _PAGE_SIZE // x, head_size, x)
+    if tuple(k.shape) != k_shape or tuple(v.shape) != v_shape:
+        return False
+    for t, shape in ((k, k_shape), (v, v_shape)):
+        stride = 1
+        for dim in reversed(range(5)):
+            if t.stride(dim) != stride:
+                return False
+            stride *= shape[dim]
+    return True
+
+
 def _strides_ok(
-    q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
+    q,
+    out,
+    k,
+    v,
+    block_table,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+    shuffled_kv_cache,
 ) -> bool:
     """Check the exact layout the kernel's two scalar strides imply.
 
@@ -206,6 +257,21 @@ def _strides_ok(
         return False
     if out.stride(0) != num_query_heads * head_size:
         return False
+    # Shuffled 5D KV cache (stage 4): the production gate (_dispatch_mode_ok)
+    # accepts shuffled_kv_cache as of the end of Stage 3, so this branch is
+    # live on the real dispatch path. The flag and the tensor layout MUST agree:
+    # a shuffled flag on a 4D linear tensor (or vice versa) would run the
+    # vectorized loader's byte-offset formula against the wrong memory, so
+    # decline the mismatch rather than mis-address it. shuffled -> require 5D.
+    if shuffled_kv_cache:
+        if k.dim() != 5 or v.dim() != 5:
+            return False
+        return (
+            _kv_strides_ok_5d(k, v, num_kv_heads, head_size)
+            and block_table.stride(1) == 1
+        )
+    if k.dim() != 4 or v.dim() != 4:
+        return False
     page_row = num_kv_heads * head_size
     for t in (k, v):
         if t.stride(3) != 1 or t.stride(2) != head_size:
@@ -216,15 +282,17 @@ def _strides_ok(
 
 
 def _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce) -> bool:
-    """Paged, full-window, non-shuffle, non-reduce. The reduce/shuffle flags
-    belong to Triton layouts this kernel does not read; the paged path is the
-    only one wired here. (Causal and non-causal are both built.)"""
-    return (
-        window_size[0] < 0
-        and block_table is not None
-        and not shuffled_kv_cache
-        and not skip_reduce
-    )
+    """Paged, full-window, non-reduce. The reduce flag belongs to a Triton
+    layout this kernel does not read; the paged path is the only one wired
+    here. (Causal and non-causal are both built.)
+
+    ``shuffled_kv_cache`` is accepted as of the end of Stage 3
+    (shuffled-cache-support-investigation): the vectorized K and V loaders
+    are both correctness-validated against a torch reference (Stage 2 K,
+    Stage 3 V), and ``_get_kernel``/``_strides_ok`` route a shuffled call to
+    the vectorized builder and validate its 5D K/V shape.
+    """
+    return window_size[0] < 0 and block_table is not None and not skip_reduce
 
 
 def _page_geometry_ok(block_size, max_seqlen_k) -> bool:
@@ -346,7 +414,15 @@ def _supported(
         )
         and _sinks_ok(sinks, num_query_heads)
         and _strides_ok(
-            q, out, k, v, block_table, num_query_heads, num_kv_heads, head_size
+            q,
+            out,
+            k,
+            v,
+            block_table,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            shuffled_kv_cache,
         )
     )
 
@@ -523,6 +599,7 @@ def flydsl_unified_attention(
         out_dtype_str,
         sinks is not None,
         num_kv_splits,
+        shuffled_kv_cache,
     )
 
     workspace = None
@@ -558,7 +635,23 @@ def flydsl_unified_attention(
             # per-sequence trimming comes from cu_seqlens_q via the active guard.
             int(max_seqlen_q),
             # The KV stride is the within-page row stride, not the page stride.
-            k.stride(1),
+            #
+            # Shuffled 5D KV cache (stage 4): `k.stride(1)` is always the true
+            # stride_kv_n = per-token element count across ALL kv_heads
+            # (num_kv_heads * head_dim). This arg sizes the paged
+            # buffer-descriptor: `page_elems = BLOCK_N * stride_kv_n_v *
+            # ELEM_BYTES` (init_descriptors, flash_attn_dualwave_common.py
+            # ~:1263) bounds one page and rebases the per-page-id pointer, so it
+            # must be the true per-page geometry regardless of layout. For the
+            # linear 4D cache [nb, block, kv_heads, head] that equals k.stride(1).
+            # For the 5D shuffled cache [nb, kv_heads, head//x, block, x],
+            # k.stride(1) is the kv_heads-dim stride (head_dim*block = 16x too
+            # large here), which oversizes the descriptor and walks page rebases
+            # out of bounds -- garbage single-pass, OOB fault on split-K. So for
+            # 5D compute it from shape. (The vectorized loaders derive their own
+            # fetch address from trait constants; this value is only the
+            # descriptor geometry for them.)
+            (num_kv_heads * _HEAD_DIM if k.dim() == 5 else k.stride(1)),
             q.stride(0),
             workspace=workspace,
             cu_seqlens_q=cu_seqlens_q,
