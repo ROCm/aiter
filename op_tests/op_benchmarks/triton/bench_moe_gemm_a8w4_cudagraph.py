@@ -199,6 +199,14 @@ def static_scale_of(x):
     return x.abs().max().float() / 448.0
 
 
+def alloc(shape, dev, const_init, dtype=torch.float32):
+    """Random by default; a constant fill when --const-init is given, so a run
+    can be compared against one whose values are all identical."""
+    if const_init is None:
+        return torch.randn(shape, device=dev, dtype=dtype)
+    return torch.full(shape, float(const_init), device=dev, dtype=dtype)
+
+
 def quantize(x, dtype):
     """bf16 / mxfp8 / mxfp4 tensors.
 
@@ -281,6 +289,7 @@ def bench_mlp_single_weight_init(
     routed_experts,
     rep,
     layers=LAYERS,
+    const_init=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -309,13 +318,17 @@ def bench_mlp_single_weight_init(
 
     # -- init data --
     # weights
+    # wg/bg stay random even under --const-init: they only feed the gating
+    # GEMM, and constant gate weights would collapse every token onto the same
+    # experts (and fight --routed-experts). Everything the timed GEMMs read is
+    # const-filled.
     wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+    w1 = alloc((n_expts_tot, dim1, dim2 // TP), dev, const_init)
+    w2 = alloc((n_expts_tot, dim2 // TP // 2, dim1), dev, const_init)
     # biases
     bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot, dim1), device=dev)
+    b1 = alloc((n_expts_tot, dim2 // TP), dev, const_init)
+    b2 = alloc((n_expts_tot, dim1), dev, const_init)
 
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
@@ -330,7 +343,7 @@ def bench_mlp_single_weight_init(
         w2 = preshuffle_weight(w2)
 
     # -- routing + layer-1 activations: built once, outside the timed region --
-    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
+    x = alloc((batch, dim1), dev, const_init, dtype=torch.bfloat16)
     logits = gemm_a16w16(x, wg.T, bg)
     n_pinned = None
     if routed_experts is not None:
@@ -491,6 +504,7 @@ def bench_mlp(
     rep,
     layers=LAYERS,
     num_weight_inits=1,
+    const_init=None,
 ):
     all_results = []
     for i in range(num_weight_inits):
@@ -547,6 +561,7 @@ def roofline_mlp(
     layers=LAYERS,
     num_weight_inits=1,
     name="",
+    const_init=None,
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
@@ -560,6 +575,8 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
+    if const_init is not None:
+        stem += f"-const={const_init}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -580,6 +597,7 @@ def roofline_mlp(
         rep,  # fixed args
         layers,
         num_weight_inits,
+        const_init,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -659,6 +677,17 @@ def parse_args(args: list[str] | None = None):
         "alone. Default: all three.",
     )
     parser.add_argument(
+        "--const-init",
+        type=float,
+        nargs="?",
+        const=0.0,
+        default=None,
+        metavar="VALUE",
+        help="fill weights, biases and activations with VALUE instead of random "
+        "data (bare --const-init uses 0.0); gating weights stay random so "
+        "routing is unchanged. Note 0.0 makes the fp8 static scale 0.",
+    )
+    parser.add_argument(
         "--rep",
         type=int,
         default=20,
@@ -710,6 +739,7 @@ def main(args: list[str] | None = None) -> None:
         # dedupe, keeping the canonical report order rather than argv order
         layers=tuple(n for n in LAYERS if n in parsed_args.layers),
         num_weight_inits=parsed_args.num_weight_inits,
+        const_init=parsed_args.const_init,
         name="moe_gemm_a8w4",
     )
 
