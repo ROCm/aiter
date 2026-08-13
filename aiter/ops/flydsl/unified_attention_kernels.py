@@ -122,6 +122,15 @@ _MAX_KV_TILES = 2048
 
 _FP8_DTYPE = torch.float8_e4m3fn
 
+# Minimum decode-half context depth (KV length) at which the mixed-batch dispatch
+# split (below) is taken. Below this the decode half's split-K does not amortize
+# the split's two-launch + partition-sync overhead, so the split regresses vs the
+# single call (chunk=256 was 0.87x at ctx=4096); at/above this every sampled
+# chunk size wins (1.01-1.93x). Set from a gfx950 ctx sweep at chunks 256/512/4023
+# (SILOTIGER-877): the crossover is chunk-independent and lands in (5632, 6144];
+# 6144 (96 pages) is the lowest depth where all sampled chunks win noise-robustly.
+_SPLIT_MIN_DECODE_KV = 6144
+
 
 @lru_cache(maxsize=64)
 def _get_kernel(
@@ -471,13 +480,6 @@ def _scaled_q_descale(q_descale: torch.Tensor, softmax_scale: float, head_size: 
     return q_descale * ratio
 
 
-def _dispatch_split_enabled() -> bool:
-    """Kill-switch for the mixed-batch dispatch split (read live so a benchmark
-    can A/B it in-process). Default on; ``AITER_UA_DISPATCH_SPLIT=0`` restores
-    the single unified call for a whole mixed batch."""
-    return os.environ.get("AITER_UA_DISPATCH_SPLIT", "1") != "0"
-
-
 def _partition_mixed(cu_seqlens_q, seqused_k, num_seqs):
     """Partition a mixed batch into a contiguous prefill block and a contiguous
     decode block, or return None when the layout isn't a clean two-block split.
@@ -490,11 +492,14 @@ def _partition_mixed(cu_seqlens_q, seqused_k, num_seqs):
     both non-empty. Only that shape lets each half be a zero-copy view slice of
     q/out. Interleaved layouts decline here and fall through to the single call.
 
-    On success returns (split_point, prefill_first, n_pre, n_dec, pre_max_q):
+    On success returns (split_point, prefill_first, n_pre, n_dec, pre_max_q,
+    dec_max_kv):
       split_point   -- seq index where the second block begins
       prefill_first -- True if prefills lead, False if decodes lead
       n_pre, n_dec  -- sequence counts per block (both > 0)
       pre_max_q     -- max query_len over the prefill block (grid.y for the 2d call)
+      dec_max_kv    -- max KV length over the decode block; the caller gates the
+                       split on this (shallow decodes don't amortize split-K)
     Costs one device->host sync (all scalars pulled in a single transfer).
     """
     seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]  # [num_seqs], device
@@ -506,22 +511,32 @@ def _partition_mixed(cu_seqlens_q, seqused_k, num_seqs):
     asc = torch.all(di[1:] >= di[:-1])
     desc = torch.all(di[1:] <= di[:-1])
     pre_max_q_t = torch.where(is_dec, torch.zeros_like(seqlens_q), seqlens_q).max()
+    # Max KV depth over the decode seqs only (prefill KV is larger but irrelevant
+    # to whether the decode half wants split-K).
+    dec_max_kv_t = torch.where(is_dec, seqused_k, torch.zeros_like(seqused_k)).max()
     stats = torch.stack(
         [
             n_dec_t.to(torch.int64),
             asc.to(torch.int64),
             desc.to(torch.int64),
             pre_max_q_t.to(torch.int64),
+            dec_max_kv_t.to(torch.int64),
         ]
     ).tolist()
-    n_dec, asc_b, desc_b, pre_max_q = stats[0], bool(stats[1]), bool(stats[2]), stats[3]
+    n_dec, asc_b, desc_b, pre_max_q, dec_max_kv = (
+        stats[0],
+        bool(stats[1]),
+        bool(stats[2]),
+        stats[3],
+        stats[4],
+    )
     n_pre = num_seqs - n_dec
     if n_pre == 0 or n_dec == 0:
         return None  # pure prefill or pure decode: nothing to split
     if asc_b:
-        return (n_pre, True, n_pre, n_dec, pre_max_q)
+        return (n_pre, True, n_pre, n_dec, pre_max_q, dec_max_kv)
     if desc_b:
-        return (n_dec, False, n_pre, n_dec, pre_max_q)
+        return (n_dec, False, n_pre, n_dec, pre_max_q, dec_max_kv)
     return None  # interleaved: decline (single call stays correct)
 
 
@@ -601,14 +616,20 @@ def flydsl_unified_attention(
     # its optimal path (prefill -> single-pass 2d, decode -> split-K 3d). Both
     # halves are contiguous row-range VIEWS of q/out (no gather), writing
     # disjoint output rows in place. Declines to a single call (still correct)
-    # unless the batch is a clean two-block prefill/decode split. Recursion
+    # unless the batch is a clean two-block prefill/decode split whose decode
+    # half is deep enough for split-K to amortize the split's overhead. Recursion
     # terminates after one level: a pure-prefill sub-batch returns None from the
     # partition, and a pure-decode sub-batch has max_seqlen_q == 1 so the guard
     # below is false.
-    if _dispatch_split_enabled() and max_seqlen_q > 1 and num_seqs > 1:
+    #
+    # max_seqlen_k >= _SPLIT_MIN_DECODE_KV is a cheap host-scalar pre-check: no
+    # decode can be deeper than the batch max, so a shallow batch skips the
+    # device partition entirely. Only when it could contain a deep decode do we
+    # pay _partition_mixed's sync and check the decode half's own depth exactly.
+    if max_seqlen_q > 1 and num_seqs > 1 and max_seqlen_k >= _SPLIT_MIN_DECODE_KV:
         part = _partition_mixed(cu_seqlens_q, seqused_k, num_seqs)
-        if part is not None:
-            split_point, prefill_first, n_pre, n_dec, pre_max_q = part
+        if part is not None and part[5] >= _SPLIT_MIN_DECODE_KV:
+            split_point, prefill_first, n_pre, n_dec, pre_max_q, _dec_max_kv = part
             row_split = int(cu_seqlens_q[split_point])
             total_q = q.shape[0]
             if prefill_first:
