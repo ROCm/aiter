@@ -71,6 +71,18 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# Remove this warning after all callers pass q_dtype_a explicitly.
+if (
+    os.environ.get("AITER_SITUV2_A8W4") is not None
+    or os.environ.get("AITER_SITUV2_A4W4") is not None
+):
+    logger.warning(
+        "AITER_SITUV2_A8W4 and AITER_SITUV2_A4W4 are deprecated and ignored; "
+        "pass q_dtype_a explicitly to fused_moe_ instead. If q_dtype_a is not "
+        "provided, SiTUv2 defaults to the AITER_SITUV2_A8W4 behavior (FP8 "
+        "activations)."
+    )
+
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -737,9 +749,7 @@ def _fused_moe_impl(
         q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Situv2:
-            # Keep a16w4 as the backward-compatible default. Callers select
-            # SiTUv2 a8w4/a4w4 explicitly through q_dtype_a.
-            q_dtype_a = dtypes.bf16
+            q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
