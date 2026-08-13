@@ -21,6 +21,11 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_kernel_name,
     flydsl_moe_stage1,
@@ -226,6 +231,8 @@ def gen(
     block_m,
     adtype="fp8",
     activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
 ):
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
@@ -266,6 +273,8 @@ def gen(
         activation=activation,
         quant_type=QuantType.No,
         doweight=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )  # [token, topk, inter]
     ref2 = torch_moe_stage2(
         ref1,
@@ -470,7 +479,15 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
 
 
 def populate_baseline_v2_intermediate(
-    d, v, token, topk, params, BM_S1, activation=ActivationType.Silu
+    d,
+    v,
+    token,
+    topk,
+    params,
+    BM_S1,
+    activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
 ):
     """Run baseline gemm1 into v2's sorted-row fp8/fp4 buffers.
 
@@ -520,7 +537,9 @@ def populate_baseline_v2_intermediate(
         a_dtype=adtype,
         b_dtype="fp4",
         out_dtype=stage2_adtype,
-        act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        act=get_flydsl_activation_name(activation),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         w1_scale=d["base"]["w1_scale_shuf"],
         a1_scale=a1_scale_sort,
         sorted_weights=None,
