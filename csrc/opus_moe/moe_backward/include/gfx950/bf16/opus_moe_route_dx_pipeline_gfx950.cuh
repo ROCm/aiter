@@ -144,6 +144,11 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::ISSUE_B_FIRST;
         return false;
     }();
+    constexpr bool compact_route_group_grid = []() constexpr {
+        if constexpr(requires { T::COMPACT_ROUTE_GROUP_GRID; })
+            return T::COMPACT_ROUTE_GROUP_GRID && RouteTiles > 1;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
@@ -174,7 +179,55 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     const int linear_block = static_cast<int>(blockIdx.x);
     int route_tile;
     int output_n_tile;
-    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    int expert_id = -1;
+    int expert_end_row = kargs.route.num_valid_ids[0];
+    if constexpr(compact_route_group_grid)
+    {
+        static_assert(RouteTiles > 1);
+        static_assert(T::ROUTE_COHORT_TILES % RouteTiles == 0);
+        constexpr int group_cohort = T::ROUTE_COHORT_TILES / RouteTiles;
+        const int blocks_per_cohort = group_cohort * n_tiles;
+        const int cohort_id = linear_block / blocks_per_cohort;
+        const int within_cohort = linear_block % blocks_per_cohort;
+        output_n_tile = within_cohort / group_cohort;
+        const int compact_group =
+            cohort_id * group_cohort + within_cohort % group_cohort;
+
+        if(kargs.route.expert_offsets == nullptr)
+            return;
+
+        // Expert e owns the sparse compact interval
+        //   floor(first_tile / RouteTiles) + e + local_group.
+        // Adjacent expert intervals never overlap and leave at most one hole,
+        // so an upper_bound over their first keys recovers the owner exactly.
+        int lo = 0;
+        int hi = kargs.route.num_experts;
+        while(lo < hi)
+        {
+            const int mid = (lo + hi) / 2;
+            const int first_tile = kargs.route.expert_offsets[mid] / BM;
+            const int first_group = first_tile / RouteTiles + mid;
+            if(first_group <= compact_group)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        expert_id = lo - 1;
+        if(expert_id < 0)
+            return;
+        const int first_row = kargs.route.expert_offsets[expert_id];
+        expert_end_row = kargs.route.expert_offsets[expert_id + 1];
+        const int first_tile = first_row / BM;
+        const int expert_tiles = (expert_end_row - first_row) / BM;
+        const int local_group =
+            compact_group - (first_tile / RouteTiles + expert_id);
+        const int expert_groups =
+            (expert_tiles + RouteTiles - 1) / RouteTiles;
+        if(local_group < 0 || local_group >= expert_groups)
+            return;
+        route_tile = first_tile + local_group * RouteTiles;
+    }
+    else if constexpr(T::ROUTE_COHORT_TILES > 0)
     {
         constexpr int cohort = T::ROUTE_COHORT_TILES;
         const int blocks_per_cohort = cohort * n_tiles;
@@ -194,23 +247,23 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     if(route_base >= valid_rows)
         return;
 
-    const int expert_id = kargs.route.sorted_expert_ids[route_tile];
-    if(expert_id < 0 || expert_id >= kargs.route.num_experts)
-        return;
-    int expert_end_row = valid_rows;
-    if constexpr(RouteTiles > 1)
+    if constexpr(!compact_route_group_grid)
     {
-        if(kargs.route.expert_offsets == nullptr)
+        expert_id = kargs.route.sorted_expert_ids[route_tile];
+        if(expert_id < 0 || expert_id >= kargs.route.num_experts)
             return;
-        const int expert_first_tile =
-            kargs.route.expert_offsets[expert_id] / BM;
-        if((route_tile - expert_first_tile) % RouteTiles != 0)
-            return;
-        // An expert may own a non-multiple of RouteTiles padded BM tiles.  The
-        // final CTA keeps all accumulator groups but does not publish rows of
-        // the following expert.  This avoids a separate tail launch while
-        // preserving one shared W1 load for each complete route group.
-        expert_end_row = kargs.route.expert_offsets[expert_id + 1];
+        if constexpr(RouteTiles > 1)
+        {
+            if(kargs.route.expert_offsets == nullptr)
+                return;
+            const int expert_first_tile =
+                kargs.route.expert_offsets[expert_id] / BM;
+            if((route_tile - expert_first_tile) % RouteTiles != 0)
+                return;
+            // An expert may own a non-multiple of RouteTiles padded BM tiles.
+            // The final CTA masks rows belonging to the following expert.
+            expert_end_row = kargs.route.expert_offsets[expert_id + 1];
+        }
     }
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
@@ -580,7 +633,29 @@ inline void route_dx_launch_gfx950(const RouteDxKargs& kargs,
     const unsigned int n_tiles =
         static_cast<unsigned int>(kargs.model_dim / T::B_N);
     dim3 grid;
-    if constexpr(T::ROUTE_COHORT_TILES > 0)
+    constexpr int route_tiles = T::ROUTE_M_TILES;
+    constexpr bool compact_route_group_grid = []() constexpr {
+        if constexpr(requires { T::COMPACT_ROUTE_GROUP_GRID; })
+            return T::COMPACT_ROUTE_GROUP_GRID;
+        return false;
+    }();
+    if constexpr(compact_route_group_grid)
+    {
+        AITER_CHECK(kargs.route.expert_offsets != nullptr,
+                    "route_dx compact group grid requires expert offsets");
+        static_assert(route_tiles > 1);
+        static_assert(T::ROUTE_COHORT_TILES % route_tiles == 0);
+        constexpr int group_cohort = T::ROUTE_COHORT_TILES / route_tiles;
+        const int compact_groups =
+            (kargs.route.sorted_block_capacity + route_tiles - 1) /
+                route_tiles +
+            kargs.route.num_experts;
+        const int padded_groups =
+            ((compact_groups + group_cohort - 1) / group_cohort) *
+            group_cohort;
+        grid = dim3(static_cast<unsigned int>(padded_groups) * n_tiles);
+    }
+    else if constexpr(T::ROUTE_COHORT_TILES > 0)
     {
         constexpr int cohort = T::ROUTE_COHORT_TILES;
         const int padded_route_tiles =
@@ -605,7 +680,6 @@ inline void route_dx_launch_gfx950(const RouteDxKargs& kargs,
         kargs.stride_w1_e == 2 * target_i * target_d &&
         kargs.stride_w1_i == target_d &&
         kargs.stride_dx_route_r == target_d;
-    constexpr int route_tiles = T::ROUTE_M_TILES;
     if(use_target_shape)
     {
         if(kargs.route.expert_offsets != nullptr)

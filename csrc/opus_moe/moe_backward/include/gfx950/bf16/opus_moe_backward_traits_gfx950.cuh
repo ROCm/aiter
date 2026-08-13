@@ -327,6 +327,12 @@ struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM5Cohort10ASlabPadSortedOutputBFir
     static constexpr bool ISSUE_B_FIRST = true;
 };
 
+struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM5BinaryCompactCohort10ASlabPadSortedOutputBFirst
+    : RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM5Cohort10ASlabPadSortedOutputBFirst
+{
+    static constexpr bool COMPACT_ROUTE_GROUP_GRID = true;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,
