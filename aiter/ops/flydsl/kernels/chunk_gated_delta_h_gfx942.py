@@ -37,30 +37,16 @@ _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 
 # -- gfx942 tuned variant table ------------------------------------------
-# Data-driven K5 variant selection for gfx942, from the MI325X graph-mode sweep.
-# The host wrapper's grid-fill heuristic never emits a wave-widened tag and mispicks
-# BV for many shapes; this table encodes the best variant per selection signature and
-# is consulted first for gfx942 (the wrapper falls back to the heuristic on a miss).
+# Measured-best K5 variant per shape signature, from a gfx942 sweep. Consulted
+# before the host wrapper's grid-fill heuristic, which cannot emit wave-widened
+# tags and mispicks BV for many shapes; a table miss falls back to it.
 #
-# Key = (gate, H, _n_bucket(N), is_varlen). Findings from the full sweep:
-#   * gate x H x N together decide the tile. gate alone is not enough: scalar-g is
-#     bv16 only at small H*N; by H>=8,N>=4 the larger tiles win (g,8,8->bv32;
-#     g,16,4->bv32; g,16/32,>=8->bv64w8). KDA scales the same way -- the N=1 pick
-#     grows with H (gk,12/24,1->bv16; gk,48,1->bv32; gk,96,1->bv64w8), and every KDA
-#     N>=4 at H>=24 is bv64w8.
-#   * T_local (=T_flat/N) is never discriminative: each (gate,H,N-bucket) group
-#     picks the same variant at T_flat 8192 and 32768, so T is not in the key.
-#   * N-buckets are {1, 2, 4:(3-4), 8:(>=5)}. The >=5 bucket is flat (measured
-#     N=6/8/12/16 for g H16/H32 and gk H24 all agree). N=2 is its own bucket: it
-#     halves the grid and drops the tile one regime below N=4 for the mid-H groups
-#     (g H16 & gk H12: N2->bv16 vs N4->bv32; g H32 & gk H24: N2->bv32 vs N4->bv64w8);
-#     flat at the extremes (small-H floor bv16, gk H48/H96 ceiling bv64w8). N=3 has
-#     no data for the groups that matter and folds into bucket 4 (larger-tile side).
-#   * Tie-break objective is MIN-MEAN loss across the shapes sharing a signature,
-#     including the varlen skew/skew_last patterns the selector cannot see (only
-#     cu_seqlens exists). Rationale: real prefill batches are equal/ragged/bimodal;
-#     the "skew" pattern (one seq holds ~half the tokens) is an adversarial corner,
-#     so favour the common case and let the rare skew batch degrade.
+# Key = (gate, H, _n_bucket(N), is_varlen). gate x H x N together decide the
+# tile -- larger tiles win as H*N (i.e. grid fill) grows. T_flat is NOT in the
+# key: it never changed the pick. Ties are broken by min MEAN loss across the
+# shapes sharing a signature, so the adversarial varlen "skew" distribution
+# (invisible here -- only cu_seqlens reaches dispatch) is allowed to degrade in
+# favour of the common equal/ragged/bimodal batches.
 
 
 @dataclass(frozen=True)
@@ -72,13 +58,10 @@ class _K5TunedEntry:
     variant: str  # registered K5 variant tag, e.g. "bv64w8"
 
 
-# is_varlen is (N > 1) at runtime -- the wrapper sets it from cu_seqlens, which the
-# host builds for every N>1 batch regardless of length distribution. So N=1 shapes
-# are is_varlen=False and all N>1 shapes are is_varlen=True (redundant with the
-# n_bucket, but kept explicit to mirror the selection signature).
+# is_varlen is exactly (N > 1) -- the host builds cu_seqlens for every N>1 batch
+# -- so it is redundant with n_bucket, but kept explicit to mirror the selection
+# signature the wrapper passes in.
 _K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
-    # KDA (per-channel gate). N=1 pick grows with H; N>=4 at H>=24 is bv64w8.
-    # N=2 is one tile below N=4 for the mid-H groups (H12/H24), flat at the extremes.
     _K5TunedEntry("gk", 12, 1, False, "bv16"),
     _K5TunedEntry("gk", 12, 2, True, "bv16"),
     _K5TunedEntry("gk", 12, 4, True, "bv32"),
@@ -95,8 +78,6 @@ _K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
     _K5TunedEntry("gk", 96, 2, True, "bv64w8"),
     _K5TunedEntry("gk", 96, 4, True, "bv64w8"),
     _K5TunedEntry("gk", 96, 8, True, "bv64w8"),
-    # GDN (scalar gate). bv16 only at small H*N; larger tiles win as H*N grows.
-    # N=2 is one tile below N=4 for the mid-H groups (H16/H32), flat at small H.
     _K5TunedEntry("g", 4, 1, False, "bv16"),
     _K5TunedEntry("g", 4, 2, True, "bv16"),
     _K5TunedEntry("g", 4, 4, True, "bv16"),
@@ -106,11 +87,11 @@ _K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
     _K5TunedEntry("g", 8, 4, True, "bv16"),
     _K5TunedEntry("g", 8, 8, True, "bv32"), 
     _K5TunedEntry("g", 16, 1, False, "bv16"),
-    _K5TunedEntry("g", 16, 2, True, "bv16"),  # N=2 halves grid -> bv16 (N4 is bv32)
+    _K5TunedEntry("g", 16, 2, True, "bv16"),
     _K5TunedEntry("g", 16, 4, True, "bv32"),
     _K5TunedEntry("g", 16, 8, True, "bv64w8"), 
     _K5TunedEntry("g", 32, 1, False, "bv16"),
-    _K5TunedEntry("g", 32, 2, True, "bv32"),  # N=2 halves grid -> bv32 (N4 is bv64w8)
+    _K5TunedEntry("g", 32, 2, True, "bv32"),
     _K5TunedEntry("g", 32, 4, True, "bv64w8"),
     _K5TunedEntry("g", 32, 8, True, "bv64w8"),
 )
@@ -121,13 +102,12 @@ _K5_TUNED_TABLE_GFX942: dict[tuple, str] = {
 
 
 def _n_bucket(N: int) -> int:
-    """Normalize the batch/sequence count into the measured grid-size regimes.
+    """Bucket the sequence count into the measured grid-size regimes.
 
-    Four buckets: {1: N==1, 2: N==2, 4: 3<=N<=4, 8: N>=5}. N=2 is its own bucket
-    because halving the grid drops the optimal tile one regime below N=4 for the
-    mid-H groups (measured: g H16/gk H12 N2->bv16 vs N4->bv32; g H32/gk H24 N2->bv32
-    vs N4->bv64w8). N=3 has no measurement for the groups that matter and folds into
-    bucket 4 (the larger-tile side). The >=5 bucket was validated flat (N=6/8/12/16).
+    {1: N==1, 2: N==2, 4: 3<=N<=4, 8: N>=5}. N=2 is its own bucket because
+    halving the grid drops the optimal tile one regime for mid-H shapes. N=3 is
+    unmeasured and folds into bucket 4 (the larger-tile side); the >=5 bucket is
+    flat.
     """
     if N <= 1:
         return 1
@@ -141,13 +121,12 @@ def _n_bucket(N: int) -> int:
 def select_variant(
     *, gate: str, H: int, N: int, V: int, is_varlen: bool
 ) -> str | None:
-    """gfx942 measured-best K5 variant tag for this shape, or None on a table miss.
+    """gfx942 measured-best K5 variant tag for this shape, or None on a miss.
 
-    Returns a tag from ``K5_VARIANTS`` (e.g. ``"bv64w8"``) when the
-    ``(gate, H, _n_bucket(N), is_varlen)`` signature is tabled and the tabled BV is
-    legal for ``V``; otherwise None (the host wrapper then falls back to its
-    cross-arch grid-fill heuristic). ``T_flat``/``Hg`` are intentionally not part of
-    the key -- see the table note above.
+    Returns a ``K5_VARIANTS`` tag (e.g. ``"bv64w8"``) when the
+    ``(gate, H, _n_bucket(N), is_varlen)`` signature is tabled and its BV is
+    legal for ``V``; otherwise None, and the caller falls back to its grid-fill
+    heuristic.
     """
     tag = _K5_TUNED_TABLE_GFX942.get((gate, H, _n_bucket(N), is_varlen))
     if tag is None:
@@ -158,11 +137,10 @@ def select_variant(
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
-    """Return the ``exp`` helper (see gfx950 kernel for the rationale).
+    """Return the ``exp`` helper, pre-specialised on the gate's log2 scaling.
 
-    ``rocdl.exp2`` requires a raw ``ir.Value``; a FlyDSL ``Float32`` wrapper (as
-    produced by re-typing a loop-carried value) is not one, and the arithmetic
-    below may hand back either. ``as_ir_value`` normalises both.
+    ``as_ir_value`` is required: ``rocdl.exp2`` takes a raw ``ir.Value``, but a
+    re-typed loop-carried value arrives as a FlyDSL ``Float32`` wrapper.
     """
     if g_is_log2_scaled:
 
@@ -180,29 +158,24 @@ def _to_bf16_fast(val, n=1):
     """f32 -> bf16 as ``(bitcast<u32>(x) + 0x8000) >> 16`` (round-half-away).
 
     ``n`` is the element count: 1 for a scalar ``Float32``, N for an f32xN
-    ``Vector``. Returns a raw ``ir.Value`` (accepted by ``fx.ptr_store`` and by
-    the ``GTensor`` store paths).
+    ``Vector``. Returns a raw ``ir.Value`` (accepted by ``fx.ptr_store`` and the
+    ``GTensor`` store paths).
 
-    Why not ``.truncf()`` / ``.to(BFloat16)``: those emit ``arith.truncf`` with
-    no rounding-mode attribute, which MLIR defines as IEEE round-to-nearest-EVEN.
-    gfx942 has no ``v_cvt_pk_bf16_f32`` (gfx950-only), so the backend expands RNE
-    into ~6 VALU per element -- extract lsb, add the 0x7FFF bias, ``v_cmp_u_f32``
-    NaN test, ``v_cndmask``, then pack with ``v_perm_b32``. At 64 conversions per
-    chunk that was ~90 of the ~193 non-MFMA VALU instructions in the chunk loop,
-    the single largest term. Asking for ``rounding_mode=toward_zero`` instead is
-    NOT an option: it hard-aborts inside MLIR (uncatchable) on this path.
+    Do NOT replace this with ``.truncf()`` / ``.to(BFloat16)``. Those emit
+    ``arith.truncf``, which MLIR defines as round-to-nearest-even; gfx942 lacks
+    ``v_cvt_pk_bf16_f32``, so the backend expands RNE into ~6 VALU per element
+    and this became the largest non-MFMA VALU term in the chunk loop. Passing
+    ``rounding_mode=toward_zero`` is not an escape either -- it hard-aborts
+    inside MLIR (uncatchable) on this path.
 
-    Pure truncation (what the HIP reference does --
-    ``bit_cast<uint32_t>(x) >> 16``, csrc/kernels/chunk_gated_delta_rule_fwd_h.cu:63)
-    is cheaper still at ~2 VALU, but it was measured to be marginally too lossy
-    here: its one-sided bias, accumulated over the serial chunk scan, put 13 of
-    25.4M h elements past the 5e-2 tolerance (max_abs 0.104). Adding the 0x8000
-    bias first costs one more add and restores <=0.5 ulp symmetric error, which
-    matches RNE except on exact ties.
+    Plain truncation (``bits >> 16``) is ~2 VALU but measurably too lossy here:
+    its one-sided bias accumulates over the serial chunk scan and pushes some h
+    elements past tolerance. The 0x8000 bias costs one add and restores <=0.5
+    ulp symmetric error, matching RNE except on exact ties.
 
-    Ties round away from zero rather than to even. Values are sign-magnitude, so
-    the same bias works for both signs; the carry can only perturb the exponent
-    within ~1 ulp of FLT_MAX, far outside the range this kernel produces.
+    Ties round away from zero, not to even. Values are sign-magnitude so one
+    bias serves both signs, and the carry can only perturb the exponent within
+    ~1 ulp of FLT_MAX -- far outside the range this kernel produces.
     """
     is_vec = n > 1
     i32_ty = T.vec(n, T.i32) if is_vec else T.i32
@@ -286,17 +259,13 @@ def compile_chunk_gated_delta_h_gfx942(
     )
     NUM_K_BLOCKS = K // 64
 
-    # -- Chiplet (XCD) remap --------------------------------------
-    # The grid is (GRID_V, grid_nh) with grid_nh = N*H. For a fixed head (i_nh)
-    # the GRID_V V-tiles all read the same k/w/g/gk slices (only v/v_new differ
-    # by V-tile). Under the HW default (flat block `xy` runs on XCD `xy % 8`)
-    # those V-tiles scatter across XCDs, so k/w/g get pulled into up to nXCD
-    # separate private L2 caches. The chiplet re-map applies the HipKittens
-    # inverse shuffle with chunk size = GRID_V, forcing each head's whole
-    # V-tile run on a single XCD. Hence, k/w/g are fetched into one L2 and reused.
-    #
-    # GRID_V is a compile-time constant (V and BV are both build-time known), so
-    # the whole remap collapses to integer math on the flat block id.
+    # -- Chiplet (XCD) remap --
+    # A head's GRID_V V-tiles all read the same k/w/g/gk slices. Under the HW
+    # default (flat block `xy` runs on XCD `xy % NXCD`) they scatter across XCDs,
+    # so those slices land in up to NXCD separate private L2s. The remap below
+    # co-locates each head's whole V-tile run on one XCD, so they are fetched
+    # once and reused. GRID_V is compile-time, so it is all integer math on the
+    # flat block id.
     GRID_V = (V + BV - 1) // BV
     NXCD = 8
 
@@ -309,23 +278,18 @@ def compile_chunk_gated_delta_h_gfx942(
     N_REPEAT = BV // WMMA_N
 
     # -- Wave decomposition (NR_SPLIT: the "wave widening" axis) --
-    # A wave is identified by (wid_m, wid_n):
+    # A wave is (wid_m, wid_n):
     #   wid_m in [0, M_WAVES)  -- the BT tile for GEMM1 / the K tile for GEMM2.
-    #                             This is the ONLY axis the original kernel had,
-    #                             and BT=64 pins it to 4.
-    #   wid_n in [0, NR_SPLIT) -- a slice of the N_REPEAT (V) axis. Each wave
-    #                             owns N_REPEAT_LOCAL of the N_REPEAT column
-    #                             tiles instead of looping over all of them.
+    #   wid_n in [0, NR_SPLIT) -- this wave's slice of the N_REPEAT (V) axis; it
+    #                             owns N_REPEAT_LOCAL column tiles rather than
+    #                             looping over all of them.
     #
-    # Why: LDS (38-56 KiB) allows only one workgroup per CU on gfx942's 64 KiB,
-    # so a CU holds NUM_WARPS waves and no more. With NUM_WARPS=4 that is 1
-    # wave/SIMD, far too little to hide HBM latency in a kernel that is
-    # memory-bound at ~33% of peak. Splitting the V axis across waves multiplies
-    # resident waves by NR_SPLIT at zero extra HBM traffic and identical CU
-    # coverage: LDS depends only on BV, and each wave's share of the h
-    # accumulators (and hence its VGPR footprint) shrinks by the same factor.
-    #
-    # NR_SPLIT=1 reproduces the original 4-wave kernel exactly.
+    # LDS pins gfx942 to one workgroup per CU, so a CU holds exactly NUM_WARPS
+    # waves. At NUM_WARPS=4 that is 1 wave/SIMD -- too little to hide HBM latency
+    # in a memory-bound kernel. Splitting V across waves multiplies resident
+    # waves by NR_SPLIT for free: LDS depends only on BV, and each wave's share
+    # of the h accumulators (its VGPR footprint) shrinks by the same factor.
+    # NR_SPLIT=1 is the plain 4-wave kernel.
     M_WAVES = BT // 16
     assert N_REPEAT % NR_SPLIT == 0, (
         f"NR_SPLIT={NR_SPLIT} must divide N_REPEAT={N_REPEAT} (=BV/16); "
@@ -353,38 +317,31 @@ def compile_chunk_gated_delta_h_gfx942(
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
 
     # -- Loop-carried gate/u prefetch --
-    # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they can be
-    # issued a full iteration ahead.
-    #
-    # The carried values are raw loads only -- exp()/in-bounds selects stay at
-    # the use site, so the prefetch block has no arithmetic hanging off the
-    # loads and nothing forces a wait in the issuing iteration.
+    # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they are
+    # issued a full iteration ahead. The carried values are RAW LOADS ONLY --
+    # exp() and the in-bounds selects stay at the use site, so no arithmetic
+    # hangs off the loads and nothing forces a wait in the issuing iteration.
     N_GATE_G = 5 if USE_G else 0  # g_last + 4 g_row
-    # gk is loaded as ONE dwordx4 per 64-wide K block, not four scalar dwords:
-    # the 4 elements are consecutive k (kb*64 + wid_m*16 + lane_m_base*4 + 0..3)
-    # and -- unlike g_row -- carry no per-element clamp, so the quad is
-    # contiguous and 16 B aligned by construction (kb*64, wid_m*16,
-    # lane_m_base*4, i_h*K and (bos+last_idx)*H*K are all multiples of 4).
-    # Measured: -6 buffer_load and -13% SQ_WAIT_ANY per dispatch on shape 10.
+    # gk is one dwordx4 per 64-wide K block, not four scalar dwords: its 4
+    # elements are consecutive k and -- unlike g_row -- carry no per-element
+    # clamp, so the quad is contiguous and 16 B aligned by construction.
     N_GATE_GK = NUM_K_BLOCKS if USE_GK else 0  # entries, each an f32x4
     N_U = N_REPEAT_LOCAL * 4
     N_GU = N_GATE_G + N_GATE_GK + N_U
 
     # -- LDS layout --
-    # All four buffers use the same GROUP-MAJOR + XOR scheme (see _grp_idx in the
-    # kernel body): a logical [R, C] tile is stored as [R][C/4][4], and the group
-    # index is XOR-swizzled by the row. 4 bf16 = 8 B = one MFMA fragment, so every
-    # fragment access is a single conflict-free ds_read_b64/ds_write_b64 and no
-    # buffer needs padding.
+    # Every buffer uses the same GROUP-MAJOR + XOR scheme (see _grp_idx): a
+    # logical [R, C] tile is stored as [R][C/4][4] with the group index
+    # XOR-swizzled by the row. 4 bf16 = 8 B = one MFMA fragment, so each fragment
+    # access is a single conflict-free ds_read_b64/ds_write_b64, no padding.
     assert BT % 4 == 0 and K % 4 == 0
     # The XOR is a bank bijection only if a row has >= 16 groups (one per lane of
-    # an MFMA fragment); both K/4 and BT/4 are >= 16 for the supported shapes.
+    # an MFMA fragment).
     assert K // 4 >= 16 and BT // 4 >= 16, "group-XOR needs >=16 groups per row"
 
-    # lds_w: w tile [BT, K] (A-frag for GEMM1). Single stage.
-    # The old row-major [BT, K] pitch was 256 B == 0 (mod 32 banks), so all 16
-    # lanes of an A-frag hit the SAME bank -- a 16-way conflict on the highest
-    # traffic read in the kernel. The XOR fixes exactly that.
+    # lds_w: w tile [BT, K] (A-frag for GEMM1). Single stage. Plain row-major
+    # would give a 256 B pitch == 0 (mod 32 banks), putting all 16 lanes of an
+    # A-frag on ONE bank -- a 16-way conflict on the hottest read in the kernel.
     LDS_W_NG = K // 4
     LDS_W_ELEMS = BT * K
 
@@ -400,23 +357,10 @@ def compile_chunk_gated_delta_h_gfx942(
     LDS_VNT_NG = BT // 4
     LDS_VNT_ELEMS = BV * BT
 
-    # lds_h: h snapshot, logically [BV, K] (v_local, k) -- GEMM1's B-frag is a run
-    # over K (the contraction) at fixed V, and the HBM snapshot wants K contiguous
-    # too, so both consumers want the same K-major order.
-    #
-    # Layout is GROUP-MAJOR + XOR (see _grp_idx below): the row is split into
-    # NG = K/4 groups of 4 bf16, and the group index is XOR-swizzled by the row.
-    # 4 bf16 = 8 bytes = exactly one MFMA fragment, so every access is a single
-    # aligned ds_read_b64/ds_write_b64 instead of 4 scalar ds_*_u16.
-    #
-    # Why this replaces the old ``[BV, K+4]`` padded layout: with a 132-element
-    # pitch the row stride is 264 B = 66 dwords == 2 (mod 32 banks), so the 16
-    # lanes of a fragment land on only the 16 EVEN banks -- 2-way conflicted no
-    # matter how wide the access is. That is why widening the old layout to vec4
-    # and adding an XOR on top of the pitch both measured as no-ops. Here the row
-    # term is a multiple of 128 B, so the bank pair is decided purely by the
-    # swizzled group index, and XOR-ing by the row makes it a bijection across the
-    # 16 lanes -> all 32 banks hit exactly once. Padding is no longer needed.
+    # lds_h: h snapshot, logically [BV, K] (v_local, k). Both consumers want
+    # K-major: GEMM1's B-frag is a run over K (the contraction) at fixed V, and
+    # the HBM snapshot wants K contiguous. Sized to BV rows, not V, for the same
+    # reason as lds_vnt.
     LDS_H_NG = K // 4
     LDS_H_ELEMS = BV * K  # BV rows of V per CTA, no padding
 
@@ -426,13 +370,12 @@ def compile_chunk_gated_delta_h_gfx942(
     LDS_A_NG = BT // 4
     LDS_A_ELEMS = BT * BT if COMPUTE_OUTPUT else 0
 
-    # LDS budget with the K6 buffer. At BV=64 (K=128) the five buffers come to
-    # exactly 64 KiB (lds_w 16 + lds_kt 16 + lds_vnt 8 + lds_h 16 + lds_A 8), so
-    # aliasing is not needed there any more -- but the path is kept because
-    # GEMM4a (the lds_A writer) runs strictly after GEMM3 (the last lds_h reader),
-    # so lds_A may reuse lds_h's storage under a barrier whenever the total does
-    # overflow. Aliasing needs lds_A (BT*BT) <= lds_h (BV*K), i.e. BV >= 32;
-    # BV=16 never overflows, so it keeps the buffers distinct.
+    # LDS budget with the K6 buffer. At BV=64 / K=128 the five buffers come to
+    # exactly 64 KiB, so aliasing is currently inactive -- but the path is kept
+    # because GEMM4a (the lds_A writer) runs strictly after GEMM3 (the last lds_h
+    # reader), so lds_A may reuse lds_h's storage under a barrier whenever the
+    # total does overflow. Aliasing needs lds_A (BT*BT) <= lds_h (BV*K), i.e.
+    # BV >= 32; BV=16 never overflows, so it keeps the buffers distinct.
     _lds_total_kib = (
         LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS + LDS_A_ELEMS
     ) * 2 / 1024
@@ -444,13 +387,10 @@ def compile_chunk_gated_delta_h_gfx942(
         f"not fit lds_h ({LDS_H_ELEMS}) to alias (BV={BV}, K={K})"
     )
 
-    # The LDS->HBM snapshot drain walks BV*LDS_H_NG groups BLOCK_THREADS at a
-    # time, so the block must tile it. This holds for every legal NR_SPLIT
-    # (BLOCK_THREADS = 256*NR_SPLIT <= 16*BV, and BV*LDS_H_NG = 32*BV), but
-    # assert it rather than rely on the algebra.
     # The drain walks pairs of adjacent k-groups (one 16 B store per thread), so
     # the block must tile the pair count and a row must hold an even number of
-    # groups.
+    # groups. This holds for every legal NR_SPLIT, but assert rather than rely on
+    # the algebra.
     if STORE_H:
         assert LDS_H_NG % 2 == 0, f"h drain pairs k-groups; K/4={LDS_H_NG} must be even"
         assert (BV * (LDS_H_NG // 2)) % BLOCK_THREADS == 0, (
@@ -479,26 +419,20 @@ def compile_chunk_gated_delta_h_gfx942(
             lds_vnt: fx.Array[fx.BFloat16, LDS_VNT_ELEMS, 16]
             lds_h: fx.Array[fx.BFloat16, LDS_H_ELEMS, 16]
 
-    # Cooperative load parameters (bf16x8 = dwordx4)
-    #
-    # Two decompositions of the [BT, K] w tile:
-    #
-    #  * BATCHED (the historical one): thread -> (k-block, row-batch), giving
-    #    each thread NUM_K_BLOCKS x NUM_LOAD_BATCHES_64 slots that pair 2 rows
-    #    with 2 k-blocks. Kept verbatim wherever it is still valid: switching
-    #    BV=64 to the linear mapping below measured 19% slower on shape 6
-    #    (283 -> 340 us) at an essentially unchanged VGPR count (240 vs 242).
-    #    The mapping decides which (row, grp) each thread writes to lds_w, and
-    #    hence the bank pattern of the XOR swizzle that 3e tuned to the conflict
-    #    floor -- so a "harmless" reindex silently reintroduces bank conflicts.
-    #    Any change here must be re-checked against the swizzle, not just the
-    #    coalescing.
+    # Cooperative load parameters (bf16x8 = dwordx4). Two decompositions of the
+    # [BT, K] w tile:
+    #  * BATCHED: thread -> (k-block, row-batch). The default wherever valid.
     #  * LINEAR: slot s = i*BLOCK_THREADS + tid over the whole tile. Needed once
-    #    BLOCK_THREADS > BT * THREADS_PER_ROW_64, where the batched form divides
-    #    BT by a rows-per-batch larger than BT and silently yields 0 batches.
+    #    BLOCK_THREADS > BT * THREADS_PER_ROW_64, where the batched form would
+    #    divide BT by a rows-per-batch larger than BT and yield 0 batches.
     #
-    # Both give W_THREADS_PER_ROW-consecutive tids one contiguous row segment,
-    # so global coalescing is equivalent; only the register live-ranges differ.
+    # Both give W_THREADS_PER_ROW-consecutive tids one contiguous row segment, so
+    # global coalescing is equivalent. They are NOT interchangeable, though: this
+    # mapping decides which (row, grp) each thread writes to lds_w, and hence the
+    # bank pattern the XOR swizzle was tuned against. A "harmless" reindex here
+    # silently reintroduces bank conflicts (measured: forcing BV=64 onto the
+    # linear form cost ~19%). Re-check any change against the swizzle, not just
+    # the coalescing.
     LOAD_VEC_WIDTH = 8
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64
@@ -519,17 +453,14 @@ def compile_chunk_gated_delta_h_gfx942(
     BT_STEPS = BT // WMMA_K  # 4
 
     # -- k store-transpose decomposition --
-    # k arrives from HBM as runs along K, but lds_kt wants runs along BT, so the
-    # store is a genuine transpose. With the default load mapping (1 row x 8 k-cols
-    # per thread) the 8 elements land in 8 different lds_kt rows -> 8 scalar
-    # ds_write_b16. Instead give each thread 4 BT-CONSECUTIVE rows at the same 8
-    # k-cols: then for each k-col the 4 values are one bt-group, so an in-register
-    # transpose turns 8 scalar writes into one packed ds_write_b64 each.
-    # A "slot" is one (row-quad, k-col-group) pair; each slot is 4 vec8 loads.
-    # The per-thread k vector width shrinks as the block widens, so that the
-    # (row-quad, k-col-group) slots keep tiling the block exactly. The ROW QUAD
-    # stays 4 regardless -- that is what makes the transposed store a packed
-    # ds_write_b64 -- so widening the block costs load width, not LDS width.
+    # k arrives from HBM as runs along K but lds_kt wants runs along BT, so the
+    # store is a genuine transpose. Giving a thread one row x 8 k-cols would
+    # scatter its 8 elements over 8 lds_kt rows (8 scalar ds_write_b16). Instead
+    # each thread takes 4 BT-CONSECUTIVE rows at the same k-cols, so per k-col
+    # the 4 values form one bt-group and an in-register transpose turns those
+    # writes into one packed ds_write_b64 each. A "slot" is one (row-quad,
+    # k-col-group) pair. The ROW QUAD stays 4 regardless -- that is what makes
+    # the store packed -- so a wider block costs load width, not LDS width:
     #   256 thr -> vec8 (dwordx4) | 512 thr -> vec4 (dwordx2) | 1024 thr -> vec2
     K_VEC_WIDTH = min(LOAD_VEC_WIDTH, max(2, (BT // 4) * K // BLOCK_THREADS))
     K_COL_GROUPS = K // K_VEC_WIDTH
@@ -542,18 +473,16 @@ def compile_chunk_gated_delta_h_gfx942(
     K_ROW_QUAD_STRIDE = BLOCK_THREADS // K_COL_GROUPS if K_PACKED_XPOSE else 0
 
     # known_block_size is REQUIRED once BLOCK_THREADS > 256 (the AMDGPU default
-    # max_flat_workgroup_size), but must NOT be declared at 256: it raises the
-    # backend's per-wave register budget, and at BV=64 that lets the allocator
-    # go from 152 to 242 VGPRs, which measured 19% slower on shape 6 (286 ->
-    # 340 us). Leaving the default in place at 4 waves keeps the historical
-    # codegen bit-for-bit.
+    # max_flat_workgroup_size), but must NOT be declared AT 256: it raises the
+    # backend's per-wave register budget, and the extra VGPRs the allocator then
+    # takes measured ~19% slower. Leave it off at 4 waves.
     _kernel_deco_kwargs = (
         {} if BLOCK_THREADS == 256 else {"known_block_size": [BLOCK_THREADS, 1, 1]}
     )
 
     # One kernel serves both builds, so the parameter list is the union of what
     # each needs. Params the active config does not use are never dereferenced
-    # (no GTensor view is created for them) and so cost nothing beyond a wider
+    # (no GTensor view is built for them) and so cost nothing beyond a wider
     # kernarg segment -- the same treatment gk/h0/ht already get when disabled.
     # The host wrapper passes a dummy tensor for each unused slot.
     _kernel_name = (
@@ -581,23 +510,18 @@ def compile_chunk_gated_delta_h_gfx942(
         N_val: fx.Int32,
     ):
         if const_expr(NXCD > 0):
-            # HipKittens remap algorithm: Flatten the HW-assigned 2D block id the way 
-            # the AMD dispatcher does (xy = x + gridDim.x * y), invert the round-robin
-            # such that runs of CHUNK = GRID_V consecutive logical ids land on one XCD, 
-            # then unflatten back to (i_v, i_nh). Head runs are already GRID_V-contiguous
-            # in logical order, so CHUNK = GRID_V co-locates each head's V-tiles.
-            #
-            # Enabled by default on gfx942 (nXCD=8). 
-            # The tail guard below makes any grid_nh better or equal to the round-robin 
-            # baseline: every full nXCD*CHUNK cycle is cleanly co-located, and the remaining
-            # tail (when grid_nh is not a multiple of nXCD) passes through unchanged, i.e., 
-            # it gets the default mapping.
+            # Flatten the 2D block id the way the dispatcher does
+            # (xy = x + gridDim.x * y), invert the round-robin so that runs of
+            # GRID_V consecutive logical ids land on one XCD, then unflatten back
+            # to (i_v, i_nh). Head runs are already GRID_V-contiguous in logical
+            # order, so this co-locates each head's V-tiles.
             grid_nh_rt = N_val * fx.Int32(H)
             grid_total = fx.Int32(GRID_V) * grid_nh_rt
             xy = fx.block_idx.x + fx.Int32(GRID_V) * fx.block_idx.y
             xcd = xy % fx.Int32(NXCD)
-            # Tail guard: ids past the last full nXCD*CHUNK cycle pass through
-            # unchanged (remapping them would collide / go out of range).
+            # Tail guard: ids past the last full NXCD*GRID_V cycle pass through
+            # unchanged (remapping them would collide / go out of range). So any
+            # grid is at least as good as the round-robin baseline.
             cycle = fx.Int32(NXCD) * fx.Int32(GRID_V)
             last_full = (grid_total // cycle) * cycle
             local_id = xy // fx.Int32(NXCD)
@@ -618,10 +542,8 @@ def compile_chunk_gated_delta_h_gfx942(
         wid = tid // fx.Int32(WARP_SIZE)
         lane = tid % fx.Int32(WARP_SIZE)
 
-        # Wave split (see NR_SPLIT above). wid_m keeps the original role (BT tile
-        # for GEMM1, K tile for GEMM2); wid_n selects this wave's slice of the
-        # N_REPEAT (V) axis. At NR_SPLIT == 1 wid_n is identically 0 and wid_m is
-        # wid, so the generated code is unchanged from the 4-wave kernel.
+        # Wave split (see NR_SPLIT above). At NR_SPLIT == 1, wid_n is identically
+        # 0 and wid_m is wid, so the generated code collapses to the 4-wave form.
         if const_expr(NR_SPLIT == 1):
             wid_m = wid
         else:
@@ -629,10 +551,9 @@ def compile_chunk_gated_delta_h_gfx942(
         wid_n = wid // fx.Int32(M_WAVES)
 
         def _nr_v(nr_local):
-            """V-offset (in elements) of this wave's local column tile ``nr_local``.
+            """V-offset (elements) of this wave's local column tile ``nr_local``.
 
-            Global tile index is ``wid_n * N_REPEAT_LOCAL + nr_local``; returns
-            that times 16. Compile-time constant when NR_SPLIT == 1.
+            Global tile index is ``wid_n * N_REPEAT_LOCAL + nr_local``, times 16.
             """
             if const_expr(NR_SPLIT == 1):
                 return fx.Int32(nr_local * 16)
@@ -686,21 +607,18 @@ def compile_chunk_gated_delta_h_gfx942(
         # indices are 16 consecutive values) map to 16 distinct groups -- covering
         # all 32 banks exactly once. Returns the element index of the group base.
         def _grp_idx(row, grp, cols, ng):
-            # The mask folds the row's bits 3+ down onto its low bits before the
-            # XOR. Most sites vary the row's low bits across lanes (all four MFMA
-            # fragment reads use row = ...*16 + lane_n), so a plain ``row & (ng-1)``
-            # spreads them sufficiently. But the k store-transpose writes rows
-            # ``(tid%16)*8 + e`` -- across its 16 lanes ``row & 15`` takes only two
-            # distinct values, so a plain mask cannot spread it and that causes
-            # 8-way bank multiplicity.
-            # Folding in ``row >> 3`` keys the swizzle on the bits that site does
-            # vary, and a sweep over all nine LDS sites puts every one at minimum 
-            # bank conflict rate.
+            # The mask folds the row's bits 3+ onto its low bits before the XOR.
+            # A plain ``row & (ng-1)`` would suffice for the MFMA fragment reads
+            # (row = ...*16 + lane_n varies in the low bits), but the k
+            # store-transpose writes rows ``(tid%16)*8 + e``, whose low 4 bits
+            # take only two distinct values across its 16 lanes -- 8-way bank
+            # multiplicity. Folding in ``row >> 3`` keys the swizzle on the bits
+            # that site does vary, which puts every LDS site at its conflict
+            # floor.
             #
-            # Safe by construction: this only permutes group slots within a row, XOR
-            # by a fixed per-row value is a bijection on the group index, and writes
-            # and reads derive the mask from the same row. Each (row, grp) still
-            # maps to a unique slot.
+            # Safe by construction: XOR by a fixed per-row value is a bijection
+            # on the group index, so this only permutes slots within a row, and
+            # reads and writes derive the mask from the same row.
             mask = (row ^ (row >> fx.Int32(3))) & fx.Int32(ng - 1)
             return row * fx.Int32(cols) + ((grp ^ mask) * fx.Int32(4))
 
@@ -722,9 +640,7 @@ def compile_chunk_gated_delta_h_gfx942(
         def _lds_A_idx(bt_row, bt_grp):
             return _grp_idx(bt_row, bt_grp, BT, LDS_A_NG)
 
-        # -- Cooperative load decomposition --
-        # See W_BATCHED above: the batched form is the historical mapping and is
-        # preserved wherever valid; the linear form only kicks in at 1024 threads.
+        # -- Cooperative load decomposition (see W_BATCHED above) --
         if const_expr(W_BATCHED):
             load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
             load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(
@@ -851,10 +767,9 @@ def compile_chunk_gated_delta_h_gfx942(
             issuing iteration depends on the results. Order must match the
             N_GATE_G / N_GATE_GK / N_U unpacking in the loop body.
 
-            Out-of-range rows on the tail chunk (and the whole speculative
-            chunk NT) are address-clamped to row 0 exactly as the w prefetch
-            already is; the values are masked at the use site, so loading
-            garbage here is harmless.
+            Out-of-range rows (the tail chunk, and all of the speculative chunk
+            NT) are address-clamped to row 0 like the w prefetch; the values are
+            masked at the use site, so the garbage is harmless.
             """
             out = []
             next_end = (it_i32 + fx.Int32(1)) * fx.Int32(BT)
@@ -953,21 +868,16 @@ def compile_chunk_gated_delta_h_gfx942(
             if const_expr(STORE_H):
                 gpu.barrier()
 
-                # -- LDS -> HBM h snapshot, one k-group (4 bf16) per thread. --
+                # -- LDS -> HBM h snapshot --
                 # Consecutive tids walk consecutive k-groups at fixed v, so the
                 # XOR term is constant across the wave (conflict-free 8 B/lane)
-                # and the HBM side is both coalesced and vectorized (it was
-                # scalar bf16). Each thread drains two adjacent k-groups as one
-                # 16 B store. The groups are consecutive k and h is [v, k] with
-                # k contiguous, so the pair is contiguous in HBM and 16 B
-                # aligned (g0 is even, K and stride_h are multiples of 8
-                # elements). That halves the store count and doubles the
-                # transaction width: 1024 contiguous B per wave instruction
-                # instead of 512.
-                #
-                # The LDS side stays two b64 reads. The XOR swizzle puts
-                # adjacent groups at non-adjacent slots on purpose, so this is a
-                # store-side widening only.
+                # and the HBM side is coalesced. Each thread drains two adjacent
+                # k-groups as ONE 16 B store: the groups are consecutive k and h
+                # is [v, k] with k contiguous, so the pair is contiguous and 16 B
+                # aligned (g0 is even; K and stride_h are multiples of 8
+                # elements). The LDS side stays two b64 reads -- the XOR swizzle
+                # puts adjacent groups at non-adjacent slots on purpose -- so
+                # this is a store-side widening only.
                 VG_PAIRS = BV * (LDS_H_NG // 2)
                 for vp_base in range_constexpr(0, VG_PAIRS, BLOCK_THREADS):
                     linear = fx.Int32(vp_base) + tid
@@ -1041,10 +951,9 @@ def compile_chunk_gated_delta_h_gfx942(
                     k_prefetch_lds_t.append((row, col))
 
             # -- g / gk / u: unpack this chunk's values, prefetched last iter --
-            # Values come back off the loop-carried state as bare IR values; the
-            # f32 gates must be re-wrapped as Float32 before they can feed
-            # rocdl.exp2 (which needs a Value, not a raw carried operand). u is
-            # left alone -- it is bf16 and its use site already wraps it.
+            # These come off the loop-carried state as bare IR values; the f32
+            # gates must be re-wrapped as Float32 before they can feed
+            # rocdl.exp2. u is left alone -- its use site already wraps it.
             gu_all = list(gu_prefetch_all)
 
             def _as_f32(v):
@@ -1101,12 +1010,11 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- Tail-chunk row mask --
             # On the final chunk, BT rows beyond T_local are padding whose w/u/k
-            # loads were clamped to row 0 (garbage). They must be zeroed in v_new
-            # before the k^T @ v_new state update, or ``final_state`` is corrupted.
-            # The USE_G gate below already zeroes out-of-range rows, but the
-            # USE_GK path does no v_new gating -- so mask here unconditionally so
-            # both gate ranks are correct. Each lane's f32x4 spans 4 BT rows (one
-            # per elem_i); the row is the same across all nr.
+            # loads were clamped to row 0 (garbage). They MUST be zeroed in v_new
+            # before the k^T @ v_new state update or final_state is corrupted.
+            # The USE_G gate below happens to zero them too, but the USE_GK path
+            # does no v_new gating -- so mask here unconditionally. Each lane's
+            # f32x4 spans 4 BT rows (one per elem_i), the same rows for all nr.
             row_mask_elems = []
             for elem_i in range_constexpr(4):
                 bt_row = (
@@ -1125,7 +1033,9 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- 2b. Store v_new (pre-gating) for output --
             if const_expr(SAVE_NEW_VALUE):
-
+                # The store must go through a helper: a bare ``vn_[off] = ...``
+                # inside ``if (...).ir_value():`` makes the scf.if try to yield
+                # the GTensor (TypeError).
                 def _emit_vn_store(off, value):
                     vn_[fx.Int64(off)] = value
 
@@ -1277,11 +1187,10 @@ def compile_chunk_gated_delta_h_gfx942(
                     q_prefetch.append(q_.vec_load((fx.Int64(qoff),), LOAD_VEC_WIDTH))
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
-            # A-frag (k): lane holds k[m=V head dim? no] -> k is [BT, K]; we want
-            #   k^T = [K, BT] as A so output is [K, V]. A[m=K, contraction=BT].
-            #   lds_kt[k, bt]: read 4 contiguous BT for fixed k.
-            #   A[m=K=wid*16+lane_n? ] -- see ABI: A[m=lane_n(+row grp), k=grp*4+e].
-            #   Here MFMA "m" = K output row, "contraction" = BT.
+            # k is [BT, K]; we want k^T = [K, BT] as the A operand so the output
+            # is [K, V]. So MFMA "m" = the K output row and the contraction is
+            # BT, and the A-frag is 4 contiguous BT at fixed k -- exactly one
+            # group of lds_kt[k, bt].
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
                     # A-frag k: m = K row = kb*64 + wid*16 + lane_n,
