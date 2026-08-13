@@ -253,13 +253,17 @@ def flydsl_flash_attn_varlen_func(
     # Attention sink is supported only by the m16x8 (qk_hdim==128) path; the d192
     # kernel has no sink handling, so it still falls through to CK when sink given.
     _sink_ok = sink is None or qk_hdim == 128
+    # Sliding window (finite window_size[:2]) is supported only by the m16x8
+    # (qk_hdim==128) path; the d192 kernel is full/causal only, so keep rejecting
+    # finite windows there.
+    _window_ok = tuple(window_size[:2]) == (-1, -1) or qk_hdim == 128
     supported = (
         get_gfx() == "gfx1250"
         and qk_hdim in _allowed_hdim
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
-        and tuple(window_size[:2]) == (-1, -1)
+        and _window_ok
         and block_table is None
         and bias is None
         and alibi_slopes is None
@@ -286,6 +290,7 @@ def flydsl_flash_attn_varlen_func(
             max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
+            window_size=window_size,
             out=out,
             return_lse=return_lse,
             sink=sink,
@@ -342,7 +347,6 @@ def flydsl_flash_attn_batch_func(
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
-        and tuple(window_size[:2]) == (-1, -1)
         and bias is None
         and alibi_slopes is None
         and not return_attn_probs
@@ -356,6 +360,7 @@ def flydsl_flash_attn_batch_func(
         v,
         softmax_scale=softmax_scale,
         causal=causal,
+        window_size=window_size,
         out=out,
         return_lse=return_lse,
         sink=sink,
