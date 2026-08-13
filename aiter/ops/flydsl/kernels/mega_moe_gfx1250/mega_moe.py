@@ -26,7 +26,7 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-class _SymmetricArena:
+class SymmetricArena:
     _ALIGNMENT = 256
 
     def __init__(self, communicator, regions):
@@ -67,7 +67,7 @@ class _SymmetricArena:
 
 
 @dataclass
-class _Stage2Config:
+class MegaMoEStage2Config:
     rank: int
     world_size: int
     hidden_dim: int
@@ -120,7 +120,7 @@ class _Stage2Config:
 
 
 @dataclass
-class _Routing:
+class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
 
@@ -205,7 +205,7 @@ class MegaMoEGfx1250:
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
 
         self._initialize_pipeline(
-            _Stage2Config(
+            MegaMoEStage2Config(
                 rank=int(rank),
                 world_size=int(world_size),
                 hidden_dim=self.model_dim,
@@ -276,13 +276,13 @@ class MegaMoEGfx1250:
     def __exit__(self, *exc):
         self.close()
 
-    def _initialize_pipeline(self, config: _Stage2Config, communicator):
+    def _initialize_pipeline(self, config: MegaMoEStage2Config, communicator):
         self._config = config
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
 
-        self._arena = _SymmetricArena(
+        self._arena = SymmetricArena(
             communicator,
             [
                 ("tok_off", 4),
@@ -447,7 +447,7 @@ class MegaMoEGfx1250:
             (self._config.max_recv,),
             torch.int32,
         )
-        routing = _Routing(
+        routing = Routing(
             token_count=token_count,
             reverse_source_view=reverse_source_view,
         )
@@ -459,7 +459,7 @@ class MegaMoEGfx1250:
             routing,
         )
 
-    def _scatter_context(self, routing: _Routing) -> Stage2ScatterContext:
+    def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:
         return Stage2ScatterContext(
             arena_handle=self._arena.handle,
             combine_input_offset=self._arena.offset("comb_inp"),
@@ -469,7 +469,7 @@ class MegaMoEGfx1250:
             source_token_map=routing.source_token_map,
         )
 
-    def _combine(self, routing: _Routing) -> torch.Tensor:
+    def _combine(self, routing: Routing) -> torch.Tensor:
         spec = self._select_combine(routing.token_count)
         stream = fx.Stream(torch.cuda.current_stream())
         self._combine_variants[spec](

@@ -17,7 +17,7 @@ _DTYPE_INFO = {
 }
 
 
-class _GpuPointerView:
+class GpuPointerView:
     def __init__(self, pointer: int, shape, typestr: str):
         self.__cuda_array_interface__ = {
             "data": (pointer, False),
@@ -36,10 +36,10 @@ def _from_gpu_ptr(pointer: int, shape, dtype: torch.dtype) -> torch.Tensor:
 
     device = torch.cuda.current_device()
     if reinterpret_dtype is not None:
-        byte_view = _GpuPointerView(pointer, (prod(shape) * element_size,), typestr)
+        byte_view = GpuPointerView(pointer, (prod(shape) * element_size,), typestr)
         raw = torch.as_tensor(byte_view, device=f"cuda:{device}")
         return raw.view(reinterpret_dtype).reshape(shape)
-    view = _GpuPointerView(pointer, shape, typestr)
+    view = GpuPointerView(pointer, shape, typestr)
     return torch.as_tensor(view, device=f"cuda:{device}")
 
 

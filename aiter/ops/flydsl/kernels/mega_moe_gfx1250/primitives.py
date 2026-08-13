@@ -19,13 +19,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""FlyDSL device primitives for the cco-LSA dispatch/combine kernels: system-scope
-atomics, ordered stores, fences, uncached/non-temporal loads and volatile spin-waits,
-on top of cco peer pointers (cco.Window(h).lsa_ptr(pe, off)).
+"""gfx1250-only FlyDSL primitives for the cco-LSA dispatch/combine kernels:
+split waitcnt, non-temporal loads, and volatile spin-waits on cco peer pointers.
 
-The atomic / ordered-store / fence / volatile-load ops stay on
-flydsl._mlir.dialects.llvm: the high-level FlyDSL API exposes no memory ordering,
-sync-scope, volatile, or non-temporal control, which these primitives require.
+Shared atomics and ordered stores come from ``communication_ops_utils``. The
+remaining volatile/non-temporal loads stay on ``flydsl._mlir.dialects.llvm``
+because the high-level FlyDSL API does not expose those controls.
 """
 
 from flydsl._mlir import ir
@@ -51,38 +50,6 @@ def _ptr_plus(base_i64, offset, elem_bytes):
     return _gptr(addr)
 
 
-def atomic_add_global(addr_i64, val):
-    """Monotonic remote global fetch-and-add at addr_i64; returns old value."""
-    return _llvm_d.AtomicRMWOp(
-        _llvm_d.AtomicBinOp.add,
-        _gptr(addr_i64),
-        arith.unwrap(val),
-        _llvm_d.AtomicOrdering.monotonic,
-    ).res
-
-
-def store_i32_system(addr_i64, offset, val):
-    """System-release i32 store at addr + offset*4."""
-    _llvm_d.StoreOp(
-        arith.unwrap(val),
-        _ptr_plus(addr_i64, offset, 4),
-        alignment=4,
-        ordering=_llvm_d.AtomicOrdering.release,
-        syncscope="one-as",
-    )
-
-
-def store_i64_system(addr_i64, offset, val):
-    """System-release i64 store at addr + offset*8."""
-    _llvm_d.StoreOp(
-        arith.unwrap(val),
-        _ptr_plus(addr_i64, offset, 8),
-        alignment=8,
-        ordering=_llvm_d.AtomicOrdering.release,
-        syncscope="one-as",
-    )
-
-
 def waitcnt_all():
     """Drain all outstanding memory counters (no cache management, unlike a
     release fence). gpu.barrier/s_barrier only syncs wavefronts and does NOT
@@ -91,14 +58,6 @@ def waitcnt_all():
     s_waitcnt into per-kind counters."""
     _rocdl_d.s_wait_storecnt(0)
     _rocdl_d.s_wait_loadcnt(0)
-
-
-def fence_system_acquire():
-    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope="one-as")
-
-
-def fence_system_release():
-    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release, syncscope="one-as")
 
 
 def _unwrap(v):
@@ -165,11 +124,6 @@ def _spin(addr_i64, keep_waiting, *, width=32):
     with ir.InsertionPoint(body):
         scf.YieldOp([_unwrap(load(addr_i64))])
     return wrap(loop.results[0])
-
-
-def spin_until_eq_i64(addr_i64, val):
-    """Spin until *addr (i64) == val."""
-    return _spin(addr_i64, lambda cur: cur != fx.Int64(val), width=64)
 
 
 def spin_until_ge_i64(addr_i64, val):

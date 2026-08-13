@@ -36,11 +36,11 @@ from .quant_utils import (
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 
-# tdm_scatter is vendored locally (self-contained on the stock FlyDSL wheel's
-# low-level TDM intrinsics) so this kernel needs no FlyDSL-side patch. Once the
-# gather/scatter wrappers land upstream, import them from
-# flydsl.expr.rocdl.tdm_ops instead and delete tdm_gather_shim.py.
-from .tdm_gather_shim import make_tensor_gather_descriptor, tensor_store_gather
+# tdm_scatter is vendored under MegaMoE (self-contained on the stock FlyDSL
+# wheel's low-level TDM intrinsics) so this kernel needs no FlyDSL-side patch.
+# Once the gather/scatter wrappers land upstream, import them from
+# flydsl.expr.rocdl.tdm_ops instead and delete the local shim.
+from .mega_moe_gfx1250.tdm_gather_shim import make_tensor_gather_descriptor, tensor_store_gather
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
@@ -74,13 +74,13 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
-    # EP gemm2-fused scatter: when ``ep_p2p_write`` the (bf16, stage1_act=0)
+    # EP gemm2-fused scatter: when ``enable_ep_scatter`` the (bf16, stage1_act=0)
     # epilogue does NOT TDM-store arg_c; instead each contiguous output row
     # (grouped_row = blk_m + row) is P2P-written -- pre-multiplied by its route
     # weight -- into the origin peer's cco symmetric ``comb_inp[slot]`` (slot =
     # origin_lid*topk + k). The per-row (dst_packed, f32 weight) map is a
     # (cap_rows, 2) i32 tensor passed at runtime via ``arg_ep_row_map``.
-    ep_p2p_write: Constexpr[int] = 0,
+    enable_ep_scatter: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
     ep_combine_input_offset: Constexpr[int] = 0,
     ep_slot_stride_bytes: Constexpr[int] = 0,
@@ -94,19 +94,19 @@ def launch_gemm_a8w4_tdm(
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
         a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
         stage1_quant_out, quant_wmma_rep,
-        ep_p2p_write, ep_arena_handle, ep_combine_input_offset,
+        enable_ep_scatter, ep_arena_handle, ep_combine_input_offset,
         ep_slot_stride_bytes, ep_destination_stride, ep_world_size,
     )
     _ = cache_tag
-    if ep_p2p_write:
+    if enable_ep_scatter:
         # The fused P2P scatter epilogue scatters each (route-weighted) output row
         # into peers' symmetric comb_inp via a TDM gather-store; it replaces the
         # contiguous 2D TDM tensor-store and is only defined for the bf16/f16
         # down-proj (stage1_act=0, no quant-out).
         if stage1_act != 0:
-            raise ValueError("ep_p2p_write is gemm2-only (stage1_act must be 0)")
+            raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
-            raise ValueError("ep_p2p_write is incompatible with stage1_quant_out")
+            raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -150,7 +150,7 @@ def launch_gemm_a8w4_tdm(
     if C_LDS_ROW_BYTES % 32 == 0:
         C_LDS_ROW_BYTES += 16
     C_LDS_PAD_ELEMS = (
-        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if ep_p2p_write else 0
+        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     )
     C_STORE_B = (
         (tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128
@@ -260,7 +260,7 @@ def launch_gemm_a8w4_tdm(
         # Persistent (survives the mainloop) LDS slot for the prefetched rowmap:
         # tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped off the SAME
         # allocator so it is disjoint from the reused A/B/C arena above.
-        if const_expr(ep_p2p_write):
+        if const_expr(enable_ep_scatter):
             _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
             rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
 
@@ -553,7 +553,7 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
-            if const_expr(ep_p2p_write):
+            if const_expr(enable_ep_scatter):
                 # Build the rowmap (dst_i32, weight_f32) TDM descriptor: a
                 # (tile_m, 2) i32 slice at global row blk_m -> the persistent
                 # rowmap LDS region. The load is ISSUED at the drain tail (below),
@@ -596,7 +596,7 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    if const_expr(ep_p2p_write and j == num_buffers - 1):
+                    if const_expr(enable_ep_scatter and j == num_buffers - 1):
                         # A/B TDM drained (outstanding==0 above); issue the rowmap
                         # TDM here so it overlaps this last WMMA on the idle HBM.
                         fx.copy(_rm_atom, _rm_gt, _rm_dst)
@@ -615,7 +615,7 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-                    if const_expr(ep_p2p_write and j == num_buffers - 2):
+                    if const_expr(enable_ep_scatter and j == num_buffers - 2):
                         # A/B TDM drained (outstanding==0 above); issue the rowmap
                         # TDM here so it overlaps this last WMMA on the idle HBM.
                         fx.copy(_rm_atom, _rm_gt, _rm_dst)
@@ -637,7 +637,7 @@ def launch_gemm_a8w4_tdm(
             )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
-            if const_expr(ep_p2p_write):
+            if const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter: symmetric-heap window for the TDM
                 # gather-store. The rowmap (dst/weight) is read from LDS (prefetched
                 # in the prologue), so no rowmap buffer resource is needed here.
@@ -749,7 +749,7 @@ def launch_gemm_a8w4_tdm(
                         alignment=2,
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
-                if const_expr(ep_p2p_write):
+                if const_expr(enable_ep_scatter):
                     # Route weight per output row (ep_rowmap[grouped_row].col1, f32,
                     # byte 4 of the prologue-prefetched 8-byte [dst|weight] slot);
                     # hoisted out of the wn loop (alias analysis would otherwise
@@ -800,7 +800,7 @@ def launch_gemm_a8w4_tdm(
                                 hv.bitcast(fx.Int32).ir_value(),
                             )
                         else:
-                            if const_expr(ep_p2p_write):
+                            if const_expr(enable_ep_scatter):
                                 # Weight the row BEFORE truncating to bf16; the
                                 # combine kernel does an unweighted sum.
                                 _wf = _wf_rows[wm]
@@ -814,7 +814,7 @@ def launch_gemm_a8w4_tdm(
 
             # -- Shared LDS -> global --
             workgroup_barrier()
-            if const_expr(ep_p2p_write):
+            if const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store, built with this
                 # kernel's own view helpers (global_view / lds_view) and the native
                 # flydsl gather API -- no raw-VA descriptor shim. cco flat symmetric

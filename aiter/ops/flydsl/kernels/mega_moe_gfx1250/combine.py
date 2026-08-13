@@ -26,6 +26,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -152,7 +153,7 @@ def _make_combine_fused_reduce(
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+            comm_ops.store_i64_global_system(xdb_remote, phase)
         # advance this block's private counter for the next call (single writer)
         if tid == 0:
             buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
