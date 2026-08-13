@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Union
+from typing import Tuple, Union
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith

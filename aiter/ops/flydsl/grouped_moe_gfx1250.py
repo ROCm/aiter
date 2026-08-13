@@ -14,6 +14,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
@@ -398,13 +399,7 @@ def _grouped_a8w4_tdm_moe(
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
-    ep_scatter=False,
-    ep_arena_handle=0,
-    ep_combine_input_offset=0,
-    ep_slot_stride_bytes=0,
-    ep_max_tokens_per_rank=0,
-    ep_world_size=0,
-    ep_source_token_map=None,
+    stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -420,6 +415,7 @@ def _grouped_a8w4_tdm_moe(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
+    enable_ep_scatter = stage2_scatter is not None
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -491,21 +487,19 @@ def _grouped_a8w4_tdm_moe(
     # EP gemm2-fused scatter: fold the ep_rowmap build into the remap pass (it
     # already computes each route's final contiguous row) so the gemm2 TDM epilogue
     # can P2P each weighted row into peers' comb_inp. Sized to the contiguous buffer.
-    _ep_remap = None
+    ep_scatter_params = None
     ep_rowmap = None
-    if ep_scatter:
+    if enable_ep_scatter:
         _cap_rows = int(contiguous_m)
-        ep_rowmap = torch.empty(
-            (_cap_rows + 1, 2), dtype=torch.int32, device=device
-        )
-        _ep_remap = dict(
+        ep_rowmap = torch.empty((_cap_rows + 1, 2), dtype=torch.int32, device=device)
+        ep_scatter_params = dict(
             gather_w=_gather_w_buf,
-            tis=ep_source_token_map,
+            tis=stage2_scatter.source_token_map,
             ep_rowmap=ep_rowmap,
             cap_rows=_cap_rows,
             topk=int(topk),
-            max_tok=int(ep_max_tokens_per_rank),
-            slot_stride=int(ep_max_tokens_per_rank) * int(topk),
+            max_tok=int(stage2_scatter.max_tokens_per_rank),
+            slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
@@ -514,22 +508,18 @@ def _grouped_a8w4_tdm_moe(
         max_m,
         tile_m,
         num_valid_routes=_ep_nvr,
-        ep=_ep_remap,
+        ep_scatter_params=ep_scatter_params,
     )
     psum = psum.to(torch.int32).contiguous()
     # gemm2 kwargs that turn the felix TDM GEMM2 epilogue into the fused P2P
     # scatter-combine (see flydsl_grouped_gemm_a8w4_masked / launch_gemm_a8w4_tdm).
     _ep_gemm2_kwargs = (
         dict(
-            ep_p2p_write=1,
-            ep_arena_handle=int(ep_arena_handle),
-            ep_combine_input_offset=int(ep_combine_input_offset),
-            ep_slot_stride_bytes=int(ep_slot_stride_bytes),
-            ep_destination_stride=int(ep_max_tokens_per_rank) * int(topk),
-            ep_world_size=int(ep_world_size),
+            stage2_scatter=stage2_scatter,
+            ep_destination_stride=(int(stage2_scatter.max_tokens_per_rank) * int(topk)),
             ep_row_map=ep_rowmap,
         )
-        if ep_scatter
+        if enable_ep_scatter
         else {}
     )
 
@@ -774,6 +764,12 @@ def _grouped_a8w4_tdm_moe(
             )
         )
 
+    if enable_ep_scatter:
+        # GEMM2 already P2P-wrote every route-weighted result into the peers'
+        # combine buffers. Return a shape-only tensor to satisfy the custom-op
+        # contract; MegaMoE ignores its contents and consumes comb_inp instead.
+        return torch.empty((token_num, model_dim), dtype=dtype, device=device)
+
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if _is_ep:
         # Route kernel already produced gather weights (dropped routes zeroed);
@@ -787,13 +783,6 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
-    if ep_scatter:
-        # gemm2 already P2P-wrote each route-weighted (token,k) result into peers'
-        # comb_inp; the fused combine kernel reads/sums it. No gather-reduce here.
-        # Return a shape-only placeholder (the caller's combine() ignores it and
-        # reads comb_inp).
-        os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
-        return torch.empty((token_num, model_dim), dtype=dtype, device=device)
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
@@ -801,7 +790,6 @@ def _grouped_a8w4_tdm_moe(
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
     )
-    os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
     return moe_out
 
 
@@ -833,13 +821,7 @@ def grouped_gemm_gfx1250_a8w4(
     num_local_tokens: torch.Tensor | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    ep_scatter: bool = False,
-    ep_arena_handle: int = 0,
-    ep_combine_input_offset: int = 0,
-    ep_slot_stride_bytes: int = 0,
-    ep_max_tokens_per_rank: int = 0,
-    ep_world_size: int = 0,
-    ep_source_token_map: torch.Tensor | None = None,
+    stage2_scatter: Stage2ScatterContext | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the felix TDM batched GEMM (gfx1250).
 
@@ -910,7 +892,6 @@ def grouped_gemm_gfx1250_a8w4(
     if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
-    os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
     _is_ep = expert_mask is not None
     if _is_ep:
         _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
@@ -1082,13 +1063,7 @@ def grouped_gemm_gfx1250_a8w4(
             data_format=data_format,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
-            ep_scatter=ep_scatter,
-            ep_arena_handle=ep_arena_handle,
-            ep_combine_input_offset=ep_combine_input_offset,
-            ep_slot_stride_bytes=ep_slot_stride_bytes,
-            ep_max_tokens_per_rank=ep_max_tokens_per_rank,
-            ep_world_size=ep_world_size,
-            ep_source_token_map=ep_source_token_map,
+            stage2_scatter=stage2_scatter,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             **_tdm_kw,
@@ -1298,13 +1273,13 @@ def contiguous_psum_remap(
     route_max_m: int,
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
-    ep: dict | None = None,
+    ep_scatter_params: dict | None = None,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
 
-    When ``ep`` is given (dict of gather_w/tis/ep_rowmap/cap_rows/topk/max_tok/
-    slot_stride), the same remap pass ALSO scatters the gemm2-fused EP row map
-    (folds the standalone moe_build_ep_rowmap launch in here)."""
+    When ``ep_scatter_params`` is given (dict of gather_w/tis/ep_rowmap/cap_rows/
+    topk/max_tok/slot_stride), the same remap pass ALSO scatters the gemm2-fused
+    EP row map (folds the standalone moe_build_ep_rowmap launch in here)."""
     device = masked_m.device
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
@@ -1324,13 +1299,13 @@ def contiguous_psum_remap(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
-    if ep is not None:
+    if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap init: a parallel HW memset of the whole (cap_rows+1, 2) i32 map
         # to (-1, 0) via one int64 fill (low i32 = -1 = 0xFFFFFFFF, high i32 = 0),
         # ordered before the launch on the current stream (graph-capturable), so the
         # kernel's scatter overwrites only the kept rows.
-        ep["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
+        ep_scatter_params["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
         launch(
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
@@ -1342,13 +1317,13 @@ def contiguous_psum_remap(
             int(route_max_m),
             int(tile_m),
             ptr_arg(num_valid_routes_i32),
-            ptr_arg(ep["gather_w"].reshape(-1)),
-            ptr_arg(ep["tis"].reshape(-1)),
-            ptr_arg(ep["ep_rowmap"].reshape(-1)),
-            int(ep["cap_rows"]),
-            int(ep["topk"]),
-            int(ep["max_tok"]),
-            int(ep["slot_stride"]),
+            ptr_arg(ep_scatter_params["gather_w"].reshape(-1)),
+            ptr_arg(ep_scatter_params["tis"].reshape(-1)),
+            ptr_arg(ep_scatter_params["ep_rowmap"].reshape(-1)),
+            int(ep_scatter_params["cap_rows"]),
+            int(ep_scatter_params["topk"]),
+            int(ep_scatter_params["max_tok"]),
+            int(ep_scatter_params["slot_stride"]),
             stream=torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
