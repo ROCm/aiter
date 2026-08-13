@@ -14,6 +14,12 @@ WavePerEU=2, KVBlockSize=1, Preshuffle=False) -- NOT detuned. Both the reference
 host and the FlyDSL host auto-compute SplitKV to fill the device on small decode
 grids, so the comparison is apples-to-apples.
 
+This A/B is fixed at ``KVBlockSize=1``: the Gluon reference faults on a
+non-padded block-flat cache at ``KVBlockSize>1``, so any KVBlockSize>1 (incl.
+Preshuffle) comparison would not be apples-to-apples. FlyDSL KVBlockSize>1 and
+Preshuffle correctness is covered against a torch oracle in
+``op_tests/flydsl_tests/test_flydsl_fp8_paged_mqa_logits.py`` instead.
+
 Reuses the paged benchmark's fp8 cache packer to guarantee the same input build.
 """
 

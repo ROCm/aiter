@@ -18,8 +18,9 @@ Supported scope (this file): ``KVBlockSize >= 1`` (block-flat co-packed layout)
 with SplitKV KV-column parallelism. The public ``flydsl_fp8_paged_mqa_logits``
 mirrors the tensor contract of the Triton
 ``aiter.ops.triton.attention.pa_mqa_logits.deepgemm_fp8_paged_mqa_logits`` so the
-two are interchangeable in tests/benchmarks. Preshuffle is not supported and
-raises ``NotImplementedError``.
+two are interchangeable in tests/benchmarks. ``Preshuffle=True`` consumes the
+production ``shuffle_weight(layout=(16,16))`` KV data layout (requires
+``KVBlockSize % 16 == 0``).
 
 Cache layout (per physical block of ``KVBlockSize`` tokens): all ``KVBlockSize``
 fp8 key rows (``D`` bytes each) grouped first, then all ``KVBlockSize`` f32
@@ -60,6 +61,7 @@ from ._mqa_logits_common import (
     Vec,
     device_cu_count,
     load_pack_v8i32,
+    load_pack_v8i32_preshuffle,
     make_out_row_view,
     mfma_head_reduce,
 )
@@ -91,6 +93,7 @@ def _build_paged_kernel(
     block_kv: int,
     waves_per_block: int,
     kv_block_size: int = 1,
+    preshuffle: bool = False,
     scale_mul: float = 1.0,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
@@ -108,6 +111,12 @@ def _build_paged_kernel(
     KVBlockSize`` -> token within the block-flat block), so a column tile may
     straddle block boundaries. ``KVBlockSize == 1`` degenerates to the per-token
     ``[D fp8 | 4 scale]`` slot layout.
+
+    ``preshuffle`` selects the production ``shuffle_weight(layout=(16,16))`` KV
+    data layout (each block's ``KVB*D`` fp8 bytes reordered into 16-token x
+    16-hidden tiles; the co-packed f32 scale tail stays token-ordered). Only the
+    intra-block key-byte offset changes -- the block-table gather, scale gather,
+    MFMA, and mask are identical. Requires ``KVBlockSize % 16 == 0``.
 
     ``scale_mul`` folds the FN->FNUZ 2x-per-converted-operand compensation into
     the (co-packed) per-token scale at compile time (ReLU positive-homogeneity).
@@ -139,7 +148,11 @@ def _build_paged_kernel(
         _cvt_tag += "_cq"
     if convert_kv_fn:
         _cvt_tag += "_ck"
-    _kname = f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_kvb{KVB}_w{WPB}{_cvt_tag}_flydsl"
+    _ps_tag = "_ps" if preshuffle else ""
+    _kname = (
+        f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_kvb{KVB}_w{WPB}"
+        f"{_ps_tag}{_cvt_tag}_flydsl"
+    )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
     def kernel(
@@ -275,14 +288,24 @@ def _build_paged_kernel(
                 ind_off = pid_batch * max_block_len + block_idx
                 physical = fx.Int32(ind_t[ind_off])
                 block_byte_base = physical * block_byte_stride
-                key_byte = block_byte_base + tok_in_block * D
 
                 # B operands: vector<8xi32> per K-step (MFMA_K=64).
-                # convert_kv_fn is always False (gfx950 native fp8).
+                # convert_kv_fn is always False (gfx950 native fp8). The
+                # preshuffle branch is compile-time (Python if): it only swaps
+                # the intra-block key-byte offset for the shuffle_weight(16x16)
+                # layout; the scale gather below is unchanged (scales stay
+                # co-packed and token-ordered).
                 b_col = [None] * K_STEPS
-                for kk in range_constexpr(K_STEPS):
-                    byte_base_b = key_byte + kk * MFMA_K
-                    b_col[kk] = load_pack_v8i32(kv_i32, byte_base_b, lane8)
+                if preshuffle:
+                    for kk in range_constexpr(K_STEPS):
+                        b_col[kk] = load_pack_v8i32_preshuffle(
+                            kv_i32, block_byte_base, tok_in_block, D, kk, lane8
+                        )
+                else:
+                    key_byte = block_byte_base + tok_in_block * D
+                    for kk in range_constexpr(K_STEPS):
+                        byte_base_b = key_byte + kk * MFMA_K
+                        b_col[kk] = load_pack_v8i32(kv_i32, byte_base_b, lane8)
 
                 # Co-packed per-token f32 scale (block-flat: after the KVB keys).
                 scale_byte = block_byte_base + (KVB * D) + tok_in_block * 4
@@ -409,6 +432,7 @@ def compile_fp8_paged_mqa_logits(
     head_size: int,
     block_kv: int = _BLOCK_KV,
     kv_block_size: int = 1,
+    preshuffle: bool = False,
     variant: str = DEFAULT_VARIANT,
     scale_mul: float = 1.0,
     convert_q_fn: bool = False,
@@ -416,11 +440,11 @@ def compile_fp8_paged_mqa_logits(
 ):
     """Return a cached, compiled FlyDSL paged launcher for the given config.
 
-    ``num_heads``/``head_size``/``kv_block_size`` are compile-time constants;
-    ``variant`` is a ``paged_w<WPB>`` tag; ``convert_q_fn``/``convert_kv_fn`` mark
-    an FP8 FN operand whose -0 (0x80) byte the kernel patches to FNUZ +0, and
-    ``scale_mul`` folds the 2x-per-converted-operand compensation into the
-    co-packed scale.
+    ``num_heads``/``head_size``/``kv_block_size``/``preshuffle`` are compile-time
+    constants; ``variant`` is a ``paged_w<WPB>`` tag; ``convert_q_fn``/
+    ``convert_kv_fn`` mark an FP8 FN operand whose -0 (0x80) byte the kernel
+    patches to FNUZ +0, and ``scale_mul`` folds the 2x-per-converted-operand
+    compensation into the co-packed scale.
     """
     launcher = _build_paged_kernel(
         num_heads=num_heads,
@@ -428,6 +452,7 @@ def compile_fp8_paged_mqa_logits(
         block_kv=block_kv,
         waves_per_block=_variant_wpb(variant),
         kv_block_size=kv_block_size,
+        preshuffle=preshuffle,
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
@@ -462,7 +487,12 @@ def flydsl_fp8_paged_mqa_logits(
     kv_cache:     [num_blocks, KVBlockSize, 1, index_dim], dtype uint8, block-flat
                   co-packed: per physical block, KVBlockSize*hidden_dim fp8 K
                   bytes (all key rows grouped) then KVBlockSize f32 dequant scales;
-                  index_dim == hidden_dim + 4 (+ optional 16B padding).
+                  index_dim == hidden_dim + 4 (+ optional 16B padding). When
+                  ``Preshuffle=True`` the fp8 data section is reordered by the
+                  production ``shuffle_weight(layout=(16,16))`` (16-token x
+                  16-hidden tiles); the f32 scale tail stays token-ordered.
+    Preshuffle:   consume the shuffle_weight(16x16) KV data layout. Requires
+                  ``KVBlockSize % 16 == 0``. Default False (block-flat gather).
     weights:      [batch*next_n, heads], dtype float32
     out_logits:   [batch*next_n, max_model_len], dtype float32. MUST be prefilled
                   with -inf by the caller; the kernel writes only in-window
@@ -484,8 +514,9 @@ def flydsl_fp8_paged_mqa_logits(
     Returns the same ``out_logits`` tensor (written in place).
     """
     if Preshuffle:
-        raise NotImplementedError(
-            "Preshuffle is not supported by the FlyDSL paged fp8_mqa_logits kernel."
+        assert KVBlockSize % 16 == 0, (
+            f"Preshuffle mode only supports KVBlockSize aligned to 16; "
+            f"got KVBlockSize={KVBlockSize}."
         )
     if ChunkK % MFMA_N != 0:
         raise ValueError(f"ChunkK={ChunkK} must be a multiple of MFMA_N={MFMA_N}.")
@@ -549,6 +580,7 @@ def flydsl_fp8_paged_mqa_logits(
         head_size=head_size,
         block_kv=ChunkK,
         kv_block_size=int(KVBlockSize),
+        preshuffle=bool(Preshuffle),
         variant=variant,
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,

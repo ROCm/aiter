@@ -122,6 +122,52 @@ def load_pack_v8i32(i32_view, byte_off_i32, lane8):
     return Vec.from_elements([i64_0, i64_1, i64_2, i64_3], fx.Int64).bitcast(fx.Int32)
 
 
+def load_pack_v8i32_preshuffle(
+    i32_view, block_byte_base, tok_in_block, head_size, kk_step, lane8
+):
+    """Load 32 fp8 bytes as vector<8xi32> from the production preshuffled layout.
+
+    The production ``Preshuffle`` path stores each physical block's fp8 key data
+    reordered by ``shuffle_weight(layout=(16,16))`` (only the ``KVB*D`` data
+    section; the co-packed f32 scale tail is left token-ordered, so the scale
+    gather is unchanged). Element ``(token c, hidden h)`` lands at the intra-block
+    byte offset::
+
+        off(c,h) = (c//16)*(D*16) + (h//16)*256 + (c%16)*16 + (h%16)
+
+    which is exactly the inverse of the host shuffle permute (and matches the
+    gluon CDNA ``offset_k_fixed``). This kernel's per-lane K payload for MFMA
+    K-step ``kk_step`` is the four contiguous hidden-16 groups
+    ``g = kk_step*4 + sub`` (``sub`` in 0..3); within a group the 8-byte half
+    picked by ``lane8`` (``= lane_div_N*8``) is still contiguous, so we issue the
+    same four ``dwordx2`` loads and assemble a ``vector<8xi32>``.
+
+    ``block_byte_base`` is the physical block's byte base in the cache pool
+    (``physical * KVB * index_dim``); the shuffled data section starts at
+    offset 0 within it. ``head_size`` (``D``) must be a multiple of 32 (the 16x16
+    shuffle pairs ``k_width=16`` fp8 into 32-byte chunks) -- guaranteed here by
+    ``D % MFMA_K == 0``.
+    """
+    D = head_size
+    # Token super-row (16-token blocks) + intra-super-row column; loop-invariant
+    # across the four hidden groups, so hoist out of the per-group load.
+    c_hi = fx.Int32(arith.divui(_to_raw(tok_in_block), _to_raw(fx.Int32(16))))
+    c_lo = fx.Int32(arith.remui(_to_raw(tok_in_block), _to_raw(fx.Int32(16))))
+    base = block_byte_base + c_hi * (D * 16) + c_lo * 16 + lane8
+
+    def _load_i64(g):
+        dw = fx.Int32(arith.divui(_to_raw(base + g * 256), _to_raw(fx.Int32(4))))
+        v2 = i32_view.vec_load((dw,), vec_size=2)
+        return Vec(v2).bitcast(fx.Int64)[0].ir_value()
+
+    g0 = kk_step * 4  # first hidden-16 group of this MFMA K-step
+    i64_0 = _load_i64(g0 + 0)
+    i64_1 = _load_i64(g0 + 1)
+    i64_2 = _load_i64(g0 + 2)
+    i64_3 = _load_i64(g0 + 3)
+    return Vec.from_elements([i64_0, i64_1, i64_2, i64_3], fx.Int64).bitcast(fx.Int32)
+
+
 def fn_to_fnuz_i64(raw_i64):
     """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes.
 

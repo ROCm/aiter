@@ -71,6 +71,33 @@ def kv_cache_cast_to_fp8(x, fp8_dtype):
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
+def preshuffle_kv_data(kv_cache_fp8, head_dim):
+    """Reorder the fp8 data section into the production ``Preshuffle`` layout.
+
+    Applies ``shuffle_weight(layout=(16,16))`` to the per-block ``KVB*head_dim``
+    fp8 key bytes (reshaped ``[num_blocks, KVBlockSize, head_dim]``) and leaves
+    the co-packed f32 scale tail untouched -- exactly what the production
+    ``deepgemm_fp8_paged_mqa_logits`` benchmark builds for ``Preshuffle=True``.
+    The torch oracle still reads the *unshuffled* cache (the reference is
+    layout-agnostic), so this shuffled copy is fed only to the kernel.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    num_blocks, block_size, one, index_dim = kv_cache_fp8.shape
+    assert block_size % 16 == 0, "preshuffle requires KVBlockSize % 16 == 0"
+    flat = kv_cache_fp8.reshape(num_blocks, block_size * index_dim).clone()
+    data = (
+        flat[:, : block_size * head_dim]
+        .contiguous()
+        .view(num_blocks, block_size, head_dim)
+    )
+    shuffled = shuffle_weight(data, layout=(16, 16)).reshape(
+        num_blocks, block_size * head_dim
+    )
+    flat[:, : block_size * head_dim] = shuffled
+    return flat.view(num_blocks, block_size, one, index_dim)
+
+
 def ref_fp8_paged_mqa_logits(
     q,
     kv_cache_fp8,
@@ -196,6 +223,7 @@ def test_fp8_paged_mqa_logits(
     q_dtype,
     split_kv=0,
     block_size=1,
+    preshuffle=False,
 ):
     # split_kv == 0 -> auto (production host formula); else an explicit override
     # (1 disables splitting). Both must be correctness-identical.
@@ -239,15 +267,22 @@ def test_fp8_paged_mqa_logits(
         dtype=torch.float32,
     )
 
+    # Oracle reads the unshuffled cache above; the kernel gets the preshuffled
+    # copy (same numbers, production shuffle_weight(16x16) data layout).
+    kv_cache_kernel = (
+        preshuffle_kv_data(kv_cache_fp8, head_dim) if preshuffle else kv_cache_fp8
+    )
+
     with torch.inference_mode():
         got = flydsl_fp8_paged_mqa_logits(
             q_fp8,
-            kv_cache_fp8,
+            kv_cache_kernel,
             weights,
             out,
             context_lens,
             block_tables,
             max_model_len,
+            Preshuffle=preshuffle,
             KVBlockSize=block_size,
             SplitKV=_split_kv,
         )
@@ -272,9 +307,26 @@ def test_fp8_paged_mqa_logits(
     return {
         "gfx": get_gfx(),
         "kvb": block_size,
+        "preshuffle": preshuffle,
         "split_kv": "auto" if split_kv == 0 else split_kv,
         "flydsl err": err,
     }
+
+
+# Preshuffle is a distinct correctness branch (production shuffle_weight(16x16)
+# data layout, KVBlockSize % 16 == 0). A small fixed set covers what differs from
+# the block-flat path -- KVBlockSize 16 and 64, head_dim 64 and 128, the FN->FNUZ
+# Q patch, and a couple of grid/context shapes -- without re-running the whole
+# block-flat sweep.
+# (batch_size, next_n, heads, head_dim, avg_kv, q_dtype, kv_block_size)
+PRESHUFFLE_CASES = [
+    (1, 1, 64, 128, 1024, "fnuz", 16),
+    (1, 2, 64, 128, 1024, "fnuz", 64),
+    (2, 1, 128, 128, 8192, "fnuz", 64),
+    (1, 1, 64, 64, 1024, "fnuz", 16),  # head_dim=64 (single K-step)
+    (1, 1, 64, 128, 1024, "fn", 64),  # exercises the gfx942 FN->FNUZ Q patch
+    (4, 2, 64, 128, 8192, "fnuz", 64),
+]
 
 
 def main():
@@ -325,6 +377,11 @@ def main():
         default=[1, 64],
         help="KVBlockSize (paged block-flat page size); 1 == per-token slots",
     )
+    parser.add_argument(
+        "--no-preshuffle",
+        action="store_true",
+        help="skip the preshuffle (shuffle_weight 16x16 layout) correctness cases",
+    )
     args = parser.parse_args()
 
     df = []
@@ -338,6 +395,14 @@ def main():
         args.kv_block_size,
     ):
         df.append(test_fp8_paged_mqa_logits(bs, nn, nh, hd, kv, qd, sk, block_size=kvb))
+
+    if not args.no_preshuffle:
+        for bs, nn, nh, hd, kv, qd, kvb in PRESHUFFLE_CASES:
+            df.append(
+                test_fp8_paged_mqa_logits(
+                    bs, nn, nh, hd, kv, qd, 0, block_size=kvb, preshuffle=True
+                )
+            )
 
     df = pd.DataFrame(df)
     try:
