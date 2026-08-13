@@ -243,10 +243,15 @@ def get_GEMM_A16W16_config(
                     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    if flydsl_config is None:
+                    if (
+                        flydsl_config is None
+                        or flydsl_config.get("target_gfx") != gfx
+                        or int(config["splitK"]) != flydsl_config.get("split_k")
+                    ):
                         logger.warning(
                             f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized by the current catalog; falling back to next candidate."
+                            "recognized or has incompatible architecture/split-K metadata; "
+                            "falling back to next candidate."
                         )
                         config = None
                 else:
@@ -258,7 +263,7 @@ def get_GEMM_A16W16_config(
                     config = None
                 elif is_flydsl_available():
                     try:
-                        from aiter.ops.flydsl.kernels.gemm_decode_config import (
+                        from aiter.ops.flydsl.gemm_kernels import (
                             parse_gemm_decode_kernel_name,
                         )
 
@@ -287,21 +292,26 @@ def get_GEMM_A16W16_config(
                     try:
                         from aiter.ops.flydsl.kernels.small_m_hgemm import (
                             parse_small_m_kernel_name,
+                            validate_small_m_kernel_config,
                         )
 
-                        name_arch, name_m, name_n, name_k, name_config = (
-                            parse_small_m_kernel_name(config["kernelName"])
+                        name_config = parse_small_m_kernel_name(
+                            config["kernelName"]
                         )
                         if (
-                            (name_arch, name_m, name_n, name_k)
-                            != (gfx, M, N, K)
+                            name_config["target_gfx"] != gfx
                             or name_config["has_bias"] != bias
+                            or int(config["splitK"]) != name_config["split_k"]
                         ):
                             logger.warning(
-                                "FlyDSL small-M tuned row does not match the "
-                                "runtime architecture/exact shape/bias; ignoring it."
+                                "FlyDSL small-M tuned row has incompatible "
+                                "architecture/bias/split-K metadata; ignoring it."
                             )
                             config = None
+                        else:
+                            validate_small_m_kernel_config(
+                                M, N, K, name_config, arch=gfx
+                            )
                     except (ImportError, ValueError):
                         config = None
                 else:
@@ -670,7 +680,7 @@ def flydsl_decode_gemm(
         raise ValueError("FlyDSL decode does not support preshuffled weights")
     if (otype or inp.dtype) != torch.bfloat16:
         raise ValueError("FlyDSL decode requires BF16 output")
-    from aiter.ops.flydsl.kernels.gemm_decode import (
+    from aiter.ops.flydsl.gemm_kernels import (
         launch_gemm_decode_kernel_name,
     )
 
@@ -713,42 +723,45 @@ def flydsl_small_m_gemm(
         raise ValueError("FlyDSL small-M requires BF16 output")
     from aiter.ops.flydsl.kernels.small_m_hgemm import (
         parse_small_m_kernel_name,
+        validate_small_m_kernel_config,
     )
 
-    arch, m, n, k, kernel_config = parse_small_m_kernel_name(
-        config["kernelName"]
+    kernel_config = parse_small_m_kernel_name(config["kernelName"])
+    if inp.ndim != 2 or weights.ndim != 2 or inp.shape[1] != weights.shape[1]:
+        raise ValueError(
+            "FlyDSL small-M requires rank-2 inputs with matching K dimensions"
+        )
+    if not 1 <= inp.shape[0] <= 16:
+        raise ValueError(
+            f"FlyDSL small-M requires M=1..16, got M={inp.shape[0]}"
+        )
+    runtime_arch = get_gfx_runtime()
+    validate_small_m_kernel_config(
+        int(inp.shape[0]),
+        int(weights.shape[0]),
+        int(inp.shape[1]),
+        kernel_config,
+        arch=runtime_arch,
     )
-    runtime_shape = (inp.shape[0], weights.shape[0], inp.shape[1])
-    if runtime_shape != (m, n, k) or weights.shape[1] != k:
-        raise ValueError(
-            f"FlyDSL small-M kernel expects {(m, n, k)}, got {runtime_shape}"
-        )
-    if arch != get_gfx_runtime():
-        raise ValueError(
-            f"FlyDSL small-M kernel targets {arch}, runtime is {get_gfx_runtime()}"
-        )
     if kernel_config["has_bias"] != (bias is not None):
         raise ValueError("FlyDSL small-M kernel bias identity does not match launch")
-    return aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+    if config.get("splitK") is not None and int(config["splitK"]) != kernel_config[
+        "split_k"
+    ]:
+        raise ValueError("FlyDSL small-M CSV splitK does not match kernel name")
+    return aiter.ops.flydsl.gemm_kernels.flydsl_small_m_hgemm(
         inp,
         weights,
         bias=bias,
-        kernel_family="small_m",
-        tile_m=kernel_config["tile_m"],
         tile_n=kernel_config["tile_n"],
         tile_k=kernel_config["tile_k"],
         split_k=kernel_config["split_k"],
-        block_m_warps=kernel_config["block_m_warps"],
         block_n_warps=kernel_config["block_n_warps"],
-        block_k_warps=1,
         n_tile_repeat=kernel_config["n_tile_repeat"],
         persistent_n_tiles=kernel_config["persistent_n_tiles"],
         waves_per_eu=kernel_config["waves_per_eu"],
         b_to_lds_unroll=kernel_config["b_to_lds_unroll"],
-        stages=kernel_config["stage"],
-        async_copy=True,
         b_to_lds=kernel_config["b_to_lds"],
-        c_to_lds=False,
         lds_staging=kernel_config["lds_staging"],
     )
 

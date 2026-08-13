@@ -10,28 +10,24 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from .gemm_decode_config import (
+from .gemm_decode_common import (
     ReductionMode,
     WaveDecodeConfig,
+    contract_pair,
     gemm_decode_kernel_name,
-    make_decode_cache_tag,
-)
-from .gemm_decode_layouts import (
     k_element,
     load_vector,
     make_buffer_matrix,
-    wave_lane_coordinates,
-)
-from .tensor_shim import _run_compiled
-from .gemm_decode_numeric import (
-    contract_pair,
+    make_decode_cache_tag,
     masked_bf16_vector,
     pack_bf16x2,
     prepare_pair,
     reduce_wave_accumulator,
     store_bf16,
+    wave_lane_coordinates,
     zero_wave_accumulator,
 )
+from .tensor_shim import _run_compiled
 
 
 def _accumulate_vectors(

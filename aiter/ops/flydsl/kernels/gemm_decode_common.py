@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-"""Configuration, architecture traits, and registry for BF16 decode GEMM."""
+"""Shared configuration, layouts, and numeric primitives for BF16 decode GEMM."""
 
 from __future__ import annotations
 
@@ -12,6 +12,18 @@ import json
 import re
 from typing import Iterator, TypeAlias
 
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as arith_dialect
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
+
+# Host configuration, validation, naming, and enumeration.
 WAVE_SIZE = 64
 MFMA_K = 4
 BF16_BYTES = 2
@@ -19,6 +31,8 @@ SIGNED_INT32_MAX = (1 << 31) - 1
 CACHE_POLICY_DEFAULT = 0
 CACHE_POLICY_NON_TEMPORAL = 0x2
 _CACHE_POLICY_MASK = 0x13
+
+
 def validate_cache_policy(cache_policy: int) -> None:
     """Reject cache-policy bits that gfx942 lowering would silently discard."""
     if not isinstance(cache_policy, int):
@@ -450,117 +464,191 @@ def conservative_wave_config(m: int, n: int, k: int, arch: str) -> WaveDecodeCon
     return config
 
 
+_DEFAULT_CUS_BY_ARCH = {"gfx942": 304, "gfx950": 256}
+_NON_TEMPORAL_WEIGHT_BYTES = 8 * 1024 * 1024
+_BLOCK_TILE_PRESETS = (
+    (4, 1),
+    (8, 1),
+    (8, 2),
+    (12, 1),
+    (16, 1),
+    (16, 2),
+    (16, 4),
+)
+
+
+def _decode_cache_options(n: int, k: int) -> tuple[int, ...]:
+    if n * k * BF16_BYTES >= _NON_TEMPORAL_WEIGHT_BYTES:
+        return CACHE_POLICY_DEFAULT, CACHE_POLICY_NON_TEMPORAL
+    return (CACHE_POLICY_DEFAULT,)
+
+
+def _wave_prefetch_options(k: int, arch: str) -> tuple[int, ...]:
+    options = [0]
+    if k >= WAVE_SIZE * 4:
+        options.append(1)
+    if arch == "gfx950" and k >= WAVE_SIZE * 8:
+        options.append(2)
+    return tuple(options)
+
+
+def _block_pipeline_presets(arch: str) -> tuple[tuple[int, int, int], ...]:
+    presets = [(4, 1, 1), (8, 1, 1), (8, 2, 1)]
+    if arch == "gfx950":
+        presets.append((8, 2, 2))
+    return tuple(presets)
+
+
+def _persistent_grid_options(
+    n: int,
+    config: BlockMfmaDecodeConfig,
+    *,
+    num_cus: int,
+) -> tuple[int, ...]:
+    """Keep grid caps whose final turn wastes at most one quarter of the grid."""
+    tile_columns = config.waves_per_workgroup * config.columns_per_wave
+    logical_workgroups = (n + tile_columns - 1) // tile_columns
+    if logical_workgroups < 2:
+        return ()
+    options = []
+    seen_grids = set()
+    for workgroups_per_cu in (1, 2, 4):
+        grid = min(logical_workgroups, num_cus * workgroups_per_cu)
+        if grid in seen_grids:
+            continue
+        turns = (logical_workgroups + grid - 1) // grid
+        scheduled = grid * turns
+        if scheduled - logical_workgroups <= max(1, grid // 4):
+            options.append(workgroups_per_cu)
+            seen_grids.add(grid)
+    return tuple(options)
+
+
 def iter_gemm_decode_configs(
     m: int,
     n: int,
     k: int,
     arch: str,
+    *,
+    num_cus: int | None = None,
 ) -> Iterator[DecodeConfig]:
-    """Enumerate, deduplicate, and legality-prune all production-equivalent axes."""
+    """Enumerate the bounded production tuning catalog.
+
+    The supported catalog includes every exact-M Wave tile, direct BlockMFMA
+    tiles from the measured 4/8/12/16-wave families, and N-persistent
+    BlockMFMA whenever full-A LDS is legal. It intentionally does not form the
+    raw Cartesian product of every axis: prefetch depth is K-aware, the
+    non-temporal cache variant is reserved for weights of at least 8 MiB, and
+    persistent grid caps with more than 25% final-turn waste are omitted.
+    Stable names remain capable of representing any individually legal config.
+    """
     _validate_problem(m, n, k)
     get_decode_arch_traits(arch)
+    if num_cus is None:
+        num_cus = _DEFAULT_CUS_BY_ARCH[arch]
+    if not isinstance(num_cus, int) or num_cus <= 0:
+        raise ValueError(f"num_cus must be a positive integer, got {num_cus!r}")
+
     seen: set[DecodeConfig] = set()
+
+    def emit(config: DecodeConfig) -> Iterator[DecodeConfig]:
+        try:
+            config.validate(m=m, n=n, k=k, arch=arch)
+        except ValueError:
+            return
+        if config not in seen:
+            seen.add(config)
+            yield config
+
     contractions = (
         (ContractionMode.SCALAR_F32, ContractionMode.PACKED_F32)
         if arch == "gfx942"
         else (ContractionMode.DOT2_BF16,)
     )
-    wave_prefetch = (0, 1) if arch == "gfx942" else (0, 1, 2)
-    reductions = (ReductionMode.DPP, ReductionMode.BPERMUTE)
     exact_m_divisors = tuple(mp for mp in range(1, m + 1) if m % mp == 0)
     for values in product(
         exact_m_divisors,
         (2, 4, 8),
         (1, 2, 4),
-        wave_prefetch,
-        (1, 2, 4),
-        (CACHE_POLICY_DEFAULT, CACHE_POLICY_NON_TEMPORAL),
-        reductions,
+        _wave_prefetch_options(k, arch),
+        (2, 4),
+        _decode_cache_options(n, k),
+        tuple(ReductionMode),
         contractions,
     ):
         mp, kvec, np, prefetch, wpe, cache, reduction, contraction = values
-        config = WaveDecodeConfig(
-            m_per_wave=mp,
-            n_per_wave=np,
-            kvec=kvec,
-            prefetch_depth=prefetch,
-            waves_per_eu=wpe,
-            b_cache_modifier=cache,
-            reduction=reduction,
-            contraction=contraction,
+        yield from emit(
+            WaveDecodeConfig(
+                m_per_wave=mp,
+                n_per_wave=np,
+                kvec=kvec,
+                prefetch_depth=prefetch,
+                waves_per_eu=wpe,
+                b_cache_modifier=cache,
+                reduction=reduction,
+                contraction=contraction,
+            )
         )
-        try:
-            config.validate(m=m, n=n, k=k, arch=arch)
-        except ValueError:
-            continue
-        if config not in seen:
-            seen.add(config)
-            yield config
 
-    b_widths = (4, 8)
-    stages = (1, 2) if arch == "gfx950" else (1,)
+    pipelines = _block_pipeline_presets(arch)
     for values in product(
-        (4, 8, 12, 16),
-        (1, 2, 4),
+        _BLOCK_TILE_PRESETS,
         tuple(ActivationSource),
-        b_widths,
-        (1, 2),
-        stages,
-        (0, 1, 2, 4),
-        (CACHE_POLICY_DEFAULT, CACHE_POLICY_NON_TEMPORAL),
+        pipelines,
+        (0, 2),
+        _decode_cache_options(n, k),
     ):
-        waves, columns, a_source, b_width, unroll, prefetch, wpe, cache = values
-        config = BlockMfmaDecodeConfig(
-            waves_per_workgroup=waves,
-            columns_per_wave=columns,
-            activation_source=a_source,
-            b_load_width=b_width,
-            k_unroll=unroll,
-            prefetch_stages=prefetch,
-            waves_per_eu=wpe,
-            b_cache_modifier=cache,
-        )
-        try:
-            config.validate(m=m, n=n, k=k, arch=arch)
-        except ValueError:
-            continue
-        if config not in seen:
-            seen.add(config)
-            yield config
-
-    # Keep persistence targeted to the measured parity gaps. Names can still
-    # request any legal shape/config explicitly without multiplying the broad
-    # tuner catalog for unrelated cells.
-    if m in (3, 4) and (n, k) == (2304, 1536):
-        for values in product(
-            (4, 8, 16),
-            (1, 2),
-            b_widths,
-            (1, 2),
-            stages,
-            (1, 2),
-            (0, 2, 4),
-        ):
-            waves, columns, b_width, unroll, prefetch, grid, wpe = values
-            config = BlockMfmaDecodeConfig(
+        (waves, columns), a_source, (b_width, unroll, prefetch), wpe, cache = values
+        yield from emit(
+            BlockMfmaDecodeConfig(
                 waves_per_workgroup=waves,
                 columns_per_wave=columns,
-                activation_source=ActivationSource.FULL_LDS,
+                activation_source=a_source,
                 b_load_width=b_width,
                 k_unroll=unroll,
                 prefetch_stages=prefetch,
-                persistent_n=True,
-                workgroups_per_cu=grid,
                 waves_per_eu=wpe,
-                b_cache_modifier=CACHE_POLICY_DEFAULT,
+                b_cache_modifier=cache,
             )
-            try:
-                config.validate(m=m, n=n, k=k, arch=arch)
-            except ValueError:
-                continue
-            if config not in seen:
-                seen.add(config)
-                yield config
+        )
+
+    # Persistence is useful beyond one historical cell, but only when full-A
+    # staging fits. Keep two representative load pipelines and N-aware grid
+    # caps; direct variants above remain available for every legal shape.
+    persistent_pipelines = (pipelines[0], pipelines[-1])
+    for (waves, columns), (b_width, unroll, prefetch), wpe in product(
+        _BLOCK_TILE_PRESETS,
+        persistent_pipelines,
+        (0, 2),
+    ):
+        base = BlockMfmaDecodeConfig(
+            waves_per_workgroup=waves,
+            columns_per_wave=columns,
+            activation_source=ActivationSource.FULL_LDS,
+            b_load_width=b_width,
+            k_unroll=unroll,
+            prefetch_stages=prefetch,
+            persistent_n=True,
+            waves_per_eu=wpe,
+        )
+        try:
+            base.validate(m=m, n=n, k=k, arch=arch)
+        except ValueError:
+            continue
+        for grid in _persistent_grid_options(n, base, num_cus=num_cus):
+            yield from emit(
+                BlockMfmaDecodeConfig(
+                    waves_per_workgroup=waves,
+                    columns_per_wave=columns,
+                    activation_source=ActivationSource.FULL_LDS,
+                    b_load_width=b_width,
+                    k_unroll=unroll,
+                    prefetch_stages=prefetch,
+                    persistent_n=True,
+                    workgroups_per_cu=grid,
+                    waves_per_eu=wpe,
+                )
+            )
 
 
 _NAME_RE = re.compile(
@@ -646,3 +734,395 @@ def parse_gemm_decode_kernel_name(
         )
     config.validate(m=m, n=n, k=k, arch=arch)
     return arch, m, n, k, config
+
+
+# Layout, address, and data-movement helpers.
+def _next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+def make_buffer_matrix(
+    tensor,
+    rows: int,
+    columns: int,
+):
+    """Give a packed BF16 global operand an exact two-dimensional view."""
+    buffer = fx.rocdl.make_buffer_tensor(
+        tensor,
+        max_size=False,
+        num_records_bytes=rows * columns * BF16_BYTES,
+    )
+    return fx.make_view(
+        fx.get_iter(buffer),
+        fx.make_layout((rows, columns), (columns, 1)),
+    )
+
+
+def make_vector_view(
+    tensor,
+    row,
+    column,
+    row_stride: int,
+    width: int,
+):
+    """Create a contiguous register-width view at a matrix coordinate."""
+    # FlyDSL 0.3.0 crd2idx normalizes dynamic coordinates. These coordinates
+    # are already proven in bounds, so keep the physical offset explicit at
+    # this address-generation boundary.
+    element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
+    pointer = fx.add_offset(fx.get_iter(tensor), fx.make_int_tuple(element))
+    return fx.make_view(pointer, fx.make_layout(width, 1))
+
+
+def load_vector(
+    tensor,
+    row,
+    column,
+    row_stride: int,
+    width: int,
+    cache_modifier: int = 0,
+):
+    """Load one logical row vector while preserving explicit cache controls."""
+    if cache_modifier:
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
+        element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
+        return buffer_ops.buffer_load(
+            resource,
+            element,
+            vec_width=width,
+            dtype=tensor.dtype,
+            cache_modifier=cache_modifier,
+        )
+    return make_vector_view(tensor, row, column, row_stride, width).load()
+
+
+def load_scalar(
+    tensor,
+    row,
+    column,
+    row_stride: int,
+    cache_modifier: int = 0,
+):
+    """Load one logical matrix element with optional cache controls."""
+    element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
+    if cache_modifier:
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
+        return buffer_ops.buffer_load(
+            resource,
+            element,
+            vec_width=1,
+            dtype=tensor.dtype,
+            cache_modifier=cache_modifier,
+        )
+    pointer = fx.add_offset(fx.get_iter(tensor), fx.make_int_tuple(element))
+    return fx.make_view(pointer, fx.make_layout(1, 1))[0]
+
+
+def wave_lane_coordinates(thread_id, waves: int):
+    """Map a workgroup thread id to ``(wave, lane)``."""
+    return fx.idx2crd(
+        thread_id,
+        fx.make_layout((waves, WAVE_SIZE), (WAVE_SIZE, 1)),
+    ).unpack()
+
+
+def padded_row_coordinates(
+    slot,
+    rows: int,
+    values_per_row: int,
+):
+    """Map a cooperative slot to a padded physical row and row-local value.
+
+    The physical row mode is power-of-two padded so FlyDSL's coordinate
+    normalization lowers to a mask instead of integer remainder. The staging
+    predicate limits slots to the logical ``rows`` and leaves padded rows
+    unreachable.
+    """
+    return fx.idx2crd(
+        slot,
+        fx.make_layout(
+            (_next_power_of_two(rows), values_per_row),
+            (values_per_row, 1),
+        ),
+    ).unpack()
+
+
+def k_element(
+    chunk,
+    lane,
+    value,
+    chunks: int,
+    width: int,
+):
+    return fx.Int32(
+        fx.get_scalar(
+            fx.crd2idx(
+                (chunk, lane, value),
+                fx.make_layout(
+                    (chunks, WAVE_SIZE, width),
+                    (WAVE_SIZE * width, width, 1),
+                ),
+            )
+        )
+    )
+
+
+# Compiler-sensitive numeric, MFMA, DPP, and tail helpers.
+def raw(value):
+    if isinstance(value, ir.Value):
+        return value
+    if hasattr(value, "ir_value"):
+        return raw(value.ir_value())
+    if hasattr(value, "value"):
+        return raw(value.value)
+    return value
+
+
+def const_bf16(value: float = 0.0):
+    return arith_dialect.ConstantOp(
+        ir.BF16Type.get(),
+        ir.FloatAttr.get(ir.BF16Type.get(), value),
+    ).result
+
+
+def const_f32(value: float = 0.0):
+    return arith_dialect.ConstantOp(
+        ir.F32Type.get(),
+        ir.FloatAttr.get(ir.F32Type.get(), value),
+    ).result
+
+
+def add_f32(lhs, rhs):
+    return arith_dialect.AddFOp(raw(lhs), raw(rhs)).result
+
+
+def pack_bf16x2(lo, hi):
+    lo_i16 = ArithValue(raw(lo)).bitcast(T.i16)
+    hi_i16 = ArithValue(raw(hi)).bitcast(T.i16)
+    lo_i32 = ArithValue(lo_i16).extui(T.i32)
+    hi_i32 = ArithValue(hi_i16).extui(T.i32)
+    return ArithValue(lo_i32) | (ArithValue(hi_i32) << fx.Int32(16))
+
+
+def unpack_bf16x2_f32(packed):
+    packed = ArithValue(raw(packed))
+    lo_bits = (packed & fx.Int32(0xFFFF)) << fx.Int32(16)
+    hi_bits = packed & fx.Int32(0xFFFF0000)
+    return (
+        raw(ArithValue(lo_bits).bitcast(T.f32)),
+        raw(ArithValue(hi_bits).bitcast(T.f32)),
+    )
+
+
+def prepare_pair(packed, contraction: ContractionMode):
+    if contraction == ContractionMode.DOT2_BF16:
+        return raw(packed)
+    expanded = unpack_bf16x2_f32(packed)
+    if contraction == ContractionMode.PACKED_F32:
+        return vector.from_elements(T.vec(2, T.f32), list(expanded))
+    return expanded
+
+
+def zero_wave_accumulator(contraction: ContractionMode):
+    if contraction == ContractionMode.PACKED_F32:
+        return arith.constant_vector(0.0, T.vec(2, T.f32))
+    return const_f32()
+
+
+def contract_pair(accumulator, a_pair, b_pair, contraction: ContractionMode):
+    if contraction == ContractionMode.DOT2_BF16:
+        return llvm.inline_asm(
+            ir.F32Type.get(),
+            [raw(accumulator), raw(a_pair), raw(b_pair)],
+            "v_dot2_f32_bf16 $0, $2, $3, $1",
+            "=v,0,v,v",
+            has_side_effects=False,
+        )
+    if contraction == ContractionMode.PACKED_F32:
+        return llvm.inline_asm(
+            ir.VectorType.get([2], ir.F32Type.get()),
+            [raw(accumulator), raw(a_pair), raw(b_pair)],
+            "v_pk_fma_f32 $0, $2, $3, $1",
+            "=v,0,v,v",
+            has_side_effects=False,
+        )
+    accumulator = llvm.intr_fma(a_pair[0], b_pair[0], raw(accumulator))
+    return llvm.intr_fma(a_pair[1], b_pair[1], accumulator)
+
+
+def dpp_add_f32(value, control: str):
+    return llvm.inline_asm(
+        ir.F32Type.get(),
+        [raw(value), raw(value), raw(value)],
+        f"s_nop 3\n\tv_add_f32 $0, $2, $3 {control} bound_ctrl:0",
+        "=v,0,v,v",
+        has_side_effects=False,
+    )
+
+
+def wavefront_reduce_sum_f32(value):
+    for shift in (8, 4, 2, 1):
+        value = dpp_add_f32(value, f"row_shr:{shift}")
+    value = dpp_add_f32(value, "row_bcast:15")
+    return dpp_add_f32(value, "row_bcast:31")
+
+
+def bpermute_reduce_sum_f32(value, lane):
+    value = llvm.inline_asm(
+        ir.F32Type.get(),
+        [raw(value)],
+        "s_nop 3\n\tv_mov_b32 $0, $1",
+        "=v,v",
+        has_side_effects=False,
+    )
+    for stage in range_constexpr(6):
+        partner = lane ^ fx.Int32(1 << stage)
+        value_i32 = ArithValue(raw(value)).bitcast(T.i32)
+        peer_i32 = fx.rocdl.ds_bpermute(
+            T.i32,
+            partner * fx.Int32(4),
+            value_i32,
+        )
+        value = add_f32(value, ArithValue(peer_i32).bitcast(T.f32))
+    return value
+
+
+def reduce_wave_accumulator(accumulator, lane, contraction, reduction):
+    use_dpp = reduction == ReductionMode.DPP
+    if contraction != ContractionMode.PACKED_F32:
+        return (
+            wavefront_reduce_sum_f32(accumulator)
+            if use_dpp
+            else bpermute_reduce_sum_f32(accumulator, lane)
+        )
+    lo = vector.extract(
+        accumulator,
+        static_position=[0],
+        dynamic_position=[],
+    )
+    hi = vector.extract(
+        accumulator,
+        static_position=[1],
+        dynamic_position=[],
+    )
+    if use_dpp:
+        lo = wavefront_reduce_sum_f32(lo)
+        hi = wavefront_reduce_sum_f32(hi)
+    else:
+        lo = bpermute_reduce_sum_f32(lo, lane)
+        hi = bpermute_reduce_sum_f32(hi, lane)
+    return add_f32(lo, hi)
+
+
+def convert_bf16(value, element, rounding: OutputRounding):
+    if rounding == OutputRounding.RNE:
+        return arith_dialect.TruncFOp(T.bf16, raw(value)).result
+    seed = (
+        ArithValue(raw(element)) * fx.Int32(0x45D9F3B)
+    ) ^ (ArithValue(raw(element)) << fx.Int32(16)) ^ fx.Int32(0x27D4EB2D)
+    converted = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [raw(value), raw(seed)],
+        "v_cvt_sr_bf16_f32 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )
+    return ArithValue(converted).trunci(T.i16).bitcast(T.bf16)
+
+
+def store_bf16(
+    value,
+    tensor,
+    row,
+    column,
+    row_stride: int,
+    rounding: OutputRounding,
+) -> None:
+    element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
+    output = convert_bf16(value, element, rounding)
+    tensor[row, column] = output
+
+
+def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
+    """Use the shared native atom; FlyDSL has no matching high-level MMA atom."""
+    a_i16 = vector.bitcast(T.vec(4, T.i16), a_fragment)
+    b_i16 = vector.bitcast(T.vec(4, T.i16), b_fragment)
+    return fx.rocdl.mfma_f32_4x4x4bf16_1k_(
+        T.vec(4, T.f32),
+        raw(a_i16),
+        raw(b_i16),
+        raw(accumulator),
+        0,
+        0,
+        0,
+    )
+
+
+def bf16x4_slice(fragment, fragment_index: int):
+    return vector.extract_strided_slice(
+        T.vec(MFMA_K, T.bf16),
+        raw(fragment),
+        [fragment_index * MFMA_K],
+        [MFMA_K],
+        [1],
+    )
+
+
+def dpp_move_f32(value, control: int):
+    return fx.rocdl.update_dpp(
+        T.f32,
+        raw(value),
+        raw(value),
+        control,
+        0xF,
+        0xF,
+        True,
+    )
+
+
+def reduce_mfma_scalar(accumulator):
+    components = [
+        vector.extract(accumulator, static_position=[i], dynamic_position=[])
+        for i in range_constexpr(4)
+    ]
+    result = components[0]
+    result = add_f32(result, dpp_move_f32(components[1], 0x101))
+    result = add_f32(result, dpp_move_f32(components[2], 0x102))
+    result = add_f32(result, dpp_move_f32(components[3], 0x103))
+    result = add_f32(result, dpp_move_f32(result, 0x104))
+    result = add_f32(result, dpp_move_f32(result, 0x108))
+    result = dpp_move_f32(result, 0x11F)
+    result = add_f32(result, dpp_move_f32(result, 0x142))
+    return add_f32(result, dpp_move_f32(result, 0x143))
+
+
+def masked_bf16_vector(
+    tensor,
+    row,
+    column_base,
+    width: int,
+    row_size: int,
+    cache_modifier: int = 0,
+    row_valid=None,
+):
+    """Load a compile-time BF16 vector with safe N/K tail masking."""
+    zero = const_bf16()
+    values = []
+    for offset in range_constexpr(width):
+        column = column_base + fx.Int32(offset)
+        valid = column < fx.Int32(row_size)
+        if row_valid is not None:
+            valid = valid & row_valid
+        safe_column = ArithValue(raw(valid)).select(column, fx.Int32(0))
+        safe_row = row
+        if row_valid is not None:
+            safe_row = ArithValue(raw(row_valid)).select(row, fx.Int32(0))
+        loaded = load_scalar(
+            tensor,
+            safe_row,
+            safe_column,
+            row_size,
+            cache_modifier,
+        )
+        values.append(ArithValue(raw(valid)).select(loaded, zero))
+    return vector.from_elements(T.vec(width, T.bf16), values)

@@ -38,29 +38,32 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 
 FLYDSL_TUNE_ERROR = None
-FLYDSL_SMALL_M_SUPPORTED_ARCHS = frozenset({"gfx942", "gfx950"})
+FLYDSL_SMALL_M_SUPPORTED_ARCHS = frozenset()
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
+            SPLIT_K_SEMAPHORE_MAX_LEN,
             flydsl_hgemm,
-            get_flydsl_splitk_hgemm_kernels,
-        )
-        from aiter.ops.flydsl.kernels.gemm_decode import (
+            flydsl_small_m_hgemm,
             gemm_decode_bf16_configured,
-        )
-        from aiter.ops.flydsl.kernels.gemm_decode_config import (
             gemm_decode_kernel_name,
+            get_flydsl_splitk_hgemm_kernels,
             iter_gemm_decode_configs,
         )
         from aiter.ops.flydsl.kernels.small_m_hgemm import (
+            SMALL_M_SUPPORTED_ARCHS,
             iter_small_m_registry_configs,
             small_m_kernel_name,
         )
+
+        FLYDSL_SMALL_M_SUPPORTED_ARCHS = SMALL_M_SUPPORTED_ARCHS
         import flydsl.expr as fx
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
+    flydsl_small_m_hgemm = None
+    SPLIT_K_SEMAPHORE_MAX_LEN = 256
     get_flydsl_splitk_hgemm_kernels = None
     gemm_decode_bf16_configured = None
     gemm_decode_kernel_name = None
@@ -471,30 +474,48 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         and bias.dtype == input.dtype
     ):
         fused_bias = bias
-    out = flydsl_hgemm(
-        input,
-        weight,
-        bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config.get("block_k_warps", 1),
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        auto_shuffle_b=False,
-        c_to_lds=config.get("c_to_lds", False),
-        lds_staging=config.get("lds_staging", "direct"),
-    )
+    if config.get("kernel_family") == "small_m":
+        if flydsl_small_m_hgemm is None:
+            raise RuntimeError("FlyDSL small-M runtime is unavailable")
+        out = flydsl_small_m_hgemm(
+            input,
+            weight,
+            bias=fused_bias,
+            tile_n=config["tile_n"],
+            tile_k=config["tile_k"],
+            split_k=config["split_k"],
+            block_n_warps=config["block_n_warps"],
+            n_tile_repeat=config.get("n_tile_repeat", 1),
+            persistent_n_tiles=config.get("persistent_n_tiles", 1),
+            waves_per_eu=config.get("waves_per_eu", 0),
+            b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
+            b_to_lds=config["b_to_lds"],
+            lds_staging=config["lds_staging"],
+        )
+    else:
+        out = flydsl_hgemm(
+            input,
+            weight,
+            bias=fused_bias,
+            kernel_family=config.get("kernel_family"),
+            tile_m=config["tile_m"],
+            tile_n=config["tile_n"],
+            tile_k=config["tile_k"],
+            split_k=config["split_k"],
+            block_m_warps=config["block_m_warps"],
+            block_n_warps=config["block_n_warps"],
+            block_k_warps=config.get("block_k_warps", 1),
+            n_tile_repeat=config.get("n_tile_repeat", 1),
+            persistent_n_tiles=config.get("persistent_n_tiles", 1),
+            waves_per_eu=config.get("waves_per_eu", 0),
+            b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
+            stages=stages,
+            async_copy=config.get("async_copy", False),
+            b_to_lds=config["b_to_lds"],
+            b_preshuffle=config.get("b_preshuffle", False),
+            auto_shuffle_b=False,
+            c_to_lds=config.get("c_to_lds", False),
+        )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
     if otype is not None and out.dtype != otype:
@@ -1070,7 +1091,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
                     N // config["tile_n"]
                 )
-                if counters > 128:
+                if counters > SPLIT_K_SEMAPHORE_MAX_LEN:
                     continue
             info = (
                 info_keys,
@@ -1143,7 +1164,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         # Decode has a deliberately stricter absolute/relative correctness gate
         # than the general GEMM catalog. Every candidate is rejected independently.
         for solidx, config in enumerate(
-            iter_gemm_decode_configs(M, N, K, arch)
+            iter_gemm_decode_configs(M, N, K, arch, num_cus=int(info_keys[1]))
         ):
             kernel_name = gemm_decode_kernel_name(arch, M, N, K, config)
             info = (
@@ -1227,11 +1248,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             config = dict(config)
             config["block_k_warps"] = 1
             kernel_name = small_m_kernel_name(
-                arch,
                 "bf16",
-                M,
-                N,
-                K,
+                target_gfx=config["target_gfx"],
                 tile_n=config["tile_n"],
                 tile_k=config["tile_k"],
                 split_k=config["split_k"],

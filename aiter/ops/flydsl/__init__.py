@@ -38,7 +38,29 @@ if is_flydsl_available():
         )
 
     from .fmha_kernels import flydsl_flash_attn_func
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .gemm_kernels import (
+        ActivationSource,
+        BlockMfmaDecodeConfig,
+        ContractionMode,
+        DecodeArchTraits,
+        DecodeConfig,
+        DecodePolicy,
+        OutputRounding,
+        ReductionMode,
+        WaveDecodeConfig,
+        compile_gemm_decode_bf16,
+        flydsl_hgemm,
+        flydsl_small_m_hgemm,
+        flydsl_preshuffle_gemm_a8,
+        gemm_decode_bf16,
+        gemm_decode_bf16_configured,
+        gemm_decode_kernel_name,
+        get_decode_arch_traits,
+        get_gemm_decode_bf16,
+        iter_gemm_decode_configs,
+        launch_gemm_decode_kernel_name,
+        parse_gemm_decode_kernel_name,
+    )
     from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
@@ -65,10 +87,21 @@ if is_flydsl_available():
     __all__ += [
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
+        "ActivationSource",
+        "BlockMfmaDecodeConfig",
+        "ContractionMode",
+        "DecodeArchTraits",
+        "DecodeConfig",
+        "DecodePolicy",
+        "OutputRounding",
+        "ReductionMode",
+        "WaveDecodeConfig",
+        "compile_gemm_decode_bf16",
         "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_small_m_hgemm",
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
@@ -77,5 +110,13 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "gemm_decode_bf16",
+        "gemm_decode_bf16_configured",
+        "gemm_decode_kernel_name",
+        "get_decode_arch_traits",
+        "get_gemm_decode_bf16",
+        "iter_gemm_decode_configs",
+        "launch_gemm_decode_kernel_name",
+        "parse_gemm_decode_kernel_name",
         # "flydsl_gdr_decode",
     ]
