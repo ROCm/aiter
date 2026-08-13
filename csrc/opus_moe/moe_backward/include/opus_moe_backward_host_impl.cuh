@@ -2265,7 +2265,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         AITER_CHECK(z.size(0) == sorted_capacity &&
                         z.size(1) == gate_up_dim,
                     "z must have shape [sorted_capacity,2I]");
-        const bool uses_sorted_x = dw1_kernel_id == 14;
+        const bool uses_sorted_x =
+            dw1_kernel_id == 14 || dw1_kernel_id == 15;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,

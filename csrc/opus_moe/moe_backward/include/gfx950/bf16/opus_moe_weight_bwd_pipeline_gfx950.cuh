@@ -169,6 +169,12 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::PREFETCH_REDUCTION_A;
         return false;
     }();
+    constexpr bool prefetch_reduction_ab = []() constexpr {
+        if constexpr(requires { T::PREFETCH_REDUCTION_AB; })
+            return T::PREFETCH_REDUCTION_AB;
+        return false;
+    }();
+    static_assert(!(prefetch_reduction_a && prefetch_reduction_ab));
     constexpr bool swap_route_sources = []() constexpr {
         if constexpr(requires { T::SWAP_ROUTE_SOURCES; })
             return T::SWAP_ROUTE_SOURCES;
@@ -177,6 +183,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr bool sorted_b_rows = []() constexpr {
         if constexpr(requires { T::SORTED_B_ROWS; })
             return T::SORTED_B_ROWS;
+        return false;
+    }();
+    constexpr bool issue_direct_b_first = []() constexpr {
+        if constexpr(requires { T::ISSUE_DIRECT_B_FIRST; })
+            return T::ISSUE_DIRECT_B_FIRST;
         return false;
     }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
@@ -437,86 +448,99 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         OPUS_LDS_ADDR D_B* b_wave_dst =
             reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
             wave_id * opus::get_warp_size() * VEC;
-        if constexpr(wide_workgroup)
-        {
-            // Eight waves form two four-wave loader groups.  Each group owns
-            // one slab in each half of BM256, so every lane issues exactly
-            // two dZ vectors and all four 64-row slabs are covered once.
-            opus::static_for<2>([&](auto half) {
-                const int slab = wave_id / 4 + half.value * 2;
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
-                    slab * 64 * BK +
-                    (wave_id % 4) * opus::get_warp_size() * VEC;
-                g_a.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (sources.a * kargs.stride_a_row + output_m_base +
-                     slab * 64 + a_local_m) *
-                        sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
-            });
-        }
-        else
-        {
-            opus::static_for<a_m_slabs>([&](auto slab) {
-                OPUS_LDS_ADDR D_A* a_wave_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
-                    slab.value * 64 * BK +
-                    wave_id * opus::get_warp_size() * VEC;
-                g_a.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (sources.a * kargs.stride_a_row + output_m_base +
-                     slab.value * 64 + a_local_m) *
-                        sizeof(D_A),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_A>{});
-            });
-        }
-        if constexpr(split_b_n64)
-        {
-            opus::static_for<2>([&](auto slab) {
-                OPUS_LDS_ADDR D_B* b_slab_dst =
-                    b_wave_dst + slab.value * 64 * BK;
-                const int source_n =
-                    output_n_base + slab.value * 64 + b_split_local_n;
-                g_b.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
-                    (sources.b_split * kargs.stride_b_row + source_n) *
-                        sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
-            });
-        }
-        else
-        {
-            opus::static_for<b_n_slabs>([&](auto slab) {
-                OPUS_LDS_ADDR D_B* b_slab_dst =
-                    b_wave_dst + slab.value * 128 * BK;
-                const int source_n =
-                    output_n_base + slab.value * 128 + b_local_n;
-                g_b.template _async_load<VEC>(
-                    reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
-                    (sources.b0 * kargs.stride_b_row + source_n) *
-                        sizeof(D_B),
-                    0,
-                    opus::number<0>{},
-                    opus::number<T::CACHECTL_B>{});
-                if constexpr(!wide_workgroup)
+        auto issue_a = [&]() __attribute__((always_inline)) {
+            if constexpr(wide_workgroup)
+            {
+                // Eight waves form two four-wave loader groups.  Each group
+                // owns one slab in each half of BM256.
+                opus::static_for<2>([&](auto half) {
+                    const int slab = wave_id / 4 + half.value * 2;
+                    OPUS_LDS_ADDR D_A* a_wave_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                        slab * 64 * BK +
+                        (wave_id % 4) * opus::get_warp_size() * VEC;
+                    g_a.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                        (sources.a * kargs.stride_a_row + output_m_base +
+                         slab * 64 + a_local_m) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                });
+            }
+            else
+            {
+                opus::static_for<a_m_slabs>([&](auto slab) {
+                    OPUS_LDS_ADDR D_A* a_wave_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                        slab.value * 64 * BK +
+                        wave_id * opus::get_warp_size() * VEC;
+                    g_a.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                        (sources.a * kargs.stride_a_row + output_m_base +
+                         slab.value * 64 + a_local_m) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                });
+            }
+        };
+        auto issue_b = [&]() __attribute__((always_inline)) {
+            if constexpr(split_b_n64)
+            {
+                opus::static_for<2>([&](auto slab) {
+                    OPUS_LDS_ADDR D_B* b_slab_dst =
+                        b_wave_dst + slab.value * 64 * BK;
+                    const int source_n =
+                        output_n_base + slab.value * 64 + b_split_local_n;
                     g_b.template _async_load<VEC>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(
-                            reinterpret_cast<OPUS_LDS_ADDR char*>(
-                                b_slab_dst) +
-                            4096),
-                        (sources.b1 * kargs.stride_b_row + source_n) *
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                        (sources.b_split * kargs.stride_b_row + source_n) *
                             sizeof(D_B),
                         0,
                         opus::number<0>{},
                         opus::number<T::CACHECTL_B>{});
-            });
+                });
+            }
+            else
+            {
+                opus::static_for<b_n_slabs>([&](auto slab) {
+                    OPUS_LDS_ADDR D_B* b_slab_dst =
+                        b_wave_dst + slab.value * 128 * BK;
+                    const int source_n =
+                        output_n_base + slab.value * 128 + b_local_n;
+                    g_b.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
+                        (sources.b0 * kargs.stride_b_row + source_n) *
+                            sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+                    if constexpr(!wide_workgroup)
+                        g_b.template _async_load<VEC>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                reinterpret_cast<OPUS_LDS_ADDR char*>(
+                                    b_slab_dst) +
+                                4096),
+                            (sources.b1 * kargs.stride_b_row + source_n) *
+                                sizeof(D_B),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_B>{});
+                });
+            }
+        };
+        if constexpr(issue_direct_b_first)
+        {
+            issue_b();
+            issue_a();
+        }
+        else
+        {
+            issue_a();
+            issue_b();
         }
     };
 
@@ -617,6 +641,22 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 __builtin_amdgcn_s_setprio(1);
                 v_c = mma_k_fragment(v_a0, v_b0, v_c);
                 load_b_fragment(opus::number<1>{}, v_b1);
+                s_waitcnt_lgkmcnt(0_I);
+                v_c = mma_k_fragment(v_a1, v_b1, v_c);
+                __builtin_amdgcn_s_setprio(0);
+            }
+            else if constexpr(prefetch_reduction_ab)
+            {
+                typename decltype(mma_k_fragment)::vtype_a v_a0;
+                typename decltype(mma_k_fragment)::vtype_b v_b0;
+                typename decltype(mma_k_fragment)::vtype_a v_a1;
+                typename decltype(mma_k_fragment)::vtype_b v_b1;
+                load_fragment(opus::number<0>{}, v_a0, v_b0);
+                s_waitcnt_lgkmcnt(0_I);
+                load_a_fragment(opus::number<1>{}, v_a1);
+                load_b_fragment(opus::number<1>{}, v_b1);
+                __builtin_amdgcn_s_setprio(1);
+                v_c = mma_k_fragment(v_a0, v_b0, v_c);
                 s_waitcnt_lgkmcnt(0_I);
                 v_c = mma_k_fragment(v_a1, v_b1, v_c);
                 __builtin_amdgcn_s_setprio(0);

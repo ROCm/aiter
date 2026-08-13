@@ -645,6 +645,17 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchASortedXDoubleLds
     static constexpr bool SORTED_B_ROWS = true;
 };
 
+// Long sorted reductions can place both second-K16 LDS reads ahead of the
+// first MFMA without reducing occupancy.  Start the smaller, reused sorted-X
+// transfer before dZ so it also enters each direct-to-LDS stage first.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoubleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchASortedXDoubleLds
+{
+    static constexpr bool PREFETCH_REDUCTION_A = false;
+    static constexpr bool PREFETCH_REDUCTION_AB = true;
+    static constexpr bool ISSUE_DIRECT_B_FIRST = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
