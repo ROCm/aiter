@@ -148,6 +148,7 @@ def select_3d_config(
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
     SLIDING_WINDOW: int | None = None,
+    per_token_kv_descale: bool = False,
 ):
     arch = get_arch()
     reduce_num_warps = 2
@@ -164,6 +165,14 @@ def select_3d_config(
         ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8}) in arch = {DEVICE_ARCH}"
         attn_warps = 1
         TILE_SIZE = block_size
+        if per_token_kv_descale and TILE_SIZE >= 128:
+            # Broadcasting the per-token descale column onto the score and the
+            # probability tile costs two extra [BLOCK_M, TILE_SIZE] fp32
+            # temporaries. At TILE_SIZE 128 that spills the register file with
+            # one warp (~290 spills, 1.6x slower than bf16); two warps halve the
+            # per-lane pressure and put fp8 back ahead of bf16. Smaller tiles
+            # are measurably fastest at one warp, so only widen here.
+            attn_warps = 2
         if shuffled_kv_cache and head_size < 128:
             if kv_cache_dtype in (
                 torch.bfloat16,
@@ -281,6 +290,51 @@ def select_3d_config(
     return attn_config, reduce_config
 
 
+def _validate_per_token_kv_descale(
+    k_descale,
+    v_descale,
+    num_blocks,
+    num_kv_heads,
+    block_size,
+    kv_cache_dtype,
+    shuffled_kv_cache,
+):
+    """Check a per-token (per KV slot) fp8 dequant scale pair.
+
+    Consumed by the gfx1250 shuffled-fp8 3D gluon kernel
+    (``_gluon_kernels/gfx1250/attention/unified_attention_3d.py``, the
+    all-decode path) and by the Triton 2D kernel
+    (``_triton_kernels/attention/unified_attention.py``, the prefill path that
+    MiniMax-M3's dense fp8 layers take). The gluon 2D and Triton 3D kernels do
+    not implement it and reject it at their dispatch sites.
+    """
+    expected = (num_blocks, num_kv_heads, block_size)
+    if not (IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache):
+        raise NotImplementedError(
+            "per-token k_descale/v_descale is only implemented for the gfx1250 "
+            f"shuffled KV cache (arch={DEVICE_ARCH}, "
+            f"shuffled_kv_cache={shuffled_kv_cache})"
+        )
+    if kv_cache_dtype != e4m3_dtype:
+        raise NotImplementedError(
+            f"per-token k_descale/v_descale requires an fp8 ({e4m3_dtype}) KV "
+            f"cache, got {kv_cache_dtype}"
+        )
+    if v_descale is None or v_descale.numel() == 1:
+        raise ValueError(
+            "k_descale is per-token but v_descale is not; pass both per-token"
+        )
+    for name, descale in (("k_descale", k_descale), ("v_descale", v_descale)):
+        if tuple(descale.shape) != expected:
+            raise ValueError(
+                f"per-token {name} must be {expected}, got {tuple(descale.shape)}"
+            )
+        if descale.dtype != torch.float32:
+            raise ValueError(f"per-token {name} must be fp32, got {descale.dtype}")
+        if not descale.is_contiguous():
+            raise ValueError(f"per-token {name} must be contiguous")
+
+
 def use_2d_kernel(
     head_size,
     sliding_window,
@@ -380,6 +434,26 @@ def unified_attention(
         K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
         SCALE_K_WIDTH = 4
 
+    # k_descale/v_descale are normally a single scalar for the whole cache. A
+    # [num_blocks, num_kv_heads, block_size] fp32 tensor instead carries one
+    # dequant scale per cached token, as produced by dynamic per-token fp8 KV
+    # quantization (e.g. MiniMax-M3 sparse attention, and its dense fp8 layers),
+    # where no scalar can stand in for the whole cache. Implemented by the
+    # gfx1250 3D gluon kernel (all-decode) and the Triton 2D kernel (prefill);
+    # the remaining paths would silently drop the descale, so they reject it
+    # below rather than return wrong numbers.
+    per_token_kv_descale = k_descale is not None and k_descale.numel() > 1
+    if per_token_kv_descale:
+        _validate_per_token_kv_descale(
+            k_descale,
+            v_descale,
+            num_blocks,
+            num_kv_heads,
+            block_size,
+            kv_cache_dtype,
+            shuffled_kv_cache,
+        )
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -416,12 +490,21 @@ def unified_attention(
         target_num_prgms,
         num_2d_prgms,
     ):
-
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(
             q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
+        if per_token_kv_descale and use_gluon_2d:
+            # The Triton 2d kernel below folds the per-token scales onto the
+            # score columns / probabilities; the gluon 2d kernel has no such
+            # path yet. (M3's dense fp8 layers pass bf16 q + fp8 KV, so
+            # is_2d_gluon_available() is already False for them.)
+            raise NotImplementedError(
+                "per-token k_descale/v_descale is not implemented in the "
+                "gfx1250 gluon 2D kernel; it is supported by the gluon 3D "
+                "kernel and by the Triton 2D kernel"
+            )
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
                 q,
@@ -481,8 +564,19 @@ def unified_attention(
                 qq_bias_ptr=qq_bias,
                 scale=softmax_scale,
                 q_descale_ptr=q_descale,
-                k_descale_ptr=k_descale,
-                v_descale_ptr=v_descale,
+                # Per-token scales go in via k/v_token_scale_ptr instead: the
+                # scalar path folds them into qk_scale / one_over_L, which is
+                # only valid when the scale is constant along the key axis.
+                k_descale_ptr=None if per_token_kv_descale else k_descale,
+                v_descale_ptr=None if per_token_kv_descale else v_descale,
+                k_token_scale_ptr=k_descale if per_token_kv_descale else None,
+                v_token_scale_ptr=v_descale if per_token_kv_descale else None,
+                stride_kv_tok_scale_0=(
+                    k_descale.stride(0) if per_token_kv_descale else 0
+                ),
+                stride_kv_tok_scale_1=(
+                    k_descale.stride(1) if per_token_kv_descale else 0
+                ),
                 out_scale_ptr=output_scale,
                 softcap=softcap,
                 num_query_heads=num_query_heads,
@@ -531,6 +625,7 @@ def unified_attention(
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
             SLIDING_WINDOW,
+            per_token_kv_descale=per_token_kv_descale,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
@@ -578,8 +673,10 @@ def unified_attention(
                 alibi_slopes_ptr=alibi_slopes,
                 qq_bias_ptr=qq_bias,
                 q_scale_ptr=q_descale,
-                k_scale_ptr=k_descale,
-                v_scale_ptr=v_descale,
+                k_scale_ptr=None if per_token_kv_descale else k_descale,
+                v_scale_ptr=None if per_token_kv_descale else v_descale,
+                k_token_scale_ptr=k_descale if per_token_kv_descale else None,
+                v_token_scale_ptr=v_descale if per_token_kv_descale else None,
                 out_scale_ptr=(
                     output_scale
                     if (output_scale is not None and NUM_SEGMENTS == 1)
@@ -628,6 +725,11 @@ def unified_attention(
                 **attn_config,
             )
         else:
+            if per_token_kv_descale:
+                raise NotImplementedError(
+                    "per-token k_descale/v_descale is implemented in the gfx1250 "
+                    "3D gluon kernel only; this call selected the Triton 3D kernel"
+                )
             kernel_unified_attention_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
