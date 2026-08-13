@@ -629,6 +629,11 @@ def mxfp4_moe_gemm2(
             "FlyDSL v2 GEMM2 supports only torch.bfloat16 output, "
             f"got {getattr(out, 'dtype', None)}"
         )
+    if sorted_weights is None:
+        raise NotImplementedError(
+            "FlyDSL v2 GEMM2 requires sorted_weights; "
+            "doweight_stage1=True is not supported"
+        )
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER

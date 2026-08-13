@@ -3783,9 +3783,11 @@ class FmoeTuner(TunerCommon):
             q_dtype_w,
             q_type,
             use_g1u1,
-            _doweight_stage1,
+            doweight_stage1,
         ) = info
         if dtype != dtypes.bf16:
+            return tasks
+        if doweight_stage1:
             return tasks
         if q_type != QuantType.per_1x32 or not use_g1u1:
             return tasks
