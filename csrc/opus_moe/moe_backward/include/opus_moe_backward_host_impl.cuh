@@ -713,16 +713,20 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     // K4 and K2 both consume K1's much larger dZ stream.  For the bounded
     // mid-width D family once dZ has outgrown the cache-friendly regime,
     // consume it with K4 immediately, then let K2's read refresh dZ before
-    // route reduction.  K5 is independent and moves last; this ordering
-    // retains more of dZ across the two dominant grouped GEMMs than
-    // prioritizing the smaller a_scaled stream.  Small working sets and
-    // narrower or wider grids retain the legacy launch order.
+    // route reduction.  K5 normally moves last so dZ stays warm across the
+    // two dominant grouped GEMMs.  The largest forward-cache working sets
+    // instead finish K5 before the adjacent K2/K3 producer-consumer pair.
+    // Small working sets and narrower or wider grids retain the legacy order.
     const int model_dim = dw1.model_dim;
     const bool mid_width_d = model_dim >= 1536 && model_dim <= 2048;
     constexpr uint64_t dz_reorder_min_bytes = 512ull * 1024ull * 1024ull;
+    constexpr uint64_t dz_k5_before_route_min_bytes =
+        1024ull * 1024ull * 1024ull;
     const uint64_t dz_bytes =
         static_cast<uint64_t>(down.route.sorted_capacity) *
         static_cast<uint64_t>(2 * down.inter_dim) * sizeof(hip_bfloat16);
+    const bool uses_saved_a_and_sorted_x =
+        down_kernel_id == 14 && dw1_kernel_id == 15;
     if(mid_width_d && dz_bytes >= dz_reorder_min_bytes)
     {
         invoke(gfx950::dispatch_dw1(
@@ -730,6 +734,16 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                dw1,
                stream,
                Family::Dw1);
+        // Once dZ itself reaches a GiB, K4 has already refreshed the stream
+        // that K2 consumes.  Finish independent K5 next so K2/K3 can run as
+        // one producer-consumer pair; smaller dZ retains immediate K2 reuse.
+        if(uses_saved_a_and_sorted_x &&
+           dz_bytes >= dz_k5_before_route_min_bytes)
+            invoke(gfx950::dispatch_dw2(
+                       select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+                   dw2,
+                   stream,
+                   Family::Dw2);
         invoke(gfx950::dispatch_route_dx(selected_route_dx),
                route_dx,
                stream,
@@ -738,11 +752,13 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                route_reduce,
                stream,
                Family::RouteReduce);
-        invoke(gfx950::dispatch_dw2(
-                   select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
-               dw2,
-               stream,
-               Family::Dw2);
+        if(!uses_saved_a_and_sorted_x ||
+           dz_bytes < dz_k5_before_route_min_bytes)
+            invoke(gfx950::dispatch_dw2(
+                       select_fixed_dw2_kernel_id(dw2, dw2_kernel_id)),
+                   dw2,
+                   stream,
+                   Family::Dw2);
     }
     else
     {
