@@ -12,7 +12,6 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
@@ -64,7 +63,12 @@ __global__ void add_rmsnorm_quant_kernel(
         auto buffer_i = opus::make_gmem<DTYPE_I>(input_ptr, oob_i * sizeof(DTYPE_I));
         auto weight_buffer = opus::make_gmem<DTYPE_I>(weight, oob_i * sizeof(DTYPE_I));
         
-        const int oob_o = (n + ooba_o - 1) / ooba_o * ooba_o;
+        // opus::fp4_t occupies one byte as a standalone C++ type, while the output
+        // packs two logical FP4 values per byte. Bound stores to the packed row so
+        // threads beyond n cannot write into the following row.
+        const int oob_o = std::is_same_v<DTYPE_O, opus::fp4_t>
+                            ? (n + 1) / 2
+                            : (n + ooba_o - 1) / ooba_o * ooba_o;
 
         constexpr int interleave_size = WARP_SIZE;
         int row_offset = (interleave && (num_load_inst > 1)) ? (tid % WARP_SIZE * load_vec_size + (tid / WARP_SIZE) * WARP_SIZE * thread_data_size) : (tid * thread_data_size);
@@ -227,7 +231,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 float quant_scale;
                 if(group_size ==  0)
                 {
-                    float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+                    float max = block_reduce<float, aiter::Max, BlockSize, true>(thread_max, aiter::Max());
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x == 0)
                     {
@@ -237,7 +241,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 else
                 {
                     int reduce_thread_size = group_size / thread_data_size;
-                    float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+                    float max= multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
                     if(use_e8m0)
                     {
                         constexpr aiter::MxDtype kMxDtype = is_fp4_out

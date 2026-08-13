@@ -150,23 +150,25 @@ def select_3d_config(
     SLIDING_WINDOW: int | None = None,
 ):
     arch = get_arch()
-    # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
-    # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
-    assert kv_cache_dtype in (
-        torch.float16,
-        torch.bfloat16,
-        e4m3_dtype,
-    ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
     attn_stages = 2
     if IS_DEVICE_ARCH_GFX12:
+        assert kv_cache_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            e4m3_dtype,
+            torch.uint8,
+        ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8}) in arch = {DEVICE_ARCH}"
         attn_warps = 1
         TILE_SIZE = block_size
         if shuffled_kv_cache and head_size < 128:
-            if kv_cache_dtype == torch.bfloat16:
+            if kv_cache_dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
                 if block_size <= 64:
                     waves_per_eu = 2
                 else:
@@ -202,9 +204,14 @@ def select_3d_config(
         #     attn_warps = max(attn_warps, 1)
         #     attn_warps = min(attn_warps, 4)
     else:
+        assert kv_cache_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            e4m3_dtype,
+        ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}) in arch = {DEVICE_ARCH}"
+
         if head_size >= 512 and not arch.is_rdna:
             attn_warps, attn_stages = 4, 1
-
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
 

@@ -486,35 +486,35 @@ jobs:
             label: MI35X
             shard_total: 8
             shard_idx: 7
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 0
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 1
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 2
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 3
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 4
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 5
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 6
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 7
@@ -787,7 +787,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in {linux-aiter-mi35x-1,linux-aiter-oci-mi300x-1}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -810,8 +810,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-8
+            label: MI350X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -1109,13 +1109,16 @@ jobs:
         if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
         id: baseline_pinned
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
           commit: ${{ github.event.pull_request.base.sha }}
           name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
           path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Fallback — fetch baseline from latest main
@@ -1124,7 +1127,7 @@ jobs:
           github.event_name == 'pull_request'
         id: baseline_main
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
@@ -1132,6 +1135,7 @@ jobs:
           name_is_regexp: true
           name: ^tuned-op-bench-[a-f0-9]+$
           path: /tmp/baseline_main/
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Compare

@@ -34,6 +34,8 @@ OPUS_A8W4_KID_ATOMIC_BM16_BN128_B3_WS2_BT256 = 2011
 OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B2_WS2 = 2012
 
 _OPUS_A8W4_REDUCE_BLOCK_N_RE = re.compile(r"_rbn(\d+)$")
+_OPUS_A8W4_STAGE2_PREFIX = "opus_moe2_"
+_OPUS_A8W4_STAGE2_LAYOUT_PREFIX = "opus_moe2_layout_"
 
 
 @dataclass(frozen=True)
@@ -141,7 +143,7 @@ OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = OpusA8W4KernelContract(
 )
 
 
-OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (384,)
+OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (384, 512)
 
 
 def _opus_a8w4_k_step_packed() -> int:
@@ -475,6 +477,13 @@ def opus_a8w4_effective_inter_dim(
     return logical_inter_dim - inter_dim_pad
 
 
+def opus_a8w4_dispatch_name(name) -> str:
+    name = str(name).strip()
+    if name.startswith(_OPUS_A8W4_STAGE2_LAYOUT_PREFIX):
+        return _OPUS_A8W4_STAGE2_PREFIX + name[len(_OPUS_A8W4_STAGE2_LAYOUT_PREFIX) :]
+    return name
+
+
 def opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim: int) -> int:
     effective_inter_dim = int(effective_inter_dim)
     if effective_inter_dim <= 0:
@@ -509,7 +518,7 @@ def opus_a8w4_reduce_block_n_from_name(name) -> int | None:
 
 
 def opus_a8w4_kid_from_name(name) -> int | None:
-    name = str(name).strip()
+    name = opus_a8w4_dispatch_name(name)
     inst = OPUS_A8W4_STAGE2_BY_NAME.get(name)
     if inst is None:
         inst = OPUS_A8W4_STAGE2_BY_NAME.get(opus_a8w4_base_name(name))

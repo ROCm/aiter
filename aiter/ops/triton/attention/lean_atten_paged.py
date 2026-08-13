@@ -71,8 +71,6 @@ def persistent_lean_attention_paged(
         N_CTX_Q, N_CTX_K, H, H, HEAD_DIM_Q, BLOCK_M, BLOCK_N, total_programs
     )
 
-    kv_shape = k.shape[1] // BLOCK_N + (1 if k.shape[1] % BLOCK_N != 0 else 0)
-
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
@@ -87,7 +85,6 @@ def persistent_lean_attention_paged(
         Op,
         o,
         kv_block_tables,
-        kv_shape,
         batch_num_block_n,
         locks,
         q.stride(0),

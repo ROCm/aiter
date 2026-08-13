@@ -1,51 +1,29 @@
 name: vLLM disagg CI smoke workflow
 
 on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
   schedule:
     # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
     - cron: '30 18 * * *'
   workflow_dispatch:
     inputs:
-      vllm_repository:
-        description: "vLLM repository to clone"
-        required: false
-        type: string
-        default: "itej89/vllm"
-      vllm_ref:
-        description: "vLLM branch/ref with lcskrishna/vllm PR #5 changes"
-        required: false
-        type: string
-        default: "fix/moriio-ep8-dp8-read-rdma-session-routing"
-      model_name:
-        description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
-        required: false
-        type: string
-        default: "DeepSeek-V3"
       disagg_scripts_stage:
-        description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
+        description: "Shared path visible to Spur login and compute nodes"
         required: false
         type: string
         default: "/data/xinhuang/vllm-disagg-logs/"
-      spur_nodelist:
-        description: "Optional comma-separated Spur nodes for the 2-node smoke job"
+      spur_node_pool:
+        description: "Comma-separated Spur node pool used to select idle nodes for each smoke job"
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
-        description: "Docker image passed to run_xPyD disagg Slurm script"
+        description: "Pinned official vLLM ROCm image used by upstream DI build #17"
         required: false
         type: string
-        default: "vllm/vllm-openai-rocm:v0.23.0"
-      slurm_script:
-        description: "Slurm script under .buildkite/amd-disagg"
-        required: false
-        type: string
-        default: "run_xPyD_diagg.slurm"
-      wait_timeout_minutes:
-        description: "Maximum time to wait for the Slurm job"
-        required: false
-        type: string
-        default: "420"
+        default: "vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -54,59 +32,254 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  VLLM_REPOSITORY_URL: https://github.com/vllm-project/vllm.git
+  # Exact source tree used by the passing vLLM AMD DI Buildkite build #17.
+  VLLM_BASELINE_SHA: a42850c85f815ab3123a541bc92fb9b35892335e
+  # Image used by the passing vLLM AMD DI Buildkite build #17 on 2026-07-30.
+  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm@sha256:0f3fcd5cc4cb4642f85cf6c22e105ab6125730d98d1b72e16b2987721364a50e' }}
+  VLLM_ROUTER_IMAGE: vllm/vllm-router@sha256:76cec0abab4c57cf74091a2422b0f2e6f3ca07cdf73560a5b96cad3e6f97ab33
+  DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
+  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  AITER_GPU_ARCHS: gfx950
+  AITER_BUILD_MAX_JOBS: "64"
+  AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
+
 jobs:
-  vllm-disagg-smoke:
-    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
-    timeout-minutes: 480
-    env:
-      VLLM_REPOSITORY_DEFAULT: itej89/vllm
-      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
-      MODEL_NAME_DEFAULT: DeepSeek-V3
-      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
-      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
-      IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
-      ROUTER_TYPE_DEFAULT: vllm-router
-      MORIIO_READ_MODE_DEFAULT: "0"
-      VLLM_ROUTER_IMAGE_DEFAULT: vllm/vllm-router:nightly
-      SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
-      WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
+  build_aiter_wheel:
+    name: Build gfx950 Aiter overlay wheels
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
+    runs-on: build-only-aiter
     steps:
-      - name: Apply vLLM disagg inputs
+      - name: Checkout AITER
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Build AITER wheel in the vLLM nightly image
+        run: |
+          set -euo pipefail
+          bash .github/scripts/docker_pull_with_retry.sh "${BASE_IMAGE}"
+          docker run --rm \
+            --network=host \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            -e AITER_USE_SYSTEM_TRITON=1 \
+            -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
+            -e PREBUILD_KERNELS=0 \
+            -e MAX_JOBS="${AITER_BUILD_MAX_JOBS}" \
+            --entrypoint /bin/bash \
+            "${BASE_IMAGE}" \
+            -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              shopt -s nullglob
+              rm -rf dist build aiter_meta ./*.egg-info
+              rm -f .aiter-build.log
+              python3 -c "from importlib.metadata import version; import flydsl; flydsl_version = version(\"flydsl\"); print(f\"Unmodified runtime dependency: flydsl={flydsl_version} at {flydsl.__file__}\")"
+              pip uninstall -y aiter amd-aiter || true
+              pip config set global.default-timeout 60
+              pip config set global.retries 10
+              pip install -r requirements.txt
+              pip install --upgrade pandas pyzmq einops numpy==1.26.2
+              pip install --upgrade "pybind11>=3.0.1"
+              pip install --upgrade "ninja>=1.11.1"
+              pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
+              pip install tabulate
+              flydsl_version="$(python3 -c "from importlib.metadata import version; print(version(\"flydsl\"))")"
+              echo "Packaging runtime dependency flydsl==${flydsl_version}"
+              python3 -m pip download \
+                --no-deps \
+                --only-binary=:all: \
+                --dest dist \
+                "flydsl==${flydsl_version}"
+              echo "Prebuilding the gfx950 CKTile A8W8 blockscale module"
+              python3 .github/scripts/prebuild_vllm_disagg_cktile.py
+              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
+              python setup.py bdist_wheel 2>&1 | tee .aiter-build.log
+              ls -lh dist/*.whl
+              aiter_wheels=(dist/amd_aiter-*.whl)
+              flydsl_wheels=(dist/flydsl-*.whl)
+              if (( ${#aiter_wheels[@]} != 1 )); then
+                echo "Expected exactly one amd_aiter wheel, found ${#aiter_wheels[@]}" >&2
+                exit 1
+              fi
+              if (( ${#flydsl_wheels[@]} != 1 )); then
+                echo "Expected exactly one flydsl wheel, found ${#flydsl_wheels[@]}" >&2
+                exit 1
+              fi
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); prefix = \"aiter_meta/hsa/\"; arches = {name[len(prefix):].split(\"/\", 1)[0] for name in names if name.startswith(prefix) and \"/\" in name[len(prefix):]}; print(f\"AITER wheel entries: {len(names)}; packaged HSA arches: {sorted(arches)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"aiter/__init__.py\" in names; assert \"aiter/jit/module_gemm_a8w8_blockscale_cktile.so\" in names, \"missing targeted CKTile prebuild\"; assert any(name.startswith(\"aiter_meta/hsa/gfx950/\") and name.endswith(\".co\") for name in names), \"missing gfx950 code objects\"" "${aiter_wheels[0]}"
+              python3 -c "import sys, zipfile; wheel = sys.argv[1]; archive = zipfile.ZipFile(wheel); names = archive.namelist(); print(f\"FlyDSL wheel entries: {len(names)}\"); assert archive.testzip() is None, \"corrupt wheel member\"; assert \"flydsl/__init__.py\" in names, \"missing flydsl package\"" "${flydsl_wheels[0]}"
+            '
+
+      - name: Upload AITER overlay wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: |
+            dist/*.whl
+            .aiter-build.log
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 14
+
+  select_vllm_cases:
+    name: Select upstream vLLM cases
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Checkout vLLM Buildkite 17 baseline
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: a42850c85f815ab3123a541bc92fb9b35892335e
+          fetch-depth: 1
+          path: vllm
+
+      - name: Select vLLM-router cases
+        id: select
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
           import json
           import os
-          import sys
+          import re
+          from pathlib import Path
 
-          with open(sys.argv[1], encoding="utf-8") as f:
-              event = json.load(f)
+          pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
+          cases = []
+          label = None
 
-          inputs = event.get("inputs") or {}
+          for line in pipeline.read_text(encoding="utf-8").splitlines():
+              label_match = re.match(r'\s*-\s+label:\s+["\'](.+)["\']\s*$', line)
+              if label_match:
+                  label = label_match.group(1)
+                  continue
 
-          def value(name: str, default_env: str) -> str:
-              raw = inputs.get(name, "")
-              default = os.environ[default_env]
-              return raw if raw not in ("", None) else default
+              command_match = re.match(
+                  r"\s*-\s+((?:IMAGE=\S+\s+)?MODEL_NAME=.*run-slurm-disagg-test\.sh)\s*$",
+                  line,
+              )
+              if not command_match or not label or not label.endswith("-vllm-router"):
+                  continue
 
-          print(f"VLLM_REPOSITORY={value('vllm_repository', 'VLLM_REPOSITORY_DEFAULT')}")
-          print(f"VLLM_REF={value('vllm_ref', 'VLLM_REF_DEFAULT')}")
-          print(f"MODEL_NAME={value('model_name', 'MODEL_NAME_DEFAULT')}")
-          print(
-              "DISAGG_SCRIPTS_STAGE="
-              + value("disagg_scripts_stage", "DISAGG_SCRIPTS_STAGE_DEFAULT")
-          )
-          print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
-          print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
-          print(f"ROUTER_TYPE={os.environ['ROUTER_TYPE_DEFAULT']}")
-          print(f"MORIIO_READ_MODE={os.environ['MORIIO_READ_MODE_DEFAULT']}")
-          print(f"VLLM_ROUTER_IMAGE={os.environ['VLLM_ROUTER_IMAGE_DEFAULT']}")
-          print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
-          print(
-              "WAIT_TIMEOUT_MINUTES="
-              + value("wait_timeout_minutes", "WAIT_TIMEOUT_MINUTES_DEFAULT")
-          )
+              command = command_match.group(1)
+              # The historical pipeline used the mutable :nightly tag inline.
+              # Replace only that token with the immutable image from build #17.
+              command = re.sub(
+                  r"^IMAGE=\S+",
+                  f"IMAGE={os.environ['BASE_IMAGE']}",
+                  command,
+                  count=1,
+              )
+              model_match = re.search(r"(?:^|\s)MODEL_NAME=([^\s]+)", command)
+              nodes_match = re.search(r"(?:^|\s)NODES=([0-9]+)", command)
+              if not model_match or not nodes_match:
+                  continue
+              model = model_match.group(1)
+
+              topology_match = re.search(r"-PD-(1P1D|2P2D)-TP8-", label)
+              if topology_match is None:
+                  continue
+
+              topology = f"{topology_match.group(1)}-TP8"
+              slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{model}-{topology}")
+              cases.append(
+                  {
+                      "case_name": label,
+                      "case_slug": slug,
+                      "command": command,
+                      "model_name": model,
+                      "topology": topology,
+                      "nodes": int(nodes_match.group(1)),
+                  }
+              )
+
+          selected = {(case["model_name"], case["topology"]) for case in cases}
+          if len(cases) != 10 or len(selected) != len(cases):
+              raise SystemExit(
+                  "Expected exactly ten unique vLLM-router cases "
+                  f"from {pipeline}; selected {sorted(selected)!r}"
+              )
+
+          matrix = json.dumps({"include": cases}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"matrix={matrix}", file=output)
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as output:
+              print("### Selected upstream vLLM cases\n", file=output)
+              print(
+                  f"Selected all {len(cases)} vLLM-router accuracy cases.\n",
+                  file=output,
+              )
+              print("| Case | Nodes | Upstream command |", file=output)
+              print("|---|---:|---|", file=output)
+              for case in cases:
+                  print(
+                      f'| `{case["case_name"]}` | {case["nodes"]} | '
+                      f'`{case["command"]}` |',
+                      file=output,
+                  )
           PY
+
+  vllm-disagg-smoke:
+    name: ${{ matrix.case_name }}
+    needs: [build_aiter_wheel, select_vllm_cases]
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
+    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
+    timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+      UPSTREAM_CASE_COMMAND: ${{ matrix.command }}
+      CASE_NAME: ${{ matrix.case_name }}
+      CASE_SLUG: ${{ matrix.case_slug }}
+      MODEL_NAME: ${{ matrix.model_name }}
+      TOPOLOGY: ${{ matrix.topology }}
+      NODES: ${{ matrix.nodes }}
+    steps:
+      - name: Download AITER overlay wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
 
       - name: Show runner and Slurm state
         run: |
@@ -116,240 +289,387 @@ jobs:
           pwd
           command -v git
           command -v sbatch
-          command -v squeue
+          command -v scontrol
           command -v scancel
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout vLLM disagg branch
+      - name: Checkout vLLM Buildkite 17 baseline
         run: |
           set -euo pipefail
           rm -rf vllm
           git init vllm
           cd vllm
-          git remote add origin "https://github.com/${VLLM_REPOSITORY}.git"
-          git fetch --depth=1 origin "${VLLM_REF}"
+          git remote add origin "${VLLM_REPOSITORY_URL}"
+          git fetch --depth=1 origin "${VLLM_BASELINE_SHA}"
           git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${VLLM_BASELINE_SHA}"
+          echo "VLLM_BASE_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
+          echo "VLLM_TEST_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
+
+      - name: Add offline AITER wheel overlay to the upstream case
+        run: |
+          set -euo pipefail
+          artifact_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
+          mapfile -d '' aiter_wheels < <(find "${artifact_dir}" -type f -name 'amd_aiter-*.whl' -print0)
+          mapfile -d '' flydsl_wheels < <(find "${artifact_dir}" -type f -name 'flydsl-*.whl' -print0)
+          if [[ "${#aiter_wheels[@]}" -ne 1 || "${#flydsl_wheels[@]}" -ne 1 ]]; then
+            echo "Expected one amd_aiter wheel and one flydsl wheel in ${artifact_dir}; found AITER=${#aiter_wheels[@]} FlyDSL=${#flydsl_wheels[@]}" >&2
+            find "${artifact_dir}" -type f -printf '%P\n' >&2 || true
+            exit 1
+          fi
+
+          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
+          test -d "${disagg_dir}"
+          rm -rf "${disagg_dir}/aiter_overlay"
+          mkdir -p "${disagg_dir}/aiter_overlay"
+          # Extract AITER and its matching FlyDSL dependency on the login runner
+          # so compute nodes never invoke pip or PyPI.
+          python3 -m zipfile -e "${aiter_wheels[0]}" "${disagg_dir}/aiter_overlay"
+          python3 -m zipfile -e "${flydsl_wheels[0]}" "${disagg_dir}/aiter_overlay"
+          test -f "${disagg_dir}/aiter_overlay/aiter/__init__.py"
+          test -f "${disagg_dir}/aiter_overlay/flydsl/__init__.py"
+
+          cat > "${disagg_dir}/aiter_cluster_env.sh" <<'SH'
+          #!/usr/bin/env bash
+          overlay_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aiter_overlay"
+          source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
+          export GPU_ARCHS=gfx950
+          export PYTHONPATH="${overlay_root}${PYTHONPATH:+:${PYTHONPATH}}"
+          python3 - "${overlay_root}" <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import sys
+          import aiter
+          import flydsl
+
+          root = Path(sys.argv[1]).resolve()
+          loaded = Path(aiter.__file__).resolve()
+          flydsl_loaded = Path(flydsl.__file__).resolve()
+          print(
+              f"[aiter-overlay] loaded {loaded}; "
+              f"flydsl={version('flydsl')} at {flydsl_loaded}"
+          )
+          if root not in loaded.parents:
+              raise SystemExit(f"AITER was not loaded from {root}")
+          if root not in flydsl_loaded.parents:
+              raise SystemExit(f"FlyDSL was not loaded from {root}")
+          PY
+          SH
+          chmod +x "${disagg_dir}/aiter_cluster_env.sh"
+
+          du -sh "${disagg_dir}/aiter_overlay"
+          grep -n "aiter-overlay" "${disagg_dir}/aiter_cluster_env.sh"
+          grep -n 'CLUSTER_ENV_IN=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          grep -n 'export CLUSTER_ENV=' "${disagg_dir}/run_xPyD_disagg.slurm"
+          git -C "${GITHUB_WORKSPACE}/vllm" diff --exit-code -- \
+            .buildkite/amd-disagg/vllm_disagg.sh \
+            .buildkite/amd-disagg/run_xPyD_disagg.slurm
+
+      - name: Configure Spur node pool for topology
+        run: |
+          set -euo pipefail
+          if [[ "${NODES}" != "2" && "${NODES}" != "4" ]]; then
+            echo "Unsupported node count: ${NODES}" >&2
+            exit 1
+          fi
+
+          IFS=',' read -r -a pool_nodes <<< "${SPUR_NODE_POOL}"
+          if (( ${#pool_nodes[@]} < NODES )); then
+            echo "Spur node pool has ${#pool_nodes[@]} nodes, but ${NODES} are required" >&2
+            exit 1
+          fi
+
+          declare -A allowed=()
+          for node in "${pool_nodes[@]}"; do
+            allowed["${node}"]=1
+          done
+
+          mapfile -t cluster_nodes < <(sinfo -N -h -o '%N' | sort -Vu)
+          declare -A present=()
+          excluded_nodes=()
+          for node in "${cluster_nodes[@]}"; do
+            present["${node}"]=1
+            if [[ -z "${allowed[${node}]+x}" ]]; then
+              excluded_nodes+=("${node}")
+            fi
+          done
+          for node in "${pool_nodes[@]}"; do
+            if [[ -z "${present[${node}]+x}" ]]; then
+              echo "Configured Spur node is not present in sinfo: ${node}" >&2
+              exit 1
+            fi
+          done
+
+          exclude="$(IFS=,; echo "${excluded_nodes[*]}")"
+          echo "SPUR_NODE_EXCLUDE=${exclude}" >> "${GITHUB_ENV}"
+          echo "Configured upstream case ${CASE_NAME}: nodes=${NODES}, pool=${SPUR_NODE_POOL}"
 
       - name: Show vLLM disagg inputs
         run: |
           set -euo pipefail
-          cd vllm
-          git rev-parse HEAD
           {
             echo "### vLLM disagg smoke input"
             echo
-            echo "- vLLM repository: \`${VLLM_REPOSITORY}\`"
-            echo "- vLLM ref: \`${VLLM_REF}\`"
-            echo "- vLLM SHA: \`$(git rev-parse HEAD)\`"
-            echo "- MODEL_NAME: \`${MODEL_NAME}\`"
-            echo "- DISAGG_SCRIPTS_STAGE: \`${DISAGG_SCRIPTS_STAGE}\`"
-            echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
-            echo "- IMAGE: \`${IMAGE}\`"
-            echo "- Requested Slurm script: \`${SLURM_SCRIPT}\`"
+            echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
+            echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
+            echo "- AITER gfx950 + FlyDSL wheel overlay: \`PREBUILD_KERNELS=0 + targeted CKTile prebuild (offline, no compute-node pip)\`"
+            echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
+            echo "- AITER SHA: \`${GITHUB_SHA}\`"
+            echo "- Upstream case: \`${CASE_NAME}\`"
+            echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
+            echo "- IMAGE: \`${BASE_IMAGE}\`"
+            echo "- VLLM_ROUTER_IMAGE: \`${VLLM_ROUTER_IMAGE}\`"
+            echo "- SPUR_NODE_POOL: \`${SPUR_NODE_POOL}\`"
+            echo "- SPUR_NODE_EXCLUDE: \`${SPUR_NODE_EXCLUDE}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Submit and monitor vLLM disagg Slurm job
+      - name: Run upstream vLLM disagg case
         run: |
           set -euo pipefail
-          workdir="vllm/.buildkite/amd-disagg"
-          if [[ ! -d "${workdir}" ]]; then
-            echo "Missing ${workdir}" >&2
-            exit 1
-          fi
-          cd "${workdir}"
+          disagg_dir="${GITHUB_WORKSPACE}/vllm/.buildkite/amd-disagg"
+          cd "${disagg_dir}"
 
-          script="${SLURM_SCRIPT}"
-          if [[ ! -f "${script}" ]]; then
-            for candidate in run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
-              if [[ -f "${candidate}" ]]; then
-                echo "Requested Slurm script ${script} not found; using ${candidate}"
-                script="${candidate}"
-                break
-              fi
-            done
-          fi
-          if [[ ! -f "${script}" ]]; then
-            echo "No run_xPyD disagg Slurm script found under ${PWD}" >&2
-            find . -maxdepth 2 -type f | sort >&2
-            exit 1
+          script="run-slurm-disagg-test.sh"
+          job_script="run_xPyD_disagg.slurm"
+          test -f "${script}"
+          test -f "${job_script}"
+
+          # Restrict scheduling to the AITER MI350 pool and let Slurm choose
+          # any currently available nodes. This allows independent matrix jobs
+          # to run concurrently without racing on a preselected nodelist.
+          if [[ -n "${SPUR_NODE_EXCLUDE}" ]] && ! grep -q '^#SBATCH --exclude=' "${job_script}"; then
+            sed -i "/^#SBATCH --exclusive/a #SBATCH --exclude=${SPUR_NODE_EXCLUDE}" "${job_script}"
+            echo "Restricted Slurm scheduling to SPUR_NODE_POOL=${SPUR_NODE_POOL}"
           fi
 
-          log_root="${DISAGG_SCRIPTS_STAGE%/}"
-          mkdir -p "${DISAGG_SCRIPTS_STAGE}" "${log_root}"
-          # run_xPyD_disagg.slurm bind-mounts DISAGG_SCRIPTS_DIR into the container
-          # at /vllm-workspace/.buildkite/amd-disagg and runs vllm_disagg.sh from
-          # there. The runner checkout is login-node-local (invisible to compute
-          # nodes), and Spur sets SLURM_SUBMIT_DIR=/tmp, so stage the scripts into
-          # the compute-visible shared dir and point DISAGG_SCRIPTS_DIR at it.
-          echo "Staging disagg scripts from ${PWD} to ${DISAGG_SCRIPTS_STAGE}"
-          cp -rf ./. "${DISAGG_SCRIPTS_STAGE}/"
-          proxy_src="../../examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py"
-          if [[ ! -f "${proxy_src}" ]]; then
-            echo "Missing MoRIIO toy proxy script: ${proxy_src}" >&2
-            exit 1
-          fi
-          cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
-          squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
-          : > "${squeue_log}"
-          : > "${sacct_log}"
+          log_root="${DISAGG_SCRIPTS_STAGE%/}"
+          mkdir -p "${log_root}"
+          # Self-hosted runners keep their workspace between jobs. Clear stale
+          # submit/accounting files before the live-log thread looks for a job ID.
+          rm -f "${submit_log}" "${sacct_log}"
 
-          # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
-          # resource flags (--nodelist/--nodes/--ntasks/--gres/...), but in-script
-          # #SBATCH directives ARE honored (proven pattern: ATOM pd_submit.sh
-          # writes #SBATCH --nodelist into the submitted script + bare sbatch).
-          # So pin nodes by injecting an in-script #SBATCH --nodelist rather than
-          # passing it on the CLI; the rest stays in the script's own #SBATCH
-          # (nodes=2, ntasks-per-node=1, gres=gpu:8, exclusive).
-          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${script}"; then
-            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${script}"
-            echo "Pinned nodes via in-script directive: #SBATCH --nodelist=${SPUR_NODELIST}"
-          fi
-          sbatch_args=()
+          cd "${GITHUB_WORKSPACE}/vllm"
+          echo "Running vLLM Buildkite #17 baseline case: ${CASE_NAME}"
+          echo "${UPSTREAM_CASE_COMMAND}"
 
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
-          LOG_ROOT="${log_root}" \
-            MODEL_NAME="${MODEL_NAME}" \
-            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
-            DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
-            IMAGE="${IMAGE}" \
-            ROUTER_TYPE="${ROUTER_TYPE}" \
-            MORIIO_READ_MODE="${MORIIO_READ_MODE}" \
-            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
-            sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
+          stream_disagg_logs() {
+            local submit_log="$1"
+            local done_file="$2"
+            local log_root="$3"
+            local job_id=""
+            local job_log=""
+            local role_dir=""
+            local logfile=""
+            local tail_pid=""
+            local -A followed=()
+            local -a tail_pids=()
 
-          job_id="$(
-            python3 - "${submit_log}" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          text = Path(sys.argv[1]).read_text(encoding="utf-8")
-          match = re.search(r"Submitted batch job\s+(\d+)", text)
-          if not match:
-              raise SystemExit(f"Could not parse Slurm job id from: {text!r}")
-          print(match.group(1))
-          PY
-          )"
-          echo "Submitted Slurm job ${job_id}"
-          echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
-
-          cancel_slurm_job() {
-            local rc=$?
-            if [[ "${rc}" -ne 0 && -n "${job_id:-}" ]]; then
-              echo "Cancelling Slurm job ${job_id} after workflow rc=${rc}"
-              scancel "${job_id}" || true
-            fi
-            exit "${rc}"
-          }
-          trap cancel_slurm_job EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-
-          deadline=$((SECONDS + WAIT_TIMEOUT_MINUTES * 60))
-          while true; do
-            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            queue_status="$(squeue -h -j "${job_id}" -o "%i|%T|%M|%D|%R" || true)"
-            if [[ -n "${queue_status}" ]]; then
-              echo "${queue_status}" | tee -a "${squeue_log}"
-              if (( SECONDS >= deadline )); then
-                echo "Timed out waiting for Slurm job ${job_id} after ${WAIT_TIMEOUT_MINUTES} minutes" >&2
-                exit 124
-              fi
-              echo "${now} job ${job_id} still running or pending"
-              sleep 60
-            else
-              echo "${now} job ${job_id} no longer appears in squeue" | tee -a "${squeue_log}"
-              break
-            fi
-          done
-
-          if command -v sacct >/dev/null 2>&1; then
-            for _ in 1 2 3 4 5; do
-              sacct -j "${job_id}" \
-                --format=JobID,State,ExitCode,Elapsed,NodeList \
-                | tee "${sacct_log}" || true
-              if awk -v job="${job_id}" '$1 == job { found=1 } END { exit !found }' "${sacct_log}" >/dev/null 2>&1; then
-                break
-              fi
-              sleep 10
+            while [[ ! -f "${done_file}" ]]; do
+              job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || true)"
+              [[ -n "${job_id}" ]] && break
+              sleep 1
             done
 
-            state="$(
-              awk -v job="${job_id}" '$1 == job { print $2; exit }' "${sacct_log}"
-            )"
-            echo "Slurm job ${job_id} final state: ${state:-unknown}"
-            if [[ "${state}" != COMPLETED* ]]; then
-              exit 1
+            if [[ -z "${job_id}" ]]; then
+              job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || true)"
+            fi
+            if [[ -z "${job_id}" ]]; then
+              echo "[live-log] no Slurm job id found; nothing to stream"
+              return 0
+            fi
+
+            job_log="${log_root}/vllm-disagg-pd-${job_id}.log"
+            role_dir="${log_root}/${job_id}"
+            echo "[live-log] Slurm job ${job_id}; watching ${job_log} and ${role_dir}/*.log"
+
+            while [[ ! -f "${done_file}" ]]; do
+              while IFS= read -r -d '' logfile; do
+                if [[ -n "${followed[${logfile}]+x}" ]]; then
+                  continue
+                fi
+                followed["${logfile}"]=1
+                if [[ "$(basename "${logfile}")" == accuracy_*.log ]]; then
+                  echo "[accuracy-live] following ${logfile}"
+                else
+                  echo "[live-log] following ${logfile}"
+                fi
+                tail -n +1 -F -- "${logfile}" &
+                tail_pids+=("$!")
+              done < <(
+                if [[ -f "${job_log}" ]]; then
+                  printf '%s\0' "${job_log}"
+                fi
+                if [[ -d "${role_dir}" ]]; then
+                  find "${role_dir}" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null
+                fi
+              )
+              sleep 5
+            done
+
+            # Give existing followers a moment to flush terminal diagnostics,
+            # then print any log that appeared between the final scan and exit.
+            sleep 2
+            while IFS= read -r -d '' logfile; do
+              if [[ -z "${followed[${logfile}]+x}" ]]; then
+                if [[ "$(basename "${logfile}")" == accuracy_*.log ]]; then
+                  echo "[accuracy-live] final ${logfile}"
+                else
+                  echo "[live-log] final ${logfile}"
+                fi
+                tail -n +1 -- "${logfile}" || true
+              fi
+            done < <(
+              if [[ -f "${job_log}" ]]; then
+                printf '%s\0' "${job_log}"
+              fi
+              if [[ -d "${role_dir}" ]]; then
+                find "${role_dir}" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null
+              fi
+            )
+
+            for tail_pid in "${tail_pids[@]}"; do
+              kill "${tail_pid}" 2>/dev/null || true
+            done
+            for tail_pid in "${tail_pids[@]}"; do
+              wait "${tail_pid}" 2>/dev/null || true
+            done
+            echo "[live-log] stopped streaming Slurm job ${job_id}"
+          }
+
+          stream_done="${GITHUB_WORKSPACE}/.vllm-disagg-stream-done"
+          rm -f "${stream_done}"
+          stream_disagg_logs "${submit_log}" "${stream_done}" "${log_root}" &
+          stream_pid=$!
+
+          set +e
+          env \
+            BUILDKITE_COMMIT="${VLLM_BASELINE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
+            IMAGE="${BASE_IMAGE}" \
+            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
+            DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
+            LOG_ROOT="${log_root}" \
+            CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
+            bash -lc "${UPSTREAM_CASE_COMMAND}" 2>&1 | tee "${submit_log}"
+          wrapper_rc=${PIPESTATUS[0]}
+          touch "${stream_done}"
+          wait "${stream_pid}" || true
+          set -e
+
+          job_id="$(grep -oE 'Submitted batch job[[:space:]]+[0-9]+' "${submit_log}" | grep -oE '[0-9]+' | tail -1 || true)"
+          if [[ -n "${job_id}" ]]; then
+            echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
+            role_dir="${log_root}/${job_id}"
+            job_log="${log_root}/vllm-disagg-pd-${job_id}.log"
+            mapfile -d '' accuracy_logs < <(
+              find "${role_dir}" -maxdepth 1 -type f -name 'accuracy_*.log' -print0 2>/dev/null
+            )
+            if (( ${#accuracy_logs[@]} == 0 )); then
+              echo "[accuracy-result] no accuracy log found under ${role_dir}"
+            else
+              for accuracy_log in "${accuracy_logs[@]}"; do
+                echo "::group::Accuracy result: ${accuracy_log}"
+                grep -ahE 'exact_match|stderr' "${accuracy_log}" | tail -20 || true
+                echo "::endgroup::"
+              done
+            fi
+            echo "::group::Accuracy verdict: Slurm job ${job_id}"
+            grep -ahE '\[vllm_disagg\] (PASS|FAIL|VERDICT):|exact_match' "${job_log}" | tail -20 || true
+            echo "::endgroup::"
+            if command -v sacct >/dev/null 2>&1; then
+              sacct -j "${job_id}" --format=JobID,State,ExitCode,Elapsed,NodeList \
+                | tee "${sacct_log}" || true
             fi
           else
-            echo "sacct is unavailable; submitted job ${job_id} and observed it leave squeue"
+            echo "Could not parse Slurm job id from ${submit_log}" >&2
+            wrapper_rc=1
           fi
 
-      - name: Summarize Slurm result
+          exit "${wrapper_rc}"
+
+      - name: Collect Slurm result
         if: always()
         run: |
           set -euo pipefail
+          rm -f vllm-disagg-job.log
+          job_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
+          if [[ -f "${job_log}" ]]; then
+            cp -f "${job_log}" vllm-disagg-job.log
+          else
+            echo "No job log at ${job_log}; the workload may not have launched."
+          fi
+
+          role_dir=""
+          if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+            role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID}"
+          fi
+          if [[ -n "${role_dir}" && -d "${role_dir}" ]]; then
+            role_artifact_dir="vllm-disagg-role-logs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            mkdir -p "${role_artifact_dir}"
+            find "${role_dir}" -maxdepth 1 -type f -name '*.log' \
+              -exec cp -f --no-preserve=mode,ownership,timestamps {} "${role_artifact_dir}/" \;
+            echo "Copied top-level role logs from ${role_dir}."
+          else
+            echo "No role-log directory for Slurm job ${SLURM_JOB_ID:-unknown}."
+          fi
+
+      - name: Publish case accuracy summary
+        if: always()
+        run: |
+          set -euo pipefail
+          accuracy_line=""
+          if [[ -f vllm-disagg-job.log ]]; then
+            accuracy_line="$(
+              grep -ahE '\[vllm_disagg\] (PASS|FAIL): exact_match=' \
+                vllm-disagg-job.log | tail -1 || true
+            )"
+          fi
+
+          if [[ -z "${accuracy_line}" ]]; then
+            {
+              echo "### ${CASE_NAME} accuracy"
+              echo
+              echo "> No exact_match result was found for this case."
+              echo
+              echo "- Model: \`${MODEL_NAME}\`"
+              echo "- Topology: \`${TOPOLOGY}\`"
+              echo "- Slurm job: \`${SLURM_JOB_ID:-unknown}\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "No exact_match result found in vllm-disagg-job.log." >&2
+            exit 1
+          fi
+
+          result="$(sed -E 's/.*\] (PASS|FAIL):.*/\1/' <<< "${accuracy_line}")"
+          exact_match="$(sed -E 's/.*exact_match=([^[:space:]]+).*/\1/' <<< "${accuracy_line}")"
+          threshold="$(sed -E 's/.*threshold=([^[:space:]]+).*/\1/' <<< "${accuracy_line}")"
           {
+            echo "### ${CASE_NAME} accuracy"
             echo
-            echo "### vLLM disagg smoke result"
-            echo
-            echo "- Model: \`${MODEL_NAME:-unknown}\`"
-            echo "- Image: \`${IMAGE:-unknown}\`"
-            echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
-            if [[ -f slurm-sacct.txt && -n "${SLURM_JOB_ID:-}" ]]; then
-              _row="$(awk -v j="${SLURM_JOB_ID}" '$1==j{print $2, $3, $4; exit}' slurm-sacct.txt || true)"
-              read -r _st _ec _el <<< "${_row}" || true
-              echo "- State: \`${_st:-unknown}\` · ExitCode: \`${_ec:-unknown}\` · Elapsed: \`${_el:-unknown}\`"
-              if [[ "${_ec:-}" == "-1:0" || "${_el:-}" == "00:00:00" ]]; then
-                echo "- ⚠️ Slurm launch failure (NODE_FAIL): the workload never ran — NOT a real pass."
-              fi
-            fi
-            echo
-            _pd_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
-            if [[ -f "${_pd_log}" ]]; then
-              _verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL):' "${_pd_log}" | tail -1 || true)"
-              if [[ -n "${_verdict}" ]]; then
-                echo "#### Accuracy verdict"
-                echo '```text'
-                echo "${_verdict}"
-                echo '```'
-              fi
-              _tbl="$(grep -ahE '^\|' "${_pd_log}" || true)"
-              if [[ -n "${_tbl}" ]]; then
-                echo "#### gsm8k"
-                echo '```text'
-                echo "${_tbl}"
-                echo '```'
-              fi
-            else
-              echo "> No PD log at \`${_pd_log}\` — disagg workload likely never launched."
-            fi
-            echo
-            if [[ -f slurm-submit.txt ]]; then
-              echo "#### sbatch output"
-              echo '```text'
-              cat slurm-submit.txt
-              echo '```'
-            fi
-            if [[ -f slurm-sacct.txt ]]; then
-              echo "#### sacct"
-              echo '```text'
-              cat slurm-sacct.txt
-              echo '```'
-            fi
+            echo "| Field | Result |"
+            echo "| --- | --- |"
+            echo "| Model | \`${MODEL_NAME}\` |"
+            echo "| Topology | \`${TOPOLOGY}\` |"
+            echo "| exact_match | \`${exact_match}\` |"
+            echo "| Threshold | \`${threshold}\` |"
+            echo "| Verdict | **${result}** |"
+            echo "| Slurm job | \`${SLURM_JOB_ID:-unknown}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${result}" != "PASS" ]]; then
+            exit 1
+          fi
 
       - name: Upload vLLM disagg smoke artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-disagg-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          name: vllm-disagg-${{ matrix.case_slug }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
             slurm-submit.txt
-            slurm-squeue.log
             slurm-sacct.txt
+            vllm-disagg-job.log
+            vllm-disagg-role-logs-${{ github.run_id }}-${{ github.run_attempt }}/
