@@ -6,7 +6,8 @@
 # Both single-GPU; no all2all cost. Tuned rows exist only for TP=4 / EP=4.
 #
 # Usage: [TP=4] [EP=4] [TOKENS_TP=64] [TOKENS_EP=2048] [ITERS=128]
-#        [EXPERTS_ACT=0] [LOG=./moe_ubench.log] op_tests/ubench_moe_dsv4_pro.sh
+#        [EXPERTS_ACT=0] [ROTATE=0] [ROTATE_W=4] [LOG=./moe_ubench.log]
+#        op_tests/ubench_moe_dsv4_pro.sh
 
 set -uo pipefail   # no -e: a missed accuracy gate must not kill later runs
 
@@ -20,6 +21,12 @@ CONST_VAL="${CONST_VAL:-0.5}"
 # Experts actually receiving routes. 0 = all (TP: 384, EP: 96 local).
 # Valid range: [topk, experts]; TP also caps at tokens*topk.
 EXPERTS_ACT="${EXPERTS_ACT:-0}"
+# Rotating input buffers (op_tests/ubench_moe_rotate.py): every iteration reads
+# fresh copies, so runs are cache-cold by default. ROTATE: activation buffers,
+# 0 = auto-size past 2x L2. ROTATE_W: weight buffers, ~3GB per copy at TP4.
+# Set either to 1 for the cache-warm (static-buffer) behaviour.
+ROTATE="${ROTATE:-0}"
+ROTATE_W="${ROTATE_W:-4}"
 
 INTER_TP=$((3072 / TP))
 EXPERTS_EP=$((384 / EP))
@@ -30,6 +37,7 @@ LOG="${LOG:-$PWD/moe_ubench.log}"
 
 cd "$AITER_DIR" || exit 1
 
+export ROTATE ROTATE_W
 export AITER_MOE_EXPERT_BALANCE=true   # TP bench only; test_moe_ep ignores it
 export AITER_MOE_NUM_EXPERT_ACTIVATED="$EXPERTS_ACT"  # overrides EXPERT_BALANCE when >0
 export AITER_LOG_MORE=1
@@ -41,19 +49,19 @@ export FLYDSL_DUMP_IR=0                # redundant: default
 # AITER_GROUPED_GEMM_AS_PROLOGUE, AITER_GROUPED_GEMM_NAIVE,
 # WEIGHT_SCALE_OP_SEL, --layout, --wst are deprecated
 
-echo "== DSv4-Pro MoE ubench | TP=$TP EP=$EP iters=$ITERS | tokens TP=$TOKENS_TP EP=$TOKENS_EP | experts_act=$EXPERTS_ACT"
+echo "== DSv4-Pro MoE ubench | TP=$TP EP=$EP iters=$ITERS | tokens TP=$TOKENS_TP EP=$TOKENS_EP | experts_act=$EXPERTS_ACT | rotate=$ROTATE/w$ROTATE_W"
 
 echo
 
 echo "##### [1/8] e2e TP$TP 7168/$INTER_TP/384/topk6 a8w4 silu -- RAND #####" | tee -a "$LOG"
-python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_flydsl_grouped_gemm_gfx1250.py \
   --scenario bench --data-format a8w4 --act silu \
   --model-dim 7168 --inter-dim "$INTER_TP" --experts 384 --topk 6 \
   --iters "$ITERS" --no-check-aot-cache --no-bias --tokens $TOKENS_TP | tee -a "$LOG"
 
 echo
 echo "##### [2/8] e2e TP$TP 7168/$INTER_TP/384/topk6 a8w4 silu -- CONST $CONST_VAL #####" | tee -a "$LOG"
-python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_flydsl_grouped_gemm_gfx1250.py \
   --scenario bench --data-format a8w4 --act silu \
   --model-dim 7168 --inter-dim "$INTER_TP" --experts 384 --topk 6 \
   --iters "$ITERS" --no-check-aot-cache --no-bias --tokens $TOKENS_TP --const-init "$CONST_VAL" | tee -a "$LOG"
@@ -61,13 +69,13 @@ python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
 # -e is global experts, -ep divides it; -m is per-rank M in fake mode.
 echo
 echo "##### [3/8] e2e EP$EP 7168/3072/$EXPERTS_EP local/topk6 -- RAND #####" | tee -a "$LOG"
-python3 -u op_tests/test_moe_ep.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_moe_ep.py \
   -t g1u1_a8w4_mxfp4 -hd 7168 -id 3072 -e 384 -k 6 -ep "$EP" \
   --ep-mode fake -m $TOKENS_EP | tee -a "$LOG"
 
 echo
 echo "##### [4/8] e2e EP$EP 7168/3072/$EXPERTS_EP local/topk6 -- CONST $CONST_VAL #####" | tee -a "$LOG"
-python3 -u op_tests/test_moe_ep.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_moe_ep.py \
   -t g1u1_a8w4_mxfp4 -hd 7168 -id 3072 -e 384 -k 6 -ep "$EP" \
   --ep-mode fake -m $TOKENS_EP --const-init "$CONST_VAL" | tee -a "$LOG"
 
@@ -76,27 +84,27 @@ python3 -u op_tests/test_moe_ep.py \
 # AITER_EP_KERNEL_BENCH=1 for EP (which replaces the e2e us with gemm1+gemm2).
 echo
 echo "##### [5/8] kernel TP$TP MoE1/MoE2 -- RAND #####" | tee -a "$LOG"
-python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_flydsl_grouped_gemm_gfx1250.py \
   --scenario kernel --data-format a8w4 --act silu \
   --model-dim 7168 --inter-dim "$INTER_TP" --experts 384 --topk 6 \
   --iters "$ITERS" --no-check-aot-cache --no-bias --tokens $TOKENS_TP | tee -a "$LOG"
 
 echo
 echo "##### [6/8] kernel TP$TP MoE1/MoE2 -- CONST $CONST_VAL #####" | tee -a "$LOG"
-python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
+python3 -u op_tests/ubench_moe_rotate.py op_tests/test_flydsl_grouped_gemm_gfx1250.py \
   --scenario kernel --data-format a8w4 --act silu \
   --model-dim 7168 --inter-dim "$INTER_TP" --experts 384 --topk 6 \
   --iters "$ITERS" --no-check-aot-cache --no-bias --tokens $TOKENS_TP --const-init "$CONST_VAL" | tee -a "$LOG"
 
 echo
 echo "##### [7/8] kernel EP$EP MoE1/MoE2 -- RAND #####" | tee -a "$LOG"
-AITER_EP_KERNEL_BENCH=1 python3 -u op_tests/test_moe_ep.py \
+AITER_EP_KERNEL_BENCH=1 python3 -u op_tests/ubench_moe_rotate.py op_tests/test_moe_ep.py \
   -t g1u1_a8w4_mxfp4 -hd 7168 -id 3072 -e 384 -k 6 -ep "$EP" \
   --ep-mode fake -m $TOKENS_EP | tee -a "$LOG"
 
 echo
 echo "##### [8/8] kernel EP$EP MoE1/MoE2 -- CONST $CONST_VAL #####" | tee -a "$LOG"
-AITER_EP_KERNEL_BENCH=1 python3 -u op_tests/test_moe_ep.py \
+AITER_EP_KERNEL_BENCH=1 python3 -u op_tests/ubench_moe_rotate.py op_tests/test_moe_ep.py \
   -t g1u1_a8w4_mxfp4 -hd 7168 -id 3072 -e 384 -k 6 -ep "$EP" \
   --ep-mode fake -m $TOKENS_EP --const-init "$CONST_VAL" | tee -a "$LOG"
 
@@ -166,7 +174,7 @@ PYEOF
 
 # Optional: same EP shape via the TP harness (no expert_mask) to isolate
 # masked-routing overhead from the grouped GEMM.
-# python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
+# python3 -u op_tests/ubench_moe_rotate.py op_tests/test_flydsl_grouped_gemm_gfx1250.py \
 #   --scenario bench --data-format a8w4 --act silu \
 #   --model-dim 7168 --inter-dim 3072 --experts "$EXPERTS_EP" --topk 6 \
 #   --iters "$ITERS" --no-check-aot-cache --tokens $TOKENS_EP
