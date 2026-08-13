@@ -29,6 +29,7 @@ dropped-slot marker (dest PE == npes); "tis" = recv-slot -> source-token map.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -140,7 +141,9 @@ def _make_dispatch(
             if lane == 0:
                 if dup_ballot == 0:
                     peer_tok_off = fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
-                    dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
+                    dest_tok_lane0 = comm_ops.atomic_add_system(
+                        peer_tok_off, fx.Int32(1)
+                    )
             dest_tok_id = readlane(T.i32, dest_tok_lane0, 0)
             overflow = dest_tok_id >= max_recv
             is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
@@ -167,7 +170,7 @@ def _make_dispatch(
                     dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                         dest_pe
                     ) * fx.Int64(4)
-                    P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
+                    comm_ops.atomic_add_system(dest_ctr_addr, fx.Int32(1))
 
             # Per-lane (weight, expert-idx) scatter (lanes < k).
             if lane < experts_per_token:
@@ -253,7 +256,7 @@ def _make_dispatch(
         P.waitcnt_all()
         fx.barrier()
         if tid == 0:
-            P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
+            comm_ops.atomic_add_system(fx.Int64(addr_disp_bar), arith.constant(1))
 
         local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
         for dest_pe in range(lane, npes, WAVE):
@@ -266,7 +269,7 @@ def _make_dispatch(
                 peer_recv_num = fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
                 recv_num_remote_addr = peer_recv_num + fx.Int64(rank) * fx.Int64(4)
                 P.spin_until_eq_i32(recv_num_remote_addr, 0)
-                P.store_i32_system(
+                comm_ops.store_i32_system(
                     recv_num_remote_addr, arith.constant(0), signal_value
                 )
 
@@ -276,16 +279,18 @@ def _make_dispatch(
                 recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
                 signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
                 peer_recv_count = signal_value - 1
-                P.store_i32_system(
+                comm_ops.store_i32_system(
                     recv_num_src_addr, arith.constant(0), arith.constant(0)
                 )
-                P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
+                comm_ops.atomic_add_system(fx.Int64(addr_total_recv), peer_recv_count)
                 buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
 
         if global_warp_id == 0:
             if lane == 0:
                 local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
-                P.store_i32_system(local_tok_off, arith.constant(0), arith.constant(0))
+                comm_ops.store_i32_system(
+                    local_tok_off, arith.constant(0), arith.constant(0)
+                )
 
     @flyc.jit
     def run(
