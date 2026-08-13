@@ -585,29 +585,39 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         }
     };
 
-    // Each call moves 16 routes: every one of the eight waves owns one row
-    // pair, and lane halves select the first/second row.  Two calls therefore
-    // fill one 32-route half-stage without any VGPR payload or ds_write.
-    auto async_load_pair = [&](int stage, int pair, int buf) {
-        if constexpr(PAIR_DIRECT_TO_LDS)
-        {
-            const int row_in_stage = pair * 16 + warp * 2 + (lane >> 5);
-            const int feature = (lane & 31) * 8;
-            const int pair_in_stage = pair * 8 + scalar_warp;
-            void* a_dst = reinterpret_cast<void*>(&As[buf][pair_in_stage][0]);
-            void* b_dst = reinterpret_cast<void*>(&Bs[buf][pair_in_stage][0]);
-            g_dy.template async_load<8>(
-                a_dst, (stage * BK + row_in_stage) * P + feature);
-            g_a.template async_load<8>(
-                b_dst, (stage * BK + row_in_stage) * Q + feature);
-        }
-    };
+    // Each wave owns four consecutive row pairs so its Direct-to-LDS writes
+    // stay in one contiguous LDS region.  Reuse one wave-uniform destination
+    // base and select pairs with the MUBUF immediate; that immediate advances
+    // both VMEM and LDS, hence the matching subtraction from each vaddr.
     auto async_load_half = [&](auto half_tag, int stage, int buf) {
         if constexpr(PAIR_DIRECT_TO_LDS)
         {
             constexpr int HALF = decltype(half_tag)::value;
-            async_load_pair(stage, HALF * 2, buf);
-            async_load_pair(stage, HALF * 2 + 1, buf);
+            constexpr int PAIR0 = HALF * 2;
+            constexpr int PAIR1 = PAIR0 + 1;
+            constexpr int OFF0 = PAIR0 * PAIR_LD * sizeof(__bf16);
+            constexpr int OFF1 = PAIR1 * PAIR_LD * sizeof(__bf16);
+            static_assert(OFF1 < 4096);
+            const int lane_row = lane >> 5;
+            const int feature = (lane & 31) * 8;
+            const int row0 = warp * 8 + PAIR0 * 2 + lane_row;
+            const int row1 = warp * 8 + PAIR1 * 2 + lane_row;
+            void* a_dst = reinterpret_cast<void*>(
+                &As[buf][scalar_warp * 4][0]);
+            void* b_dst = reinterpret_cast<void*>(
+                &Bs[buf][scalar_warp * 4][0]);
+            g_dy.template async_load<8, OFF0>(
+                a_dst,
+                (stage * BK + row0) * P + feature - OFF0 / sizeof(__bf16));
+            g_a.template async_load<8, OFF0>(
+                b_dst,
+                (stage * BK + row0) * Q + feature - OFF0 / sizeof(__bf16));
+            g_dy.template async_load<8, OFF1>(
+                a_dst,
+                (stage * BK + row1) * P + feature - OFF1 / sizeof(__bf16));
+            g_a.template async_load<8, OFF1>(
+                b_dst,
+                (stage * BK + row1) * Q + feature - OFF1 / sizeof(__bf16));
         }
     };
 
