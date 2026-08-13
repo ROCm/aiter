@@ -45,10 +45,12 @@ try:
             SPLIT_K_SEMAPHORE_MAX_LEN,
             flydsl_hgemm,
             flydsl_small_m_hgemm,
-            gemm_decode_bf16_configured,
-            gemm_decode_kernel_name,
+            gemm_decode_bf16,
             get_flydsl_splitk_hgemm_kernels,
             iter_gemm_decode_configs,
+        )
+        from aiter.ops.flydsl.kernels.gemm_decode_common import (
+            gemm_decode_kernel_name,
         )
         from aiter.ops.flydsl.kernels.small_m_hgemm import (
             SMALL_M_SUPPORTED_ARCHS,
@@ -57,7 +59,6 @@ try:
         )
 
         FLYDSL_SMALL_M_SUPPORTED_ARCHS = SMALL_M_SUPPORTED_ARCHS
-        import flydsl.expr as fx
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
@@ -65,7 +66,7 @@ except ImportError as exc:
     flydsl_small_m_hgemm = None
     SPLIT_K_SEMAPHORE_MAX_LEN = 256
     get_flydsl_splitk_hgemm_kernels = None
-    gemm_decode_bf16_configured = None
+    gemm_decode_bf16 = None
     gemm_decode_kernel_name = None
     iter_gemm_decode_configs = None
     iter_small_m_registry_configs = None
@@ -591,9 +592,9 @@ _flydsl_decode_graphs = {}
 FLYDSL_DECODE_TUNE_GRAPH_REPEATS = 10
 
 
-def run_flydsl_decode_bf16(input, weight, output, otype, arch, config):
+def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
     """Run one exact-shape unified decode candidate for the shared tuner."""
-    if gemm_decode_bf16_configured is None:
+    if gemm_decode_bf16 is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if otype != dtypes.bf16:
         raise ValueError("FlyDSL decode candidates require BF16 output")
@@ -603,6 +604,7 @@ def run_flydsl_decode_bf16(input, weight, output, otype, arch, config):
         input.data_ptr(),
         weight.data_ptr(),
         output.data_ptr(),
+        None if bias is None else bias.data_ptr(),
         arch,
         m,
         n,
@@ -618,31 +620,25 @@ def run_flydsl_decode_bf16(input, weight, output, otype, arch, config):
         current = torch.cuda.current_stream()
         stream = torch.cuda.Stream()
         stream.wait_stream(current)
-        gemm_decode_bf16_configured(
+        gemm_decode_bf16(
             input,
             weight,
             output,
-            m,
-            n,
-            k,
             config,
-            fx.Stream(stream),
-            arch=arch,
+            bias=bias,
+            stream=stream,
         )
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             for _ in range(FLYDSL_DECODE_TUNE_GRAPH_REPEATS):
-                gemm_decode_bf16_configured(
+                gemm_decode_bf16(
                     input,
                     weight,
                     output,
-                    m,
-                    n,
-                    k,
                     config,
-                    fx.Stream(stream),
-                    arch=arch,
+                    bias=bias,
+                    stream=stream,
                 )
         current.wait_stream(stream)
         _flydsl_decode_graphs[key] = graph
@@ -1128,7 +1124,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         if (
-            gemm_decode_bf16_configured is None
+            gemm_decode_bf16 is None
             or iter_gemm_decode_configs is None
             or gemm_decode_kernel_name is None
         ):
@@ -1137,7 +1133,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
         M, N, K = map(int, info_keys[2:5])
         if (
             not 1 <= M <= 5
-            or has_bias
             or scaleAB
             or is_shuffle
             or indtype != dtypes.bf16
@@ -1166,7 +1161,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
         for solidx, config in enumerate(
             iter_gemm_decode_configs(M, N, K, arch, num_cus=int(info_keys[1]))
         ):
-            kernel_name = gemm_decode_kernel_name(arch, M, N, K, config)
+            kernel_name = gemm_decode_kernel_name(
+                arch,
+                M,
+                N,
+                K,
+                config,
+                has_bias=has_bias,
+            )
             info = (
                 info_keys,
                 solidx,
@@ -1179,9 +1181,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 (
                     info,
                     generate_data,
-                    (M, N, K, indtype, outdtype, False, False, 0, False),
+                    (M, N, K, indtype, outdtype, False, False, 0, has_bias),
                     run_flydsl_decode_bf16,
-                    (["inp", "weights", "out_asm"], outdtype, arch, config),
+                    (
+                        ["inp", "weights", "out_asm", "bias"],
+                        outdtype,
+                        arch,
+                        config,
+                    ),
                     decode_run_kwargs,
                     get_gemm_ref,
                     (

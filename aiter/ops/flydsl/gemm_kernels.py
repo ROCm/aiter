@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass
 from itertools import product
 
 import flydsl.expr as fx
@@ -20,8 +19,8 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
+from .kernels.gemm_decode_block_mfma import compile_gemm_decode_block_mfma_bf16
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from .kernels.small_m_hgemm import LDS_STAGING_DIRECT
 from .kernels.gemm_decode_common import (
     ActivationSource,
     BlockMfmaDecodeConfig,
@@ -32,12 +31,11 @@ from .kernels.gemm_decode_common import (
     OutputRounding,
     ReductionMode,
     WaveDecodeConfig,
-    conservative_wave_config,
-    gemm_decode_kernel_name,
     get_decode_arch_traits,
     iter_gemm_decode_configs,
-    parse_gemm_decode_kernel_name,
 )
+from .kernels.gemm_decode_wave import compile_gemm_decode_wave_bf16
+from .kernels.small_m_hgemm import LDS_STAGING_DIRECT
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
@@ -55,13 +53,8 @@ __all__ = [
     "flydsl_hgemm",
     "flydsl_small_m_hgemm",
     "gemm_decode_bf16",
-    "gemm_decode_bf16_configured",
-    "gemm_decode_kernel_name",
     "get_decode_arch_traits",
-    "get_gemm_decode_bf16",
     "iter_gemm_decode_configs",
-    "launch_gemm_decode_kernel_name",
-    "parse_gemm_decode_kernel_name",
 ]
 
 
@@ -212,6 +205,25 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _validate_hgemm_bias(
+    a: torch.Tensor,
+    bias: torch.Tensor | None,
+    n: int,
+) -> None:
+    if bias is None:
+        return
+    if bias.dim() != 1:
+        raise ValueError(f"`bias` must be 1D, got bias.dim={bias.dim()}")
+    if bias.shape != (n,):
+        raise ValueError(f"`bias` must have shape {(n,)}, got {tuple(bias.shape)}")
+    if bias.dtype != a.dtype:
+        raise ValueError(
+            f"`bias` dtype must match input dtype, got {bias.dtype=} {a.dtype=}"
+        )
+    if bias.device != a.device:
+        raise ValueError(f"`bias` must be on {a.device}, got {bias.device}")
+
+
 def _hgemm_tile_m_options(m: int | None) -> tuple[int, ...]:
     if m is None:
         return HGEMM_TILE_M_OPTIONS
@@ -292,17 +304,7 @@ def _validate_hgemm_inputs(
         if not out.is_contiguous():
             raise ValueError("`out` must be contiguous")
 
-    if bias is not None:
-        if bias.dim() != 1:
-            raise ValueError(f"`bias` must be 1D, got bias.dim={bias.dim()}")
-        if bias.shape != (n,):
-            raise ValueError(f"`bias` must have shape {(n,)}, got {tuple(bias.shape)}")
-        if bias.dtype != a.dtype:
-            raise ValueError(
-                f"`bias` dtype must match input dtype, got {bias.dtype=} {a.dtype=}"
-            )
-        if bias.device != a.device:
-            raise ValueError(f"`bias` must be on {a.device}, got {bias.device}")
+    _validate_hgemm_bias(a, bias, n)
 
     return m, n, k
 
@@ -1003,38 +1005,12 @@ def flydsl_small_m_hgemm(
 # Public BF16 decode GEMM runtime
 # ---------------------------------------------------------------------------
 
-_decode_wave_compile_fn = None
-_decode_block_mfma_compile_fn = None
-
-
-def _get_decode_wave_compile_fn():
-    """Lazy-load the Wave policy compiler on the first decode compile."""
-    global _decode_wave_compile_fn
-    if _decode_wave_compile_fn is None:
-        from .kernels.gemm_decode_wave import compile_gemm_decode_wave_bf16
-
-        _decode_wave_compile_fn = compile_gemm_decode_wave_bf16
-    return _decode_wave_compile_fn
-
-
-def _get_decode_block_mfma_compile_fn():
-    """Lazy-load the BlockMFMA policy compiler on the first decode compile."""
-    global _decode_block_mfma_compile_fn
-    if _decode_block_mfma_compile_fn is None:
-        from .kernels.gemm_decode_block_mfma import (
-            compile_gemm_decode_block_mfma_bf16,
-        )
-
-        _decode_block_mfma_compile_fn = compile_gemm_decode_block_mfma_bf16
-    return _decode_block_mfma_compile_fn
-
-
-def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
-    begin = tensor.data_ptr()
-    return begin, begin + tensor.numel() * tensor.element_size()
-
-
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Check if two tensors overlap in memory."""
+    def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
+        begin = tensor.data_ptr()
+        return begin, begin + tensor.numel() * tensor.element_size()
+
     lhs_begin, lhs_end = _storage_range(lhs)
     rhs_begin, rhs_end = _storage_range(rhs)
     return lhs_begin < rhs_end and rhs_begin < lhs_end
@@ -1044,11 +1020,9 @@ def validate_gemm_decode_tensors(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    M: int,
-    N: int,
-    K: int,
+    bias: torch.Tensor | None = None,
     arch: str | None = None,
-) -> None:
+) -> tuple[int, int, int]:
     """Validate the packed real-tensor ABI shared by both kernel families."""
     tensors = {"A": A, "B": B, "C": C}
     for name, tensor in tensors.items():
@@ -1061,15 +1035,20 @@ def validate_gemm_decode_tensors(
         if tensor.device.type != "cuda":
             raise ValueError(f"{name} must be on a CUDA/ROCm device")
 
-    if not (1 <= M <= 5):
+    m, k = A.shape
+    n, b_k = B.shape
+    if not (1 <= m <= 5):
         raise ValueError("decode GEMM supports exact M in [1, 5]")
-    if N <= 0 or K <= 0:
+    if n <= 0 or k <= 0:
         raise ValueError("decode GEMM requires positive N and K")
+    if b_k != k:
+        raise ValueError(f"B must have shape ({n}, {k}), got {tuple(B.shape)}")
     if A.device != B.device or A.device != C.device:
         raise ValueError("A, B, and C must be on the same device")
+    _validate_hgemm_bias(A, bias, n)
 
-    expected_shapes = {"A": (M, K), "B": (N, K), "C": (M, N)}
-    expected_strides = {"A": (K, 1), "B": (K, 1), "C": (N, 1)}
+    expected_shapes = {"A": (m, k), "B": (n, k), "C": (m, n)}
+    expected_strides = {"A": (k, 1), "B": (k, 1), "C": (n, 1)}
     for name, tensor in tensors.items():
         if tuple(tensor.shape) != expected_shapes[name]:
             raise ValueError(
@@ -1084,6 +1063,7 @@ def validate_gemm_decode_tensors(
     gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):
         raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")
+    return m, n, k
 
 
 def compile_gemm_decode_bf16(
@@ -1094,251 +1074,64 @@ def compile_gemm_decode_bf16(
     *,
     arch: str,
     num_cus: int | None = None,
+    has_bias: bool = False,
 ):
     """Compile one exact unified ``(arch, M, N, K, config)`` identity."""
     config.validate(m=m, n=n, k=k, arch=arch)
     if isinstance(config, WaveDecodeConfig):
-        return _get_decode_wave_compile_fn()(
+        return compile_gemm_decode_wave_bf16(
             m,
             n,
             k,
             config,
             arch,
+            has_bias=has_bias,
         )
     if isinstance(config, BlockMfmaDecodeConfig):
-        return _get_decode_block_mfma_compile_fn()(
+        return compile_gemm_decode_block_mfma_bf16(
             m,
             n,
             k,
             config,
             arch,
             num_cus=num_cus,
+            has_bias=has_bias,
         )
     raise TypeError(f"unsupported decode config type: {type(config).__name__}")
-
-
-def _validate_bias(
-    bias: torch.Tensor | None,
-    *,
-    output: torch.Tensor,
-    n: int,
-) -> None:
-    if bias is None:
-        return
-    if not isinstance(bias, torch.Tensor):
-        raise TypeError("bias must be a torch.Tensor")
-    if bias.shape != (n,):
-        raise ValueError(f"bias must have shape {(n,)}, got {tuple(bias.shape)}")
-    if bias.dtype != torch.bfloat16:
-        raise ValueError("bias must have dtype torch.bfloat16")
-    if bias.device != output.device:
-        raise ValueError(f"bias must be on {output.device}, got {bias.device}")
-    if not bias.is_contiguous():
-        raise ValueError("bias must be contiguous")
-
-
-@dataclass(frozen=True)
-class _ExecutionStream:
-    flydsl: fx.Stream
-    torch: torch.cuda.Stream | None
-
-
-def _resolve_execution_stream(
-    stream,
-    *,
-    device: torch.device,
-    bias_requested: bool,
-) -> _ExecutionStream:
-    """Resolve one queue for both the kernel and optional PyTorch bias op."""
-    value = stream.value if isinstance(stream, fx.Stream) else stream
-    if value is None:
-        torch_stream = torch.cuda.current_stream(device=device)
-        return _ExecutionStream(fx.Stream(torch_stream), torch_stream)
-
-    if isinstance(value, torch.cuda.Stream):
-        if value.device != device:
-            raise ValueError(
-                f"stream must be on {device}, got {value.device}"
-            )
-        return _ExecutionStream(fx.Stream(value), value)
-
-    if not isinstance(value, int) and hasattr(value, "cuda_stream"):
-        stream_device = getattr(value, "device", device)
-        if torch.device(stream_device) != device:
-            raise ValueError(
-                f"stream must be on {device}, got {stream_device}"
-            )
-        value = int(value.cuda_stream)
-
-    if isinstance(value, int):
-        if value < 0:
-            raise ValueError("raw stream pointer must be non-negative")
-        if value == 0:
-            if bias_requested:
-                raise ValueError(
-                    "bias cannot use raw stream 0 because PyTorch cannot "
-                    "safely wrap the HIP default-stream sentinel"
-                )
-            return _ExecutionStream(fx.Stream(0), None)
-        try:
-            torch_stream = torch.cuda.ExternalStream(value, device=device)
-        except Exception as error:
-            raise ValueError(
-                f"invalid raw stream pointer for {device}: {value}"
-            ) from error
-        return _ExecutionStream(fx.Stream(torch_stream), torch_stream)
-
-    raise TypeError(
-        "stream must be None, a torch.cuda.Stream, a non-negative raw "
-        "pointer, or fx.Stream wrapping one of those representations"
-    )
-
-
-def _apply_bias(
-    output: torch.Tensor,
-    bias: torch.Tensor | None,
-    stream: _ExecutionStream,
-) -> None:
-    if bias is None:
-        return
-    assert stream.torch is not None
-    with torch.cuda.stream(stream.torch):
-        output.add_(bias)
-
-
-def gemm_decode_bf16_configured(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    M: int,
-    N: int,
-    K: int,
-    config: DecodeConfig,
-    stream: fx.Stream = fx.Stream(None),
-    *,
-    arch: str | None = None,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Launch one explicit unified Wave/BlockMFMA configuration."""
-    runtime_arch = get_gfx_runtime()
-    if arch is not None and arch != runtime_arch:
-        raise ValueError(
-            f"explicit decode arch {arch} does not match runtime architecture "
-            f"{runtime_arch}; use compile_gemm_decode_bf16 for compile-only/AOT"
-        )
-    validate_gemm_decode_tensors(A, B, C, M, N, K, arch=runtime_arch)
-    _validate_bias(bias, output=C, n=N)
-    execution_stream = _resolve_execution_stream(
-        stream,
-        device=A.device,
-        bias_requested=bias is not None,
-    )
-    launcher = compile_gemm_decode_bf16(
-        M,
-        N,
-        K,
-        config,
-        arch=runtime_arch,
-        num_cus=get_cu_num(),
-    )
-    launcher(A, B, C, stream=execution_stream.flydsl)
-    _apply_bias(C, bias, execution_stream)
-    return C
 
 
 def gemm_decode_bf16(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    M: int,
-    N: int,
-    K: int,
-    stream: fx.Stream = fx.Stream(None),
+    config: DecodeConfig,
+    stream: torch.cuda.Stream | None = None,
     *,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Launch the deterministic legal unified default for exact M in [1, 5].
-
-    Tuned callers should launch their exact stable kernel name. This generic
-    API intentionally uses one legality-first Wave configuration rather than a
-    second shape heuristic. M > 5 is outside the decode family contract.
-    """
-    arch = get_gfx_runtime()
-    config = conservative_wave_config(M, N, K, arch)
-    return gemm_decode_bf16_configured(
-        A,
-        B,
-        C,
-        M,
-        N,
-        K,
-        config,
-        stream,
-        arch=arch,
-        bias=bias,
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def get_gemm_decode_bf16(config: DecodeConfig | None = None):
-    """Return a stable public launcher for a unified config or default path."""
-
-    def launch(A, B, C, M, N, K, stream=fx.Stream(None), *, bias=None):
-        if config is None:
-            return gemm_decode_bf16(
-                A,
-                B,
-                C,
-                M,
-                N,
-                K,
-                stream,
-                bias=bias,
-            )
-        return gemm_decode_bf16_configured(
-            A,
-            B,
-            C,
-            M,
-            N,
-            K,
-            config,
-            stream,
-            bias=bias,
-        )
-
-    return launch
-
-
-def launch_gemm_decode_kernel_name(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    kernel_name: str,
-    stream: fx.Stream = fx.Stream(None),
-    *,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Parse and launch one stable unified tuned-kernel identity."""
-    arch, m, n, k, config = parse_gemm_decode_kernel_name(kernel_name)
+    """Launch one Wave or BlockMFMA configuration for the inferred exact shape."""
     runtime_arch = get_gfx_runtime()
-    if runtime_arch != arch:
-        raise ValueError(
-            f"decode kernel {kernel_name!r} targets {arch}, "
-            f"but the runtime device is {runtime_arch}"
-        )
-    return gemm_decode_bf16_configured(
+    m, n, k = validate_gemm_decode_tensors(
         A,
         B,
         C,
+        bias=bias,
+        arch=runtime_arch,
+    )
+    if bias is not None and not bias.is_contiguous():
+        raise ValueError("bias must be contiguous")
+    launch_stream = _normalize_launch_stream(A.device, stream)
+    launcher = compile_gemm_decode_bf16(
         m,
         n,
         k,
         config,
-        stream,
-        arch=arch,
-        bias=bias,
+        arch=runtime_arch,
+        num_cus=get_cu_num(),
+        has_bias=bias is not None,
     )
+    launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
+    return C
 
 
 # ---------------------------------------------------------------------------

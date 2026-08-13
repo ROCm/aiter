@@ -57,6 +57,8 @@ from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     compile_gemm_decode_bf16,
     get_flydsl_splitk_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.kernels.gemm_decode_common import (
     parse_gemm_decode_kernel_name,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
@@ -172,7 +174,7 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
     k = int(row["K"])
     cu_num = int(row["cu_num"])
     csv_arch = row["gfx"].strip()
-    name_arch, name_m, name_n, name_k, config = (
+    name_arch, name_m, name_n, name_k, config, name_has_bias = (
         parse_gemm_decode_kernel_name(kernel_name)
     )
     if (name_m, name_n, name_k) != (m, n, k):
@@ -191,8 +193,11 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
             "FlyDSL decode architecture metadata mismatch: "
             f"name={name_arch}, csv={csv_arch}, cu_num={cu_num} ({cu_arch})"
         )
-    if _parse_bool(row["bias"]):
-        raise ValueError("FlyDSL decode AOT does not support bias")
+    has_bias = _parse_bool(row["bias"])
+    if name_has_bias != has_bias:
+        raise ValueError(
+            "FlyDSL decode CSV bias metadata does not match kernel name"
+        )
     if row["dtype"].strip() != "torch.bfloat16":
         raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
     if row["outdtype"].strip() != "torch.bfloat16":
@@ -210,7 +215,7 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
         "k": k,
         "cu_num": cu_num,
         "gfx": csv_arch,
-        "has_bias": False,
+        "has_bias": has_bias,
     }
 
 
@@ -669,17 +674,23 @@ def _compile_decode_to_cache(
     **kwargs,
 ) -> None:
     del kwargs
-    if has_bias:
-        raise ValueError("FlyDSL decode AOT does not support bias")
-    name_arch, name_m, name_n, name_k, name_config = (
+    name_arch, name_m, name_n, name_k, name_config, name_has_bias = (
         parse_gemm_decode_kernel_name(kernel_name)
     )
-    if (name_arch, name_m, name_n, name_k, name_config) != (
+    if (
+        name_arch,
+        name_m,
+        name_n,
+        name_k,
+        name_config,
+        name_has_bias,
+    ) != (
         arch,
         m,
         n,
         k,
         config,
+        has_bias,
     ):
         raise ValueError(
             "FlyDSL decode compile metadata does not match encoded kernel name"
@@ -690,6 +701,7 @@ def _compile_decode_to_cache(
     a = torch.empty((m, k), device=device, dtype=torch.bfloat16)
     b = torch.empty((n, k), device=device, dtype=torch.bfloat16)
     c = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    bias = torch.empty((n,), device=device, dtype=torch.bfloat16)
     launcher = compile_gemm_decode_bf16(
         m,
         n,
@@ -697,8 +709,16 @@ def _compile_decode_to_cache(
         config,
         arch=arch,
         num_cus=cu_num,
+        has_bias=has_bias,
     )
-    _compile_executable_to_cache(launcher, a, b, c, fx.Stream(0))
+    _compile_executable_to_cache(
+        launcher,
+        a,
+        b,
+        c,
+        bias if has_bias else None,
+        fx.Stream(0),
+    )
 
 
 def compile_one_config(

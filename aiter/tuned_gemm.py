@@ -263,18 +263,25 @@ def get_GEMM_A16W16_config(
                     config = None
                 elif is_flydsl_available():
                     try:
-                        from aiter.ops.flydsl.gemm_kernels import (
+                        from aiter.ops.flydsl.kernels.gemm_decode_common import (
                             parse_gemm_decode_kernel_name,
                         )
 
-                        name_arch, name_m, name_n, name_k, _ = (
+                        name_arch, name_m, name_n, name_k, _, name_has_bias = (
                             parse_gemm_decode_kernel_name(config["kernelName"])
                         )
-                        if (name_arch, name_m, name_n, name_k) != (
+                        if (
+                            name_arch,
+                            name_m,
+                            name_n,
+                            name_k,
+                            name_has_bias,
+                        ) != (
                             gfx,
                             M,
                             N,
                             K,
+                            bias,
                         ):
                             logger.warning(
                                 "FlyDSL decode tuned row does not match the "
@@ -672,28 +679,44 @@ def flydsl_decode_gemm(
     del solidx
     if config is None or not config.get("kernelName"):
         raise ValueError("FlyDSL decode dispatch requires kernelName")
-    if bias is not None:
-        raise ValueError("FlyDSL decode does not support fused bias")
     if any(scale is not None for scale in (scale_a, scale_b, scale_c)):
         raise ValueError("FlyDSL decode does not support scaling")
     if bpreshuffle:
         raise ValueError("FlyDSL decode does not support preshuffled weights")
     if (otype or inp.dtype) != torch.bfloat16:
         raise ValueError("FlyDSL decode requires BF16 output")
-    from aiter.ops.flydsl.gemm_kernels import (
-        launch_gemm_decode_kernel_name,
+    from aiter.ops.flydsl.gemm_kernels import gemm_decode_bf16
+    from aiter.ops.flydsl.kernels.gemm_decode_common import (
+        parse_gemm_decode_kernel_name,
     )
 
+    arch, m, n, k, decode_config, has_bias = parse_gemm_decode_kernel_name(
+        config["kernelName"]
+    )
+    expected = (
+        get_gfx_runtime(),
+        int(inp.shape[0]),
+        int(weights.shape[0]),
+        int(inp.shape[1]),
+    )
+    if (arch, m, n, k) != expected:
+        raise ValueError(
+            "FlyDSL decode tuned kernel does not match the runtime "
+            f"architecture/exact shape: kernel={(arch, m, n, k)}, runtime={expected}"
+        )
+    if has_bias != (bias is not None):
+        raise ValueError("FlyDSL decode kernel bias identity does not match launch")
     output = torch.empty(
-        (inp.shape[0], weights.shape[0]),
+        (m, n),
         dtype=torch.bfloat16,
         device=inp.device,
     )
-    return launch_gemm_decode_kernel_name(
+    return gemm_decode_bf16(
         inp,
         weights,
         output,
-        config["kernelName"],
+        decode_config,
+        bias=bias,
     )
 
 

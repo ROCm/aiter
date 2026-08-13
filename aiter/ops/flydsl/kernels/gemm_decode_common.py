@@ -441,29 +441,6 @@ def block_mfma_estimated_live_vgprs(
     return accumulator_vgprs + live_prefetch_vgprs + 48
 
 
-def conservative_wave_config(m: int, n: int, k: int, arch: str) -> WaveDecodeConfig:
-    """Return one legality-only fallback without a shape-performance ladder."""
-    get_decode_arch_traits(arch)
-    kvec = 2
-    reduction = ReductionMode.DPP if k % kvec == 0 else ReductionMode.BPERMUTE
-    contraction = (
-        ContractionMode.DOT2_BF16
-        if arch == "gfx950"
-        else ContractionMode.SCALAR_F32
-    )
-    config = WaveDecodeConfig(
-        m_per_wave=m,
-        n_per_wave=1,
-        kvec=kvec,
-        prefetch_depth=0,
-        waves_per_eu=4,
-        reduction=reduction,
-        contraction=contraction,
-    )
-    config.validate(m=m, n=n, k=k, arch=arch)
-    return config
-
-
 _DEFAULT_CUS_BY_ARCH = {"gfx942": 304, "gfx950": 256}
 _NON_TEMPORAL_WEIGHT_BYTES = 8 * 1024 * 1024
 _BLOCK_TILE_PRESETS = (
@@ -663,35 +640,42 @@ def gemm_decode_kernel_name(
     n: int,
     k: int,
     config: DecodeConfig,
+    *,
+    has_bias: bool = False,
 ) -> str:
     config.validate(m=m, n=n, k=k, arch=arch)
     prefix = f"flydsl_decode_v1_a{arch}_m{m}_n{n}_k{k}_"
     if isinstance(config, WaveDecodeConfig):
-        return prefix + (
+        name = prefix + (
             f"pwave_mp{config.m_per_wave}_np{config.n_per_wave}_kv{config.kvec}_"
             f"pf{config.prefetch_depth}_we{config.waves_per_eu}_"
             f"cp{config.b_cache_modifier}_rd{config.reduction.value}_"
             f"ct{config.contraction.value}_or{config.output_rounding.value}"
         )
-    return prefix + (
-        f"pblock2_ww{config.waves_per_workgroup}_cw{config.columns_per_wave}_"
-        f"as{config.activation_source.value}_bl{config.b_load_width}_"
-        f"ku{config.k_unroll}_pf{config.prefetch_stages}_"
-        f"pn{int(config.persistent_n)}_g{config.workgroups_per_cu}_"
-        f"we{config.waves_per_eu}_cp{config.b_cache_modifier}_"
-        f"or{config.output_rounding.value}"
-    )
+    else:
+        name = prefix + (
+            f"pblock2_ww{config.waves_per_workgroup}_cw{config.columns_per_wave}_"
+            f"as{config.activation_source.value}_bl{config.b_load_width}_"
+            f"ku{config.k_unroll}_pf{config.prefetch_stages}_"
+            f"pn{int(config.persistent_n)}_g{config.workgroups_per_cu}_"
+            f"we{config.waves_per_eu}_cp{config.b_cache_modifier}_"
+            f"or{config.output_rounding.value}"
+        )
+    return name + ("_BIAS" if has_bias else "")
 
 
 def parse_gemm_decode_kernel_name(
     name: str,
-) -> tuple[str, int, int, int, DecodeConfig]:
+) -> tuple[str, int, int, int, DecodeConfig, bool]:
     match = _NAME_RE.fullmatch(name)
     if match is None:
         raise ValueError(f"invalid FlyDSL decode kernel name: {name!r}")
     arch = match.group("arch")
     m, n, k = (int(match.group(field)) for field in ("m", "n", "k"))
     body = match.group("body")
+    has_bias = body.endswith("_BIAS")
+    if has_bias:
+        body = body.removesuffix("_BIAS")
     if body.startswith("pwave_"):
         wave = re.fullmatch(
             r"pwave_mp(\d+)_np(\d+)_kv(\d+)_pf(\d+)_we(\d+)_cp(\d+)_"
@@ -733,7 +717,20 @@ def parse_gemm_decode_kernel_name(
             output_rounding=OutputRounding(block.group(11)),
         )
     config.validate(m=m, n=n, k=k, arch=arch)
-    return arch, m, n, k, config
+    canonical = gemm_decode_kernel_name(
+        arch,
+        m,
+        n,
+        k,
+        config,
+        has_bias=has_bias,
+    )
+    if canonical != name:
+        raise ValueError(
+            f"non-canonical FlyDSL decode kernel name: {name!r}; "
+            f"expected {canonical!r}"
+        )
+    return arch, m, n, k, config, has_bias
 
 
 # Layout, address, and data-movement helpers.
@@ -755,6 +752,19 @@ def make_buffer_matrix(
     return fx.make_view(
         fx.get_iter(buffer),
         fx.make_layout((rows, columns), (columns, 1)),
+    )
+
+
+def make_buffer_vector(tensor, length: int):
+    """Give a packed BF16 global operand an exact one-dimensional view."""
+    buffer = fx.rocdl.make_buffer_tensor(
+        tensor,
+        max_size=False,
+        num_records_bytes=length * BF16_BYTES,
+    )
+    return fx.make_view(
+        fx.get_iter(buffer),
+        fx.make_layout(length, 1),
     )
 
 
@@ -894,6 +904,12 @@ def const_f32(value: float = 0.0):
 
 def add_f32(lhs, rhs):
     return arith_dialect.AddFOp(raw(lhs), raw(rhs)).result
+
+
+def add_bias_f32(value, bias_tensor, column):
+    """Add one BF16 column bias to an FP32 accumulator before conversion."""
+    bias_f32 = arith_dialect.ExtFOp(T.f32, raw(bias_tensor[column])).result
+    return add_f32(value, bias_f32)
 
 
 def pack_bf16x2(lo, hi):

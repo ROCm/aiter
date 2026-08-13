@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
 
@@ -17,6 +17,7 @@ from .gemm_decode_common import (
     BlockMfmaDecodeConfig,
     MFMA_K,
     WAVE_SIZE,
+    add_bias_f32,
     bf16x4_slice,
     block_mfma_staged_k,
     convert_bf16,
@@ -24,6 +25,7 @@ from .gemm_decode_common import (
     k_element,
     load_vector,
     make_buffer_matrix,
+    make_buffer_vector,
     make_decode_cache_tag,
     make_vector_view,
     masked_bf16_vector,
@@ -274,6 +276,7 @@ def _make_block_kernel(
     config: BlockMfmaDecodeConfig,
     kernel_name: str,
     persistent_turns: int,
+    has_bias: bool,
 ):
     """Build one selected BlockMFMA specialization."""
     waves = config.waves_per_workgroup
@@ -316,6 +319,7 @@ def _make_block_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        BIAS: fx.Tensor,
         runtime_grid_workgroups: Int32,
         runtime_persistent_turns: Int32,
     ):
@@ -328,6 +332,8 @@ def _make_block_kernel(
         a_global = make_buffer_matrix(A, m, k)
         b_global = make_buffer_matrix(B, n, k)
         c_global = make_buffer_matrix(C, m, n)
+        if const_expr(has_bias):
+            bias_global = make_buffer_vector(BIAS, n)
         a_smem = None
         if use_lds:
             shared = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -422,8 +428,15 @@ def _make_block_kernel(
                             fx.Int32(row) * fx.Int32(n)
                             + fx.Int32(column_coord)
                         )
+                        value = reduced[row][column]
+                        if const_expr(has_bias):
+                            value = add_bias_f32(
+                                value,
+                                bias_global,
+                                column_coord,
+                            )
                         output = convert_bf16(
-                            reduced[row][column],
+                            value,
                             element,
                             config.output_rounding,
                         )
@@ -463,8 +476,15 @@ def _make_block_kernel(
                                     fx.Int32(row) * fx.Int32(n)
                                     + fx.Int32(column_coord)
                                 )
+                                value = reduced[row][column]
+                                if const_expr(has_bias):
+                                    value = add_bias_f32(
+                                        value,
+                                        bias_global,
+                                        column_coord,
+                                    )
                                 output = convert_bf16(
-                                    reduced[row][column],
+                                    value,
                                     element,
                                     config.output_rounding,
                                 )
@@ -482,10 +502,19 @@ def compile_gemm_decode_block_mfma_bf16(
     config: BlockMfmaDecodeConfig,
     arch: str,
     num_cus: int | None = None,
+    *,
+    has_bias: bool = False,
 ):
     """Compile one work-sized or grid-capped persistent BlockMFMA kernel."""
     config.validate(m=m, n=n, k=k, arch=arch)
-    kernel_name = gemm_decode_kernel_name(arch, m, n, k, config)
+    kernel_name = gemm_decode_kernel_name(
+        arch,
+        m,
+        n,
+        k,
+        config,
+        has_bias=has_bias,
+    )
     waves = config.waves_per_workgroup
     columns = config.columns_per_wave
     block_threads = waves * WAVE_SIZE
@@ -527,6 +556,7 @@ def compile_gemm_decode_block_mfma_bf16(
             "grid_workgroups": grid_workgroups,
             "persistent_turns": persistent_turns,
             "use_lds": use_lds,
+            "has_bias": has_bias,
         },
     )
 
@@ -537,6 +567,7 @@ def compile_gemm_decode_block_mfma_bf16(
         config=config,
         kernel_name=kernel_name,
         persistent_turns=persistent_turns,
+        has_bias=has_bias,
     )
     kernel_attributes = (
         {"rocdl.waves_per_eu": config.waves_per_eu}
@@ -549,6 +580,7 @@ def compile_gemm_decode_block_mfma_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        BIAS: fx.Tensor,
         cache_identity: fx.Constexpr[str],
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -556,6 +588,7 @@ def compile_gemm_decode_block_mfma_bf16(
             A,
             B,
             C,
+            BIAS,
             fx.Int32(grid_workgroups),
             fx.Int32(persistent_turns),
             value_attrs=kernel_attributes,
@@ -569,8 +602,24 @@ def compile_gemm_decode_block_mfma_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        bias: fx.Tensor | None = None,
         stream: fx.Stream = fx.Stream(None),
     ):
-        return _run_compiled(launch, A, B, C, cache_tag, stream)
+        if has_bias and bias is None:
+            raise ValueError("This decode launcher requires `bias`.")
+        if not has_bias and bias is not None:
+            raise ValueError(
+                "This decode launcher was compiled without bias support."
+            )
+        launch_bias = B if bias is None else bias
+        return _run_compiled(
+            launch,
+            A,
+            B,
+            C,
+            launch_bias,
+            cache_tag,
+            stream,
+        )
 
     return launcher

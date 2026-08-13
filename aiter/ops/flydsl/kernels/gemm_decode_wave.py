@@ -8,16 +8,18 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .gemm_decode_common import (
     ReductionMode,
     WaveDecodeConfig,
+    add_bias_f32,
     contract_pair,
     gemm_decode_kernel_name,
     k_element,
     load_vector,
     make_buffer_matrix,
+    make_buffer_vector,
     make_decode_cache_tag,
     masked_bf16_vector,
     pack_bf16x2,
@@ -70,10 +72,19 @@ def compile_gemm_decode_wave_bf16(
     k: int,
     config: WaveDecodeConfig,
     arch: str,
+    *,
+    has_bias: bool = False,
 ):
     """Compile one exact shape/config with the architecture in the cache key."""
     config.validate(m=m, n=n, k=k, arch=arch)
-    kernel_name = gemm_decode_kernel_name(arch, m, n, k, config)
+    kernel_name = gemm_decode_kernel_name(
+        arch,
+        m,
+        n,
+        k,
+        config,
+        has_bias=has_bias,
+    )
     np = config.n_per_wave
     mp = config.m_per_wave
     kvec = config.kvec
@@ -103,6 +114,7 @@ def compile_gemm_decode_wave_bf16(
             "contraction": config.contraction.value,
             "output_rounding": config.output_rounding.value,
             "use_column_grid_y": use_column_grid_y,
+            "has_bias": has_bias,
         },
     )
 
@@ -111,6 +123,7 @@ def compile_gemm_decode_wave_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        BIAS: fx.Tensor,
     ):
         _, lane = wave_lane_coordinates(gpu.thread_idx.x, 1)
         column_block = (
@@ -133,6 +146,8 @@ def compile_gemm_decode_wave_bf16(
         a_global = make_buffer_matrix(A, m, k)
         b_global = make_buffer_matrix(B, n, k)
         c_global = make_buffer_matrix(C, m, n)
+        if const_expr(has_bias):
+            bias_global = make_buffer_vector(BIAS, n)
         columns = [
             fx.Int32(
                 fx.get_scalar(
@@ -293,8 +308,15 @@ def compile_gemm_decode_wave_bf16(
         if lane == fx.Int32(store_lane):
             for row in range_constexpr(mp):
                 for column in range_constexpr(np):
+                    value = reduced[row][column]
+                    if const_expr(has_bias):
+                        value = add_bias_f32(
+                            value,
+                            bias_global,
+                            columns[column],
+                        )
                     store_bf16(
-                        reduced[row][column],
+                        value,
                         c_global,
                         row_base + fx.Int32(row),
                         columns[column],
@@ -307,6 +329,7 @@ def compile_gemm_decode_wave_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        BIAS: fx.Tensor,
         cache_identity: fx.Constexpr[str],
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -314,6 +337,7 @@ def compile_gemm_decode_wave_bf16(
             A,
             B,
             C,
+            BIAS,
             value_attrs={"rocdl.waves_per_eu": config.waves_per_eu},
         ).launch(
             grid=(
@@ -329,8 +353,24 @@ def compile_gemm_decode_wave_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        bias: fx.Tensor | None = None,
         stream: fx.Stream = fx.Stream(None),
     ):
-        return _run_compiled(launch, A, B, C, cache_tag, stream)
+        if has_bias and bias is None:
+            raise ValueError("This decode launcher requires `bias`.")
+        if not has_bias and bias is not None:
+            raise ValueError(
+                "This decode launcher was compiled without bias support."
+            )
+        launch_bias = B if bias is None else bias
+        return _run_compiled(
+            launch,
+            A,
+            B,
+            C,
+            launch_bias,
+            cache_tag,
+            stream,
+        )
 
     return launcher

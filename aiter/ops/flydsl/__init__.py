@@ -53,13 +53,8 @@ if is_flydsl_available():
         flydsl_small_m_hgemm,
         flydsl_preshuffle_gemm_a8,
         gemm_decode_bf16,
-        gemm_decode_bf16_configured,
-        gemm_decode_kernel_name,
         get_decode_arch_traits,
-        get_gemm_decode_bf16,
         iter_gemm_decode_configs,
-        launch_gemm_decode_kernel_name,
-        parse_gemm_decode_kernel_name,
     )
     from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
@@ -111,12 +106,7 @@ if is_flydsl_available():
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
         "gemm_decode_bf16",
-        "gemm_decode_bf16_configured",
-        "gemm_decode_kernel_name",
         "get_decode_arch_traits",
-        "get_gemm_decode_bf16",
         "iter_gemm_decode_configs",
-        "launch_gemm_decode_kernel_name",
-        "parse_gemm_decode_kernel_name",
         # "flydsl_gdr_decode",
     ]
