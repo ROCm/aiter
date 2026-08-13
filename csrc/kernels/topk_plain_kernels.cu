@@ -33,9 +33,8 @@
 
 #include <hip/hip_runtime.h>
 
-#include <optional>
+#include "topk_plain.h"
 
-#include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 #include "opus/opus.hpp"
