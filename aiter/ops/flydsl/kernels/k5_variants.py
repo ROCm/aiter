@@ -60,3 +60,11 @@ def _bv_waves_of_variant(tag: str) -> tuple[int, int]:
         bv_s, w_s = body.split("w")
         return int(bv_s), int(w_s)
     return int(body), 4
+
+
+def _variant_tag(bv: int, num_waves: int) -> str:
+    """``(64, 8)`` -> ``"bv64w8"``; ``(32, 4)`` -> ``"bv32"``.
+
+    Inverse of ``_bv_waves_of_variant``
+    """
+    return f"bv{bv}" if num_waves == 4 else f"bv{bv}w{num_waves}"

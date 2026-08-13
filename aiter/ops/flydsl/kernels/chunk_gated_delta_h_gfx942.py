@@ -31,7 +31,7 @@ from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import vector as _vector
 
 from .tensor_shim import GTensor, _to_raw
-from .k5_variants import _bv_of_variant, _legal_bv_candidates
+from .k5_variants import _bv_of_variant, _legal_bv_candidates, _variant_tag
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
@@ -557,7 +557,8 @@ def compile_chunk_gated_delta_h_gfx942(
     # kernarg segment -- the same treatment gk/h0/ht already get when disabled.
     # The host wrapper passes a dummy tensor for each unused slot.
     _kernel_name = (
-        "chunk_gdn_fwd_h_o_flydsl_vk" if COMPUTE_OUTPUT else "chunk_gdn_fwd_h_flydsl_vk"
+        ("chunk_gdn_fwd_h_o_flydsl_vk" if COMPUTE_OUTPUT else "chunk_gdn_fwd_h_flydsl_vk")
+        + f"_{_variant_tag(BV, NUM_WARPS)}"
     )
 
     @flyc.kernel(name=_kernel_name, **_kernel_deco_kwargs)
