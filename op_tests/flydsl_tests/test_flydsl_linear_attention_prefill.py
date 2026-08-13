@@ -1460,6 +1460,56 @@ class TestCorrectness:
         )
         torch.testing.assert_close(fs_fly.float(), fs_tri.float(), atol=2e-2, rtol=2e-2)
 
+    def test_e2e_dispatch_indexed_state_pool(self):
+        """K5 gathers from / writes back into an SGLang-style pool via dispatch."""
+        torch.manual_seed(42)
+        B, T, H, D = 1, 64, 4, 128
+        q = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1
+        ).to(torch.bfloat16)
+        v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        g = torch.nn.functional.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+        beta = torch.rand(B, T, H, dtype=torch.bfloat16).sigmoid()
+        h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+        kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
+            "beta": beta,
+            "scale": D**-0.5,
+            "output_final_state": True,
+            "use_exp2": True,
+            "use_chunk_flydsl": True,
+        }
+
+        _, out_ref, fs_ref = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, initial_state=h0.clone()
+        )
+
+        pool_size = B + 5
+        indices = torch.tensor([3], device=h0.device, dtype=torch.int32)
+        pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device=h0.device)
+        pool_before = pool.clone()
+        pool[indices.long()] = h0
+
+        _, out_pool, returned = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, initial_state=pool, initial_state_indices=indices
+        )
+
+        assert returned is pool
+        torch.testing.assert_close(
+            out_pool.float(), out_ref.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            pool[indices.long()].float(), fs_ref.float(), atol=2e-2, rtol=2e-2
+        )
+
+        untouched = torch.ones(pool_size, dtype=torch.bool, device=pool.device)
+        untouched[indices.long()] = False
+        assert torch.equal(pool[untouched], pool_before[untouched])
+
     def test_e2e_dispatch_rejects_k64(self):
         """K=64 is unsupported and must fail before launching any K1-K6 kernel."""
         B, T, H, D = 1, 64, 4, 64
