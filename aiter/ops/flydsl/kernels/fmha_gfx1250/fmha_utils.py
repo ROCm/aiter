@@ -1261,6 +1261,84 @@ _PSP_SIZE = NUM_MSB * N_SP_PAIRS
 _OFF_PSP_HI = _OFF_PSP + _PSP_SIZE
 _OFF_PED = _OFF_PSP_HI + _PSP_SIZE
 
+def xcd_remap(raw_bx, raw_by, raw_bz, gdx, gdy, gdz):
+    """Software XCD remap: flat wgid -> chunked assignment for K/V cache locality."""
+    _NUM_XCDS = 8
+    wgid = raw_bx + gdx * raw_by + gdx * gdy * raw_bz
+    num_wgs = gdx * gdy * gdz
+    wgs_per_xcd = num_wgs // _NUM_XCDS
+    do_remap = (num_wgs > _NUM_XCDS) & (num_wgs % _NUM_XCDS == 0)
+    new_wgid = do_remap.select(
+        (wgid % _NUM_XCDS) * wgs_per_xcd + wgid // _NUM_XCDS, wgid)
+    new_bx = new_wgid % gdx
+    new_tmp = new_wgid // gdx
+    return new_bx, new_tmp % gdy, new_tmp // gdy
+
+
+def build_init_args(zero_v8f32, softmax_state_pro, sp_pairs_all_pro,
+                    kv_tiles_init, all_su_sp_tiles,
+                    k_b_base, v_a_base, k_a_base, v_b_base):
+    """Pack prologue results into scf.for_ iter_args list."""
+    _ssp = softmax_state_pro
+    pro_old_max = [_ssp["old_max"][m] for m in fx.range_constexpr(NUM_MSB)]
+    pro_row_sums = [_ssp["row_sums"][m] for m in fx.range_constexpr(NUM_MSB)]
+    pro_local_max = [_ssp["local_max"][m] for m in fx.range_constexpr(NUM_MSB)]
+    pro_delta = [_ssp["delta"][m] for m in fx.range_constexpr(NUM_MSB)]
+    pro_partial_sp_lo_flat, pro_partial_sp_hi_flat = [], []
+    for m in fx.range_constexpr(NUM_MSB):
+        for i in fx.range_constexpr(N_SP_PAIRS):
+            pair = Vec(sp_pairs_all_pro[m][i], dtype=Float32)
+            pro_partial_sp_lo_flat.append(pair[0].ir_value())
+            pro_partial_sp_hi_flat.append(pair[1].ir_value())
+    pro_exp_delta = [_ssp["exp_delta"][m] for m in fx.range_constexpr(NUM_MSB)]
+    kv_flat = [kv_tiles_init[msb][k]
+               for msb in fx.range_constexpr(NUM_MSB)
+               for k in fx.range_constexpr(N_WMMA_K_TILES)]
+    sp_flat = [all_su_sp_tiles[su][msb][0]
+               for su in fx.range_constexpr(CNT_SU)
+               for msb in fx.range_constexpr(NUM_MSB)]
+    return ([zero_v8f32] * (NUM_MSB * N_PV_WMMA_N) + pro_old_max + pro_row_sums
+            + kv_flat + pro_local_max + pro_delta + sp_flat
+            + [k_b_base, v_a_base, k_a_base, v_b_base]
+            + pro_partial_sp_lo_flat + pro_partial_sp_hi_flat + pro_exp_delta)
+
+
+def unpack_loop_results(lr, lane_id):
+    """Unpack scf.for_ loop results into epilogue state dict."""
+    ep_partial_sp_lo = [lr[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)]
+    ep_partial_sp_hi = [lr[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)]
+    return {
+        "o_tiles": [[set_vgpr_bank(lr[d * N_PV_WMMA_N + n], d)
+                      for n in fx.range_constexpr(N_PV_WMMA_N)]
+                     for d in fx.range_constexpr(NUM_MSB)],
+        "old_max": [set_vgpr_bank(lr[16 + i], i)
+                    for i in fx.range_constexpr(NUM_MSB)],
+        "row_sums": [set_vgpr_bank(lr[20 + i], i)
+                     for i in fx.range_constexpr(NUM_MSB)],
+        "kv_tiles": [[set_vgpr_bank(lr[24 + m * N_WMMA_K_TILES + k], m)
+                       for k in fx.range_constexpr(N_WMMA_K_TILES)]
+                      for m in fx.range_constexpr(NUM_MSB)],
+        "local_max": [set_vgpr_bank(lr[_OFF_LOCAL_MAX + i], i)
+                      for i in fx.range_constexpr(NUM_MSB)],
+        "delta": [set_vgpr_bank(lr[_OFF_DELTA + i], i)
+                  for i in fx.range_constexpr(NUM_MSB)],
+        "k_cur_base": lr[_OFF_PP],
+        "v_cur_base": lr[_OFF_PP + 1],
+        "k_next_base": lr[_OFF_PP + 2],
+        "v_next_base": lr[_OFF_PP + 3],
+        "kv_lds_addrs": build_kv_lds_addrs(lane_id, lr[_OFF_PP], lr[_OFF_PP + 1]),
+        "kv_lds_addrs_next": build_kv_lds_addrs(
+            lane_id, lr[_OFF_PP + 2], lr[_OFF_PP + 3]),
+        "partial_sp_pairs": [
+            [make_v2f32(ep_partial_sp_lo[m * N_SP_PAIRS + i],
+                        ep_partial_sp_hi[m * N_SP_PAIRS + i], m)
+             for i in fx.range_constexpr(N_SP_PAIRS)]
+            for m in fx.range_constexpr(NUM_MSB)],
+        "exp_delta": [set_vgpr_bank(lr[_OFF_PED + m], m)
+                      for m in fx.range_constexpr(NUM_MSB)],
+    }
+
+
 def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
     lane_id = ctx["lane_id"]
     wave_id = ctx["wave_id"]
