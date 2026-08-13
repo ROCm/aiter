@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness + perf sweep for the FlyDSL paged FP8 MQA-logits (decode) kernel.
+"""Correctness sweep for the FlyDSL paged FP8 MQA-logits (decode) kernel.
 
 Mirrors the aiter-op-test standard used by ``test_flydsl_fp8_mqa_logits.py`` and
 the paged benchmark ``op_tests/op_benchmarks/triton/bench_deepgemm_attention.py``.
@@ -19,7 +19,7 @@ import aiter
 import pandas as pd
 import torch
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -72,24 +72,44 @@ def kv_cache_cast_to_fp8(x, fp8_dtype):
 
 
 def ref_fp8_paged_mqa_logits(
-    q, kv_cache_fp8, weights, context_lens, block_tables, max_model_len, fp8_dtype
+    q,
+    kv_cache_fp8,
+    weights,
+    context_lens,
+    block_tables,
+    max_model_len,
+    fp8_dtype,
+    block_size=1,
 ):
     """Torch reference (vectorized port of vLLM ``fp8_paged_mqa_logits_torch``).
 
-    Dequantizes the co-packed fp8 cache (``fp8_bytes.float() * scale``) so it
-    matches what the kernel computes (kv-scale folded into K), then:
+    Dequantizes the **block-flat** co-packed fp8 cache and computes:
         logits[b*next_n+n, p] = sum_h ReLU(<q[b,n,h,:], K_deq(p)>) * weights[.., h]
-    with the causal mask ``p <= context_len - next_n + n``. The inner per-token
-    loop of the original is replaced by a single gather + einsum per batch
-    element (block_size == 1), which is orders of magnitude faster at long
-    context while numerically identical.
+    with the causal mask ``p <= context_len - next_n + n``. Logical position ``p``
+    resolves to physical ``(block, tok) = (block_tables[b, p//KVB], p%KVB)`` and
+    the block-flat block groups all ``KVB`` fp8 key rows first, then all ``KVB``
+    f32 scales. ``block_size == 1`` degenerates to the per-token page table.
     """
     batch_size, next_n, heads, dim = q.size()
-    kvv, scale = kv_cache_fp8[..., :dim], kv_cache_fp8[..., dim:]
-    scale = scale.contiguous().view(torch.float)
+    num_blocks = kv_cache_fp8.shape[0]
+    index_dim = kv_cache_fp8.shape[-1]
+    # Reconstruct the block-flat block: [KVB keys (dim bytes each)][KVB f32 scales].
+    flat = kv_cache_fp8.reshape(num_blocks, block_size * index_dim)
+    keys = (
+        flat[:, : block_size * dim]
+        .contiguous()
+        .view(fp8_dtype)
+        .float()
+        .view(num_blocks, block_size, dim)
+    )
+    scales = (
+        flat[:, block_size * dim : block_size * dim + 4 * block_size]
+        .contiguous()
+        .view(torch.float32)
+        .view(num_blocks, block_size, 1)
+    )
+    kvf = keys * scales  # [num_blocks, block_size, dim] dequantized K
     qf = q.float()
-    # dequantized K per physical block: [num_blocks, dim]  (block_size == 1)
-    kvf = (kvv.view(fp8_dtype).float() * scale).view(kv_cache_fp8.shape[0], dim)
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -100,30 +120,33 @@ def ref_fp8_paged_mqa_logits(
         context_len = int(context_lens[i].item())
         if context_len == 0:
             continue
-        pages = block_tables[i, :context_len]  # [ctx] physical token ids
-        kx = kvf[pages]  # [ctx, dim] dequantized K
+        pos = torch.arange(context_len, device=q.device)
+        blk = block_tables[i, pos // block_size]  # [ctx] physical block ids
+        tok = pos % block_size  # [ctx] token-in-block
+        kx = kvf[blk, tok]  # [ctx, dim] dequantized K
         s = torch.einsum("nhd,pd->nhp", qf[i], kx)  # [next_n, heads, ctx]
         s = torch.relu(s)
         wl = weights[i * next_n : (i + 1) * next_n, :]  # [next_n, heads]
         s = (s * wl[:, :, None]).sum(dim=1)  # [next_n, ctx]
-        p = torch.arange(context_len, device=q.device)
         q_lim = (
             context_len - next_n + torch.arange(next_n, device=q.device)
         ).unsqueeze(
             1
         )  # [next_n, 1]
-        s = torch.where(p[None, :] <= q_lim, s, float("-inf"))
+        s = torch.where(pos[None, :] <= q_lim, s, float("-inf"))
         logits[i * next_n : (i + 1) * next_n, :context_len] = s
     return logits
 
 
-def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, seed=0):
+def _build_inputs(
+    batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, block_size=1, seed=0
+):
     torch.manual_seed(seed)
     random.seed(seed)
     fp8_dtype = get_fp8_e4m3_dtype()
 
     max_model_len = 2 * avg_kv_length
-    num_blocks = max_model_len  # KVBlockSize == 1
+    num_blocks = (max_model_len + block_size - 1) // block_size
 
     lo = max(1, int((1 - 0.5) * avg_kv_length))
     hi = int((1 + 0.5) * avg_kv_length) + 1
@@ -132,10 +155,11 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, s
     context_lens = torch.clamp(context_lens, min=next_n)
 
     q = torch.randn((batch_size, next_n, heads, head_dim), dtype=torch.bfloat16)
-    kv_cache = torch.randn((num_blocks, 1, 1, head_dim), dtype=torch.bfloat16)
+    kv_cache = torch.randn((num_blocks, block_size, 1, head_dim), dtype=torch.bfloat16)
     weights = torch.randn((batch_size * next_n, heads), dtype=torch.float32)
 
-    max_block_len = int(context_lens.max().item())  # blocksize == 1
+    # block table: one entry per KVBlockSize-token block, ceil(ctx / block_size).
+    max_block_len = (int(context_lens.max().item()) + block_size - 1) // block_size
     block_tables = torch.zeros(
         (batch_size, max_block_len), device="cuda", dtype=torch.int32
     )
@@ -143,7 +167,8 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, s
     random.shuffle(pool)
     counter = 0
     for i in range(batch_size):
-        for j in range(int(context_lens[i].item())):
+        n_blk = (int(context_lens[i].item()) + block_size - 1) // block_size
+        for j in range(n_blk):
             block_tables[i][j] = pool[counter % num_blocks]
             counter += 1
 
@@ -163,7 +188,14 @@ def _build_inputs(batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, s
 
 @benchmark()
 def test_fp8_paged_mqa_logits(
-    batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, split_kv=0
+    batch_size,
+    next_n,
+    heads,
+    head_dim,
+    avg_kv_length,
+    q_dtype,
+    split_kv=0,
+    block_size=1,
 ):
     # split_kv == 0 -> auto (production host formula); else an explicit override
     # (1 disables splitting). Both must be correctness-identical.
@@ -178,7 +210,13 @@ def test_fp8_paged_mqa_logits(
         max_model_len,
         fp8_dtype,
     ) = _build_inputs(
-        batch_size, next_n, heads, head_dim, avg_kv_length, DTYPE_MAP[q_dtype]
+        batch_size,
+        next_n,
+        heads,
+        head_dim,
+        avg_kv_length,
+        DTYPE_MAP[q_dtype],
+        block_size=block_size,
     )
 
     with torch.inference_mode():
@@ -190,6 +228,7 @@ def test_fp8_paged_mqa_logits(
             block_tables,
             max_model_len,
             fp8_dtype,
+            block_size=block_size,
         )
     ref_mask = ref == float("-inf")
 
@@ -200,9 +239,8 @@ def test_fp8_paged_mqa_logits(
         dtype=torch.float32,
     )
 
-    def fn():
-        out.fill_(float("-inf"))
-        return flydsl_fp8_paged_mqa_logits(
+    with torch.inference_mode():
+        got = flydsl_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
             weights,
@@ -210,11 +248,9 @@ def test_fp8_paged_mqa_logits(
             context_lens,
             block_tables,
             max_model_len,
+            KVBlockSize=block_size,
             SplitKV=_split_kv,
         )
-
-    with torch.inference_mode():
-        got, us = run_perftest(fn)
 
     got_mask = got == float("-inf")
     assert torch.equal(got_mask, ref_mask), "flydsl paged: -inf mask mismatch"
@@ -233,12 +269,10 @@ def test_fp8_paged_mqa_logits(
             printLog=False,
         )
 
-    total_flops = 2 * next_n * heads * head_dim * context_lens.float().sum().item()
     return {
         "gfx": get_gfx(),
+        "kvb": block_size,
         "split_kv": "auto" if split_kv == 0 else split_kv,
-        "flydsl us": us,
-        "flydsl TFLOPS": total_flops / us / 1e6 if us > 0 else 0,
         "flydsl err": err,
     }
 
@@ -255,7 +289,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL paged fp8_mqa_logits correctness + perf sweep",
+        description="FlyDSL paged fp8_mqa_logits correctness sweep",
     )
     parser.add_argument(
         "-b",
@@ -284,18 +318,26 @@ def main():
         default=[0, 1, 4],
         help="0 == auto (production formula); else explicit SplitKV (1 disables)",
     )
+    parser.add_argument(
+        "--kv-block-size",
+        type=int,
+        nargs="*",
+        default=[1, 64],
+        help="KVBlockSize (paged block-flat page size); 1 == per-token slots",
+    )
     args = parser.parse_args()
 
     df = []
-    for (bs, nn), nh, hd, kv, qd, sk in itertools.product(
+    for (bs, nn), nh, hd, kv, qd, sk, kvb in itertools.product(
         args.batch_next_n,
         args.num_heads,
         args.head_dim,
         args.avg_kv_length,
         args.q_dtype,
         args.split_kv,
+        args.kv_block_size,
     ):
-        df.append(test_fp8_paged_mqa_logits(bs, nn, nh, hd, kv, qd, sk))
+        df.append(test_fp8_paged_mqa_logits(bs, nn, nh, hd, kv, qd, sk, block_size=kvb))
 
     df = pd.DataFrame(df)
     try:

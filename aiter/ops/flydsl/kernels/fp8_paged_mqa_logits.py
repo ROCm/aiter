@@ -14,16 +14,23 @@ the query token and ``p >= context_lens[b]`` stay ``-inf``). ``K_phys(p)`` /
 maps through the block table (``kv_indices``) to a physical block, and each
 token's fp8 K bytes and its f32 dequant scale are **co-packed** in that block.
 
-Supported scope (this file): ``KVBlockSize == 1`` with SplitKV KV-column
-parallelism. The public ``flydsl_fp8_paged_mqa_logits`` mirrors the tensor
-contract of the Triton
+Supported scope (this file): ``KVBlockSize >= 1`` (block-flat co-packed layout)
+with SplitKV KV-column parallelism. The public ``flydsl_fp8_paged_mqa_logits``
+mirrors the tensor contract of the Triton
 ``aiter.ops.triton.attention.pa_mqa_logits.deepgemm_fp8_paged_mqa_logits`` so the
-two are interchangeable in tests/benchmarks. ``KVBlockSize > 1`` and preshuffle
-are not supported and raise ``NotImplementedError``.
+two are interchangeable in tests/benchmarks. Preshuffle is not supported and
+raises ``NotImplementedError``.
 
-The fp8 16x16x32 MFMA compute, ReLU*weight head-sum + kv-scale hoist, in-wave
-``shuffle_xor`` head reduce, the fp8 dword-pack load, the FN->FNUZ byte patch, and
-the i64 byte-base per-row output view are all shared with the dense kernel via
+Cache layout (per physical block of ``KVBlockSize`` tokens): all ``KVBlockSize``
+fp8 key rows (``D`` bytes each) grouped first, then all ``KVBlockSize`` f32
+dequant scales (block-flat). The per-lane gather resolves each logical KV column
+independently through the block table (``kv_indices[b, p // KVBlockSize]``) so a
+column tile may straddle block boundaries; ``KVBlockSize == 1`` degenerates to
+the per-token ``[D fp8 | 4 scale]`` slot layout.
+
+The fp8 32x32x64 scaled MFMA compute, ReLU*weight head-sum + kv-scale hoist,
+in-wave ``shuffle_xor`` head reduce, the fp8 dword-pack load, and the i64
+byte-base per-row output view are all shared with the dense kernel via
 ``._mqa_logits_common`` (no duplication).
 """
 
@@ -83,16 +90,24 @@ def _build_paged_kernel(
     head_size: int,
     block_kv: int,
     waves_per_block: int,
+    kv_block_size: int = 1,
     scale_mul: float = 1.0,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
 ):
-    """Paged MQA-logits kernel (KVBlockSize==1) with SplitKV column parallelism.
+    """Paged MQA-logits kernel (KVBlockSize>=1) with SplitKV column parallelism.
 
     One thread block owns one ``(batch, next_n)`` query row and walks the whole
     ``[0, context_length)`` KV window in ``BKV``-wide tiles. ``waves_per_block``
     waves each own a disjoint slice of the ``BKV/MFMA_N`` column tiles (no
     cross-wave sharing / barrier), mirroring the dense kernel's wave split.
+
+    ``kv_block_size`` (KVBlockSize) is the number of tokens co-packed in one
+    physical block; each lane gathers its own logical KV column independently
+    (``kv_indices[b, col // KVBlockSize]`` -> physical block, ``col %
+    KVBlockSize`` -> token within the block-flat block), so a column tile may
+    straddle block boundaries. ``KVBlockSize == 1`` degenerates to the per-token
+    ``[D fp8 | 4 scale]`` slot layout.
 
     ``scale_mul`` folds the FN->FNUZ 2x-per-converted-operand compensation into
     the (co-packed) per-token scale at compile time (ReLU positive-homogeneity).
@@ -101,6 +116,8 @@ def _build_paged_kernel(
     D = head_size
     BKV = block_kv
     WPB = waves_per_block
+    KVB = kv_block_size
+    assert KVB >= 1, f"kv_block_size must be >= 1; got {KVB}"
     MR_BLOCK_THREADS = 64 * WPB
 
     assert H % MFMA_M == 0, f"num_heads={H} must be a multiple of MFMA_M={MFMA_M}"
@@ -122,12 +139,12 @@ def _build_paged_kernel(
         _cvt_tag += "_cq"
     if convert_kv_fn:
         _cvt_tag += "_ck"
-    _kname = f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_w{WPB}{_cvt_tag}_flydsl"
+    _kname = f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_kvb{KVB}_w{WPB}{_cvt_tag}_flydsl"
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
     def kernel(
         Q: fx.Tensor,  # [batch, next_n, H, D]       fp8 (bytes passed raw)
-        KV_cache: fx.Tensor,  # [num_blocks, 1, 1, index_dim] uint8 co-packed
+        KV_cache: fx.Tensor,  # [num_blocks, KVB, 1, index_dim] uint8 block-flat
         weights: fx.Tensor,  # [batch*next_n, H]           f32
         out_logits: fx.Tensor,  # [batch*next_n, max_model_len] f32 (-inf prefilled)
         context_lens: fx.Tensor,  # [batch]                     i32
@@ -138,7 +155,7 @@ def _build_paged_kernel(
         stride_q_batch: fx.Int32,  # fp8 elems (== bytes)
         stride_q_next_n: fx.Int32,
         stride_q_heads: fx.Int32,
-        index_dim: fx.Int32,  # cache row width in bytes (D + 4 + pad)
+        index_dim: fx.Int32,  # per-token slot bytes (D+4+pad); block stride = KVB*index_dim
         max_block_len: fx.Int32,  # kv_indices row width
         stride_out: fx.Int32,  # out_logits.stride(0) == max_model_len
     ):
@@ -199,9 +216,9 @@ def _build_paged_kernel(
                 a_pack[mi][kk] = load_pack_v8i32(q_i32, byte_base, lane8)
 
         # weights[out_row, h] per (mi, ii): head = mi*MFMA_M + h_off(lane_div_N, ii)
-        # For 32x32x16 fp8 MFMA, the D-reg ii at lane_div_N encodes head:
-        #   h_off = (ii % 4) + lane_div_N * 4 + (ii // 4) * 8
-        # This is the same 4-interleave as 16x16x32 but extended to 16 D-regs.
+        # For the 32x32x64 MFMA (16 f32 D-regs), the D-reg ii at lane_div_N encodes
+        # head:  h_off = (ii % 4) + lane_div_N * 4 + (ii // 4) * 8
+        # -- the same 4-interleave as the 16x16x32 layout, extended to 16 D-regs.
         _DREG = 16
         w_frag = [[None] * _DREG for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
@@ -226,6 +243,9 @@ def _build_paged_kernel(
         tile_lo_col = pid_split_kv * split_cols
         tile_hi_col = arith.minsi(_to_raw(tile_lo_col + split_cols), _to_raw(full_end))
         ctx_m1 = context_length - 1
+        # Block-flat block byte-stride (KVB tokens per physical block);
+        # loop-invariant, so hoist it out of the per-column gather below.
+        block_byte_stride = fx.Int32(KVB) * index_dim
 
         tile_lo = _to_raw(fx.Index(tile_lo_col))
         tile_hi = _to_raw(fx.Index(fx.Int32(tile_hi_col)))
@@ -239,20 +259,35 @@ def _build_paged_kernel(
                 col = col0 + abs_ni * MFMA_N + lane_mod_N
                 # Clamp the gather index to a valid token (mask handles the rest).
                 col_c = fx.Int32(arith.minsi(_to_raw(col), _to_raw(ctx_m1)))
-                ind_off = pid_batch * max_block_len + col_c
+                # Block table maps a logical column to a physical block. The
+                # block-flat block byte-stride is KVB*index_dim, keys grouped
+                # first (tok*D) then all scales (KVB*D + tok*4). KVB is a
+                # compile-time constant, so for KVB==1 divui/remui/mul-by-1 fold
+                # away (block_idx==col_c, tok_in_block==0) -- no Python `if` here
+                # because the FlyDSL AST rewriter would turn it into a runtime
+                # scf.if and drop the branch-local addresses.
+                block_idx = fx.Int32(
+                    arith.divui(_to_raw(col_c), _to_raw(fx.Int32(KVB)))
+                )
+                tok_in_block = fx.Int32(
+                    arith.remui(_to_raw(col_c), _to_raw(fx.Int32(KVB)))
+                )
+                ind_off = pid_batch * max_block_len + block_idx
                 physical = fx.Int32(ind_t[ind_off])
-                tok_byte = physical * index_dim
+                block_byte_base = physical * block_byte_stride
+                key_byte = block_byte_base + tok_in_block * D
 
                 # B operands: vector<8xi32> per K-step (MFMA_K=64).
                 # convert_kv_fn is always False (gfx950 native fp8).
                 b_col = [None] * K_STEPS
                 for kk in range_constexpr(K_STEPS):
-                    byte_base_b = tok_byte + kk * MFMA_K
+                    byte_base_b = key_byte + kk * MFMA_K
                     b_col[kk] = load_pack_v8i32(kv_i32, byte_base_b, lane8)
 
-                # Co-packed per-token scale: f32 at byte tok_byte + D.
+                # Co-packed per-token f32 scale (block-flat: after the KVB keys).
+                scale_byte = block_byte_base + (KVB * D) + tok_in_block * 4
                 scale_dword = fx.Int32(
-                    arith.divui(_to_raw(tok_byte + D), _to_raw(fx.Int32(4)))
+                    arith.divui(_to_raw(scale_byte), _to_raw(fx.Int32(4)))
                 )
                 kv_scale = _to_raw(fx.Float32(kv_f32[scale_dword]))
                 if scale_mul != 1.0:
@@ -373,6 +408,7 @@ def compile_fp8_paged_mqa_logits(
     num_heads: int,
     head_size: int,
     block_kv: int = _BLOCK_KV,
+    kv_block_size: int = 1,
     variant: str = DEFAULT_VARIANT,
     scale_mul: float = 1.0,
     convert_q_fn: bool = False,
@@ -380,16 +416,18 @@ def compile_fp8_paged_mqa_logits(
 ):
     """Return a cached, compiled FlyDSL paged launcher for the given config.
 
-    ``num_heads``/``head_size`` are compile-time constants; ``variant`` is a
-    ``paged_w<WPB>`` tag; ``convert_q_fn``/``convert_kv_fn`` mark an FP8 FN
-    operand whose -0 (0x80) byte the kernel patches to FNUZ +0, and ``scale_mul``
-    folds the 2x-per-converted-operand compensation into the co-packed scale.
+    ``num_heads``/``head_size``/``kv_block_size`` are compile-time constants;
+    ``variant`` is a ``paged_w<WPB>`` tag; ``convert_q_fn``/``convert_kv_fn`` mark
+    an FP8 FN operand whose -0 (0x80) byte the kernel patches to FNUZ +0, and
+    ``scale_mul`` folds the 2x-per-converted-operand compensation into the
+    co-packed scale.
     """
     launcher = _build_paged_kernel(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=block_kv,
         waves_per_block=_variant_wpb(variant),
+        kv_block_size=kv_block_size,
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
@@ -416,21 +454,23 @@ def flydsl_fp8_paged_mqa_logits(
     variant=None,
     stream=None,
 ):
-    """FlyDSL paged FP8 MQA logits (decode) -- KVBlockSize==1 with SplitKV.
+    """FlyDSL paged FP8 MQA logits (decode) -- KVBlockSize>=1 with SplitKV.
 
     Drop-in for the Triton ``deepgemm_fp8_paged_mqa_logits`` tensor contract.
 
     q_fp8:        [batch, next_n, heads, hidden_dim], dtype float8 (e4m3 fn/fnuz)
-    kv_cache:     [num_blocks, KVBlockSize, 1, index_dim], dtype uint8, co-packed
-                  fp8 K bytes (first KVBlockSize*hidden_dim) then f32 dequant
-                  scales; index_dim == hidden_dim + 4 (+ optional 16B padding).
+    kv_cache:     [num_blocks, KVBlockSize, 1, index_dim], dtype uint8, block-flat
+                  co-packed: per physical block, KVBlockSize*hidden_dim fp8 K
+                  bytes (all key rows grouped) then KVBlockSize f32 dequant scales;
+                  index_dim == hidden_dim + 4 (+ optional 16B padding).
     weights:      [batch*next_n, heads], dtype float32
     out_logits:   [batch*next_n, max_model_len], dtype float32. MUST be prefilled
                   with -inf by the caller; the kernel writes only in-window
                   (causal) positions and leaves masked positions untouched.
     context_lens: [batch], dtype int32
     kv_indices:   [batch, max_block_len], dtype int32 block table (physical block
-                  per logical position; KVBlockSize==1 => per-token page table).
+                  per logical block ``p // KVBlockSize``; KVBlockSize==1 => a
+                  per-token page table).
     max_model_len: int, out_logits column count.
     SplitKV:      KV-column split count (grid = split_kv*batch*next_n). None =>
                   the production host formula (fills the device on small decode
@@ -447,11 +487,6 @@ def flydsl_fp8_paged_mqa_logits(
         raise NotImplementedError(
             "Preshuffle is not supported by the FlyDSL paged fp8_mqa_logits kernel."
         )
-    if KVBlockSize != 1:
-        raise NotImplementedError(
-            "FlyDSL paged fp8_mqa_logits supports KVBlockSize==1 only "
-            f"(got KVBlockSize={KVBlockSize})."
-        )
     if ChunkK % MFMA_N != 0:
         raise ValueError(f"ChunkK={ChunkK} must be a multiple of MFMA_N={MFMA_N}.")
 
@@ -460,7 +495,11 @@ def flydsl_fp8_paged_mqa_logits(
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
 
     num_blocks, block_size, one, index_dim = kv_cache.shape
-    assert block_size == 1, f"kv_cache KVBlockSize dim must be 1; got {block_size}."
+    assert block_size == KVBlockSize, (
+        f"kv_cache KVBlockSize dim ({block_size}) must equal KVBlockSize "
+        f"({KVBlockSize})."
+    )
+    assert KVBlockSize >= 1, f"KVBlockSize must be >= 1; got {KVBlockSize}."
     assert one == 1, f"kv_cache head dim must be 1; got {one}."
     assert (
         index_dim >= head_size + 4
@@ -469,11 +508,13 @@ def flydsl_fp8_paged_mqa_logits(
         kv_cache.dtype == torch.uint8
     ), f"kv_cache must be uint8 co-packed bytes; got {kv_cache.dtype}."
 
-    # i32 gather-offset ceiling: the per-token byte base physical*index_dim is
-    # computed in i32 (it rides the buffer voffset), so the whole cache pool must
-    # be addressable in i32 bytes. A larger pool would need an i64/global gather.
-    assert num_blocks * index_dim < 2**31, (
-        f"num_blocks*index_dim={num_blocks * index_dim} exceeds the i32 "
+    # i32 gather-offset ceiling: the per-token byte base (physical block byte base
+    # + intra-block offset) is computed in i32 (it rides the buffer voffset), so
+    # the whole cache pool must be addressable in i32 bytes. A larger pool would
+    # need an i64/global gather.
+    pool_bytes = num_blocks * block_size * index_dim
+    assert pool_bytes < 2**31, (
+        f"num_blocks*KVBlockSize*index_dim={pool_bytes} exceeds the i32 "
         f"gather-offset limit (2^31); the paged kernel needs an i64 gather path "
         f"for a cache pool this large."
     )
@@ -507,13 +548,14 @@ def flydsl_fp8_paged_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=ChunkK,
+        kv_block_size=int(KVBlockSize),
         variant=variant,
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
     )
 
-    # Co-packed cache -> raw uint8 byte view [num_blocks * index_dim].
+    # Co-packed cache -> raw uint8 byte view [num_blocks * KVBlockSize * index_dim].
     kv_bytes = kv_cache.reshape(-1)
 
     # KV-column splits (one lever): fill the device when the batch*next_n row
