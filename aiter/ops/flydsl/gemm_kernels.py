@@ -38,8 +38,12 @@ def _get_dtypes():
     return dtypes
 
 
-# Buffer offsets inside the FlyDSL kernels are i32 byte offsets, so keep the
-# fp32 workspace well below the 2GiB point where that arithmetic would wrap.
+# Global accesses in these kernels go through an AMD buffer descriptor, so the
+# workspace is bounded by that descriptor rather than by any pointer arithmetic:
+# `num_records` is a 32-bit BYTE count (clamped to 0xFFFFFFFF in
+# `buffer_ops.create_buffer_resource*`) and the per-lane voffset is a 32-bit
+# element offset scaled to bytes. Addressing therefore wraps at 4GiB; cap the
+# workspace at half of that so the largest slot offset keeps a 2x margin.
 SPLIT_K_WORKSPACE_MAX_BYTES = 1 << 31
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
@@ -709,6 +713,21 @@ def _split_k_workspace_elems(m: int, n: int, slots: int) -> int:
     return slots * m * n
 
 
+def _split_k_workspace_slots(
+    split_k: int, block_k_warps: int, kernel_family: str
+) -> int:
+    """Slot count of the `[slots, m, n]` workspace for one kernel config.
+
+    Each slice-K warp group gets its own slot, so its partial is reduced in fp32
+    by the reduce kernel instead of through a bf16 LDS combine; small_m has no
+    slice-K. This is part of the layout contract between the main kernel, the
+    reduce kernel and the AOT precompiler, so all three read it from here rather
+    than restating the arithmetic.
+    """
+    slice_k_slots = block_k_warps if kernel_family == KERNEL_FAMILY_HGEMM else 1
+    return split_k * slice_k_slots
+
+
 def _get_split_k_workspace(
     device: torch.device,
     elems: int,
@@ -732,32 +751,36 @@ def _get_split_k_workspace(
     if nbytes > SPLIT_K_WORKSPACE_MAX_BYTES:
         raise ValueError(
             f"FlyDSL split-K workspace would need {nbytes} bytes, above the "
-            f"{SPLIT_K_WORKSPACE_MAX_BYTES}-byte limit imposed by the kernels' "
-            "i32 buffer offsets; use a smaller split_k for this shape"
+            f"{SPLIT_K_WORKSPACE_MAX_BYTES}-byte limit imposed by 32-bit buffer "
+            "descriptor addressing; use a smaller split_k for this shape"
         )
 
     ws = _SPLIT_K_WS.get(device_index)
     if ws is not None and ws.numel() >= elems:
         return ws
 
-    if torch.cuda.is_current_stream_capturing():
-        have = 0 if ws is None else ws.numel()
-        raise RuntimeError(
-            "FlyDSL split-K workspace must be sized before CUDA graph capture "
-            f"(need {elems} fp32 elements, have {have}). Run this shape eagerly "
-            "once, or call "
-            "aiter.ops.flydsl.gemm_kernels.flydsl_splitk_prewarm_capture_workspace(...) "
-            "on the capture stream, before capturing."
-        )
+    # Only the grow path below reaches here, so the context managers are off the
+    # hot path. Both the capture check and the allocation run under them: capture
+    # state is per (device, current stream), so checking the *current* stream
+    # while allocating on an explicitly passed `stream` can disagree -- it would
+    # miss a capturing launch stream and allocate into the graph's private pool,
+    # which is precisely what this guard exists to prevent. `torch.cuda.stream`
+    # accepts None as a no-op.
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        if torch.cuda.is_current_stream_capturing():
+            have = 0 if ws is None else ws.numel()
+            raise RuntimeError(
+                "FlyDSL split-K workspace must be sized before CUDA graph capture "
+                f"(need {elems} fp32 elements, have {have}). Run this shape eagerly "
+                "once, or call "
+                "aiter.ops.flydsl.gemm_kernels.flydsl_splitk_prewarm_capture_workspace(...) "
+                "on the capture stream, before capturing."
+            )
 
-    grow_to = max(elems, 0 if ws is None else 2 * ws.numel())
-    if grow_to * 4 > SPLIT_K_WORKSPACE_MAX_BYTES:
-        grow_to = elems
-    if stream is None:
+        grow_to = max(elems, 0 if ws is None else 2 * ws.numel())
+        if grow_to * 4 > SPLIT_K_WORKSPACE_MAX_BYTES:
+            grow_to = elems
         new_ws = torch.empty(grow_to, dtype=torch.float32, device=device)
-    else:
-        with torch.cuda.stream(stream):
-            new_ws = torch.empty(grow_to, dtype=torch.float32, device=device)
     if ws is not None:
         # Retained, not freed: a captured graph may still hold this pointer.
         _SPLIT_K_WS_RETIRED.append(ws)
@@ -795,14 +818,23 @@ def flydsl_splitk_prewarm_capture_workspace(
     """
     if split_k <= 1:
         return
-    if torch.cuda.is_current_stream_capturing():
-        return
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    capture_stream = _graph_capture_stream() if stream is None else stream
-    elems = _split_k_workspace_elems(m, n, split_k * block_k_warps)
-    _get_split_k_workspace(device, elems, capture_stream)
-    capture_stream.synchronize()
+    # Capture state is per device and `torch.cuda.Stream()` binds to whichever
+    # device is current, so resolve both under `device`: prewarming for a
+    # non-current device would otherwise test, and register the workspace on,
+    # some other device's stream.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return
+        capture_stream = _graph_capture_stream() if stream is None else stream
+        # Deliberately an upper bound rather than `_split_k_workspace_slots`:
+        # a prewarm that guesses the family wrong must over-allocate, never
+        # under-allocate, since under-allocating resurfaces as a hard error at
+        # capture time. small_m simply leaves the extra slots unused.
+        elems = _split_k_workspace_elems(m, n, split_k * block_k_warps)
+        _get_split_k_workspace(device, elems, capture_stream)
+        capture_stream.synchronize()
 
 
 @functools.lru_cache(maxsize=16384)
@@ -906,10 +938,7 @@ def _compile_flydsl_hgemm(
     # supplies the ordering (a dependency edge between two nodes inside a
     # captured graph); nothing is shared between blocks.
     is_split_k = split_k > 1
-    # Each slice-K warp group gets its own slot so its partial is reduced in
-    # fp32 too. small_m has no slice-K.
-    slice_k_slots = block_k_warps if kernel_family == KERNEL_FAMILY_HGEMM else 1
-    ws_slots = split_k * slice_k_slots
+    ws_slots = _split_k_workspace_slots(split_k, block_k_warps, kernel_family)
     # `_split_k_workspace_elems` is `slots * m * n`; only `m` varies per call, so
     # precompute the constant factor and keep the launcher to one multiply.
     ws_slots_n = ws_slots * n

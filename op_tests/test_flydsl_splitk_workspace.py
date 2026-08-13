@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import itertools
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import pandas as pd
@@ -87,7 +89,9 @@ class Case(NamedTuple):
     mnk: tuple[int, int, int]
     tiles: tuple[int, int, int]  # tile_m, tile_n, tile_k
     split_k: int
-    overrides: dict[str, Any] = {}  # noqa: RUF012 - read-only
+    # A NamedTuple default is shared by every instance that omits it, so make it
+    # actually immutable rather than relying on nobody mutating it.
+    overrides: Mapping[str, Any] = MappingProxyType({})
 
     @property
     def kernel(self) -> dict[str, Any]:
@@ -108,7 +112,10 @@ class Case(NamedTuple):
         return self.overrides.get("kernel_family") == "small_m"
 
 
-SMALL_M = {"kernel_family": "small_m"}
+# Shared by four cases below, so immutable for the same reason as the default.
+# `|` on a mappingproxy returns a plain dict (PEP 584), which is what the
+# per-case overrides want anyway.
+SMALL_M = MappingProxyType({"kernel_family": "small_m"})
 
 CASES = [
     Case("hgemm_m104_n384_k7168_spk8", (104, 384, 7168), (32, 64, 128), 8),

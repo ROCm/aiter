@@ -51,9 +51,13 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
-from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+from aiter.ops.flydsl.gemm_kernels import (
+    _split_k_workspace_slots,
+    get_flydsl_splitk_hgemm_kernel_params,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
+from aiter.ops.flydsl.kernels.splitk_reduce import compile_splitk_reduce_kernel
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
@@ -298,6 +302,26 @@ def _compile_hgemm_to_cache(
         _ptr_view_safe(workspace),
         stream,
     )
+
+    # A split-K config is two launches, not one: the main kernel above leaves
+    # fp32 partials in the workspace and the reduce kernel sums them into C.
+    # Precompiling only the first would still leave every split-K config JIT-ing
+    # on first use, which is the cost AOT exists to remove.
+    if split_k > 1:
+        reduce_exe = compile_splitk_reduce_kernel(
+            dtype,
+            n,
+            _split_k_workspace_slots(split_k, block_k_warps, kernel_family),
+            HAS_BIAS=has_bias,
+        )
+        _compile_executable_to_cache(
+            reduce_exe,
+            _ptr_view_safe(out),
+            _ptr_view_safe(workspace),
+            _ptr_view_safe(launch_bias),
+            m,
+            stream,
+        )
 
 
 def _compile_preshuffle_to_cache(
