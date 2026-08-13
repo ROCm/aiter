@@ -812,13 +812,17 @@ def flydsl_splitk_prewarm_capture_workspace(
 ) -> None:
     """Size the split-K fp32 workspace on the graph capture stream, before capture.
 
-    No-op when already capturing (too late to allocate) or for `split_k <= 1`
-    (that path never touches the workspace). Follows the opus precedent in
+    No-op when already capturing (too late to allocate), for `split_k <= 1`
+    (that path never touches the workspace), or when the buffer is already big
+    enough -- the steady state, so this is cheap to call per GEMM from dispatch.
+    Follows the opus precedent in
     `aiter/tuned_gemm.py::_opus_prewarm_capture_workspace`.
     """
     if split_k <= 1:
         return
-    if device is None:
+    # Resolve the index too: an index-less `cuda` device misses the cache lookup
+    # below and would sync on every call.
+    if device is None or device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     # Capture state is per device and `torch.cuda.Stream()` binds to whichever
     # device is current, so resolve both under `device`: prewarming for a
@@ -833,8 +837,13 @@ def flydsl_splitk_prewarm_capture_workspace(
         # under-allocate, since under-allocating resurfaces as a hard error at
         # capture time. small_m simply leaves the extra slots unused.
         elems = _split_k_workspace_elems(m, n, split_k * block_k_warps)
-        _get_split_k_workspace(device, elems, capture_stream)
-        capture_stream.synchronize()
+        before = _SPLIT_K_WS.get(device.index)
+        ws = _get_split_k_workspace(device, elems, capture_stream)
+        # Sync only when this call actually allocated: on the warm path there is
+        # nothing outstanding, and a host-side sync per GEMM would make this
+        # unusable from dispatch.
+        if ws is not before:
+            capture_stream.synchronize()
 
 
 @functools.lru_cache(maxsize=16384)
