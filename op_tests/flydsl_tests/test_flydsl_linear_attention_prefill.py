@@ -21,6 +21,9 @@ import triton
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.prefill_batch_metadata import (
+    build_gated_delta_rule_prefill_metadata,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -873,6 +876,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
     output_final_state=False,
     cu_seqlens=None,
     snapshot_dtype=None,
+    prefill_metadata=None,
 ):
     """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
 
@@ -914,6 +918,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
         use_exp2=False,
         g_head_major=True,
         snapshot_dtype=snapshot_dtype,
+        prefill_metadata=prefill_metadata,
     )
 
 
@@ -942,6 +947,24 @@ def _is_k5_kernel(name: str) -> bool:
     if any(name.startswith(p) for p in _K5_KERNEL_PREFIXES):
         return True
     return any(s in name for s in _K5_KERNEL_SUBSTRINGS)
+
+
+def _build_prefill_metadata(context_lens, cu_seqlens, chunk_size: int = 64):
+    """Prebuild the reusable GDR chunk schedule for a benchmarked shape.
+
+    Serving stacks build this once per forward pass and hand it to every GDR
+    kernel; benchmarks that skip it make each wrapper rediscover the chunk
+    counts with a blocking device-to-host copy. Returns None for the dense
+    (``cu_seqlens is None``) shapes, where the wrappers take the batch layout
+    straight from the tensor shapes.
+    """
+    if cu_seqlens is None:
+        return None
+    return build_gated_delta_rule_prefill_metadata(
+        list(context_lens),
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -1749,6 +1772,12 @@ def _run_perf_comparison(args: PrefillArgs):
     if g is not None:
         g_hm = g if args.g_head_major else g.transpose(1, 2).contiguous()
 
+    # Every backend takes the chunk schedule a serving stack builds once per
+    # forward pass. Without it the wrappers recover the chunk counts with a
+    # blocking chunk_offsets D2H, which stalls the launch stream and measures
+    # host behaviour the production path does not have.
+    metadata = _build_prefill_metadata(context_lens, cu)
+
     us_fly = _bench_fn(
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         k,
@@ -1760,6 +1789,7 @@ def _run_perf_comparison(args: PrefillArgs):
         cu_seqlens=cu,
         g_head_major=args.g_head_major,
         snapshot_dtype=args.snapshot_dtype,
+        prefill_metadata=metadata,
     )
     us_tri = _bench_fn(
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -1771,6 +1801,7 @@ def _run_perf_comparison(args: PrefillArgs):
         output_final_state=ofs,
         cu_seqlens=cu,
         snapshot_dtype=args.snapshot_dtype,
+        prefill_metadata=metadata,
     )
     if _HAS_HIP_K5 and _hip_k5_supported(args):
         us_hip = _bench_fn(
@@ -1783,6 +1814,7 @@ def _run_perf_comparison(args: PrefillArgs):
             output_final_state=ofs,
             cu_seqlens=cu,
             snapshot_dtype=args.snapshot_dtype,
+            prefill_metadata=metadata,
         )
     else:
         us_hip = float("nan")
