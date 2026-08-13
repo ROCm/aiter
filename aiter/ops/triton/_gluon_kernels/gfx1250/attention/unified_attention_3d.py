@@ -80,6 +80,7 @@ class AttentionConfig:
     Q_SCALES_SHARED_LAYOUT: gl.constexpr
     K_SHARED_LAYOUT: gl.constexpr
     V_SHARED_LAYOUT: gl.constexpr
+    KV_TOKEN_SCALES_SHARED_LAYOUT: gl.constexpr
     GATHER_BLOCKED_LAYOUT: gl.constexpr
 
     q_cache_modifier: gl.constexpr
@@ -100,6 +101,7 @@ class AttentionConfig:
     SCALE_K_WIDTH: gl.constexpr
     ALL_DECODE: gl.constexpr
     BLOCK_SCALES_SIZE: gl.constexpr
+    PER_TOKEN_KV_SCALE: gl.constexpr
 
     HEAD_SIZE_SPLIT: gl.constexpr
 
@@ -133,6 +135,7 @@ class AttentionConfig:
         K_WIDTH,
         SCALE_K_WIDTH,
         BLOCK_SCALES_SIZE,
+        PER_TOKEN_KV_SCALE,
     ):
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -152,6 +155,18 @@ class AttentionConfig:
         self.K_WIDTH = gl.constexpr(K_WIDTH)
         self.SCALE_K_WIDTH = gl.constexpr(SCALE_K_WIDTH)
         self.BLOCK_SCALES_SIZE = gl.constexpr(BLOCK_SCALES_SIZE)
+        self.PER_TOKEN_KV_SCALE = gl.constexpr(PER_TOKEN_KV_SCALE)
+        if PER_TOKEN_KV_SCALE:
+            # One fp32 scale per cached token, staged through LDS as a [1,
+            # BLOCK_SIZE] row next to its KV tile (see load_per_token_kv_scale).
+            assert KV_CACHE_DTYPE == "fp8"
+            assert SHUFFLED_KV_CACHE and NUM_BLOCKS_GATHER_PER_TILE == 1
+            assert TILE_SIZE == BLOCK_SIZE
+            self.KV_TOKEN_SCALES_SHARED_LAYOUT = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+            )
+        else:
+            self.KV_TOKEN_SCALES_SHARED_LAYOUT = gl.constexpr(None)
         # Derived constants
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
@@ -557,6 +572,18 @@ class AttentionConfig:
     #     return layout
 
 
+@gluon.jit
+def sanitize_per_token_kv_scale(scale):
+    """Zero non-finite per-token KV scales.
+
+    Cache slots past the sequence end are never written by the KV-insert kernel
+    and may hold garbage. Their scores are masked to -inf so p == 0, and
+    0 * inf == NaN would poison the accumulator -- a masked column must
+    contribute nothing instead. ``x * 0.0 == 0.0`` holds exactly for finite x.
+    """
+    return gl.where(scale * 0.0 == 0.0, scale, 0.0)
+
+
 @aggregate
 @strip_annotate
 class AttentionProgram:
@@ -704,6 +731,8 @@ class AttentionProgram:
         q,
         key_cache_ptr,
         value_cache_ptr,
+        k_token_scale_ptr,
+        v_token_scale_ptr,
         output_ptr,
         segm_max_ptr,
         segm_expsum_ptr,
@@ -877,6 +906,25 @@ class AttentionProgram:
                 layout=cfg.V_SHARED_LAYOUT,
             )
 
+        if cfg.PER_TOKEN_KV_SCALE:
+            # [num_blocks * NUM_KV_HEADS, BLOCK_SIZE] fp32, one row per KV page,
+            # addressed by the same (block, kv_head) row index as the KV tile.
+            # Contiguity (row stride == BLOCK_SIZE) is validated host-side.
+            k_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=k_token_scale_ptr,
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE),
+                strides=(cfg.BLOCK_SIZE, 1),
+                block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE),
+                layout=cfg.KV_TOKEN_SCALES_SHARED_LAYOUT,
+            )
+            v_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=v_token_scale_ptr,
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE),
+                strides=(cfg.BLOCK_SIZE, 1),
+                block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE),
+                layout=cfg.KV_TOKEN_SCALES_SHARED_LAYOUT,
+            )
+
         k_shared = gl.allocate_shared_memory(
             k_desc.dtype,
             [cfg.NUM_STAGES] + k_desc.block_shape,
@@ -899,6 +947,17 @@ class AttentionProgram:
                 v_scales_desc.dtype,
                 [cfg.NUM_STAGES] + v_scales_desc.block_shape,
                 layout=cfg.V_SHARED_LAYOUT,
+            )
+        elif cfg.PER_TOKEN_KV_SCALE:
+            k_scales_shared = gl.allocate_shared_memory(
+                k_scales_desc.dtype,
+                [cfg.NUM_STAGES] + k_scales_desc.block_shape,
+                layout=cfg.KV_TOKEN_SCALES_SHARED_LAYOUT,
+            )
+            v_scales_shared = gl.allocate_shared_memory(
+                v_scales_desc.dtype,
+                [cfg.NUM_STAGES] + v_scales_desc.block_shape,
+                layout=cfg.KV_TOKEN_SCALES_SHARED_LAYOUT,
             )
 
         # Calculate tile range
@@ -1277,6 +1336,36 @@ class AttentionProgram:
             )
 
     @gluon.jit
+    def tdm_shared_load_k_token_scale(
+        self, wait_count, buffer_id, LAYOUT: gl.constexpr
+    ):
+        """Per-token K descales of the current tile, as a [TILE_SIZE] fp32 vector.
+
+        ``LAYOUT`` is the column layout of the QK score tile, so the result
+        broadcasts straight onto ``S`` as ``scale[None, :]``.
+        """
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        scale = (
+            self.k_scales_shared.index(buffer_id)
+            .reshape([self.cfg.TILE_SIZE])
+            .load(layout=LAYOUT)
+        )
+        return sanitize_per_token_kv_scale(scale)
+
+    @gluon.jit
+    def tdm_shared_load_v_token_scale(
+        self, wait_count, buffer_id, LAYOUT: gl.constexpr
+    ):
+        """Per-token V descales of the current tile; multiplies the softmax p."""
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        scale = (
+            self.v_scales_shared.index(buffer_id)
+            .reshape([self.cfg.TILE_SIZE])
+            .load(layout=LAYOUT)
+        )
+        return sanitize_per_token_kv_scale(scale)
+
+    @gluon.jit
     def tdm_shared_load_k(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
@@ -1329,7 +1418,7 @@ class AttentionProgram:
                 gl.amd.gfx1250.tdm.async_load(
                     self.k_desc, offsets, self.k_shared.index(buffer_id)
                 )
-                if self.cfg.KV_CACHE_DTYPE == "nvfp4":
+                if self.cfg.KV_CACHE_DTYPE == "nvfp4" or self.cfg.PER_TOKEN_KV_SCALE:
                     gl.amd.gfx1250.tdm.async_load(
                         self.k_scales_desc,
                         offsets,
@@ -1366,7 +1455,7 @@ class AttentionProgram:
                 gl.amd.gfx1250.tdm.async_load(
                     self.v_desc, offsets, self.v_shared.index(buffer_id)
                 )
-                if self.cfg.KV_CACHE_DTYPE == "nvfp4":
+                if self.cfg.KV_CACHE_DTYPE == "nvfp4" or self.cfg.PER_TOKEN_KV_SCALE:
                     gl.amd.gfx1250.tdm.async_load(
                         self.v_scales_desc,
                         offsets,
@@ -1940,6 +2029,8 @@ def _unified_attention_gluon_kernel_3d(
     q_scale_ptr,  # [1, ], float32
     k_scale_ptr,  # [1, ], float32
     v_scale_ptr,  # [1, ], float32v
+    k_token_scale_ptr,  # [num_blks, num_kv_heads, blk_size], float32 or None
+    v_token_scale_ptr,  # [num_blks, num_kv_heads, blk_size], float32 or None
     out_scale_ptr,  # [1, ], float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
@@ -1993,6 +2084,7 @@ def _unified_attention_gluon_kernel_3d(
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
     assert num_stages == 2
+    PER_TOKEN_KV_SCALE: gl.constexpr = k_token_scale_ptr is not None
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
         HEAD_SIZE,
@@ -2022,6 +2114,7 @@ def _unified_attention_gluon_kernel_3d(
         K_WIDTH,
         SCALE_K_WIDTH,
         BLOCK_SCALES_SIZE,
+        PER_TOKEN_KV_SCALE,
     )
 
     # Workgroup offsets
@@ -2082,6 +2175,19 @@ def _unified_attention_gluon_kernel_3d(
 
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
+
+    # Per-token KV dequant scales: one fp32 per cached token instead of the
+    # single k_scale/v_scale folded into qk_factor/out_factor above. Used by
+    # dynamically per-token quantized fp8 KV caches (e.g. MiniMax-M3 sparse
+    # attention), where no scalar can stand in for the whole cache. K's scale
+    # rides on the score columns and V's on the softmax probabilities, so the
+    # fp8 tiles themselves are still consumed exactly as in the scalar path.
+    # The scales stage through LDS alongside their KV tile (a [TILE_SIZE] fp32
+    # column vector is far too scattered for a per-lane global load).
+    if PER_TOKEN_KV_SCALE:
+        assert k_token_scale_ptr is not None and v_token_scale_ptr is not None
+        assert k_scale_ptr is None and v_scale_ptr is None
+    kv_scale_layout: gl.constexpr = gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
@@ -2217,6 +2323,8 @@ def _unified_attention_gluon_kernel_3d(
         Q,
         key_cache_ptr,
         value_cache_ptr,
+        k_token_scale_ptr,
+        v_token_scale_ptr,
         segm_output_ptr,
         segm_max_ptr,
         segm_expsum_ptr,
@@ -2313,6 +2421,14 @@ def _unified_attention_gluon_kernel_3d(
             k_scales = pgm.tdm_shared_load_k_scales(
                 wait_count=2, buffer_id=buffer_id
             ).to(e4m3_dtype, bitcast=True)
+        elif PER_TOKEN_KV_SCALE:
+            # 4 TDM ops per tile (K, K scales, V, V scales) issued in that
+            # order, so the same wait counts as the nvfp4 path apply.
+            k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
+            k_tok_scale = pgm.tdm_shared_load_k_token_scale(
+                wait_count=2, buffer_id=buffer_id, LAYOUT=kv_scale_layout
+            )
+            k_scales = None
         else:
             k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
             k_scales = None
@@ -2321,7 +2437,13 @@ def _unified_attention_gluon_kernel_3d(
         pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
 
         S = pgm.compute_qk(k, q_scales, k_scales)
-        S = S * qk_factor
+        if PER_TOKEN_KV_SCALE:
+            # Fold the scalar qk_factor into the per-token K descale: the score
+            # tile still sees exactly one broadcast multiply, the extra work is
+            # one multiply over a TILE_SIZE vector.
+            S = S * (k_tok_scale * qk_factor)[None, :]
+        else:
+            S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
@@ -2352,6 +2474,18 @@ def _unified_attention_gluon_kernel_3d(
                     wait_count=4, buffer_id=buffer_id
                 ).to(e4m3_dtype, bitcast=True)
                 acc = pgm.compute_pv(p, v, v_scales, acc)
+        elif PER_TOKEN_KV_SCALE:
+            v = pgm.tdm_shared_load_v(wait_count=5, buffer_id=buffer_id)
+            v_tok_scale = pgm.tdm_shared_load_v_token_scale(
+                wait_count=4, buffer_id=buffer_id, LAYOUT=kv_scale_layout
+            )
+            # sum_n p[m,n] * v[n,d] * v_scale[n]: the per-token V descale cannot
+            # leave the sum, so it rides on p. Strictly after softmax_part1 --
+            # the softmax denominator L must see the unscaled probabilities.
+            # Reassign (never a temporary): a second live [BLOCK_M, TILE_SIZE]
+            # fp32 tile spills the register file at TILE_SIZE 128.
+            p = p * v_tok_scale[None, :]
+            acc = pgm.compute_pv(p, v, None, acc)
         else:
             v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
             v_scales = None
@@ -2371,11 +2505,20 @@ def _unified_attention_gluon_kernel_3d(
         k_scales = pgm.tdm_shared_load_k_scales(wait_count=2, buffer_id=buffer_id).to(
             e4m3_dtype, bitcast=True
         )
+    elif PER_TOKEN_KV_SCALE:
+        k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
+        k_tok_scale = pgm.tdm_shared_load_k_token_scale(
+            wait_count=2, buffer_id=buffer_id, LAYOUT=kv_scale_layout
+        )
+        k_scales = None
     else:
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         k_scales = None
     S = pgm.compute_qk(k, q_scales, k_scales)
-    S = S * qk_factor
+    if PER_TOKEN_KV_SCALE:
+        S = S * (k_tok_scale * qk_factor)[None, :]
+    else:
+        S = S * qk_factor
 
     S = pgm.apply_softcap(S)
     seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
@@ -2405,6 +2548,13 @@ def _unified_attention_gluon_kernel_3d(
                 wait_count=0, buffer_id=buffer_id
             ).to(e4m3_dtype, bitcast=True)
             acc = pgm.compute_pv(p, v, v_scales, acc)
+    elif PER_TOKEN_KV_SCALE:
+        v = pgm.tdm_shared_load_v(wait_count=1, buffer_id=buffer_id)
+        v_tok_scale = pgm.tdm_shared_load_v_token_scale(
+            wait_count=0, buffer_id=buffer_id, LAYOUT=kv_scale_layout
+        )
+        p = p * v_tok_scale[None, :]
+        acc = pgm.compute_pv(p, v, None, acc)
     else:
         v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=buffer_id)
         v_scales = None
