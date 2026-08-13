@@ -99,8 +99,6 @@ _STATE_BF16 = (False, True)
 _FIXED_SWITCHES: dict[str, bool] = {
     "use_g": True,
     "use_gk": False,
-    "use_h0": True,
-    "store_fs": True,
     "save_vn": True,
     "wu_contig": True,
     "g_head_major": True,
@@ -154,11 +152,11 @@ def _resolve_archs(row_arch: str | None) -> list[str]:
 def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     """Expand the tuned table into unique compile jobs.
 
-    Rows collapse to their distinct ``(arch, dtype, K, V, BT, H, Hg,
-    is_varlen)`` shapes -- the tuned table has one row per benchmarked batch
-    shape, and ``T_flat``/``N``/``total_chunks`` only steer the host launch
-    grid, not the compiled artifact. Each shape then fans out over every legal
-    BV and both dtype specializations.
+    Rows collapse to their distinct ``(arch, dtype, K, V, BT, H, Hg, is_varlen,
+    use_h0, store_fs)`` shapes -- the tuned table has one row per benchmarked
+    batch shape, and ``T_flat``/``N``/``total_chunks`` only steer the host
+    launch grid, not the compiled artifact. Each shape then fans out over every
+    legal BV and both dtype specializations.
 
     The fan-out lives here rather than in ``main`` so the wheel build, which
     reaches this module through ``run_aot`` -> ``parse_csv`` only, gets the
@@ -181,16 +179,20 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 H = int(row["H"])
                 Hg = int(row["Hg"])
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
+                use_h0 = _parse_bool(row.get("use_h0") or "True")
+                store_fs = _parse_bool(row.get("store_fs") or "True")
             except (KeyError, TypeError, ValueError) as e:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
             for arch in _resolve_archs(row.get("arch")):
-                shapes[(arch, dtype, K, V, BT, H, Hg, is_varlen)] = None
+                shapes[(arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = (
+                    None
+                )
 
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
-    for arch, dtype, K, V, BT, H, Hg, is_varlen in shapes:
+    for arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
         bvs = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
         if not bvs:
             print(f"  [WARN] no legal BV for V={V}, skipping shape in {csv_path}")
@@ -209,6 +211,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 "H": H,
                 "Hg": Hg,
                 "is_varlen": is_varlen,
+                "use_h0": use_h0,
+                "store_fs": store_fs,
                 "snapshot_bf16": snapshot_bf16,
                 "state_bf16": state_bf16,
                 **_FIXED_SWITCHES,

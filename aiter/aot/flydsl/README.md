@@ -68,8 +68,9 @@ python -m aiter.aot.flydsl.chunk_gdn_h_mfma16_hip --target-arch gfx942
 > from. Its csv
 > (`aiter/ops/flydsl/chunk_gdn_h_mfma16_hip_tuned.csv`) is also read at runtime
 > to pick BV, so it lists *measured batch shapes*, not compile configs. AOT
-> keeps only the distinct `(arch, dtype, K, V, BT, H, Hg)` shapes from it and
-> fans each out over every legal BV and both snapshot/state dtypes — batch
+> keeps only the distinct `(arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0,
+> store_fs)` shapes from it and fans each out over every legal BV and both
+> snapshot/state dtypes — batch
 > shapes absent from the table fall back to the runtime BV rule, which can pick
 > any tile, and none of them may hit the JIT. Rows are produced by
 > `op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`. A row with an

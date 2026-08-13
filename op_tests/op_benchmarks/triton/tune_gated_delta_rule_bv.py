@@ -209,11 +209,14 @@ def main():
         )
 
         if not args.only_improvements or best != rule:
+            # ``_build_k5_inputs`` always passes an initial state, so use_h0 is
+            # True for every measured row; store_fs follows the case.
             key = (
                 _GFX_ARCH,
                 case.H,
                 case.Hg,
                 case.is_varlen,
+                case.output_final_state,
                 snapshot_dtype is torch.bfloat16,
                 case.ssm_state_dtype is torch.bfloat16,
                 total_chunks,
@@ -221,7 +224,8 @@ def main():
             )
             emitted[key] = (
                 f"{case.model_name},{_GFX_ARCH},{case.dtype},{case.K},{case.V},"
-                f"{case.BT},{case.H},{case.Hg},{case.is_varlen},"
+                f"{case.BT},{case.H},{case.Hg},{case.is_varlen},True,"
+                f"{case.output_final_state},"
                 f"{snapshot_dtype is torch.bfloat16},"
                 f"{case.ssm_state_dtype is torch.bfloat16},{T_flat},{N},"
                 f"{total_chunks},{max_seq_chunks},{best},{times[best]:.1f}"
