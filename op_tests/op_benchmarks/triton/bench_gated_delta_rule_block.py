@@ -10,8 +10,13 @@ measurement three ways:
 
 * wall time -- the host-visible block latency (median of CUDA-event timings),
 * device time per stage -- profiler self time bucketed into K1..K6,
-* host gap -- wall minus device total, i.e. launch overhead and any host
-  stall a wrapper introduces.
+* launch only -- the python-side cost of one call, measured without syncing,
+* host gap -- wall minus device total.
+
+`launch only` is what reads the host gap: it is a floor on wall time, so a
+shape whose device work sits below it is launch bound and the gap is that
+shortfall. A gap above `launch only` instead means a wrapper stalled the
+stream, which is what the metadata=None runs below show.
 
 Shapes are the ``PrefillArgs`` cases from the K5 test suite
 (``op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py``), selected by
@@ -33,8 +38,12 @@ python bench_gated_delta_rule_block.py
 # List the case ids this benchmark can run
 python bench_gated_delta_rule_block.py --list-cases
 
-# Any subset of the suite, matched as regexes against the case ids
-python bench_gated_delta_rule_block.py --case "varlen-qwen3.5-397b.*mnbt8192_"
+# Any subset of the suite, matched as regexes against the case ids. Case ids
+# start with the PrefillGroup name, so a prefix runs that group's whole sweep,
+# and several patterns run several groups; more than one case adds a
+# cross-case summary table (--summary-only drops the per-case ones).
+python bench_gated_delta_rule_block.py --summary-only \
+    --case "^varlen-qwen-ali-tp1-" "^varlen-qwen3.5-397b-ptpc-ali-"
 
 # Quantify what skipping the prebuilt chunk schedule costs
 python bench_gated_delta_rule_block.py --without-metadata
@@ -48,7 +57,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import re
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -92,7 +103,7 @@ STAGES = [
     "K6 output",
     "other",
 ]
-TOTALS = ["kernel total", "wall total", "host gap"]
+TOTALS = ["kernel total", "wall total", "launch only", "host gap"]
 
 DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
@@ -226,6 +237,27 @@ def _bench_wall_us(run, warmup_iters, bench_iters):
     return times[len(times) // 2]
 
 
+def _bench_launch_us(run, warmup_iters, bench_iters):
+    """Median python-side cost of one block call, measured without syncing.
+
+    The device stays behind the host here, so this is what the host needs to
+    enqueue the block: dispatch, allocations and the kernel launches. It is a
+    floor on wall time -- a shape whose device work is below it is launch
+    bound, and the wall-minus-device gap is that shortfall rather than a stall
+    inside a wrapper.
+    """
+    for _ in range(warmup_iters):
+        run()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(bench_iters):
+        start = time.perf_counter()
+        run()
+        times.append((time.perf_counter() - start) * 1e6)
+    torch.cuda.synchronize()
+    return statistics.median(times)
+
+
 def _profile_kernels_us(run, warmup_iters, prof_iters):
     for _ in range(warmup_iters):
         run()
@@ -248,12 +280,14 @@ def _measure(run, args):
     run()
     torch.cuda.synchronize()
     wall_us = _bench_wall_us(run, args.warmup_iters, args.bench_iters)
+    launch_us = _bench_launch_us(run, args.warmup_iters, args.bench_iters)
     per_kernel = _profile_kernels_us(run, args.warmup_iters, args.prof_iters)
     row = {stage: 0.0 for stage in STAGES}
     for name, us in per_kernel.items():
         row[_stage_of(name)] += us
     row["kernel total"] = sum(per_kernel.values())
     row["wall total"] = wall_us
+    row["launch only"] = launch_us
     row["host gap"] = wall_us - row["kernel total"]
     return row, per_kernel
 
@@ -287,18 +321,72 @@ def _select_cases(cases, patterns):
     return selected
 
 
+def _print_summary(records, metrics):
+    """Cross-case view: one table per metric, cases down, configs across.
+
+    A case contributes one row per snapshot dtype, so the columns stay dense
+    when a sweep mixes bf16 and fp32 groups (the case id already carries the
+    shape, the snapshot policy does not fit in it). Each non-HIP backend also
+    gets a speedup-vs-HIP column, >1 meaning that backend is the faster one.
+    """
+    columns, row_keys, cells = [], [], {}
+    for rec in records:
+        if rec["column"] not in columns:
+            columns.append(rec["column"])
+        row_key = (rec["case"], rec["snap"])
+        if row_key not in row_keys:
+            row_keys.append(row_key)
+        cells[(row_key, rec["column"])] = rec["row"]
+
+    # (ratio column, numerator column, denominator column) for every backend
+    # timed against HIP under the same metadata variant.
+    ratios = []
+    for column in columns:
+        backend, _, meta = column.partition(" ")
+        hip_column = f"hip {meta}"
+        if backend != "hip" and hip_column in columns:
+            ratios.append((f"{backend[:3]}/hip {meta}", hip_column, column))
+
+    case_width = max(len(case_id) for case_id, _ in row_keys) + 2
+    col_width = max(12, max(len(column) for column, _, _ in ratios) + 2)
+    col_width = max(col_width, max(len(column) for column in columns) + 2)
+    for metric in metrics:
+        header = f"{metric + ' (us)':<{case_width}}{'snap':>6}"
+        header += "".join(f"{column:>{col_width}}" for column in columns)
+        header += "".join(f"{column:>{col_width}}" for column, _, _ in ratios)
+        print(f"\n{header}")
+        print("-" * len(header))
+        for row_key in row_keys:
+            case_id, snap = row_key
+            line = f"{case_id:<{case_width}}{snap:>6}"
+            for column in columns:
+                row = cells.get((row_key, column))
+                line += f"{row[metric]:{col_width}.1f}" if row else "-".rjust(col_width)
+            for _, hip_column, column in ratios:
+                hip_row = cells.get((row_key, hip_column))
+                row = cells.get((row_key, column))
+                # host gap goes to zero (and through it, on jitter), so a ratio
+                # there would be noise rather than a speedup.
+                if hip_row is None or row is None or row[metric] <= 0.0:
+                    line += "-".rjust(col_width)
+                else:
+                    line += f"{hip_row[metric] / row[metric]:{col_width - 1}.2f}x"
+            print(line)
+
+
 def _run_case(case_id, case, args):
     if not case.use_g:
         # The suite's no-g cases exercise K5's padding masking directly; the
         # block entry always cumsums a gate, so there is no g=None path here.
         print(f"\n== {case_id}\nskipped: the block entry requires g")
-        return
+        return []
 
     tensors = _build_inputs(case, args.seed)
     metadata_variants = [("meta", tensors["metadata"])]
     if args.without_metadata and tensors["metadata"] is not None:
         metadata_variants.append(("no-meta", None))
 
+    records = []
     labels, rows, per_kernel_rows = [], {}, {}
     for backend in args.backends:
         for dtype_name in args.snapshot_dtype:
@@ -315,15 +403,24 @@ def _run_case(case_id, case, args):
                 label = f"{backend} {snapshot_name} {meta_name}"
                 labels.append(label)
                 rows[label], per_kernel_rows[label] = _measure(run, args)
+                records.append(
+                    {
+                        "case": case_id,
+                        "snap": snapshot_name,
+                        "column": f"{backend} {meta_name}",
+                        "row": rows[label],
+                    }
+                )
 
-    print(f"\n== {case_id}")
-    print(
-        f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} "
-        f"{'varlen' if case.is_varlen else f'dense B={case.dense_batch}'}, "
-        f"T={tensors['total_tokens']} ({tensors['num_seqs']} seqs), "
-        f"final_state={'on' if case.output_final_state else 'off'}"
-    )
-    _print_table(labels, rows)
+    if not args.summary_only:
+        print(f"\n== {case_id}")
+        print(
+            f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} "
+            f"{'varlen' if case.is_varlen else f'dense B={case.dense_batch}'}, "
+            f"T={tensors['total_tokens']} ({tensors['num_seqs']} seqs), "
+            f"final_state={'on' if case.output_final_state else 'off'}"
+        )
+        _print_table(labels, rows)
 
     if args.show_kernels:
         print("\n-- per-kernel device time (us)")
@@ -331,6 +428,8 @@ def _run_case(case_id, case, args):
             print(f"   {label}")
             for name, us in sorted(per_kernel_rows[label].items(), key=lambda x: -x[1]):
                 print(f"     {us:8.1f}  [{_stage_of(name)}]  {name[:100]}")
+
+    return records
 
 
 def main() -> None:
@@ -372,6 +471,18 @@ def main() -> None:
         action="store_true",
         help="Print the per-kernel device times behind the stage buckets.",
     )
+    parser.add_argument(
+        "--summary-metrics",
+        nargs="+",
+        choices=STAGES + TOTALS,
+        default=["wall total", "K5 state scan", "host gap"],
+        help="Metrics tabulated across cases when more than one case runs.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print only the cross-case summary, not the per-case stage tables.",
+    )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--bench-iters", type=int, default=50)
     parser.add_argument("--prof-iters", type=int, default=20)
@@ -387,11 +498,16 @@ def main() -> None:
     props = torch.cuda.get_device_properties(0)
     print(f"\ngfx={props.gcnArchName} CUs={props.multi_processor_count}")
     print(
-        f"wall = median of {args.bench_iters} CUDA-event timings; "
-        f"device = {args.prof_iters}-iter profiler self time"
+        f"wall / launch = median of {args.bench_iters} CUDA-event / unsynced "
+        f"host timings; device = {args.prof_iters}-iter profiler self time"
     )
-    for case_id, case in _select_cases(cases, args.case):
-        _run_case(case_id, case, args)
+    selected = _select_cases(cases, args.case)
+    records = []
+    for case_id, case in selected:
+        records += _run_case(case_id, case, args)
+
+    if records and (len(selected) > 1 or args.summary_only):
+        _print_summary(records, args.summary_metrics)
 
 
 if __name__ == "__main__":
