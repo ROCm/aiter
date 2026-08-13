@@ -2121,6 +2121,7 @@ void opus_moe_dw2_bwd(aiter_tensor_t& d_out,
 template<bool Validate>
 void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                             aiter_tensor_t& x,
+                            aiter_tensor_t& x_dw1,
                             aiter_tensor_t& z,
                             aiter_tensor_t& w1,
                             aiter_tensor_t& w2,
@@ -2149,6 +2150,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
     {
         check_down_tensor(d_out, "d_out", 2, AITER_DTYPE_bf16, "bfloat16");
         check_down_tensor(x, "x", 2, AITER_DTYPE_bf16, "bfloat16");
+        check_down_tensor(
+            x_dw1, "x_dw1", 2, AITER_DTYPE_bf16, "bfloat16");
         check_down_tensor(z, "z", 2, AITER_DTYPE_bf16, "bfloat16");
         check_down_tensor(w1, "w1", 3, AITER_DTYPE_bf16, "bfloat16");
         check_down_tensor(w2, "w2", 3, AITER_DTYPE_bf16, "bfloat16");
@@ -2186,6 +2189,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         check_down_tensor(d_w2, "d_w2", 3, AITER_DTYPE_bf16, "bfloat16");
 
         check_down_same_device(d_out, x, "x");
+        check_down_same_device(d_out, x_dw1, "x_dw1");
         check_down_same_device(d_out, z, "z");
         check_down_same_device(d_out, w1, "w1");
         check_down_same_device(d_out, w2, "w2");
@@ -2252,6 +2256,14 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         AITER_CHECK(z.size(0) == sorted_capacity &&
                         z.size(1) == gate_up_dim,
                     "z must have shape [sorted_capacity,2I]");
+        const bool uses_sorted_x = dw1_kernel_id == 14;
+        AITER_CHECK(x_dw1.size(0) ==
+                            (uses_sorted_x ? sorted_capacity : token_num) &&
+                        x_dw1.size(1) == model_dim,
+                    uses_sorted_x
+                        ? "x_dw1 must have shape [sorted_capacity,D] for "
+                          "the direct sorted-X K4 kernel"
+                        : "x_dw1 must have shape [T,D] for token-gather K4");
         AITER_CHECK(d_z.size(0) == sorted_capacity &&
                         d_z.size(1) == gate_up_dim,
                     "d_z must have shape [sorted_capacity,2I]");
@@ -2367,14 +2379,14 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
     reduce_args.stride_dx_t = d_x.stride(0);
 
     opus_moe_backward::Dw1Kargs dw1_args{};
-    dw1_args.x = reinterpret_cast<const hip_bfloat16*>(x.data_ptr());
+    dw1_args.x = reinterpret_cast<const hip_bfloat16*>(x_dw1.data_ptr());
     dw1_args.d_z = reinterpret_cast<const hip_bfloat16*>(d_z.data_ptr());
     dw1_args.route = route;
     dw1_args.d_w1 = reinterpret_cast<hip_bfloat16*>(d_w1.data_ptr());
     dw1_args.model_dim = model_dim;
     dw1_args.inter_dim = inter_dim;
     dw1_args.split_k = 1;
-    dw1_args.stride_x_t = x.stride(0);
+    dw1_args.stride_x_t = x_dw1.stride(0);
     dw1_args.stride_dz_r = d_z.stride(0);
     dw1_args.stride_dw1_e = d_w1.stride(0);
     dw1_args.stride_dw1_i = d_w1.stride(1);
@@ -2434,6 +2446,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
 
 void opus_moe_full_bwd(aiter_tensor_t& d_out,
                        aiter_tensor_t& x,
+                       aiter_tensor_t& x_dw1,
                        aiter_tensor_t& z,
                        aiter_tensor_t& w1,
                        aiter_tensor_t& w2,
@@ -2460,6 +2473,7 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
 {
     opus_moe_full_bwd_impl<true>(d_out,
                                  x,
+                                 x_dw1,
                                  z,
                                  w1,
                                  w2,
@@ -2487,6 +2501,7 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
 
 void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
                                aiter_tensor_t& x,
+                               aiter_tensor_t& x_dw1,
                                aiter_tensor_t& z,
                                aiter_tensor_t& w1,
                                aiter_tensor_t& w2,
@@ -2513,6 +2528,7 @@ void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
 {
     opus_moe_full_bwd_impl<false>(d_out,
                                   x,
+                                  x_dw1,
                                   z,
                                   w1,
                                   w2,

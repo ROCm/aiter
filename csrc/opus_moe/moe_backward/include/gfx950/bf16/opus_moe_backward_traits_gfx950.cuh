@@ -623,6 +623,17 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchADoubleLds
     static constexpr bool PREFETCH_REDUCTION_A = true;
 };
 
+// Optional forward-state instance for an expert-sorted X cache.  It retains
+// production kid 13's output/reduction geometry and replaces per-CTA route
+// decoding plus token-major gathers with direct sorted-row reads.  Every
+// sorter-padding row in the cache must be exact zero because K4 reduces the
+// full padded expert interval.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchASortedXDoubleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchADoubleLds
+{
+    static constexpr bool SORTED_B_ROWS = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

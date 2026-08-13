@@ -97,6 +97,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` wide/long wave8 baseline | 10 | `BM256 x BN128 x BK32`, 512 threads + shared gathered-X tile |
 | K4 `dw1` wide/long production | 11 | `BM256 x BN128 x BK32`, 256 threads + eight native C tiles per wave |
 | K4 `dw1` long-reduction production | 13 | kid 11 geometry + reverse cohort4 + A-fragment prefetch |
+| K4 `dw1` forward-saved sorted-X | 14 | kid 13 geometry + direct padded sorted-row X reads |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
@@ -166,6 +167,14 @@ For average padded intervals of at least 3072 routes with `I <= 1024`, kid 13
 retains the reverse-cohort4 schedule and prefetches the second K16 dZ operand
 fragment before the first fragment's MFMA.  The narrower A-only prefetch hides
 part of the LDS latency without carrying the second X fragment early.
+Forward may optionally preserve `x[token]` in the same padded expert-sorted
+row domain as `dZ`.  Kid 14 then removes K4's repeated route decode and
+token-major X gather while retaining kid 13's generic geometry policy.  The
+cache is `[sorted_capacity,D]` BF16 and every sorter-padding row must be exact
+zero.  It is forward-owned: constructing it as a standalone backward gather
+costs more than the K4 saving.  On the target shape it occupies about 1.08 GB.
+Auto selects it only when kid 13's long-reduction, `I <= 1024`, and BM256
+output-grid conditions hold; explicit kid 14 remains a tuning override.
 
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output

@@ -194,6 +194,89 @@ def _validate_saved_a_scaled(
         raise ValueError("saved_a_scaled must be contiguous on the common device")
 
 
+def _validate_saved_x_sorted(
+    saved_x_sorted: Tensor,
+    sorted_capacity: int,
+    model_dim: int,
+    device: torch.device,
+) -> None:
+    """Validate an optional forward-saved padded expert-sorted X cache.
+
+    Live row ``r`` must contain ``x[token(r)]`` in BF16.  Unlike the ordinary
+    gather path, the direct sorted-row K4 kernel also consumes padded reduction
+    rows, so the producer must materialize every padding row as exact zero.
+    """
+
+    if saved_x_sorted.dtype != torch.bfloat16:
+        raise TypeError("saved_x_sorted must be BF16")
+    if saved_x_sorted.shape != (sorted_capacity, model_dim):
+        raise ValueError(
+            "saved_x_sorted must have shape [sorted_capacity,D]"
+        )
+    if saved_x_sorted.device != device or not saved_x_sorted.is_contiguous():
+        raise ValueError(
+            "saved_x_sorted must be contiguous on the common device"
+        )
+
+
+def _select_saved_x_dw1_kernel(
+    gate_up_dim: int,
+    model_dim: int,
+    sorted_capacity: int,
+    num_experts: int,
+    kernel_id: int,
+) -> int:
+    """Select direct sorted-X K4 from the production grouped-GEMM geometry.
+
+    The cache-backed instance shares kid 13's BM256xBN128xBK32 output tile,
+    reverse cohort-4 schedule, and register/LDS footprint.  Auto therefore
+    uses the same long-reduction and output-grid crossover instead of a model
+    tuple.  An explicit kid 14 remains available to benchmark new families.
+    """
+
+    if gate_up_dim % 256 != 0 or model_dim % 128 != 0:
+        raise ValueError(
+            "saved_x_sorted K4 requires 2I divisible by 256 and D by 128"
+        )
+    if kernel_id not in (-1, 14):
+        raise ValueError(
+            "saved_x_sorted currently supports auto or K4 kernel_id=14"
+        )
+    if kernel_id == 14:
+        return 14
+
+    if num_experts < 2:
+        raise ValueError(
+            "saved_x_sorted auto requires at least two experts; use "
+            "kernel_id=14 only for explicit tuning"
+        )
+    average_padded_routes = sorted_capacity // num_experts
+    inter_dim = gate_up_dim // 2
+    output_tiles = (
+        num_experts * (gate_up_dim // 256) * (model_dim // 128)
+    )
+    compact_full_residency_grid = (
+        1024 <= output_tiles < 1536 and output_tiles % 512 == 0
+    )
+    if not (
+        average_padded_routes >= 3072
+        and inter_dim <= 1024
+        and (output_tiles >= 1536 or compact_full_residency_grid)
+    ):
+        raise ValueError(
+            "saved_x_sorted auto requires the production long-reduction "
+            "BM256 K4 geometry; use kernel_id=14 only for explicit tuning"
+        )
+    return 14
+
+
+def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
+    """Keep the direct-row K4 instance away from token-major X."""
+
+    if int(kernel_id) == 14:
+        raise ValueError("K4 kernel_id=14 requires saved_x_sorted")
+
+
 @dataclass(frozen=True)
 class OpusMoeWeightBackwardOutput:
     d_w1: Tensor
@@ -474,6 +557,7 @@ def _opus_moe_dw2_bwd_raw(
 def _gen_opus_moe_full_bwd_fake_tensors(
     d_out: Tensor,
     x: Tensor,
+    x_dw1: Tensor,
     z: Tensor,
     w1: Tensor,
     w2: Tensor,
@@ -504,6 +588,7 @@ def _gen_opus_moe_full_bwd_fake_tensors(
 def _opus_moe_full_bwd_raw(
     d_out: Tensor,
     x: Tensor,
+    x_dw1: Tensor,
     z: Tensor,
     w1: Tensor,
     w2: Tensor,
@@ -539,6 +624,7 @@ def _opus_moe_full_bwd_raw(
 def _opus_moe_full_bwd_trusted_raw(
     d_out: Tensor,
     x: Tensor,
+    x_dw1: Tensor,
     z: Tensor,
     w1: Tensor,
     w2: Tensor,
@@ -1028,6 +1114,7 @@ def opus_moe_weight_backward(
         raise ValueError("K4 requires 2I%32==0 and D%128==0")
     if model_dim % 32 != 0 or inter_dim % 128 != 0:
         raise ValueError("K5 requires D%32==0 and I%128==0")
+    _reject_sorted_x_dw1_without_cache(dw1_kernel_id)
 
     num_experts = expert_padded_offsets.numel() - 1
     d_w1 = torch.empty(
@@ -1068,8 +1155,15 @@ def opus_moe_dw1_backward(
     topk: int,
     block_m: int,
     kernel_id: int = -1,
+    saved_x_sorted: Tensor | None = None,
 ) -> Tensor:
-    """Launch K4 only, allowing the up Function to prune K5."""
+    """Launch K4 only, allowing the up Function to prune K5.
+
+    ``saved_x_sorted`` may carry the forward input in padded expert-sorted
+    route order.  Padding rows must be exact zero.  This removes K4's repeated
+    token decode and random gather while leaving the default token-major path
+    unchanged.
+    """
 
     if x.dtype != torch.bfloat16 or d_z_sorted.dtype != torch.bfloat16:
         raise TypeError("Opus K4 currently requires BF16 x and d_z_sorted")
@@ -1098,6 +1192,21 @@ def opus_moe_dw1_backward(
         raise ValueError("the first K4 instance requires block_m=32")
     if gate_up_dim % 32 != 0 or model_dim % 128 != 0:
         raise ValueError("K4 requires 2I%32==0 and D%128==0")
+    x_dw1 = x
+    if saved_x_sorted is not None:
+        _validate_saved_x_sorted(
+            saved_x_sorted, sorted_capacity, model_dim, x.device
+        )
+        kernel_id = _select_saved_x_dw1_kernel(
+            gate_up_dim,
+            model_dim,
+            sorted_capacity,
+            expert_padded_offsets.numel() - 1,
+            int(kernel_id),
+        )
+        x_dw1 = saved_x_sorted
+    else:
+        _reject_sorted_x_dw1_without_cache(kernel_id)
 
     d_w1 = torch.empty(
         (expert_padded_offsets.numel() - 1, gate_up_dim, model_dim),
@@ -1105,7 +1214,7 @@ def opus_moe_dw1_backward(
         device=x.device,
     )
     _opus_moe_dw1_bwd_raw(
-        x,
+        x_dw1,
         d_z_sorted,
         sorted_token_ids,
         num_valid_ids,
@@ -1473,6 +1582,7 @@ def opus_moe_backward(
     db1_kernel_id: int = -1,
     bias_kernel_id: int = -1,
     saved_a_scaled: Tensor | None = None,
+    saved_x_sorted: Tensor | None = None,
 ) -> OpusMoeBackwardOutput:
     """Run the complete checked fixed-top-k K1--K5 backward chain.
 
@@ -1481,12 +1591,19 @@ def opus_moe_backward(
     sorting metadata and contain ``route_weight * SwiGLU(z_sorted)`` for each
     routed row; sorter padding rows are ignored.  The cache is treated as
     non-differentiable because K1 still computes dZ and dScore explicitly.
+
+    A BF16 ``saved_x_sorted=[sorted_capacity,D]`` may independently preserve
+    the forward input in expert-sorted route order.  Its live rows must equal
+    ``x[token]`` and every sorter-padding row must be exact zero.  K4 then reads
+    both operands by sorted row instead of repeating token decode and gather.
     """
 
     if not isinstance(metadata, OpusMoeFixedMetadata):
         raise TypeError("opus_moe_backward requires OpusMoeFixedMetadata")
-    token_num, model_dim, _, inter_dim = _validate_common_backward_contract(
-        d_out, x, z_sorted, w1, w2, route_weights, metadata, b1, b2
+    token_num, model_dim, num_experts, inter_dim = (
+        _validate_common_backward_contract(
+            d_out, x, z_sorted, w1, w2, route_weights, metadata, b1, b2
+        )
     )
     sorted_capacity = metadata.sorted_token_ids.numel()
     if saved_a_scaled is not None:
@@ -1500,6 +1617,21 @@ def opus_moe_backward(
             metadata.expert_padded_offsets,
             down_kernel_id,
         )
+    x_dw1 = x
+    if saved_x_sorted is not None:
+        _validate_saved_x_sorted(
+            saved_x_sorted, sorted_capacity, model_dim, x.device
+        )
+        dw1_kernel_id = _select_saved_x_dw1_kernel(
+            2 * inter_dim,
+            model_dim,
+            sorted_capacity,
+            num_experts,
+            int(dw1_kernel_id),
+        )
+        x_dw1 = saved_x_sorted
+    else:
+        _reject_sorted_x_dw1_without_cache(dw1_kernel_id)
     down_block_n = _select_fixed_down_block_n(
         inter_dim,
         metadata.sorted_expert_ids,
@@ -1533,6 +1665,7 @@ def opus_moe_backward(
     _opus_moe_full_bwd_raw(
         d_out,
         x,
+        x_dw1,
         z_sorted,
         w1,
         w2,
@@ -1612,6 +1745,8 @@ def _varlen_up_backward(
     dw1_kernel_id: int = -1,
     bias_kernel_id: int = -1,
 ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+    if compute_dw1:
+        _reject_sorted_x_dw1_without_cache(dw1_kernel_id)
     d_x_route = torch.empty(
         (metadata.route_to_token.numel(), x.shape[1]),
         device=x.device,
@@ -1812,10 +1947,17 @@ class _OpusMoeUpProjectionFunction(torch.autograd.Function):
         w1: Tensor,
         metadata: OpusMoeFixedMetadata | OpusMoeVarlenMetadata,
         b1: Tensor | None,
+        saved_x_sorted: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
         del b1
-        ctx.save_for_backward(x, w1)
+        saved_x = (
+            saved_x_sorted
+            if saved_x_sorted is not None
+            else x.new_empty((0, 0))
+        )
+        ctx.save_for_backward(x, w1, saved_x)
         ctx.opus_metadata = metadata
+        ctx.has_saved_x_sorted = saved_x_sorted is not None
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(a_sorted)
         return a_sorted, z_sorted
@@ -1824,7 +1966,7 @@ class _OpusMoeUpProjectionFunction(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_a_sorted: Tensor | None, grad_z_sorted: Tensor | None):
         del grad_a_sorted
-        x, w1 = ctx.saved_tensors
+        x, w1, saved_x_sorted = ctx.saved_tensors
         metadata = ctx.opus_metadata
         need_dx = ctx.needs_input_grad[2]
         need_dw1 = ctx.needs_input_grad[3]
@@ -1872,6 +2014,9 @@ class _OpusMoeUpProjectionFunction(torch.autograd.Function):
                         metadata.expert_padded_offsets,
                         topk=topk,
                         block_m=metadata.block_m,
+                        saved_x_sorted=(
+                            saved_x_sorted if ctx.has_saved_x_sorted else None
+                        ),
                     )
                 if need_db1:
                     d_b1 = opus_moe_db1_backward(
@@ -1883,7 +2028,7 @@ class _OpusMoeUpProjectionFunction(torch.autograd.Function):
                         topk=topk,
                         block_m=metadata.block_m,
                     )
-        return None, None, d_x, d_w1, None, d_b1
+        return None, None, d_x, d_w1, None, d_b1, None
 
 
 class _OpusMoeDownProjectionFunction(torch.autograd.Function):
@@ -2004,6 +2149,7 @@ def opus_moe_attach_backward(
     b1: Tensor | None = None,
     b2: Tensor | None = None,
     saved_a_scaled: Tensor | None = None,
+    saved_x_sorted: Tensor | None = None,
 ) -> Tensor:
     """Attach native backward to saved tensors produced by an Opus forward.
 
@@ -2012,6 +2158,8 @@ def opus_moe_attach_backward(
     metadata used to produce them.  It may also pass the non-differentiable
     BF16 ``saved_a_scaled=route_weight*SwiGLU(z_sorted)`` cache in the same
     expert-sorted route-major layout; sorter padding rows are ignored.
+    ``saved_x_sorted`` may similarly preserve ``x[token]`` in padded sorted
+    order, but its padding rows must be exact zero because K4 reduces them.
     """
 
     _validate_attach_contract(
@@ -2028,8 +2176,19 @@ def opus_moe_attach_backward(
             w2.shape[2],
             x.device,
         )
+    if saved_x_sorted is not None:
+        if isinstance(metadata, OpusMoeVarlenMetadata):
+            raise ValueError(
+                "saved_x_sorted fast path currently supports fixed top-k"
+            )
+        _validate_saved_x_sorted(
+            saved_x_sorted,
+            metadata.sorted_token_ids.numel(),
+            x.shape[1],
+            x.device,
+        )
     attached_a, attached_z = _OpusMoeUpProjectionFunction.apply(
-        a_sorted, z_sorted, x, w1, metadata, b1
+        a_sorted, z_sorted, x, w1, metadata, b1, saved_x_sorted
     )
     return _OpusMoeDownProjectionFunction.apply(
         out,

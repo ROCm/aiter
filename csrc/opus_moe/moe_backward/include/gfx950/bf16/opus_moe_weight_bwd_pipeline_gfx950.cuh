@@ -174,6 +174,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::SWAP_ROUTE_SOURCES;
         return false;
     }();
+    constexpr bool sorted_b_rows = []() constexpr {
+        if constexpr(requires { T::SORTED_B_ROWS; })
+            return T::SORTED_B_ROWS;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -192,6 +197,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert(!split_b_n64 ||
                       (BN == 128 && T::BLOCK_SIZE == 256),
                   "split-B K4 requires a four-wave BN128 tile");
+    static_assert(!sorted_b_rows || (split_b_n64 && !swap_route_sources),
+                  "sorted-B K4 requires the split-B dW1 load path");
     int expert;
     int output_m_base;
     int output_n_base;
@@ -287,8 +294,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const D_B* b = reinterpret_cast<const D_B*>(kargs.b);
     const int a_rows = swap_route_sources ? kargs.route.token_num
                                           : kargs.route.sorted_capacity;
-    const int b_rows = swap_route_sources ? kargs.route.sorted_capacity
-                                          : kargs.route.token_num;
+    const int b_rows = sorted_b_rows
+                           ? kargs.route.sorted_capacity
+                           : (swap_route_sources
+                                  ? kargs.route.sorted_capacity
+                                  : kargs.route.token_num);
     const unsigned int a_bytes = static_cast<unsigned int>(
         static_cast<unsigned long long>(a_rows) *
         static_cast<unsigned long long>(kargs.stride_a_row) * sizeof(D_A));
@@ -360,7 +370,14 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         int token_a;
         int token_b0 = 0;
         int token_b1 = 0;
-        if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+        if constexpr(sorted_b_rows)
+        {
+            // A forward-saved sorted-X cache has the same padded row domain as
+            // dZ.  Padding rows are materialized as zero, so K4 can consume
+            // both operands without decoding token IDs in every output CTA.
+            token_a = a_sorted_row;
+        }
+        else if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
         {
             token_a = weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
                 kargs.route, a_sorted_row, true);
@@ -384,18 +401,22 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                            kPackedTokenMask;
             }
         }
-        const int source_a = token_a < kargs.route.token_num
+        const int source_a = sorted_b_rows
                                  ? a_sorted_row
-                                 : kargs.route.sorted_capacity;
+                                 : (token_a < kargs.route.token_num
+                                        ? a_sorted_row
+                                        : kargs.route.sorted_capacity);
         const int source_b0 = token_b0 < kargs.route.token_num
                                   ? token_b0
                                   : kargs.route.token_num;
         const int source_b1 = token_b1 < kargs.route.token_num
                                   ? token_b1
                                   : kargs.route.token_num;
-        const int source_b_split = token_a < kargs.route.token_num
-                                       ? token_a
-                                       : kargs.route.token_num;
+        const int source_b_split = sorted_b_rows
+                                       ? a_sorted_row
+                                       : (token_a < kargs.route.token_num
+                                              ? token_a
+                                              : kargs.route.token_num);
         if constexpr(swap_route_sources)
         {
             static_assert(split_b_n64,
