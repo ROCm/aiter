@@ -13,10 +13,7 @@ import triton.profiler as proton
 
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-    get_gluon_a8w4_ctas_per_cga,
-    moe_gemm_a8w4,
-)
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -307,11 +304,7 @@ def bench_mlp_single_weight_init(
         logits = gemm_a16w16(xg, wg.T, bg)
         if pin_mask is not None:
             logits.masked_fill_(pin_mask, float("-inf"))
-        rdata, gather_indx, scatter_indx = routing(
-            logits,
-            n_expts_act,
-            tile_m_scale=get_gluon_a8w4_ctas_per_cga(logits.shape[0] * n_expts_act)[0],
-        )
+        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         if x_dtype_str == "fp8":
             x = downcast_to_static_fp8(x, static_scale)
             x = moe_gemm_a8w4(

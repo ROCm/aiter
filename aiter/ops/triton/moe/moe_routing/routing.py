@@ -281,7 +281,6 @@ def routing(
     num_expert_group: int | None = None,
     topk_group: int | None = None,
     expert_group: torch.Tensor | None = None,
-    tile_m_scale: int = 1,
 ):
     """Routing entry point. ``score_mode`` selects the path:
 
@@ -297,11 +296,6 @@ def routing(
     ``block_m`` is not supplied by the caller: it is derived internally from the
     raw ``logits`` shape and the originally requested ``n_expts_act``.
 
-    ``tile_m_scale`` (default 1) scales ``block_m``, so a CGA kernel gets
-    metadata matching the tile its whole cluster covers. Pass
-    ``get_gluon_a8w4_ctas_per_cga(m)[0]``; leave at 1 for non-CGA kernels. The
-    kernel wrapper recovers the per-CTA tile by dividing back out.
-
     Returns ``(RoutingData, gather_indx, scatter_indx)``.
     """
     num_tokens, n_expts_tot = logits.shape
@@ -311,7 +305,6 @@ def routing(
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    block_m *= tile_m_scale
 
     # ------------------------------------------------------------------
     # flat top-k path: plain top-k + softmax (score_mode is None)
@@ -449,7 +442,6 @@ def routing_from_hash(
     score_mode: str = "sqrtsoftplus",
     renorm: bool = True,
     routed_scaling_factor: float = 1.0,
-    tile_m_scale: int = 1,
 ):
     """All-Triton routing for the a8w4 path on DeepSeek-V4 hash layers.
 
@@ -463,7 +455,6 @@ def routing_from_hash(
     from .topk import hash_routing
 
     n_tokens, n_expts_tot = router_logits.shape
-    block_m *= tile_m_scale
 
     expt_scal, expt_indx, bitmatrix = hash_routing(
         router_logits,

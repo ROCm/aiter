@@ -279,10 +279,7 @@ def get_gluon_a8w4_ctas_per_cga(m):
 def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     ctas_per_cga = get_gluon_a8w4_ctas_per_cga(m)
     num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
-    # routing_data.block_m is the tile the whole cluster covers; the heuristics
-    # below are written against the per-CTA tile, and it is scaled back up at
-    # the end.
-    block_m = routing_data.block_m // ctas_per_cga[0]
+    block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
@@ -394,9 +391,7 @@ def moe_gemm_a8w4(
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
     # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
     padded_N = N
-    # Per-CTA tile: routing_data.block_m covers the whole cluster, so divide out
-    # the same scale the caller passed to routing() (1 unless multicast is on).
-    block_m = routing_data.block_m // get_gluon_a8w4_ctas_per_cga(M)[0]
+    block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
         N = unpadded_N
     if unpadded_K and block_m == 16:
@@ -477,9 +472,6 @@ def moe_gemm_a8w4(
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
-    # ExptData is built for routing_data.block_m, which the config only rescales
-    # by the cluster's M split -- so it always matches what the kernel launches.
-    assert expt_data is None or config["block_m"] == routing_data.block_m
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
@@ -618,6 +610,8 @@ def moe_gemm_a8w4(
             apply_swiglu=apply_swiglu_matmul,
             GatherIndx=gather_indx,
             X_SCALE_TDM=X_SCALE_TDM,
+            out_mx_quant=out_mx_quant,
+            is_prefill=M >= 1024,
         )
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
             y,

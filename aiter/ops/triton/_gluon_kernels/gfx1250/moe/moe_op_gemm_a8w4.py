@@ -869,10 +869,9 @@ def _moe_gemm_a8w4_decode(
     CLAMP_BOUNDS: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    # MXFP8 output quant
     YMxScale=None,
-    stride_y_mx_m: gl.constexpr = 0,
-    stride_y_mx_n: gl.constexpr = 0,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
     HAS_MX_OUT: gl.constexpr = False,
 ):
 
@@ -1005,7 +1004,7 @@ def _moe_gemm_a8w4_decode(
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-    if Quant_static_scale is not None:
+    if Quant_static_scale is not None or HAS_MX_OUT:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
@@ -1609,6 +1608,8 @@ def get_moe_a8w4_layouts(
     apply_swiglu,
     GatherIndx,
     X_SCALE_TDM=False,
+    out_mx_quant=False,
+    is_prefill=True,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     NATIVE_BLOCK_K_W = BLOCK_K // 2
@@ -1630,13 +1631,15 @@ def get_moe_a8w4_layouts(
     cga_layout_c = make_cga_layout(ctas_per_cga, ctas_per_cga, [0, 1])
 
     if num_warps == 2:
-        warp_bases = [[1, 0]]
+        warp_bases = [[0, 1]]
         reg_bases = []
     elif num_warps == 4:
         warp_bases = [[0, 1], [0, 2]]
-        reg_bases = [[1, 0]]
+        reg_bases = []
     else:
-        warp_bases = [[1, 0], [0, 1], [0, 2]]
+        warp_bases = (
+            [[1, 0], [0, 1], [0, 2]] if is_prefill else [[0, 1], [0, 2], [0, 4]]
+        )
         reg_bases = []
 
     WMMA_LAYOUT = gl.amd.AMDWMMALayout(
@@ -1681,14 +1684,6 @@ def get_moe_a8w4_layouts(
             ),
         )
 
-    WMMA_X_SCALE = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=[16, 16, 128],
-        cga_layout=CGA_A,
-    )
     WMMA_W_SCALE = gl.amd.AMDWMMALayout(
         3,
         transposed=True,
@@ -1720,7 +1715,7 @@ def get_moe_a8w4_layouts(
         SHARED_LAYOUT_Y = gl.SwizzledSharedLayout(
             1, 1, 1, [1, 0], cga_layout=cga_layout_c
         )
-    elif has_quant_static_scale:
+    elif has_quant_static_scale or out_mx_quant:
         SHARED_LAYOUT_Y = gl.PaddedSharedLayout.with_identity_for(
             [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0], cga_layout_c
         )
@@ -1752,14 +1747,27 @@ def get_moe_a8w4_layouts(
         "X_SCALES_LOAD_LAYOUT": None,
     }
     if is_x_microscaled:
+        WMMA_X_SCALE = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=warp_bases,
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+            cga_layout=CGA_A,
+        )
         layouts["DOT_LAYOUT_X_SCALES"] = gl.amd.gfx1250.get_wmma_scale_layout(
             gl.DotOperandLayout(0, WMMA_X_SCALE, k_width=16),
             [BLOCK_M, MX_SCALE_BLOCK_K],
         )
-        XS_PAD_INTERVAL = MX_SCALE_BLOCK_K if X_SCALE_TDM else 256
-        layouts["SHARED_LAYOUT_X_SCALES"] = gl.PaddedSharedLayout.with_identity_for(
-            [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0], CGA_A
-        )
+        if is_prefill:
+            XS_PAD_INTERVAL = MX_SCALE_BLOCK_K if X_SCALE_TDM else 256
+            layouts["SHARED_LAYOUT_X_SCALES"] = gl.PaddedSharedLayout.with_identity_for(
+                [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0], CGA_A
+            )
+        else:
+            layouts["SHARED_LAYOUT_X_SCALES"] = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_A
+            )
         layouts["X_SCALES_LOAD_LAYOUT"] = gl.BlockedLayout(
             [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0], CGA_A
         )
@@ -1834,8 +1842,8 @@ def _moe_gemm_a8w4_prefill(
     SHARED_LAYOUT_BIAS: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
     YMxScale=None,
-    stride_y_mx_m: gl.constexpr = 0,
-    stride_y_mx_n: gl.constexpr = 0,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
     HAS_MX_OUT: gl.constexpr = False,
     X_GATHER_IDX_LAYOUT: gl.constexpr = None,
     DOT_LAYOUT_X_SCALES: gl.constexpr = None,
