@@ -31,6 +31,7 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "mxscale_preshuffle": "mxscale_preshuffle_tuned_gemm.csv",
     }
 
     def _load_csv(self, name):
@@ -119,6 +120,11 @@ class TestCSVValidation(unittest.TestCase):
             ],
         )
 
+    def test_mxscale_preshuffle_no_duplicates(self):
+        self._check_no_duplicates(
+            "mxscale_preshuffle", extra_keys=["a_dtype", "b_dtype"]
+        )
+
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
             with self.subTest(csv=name):
@@ -170,6 +176,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
+            "mxscale_preshuffle_untuned_gemm.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):
