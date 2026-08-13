@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _get_config
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
@@ -15,7 +14,10 @@ from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -300,7 +302,7 @@ def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
     if not has_bias:
         bias = None
 
-    config, _ = _get_config(m, n, k)
+    config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
     config["NUM_KSPLIT"] = num_ksplit
     compute_splitk_params(config, k)
 
@@ -351,7 +353,7 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
         output=False,
     )
 
-    config, _ = _get_config(m, n, k)
+    config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
     config["NUM_KSPLIT"] = num_ksplit
     compute_splitk_params(config, k)
 

@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
-from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
@@ -39,8 +38,6 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["Quant_static_scale"] is not None:
-        ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
@@ -187,8 +184,6 @@ def _moe_gemm_a4w4(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    X_static_scale,
-    Quant_static_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -446,14 +441,6 @@ def _moe_gemm_a4w4(
             x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc, fast_math=True
         )
 
-    # scalar fp8 scale
-    if X_static_scale is not None:
-        # should not go in here since static scale fp4 is disabled
-        tl.static_assert(
-            X_static_scale is None,
-            f"Static scale is disabled for fp4 precision. got {X_static_scale}",
-        )
-
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
@@ -483,9 +470,6 @@ def _moe_gemm_a4w4(
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
-    # quant
-    if Quant_static_scale is not None:
-        out = _compute_static_fp8_quant(out, tl.load(Quant_static_scale))
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
