@@ -19,8 +19,6 @@
 #include "moe_op.h"
 #include <cfloat>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
 #ifndef AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE
 #define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE 0
@@ -203,7 +201,7 @@ __device__ constexpr void wave_reduce_argmax2(
 
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
-    using kvp = hipcub::KeyValuePair<int, float>;
+    using kvp = aiter::KeyValuePair<int, float>;
     kvp thread_kvp;
     thread_kvp.key       = idx;
     thread_kvp.value     = val_o;
@@ -540,12 +538,6 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         }
         __syncthreads();
     }
-
-    // using kvp = hipcub::KeyValuePair<int, float>;
-    // using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
-    // __shared__ typename BlockReduce::TempStorage tmpStorage;
-    // kvp thread_kvp;
-    // hipcub::ArgMax arg_max;
 
     float sum = 0.0f;
     int topk_indice;

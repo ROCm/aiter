@@ -164,9 +164,11 @@ namespace py = pybind11;
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
     m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
-#define AITER_UNARY_PYBIND                                  \
-    m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
-    m.def("tanh", &aiter_tanh, "apply for tanh.");
+#define AITER_UNARY_PYBIND                                                        \
+    AITER_SET_STREAM_PYBIND;                                                      \
+    m.def(                                                                        \
+        "sigmoid", &aiter_sigmoid, "apply for sigmoid.", py::arg("out"), py::arg("input")); \
+    m.def("tanh", &aiter_tanh, "apply for tanh.", py::arg("out"), py::arg("input"));
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -299,6 +301,18 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
+#define OPUS_BMM_A8W8_MXSCALE_PYBIND \
+    m.def("opus_bmm_a8w8_mxscale",   \
+          &opus_bmm_a8w8_mxscale,    \
+          "mmajor fp8 e8m0 mxscale (block-scale) BMM with native "  \
+          "scaled MFMA; kid-dispatched flatmm split-K backend", \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"),                            \
+          py::arg("splitK") = 2,                         \
+          py::arg("kernelId") = 0);
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \
@@ -331,9 +345,11 @@ namespace py = pybind11;
           py::arg("sorted_expert_ids"),                                             \
           py::arg("num_valid_ids"),                                                 \
           py::arg("out"),                                                           \
+          py::arg("token_num"),                                                     \
+          py::arg("topk"),                                                          \
           py::arg("block_m"),                                                       \
           py::arg("kernel_id"),                                                     \
-          py::arg("inter_dim_pad"));                                                 \
+          py::arg("inter_dim_pad"));                                                \
     m.def("opus_moe_stage2_reduce_token_slot_route_output_fwd",                     \
           &opus_moe_stage2_reduce_token_slot_route_output_fwd,                      \
           "Opus MoE route-output topk reduce",                                      \
@@ -354,6 +370,7 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                                  \
           py::arg("out"),                                                            \
           py::arg("out_scale"),                                                      \
+          py::arg("topk"),                                                           \
           py::arg("block_m"),                                                        \
           py::arg("kernelName"),                                                     \
           py::arg("inter_dim_pad"),                                                  \
@@ -665,6 +682,7 @@ namespace py = pybind11;
           py::arg("handle_ptrs"),                                                    \
           py::arg("offset_ptrs"));                                                   \
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));    \
+    m.def("allocate_data_buffer", &aiter::allocate_data_buffer, py::arg("size"));    \
     m.def("free_meta_buffer", &aiter::free_meta_buffer, py::arg("ptr"));             \
     m.def("get_meta_buffer_ipc_handle",                                              \
           &aiter::get_meta_buffer_ipc_handle,                                        \
@@ -1752,21 +1770,22 @@ namespace py = pybind11;
           py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
-#define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
-#define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
-#define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
-#define ROPE_2C_CACHED_FWD_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
-#define ROPE_1C_THD_FWD_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
-#define ROPE_1C_2D_FWD_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_1C_UNCACHED_BWD_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
-#define ROPE_2C_UNCACHED_BWD_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
-#define ROPE_1C_CACHED_BWD_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
-#define ROPE_2C_CACHED_BWD_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
-#define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
-#define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
 #define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND  \
+    AITER_SET_STREAM_PYBIND;                  \
     m.def("rope_cached_positions_fwd_impl",  \
           &rope_cached_positions_fwd_impl,   \
           py::arg("output"),                 \
@@ -1778,6 +1797,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"), \
           py::arg("nope_first"))
 #define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND;                    \
     m.def("rope_cached_positions_2c_fwd_impl", \
           &rope_cached_positions_2c_fwd_impl,  \
           py::arg("output_x"),                 \
@@ -1791,6 +1811,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
 #define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND;                         \
     m.def("rope_cached_positions_offsets_fwd_impl", \
           &rope_cached_positions_offsets_fwd_impl,  \
           py::arg("output"),                        \
@@ -1803,6 +1824,7 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),        \
           py::arg("nope_first"))
 #define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND;                            \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", \
           &rope_cached_positions_offsets_2c_fwd_impl,  \
           py::arg("output_x"),                         \
@@ -1995,6 +2017,7 @@ namespace py = pybind11;
           py::arg("swa_nope_scale_buff") = std::nullopt,               \
           py::arg("swa_rope_buff")       = std::nullopt,               \
           py::arg("swa_block_tables")    = std::nullopt,               \
+          py::arg("swa_dest_row")        = std::nullopt,               \
           py::arg("swa_block_size")      = 0,                          \
           py::arg("batch_id_per_token")  = std::nullopt);               \
     m.def("fused_kv_norm_rope_group_quant",                            \
@@ -2167,36 +2190,45 @@ namespace py = pybind11;
     m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
-#define TOP_K_PER_ROW_PYBIND                    \
-    m.def("top_k_per_row_prefill",              \
-          &top_k_per_row_prefill,               \
-          py::arg("logits"),                    \
-          py::arg("rowStarts"),                 \
-          py::arg("rowEnds"),                   \
-          py::arg("indices"),                   \
-          py::arg("values"),                    \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("stride1"),                   \
-          py::arg("k")         = 2048,          \
-          py::arg("workspace") = std::nullopt); \
-    m.def("top_k_per_row_decode",               \
-          &top_k_per_row_decode,                \
-          py::arg("logits"),                    \
-          py::arg("next_n"),                    \
-          py::arg("seqLens"),                   \
-          py::arg("indices"),                   \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("stride1"),                   \
-          py::arg("k")         = 2048,          \
-          py::arg("workspace") = std::nullopt); \
-    m.def("topk_mb_workspace_size",             \
-          &topk_mb_workspace_size,              \
-          py::arg("numRows"),                   \
-          py::arg("stride0"),                   \
-          py::arg("k"),                         \
-          py::arg("is_decode"));                \
+#define TOP_K_PER_ROW_PYBIND                     \
+    AITER_SET_STREAM_PYBIND;                      \
+    m.def("top_k_per_row_prefill",               \
+          &top_k_per_row_prefill,                \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("stable")    = false);         \
+    m.def("top_k_per_row_decode",                \
+          &top_k_per_row_decode,                 \
+          py::arg("logits"),                     \
+          py::arg("next_n"),                     \
+          py::arg("seqLens"),                    \
+          py::arg("indices"),                    \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("stable")    = false);         \
+    m.def("topk_mb_workspace_size",              \
+          &topk_mb_workspace_size,               \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("is_decode"));                 \
+    m.def("topk_ob_workspace_size",              \
+          &topk_ob_workspace_size,               \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("is_decode"));                 \
     m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
 #define MLA_METADATA_PYBIND                                 \
@@ -2291,6 +2323,7 @@ namespace py = pybind11;
           py::arg("final_lse") = std::nullopt);
 
 #define TOPK_PLAIN_PYBIND                         \
+    AITER_SET_STREAM_PYBIND;                      \
     m.def("topk_plain",                           \
           &topk_plain,                            \
           py::arg("values"),                      \
@@ -2298,10 +2331,16 @@ namespace py = pybind11;
           py::arg("topk_out"),                    \
           py::arg("topk"),                        \
           py::arg("largest")   = true,            \
-          py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("rowStarts") = std::nullopt,    \
+          py::arg("rowEnds")   = std::nullopt,    \
           py::arg("stride0")   = -1,              \
-          py::arg("stride1")   = 1);
+          py::arg("stride1")   = 1,               \
+          py::arg("workspace") = std::nullopt);   \
+    m.def("topk_plain_workspace_size",            \
+          &topk_plain_workspace_size,             \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
     AITER_SET_STREAM_PYBIND;                 \
@@ -2367,6 +2406,7 @@ namespace py = pybind11;
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \
+    AITER_SET_STREAM_PYBIND;                      \
     m.def("mhc_pre_gemm_sqrsum",                  \
           &aiter::mhc_pre_gemm_sqrsum,            \
           "mhc_pre_gemm_sqrsum",                  \
@@ -2529,6 +2569,20 @@ namespace py = pybind11;
           py::arg("scale"),                                           \
           py::arg("use_qk_l2norm_in_kernel"),                         \
           py::arg("output"));
+
+#define GDR_DECODE_PACKED_BF16_PYBIND                  \
+    m.def("gdr_decode_packed_bf16",                    \
+          &aiter::gdr_decode_packed_bf16,               \
+          "gfx950 packed BF16 GDR decode (HIP).",      \
+          py::arg("mixed_qkv"),                        \
+          py::arg("a"),                                \
+          py::arg("b"),                                \
+          py::arg("dt_bias"),                          \
+          py::arg("A_log"),                            \
+          py::arg("indices"),                          \
+          py::arg("state"),                            \
+          py::arg("out"),                              \
+          py::arg("scale"));
 
 #define MXFP4_MOE_AUX_PYBIND                  \
     m.def("mxfp4_moe_sort_quant",             \
