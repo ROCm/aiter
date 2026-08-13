@@ -10,7 +10,8 @@ the JIT path hits the cache instead of compiling again.
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
-| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels |
+| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels (baseline `chunk_gdn_fwd_h_flydsl_vk`) |
+| `chunk_gdn_h_mfma16_hip.py` | `CHUNK_GDN_H_MFMA16_HIP` | chunk-gdn-h mfma16/HIP-aligned fork, the K5 kernel production dispatches |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -45,8 +46,11 @@ python -m aiter.aot.flydsl.gemm
 # grouped MoE (gfx1250)
 python -m aiter.aot.flydsl.grouped_moe
 
-# chunk-gdn-h
+# chunk-gdn-h (baseline)
 python -m aiter.aot.flydsl.chunk_gdn_h
+
+# chunk-gdn-h mfma16_hip fork (add --dry-run to just print the expanded jobs)
+python -m aiter.aot.flydsl.chunk_gdn_h_mfma16_hip
 ```
 
 ### Common arguments
@@ -55,9 +59,22 @@ python -m aiter.aot.flydsl.chunk_gdn_h
 # Custom CSV(s) — every module supports --csv and accepts multiple paths
 python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 
-# chunk_gdn_h also supports overriding the arch column for cross-compiling
+# both chunk_gdn_h modules support overriding the arch for cross-compiling
 python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
+python -m aiter.aot.flydsl.chunk_gdn_h_mfma16_hip --target-arch gfx942
 ```
+
+> `chunk_gdn_h_mfma16_hip` differs from the other modules in where its jobs come
+> from. Its csv
+> (`aiter/ops/flydsl/chunk_gdn_h_mfma16_hip_tuned.csv`) is also read at runtime
+> to pick BV, so it lists *measured batch shapes*, not compile configs. AOT
+> keeps only the distinct `(arch, dtype, K, V, BT, H, Hg)` shapes from it and
+> fans each out over every legal BV and both snapshot/state dtypes — batch
+> shapes absent from the table fall back to the runtime BV rule, which can pick
+> any tile, and none of them may hit the JIT. Rows are produced by
+> `op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`. A row with an
+> empty `BV` is AOT-only: the shape gets pre-compiled while the runtime keeps
+> using the rule, which is how to cover a new model before tuning it.
 
 ### Environment variables
 
@@ -77,8 +94,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
 > does **not** change what gets built. To cross-compile, use
-> `chunk_gdn_h --target-arch <arch>` (the only module that exposes an override),
-> or edit the `cu_num` column in the CSV.
+> `--target-arch <arch>` (exposed by the two `chunk_gdn_h*` modules), or edit the
+> `cu_num` column in the CSV. The one exception is
+> `chunk_gdn_h_mfma16_hip`: rows whose `arch` column is empty do follow
+> `ARCH` / `GPU_ARCHS`, falling back to the host GPU.
 
 Example:
 
