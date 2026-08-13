@@ -1304,7 +1304,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
@@ -1331,7 +1330,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     }
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -1545,28 +1544,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     }
 }
 
-// Forwarding overload
-template <int NKH, int NVH, int NUM_V_BLOCKS, bool VmWaitSched = false, int FIXED_BATCH_SIZE = 0,
-          bool FUSE_POST_REDUCE = false>
-__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body_opt<NKH, NVH, NUM_V_BLOCKS, VmWaitSched, FIXED_BATCH_SIZE,
-                                        FUSE_POST_REDUCE>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
-}
-
 // ── dot2_opt: v_dot2_f32_bf16 for L2 + raw Q·K (NKH=2 NVH=8 NVB=2 path) ──
 template <int NKH, int NVH, int NUM_V_BLOCKS>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
@@ -1580,7 +1557,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
@@ -1604,7 +1580,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -1798,26 +1774,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
         }
     }
 }
-
-template <int NKH, int NVH, int NUM_V_BLOCKS>
-__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body_dot2_opt<NKH, NVH, NUM_V_BLOCKS>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
-}
-
 
 // ============================================================
 // TUNED kernel: Maximized ILP through restructured loops
@@ -2318,7 +2274,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM;
@@ -2339,7 +2294,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = warp_id * WARP_V_THREADS + v_tid;
@@ -2492,7 +2447,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming_nvb4(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int NUM_V_BLOCKS = 4;
@@ -2517,7 +2471,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming_nvb4(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -2627,25 +2581,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming_nvb4(
     }
 }
 
-template <int NKH, int NVH>
-__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming_nvb4(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body_streaming_nvb4<NKH, NVH>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
-}
-
 // NVB=4 streaming + interleaved ds_swizzle (FlyDSL): issue 3 xor swizzles, run VALU while lgkm
 // completes, then s_waitcnt lgkmcnt(0) before consuming results — matches ultra_body SWAP pattern.
 template <int NKH, int NVH>
@@ -2660,7 +2595,6 @@ __device__ __forceinline__ void gdn_decode_kernel_interleaved_body_nvb4(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int NUM_V_BLOCKS = 4;
@@ -2685,7 +2619,7 @@ __device__ __forceinline__ void gdn_decode_kernel_interleaved_body_nvb4(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -2857,45 +2791,6 @@ __device__ __forceinline__ void gdn_decode_kernel_interleaved_body_nvb4(
     }
 }
 
-template <int NKH, int NVH>
-__device__ __forceinline__ void gdn_decode_kernel_interleaved_body_nvb4(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_interleaved_body_nvb4<NKH, NVH>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
-}
-
-// Forwarding overload for streaming body: existing callers → nullptr
-template <int NKH, int NVH>
-__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body_streaming<NKH, NVH>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
-}
-
 // FIXED_BATCH_SIZE>0: BS is known at compile time (__builtin_assume for idx); omit runtime batch bound.
 template <int NKH, int NVH, int NUM_V_BLOCKS, int FIXED_BATCH_SIZE = 0>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
@@ -2909,7 +2804,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
@@ -2936,7 +2830,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     }
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
-    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+    const int io_bid = batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -3120,26 +3014,6 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
             *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
         }
     }
-}
-
-// Forwarding overload: existing callers pass no batch_perm → nullptr
-template <int NKH, int NVH, int NUM_V_BLOCKS, int FIXED_BATCH_SIZE = 0>
-__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body<NKH, NVH, NUM_V_BLOCKS, FIXED_BATCH_SIZE>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, (const int*)nullptr, batch_size, scale);
 }
 
 // ============================================================
@@ -7497,52 +7371,6 @@ DEFINE_BS16_NVB1_SQ1_FIXED(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb6_fixedbs
 
 #undef DEFINE_BS16_NVB1_SQ1_FIXED
 
-// ── Sorted variants: accept batch_perm for indirect I/O indexing ──
-// indices must be pre-sorted; batch_perm maps sorted position → original batch position
-__global__
-__launch_bounds__(BLOCK_THREADS, 4)
-__attribute__((amdgpu_waves_per_eu(4, 6)))
-void gdn_decode_kernel_iasm_tp8_nvh8_sq1_sorted(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body<2, 8, 2>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, batch_perm, batch_size, scale);
-}
-
-__global__
-__launch_bounds__(BLOCK_THREADS, 4)
-__attribute__((amdgpu_waves_per_eu(4, 6)))
-void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_sorted(
-    const __hip_bfloat16* __restrict__ query,
-    const __hip_bfloat16* __restrict__ key,
-    const __hip_bfloat16* __restrict__ value,
-    const __hip_bfloat16* __restrict__ a_input,
-    const __hip_bfloat16* __restrict__ b_input,
-    const __hip_bfloat16* __restrict__ dt_bias,
-    const float* __restrict__          A_log,
-    const int* __restrict__            indices,
-    float* __restrict__                state,
-    __hip_bfloat16* __restrict__       output,
-    const int* __restrict__            batch_perm,
-    int batch_size, float scale
-) {
-    gdn_decode_kernel_iasm_sq1_body<2, 8, 1>(
-        query, key, value, a_input, b_input, dt_bias, A_log, indices,
-        state, output, batch_perm, batch_size, scale);
-}
-
 __global__
 __launch_bounds__(BLOCK_THREADS, 3)
 __attribute__((amdgpu_waves_per_eu(3, 5)))
@@ -7672,7 +7500,6 @@ void launch_gdn_decode_iasm(
     int batch_size, int seq_length,
     int num_v_blocks, bool use_qk_l2norm, float scale,
     int num_k_heads, int num_v_heads,
-    const int* batch_perm,
     hipStream_t stream
 ) {
     auto q = reinterpret_cast<const __hip_bfloat16*>(query);
@@ -7707,20 +7534,7 @@ void launch_gdn_decode_iasm(
             return;
         }
         if (num_k_heads == 2 && num_v_heads == 8) {
-            if (batch_perm) {
-                if (batch_size <= 4) {
-                    dim3 grid(batch_size * 8 * 2);
-                    dim3 block(BLOCK_THREADS);
-                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_sorted, dim3(grid), dim3(block), 0, stream,
-                        q, k, v, a, b, dt, al, idx, st, o, batch_perm, batch_size, scale);
-                } else {
-                    dim3 grid(batch_size * 8);
-                    dim3 block(BLOCK_THREADS);
-                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_sorted, dim3(grid), dim3(block), 0, stream,
-                        q, k, v, a, b, dt, al, idx, st, o, batch_perm, batch_size, scale);
-                }
-            } else {
-                if (batch_size == 2) {
+            if (batch_size == 2) {
                     // BS=2 cache-bypass dispatch.
                     // In `online` GDN sits between in_proj/conv (heavy L2 footprint) and
                     // rmsnorm/out_proj.  Without bypass, our 1MB state read/write thrashes
@@ -7857,7 +7671,6 @@ void launch_gdn_decode_iasm(
                         hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4, dim3(grid), dim3(block), 0, stream,
                             q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
                     }
-                }
             }
             return;
         }
