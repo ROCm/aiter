@@ -908,8 +908,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     ``state_dtype`` controls the persistent initial/final state, while
     ``snapshot_dtype`` independently controls the per-chunk ``h`` snapshots and
     defaults to ``k.dtype`` (bf16 here), mirroring
-    ``chunk_gated_delta_rule_fwd_h_hip_fn``. fp32 snapshots are stored straight
-    from the f32 accumulators, as in the HIP kernel.
+    ``chunk_gated_delta_rule_fwd_h_hip_fn``. fp32 snapshots take two half-BV
+    transpose rounds, since the f32 tile does not fit the LDS budget whole.
     """
     use_g = g is not None
     use_gk = gk is not None
