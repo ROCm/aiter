@@ -25,7 +25,7 @@ if not is_flydsl_available():
 
 fla_kda = pytest.importorskip("fla.ops.kda")
 
-from aiter.ops.flydsl import flydsl_chunk_kda, flydsl_kda_supported  # noqa: E402
+from aiter.ops.flydsl import flydsl_chunk_kda, flydsl_kda_supported
 
 DK = DV = 128
 LOWER_BOUND = -5.0
@@ -91,15 +91,15 @@ def test_matches_fla(seqlens, has_h0, saturated, num_heads):
     q, k, v, g, beta, A_log, dt_bias, h0, cu = _build(
         seqlens, num_heads, has_h0, saturated, seed=0
     )
-    common = dict(
-        A_log=A_log,
-        dt_bias=dt_bias,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        lower_bound=LOWER_BOUND,
-    )
+    common = {
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "lower_bound": LOWER_BOUND,
+    }
     o_ref, ht_ref = fla_kda.chunk_kda(
         q=q,
         k=k,
@@ -144,18 +144,18 @@ def test_raw_bf16_beta_matches_fp32_beta():
     seqlens = [1024, 1024]
     q, k, v, g, beta, A_log, dt_bias, h0, cu = _build(seqlens, 12, True, False, seed=3)
     beta_bf16 = beta.to(torch.bfloat16)
-    common = dict(
-        cu_seqlens=cu,
-        max_seqlen=max(seqlens),
-        A_log=A_log,
-        dt_bias=dt_bias,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        lower_bound=LOWER_BOUND,
-        state_v_first=True,
-    )
+    common = {
+        "cu_seqlens": cu,
+        "max_seqlen": max(seqlens),
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "lower_bound": LOWER_BOUND,
+        "state_v_first": True,
+    }
     o_wide, ht_wide = flydsl_chunk_kda(
         q, k, v, g, beta_bf16.float(), initial_state=h0.clone(), **common
     )

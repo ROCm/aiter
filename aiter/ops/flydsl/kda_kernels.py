@@ -40,18 +40,18 @@ import os
 
 import torch
 
+from .kda_varlen import kda_pack_prepare, kda_unpack_output
 from .kernels.kda_kernel import (
     LDS_GRANULE,
     LDS_PER_CU,
     fwd_lds_bytes,
 )
 from .kernels.kda_split import build_kda_prep_module, build_kda_scan_module
-from .kda_varlen import kda_pack_prepare, kda_unpack_output
 
 __all__ = [
-    "kda_chunk_fwd",
     "flydsl_chunk_kda",
     "flydsl_kda_supported",
+    "kda_chunk_fwd",
 ]
 
 # C=32 with a 4-way value split keeps LDS ~71 KB (two workgroups/CU); with the
@@ -253,6 +253,7 @@ def kda_chunk_fwd(
         float(scale),
         stream=stream,
     )
+
     # the scan stages these with 128-bit reads, so hand it flat views
     def flat(x):
         return x.reshape(BH * NC, -1)
@@ -287,9 +288,7 @@ def flydsl_kda_supported(head_k: int, head_v: int, dtype, device) -> bool:
         return False
     # BLOCK is fixed at 2*DK by the in-place cumulative sum, and the 256-thread
     # workgroup the kernel is built around pins DK to 128.
-    if head_k != 128 or head_v != 128:
-        return False
-    return True
+    return head_k == 128 and head_v == 128
 
 
 def flydsl_chunk_kda(
@@ -348,9 +347,9 @@ def flydsl_chunk_kda(
 
     BH = num_seqs * num_heads
     NC = t_pad // CHUNK_SIZE
-    if _split_workspace_bytes(BH, NC, CHUNK_SIZE, head_k) >= SPLIT_MEM_FRACTION * _free_bytes(
-        q.device
-    ):
+    if _split_workspace_bytes(
+        BH, NC, CHUNK_SIZE, head_k
+    ) >= SPLIT_MEM_FRACTION * _free_bytes(q.device):
         return None
 
     if cu_seqlens.dtype != torch.int32:
