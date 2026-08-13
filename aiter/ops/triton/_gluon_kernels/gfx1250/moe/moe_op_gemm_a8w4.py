@@ -1651,6 +1651,11 @@ def _moe_gemm_a8w4_prefill(
     CLAMP_BOUNDS: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    # MXFP8 output quant
+    YMxScale=None,
+    stride_y_mx_m: gl.constexpr = 0,
+    stride_y_mx_n: gl.constexpr = 0,
+    HAS_MX_OUT: gl.constexpr = False,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -1784,7 +1789,7 @@ def _moe_gemm_a8w4_prefill(
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
         )
-    if Quant_static_scale is not None:
+    if Quant_static_scale is not None or HAS_MX_OUT:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
@@ -2229,7 +2234,31 @@ def _moe_gemm_a8w4_prefill(
         out *= gammas[:, None]
 
     # quant
-    if Quant_static_scale is not None:
+    if HAS_MX_OUT:
+        tl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
+        )
+        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
+        out_3d = tl.reshape(out, [BLOCK_M, NUM_QB, 32])
+        scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
+        out = tl.reshape(out_3d * quant_scale, [BLOCK_M, OUT_BLOCK_N]).to(tl.float8e4nv)
+        scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
+        offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m_s = offs_m_s < M
+        offs_n_s = NUM_QB * pid_n + gl.arange(0, NUM_QB)
+        mask_n_s = offs_n_s < tl.cdiv(yN, 32)
+        YMxScalePtrs = (
+            YMxScale
+            + (start_m + offs_m_s).to(index_type)[:, None] * stride_y_mx_m
+            + offs_n_s.to(index_type)[None, :] * stride_y_mx_n
+        )
+        tl.store(
+            YMxScalePtrs,
+            scale_exp_2d,
+            mask=mask_m_s[:, None] & mask_n_s[None, :],
+        )
+    elif Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
     else:
         out = out.to(tl.bfloat16)

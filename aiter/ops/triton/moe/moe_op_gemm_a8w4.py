@@ -5,7 +5,6 @@ import functools
 import itertools
 import json
 import os
-import warnings
 
 import torch
 import triton
@@ -631,6 +630,10 @@ def moe_gemm_a8w4(
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
             waves_per_eu=config["waves_per_eu"],
         )
     else:
