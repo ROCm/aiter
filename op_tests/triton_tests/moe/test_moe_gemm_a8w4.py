@@ -6,7 +6,7 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
-from aiter.ops.shuffle import moe_shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
@@ -38,6 +38,17 @@ def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
     then reinterprets it (zero-copy) as the flattened view the kernel loads.
     """
     return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
+def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. This
+    is the kwidth-4 counterpart of ``shuffle_scale_moe(..., scale_kwidth=4)``
+    and must stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
 
 
 # ---------------
@@ -275,7 +286,9 @@ def test_op(
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
             )
-        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 8) != 0):
+        # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
+        # K//32 divisible by 4; gfx950 still needs 8.
+        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 4) != 0):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )
@@ -318,9 +331,7 @@ def test_op(
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-            )
+            w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         else:
             assert get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
