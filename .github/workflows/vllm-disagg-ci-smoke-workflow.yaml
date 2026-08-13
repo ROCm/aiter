@@ -594,62 +594,77 @@ jobs:
 
           exit "${wrapper_rc}"
 
-      - name: Summarize Slurm result
+      - name: Collect Slurm result
         if: always()
         run: |
           set -euo pipefail
+          rm -f vllm-disagg-job.log
+          job_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
+          if [[ -f "${job_log}" ]]; then
+            cp -f "${job_log}" vllm-disagg-job.log
+          else
+            echo "No job log at ${job_log}; the workload may not have launched."
+          fi
+
+          role_dir=""
+          if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+            role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID}"
+          fi
+          if [[ -n "${role_dir}" && -d "${role_dir}" ]]; then
+            role_artifact_dir="vllm-disagg-role-logs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            mkdir -p "${role_artifact_dir}"
+            find "${role_dir}" -maxdepth 1 -type f -name '*.log' \
+              -exec cp -f --no-preserve=mode,ownership,timestamps {} "${role_artifact_dir}/" \;
+            echo "Copied top-level role logs from ${role_dir}."
+          else
+            echo "No role-log directory for Slurm job ${SLURM_JOB_ID:-unknown}."
+          fi
+
+      - name: Publish case accuracy summary
+        if: always()
+        run: |
+          set -euo pipefail
+          accuracy_line=""
+          if [[ -f vllm-disagg-job.log ]]; then
+            accuracy_line="$(
+              grep -ahE '\[vllm_disagg\] (PASS|FAIL): exact_match=' \
+                vllm-disagg-job.log | tail -1 || true
+            )"
+          fi
+
+          if [[ -z "${accuracy_line}" ]]; then
+            {
+              echo "### ${CASE_NAME} accuracy"
+              echo
+              echo "> No exact_match result was found for this case."
+              echo
+              echo "- Model: \`${MODEL_NAME}\`"
+              echo "- Topology: \`${TOPOLOGY}\`"
+              echo "- Slurm job: \`${SLURM_JOB_ID:-unknown}\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "No exact_match result found in vllm-disagg-job.log." >&2
+            exit 1
+          fi
+
+          result="$(sed -E 's/.*\] (PASS|FAIL):.*/\1/' <<< "${accuracy_line}")"
+          exact_match="$(sed -E 's/.*exact_match=([^[:space:]]+).*/\1/' <<< "${accuracy_line}")"
+          threshold="$(sed -E 's/.*threshold=([^[:space:]]+).*/\1/' <<< "${accuracy_line}")"
           {
+            echo "### ${CASE_NAME} accuracy"
             echo
-            echo "### vLLM disagg smoke result"
-            echo
-            echo "- Model: \`${MODEL_NAME:-unknown}\`"
-            echo "- Topology: \`${TOPOLOGY:-unknown}\`"
-            echo "- Image: \`${BASE_IMAGE:-unknown}\`"
-            echo "- AITER SHA: \`${GITHUB_SHA}\`"
-            echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
-            if [[ -f slurm-sacct.txt && -n "${SLURM_JOB_ID:-}" ]]; then
-              row="$(awk -v job="${SLURM_JOB_ID}" '$1 == job { print $2, $3, $4; exit }' slurm-sacct.txt || true)"
-              read -r state exit_code elapsed <<< "${row}" || true
-              echo "- State: \`${state:-unknown}\`; ExitCode: \`${exit_code:-unknown}\`; Elapsed: \`${elapsed:-unknown}\`"
-            fi
-
-            job_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
-            if [[ -f "${job_log}" ]]; then
-              cp -f "${job_log}" vllm-disagg-job.log
-              overlay_line="$(grep -ahE '\[aiter-overlay\] loaded ' "${job_log}" | head -1 || true)"
-              accuracy="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL): exact_match=' "${job_log}" | tail -1 || true)"
-              verdict="$(grep -ahE '\[vllm_disagg\] VERDICT:' "${job_log}" | tail -1 || true)"
-              if [[ -n "${overlay_line}" ]]; then
-                echo "- AITER overlay: \`${overlay_line}\`"
-              else
-                echo "- AITER overlay: no load confirmation found"
-              fi
-              if [[ -n "${accuracy}" ]]; then
-                echo "- Accuracy: \`${accuracy}\`"
-              else
-                echo "- Accuracy: no exact_match result found"
-              fi
-              if [[ -n "${verdict}" ]]; then
-                echo "- Accuracy verdict: \`${verdict}\`"
-              fi
-            else
-              echo "> No job log at \`${job_log}\`; the workload may not have launched."
-            fi
-
-            role_dir=""
-            if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-              role_dir="${DISAGG_SCRIPTS_STAGE%/}/${SLURM_JOB_ID}"
-            fi
-            if [[ -n "${role_dir}" && -d "${role_dir}" ]]; then
-              role_artifact_dir="vllm-disagg-role-logs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-              mkdir -p "${role_artifact_dir}"
-              find "${role_dir}" -maxdepth 1 -type f -name '*.log' \
-                -exec cp -f --no-preserve=mode,ownership,timestamps {} "${role_artifact_dir}/" \;
-              echo "- Role logs: copied top-level logs from \`${role_dir}\`"
-            else
-              echo "> No role-log directory for Slurm job \`${SLURM_JOB_ID:-unknown}\`."
-            fi
+            echo "| Field | Result |"
+            echo "| --- | --- |"
+            echo "| Model | \`${MODEL_NAME}\` |"
+            echo "| Topology | \`${TOPOLOGY}\` |"
+            echo "| exact_match | \`${exact_match}\` |"
+            echo "| Threshold | \`${threshold}\` |"
+            echo "| Verdict | **${result}** |"
+            echo "| Slurm job | \`${SLURM_JOB_ID:-unknown}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${result}" != "PASS" ]]; then
+            exit 1
+          fi
 
       - name: Upload vLLM disagg smoke artifacts
         if: always()
