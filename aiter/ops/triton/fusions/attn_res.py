@@ -28,8 +28,11 @@ Both residual layouts are served by the single ``attnres_fwd_kernel`` via an
 
 :func:`attn_res_gate` exposes the same packed kernel under the inference contract
 used by serving stacks (the candidate set is a packed ``[.., B, D]`` block plus a
-separate ``prefix`` row, and the caller's ``prefix += hidden`` add can be folded
-into the kernel) -- this mirrors ATOM's ``apply_attn_res``.
+separate ``prefix`` row, and the caller's ``prefix += hidden [+ hidden2]`` add can
+be folded into the kernel) -- this mirrors ATOM's ``apply_attn_res``, including its
+two-addend fold (``add_hidden``/``add_hidden2``, for an MoE layer's routed and
+shared expert outputs) and its independently-epsilon'd output RMSNorm
+(``output_rms_eps``, distinct from the per-candidate ``eps``).
 """
 
 from collections.abc import Sequence
@@ -43,29 +46,58 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-# Static per-token-count launch table (ATOM-style), replacing @triton.autotune.
-# Each bucket maps an upper-bound token count N to (num_warps, num_stages); BL is
-# set to L2 at launch so the whole candidate axis is a single tile. Dispatch rounds
-# N UP to the smallest bucket >= N (ceil-to-bucket), so a handful of fixed sizes
-# compile one config each -- bounded compile cost and CUDAGraph-capture safe (autotune
-# would JIT many configs on a cold cache and invalidate the capture). N above the
-# largest bucket falls through to the catch-all. The values are conservative defaults;
-# retune them with op_benchmarks/triton/bench_attn_res.py in the perf PR.
-_ATTN_RES_CONFIGS = (
+# Static per-token-count launch tables (ATOM-style), replacing @triton.autotune.
+# Dispatch rounds N UP to the smallest bucket >= N (ceil-to-bucket), so a handful
+# of fixed sizes compile one config each -- bounded compile cost and CUDAGraph-
+# capture safe (autotune would JIT many configs on a cold cache and invalidate the
+# capture). N above the largest bucket falls through to the catch-all.
+#
+# Two separate tables because BL means something different per layout:
+#
+# * sequence: the AMD-safe gather scans all L2 padded pointer slots on EVERY BL
+#   tile regardless of BL (see the kernel body), so splitting into more, smaller
+#   tiles only multiplies that O(L2) scan instead of shrinking anything -- BL=L2
+#   (a single tile, one scan) is the right choice here, independent of token count.
+# * packed: the tile load is a plain strided read with no such cost, so BL can
+#   (and should) be a small constant independent of the candidate count L. Tying
+#   BL to L2 here -- the original design -- makes the [BL, BD] register tile scale
+#   with L for no benefit: measured on MI350X/gfx950 at H=7168, L2=16 (Kimi-K3's
+#   real worst case, 8 banked candidates + 1 prefix) spills 199 of 256 VGPR and is
+#   4-6x slower than a fixed-BL=2 dispatch. ATOM's own attn_res kernel uses this
+#   fixed-BL-by-token-count shape (not keyed by L at all); the values below are
+#   copied from it since they're already validated in production.
+_ATTN_RES_SEQ_CONFIGS = (
     # (max_tokens, num_warps, num_stages)
     (16, 8, 1),
     (64, 8, 1),
     (256, 8, 1),
     (1024, 16, 1),
 )
-_ATTN_RES_CATCHALL = (16, 1)  # N > largest bucket
+_ATTN_RES_SEQ_CATCHALL = (16, 1)  # N > largest bucket
+
+_ATTN_RES_PACKED_CONFIGS = (
+    # (max_tokens, num_warps, num_stages, BL)
+    (8, 8, 2, 2),
+    (64, 8, 2, 2),
+    (512, 8, 2, 2),
+    (2048, 4, 2, 2),
+)
+_ATTN_RES_PACKED_CATCHALL = (4, 2, 2)  # N > largest bucket
 
 
-def _pick_attn_res_config(tokens: int) -> tuple[int, int]:
-    for max_tokens, num_warps, num_stages in _ATTN_RES_CONFIGS:
+def _pick_attn_res_seq_config(tokens: int) -> tuple[int, int]:
+    for max_tokens, num_warps, num_stages in _ATTN_RES_SEQ_CONFIGS:
         if tokens <= max_tokens:
             return num_warps, num_stages
-    return _ATTN_RES_CATCHALL
+    return _ATTN_RES_SEQ_CATCHALL
+
+
+def _pick_attn_res_packed_config(tokens: int, l2: int) -> tuple[int, int, int]:
+    for max_tokens, num_warps, num_stages, bl in _ATTN_RES_PACKED_CONFIGS:
+        if tokens <= max_tokens:
+            return num_warps, num_stages, min(bl, l2)
+    num_warps, num_stages, bl = _ATTN_RES_PACKED_CATCHALL
+    return num_warps, num_stages, min(bl, l2)
 
 
 def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
@@ -142,7 +174,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
 
     o = torch.empty((N, D), device=device, dtype=dtype)
     L2 = max(1, triton.next_power_of_2(L))
-    num_warps, num_stages = _pick_attn_res_config(N)
+    num_warps, num_stages = _pick_attn_res_seq_config(N)
 
     attnres_fwd_kernel[(N,)](
         q=q_flat,
@@ -157,14 +189,19 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         res_packed=None,
         prefix=None,
         add_hidden=None,
+        add_hidden2=None,
         prefix_out=None,
+        block_out=None,
         N=N,
         L=L,
         stride_res_n=0,
         stride_res_l=0,
+        stride_bo_n=0,
+        stride_bo_l=0,
         L2=L2,
         D=D,
         eps=rms_eps,
+        out_eps=rms_eps,
         scale=scale,
         BL=L2,
         BD=triton.next_power_of_2(D),
@@ -174,7 +211,9 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         IS_PACKED=False,
         HAS_PREFIX=False,
         DO_ADD=False,
+        DO_ADD2=False,
         WRITE_PREF=False,
+        WRITE_BLOCK_CAT=False,
         HAS_W=True,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -201,7 +240,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
 
     o = torch.empty((N, D), device=device, dtype=dtype)
     L2 = max(1, triton.next_power_of_2(L))
-    num_warps, num_stages = _pick_attn_res_config(N)
+    num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
 
     attnres_fwd_kernel[(N,)](
         q=q_flat,
@@ -217,16 +256,21 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         res_packed=packed,
         prefix=None,
         add_hidden=None,
+        add_hidden2=None,
         prefix_out=None,
+        block_out=None,
         N=N,
         L=L,
         stride_res_n=packed.stride(0),
         stride_res_l=packed.stride(1),
+        stride_bo_n=0,
+        stride_bo_l=0,
         L2=L2,
         D=D,
         eps=rms_eps,
+        out_eps=rms_eps,
         scale=scale,
-        BL=L2,
+        BL=bl,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -234,7 +278,9 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         IS_PACKED=True,
         HAS_PREFIX=False,
         DO_ADD=False,
+        DO_ADD2=False,
         WRITE_PREF=False,
+        WRITE_BLOCK_CAT=False,
         HAS_W=True,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -248,10 +294,13 @@ def attn_res_gate(
     score_weight: torch.Tensor,
     eps: float = 1e-6,
     add_hidden: torch.Tensor | None = None,
+    add_hidden2: torch.Tensor | None = None,
     *,
     output_rms_weight: torch.Tensor | None = None,
+    output_rms_eps: float = 1e-6,
     scale: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    close_block: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
     Same math as :func:`attn_res_fwd` on the packed layout, specialized for the
@@ -262,16 +311,32 @@ def attn_res_gate(
     - prefix: ``[.., D]`` running residual, used as the last candidate.
     - block_residual: ``[.., B, D]`` packed candidate block.
     - score_weight: ``[D]`` pre-folded ``rms_weight * query`` scoring vector.
-    - eps: RMSNorm epsilon (also used by the output RMSNorm when set).
+    - eps: per-candidate RMSNorm epsilon.
     - add_hidden: optional ``[.., D]``; folds ``prefix = prefix + add_hidden``
       into the kernel, saving a launch and an HBM round trip.
+    - add_hidden2: optional ``[.., D]``; folds a SECOND addend the same way
+      (``prefix = prefix + add_hidden + add_hidden2``), e.g. so an MoE layer can
+      hand over its routed and shared expert outputs unsummed. Requires
+      ``add_hidden`` to also be given.
     - output_rms_weight: optional ``[D]``; folds the prenorm that would
       otherwise follow this call into the kernel.
+    - output_rms_eps: epsilon of that output RMSNorm; independent of ``eps``
+      since the caller's output-norm module may differ from the per-candidate
+      one (only used when ``output_rms_weight`` is given).
     - scale: multiplies the logits before the softmax.
+    - close_block: when True, additionally fuses
+      ``torch.cat([block_residual, prefix_out.unsqueeze(-2)], dim=-2)`` into
+      this same kernel pass (mirrors ATOM's ``AttnRes.maybe_close_block``
+      block-banking step) instead of a separate ``torch.cat`` that would
+      re-read ``block_residual`` from HBM. See ``block_out`` below.
 
     Returns:
-    - (y, prefix_out); ``prefix_out`` is the summed prefix when ``add_hidden``
-      is given, otherwise ``prefix`` unchanged.
+    - ``close_block=False`` (default): ``(y, prefix_out)``, unchanged for
+      every existing caller. ``prefix_out`` is the summed prefix when
+      ``add_hidden`` is given, otherwise ``prefix`` unchanged.
+    - ``close_block=True``: ``(y, prefix_out, block_out)`` where ``block_out``
+      is ``cat([block_residual, prefix_out.unsqueeze(-2)], dim=-2)``,
+      ``[.., B + 1, D]``.
     """
     if not prefix.is_cuda:
         raise ValueError("Triton attn_res requires CUDA/ROCm tensors")
@@ -280,6 +345,8 @@ def attn_res_gate(
             f"prefix and block_residual must share a dtype, got {prefix.dtype} "
             f"and {block_residual.dtype}"
         )
+    if add_hidden2 is not None and add_hidden is None:
+        raise ValueError("add_hidden2 requires add_hidden")
 
     _LOGGER.info(
         f"ATTN_RES_GATE: prefix={tuple(prefix.shape)} "
@@ -306,6 +373,7 @@ def attn_res_gate(
 
     y = torch.empty((N, D), device=pf.device, dtype=pf.dtype)
     do_add = add_hidden is not None
+    do_add2 = add_hidden2 is not None
     if do_add:
         hs = add_hidden.reshape(-1, D).contiguous()
         prefix_out = torch.empty_like(pf)
@@ -314,9 +382,17 @@ def attn_res_gate(
         # Triton still needs a tensor argument, so reuse the prefix.
         hs = pf
         prefix_out = pf
+    hs2 = add_hidden2.reshape(-1, D).contiguous() if do_add2 else pf
+
+    if close_block:
+        block_out = torch.empty((N, B + 1, D), device=br.device, dtype=br.dtype)
+        bo = block_out
+    else:
+        block_out = None
+        bo = br  # unused (WRITE_BLOCK_CAT off); reuse an existing tensor arg
 
     L2 = max(1, triton.next_power_of_2(L))
-    num_warps, num_stages = _pick_attn_res_config(N)
+    num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
 
     attnres_fwd_kernel[(N,)](
         q=sw,
@@ -332,16 +408,21 @@ def attn_res_gate(
         res_packed=br,
         prefix=pf,
         add_hidden=hs,
+        add_hidden2=hs2,
         prefix_out=prefix_out,
+        block_out=bo,
         N=N,
         L=L,
         stride_res_n=br.stride(0),
         stride_res_l=br.stride(1),
+        stride_bo_n=bo.stride(0),
+        stride_bo_l=bo.stride(1),
         L2=L2,
         D=D,
         eps=eps,
+        out_eps=output_rms_eps,
         scale=scale,
-        BL=L2,
+        BL=bl,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -349,9 +430,15 @@ def attn_res_gate(
         IS_PACKED=True,
         HAS_PREFIX=True,
         DO_ADD=do_add,
+        DO_ADD2=do_add2,
         WRITE_PREF=do_add,
+        WRITE_BLOCK_CAT=close_block,
         HAS_W=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return y.view(output_shape), (prefix_out.view(output_shape) if do_add else prefix)
+    y_out = y.view(output_shape)
+    prefix_result = prefix_out.view(output_shape) if do_add else prefix
+    if not close_block:
+        return y_out, prefix_result
+    return y_out, prefix_result, block_out
