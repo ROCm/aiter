@@ -1,47 +1,42 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Sole torch-aware entry point for a4w4 blockscale GEMM.  All kernel code
-// (gemm_a4w4_blockscale.cu and the generated instances) is torch-free and
-// uses aiter_tensor_t.  This wrapper converts torch::Tensor to aiter_tensor_t,
-// extracts the current HIP stream from ATen, and delegates to aiter::.
-#include "rocm_ops.hpp"
+// Torch-free pybind entry point for a4w4 blockscale GEMM.  Torch lives only in
+// the Python layer: @compile_ops(..., develop=True) makes core.py convert each
+// torch.Tensor argument to a pybind aiter_tensor_t via torch_to_aiter_pybind()
+// and push the caller's stream through _set_current_hip_stream(), so this TU
+// includes no torch or ATen header.
+//
+// Writes into Out in place and returns void; the Python wrapper in
+// aiter/ops/gemm_op_a4w4.py returns Out so the public API still yields a
+// torch.Tensor.
+#include "aiter_stream.h"
 #include "gemm_a4w4_blockscale.h"
-#include "py_itfs_common.h"
-
-#include <ATen/hip/HIPContext.h>
+#include "rocm_ops.hpp"
 
 namespace {
 
-torch::Tensor gemm_a4w4_blockscale(torch::Tensor& XQ,
-                                    torch::Tensor& WQ,
-                                    torch::Tensor& x_scale,
-                                    torch::Tensor& w_scale,
-                                    torch::Tensor& Y,
-                                    int splitK,
-                                    std::string kernelName)
+void gemm_a4w4_blockscale(aiter_tensor_t& XQ,
+                          aiter_tensor_t& WQ,
+                          aiter_tensor_t& x_scale,
+                          aiter_tensor_t& w_scale,
+                          aiter_tensor_t& Y,
+                          int splitK,
+                          std::string kernelName)
 {
-    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
-    TORCH_CHECK(Y.scalar_type() == at::ScalarType::Half ||
-                Y.scalar_type() == at::ScalarType::BFloat16,
+    AITER_CHECK(XQ.dtype_ == WQ.dtype_, "Weights and activations should have the same dtype!");
+    AITER_CHECK(x_scale.dtype_ == w_scale.dtype_, "Scales should have the same dtype!");
+    AITER_CHECK(Y.dtype_ == AITER_DTYPE_fp16 || Y.dtype_ == AITER_DTYPE_bf16,
                 "Unsupported output dtype!");
 
-    auto xq_at = aiter_pybind::make_aiter_tensor(XQ);
-    auto wq_at = aiter_pybind::make_aiter_tensor(WQ);
-    auto xs_at = aiter_pybind::make_aiter_tensor(x_scale);
-    auto ws_at = aiter_pybind::make_aiter_tensor(w_scale);
-    auto y_at  = aiter_pybind::make_aiter_tensor(Y);
-
     aiter::gemm_a4w4_blockscale(
-        xq_at, wq_at, xs_at, ws_at, y_at, splitK,
-        at::hip::getCurrentHIPStream(), kernelName);
-    return Y;
+        XQ, WQ, x_scale, w_scale, Y, splitK, aiter::getCurrentHIPStream(), kernelName);
 }
 
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    AITER_SET_STREAM_PYBIND
     GEMM_A4W4_BLOCKSCALE_PYBIND;
 }
