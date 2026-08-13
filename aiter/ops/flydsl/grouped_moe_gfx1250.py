@@ -436,6 +436,7 @@ def _grouped_a8w4_tdm_moe(
     m_warp2=None,
     n_warp2=None,
     num_buffers2=None,
+    cluster_n=-1,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -619,6 +620,7 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            cluster_n=cluster_n,
             **_situ_kw,
         )
     else:
@@ -646,6 +648,7 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            cluster_n=cluster_n,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -682,6 +685,7 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
+        cluster_n=cluster_n,
     )
 
     if kernel_bench_callable is not None:
@@ -715,6 +719,7 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        cluster_n=cluster_n,
                         **_situ_kw,
                     ),
                 )
@@ -746,6 +751,7 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        cluster_n=cluster_n,
                         **_situ_kw,
                     ),
                 )
@@ -775,6 +781,7 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    cluster_n=cluster_n,
                 ),
             )
         )
@@ -1013,6 +1020,7 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
+            _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
