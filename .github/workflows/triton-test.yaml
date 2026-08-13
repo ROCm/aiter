@@ -20,6 +20,15 @@ on:
       - ".github/scripts/split_tests.sh"
       - ".github/scripts/verify_triton_pin.py"
       - ".github/requirements/triton-test.txt"
+      # Docs-only changes (README.md, configs/CLAUDE.md, conv/DESIGN.md, ...)
+      # don't affect test results — skip the test suites when a PR touches
+      # nothing else.
+      - "!**/*.md"
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.github/workflows/**'
+      - '!.github/scripts/sglang_downstream.py'
   workflow_dispatch:
 
 concurrency:
