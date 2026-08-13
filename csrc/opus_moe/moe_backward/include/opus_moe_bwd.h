@@ -70,6 +70,20 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     int num_tiles,
     int max_m);
 
+// Exact full-MoE variant: dscore partials are scattered from expert-grouped
+// route rows into original (token, top-k rank) order via route_to_flat [M].
+void opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16(
+    aiter_tensor_t& dy,
+    aiter_tensor_t& w,
+    aiter_tensor_t& act_input,
+    aiter_tensor_t& d_act_input,
+    aiter_tensor_t& dscore_partials,
+    aiter_tensor_t& expert_offsets,
+    aiter_tensor_t& tile_offsets,
+    aiter_tensor_t& route_to_flat,
+    int num_tiles,
+    int max_m);
+
 // Ragged compact-route plain dgrad through the 192x256x64 mono mainloop.
 void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
                                      aiter_tensor_t& w,
@@ -186,6 +200,18 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
     aiter_tensor_t& route_scores,
     aiter_tensor_t& partials,
     aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& router_w,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits);
+
+// Keep expert-grouped route gradients, but consume dscore metadata in flat
+// [T,topk] order so the sparse router tail needs no order indirection.
+void opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
     aiter_tensor_t& topk_ids,
     aiter_tensor_t& router_w,
     aiter_tensor_t& dst,

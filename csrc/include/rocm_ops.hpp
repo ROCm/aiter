@@ -400,6 +400,19 @@ namespace py = pybind11;
           py::arg("tile_offsets"), \
           py::arg("num_tiles"), \
           py::arg("max_m")); \
+    m.def("opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16", \
+          &opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16, \
+          "MoE ragged dgrad + SwiGLU + flat dscore partials", \
+          py::arg("dy"), \
+          py::arg("w"), \
+          py::arg("act_input"), \
+          py::arg("d_act_input"), \
+          py::arg("dscore_partials"), \
+          py::arg("expert_offsets"), \
+          py::arg("tile_offsets"), \
+          py::arg("route_to_flat"), \
+          py::arg("num_tiles"), \
+          py::arg("max_m")); \
     m.def("opus_moe_dgrad_mono_ragged_bf16", \
           &opus_moe_dgrad_mono_ragged_bf16, \
           "MoE ragged mono-tile plain dgrad", \
@@ -515,6 +528,17 @@ namespace py = pybind11;
           py::arg("route_scores"), \
           py::arg("partials"), \
           py::arg("order"), \
+          py::arg("topk_ids"), \
+          py::arg("router_w"), \
+          py::arg("dst"), \
+          py::arg("dlogits")); \
+    m.def("opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16", \
+          &opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16, \
+          "MoE exact dx gather with flat dscore metadata", \
+          py::arg("src"), \
+          py::arg("token_routes"), \
+          py::arg("route_scores"), \
+          py::arg("partials"), \
           py::arg("topk_ids"), \
           py::arg("router_w"), \
           py::arg("dst"), \

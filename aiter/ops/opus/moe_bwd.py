@@ -380,6 +380,25 @@ def _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
 
 @compile_ops(
     "module_moe_opus_bwd",
+    fc_name="opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16",
+    develop=True,
+)
+def _opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16_raw(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    d_act_input: Tensor,
+    dscore_partials: Tensor,
+    expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    route_to_flat: Tensor,
+    num_tiles: int,
+    max_m: int,
+) -> None: ...
+
+
+@compile_ops(
+    "module_moe_opus_bwd",
     fc_name="opus_moe_build_dgrad_meta_i32",
     develop=True,
 )
@@ -497,6 +516,45 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         dscore_partials,
         expert_offsets,
         tile_offsets,
+        num_tiles,
+        max_m,
+    )
+    return out
+
+
+def opus_moe_dgrad_swiglu_dscore_ragged_flat_prepared(
+    dy: Tensor,
+    w_bnk: Tensor,
+    act_input: Tensor,
+    expert_offsets: Tensor,
+    tile_offsets: Tensor,
+    route_to_flat: Tensor,
+    num_tiles: int,
+    max_m: int,
+    out: Tensor,
+    dscore_partials: Tensor,
+) -> Tensor:
+    """Exact stage-2 path with dscore partials in flat route order."""
+    E, N, K = w_bnk.shape
+    expected = (dy.shape[0], 2 * N)
+    if (
+        (E, N, K) != (64, 1024, 2048)
+        or act_input.shape != expected
+        or out.shape != expected
+        or route_to_flat.shape != (dy.shape[0],)
+        or route_to_flat.dtype != torch.int32
+        or dscore_partials.shape != (dy.shape[0], 4)
+    ):
+        raise ValueError("invalid exact flat dscore inputs")
+    _opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16_raw(
+        dy.contiguous(),
+        w_bnk.contiguous(),
+        act_input.contiguous(),
+        out,
+        dscore_partials,
+        expert_offsets,
+        tile_offsets,
+        route_to_flat,
         num_tiles,
         max_m,
     )
@@ -800,6 +858,23 @@ def _opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16",
+    develop=True,
+)
+def _opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16_raw(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+    dst: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 def build_token_routes(gather: Tensor, T: int, topk: int) -> Tensor:
     """Fixed top-k reverse map for the dx gather-sum: token_routes[t,k] = the
     compact route index of token t's k-th selection. Built once per moe-sort
@@ -870,6 +945,31 @@ def opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
     return dx, dlogits
 
 
+def opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+):
+    """Exact full tail with flat dscore metadata and grouped route gradients."""
+    T = route_scores.shape[0]
+    dx = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+    dlogits = torch.empty(T, 64, device=src.device, dtype=torch.bfloat16)
+    _opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16_raw(
+        src.contiguous(),
+        token_routes,
+        route_scores.contiguous(),
+        partials,
+        topk_ids.contiguous(),
+        router_w.contiguous(),
+        dx,
+        dlogits,
+    )
+    return dx, dlogits
+
+
 # --- M5 R7: router backward (opus kernel) ---
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_router_bwd_bf16", develop=True)
 def _opus_moe_router_bwd_bf16_raw(
@@ -918,6 +1018,7 @@ _WEIGHT_TRANSPOSE_CACHE = {}
 # Retain the host-built fallback for controlled performance comparisons and
 # non-capturable environments while the exact-shape GPU metadata path matures.
 _USE_GPU_DGRAD_METADATA = True
+_USE_FLAT_DSCORE_LAYOUT = True
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -998,6 +1099,9 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         offs = _offs_from_lens(lens)
         exact_shape = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
+        ctx.use_flat_dscore_layout = (
+            exact_shape and ctx.use_sparse_router_dx and _USE_FLAT_DSCORE_LAYOUT
+        )
         gpu_dgrad_metadata = exact_shape and _USE_GPU_DGRAD_METADATA
         if gpu_dgrad_metadata:
             # One 64-thread GPU kernel builds E+1 tile prefix sums followed by
@@ -1150,6 +1254,19 @@ class OpusMoERefFunc(torch.autograd.Function):
                     and w is w2_ref
                     and ctx.dims == (32768, 2048, 64, 1024, 8)
                 ):
+                    if ctx.use_flat_dscore_layout:
+                        return opus_moe_dgrad_swiglu_dscore_ragged_flat_prepared(
+                            dy_op.contiguous(),
+                            wt,
+                            act_input,
+                            offs,
+                            ctx.mono_tile_offsets,
+                            order,
+                            ctx.num_mono_tiles,
+                            ctx.max_expert_m,
+                            out,
+                            dscore_partials,
+                        )
                     return opus_moe_dgrad_swiglu_dscore_ragged_prepared(
                         dy_op.contiguous(),
                         wt,
@@ -1201,6 +1318,19 @@ class OpusMoERefFunc(torch.autograd.Function):
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             nonlocal fused_dlogits
+            if ctx.use_flat_dscore_layout and dscore_partials is not None:
+                dx, fused_dlogits = (
+                    opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
+                        src,
+                        ctx.token_routes,
+                        ctx.saved_tensors[11],
+                        dscore_partials,
+                        topk_ids,
+                        ctx.full_router_w,
+                    )
+                )
+                ctx.fused_sparse_router_dx = True
+                return dx
             if ctx.use_sparse_router_dx and dscore_partials is not None:
                 dx, fused_dlogits = (
                     opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(

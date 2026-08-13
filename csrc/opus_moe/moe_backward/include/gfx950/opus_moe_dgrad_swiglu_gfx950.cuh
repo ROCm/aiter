@@ -22,6 +22,7 @@ struct opus_moe_dgrad_swiglu_kargs
     const void* __restrict__ ptr_act_input;
     void* __restrict__ ptr_dact;
     void* __restrict__ ptr_dscore_partials;
+    const int32_t* __restrict__ route_to_flat;
     const int32_t* __restrict__ expert_offsets;
     const int32_t* __restrict__ tile_offsets;
     int m;
@@ -82,7 +83,8 @@ template<typename UserTraits,
          bool COMPACT_TILES = false,
          int FIXED_K = 0,
          bool TARGET_EXACT = false,
-         bool PADDED_GRID = false>
+         bool PADDED_GRID = false,
+         bool FLAT_DSCORE = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -439,8 +441,11 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                 const int compact_row = RAGGED
                     ? batch_row_start + route_row
                     : batch_id * kargs.m + route_row;
+                const int score_row = FLAT_DSCORE
+                    ? kargs.route_to_flat[compact_row]
+                    : compact_row;
                 reinterpret_cast<float*>(kargs.ptr_dscore_partials)[
-                    compact_row * stride_dscore +
+                    score_row * stride_dscore +
                     n_tile] = partial;
             }
         }
@@ -592,4 +597,20 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
             opus_moe_dgrad_swiglu_traits_gfx950,
             false, false, true, true>
             <<<grid, block, 0, stream>>>(kargs);
+}
+
+// The exact full-MoE variant writes the small dscore partial tensor in original
+// (token, top-k rank) order.  The final router tail then avoids reverse-map
+// loads while the 1-GiB route gradient retains its efficient grouped stores.
+inline void opus_moe_dgrad_swiglu_dscore_ragged_flat_launch_gfx950(
+    const opus_moe_dgrad_swiglu_kargs& kargs,
+    hipStream_t stream)
+{
+    const int num_tiles_n = kargs.n / 256;
+    dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
+    dim3 block(512);
+    opus_moe_dgrad_swiglu_kernel_gfx950<
+        opus_moe_dgrad_swiglu_traits_gfx950,
+        true, true, true, true, 2048, true, true, true>
+        <<<grid, block, 0, stream>>>(kargs);
 }

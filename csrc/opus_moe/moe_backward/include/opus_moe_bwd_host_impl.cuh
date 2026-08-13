@@ -364,6 +364,76 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
         k, aiter::getCurrentHIPStream());
 }
 
+void opus_moe_dgrad_swiglu_dscore_ragged_flat_bf16(
+    aiter_tensor_t& dy,
+    aiter_tensor_t& w,
+    aiter_tensor_t& act_input,
+    aiter_tensor_t& d_act_input,
+    aiter_tensor_t& dscore_partials,
+    aiter_tensor_t& expert_offsets,
+    aiter_tensor_t& tile_offsets,
+    aiter_tensor_t& route_to_flat,
+    int num_tiles,
+    int max_m)
+{
+    const int E = static_cast<int>(w.size(0));
+    const int N = static_cast<int>(w.size(1));
+    const int K = static_cast<int>(w.size(2));
+    const int M = static_cast<int>(dy.size(0));
+    constexpr int kTargetRoutes = 32768 * 8;
+    constexpr int kTargetTiles =
+        (kTargetRoutes + 191) / 192 + 64 - 1;
+    AITER_CHECK(E == 64 && M == kTargetRoutes && N == 1024 && K == 2048,
+                "flat dscore is specialized for the Sonic parity shape");
+    AITER_CHECK(max_m == M && num_tiles == kTargetTiles,
+                "flat dscore requires the padded exact-shape tile grid");
+    AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1 &&
+                    static_cast<int>(tile_offsets.size(0)) ==
+                        E + 1 + num_tiles,
+                "flat dscore requires packed exact-shape metadata");
+    AITER_CHECK(static_cast<int>(act_input.size(0)) == M &&
+                    static_cast<int>(act_input.size(1)) == 2 * N &&
+                    static_cast<int>(d_act_input.size(0)) == M &&
+                    static_cast<int>(d_act_input.size(1)) == 2 * N,
+                "invalid flat dscore activation tensors");
+    AITER_CHECK(static_cast<int>(dscore_partials.size(0)) == M &&
+                    static_cast<int>(dscore_partials.size(1)) == N / 256,
+                "flat dscore partials must have shape [M,4]");
+    AITER_CHECK(route_to_flat.dim() == 1 &&
+                    static_cast<int>(route_to_flat.size(0)) == M &&
+                    route_to_flat.dtype() == AITER_DTYPE_i32 &&
+                    route_to_flat.is_contiguous(),
+                "route_to_flat must be contiguous int32 [M]");
+
+    opus_moe_dgrad_swiglu_kargs k{};
+    k.ptr_a = dy.data_ptr();
+    k.ptr_b = w.data_ptr();
+    k.ptr_act_input = act_input.data_ptr();
+    k.ptr_dact = d_act_input.data_ptr();
+    k.ptr_dscore_partials = dscore_partials.data_ptr();
+    k.route_to_flat =
+        reinterpret_cast<const int32_t*>(route_to_flat.data_ptr());
+    k.expert_offsets =
+        reinterpret_cast<const int32_t*>(expert_offsets.data_ptr());
+    k.tile_offsets =
+        reinterpret_cast<const int32_t*>(tile_offsets.data_ptr());
+    k.m = max_m;
+    k.n = N;
+    k.k = K;
+    k.batch = E;
+    k.stride_a = static_cast<int>(dy.stride(0));
+    k.stride_b = static_cast<int>(w.stride(1));
+    k.stride_act_input = static_cast<int>(act_input.stride(0));
+    k.stride_dact = static_cast<int>(d_act_input.stride(0));
+    k.stride_b_batch = static_cast<int>(w.stride(0));
+    k.stride_dscore = static_cast<int>(dscore_partials.stride(0));
+    k.ragged = 1;
+    k.compact_tiles = 4;
+    k.num_tiles = num_tiles;
+    opus_moe_dgrad_swiglu_dscore_ragged_flat_launch_gfx950(
+        k, aiter::getCurrentHIPStream());
+}
+
 void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
                                      aiter_tensor_t& w,
                                      aiter_tensor_t& out,
@@ -1306,7 +1376,7 @@ void opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
         T);
 }
 
-template<typename Index>
+template<typename Index, bool FLAT_META = false>
 __global__ __launch_bounds__(512, 1)
 void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
     const __bf16* __restrict__ src,
@@ -1341,12 +1411,16 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
     if(valid_token && wave_in_token == 0 && lane < TOPK)
     {
         float scaled_dp = 0.0f;
-        const int32_t route = tr[lane];
+        const int32_t route = FLAT_META
+            ? t * TOPK + lane
+            : tr[lane];
 #pragma unroll
         for(int i = 0; i < PARTIALS; ++i)
             scaled_dp +=
                 partials[static_cast<int64_t>(route) * PARTIALS + i];
-        const int rank = static_cast<int>(order[route] & (TOPK - 1));
+        const int rank = FLAT_META
+            ? lane
+            : static_cast<int>(order[route] & (TOPK - 1));
         float dot = 0.0f;
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
@@ -1448,6 +1522,48 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16(
             reinterpret_cast<__bf16*>(dlogits.data_ptr()),
             T);
     }
+}
+
+void opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& router_w,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(dst.size(0));
+    AITER_CHECK(T == 32768 && static_cast<int>(src.size(0)) == T * 8 &&
+                    static_cast<int>(src.size(1)) == 2048,
+                "flat-meta route tail requires [32768*8,2048] src");
+    AITER_CHECK(static_cast<int>(route_scores.size(0)) == T &&
+                    static_cast<int>(route_scores.size(1)) == 8 &&
+                    static_cast<int>(partials.size(0)) == T * 8 &&
+                    static_cast<int>(partials.size(1)) == 4,
+                "invalid flat-meta route score tensors");
+    AITER_CHECK(token_routes.dtype() == AITER_DTYPE_i32 &&
+                    token_routes.is_contiguous() &&
+                    topk_ids.dtype() == AITER_DTYPE_i32 &&
+                    topk_ids.is_contiguous(),
+                "flat-meta route tail requires contiguous int32 metadata");
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const dim3 grid((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK);
+    const dim3 block(512);
+    opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel<
+        int32_t, true>
+        <<<grid, block, 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(src.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(route_scores.data_ptr()),
+        reinterpret_cast<const float*>(partials.data_ptr()),
+        nullptr,
+        reinterpret_cast<const int32_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<const __bf16*>(router_w.data_ptr()),
+        reinterpret_cast<__bf16*>(dst.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()),
+        T);
 }
 
 // Router backward (M5 R7): softmax-over-topk Jacobian. Per token t (one thread):
