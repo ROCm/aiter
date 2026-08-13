@@ -16,7 +16,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
 )
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
@@ -173,6 +173,38 @@ def quantize(x, dtype):
         return x, scale
 
 
+def pin_routed_experts_mask(n_tokens, n_expts_tot, n_routed, n_expts_act, dev):
+    """Bool mask that pins routing to exactly `n_routed` experts.
+
+    Masking the logits down to a random pool of `n_routed` experts only caps
+    the routed count: nothing makes top-k cover the pool, so a small batch
+    lands on fewer. Pick each token's expert set directly instead -- every pool
+    expert is claimed by at least one token, the remaining slots are filled at
+    random from the pool -- and mask everything else to -inf, the same sentinel
+    `_topk` uses for its own out-of-range lanes, so top-k has to return that
+    set. A histogram with zeros in it is the normal case, so hist /
+    block_pid_map stay consistent.
+
+    True marks the experts a token must not route to, so the profiled loop only
+    pays `logits.masked_fill_(mask, -inf)` per rep.
+
+    `n_tokens * n_expts_act` routed rows cannot reach more experts than there
+    are rows, so the pool shrinks to fit a tiny batch; the second return value
+    is what was actually pinned.
+    """
+    n_pinned = min(n_routed, n_tokens * n_expts_act)
+    pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
+
+    slot = torch.arange(n_pinned, device=dev)
+    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score[slot % n_tokens, slot] += 1.0
+    keep = pool[score.topk(n_expts_act, dim=-1).indices]
+
+    drop = torch.ones((n_tokens, n_expts_tot), dtype=torch.bool, device=dev)
+    drop.scatter_(1, keep, False)
+    return drop, n_pinned
+
+
 def bench_mlp_single_weight_init(
     batch,
     dim1,
@@ -183,12 +215,25 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     op_regex,
+    routed_experts=None,
     preshuffle=False,
 ):
     rank = 0
     dev = f"cuda:{rank}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
+    if routed_experts is not None:
+        # every token needs n_expts_act distinct experts, so the pool can't be smaller
+        assert n_expts_act <= routed_experts <= n_expts_tot, (
+            f"--routed-experts must be between top-k ({n_expts_act}) and the total "
+            f"expert count ({n_expts_tot}), got {routed_experts}"
+        )
+        # HERD routes top-(k+1) then drops the least batch-popular expert, which
+        # shrinks the routed set out from under the pin.
+        assert not _USE_HERD, (
+            "--routed-experts pins the routed expert set, which HERD routing "
+            "undoes; unset AITER_TRITON_USE_HERD"
+        )
 
     # -- init data --
     # weights
@@ -224,12 +269,24 @@ def bench_mlp_single_weight_init(
     xg = x
     if x_dtype_str == "fp8":
         static_scale = torch.tensor(1e-4, device=dev)
+    pin_mask = None
+    if routed_experts is not None:
+        pin_mask, n_pinned = pin_routed_experts_mask(
+            batch, n_expts_tot, routed_experts, n_expts_act, dev
+        )
+        if n_pinned < routed_experts:
+            print(
+                f"  batch={batch}: pinned {n_pinned} experts, not {routed_experts} "
+                f"-- batch * top-k is only {batch * n_expts_act} routed rows"
+            )
 
     # run layer
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
+        if pin_mask is not None:
+            logits.masked_fill_(pin_mask, float("-inf"))
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         if x_dtype_str == "fp8":
             x = downcast_to_static_fp8(x, static_scale)
@@ -308,6 +365,7 @@ def bench_mlp(
     w_dtype,
     TP,
     op_regex,
+    routed_experts=None,
     num_weight_inits=1,
     preshuffle=False,
 ):
@@ -323,6 +381,7 @@ def bench_mlp(
             w_dtype,
             TP,
             op_regex,
+            routed_experts=routed_experts,
             preshuffle=preshuffle,
         )
         all_results.append(result)
@@ -349,6 +408,7 @@ def roofline_mlp(
     w_dtype,
     TP,
     op_regex,
+    routed_experts=None,
     name="",
     num_weight_inits=1,
     preshuffle=False,
@@ -367,7 +427,8 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        op_regex,  # fixed args
+        op_regex,
+        routed_experts,  # fixed args
         num_weight_inits,
         preshuffle,
         bench_fn=bench_mlp,  # function to benchmark
@@ -413,6 +474,17 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default="fp8",
         help="Activation dtype, fp8 or mx8.",
+    )
+    parser.add_argument(
+        "--routed-experts",
+        type=int,
+        default=None,
+        help="Pin the number of experts that receive tokens, holding the expert "
+        "weight bytes read fixed across the batch sweep. Not to be confused with "
+        "the second value of --experts, which is top-k per token. batch * top-k "
+        "routed rows cannot reach more experts than there are rows, so a batch "
+        "that small pins fewer. Default: unset, i.e. random routing over all "
+        "experts.",
     )
     parser.add_argument(
         "--num-weight-inits",
@@ -461,6 +533,7 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         op_regex=parsed_args.op_regex,
+        routed_experts=parsed_args.routed_experts,
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
