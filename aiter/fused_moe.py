@@ -2597,24 +2597,23 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.i4x2
         and is_flydsl_available()
     ):
-        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
+        # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
+        # the port has no grid split-K (it uses intra-block k_wave); asking for it
+        # would set up partials the kernel never writes. block_m MUST equal tile_m --
+        # it sizes both moe_sorting and the gemm tile.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+        _tile_n = _tile_k = 128
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
-        if _ksplit > 1:
-            kn1 += f"_kb{_ksplit}"
         kn2 = flydsl_kernel_name(
             2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using untuned a16wi4 fallback ({kn1=}, {kn2=})"
         )
         return MOEMetadata(
             functools.partial(
@@ -2631,7 +2630,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            _ksplit,
+            0,
             False,
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.

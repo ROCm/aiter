@@ -190,19 +190,18 @@ class Case:
             Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
+            Case(300, 400, 800, "float8_e4m3fn", 8, 4),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
             Case(16, 400, 500, "float8_e4m3fn", 32, 2),
             Case(32, 500, 600, "mxfloat8_e4m3fn", 64, 4),
-            Case(64, 4096, 4096, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
-            Case(64, 4096, 2048, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2),
+            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
+            Case(64, 4096, 4096, "mxfloat8_e4m3fn", 256, 6, hbm_swizzling=True),
+            Case(64, 4096, 2048, "mxfloat8_e4m3fn", 256, 6, hbm_swizzling=True),
+            Case(32, 6144, 7168, "mxfloat8_e4m3fn", 96, 6, hbm_swizzling=True),
+            Case(128, 7168, 3072, "mxfloat8_e4m3fn", 96, 6, hbm_swizzling=True),
             Case(64, 1536, 7168, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
             Case(256, 7168, 768, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
-            # smaller tests for gfx1250 ffm
-            Case(16, 512, 512, "float8_e4m3fn", 32, 2),
-            Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
-            Case(300, 400, 800, "float8_e4m3fn", 8, 4),
-            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2),
-            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
         ]
     ],
 )
@@ -249,14 +248,8 @@ def test_op(
         )
 
     if get_arch() == "gfx1250":
-        # if act_dtype_str == "mxfloat8_e4m3fn":
-        #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
         # temporary
-        if (
-            do_gather
-            and (m * n_expts_act) > 1024
-            and act_dtype_str == "mxfloat8_e4m3fn"
-        ):
+        if do_gather and m > 1024 and act_dtype_str == "mxfloat8_e4m3fn":
             pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
