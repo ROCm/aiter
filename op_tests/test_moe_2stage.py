@@ -887,10 +887,10 @@ def _iter_csv_cases(csv_path=None, force_check_aot_cache=False):
             kwargs["linear_beta"] = (
                 25.0 if args.linear_beta is None else float(args.linear_beta)
             )
+        # The reference path below uses the CSV q_dtype_a directly, while
+        # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
+        # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
         if kwargs["actType"] == aiter.ActivationType.Situv2:
-            # The reference path below uses the CSV q_dtype_a directly, while
-            # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
-            # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
             expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
                 kwargs["qType"], kwargs["WQDType"]
             )
