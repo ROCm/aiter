@@ -178,7 +178,6 @@ jobs:
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
           cases = []
-          excluded_kimi = []
           label = None
 
           for line in pipeline.read_text(encoding="utf-8").splitlines():
@@ -208,9 +207,6 @@ jobs:
               if not model_match or not nodes_match:
                   continue
               model = model_match.group(1)
-              if model.startswith("Kimi-"):
-                  excluded_kimi.append(label)
-                  continue
 
               topology_match = re.search(r"-PD-(1P1D|2P2D)-TP8-", label)
               if topology_match is None:
@@ -230,9 +226,9 @@ jobs:
               )
 
           selected = {(case["model_name"], case["topology"]) for case in cases}
-          if len(cases) != 6 or len(selected) != len(cases):
+          if len(cases) != 10 or len(selected) != len(cases):
               raise SystemExit(
-                  "Expected exactly six unique non-Kimi vLLM-router cases "
+                  "Expected exactly ten unique vLLM-router cases "
                   f"from {pipeline}; selected {sorted(selected)!r}"
               )
 
@@ -244,8 +240,7 @@ jobs:
           with summary.open("a", encoding="utf-8") as output:
               print("### Selected upstream vLLM cases\n", file=output)
               print(
-                  f"Selected all {len(cases)} non-Kimi vLLM-router accuracy cases; "
-                  f"excluded {len(excluded_kimi)} Kimi cases.\n",
+                  f"Selected all {len(cases)} vLLM-router accuracy cases.\n",
                   file=output,
               )
               print("| Case | Nodes | Upstream command |", file=output)
