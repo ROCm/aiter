@@ -448,20 +448,38 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     constexpr int BM = 256;
     constexpr int BN = 256;
     constexpr int BK = 64;
+    // The natural-route target specializations use a direct VMEM->LDS copy.
+    // A buffer_load_dwordx4_lds always writes lane i at M0+i*16 bytes, so one
+    // full wave naturally covers two consecutive 256-BF16 rows.  Store those
+    // rows as a pair and insert one 64-byte bank-phase shift per pair.  This
+    // keeps all 64 lanes active (unlike the earlier half-wave padded copy),
+    // removes the explicit ds_write_b128 staging pass, and still gives the
+    // transpose reader a regular physical stride every two logical rows.
+    constexpr bool PAIR_DIRECT_TO_LDS =
+        FIXED_ROUTES == 0 && FIXED_P == 2048 &&
+        (FIXED_Q == 1024 || FIXED_Q == 2048);
     // A 256-bf16 row is a 512-byte multiple of the LDS bank period, so every
     // transpose read aliases the same bank phase.  Shift successive K rows by
     // 64 bytes; this cuts the measured ds_read bank conflicts without changing
     // the global-load or MFMA fragment layouts.
     constexpr int LDS_PAD = 32;
     constexpr int LD = BM + LDS_PAD;
+    constexpr int PAIR_LDS_PAD = 32;
+    constexpr int PAIR_LD = 2 * BM + PAIR_LDS_PAD;
+    constexpr int LDS_ROWS = PAIR_DIRECT_TO_LDS ? BK / 2 : BK;
+    constexpr int LDS_STRIDE = PAIR_DIRECT_TO_LDS ? PAIR_LD : LD;
     const int P = FIXED_P > 0 ? FIXED_P : P_arg;
     const int Q = FIXED_Q > 0 ? FIXED_Q : Q_arg;
-    __shared__ __align__(16) opus::bf16_t As[2][BK][LD];
-    __shared__ __align__(16) opus::bf16_t Bs[2][BK][LD];
+    __shared__ __align__(16) opus::bf16_t As[2][LDS_ROWS][LDS_STRIDE];
+    __shared__ __align__(16) opus::bf16_t Bs[2][LDS_ROWS][LDS_STRIDE];
 
     const int tid = threadIdx.x;
     const int lane = tid % 64;
     const int warp = tid / 64;
+    // Keep the wave id in an SGPR for Direct-to-LDS destination arithmetic.
+    // Otherwise clang rebuilds the wave-uniform LDS pointer in VGPRs and emits
+    // a v_readfirstlane before every buffer_load_lds instruction.
+    const int scalar_warp = __builtin_amdgcn_readfirstlane(warp);
     const int wm = warp / 4;
     const int wn = warp % 4;
     const int e = blockIdx.z;
@@ -500,12 +518,22 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     struct load_regs {
         opus_bf16x8 a0, a1, b0, b1;
     };
+    const unsigned int dy_resource_bytes = PAIR_DIRECT_TO_LDS && nroute > 0
+        ? static_cast<unsigned int>(
+              (static_cast<int64_t>(nroute) * P - m0) * sizeof(__bf16))
+        : 0xffffffffu;
+    const unsigned int a_resource_bytes = PAIR_DIRECT_TO_LDS && nroute > 0
+        ? static_cast<unsigned int>(
+              (static_cast<int64_t>(nroute) * Q - n0) * sizeof(__bf16))
+        : 0xffffffffu;
     auto g_dy = opus::make_gmem(
         reinterpret_cast<const opus::bf16_t*>(dy) +
-        static_cast<int64_t>(r0) * P + m0);
+        static_cast<int64_t>(r0) * P + m0,
+        dy_resource_bytes);
     auto g_a = opus::make_gmem(
         reinterpret_cast<const opus::bf16_t*>(a) +
-        static_cast<int64_t>(r0) * Q + n0);
+        static_cast<int64_t>(r0) * Q + n0,
+        a_resource_bytes);
     auto load_global_valid = [&](int stage, int half, load_regs& x) {
         const int route = r0 + stage * BK + half * 32 + load_k;
         const int mf = m0 + load_f;
@@ -545,13 +573,42 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
             load_global_valid(stage, half, x);
     };
     auto store_stage = [&](int buf, int half, const load_regs& x) {
-        auto as = opus::make_smem(&As[buf][0][0]);
-        auto bs = opus::make_smem(&Bs[buf][0][0]);
-        const int os = (half * 32 + load_k) * LD + load_f;
-        as.template store<8>(x.a0, os);
-        as.template store<8>(x.a1, os + 8);
-        bs.template store<8>(x.b0, os);
-        bs.template store<8>(x.b1, os + 8);
+        if constexpr(!PAIR_DIRECT_TO_LDS)
+        {
+            auto as = opus::make_smem(&As[buf][0][0]);
+            auto bs = opus::make_smem(&Bs[buf][0][0]);
+            const int os = (half * 32 + load_k) * LD + load_f;
+            as.template store<8>(x.a0, os);
+            as.template store<8>(x.a1, os + 8);
+            bs.template store<8>(x.b0, os);
+            bs.template store<8>(x.b1, os + 8);
+        }
+    };
+
+    // Each call moves 16 routes: every one of the eight waves owns one row
+    // pair, and lane halves select the first/second row.  Two calls therefore
+    // fill one 32-route half-stage without any VGPR payload or ds_write.
+    auto async_load_pair = [&](int stage, int pair, int buf) {
+        if constexpr(PAIR_DIRECT_TO_LDS)
+        {
+            const int row_in_stage = pair * 16 + warp * 2 + (lane >> 5);
+            const int feature = (lane & 31) * 8;
+            const int pair_in_stage = pair * 8 + scalar_warp;
+            void* a_dst = reinterpret_cast<void*>(&As[buf][pair_in_stage][0]);
+            void* b_dst = reinterpret_cast<void*>(&Bs[buf][pair_in_stage][0]);
+            g_dy.template async_load<8>(
+                a_dst, (stage * BK + row_in_stage) * P + feature);
+            g_a.template async_load<8>(
+                b_dst, (stage * BK + row_in_stage) * Q + feature);
+        }
+    };
+    auto async_load_half = [&](auto half_tag, int stage, int buf) {
+        if constexpr(PAIR_DIRECT_TO_LDS)
+        {
+            constexpr int HALF = decltype(half_tag)::value;
+            async_load_pair(stage, HALF * 2, buf);
+            async_load_pair(stage, HALF * 2 + 1, buf);
+        }
     };
 
     const int full_k_stages = nroute / BK;
@@ -562,35 +619,66 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     // and balanced-route scheduling remain unchanged.
     if(num_k_stages > 0)
     {
-        load_regs first;
-        if(full_k_stages > 0)
-            load_global_valid(0, 0, first);
+        if constexpr(PAIR_DIRECT_TO_LDS)
+        {
+            async_load_half(opus::number<0>{}, 0, 0);
+            async_load_half(opus::number<1>{}, 0, 0);
+        }
         else
-            load_global_tail(0, 0, first);
-        store_stage(0, 0, first);
-        if(full_k_stages > 0)
-            load_global_valid(0, 1, first);
-        else
-            load_global_tail(0, 1, first);
-        store_stage(0, 1, first);
+        {
+            load_regs first;
+            if(full_k_stages > 0)
+                load_global_valid(0, 0, first);
+            else
+                load_global_tail(0, 0, first);
+            store_stage(0, 0, first);
+            if(full_k_stages > 0)
+                load_global_valid(0, 1, first);
+            else
+                load_global_tail(0, 1, first);
+            store_stage(0, 1, first);
+        }
     }
+    if constexpr(PAIR_DIRECT_TO_LDS)
+        opus::s_waitcnt_vmcnt(opus::number<0>{});
     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     __syncthreads();
 
-    const auto tr_layout = opus_wgtn_make_tr_layout(lane, LD);
+    const auto tr_layout = opus_wgtn_make_tr_layout(
+        lane, PAIR_DIRECT_TO_LDS ? BM : LD);
     const auto tr_offsets = opus::layout_to_offsets<4>(tr_layout);
-    auto tr_base = [&](auto* ptr) {
-        auto smem = opus::make_smem(ptr);
+    auto tr_base = [&](auto* ptr, int feature_base) {
+        int physical_offset;
+        if constexpr(PAIR_DIRECT_TO_LDS)
+        {
+            const int logical_offset = tr_offsets[0];
+            const int logical_row = logical_offset / BM;
+            const int logical_col = logical_offset % BM;
+            physical_offset =
+                (logical_row / 2) * PAIR_LD +
+                (logical_row & 1) * BM + logical_col + feature_base;
+        }
+        else
+        {
+            physical_offset = tr_offsets[0] + feature_base;
+        }
+        auto smem = opus::make_smem(ptr + physical_offset);
         return static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(
-            smem.ptr + tr_offsets[0] * sizeof(__bf16)));
+            smem.ptr));
     };
     const uint32_t a_base[2] = {
-        tr_base(&As[0][0][wm * 128]), tr_base(&As[1][0][wm * 128])};
+        tr_base(&As[0][0][0], wm * 128),
+        tr_base(&As[1][0][0], wm * 128)};
     const uint32_t b_base[2] = {
-        tr_base(&Bs[0][0][wn * 64]), tr_base(&Bs[1][0][wn * 64])};
-    constexpr int KPACK_BYTES = 16 * LD * sizeof(__bf16);
+        tr_base(&Bs[0][0][0], wn * 64),
+        tr_base(&Bs[1][0][0], wn * 64)};
+    constexpr int KPACK_BYTES = PAIR_DIRECT_TO_LDS
+        ? 8 * PAIR_LD * sizeof(__bf16)
+        : 16 * LD * sizeof(__bf16);
     constexpr int SUBTILE_BYTES = 32 * sizeof(__bf16);
-    constexpr int TR_SECOND_BYTES = 4 * LD * sizeof(__bf16);
+    constexpr int TR_SECOND_BYTES = PAIR_DIRECT_TO_LDS
+        ? 2 * PAIR_LD * sizeof(__bf16)
+        : 4 * LD * sizeof(__bf16);
     if constexpr(FIXED_ROUTES > 0)
     {
         for(int stage = 0; stage < num_k_stages; ++stage)
@@ -698,7 +786,12 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         load_regs next;
         if constexpr(HAS_NEXT)
         {
-            if constexpr(MASKED_NEXT)
+            if constexpr(PAIR_DIRECT_TO_LDS)
+            {
+                async_load_half(opus::number<0>{}, stage + 1, cur ^ 1);
+                async_load_half(opus::number<1>{}, stage + 1, cur ^ 1);
+            }
+            else if constexpr(MASKED_NEXT)
                 load_global_tail(stage + 1, 0, next);
             else
                 load_global_valid(stage + 1, 0, next);
@@ -796,7 +889,8 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
                         opus::s_waitcnt_lgkmcnt(opus::number<4>{});
                 }
             });
-            if constexpr(HAS_NEXT && kpack.value == 1)
+            if constexpr(HAS_NEXT && kpack.value == 1 &&
+                         !PAIR_DIRECT_TO_LDS)
             {
                 __builtin_amdgcn_s_setprio(0);
                 store_stage(cur ^ 1, 0, next);
@@ -811,7 +905,10 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
 
         if constexpr(HAS_NEXT)
         {
-            store_stage(cur ^ 1, 1, next);
+            if constexpr(PAIR_DIRECT_TO_LDS)
+                opus::s_waitcnt_vmcnt(opus::number<0>{});
+            else
+                store_stage(cur ^ 1, 1, next);
             opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             __syncthreads();
         }
