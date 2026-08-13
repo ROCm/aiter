@@ -74,7 +74,7 @@ def _hstu_attn_fwd_one_block(
     offs_d_v = tl.arange(0, BLOCK_D_V)
     k_ptrs = K_base + offs_d_q[:, None] + offs_n[None, :] * stride_kn
     v_ptrs = V_base + offs_n[:, None] * stride_vn + offs_d_v[None, :]
-    
+
     # -- compute qk ----
     k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
     qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
@@ -180,13 +180,21 @@ def _hstu_attn_fwd_compute(
         offs_m = start_m + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_d_q = tl.arange(0, BLOCK_D_Q)
-        K_base=K + off_h * stride_kh + seq_start * stride_kn
-        V_base=V + off_h * stride_vh + seq_start * stride_vn
+        K_base = K + off_h * stride_kh + seq_start * stride_kn
+        V_base = V + off_h * stride_vh + seq_start * stride_vn
         mask_m = offs_m < seq_len
         if IS_DELTA_Q:
             Q_base = Q + off_h * stride_qh + off_z * DeltaSize * stride_qm
-            q_ptrs = Q_base + (start_m_delta + tl.arange(0, BLOCK_M))[:, None] * stride_qm + offs_d_q[None, :]
-            q = tl.load(q_ptrs, mask=((start_m_delta + tl.arange(0, BLOCK_M)) < DeltaSize)[:, None], other=0.0)
+            q_ptrs = (
+                Q_base
+                + (start_m_delta + tl.arange(0, BLOCK_M))[:, None] * stride_qm
+                + offs_d_q[None, :]
+            )
+            q = tl.load(
+                q_ptrs,
+                mask=((start_m_delta + tl.arange(0, BLOCK_M)) < DeltaSize)[:, None],
+                other=0.0,
+            )
         else:
             Q_base = Q + off_h * stride_qh + seq_start * stride_qm
             q_ptrs = Q_base + offs_m[:, None] * stride_qm + offs_d_q[None, :]
@@ -357,7 +365,7 @@ def _hstu_attn_fwd(
         off_z = tl.load(sort_by_length_indices + off_z)
     off_h = off_hz % H
     pid = tl.program_id(0)
-            
+
     _hstu_attn_fwd_compute(
         Q=Q,
         K=K,
