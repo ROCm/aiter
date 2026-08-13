@@ -478,7 +478,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail       = opus::max(batch_tail, 0);
+                        batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                         work_info.kv_end = opus::min(work_info.kv_start +
                                                          (remain_kv_blocks * params.kv_granularity),
                                                      curr_kv_end - batch_tail);
@@ -631,7 +631,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail       = opus::max(batch_tail, 0);
+                            batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                             work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
@@ -858,19 +858,12 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     const bool natively_supported =
         (num_heads == 16) ||
-        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 1)) ||
-        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 2)) ||
-        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 4)) ||
         ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 &&
          kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-         (((num_heads == 32) && (max_seqlen_qo >= 4)) || (num_heads == 64) ||
-          (num_heads == 128))) ||
+         ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
         hk_mtp_experimental;
 
     if(!natively_supported && (num_heads % 16 == 0))
@@ -932,6 +925,11 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     int32_t kPackedQoLenPerWg = 128;
     if((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 && (num_heads * max_seqlen_qo >= 64) &&
        (num_heads <= 64) && (((num_heads * max_seqlen_qo) < 128) || (num_heads == 48)))
+    {
+        kPackedQoLenPerWg = 64;
+    }
+    else if((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 32) &&
+            (max_seqlen_qo == 3))
     {
         kPackedQoLenPerWg = 64;
     }

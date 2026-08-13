@@ -41,14 +41,11 @@ to use the legacy single-kernel ``flydsl_fused_compress_attn``.
 """
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -56,24 +53,17 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    block_base_bytes_i64,
+    emit_group_fp8_nm_asm_scatter,
+    state_slot_byte_offset,
+)
 from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
-
-
-@contextmanager
-def _if_then(if_op):
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -201,9 +191,7 @@ def _build_compress_forward_kernel(
         c_state_size = arith.constant(state_size, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         # Per-thread wave / lane (block-local).
         wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
@@ -218,9 +206,9 @@ def _build_compress_forward_kernel(
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
-        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0, as a closure
+        # under a runtime `if` (rewriter sees an opaque call -> scf.if).
+        def _body():
             # Per-thread head_dim base: each thread owns VEC contiguous
             # elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
@@ -235,9 +223,16 @@ def _build_compress_forward_kernel(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -356,15 +351,12 @@ def _build_compress_forward_kernel(
                 is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
                 s_safe = arith.select(is_pad, c_zero_i32, s)
                 ring = arith.remui(s_safe, c_state_size)
+                # Slot term already folded into the descriptor base.
                 base_kv_off = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
-                    + col_off_base
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride) + col_off_base
                 )
                 base_sc_off = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
-                    + col_off_base
+                    ArithValue(ring) * ArithValue(score_state_pos_stride) + col_off_base
                 )
                 kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
                 sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
@@ -499,9 +491,7 @@ def _build_compress_forward_kernel(
             # (VEC elements per thread). For each owned element, the thread
             # reads NW values from LDS (one per K-split wave) and computes
             # the global online-softmax.
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
                     lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
@@ -525,11 +515,7 @@ def _build_compress_forward_kernel(
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
                     comp_list.append(_to_raw(kv_sum * rcp_w))
 
                 # -- Vectorized write of VEC f32 comp values --
@@ -558,6 +544,12 @@ def _build_compress_forward_kernel(
                         ArithValue(out_off) + arith.constant(half, type=i32),
                     )
 
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
+
     @flyc.jit
     def launch_hca_compress_forward(
         kv_in: fx.Tensor,
@@ -578,8 +570,8 @@ def _build_compress_forward_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
-        idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
+        idx_p = fx.Int64(plan_capacity)
+        idx_s = fx.Int64(NUM_SPLIT)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -720,11 +712,10 @@ def _build_norm_rope_scatter_kernel(
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
         # bounds-checked to 0 by the buffer resource, so guard explicitly here).
-        pos_ok = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        row_ok = arith.cmpi(CmpIPredicate.slt, _to_raw(pid), _to_raw(plan_capacity))
-        is_active = arith.andi(pos_ok, row_ok)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        is_active = (fx.Int32(position) >= 0) & (pid < plan_capacity)
+
+        # Whole body as a closure under the runtime guard (opaque call -> scf.if).
+        def _body():
             tid_x_vec = ArithValue(lane) * arith.constant(VEC, type=i32)
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
@@ -919,17 +910,22 @@ def _build_norm_rope_scatter_kernel(
             physical_block = buffer_ops.buffer_load(
                 bt_rsrc, bt_off, vec_width=1, dtype=i32
             )
-            cache_base = ArithValue(physical_block) * ArithValue(
-                kv_cache_block_stride
-            ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-            out_rsrc = buffer_ops.create_buffer_resource(kv_cache, max_size=True)
+            # The block term rides on the descriptor's base, not on the
+            # 32-bit offset -- see `block_base_bytes_i64`. What is left is one
+            # block's worth, which fits by construction.
+            out_rsrc = buffer_ops.create_buffer_resource(
+                kv_cache,
+                max_size=True,
+                base_byte_offset=block_base_bytes_i64(
+                    physical_block, kv_cache_block_stride, 1 if quant else 2
+                ),
+            )
+            cache_base = ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
 
             if const_expr(quant):
                 # -- group_fp8 (V4 nm-asm) via shared emitter (single source of truth
                 # shared with the CSA single-kernel; fp8 entry layout stays identical). --
-                _krope_base = ArithValue(physical_block) * ArithValue(
-                    krope_block_stride
-                ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                _krope_base = ArithValue(slot_in_block) * ArithValue(krope_token_stride)
                 emit_group_fp8_nm_asm_scatter(
                     normed_lane=normed_lane,
                     rotated_lane=rotated_lane,
@@ -939,7 +935,11 @@ def _build_norm_rope_scatter_kernel(
                     out_rsrc=out_rsrc,
                     krope_base=_to_raw(_krope_base),
                     krope_rsrc=buffer_ops.create_buffer_resource(
-                        k_rope_buff, max_size=True
+                        k_rope_buff,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, krope_block_stride, 2
+                        ),
                     ),
                     VEC=VEC,
                     NOPE=NOPE,
@@ -971,6 +971,9 @@ def _build_norm_rope_scatter_kernel(
                 else:
                     buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
 
+        if is_active:
+            _body()
+
     @flyc.jit
     def launch_hca_norm_rope_scatter(
         kv_compressed: fx.Tensor,
@@ -996,7 +999,7 @@ def _build_norm_rope_scatter_kernel(
             arith.addi(cap_raw, arith.constant(KW - 1, type=T.i32)),
             arith.constant(KW, type=T.i32),
         )
-        idx_p = arith.index_cast(T.index, nblocks)
+        idx_p = fx.Int64(nblocks)
         k = kernel(
             kv_compressed,
             kv_compressed_row_stride,
@@ -1239,8 +1242,13 @@ def flydsl_hca_compress_attn(
         raise ValueError("score_state shape != kv_state")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
-    if not (kv_state.is_contiguous() and score_state.is_contiguous()):
-        raise ValueError("kv_state/score_state must be contiguous")
+    # Slot and ring strides are passed to the kernel and the descriptor is
+    # rebased per slot, so the states may be strided views — a per-request
+    # arena hands out a view whose slot stride is a whole entry. Only the
+    # innermost dim must be unit stride: the kernel addresses it as
+    # `col_off + lane`.
+    if kv_state.stride(-1) != 1 or score_state.stride(-1) != 1:
+        raise ValueError("kv_state/score_state inner stride must be 1")
     if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
         raise ValueError("state_slot_mapping must be 1D int32")
 
@@ -1259,8 +1267,8 @@ def flydsl_hca_compress_attn(
             raise ValueError(
                 f"k_rope_cache shape {tuple(k_rope_cache.shape)} != [NB, k_per_block, {rope_head_dim}]"
             )
-        if not k_rope_cache.is_contiguous():
-            raise ValueError("k_rope_cache must be contiguous")
+        if k_rope_cache.stride(2) != 1:
+            raise ValueError("k_rope_cache must be dense in the last dim")
     else:
         if kv_cache.dtype != torch.bfloat16:
             raise TypeError(f"HCA 2-kernel kv_cache must be bf16; got {kv_cache.dtype}")

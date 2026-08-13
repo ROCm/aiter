@@ -112,6 +112,29 @@ inline __device__ void opus_moe_stage2_a8w4_decode_make_tile(
     col_base = tile_n_id * BN;
 }
 
+template<typename T, int ScalePair, int Mi, typename Fn>
+inline __device__ void opus_moe_stage2_a8w4_decode_with_a_selector(
+    int route_base,
+    int wave_id_m,
+    const Fn& run)
+{
+    constexpr int a_sel_base = ScalePair * 2;
+    if constexpr(T::M_MFMA_PER_WAVE == 1)
+    {
+        const int a_half = T::T_M == 1
+                               ? ((route_base / T::MMA_M) & 1)
+                               : wave_id_m;
+        if(a_half == 0)
+            run(opus::number<a_sel_base>{});
+        else
+            run(opus::number<a_sel_base + 1>{});
+    }
+    else
+    {
+        run(opus::number<a_sel_base + (Mi & 1)>{});
+    }
+}
+
 template<typename T>
 inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     const opus_moe_stage2_a8w4_kargs& kargs,
@@ -139,9 +162,12 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             const bool valid_route = token < token_num && slot < topk;
             if(valid_route)
             {
-                a_base = static_cast<int32_t>(
-                    static_cast<int64_t>(token) * kargs.stride_a_t +
-                    static_cast<int64_t>(slot) * kargs.stride_a_k);
+                a_base = kargs.stride_a_k == 0
+                             ? static_cast<int32_t>(
+                                   static_cast<int64_t>(row) * kargs.stride_a_t)
+                             : static_cast<int32_t>(
+                                   static_cast<int64_t>(token) * kargs.stride_a_t +
+                                   static_cast<int64_t>(slot) * kargs.stride_a_k);
                 weight = (kargs.sorted_weights == nullptr) ? 1.0f : kargs.sorted_weights[row];
                 if constexpr(T::DIRECT_ATOMIC_OUT)
                     route_row = static_cast<int32_t>(token);
@@ -738,41 +764,17 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
                 constexpr int ni = NHalf * T::HALF_N_MFMA_PER_WAVE + local_ni.value;
                 constexpr int b_sel = ScalePair * 2 + (ni & 1);
                 constexpr int b_scale_index = ni / 2;
-                if constexpr(T::M_MFMA_PER_WAVE == 1 && T::T_M == 2)
-                {
-                    constexpr int a_sel_base = ScalePair * 2;
-                    if(wave_id_m == 0)
-                    {
+                opus_moe_stage2_a8w4_decode_with_a_selector<
+                    T, ScalePair, mi.value>(
+                    route_base, wave_id_m, [&](auto a_sel) {
                         v_c[mi.value][ni] = mma(v_a[mi.value],
                                                 v_b[local_ni.value],
                                                 v_c[mi.value][ni],
                                                 a_scale[mi.value],
                                                 b_scale[b_scale_index],
-                                                number<a_sel_base>{},
+                                                a_sel,
                                                 number<b_sel>{});
-                    }
-                    else
-                    {
-                        v_c[mi.value][ni] = mma(v_a[mi.value],
-                                                v_b[local_ni.value],
-                                                v_c[mi.value][ni],
-                                                a_scale[mi.value],
-                                                b_scale[b_scale_index],
-                                                number<a_sel_base + 1>{},
-                                                number<b_sel>{});
-                    }
-                }
-                else
-                {
-                    constexpr int a_sel = ScalePair * 2 + (mi.value & 1);
-                    v_c[mi.value][ni] = mma(v_a[mi.value],
-                                            v_b[local_ni.value],
-                                            v_c[mi.value][ni],
-                                            a_scale[mi.value],
-                                            b_scale[b_scale_index],
-                                            number<a_sel>{},
-                                            number<b_sel>{});
-                }
+                    });
             });
         });
     };
@@ -1213,9 +1215,9 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     const uint8_t* __restrict__ w2 = kargs.w2_fp4;
     const uint8_t* __restrict__ a2_scale = kargs.a2_scale_e8m0;
     const uint8_t* __restrict__ w2_scale = kargs.w2_scale_e8m0;
-    const unsigned int a_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(token_num) *
-                                  static_cast<unsigned long long>(kargs.stride_a_t));
+    const unsigned int a_size_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.stride_a_k == 0 ? sorted_rows : token_num) *
+        static_cast<unsigned long long>(kargs.stride_a_t));
     const unsigned int a_scale_size_bytes =
         static_cast<unsigned int>(static_cast<unsigned long long>(kargs.a_scale_rows) *
                                   static_cast<unsigned long long>(kargs.stride_a_scale_route));

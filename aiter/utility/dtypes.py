@@ -44,6 +44,15 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
+def _aiter_dtype_id(dtype) -> int:
+    """torch dtype -> AiterDtype enum id, or raise with the same message the
+    former `assert dtype in _torch_to_aiter_dtype` produced."""
+    try:
+        return _torch_to_aiter_dtype[dtype]
+    except KeyError:
+        raise AssertionError(f"Unsupported dtype: {dtype}") from None
+
+
 def torch_to_aiter_pybind(tensor: torch.Tensor):
     """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
 
@@ -51,10 +60,11 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_core.  The two types are not interchangeable.
     """
-    assert (
-        tensor.ndim <= 8
-    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
-    assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
+    shape = tensor.shape
+    ndim = len(shape)
+    assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
+    dtype_ = _aiter_dtype_id(tensor.dtype)
+    index = tensor.device.index
 
     from ..jit.core import get_module
 
@@ -62,31 +72,41 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     return aiter_tensor_cls(
         tensor.data_ptr(),
         tensor.numel(),
-        tensor.ndim,
-        list(tensor.shape),
+        ndim,
+        list(shape),
         list(tensor.stride()),
-        _torch_to_aiter_dtype[tensor.dtype],
-        tensor.device.index if tensor.is_cuda else -1,
+        dtype_,
+        -1 if index is None else index,
     )
 
 
 def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
     """This is for ctypes binding.
-    torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
-    assert (
-        tensor.ndim <= 8
-    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
-    assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
+    torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory.
+
+    On the hot path of every ffi_type="ctypes" op, so each torch attribute is
+    read exactly once and shape/strides go in as whole tuples: the per-tensor
+    cost is O(1) in ndim rather than O(ndim). `tensor.stride()` (no arg) hands
+    back the full tuple, and ctypes arrays accept slice assignment, so no
+    per-dim Python loop is needed.
+    """
+    shape = tensor.shape
+    strides = tensor.stride()
+    ndim = len(shape)
+    assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
+    dtype_ = _aiter_dtype_id(tensor.dtype)
+    # device.index is None for CPU tensors (and for an un-indexed device);
+    # -1 is the C-side "not on a GPU" sentinel.
+    index = tensor.device.index
 
     at = aiter_tensor_t()
     at.ptr = tensor.data_ptr()
     at.numel_ = tensor.numel()
-    at.ndim = tensor.ndim
-    for i in range(tensor.ndim):
-        at.shape[i] = tensor.shape[i]
-        at.strides[i] = tensor.stride(i)
-    at.dtype_ = _torch_to_aiter_dtype[tensor.dtype]
-    at.device_id = tensor.device.index if tensor.is_cuda else -1
+    at.ndim = ndim
+    at.shape[:ndim] = shape
+    at.strides[:ndim] = strides
+    at.dtype_ = dtype_
+    at.device_id = -1 if index is None else index
     return at
 
 
