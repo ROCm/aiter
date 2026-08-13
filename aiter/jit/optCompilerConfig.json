@@ -1827,6 +1827,53 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_opus_gdn_wu_prefill": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt64.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt64_neumann.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt16.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt32.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt128.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_scan.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_scan_hip.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_scan32.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_out.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_wu_prefill_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/opus_gdn_wu_prefill_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-std=c++20'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_opus_gdn_c_prefill": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k1_bt64_neumann_c.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_c.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_out.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_c_prefill_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/opus_gdn_c_prefill_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-std=c++20'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_causal_conv1d_fwd_split_qkv": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_fwd_split_qkv_pybind.cu'",
