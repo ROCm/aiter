@@ -178,7 +178,6 @@ def _hstu_attn_fwd_compute(
 
         # initialize offsets
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
         offs_d_q = tl.arange(0, BLOCK_D_Q)
         K_base = K + off_h * stride_kh + seq_start * stride_kn
         V_base = V + off_h * stride_vh + seq_start * stride_vn
@@ -341,7 +340,6 @@ def _hstu_attn_fwd(
     stride_om,
     stride_oh,
     alpha,
-    # Z,
     H,
     MAX_SEQ_LEN,
     DeltaSize,
