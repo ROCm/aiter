@@ -554,6 +554,18 @@ namespace py = pybind11;
           py::arg("router_w"), \
           py::arg("dst"), \
           py::arg("dlogits")); \
+    m.def("opus_moe_gather_sum_dscore_router_dx_grouped_cached_meta_token8_h2048_e64_bf16", \
+          &opus_moe_gather_sum_dscore_router_dx_grouped_cached_meta_token8_h2048_e64_bf16, \
+          "MoE exact dx gather with grouped dscore and cached metadata", \
+          py::arg("src"), \
+          py::arg("token_routes"), \
+          py::arg("route_scores"), \
+          py::arg("partials"), \
+          py::arg("order"), \
+          py::arg("topk_ids"), \
+          py::arg("router_w"), \
+          py::arg("dst"), \
+          py::arg("dlogits")); \
     m.def("opus_moe_router_bwd_bf16", \
           &opus_moe_router_bwd_bf16, \
           "MoE router backward (softmax-over-topk Jacobian)", \

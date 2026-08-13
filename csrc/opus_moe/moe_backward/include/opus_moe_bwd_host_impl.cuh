@@ -1623,6 +1623,51 @@ void opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16(
         T);
 }
 
+void opus_moe_gather_sum_dscore_router_dx_grouped_cached_meta_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& order,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& router_w,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(dst.size(0));
+    AITER_CHECK(T == 32768 && static_cast<int>(src.size(0)) == T * 8 &&
+                    static_cast<int>(src.size(1)) == 2048,
+                "grouped cached-meta route tail requires [32768*8,2048] src");
+    AITER_CHECK(route_scores.dim() == 1 &&
+                    static_cast<int>(route_scores.size(0)) == T * 8 &&
+                    static_cast<int>(partials.size(0)) == T * 8 &&
+                    static_cast<int>(partials.size(1)) == 4,
+                "invalid grouped cached-meta route score tensors");
+    AITER_CHECK(token_routes.dtype() == AITER_DTYPE_i32 &&
+                    token_routes.is_contiguous() &&
+                    order.dtype() == AITER_DTYPE_i32 &&
+                    order.is_contiguous() &&
+                    topk_ids.dtype() == AITER_DTYPE_i32 &&
+                    topk_ids.is_contiguous(),
+                "grouped cached-meta route tail requires contiguous int32 metadata");
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const dim3 grid((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK);
+    const dim3 block(512);
+    opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel<
+        int32_t, false, true>
+        <<<grid, block, 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(src.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(route_scores.data_ptr()),
+        reinterpret_cast<const float*>(partials.data_ptr()),
+        reinterpret_cast<const int32_t*>(order.data_ptr()),
+        reinterpret_cast<const int32_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<const __bf16*>(router_w.data_ptr()),
+        reinterpret_cast<__bf16*>(dst.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()),
+        T);
+}
+
 // Router backward (M5 R7): softmax-over-topk Jacobian. Per token t (one thread):
 // s = Σ_k dp[t,k]·pw[t,k]; dlogits[t, ids[t,k]] = pw[t,k]·(dp[t,k]-s). The topk
 // ids are distinct per token so writes don't collide (dlogits pre-zeroed).
