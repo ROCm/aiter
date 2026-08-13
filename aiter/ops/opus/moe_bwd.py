@@ -6,6 +6,8 @@ Serves both stage1 (dW1 = d_act^T @ x) and stage2 (dW2 = dy^T @ h) weight
 gradients; rows must be grouped contiguously by expert (offsets = cumulative
 per-expert route counts). Correctness-first; validated against the triton
 reference (aiter.ops.triton.moe_bwd_ref) and the autograd golden."""
+import weakref
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -902,6 +904,7 @@ def opus_moe_router_bwd_bf16(dp_sorted: Tensor, order: Tensor, topk_ids: Tensor,
 
 _DGRAD_B_M = 128
 _WGRAD_STREAMS = {}
+_WEIGHT_TRANSPOSE_CACHE = {}
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -920,6 +923,43 @@ def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
         stream = torch.cuda.Stream(device=index)
         _WGRAD_STREAMS[index] = stream
     return stream
+
+
+def _backward_weight_transpose(weight: Tensor) -> Tensor:
+    """Reuse a backward-native weight until its storage/version changes.
+
+    ``autograd.Function.forward`` runs with grad recording disabled, so this
+    packed copy is data rather than a reusable autograd subgraph.  Keep one
+    entry per source object and stream: custom HIP consumers do not insert an
+    implicit cross-stream wait for a cached tensor created elsewhere.
+    """
+    stream = torch.cuda.current_stream(weight.device)
+    key = (id(weight), weight.device.index, stream.cuda_stream)
+    signature = (
+        weight._version,
+        weight.data_ptr(),
+        tuple(weight.shape),
+        tuple(weight.stride()),
+        weight.dtype,
+    )
+    cached = _WEIGHT_TRANSPOSE_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0]() is weight
+        and cached[1] == signature
+    ):
+        return cached[2]
+
+    transposed = weight.transpose(1, 2).contiguous()
+
+    def drop_dead_weight(weight_ref, cache_key=key):
+        current = _WEIGHT_TRANSPOSE_CACHE.get(cache_key)
+        if current is not None and current[0] is weight_ref:
+            _WEIGHT_TRANSPOSE_CACHE.pop(cache_key, None)
+
+    weight_ref = weakref.ref(weight, drop_dead_weight)
+    _WEIGHT_TRANSPOSE_CACHE[key] = (weight_ref, signature, transposed)
+    return transposed
 
 
 class OpusMoERefFunc(torch.autograd.Function):
@@ -991,8 +1031,8 @@ class OpusMoERefFunc(torch.autograd.Function):
         # dx reverse map for the deterministic gather-sum (no atomics); built once
         # here (moe-sort semantics), reused in backward.
         ctx.token_routes = build_token_routes(x_gather_idx, T, topk)
-        ctx.w1t = w1.transpose(1, 2).contiguous()
-        ctx.w2t = w2.transpose(1, 2).contiguous()
+        ctx.w1t = _backward_weight_transpose(w1)
+        ctx.w2t = _backward_weight_transpose(w2)
         ctx.w2_ref = w2
         ctx.wgrad_stream = _get_wgrad_stream(x.device)
         return out
