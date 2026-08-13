@@ -228,6 +228,81 @@ PRESET_SHAPES: list[tuple] = [
     ("kda_tp2",     48, 48, 32768, 2, 128, 128, 64, "gk", "equal"),
     ("kda_tp1",     96, 96,  8192, 2, 128, 128, 64, "gk", "equal"),
     ("kda_tp1",     96, 96, 32768, 2, 128, 128, 64, "gk", "equal"),
+    # -- ragged/bimodal/skew/skew_last sampling for the fusion-selection
+    # heuristic (added for the final heuristics sweep). Existing non-equal
+    # coverage was concentrated at high fill and mostly on KDA; these add the
+    # four realistic length distributions across the fill64 = 2*N*H/CU axis,
+    # weighted around the ~0.5 fusion decision boundary, with low- and high-fill
+    # tails. Selection is blind to the pattern (only cu_seqlens is visible), so
+    # these quantify how much the input distribution shifts fused-vs-unfused at a
+    # given nominal fill -- the second-order term the fill axis cannot capture.
+    # ---- near the ~0.5 boundary (fill64 0.39-0.63): the critical band ----
+    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "ragged"),  # fill64=0.39
+    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "bimodal"),  # fill64=0.39
+    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "skew"),  # fill64=0.39
+    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "skew_last"),  # fill64=0.39
+    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "ragged"),  # fill64=0.47
+    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "bimodal"),  # fill64=0.47
+    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "skew"),  # fill64=0.47
+    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "skew_last"),  # fill64=0.47
+    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "ragged"),  # fill64=0.63
+    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "bimodal"),  # fill64=0.63
+    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "skew"),  # fill64=0.63
+    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "skew_last"),  # fill64=0.63
+    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    # ---- low-fill tail (fill64 <= 0.32) ----
+    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.21
+    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.21
+    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "skew"),  # fill64=0.21
+    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.21
+    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
+    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
+    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.32
+    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
+    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
+    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
+    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "skew"),  # fill64=0.32
+    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
+    # ---- high-fill tail (fill64 >= 1.26), esp. GDN scalar-g ----
+    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=1.26
+    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
+    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "skew"),  # fill64=1.26
+    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
+    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "ragged"),  # fill64=1.26
+    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
+    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "skew"),  # fill64=1.26
+    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
+    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=2.53
+    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=2.53
+    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "skew"),  # fill64=2.53
+    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=2.53
+    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "ragged"),  # fill64=2.53
+    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "bimodal"),  # fill64=2.53
+    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew"),  # fill64=2.53
+    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew_last"),  # fill64=2.53
 ]
 
 _BENCH_TITLE = "GDN K5 inter-chunk state scan"
