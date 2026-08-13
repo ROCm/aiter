@@ -17,11 +17,13 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
     chunk_delta_attn_autotune_configs,
     exp2,
     input_guard,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 

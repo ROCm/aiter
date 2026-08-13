@@ -1021,13 +1021,16 @@ jobs:
         if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
         id: baseline_pinned
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
           commit: ${{ github.event.pull_request.base.sha }}
           name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
           path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Fallback — fetch baseline from latest main
@@ -1036,7 +1039,7 @@ jobs:
           github.event_name == 'pull_request'
         id: baseline_main
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
@@ -1044,6 +1047,7 @@ jobs:
           name_is_regexp: true
           name: ^tuned-op-bench-[a-f0-9]+$
           path: /tmp/baseline_main/
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Compare

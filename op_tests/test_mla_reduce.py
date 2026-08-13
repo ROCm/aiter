@@ -338,7 +338,7 @@ def main():
     heads_for_dim = {
         # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
         128: [1, 16, 96, 128],
-        512: [8, 16, 128],
+        512: [8, 16, 24, 128],
     }
 
     # Cover both kernel paths:
