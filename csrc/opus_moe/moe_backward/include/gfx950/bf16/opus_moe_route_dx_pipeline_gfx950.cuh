@@ -462,43 +462,38 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
 
     const int loops = gate_up_dim / BK;
     issue_tile(0, 0);
-    if(tid < CTA_M)
+    // A sorted-output K2 publishes into the same padded expert row that it
+    // computes.  K3 reaches only real routes through reverse_sorted, so
+    // sorter-padding rows need no token/slot decode and may hold arbitrary
+    // workspace values.  Logical-output variants still decode every row.
+    if constexpr(!T::WRITE_SORTED_ROUTES)
     {
-        const int sorted_row = route_base + tid;
-        const int32_t packed =
-            sorted_row < expert_end_row &&
-                    sorted_row < kargs.route.sorted_capacity
-                ? kargs.route.sorted_token_ids[sorted_row]
-                : static_cast<int32_t>(kPackedTokenMask);
-        if constexpr(T::WRITE_SORTED_ROUTES)
+        if(tid < CTA_M)
         {
-            static_assert(T::ROUTE_LAYOUT != RouteLayout::CompactRouteMajor);
-            const int token = packed_token_id(packed);
-            const int slot = packed_topk_slot(packed);
-            smem_route_row[tid] =
+            const int sorted_row = route_base + tid;
+            const int32_t packed =
                 sorted_row < expert_end_row &&
-                        sorted_row < kargs.route.sorted_capacity &&
-                        token < kargs.route.token_num && slot < topk
-                    ? sorted_row
-                    : -1;
-        }
-        else if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
-        {
-            const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
-                kargs.route,
-                packed,
-                sorted_row < expert_end_row &&
-                    sorted_row < kargs.route.sorted_capacity);
-            smem_route_row[tid] = decoded.valid ? decoded.logical : -1;
-        }
-        else
-        {
-            const int token = packed_token_id(packed);
-            const int slot = packed_topk_slot(packed);
-            smem_route_row[tid] =
-                token < kargs.route.token_num && slot < topk
-                    ? token * topk + slot
-                    : -1;
+                        sorted_row < kargs.route.sorted_capacity
+                    ? kargs.route.sorted_token_ids[sorted_row]
+                    : static_cast<int32_t>(kPackedTokenMask);
+            if constexpr(T::ROUTE_LAYOUT == RouteLayout::CompactRouteMajor)
+            {
+                const auto decoded = decode_sorted_route<T::ROUTE_LAYOUT>(
+                    kargs.route,
+                    packed,
+                    sorted_row < expert_end_row &&
+                        sorted_row < kargs.route.sorted_capacity);
+                smem_route_row[tid] = decoded.valid ? decoded.logical : -1;
+            }
+            else
+            {
+                const int token = packed_token_id(packed);
+                const int slot = packed_topk_slot(packed);
+                smem_route_row[tid] =
+                    token < kargs.route.token_num && slot < topk
+                        ? token * topk + slot
+                        : -1;
+            }
         }
     }
     s_waitcnt_vmcnt(0_I);
@@ -547,6 +542,17 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     // eight packed BF16 dwords -> four permlane swaps -> two dwordx4 stores.
     const int local_m = lane_id % 32;
     opus::static_for<RouteTiles>([&](auto route_group) {
+        const int sorted_row =
+            route_base + route_group.value * BM + local_m;
+        int route_row;
+        if constexpr(T::WRITE_SORTED_ROUTES)
+            route_row = sorted_row < expert_end_row &&
+                                sorted_row < kargs.route.sorted_capacity
+                            ? sorted_row
+                            : -1;
+        else
+            route_row =
+                smem_route_row[route_group.value * BM + local_m];
         opus::static_for<T::E_N>([&](auto en) {
             uint32_t packed[8];
 #pragma unroll
@@ -574,10 +580,9 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             packed[5] = swap57[0];
             packed[7] = swap57[1];
 
-            const int route_row =
-                smem_route_row[route_group.value * BM + local_m];
-            // smem_route_row is -1 for both the tail of the final sorted tile
-            // and token/slot sentinels.  D is an exact multiple of BN.
+            // route_row is negative only for rows outside the expert-owned
+            // tail (sorted output), or invalid token/slot rows (logical
+            // output).  D is an exact multiple of BN.
             if(route_row >= 0)
             {
                 const int repeat_n = en.value * T::T_N * T::W_N;
