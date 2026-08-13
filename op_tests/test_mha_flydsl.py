@@ -74,6 +74,33 @@ def _causal_mask(sq, sk, device):
     )
 
 
+def _local_mask(sq, sk, window_left, window_right, device):
+    """Sliding-window mask, bottom-right aligned (offset ``sk - sq`` like
+    ``_causal_mask``). Returns a ``[sq, sk]`` bool tensor, True where masked out
+    (i.e. outside the band). ``window_left``/``window_right == -1`` means
+    infinite (no bound) on that side.
+
+    Query row ``s`` attends kv col ``j`` in the inclusive band
+    ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``.
+
+    Note: ``_local_mask(sq, sk, -1, 0)`` is identical to ``_causal_mask``.
+    """
+    row_idx = torch.arange(sq, device=device, dtype=torch.long).unsqueeze(-1)
+    col_idx = torch.arange(sk, device=device, dtype=torch.long)
+    offset = sk - sq
+    masks = []
+    if window_right >= 0:
+        masks.append(col_idx > row_idx + offset + window_right)
+    if window_left >= 0:
+        masks.append(col_idx < row_idx + offset - window_left)
+    if not masks:
+        return torch.zeros(sq, sk, device=device, dtype=torch.bool)
+    m = masks[0]
+    for extra in masks[1:]:
+        m = torch.logical_or(m, extra)
+    return m
+
+
 def _make_sink(nheads_q, device):
     """Per-head fp32 sink logits in the scaled-score domain (one extra virtual
     zero-value KV column in the softmax denominator). Spread so some heads' sink
@@ -91,10 +118,23 @@ def _apply_sink(qk, sink):
     return torch.cat([qk, sink_col], dim=-1)
 
 
-def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False, sink=None):
-    """PyTorch reference for varlen THD layout, per-batch."""
+def _ref_mha_varlen(
+    q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False, sink=None,
+    window_size=(-1, -1),
+):
+    """PyTorch reference for varlen THD layout, per-batch.
+
+    Causal is routed through the local (sliding-window) mask: ``causal`` forces
+    the effective right window to 0 while leaving the left window as given, so
+    ``_local_mask(sq, sk, -1, 0)`` reproduces the pure-causal mask exactly.
+    """
     B = len(cu_q) - 1
     gqa = q.shape[1] // k.shape[1]  # q head h reads kv head h // gqa
+    # Effective window: causal pins the right side to 0 (Mistral-style causal +
+    # finite left stays valid). Apply the mask whenever it's not full attention.
+    wl = window_size[0]
+    wr = 0 if causal else window_size[1]
+    apply_mask = causal or window_size != (-1, -1)
     outs = []
     lses = []
     for b in range(B):
@@ -104,8 +144,8 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False, 
         kb = _expand_kv(k[cu_k[b] : cu_k[b + 1]].float(), gqa)
         vb = _expand_kv(v[cu_k[b] : cu_k[b + 1]].float(), gqa)
         qk = torch.bmm(qb.permute(1, 0, 2), kb.permute(1, 2, 0)) * scale
-        if causal:
-            mask = _causal_mask(sq, sk, qk.device)
+        if apply_mask:
+            mask = _local_mask(sq, sk, wl, wr, qk.device)
             qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
         qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
         if return_lse:
@@ -132,6 +172,7 @@ def run_varlen_test(
     causal=False,
     return_lse=False,
     sink=False,
+    window_size=(-1, -1),
     warmup=1,
     repeat=5,
 ):
@@ -171,6 +212,7 @@ def run_varlen_test(
             max_sk,
             softmax_scale=scale,
             causal=causal,
+            window_size=window_size,
             return_lse=return_lse,
             sink_ptr=sink_t,
         )
@@ -190,7 +232,7 @@ def run_varlen_test(
     seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
     tag = (
         f"thd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} seqs={seqs} "
-        f"causal={causal} lse={return_lse} sink={sink}"
+        f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
     )
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
@@ -204,6 +246,7 @@ def run_varlen_test(
         causal=causal,
         return_lse=return_lse,
         sink=sink_t,
+        window_size=window_size,
     )
     if return_lse:
         ref, ref_lses = ref_result
@@ -272,6 +315,7 @@ def run_varlen_test(
         "causal": causal,
         "lse": return_lse,
         "sink": sink,
+        "window": window_size,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -279,15 +323,22 @@ def run_varlen_test(
     return passed, ret
 
 
-def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False, sink=None):
+def _ref_mha_batch(
+    q, k, v, scale, causal=False, return_lse=False, sink=None,
+    window_size=(-1, -1),
+):
     """PyTorch reference for batched BSHD layout, per-batch.
 
     Loops over the batch so peak scratch stays at one [H_q, sq, sk] score
-    matrix instead of [B, H_q, sq, sk].
+    matrix instead of [B, H_q, sq, sk]. Causal is routed through the local
+    (sliding-window) mask (see ``_ref_mha_varlen``).
     """
     B, sq, _, _ = q.shape
     sk = k.shape[1]
     gqa = q.shape[2] // k.shape[2]
+    wl = window_size[0]
+    wr = 0 if causal else window_size[1]
+    apply_mask = causal or window_size != (-1, -1)
     outs = []
     lses = []
     for b in range(B):
@@ -295,8 +346,8 @@ def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False, sink=None):
         kb = _expand_kv(k[b].float(), gqa).permute(1, 0, 2)
         vb = _expand_kv(v[b].float(), gqa).permute(1, 0, 2)
         qk = torch.bmm(qb, kb.transpose(1, 2)) * scale
-        if causal:
-            mask = _causal_mask(sq, sk, qk.device)
+        if apply_mask:
+            mask = _local_mask(sq, sk, wl, wr, qk.device)
             qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
         qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
         if return_lse:
@@ -323,6 +374,7 @@ def run_batch_test(
     causal=False,
     return_lse=False,
     sink=False,
+    window_size=(-1, -1),
     warmup=1,
     repeat=5,
 ):
@@ -349,13 +401,14 @@ def run_batch_test(
             v,
             softmax_scale=scale,
             causal=causal,
+            window_size=window_size,
             return_lse=return_lse,
             sink_ptr=sink_t,
         )
 
     tag = (
         f"bshd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} sq={sq} sk={sk} "
-        f"causal={causal} lse={return_lse} sink={sink}"
+        f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
     )
 
     avg_ms = _time_fn(_run, warmup, repeat)
@@ -373,7 +426,8 @@ def run_batch_test(
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
     ref_result = _ref_mha_batch(
-        q, k, v, scale, causal=causal, return_lse=return_lse, sink=sink_t
+        q, k, v, scale, causal=causal, return_lse=return_lse, sink=sink_t,
+        window_size=window_size,
     )
     if return_lse:
         ref, ref_lse = ref_result
@@ -410,6 +464,7 @@ def run_batch_test(
         "causal": causal,
         "lse": return_lse,
         "sink": sink,
+        "window": window_size,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -585,6 +640,13 @@ if __name__ == "__main__":
         help="Attention sink: true/false. Default runs both.\n"
         "Only the m16x8 (d_qk=d_v=128) path supports sink; skipped elsewhere.\n"
         "e.g.: -s true",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Exercise sliding-window (window_size=(left,right)) coverage: narrow\n"
+        "(tile-skipping) and wide bands across single/multi-tile seqs.\n"
+        "Without --local the window axis stays (-1,-1) (full/causal only).",
     )
     parser.add_argument(
         "--warmup",
@@ -808,11 +870,26 @@ if __name__ == "__main__":
     lse_list = [lse_filter] if lse_filter is not None else [False, True]
     sink_list = [sink_filter] if sink_filter is not None else [False, True]
 
+    # Sliding-window axis. Default is pure regression (full attention only); with
+    # --local, exercise narrow (tile-skipping) and wide bands over single/
+    # multi-tile seqs, including causal-with-finite-left (128,0).
+    window_list = (
+        [(-1, -1), (64, 64), (128, 0), (256, -1), (-1, 256)]
+        if args.local
+        else [(-1, -1)]
+    )
+
     # Attention sink is served only by the m16x8 (d_qk=d_v=128) kernel; skip the
     # sink=True axis for any other head-dim so we don't test a config that falls
     # through to CK (which would drop the sink term for this path).
     def _sink_axis(d_qk, d_v):
         return sink_list if (d_qk, d_v) == (128, 128) else [s for s in sink_list if not s]
+
+    # Sliding window is only served by the 128/128 m16x8 path; any other head-dim
+    # keeps the full-attention (-1,-1) window so we don't test a config that
+    # falls through to CK.
+    def _window_axis(d_qk, d_v):
+        return window_list if (d_qk, d_v) == (128, 128) else [(-1, -1)]
 
     tests = []
     if run_thd:
@@ -823,20 +900,22 @@ if __name__ == "__main__":
                 for causal in causal_list:
                     for return_lse in lse_list:
                         for sink in _sink_axis(d_qk, d_v):
-                            tests.append(
-                                (
-                                    "thd",
-                                    cu_q,
-                                    cu_k,
-                                    H,
-                                    H_kv,
-                                    d_qk,
-                                    d_v,
-                                    causal,
-                                    return_lse,
-                                    sink,
+                            for window in _window_axis(d_qk, d_v):
+                                tests.append(
+                                    (
+                                        "thd",
+                                        cu_q,
+                                        cu_k,
+                                        H,
+                                        H_kv,
+                                        d_qk,
+                                        d_v,
+                                        causal,
+                                        return_lse,
+                                        sink,
+                                        window,
+                                    )
                                 )
-                            )
     if run_bshd:
         for d_qk, d_v in args.batch_d_qk_v:
             for shape in batch_shapes:
@@ -845,21 +924,23 @@ if __name__ == "__main__":
                 for causal in causal_list:
                     for return_lse in lse_list:
                         for sink in _sink_axis(d_qk, d_v):
-                            tests.append(
-                                (
-                                    "bshd",
-                                    bs,
-                                    sq_i,
-                                    sk_i,
-                                    H,
-                                    H_kv,
-                                    d_qk,
-                                    d_v,
-                                    causal,
-                                    return_lse,
-                                    sink,
+                            for window in _window_axis(d_qk, d_v):
+                                tests.append(
+                                    (
+                                        "bshd",
+                                        bs,
+                                        sq_i,
+                                        sk_i,
+                                        H,
+                                        H_kv,
+                                        d_qk,
+                                        d_v,
+                                        causal,
+                                        return_lse,
+                                        sink,
+                                        window,
+                                    )
                                 )
-                            )
 
     if args.cmp_triton:
         from aiter.ops.triton.attention.mha import (
@@ -869,10 +950,10 @@ if __name__ == "__main__":
     n_pass = 0
     collected = []
     for case in tests:
-        causal, return_lse, sink = case[-3], case[-2], case[-1]
+        causal, return_lse, sink, window = case[-4], case[-3], case[-2], case[-1]
         try:
             if case[0] == "thd":
-                _, cu_q, cu_k, H, H_kv, d_qk, d_v, _, _, _ = case
+                _, cu_q, cu_k, H, H_kv, d_qk, d_v, _, _, _, _ = case
                 ok, ret = run_varlen_test(
                     cu_q,
                     cu_k,
@@ -883,6 +964,7 @@ if __name__ == "__main__":
                     causal=causal,
                     return_lse=return_lse,
                     sink=sink,
+                    window_size=window,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
@@ -924,7 +1006,7 @@ if __name__ == "__main__":
                     ret["triton_tflops"] = round(_tflops(fwd_flop, tri_ms), 2)
                     ret["speedup"] = round(tri_ms / ret["avg_us"] * 1000, 2)
             else:
-                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, _, _, _ = case
+                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, _, _, _, _ = case
                 ok, ret = run_batch_test(
                     bs,
                     sq_i,
@@ -936,6 +1018,7 @@ if __name__ == "__main__":
                     causal=causal,
                     return_lse=return_lse,
                     sink=sink,
+                    window_size=window,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
@@ -944,8 +1027,8 @@ if __name__ == "__main__":
                 n_pass += 1
         except Exception as e:
             print(
-                f"  [{case[:-3]} causal={causal} lse={return_lse} sink={sink}] "
-                f"ERROR: {e}"
+                f"  [{case[:-4]} causal={causal} lse={return_lse} sink={sink} "
+                f"window={window}] ERROR: {e}"
             )
             import traceback
 

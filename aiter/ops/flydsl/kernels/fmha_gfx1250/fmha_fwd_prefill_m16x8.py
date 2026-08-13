@@ -242,7 +242,7 @@ def _qk_gemm(*, k_mgr, k_lds, q_frags, n_block, lane_idx, n_inflight=3):
 
 
 def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
-            is_causal=False, kv_pos_base=None, q_max=None, kv_len=None):
+            kv_pos_base=None, q_max=None, q_min=None, kv_len=None):
     """Online-softmax update for one KV tile. ``s`` already includes softmax_scale
     (folded into Q), so exp uses plain LOG2E.
 
@@ -252,15 +252,20 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     holds the other 8-row half of the same q, so the row max/sum reduce locally over
     (kvt, i) then across the ``shuffle_xor(16)`` partner.
 
+    Masking (per element, sequence-relative kv position ``kv_pos = kv_pos_base +
+    (l//16)*8 + kvt*16 + i``; all bounds are fx.Int32):
+      q_max (band upper edge): when set, mask ``kv_pos > min(q_max, kv_len-1)``
+        (``q_max = q_seq + (kv_len-q_len) + window_right``; causal has window_right=0).
+        Clamping to ``kv_len-1`` folds in the last-tile tail mask (rows past kv_len
+        that the clamped OOB load left holding duplicate data), so kv_len need not be
+        masked separately here.
+      q_min (band lower edge): when set, mask ``kv_pos < q_min``
+        (``q_min = q_seq + (kv_len-q_len) - window_left``).
+      kv_len (only when q_max is None): mask ``kv_pos >= kv_len`` (the standalone tail
+        mask for the non-causal / no-upper-bound case).
+
     Args:
       m_prev, d_prev: running max / denom (fx.Float32, shared by the l<->l^16 pair).
-      is_causal: when True, mask element with sequence-relative kv position
-        ``kv_pos_base + (l//16)*8 + kvt*16 + i`` greater than ``q_max`` (= q_seq +
-        (kv_len - q_len)); both ``kv_pos_base`` and ``q_max`` are fx.Int32.
-      kv_len: when set (non-causal), mask the same kv position when it is
-        ``>= kv_len`` — the last tile's tail rows past the KV length (which the
-        clamped OOB load left holding duplicate data). Redundant under causal
-        (``q_max <= kv_len-1``), so pass None there to keep that path unchanged.
 
     Returns ``(p, m_new, d_new, corr)``:
       p:     list of NKV v8 **bf16** — P^T = exp(S^T - m_new) (PV B-operand).
@@ -306,11 +311,13 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
         svec = fx.Vector(s[kvt])
         for i in range(8):
             sval = fx.Float32(svec[i])
-            if is_causal or kv_len is not None:
+            if q_max is not None or q_min is not None or kv_len is not None:
                 kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
-                if is_causal:
-                    sval = (kv_pos > q_max).select(neg_inf, sval)
-                if kv_len is not None:
+                if q_max is not None:
+                    sval = (kv_pos > _min_i32(q_max, kv_len - fx.Int32(1))).select(neg_inf, sval)
+                if q_min is not None:
+                    sval = (kv_pos < q_min).select(neg_inf, sval)
+                if kv_len is not None and q_max is None:
                     sval = (kv_pos >= kv_len).select(neg_inf, sval)
             s_masked.append(sval)
 
@@ -321,8 +328,19 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     m_new = fmax(m_prev, row_max)
 
     # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
-    corr = exp2(fmul(fsub(m_prev, m_new), log2e))
-    neg_m = fsub(zero, fmul(m_new, log2e))
+    if q_min is not None:
+        # Finite-left window: a lane's leading tiles can be wholly masked (row_max=
+        # -inf) while m is still the -inf seed -> corr/neg_m feed NaN into corr/p.
+        # Clamp maxes to a finite floor: all-masked -> corr=1, p=0; once any real key
+        # is seen the clamp is inert (byte-identical to the -inf path).
+        big_neg = fx.Float32(-1.0e30)
+        m_safe = fmax(m_new, big_neg)
+        mp_safe = fmax(m_prev, big_neg)
+        corr = exp2(fmul(fsub(mp_safe, m_safe), log2e))
+        neg_m = fsub(zero, fmul(m_safe, log2e))
+    else:
+        corr = exp2(fmul(fsub(m_prev, m_new), log2e))
+        neg_m = fsub(zero, fmul(m_new, log2e))
 
     # ---- Pass 2: p = exp(S - m_new) (bf16, per tile) + running row sum ----
     p = []
@@ -391,7 +409,8 @@ def _core_attention(
     qk_hdim,
     v_hdim,
     n_block,  # compile-time KV block width (columns of one QK GEMM tile)
-    is_causal,
+    mask_left,  # compile-time: bound the left band edge (finite window_left)
+    mask_right,  # compile-time: bound the right band edge (causal or finite window_right)
     return_lse,
     has_sink,  # compile-time: fold a per-head sink logit into the softmax denom
     gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
@@ -421,6 +440,10 @@ def _core_attention(
     q_len,  # valid Q tokens in this batch
     kv_start,  # first K/V token index of this batch
     kv_len,  # valid K/V tokens in this batch
+    # Sliding-window bounds (runtime fx.Int32, >= 0). window_left read only when
+    # mask_left, window_right only when mask_right. Causal == mask_right, window_right=0.
+    window_left,
+    window_right,
 ):
     """Layout-agnostic m16x8 compute — empty scaffold.
 
@@ -479,23 +502,41 @@ def _core_attention(
             pp = fx.Int32(pp)
         return kv_lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
 
-    # ---- This WG's KV tiles span relative kv [0, kv_len_wg). kv_len_wg is the
-    # WG's effective KV length. Non-causal: all kv tokens (== kv_len). Causal: only
-    # up to the last query row's attend-limit. Packed row r maps to seq r//gqa_ratio;
-    # the WG's largest row is block_x*BLOCK_M+BLOCK_M-1, and a query at seq s attends
-    # kv [0, s+causal_off] (causal_off=kv_len-q_len).
+    # ---- This WG's KV tiles span relative kv [start_tile*n_block, kv_len_wg).
+    # Packed row r maps to seq r//gqa_ratio; a query at seq s attends the band
+    # [s+causal_off-window_left, s+causal_off+window_right] (causal_off=kv_len-q_len).
+    #
+    # Right edge (mask_right): kv_len_wg clips to the WG's max query's attend-limit so
+    # we don't run tiles fully past the band. Non-mask_right: all kv (kv_len).
+    # Left edge (mask_left): start_tile skips whole tiles before the WG's min query's
+    # band start. Non-mask_left: start at tile 0.
     block_x = fx.Int32(gpu.block_id("x"))
-    if is_causal:
-        causal_off = kv_len - q_len
+    causal_off = kv_len - q_len
+    if mask_right:
         wg_max_seq = (
             block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)
         ) // fx.Int32(gqa_ratio)
         wg_max_seq = _min_i32(wg_max_seq, q_len - fx.Int32(1))
-        kv_len_wg = wg_max_seq + causal_off + fx.Int32(1)
+        kv_len_wg = wg_max_seq + causal_off + window_right + fx.Int32(1)
         kv_len_wg = _min_i32(kv_len_wg, kv_len)
         kv_len_wg = _max_i32(kv_len_wg, fx.Int32(1))
     else:
         kv_len_wg = kv_len
+
+    # Tile range [start_tile, n_tiles): n_tiles from the right-clipped kv_len_wg;
+    # start_tile skips whole tiles before the WG's min query's band start. The
+    # defensive min() keeps start_tile a valid buffer index even for an over-launched
+    # WG whose whole band is empty (its per-element masks zero the work anyway).
+    n_tiles = arith.ceildivui(
+        arith.unwrap(kv_len_wg), arith.constant(n_block, type=T.i32)
+    )
+    if mask_left:
+        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        kv_lo = _max_i32(wg_min_seq + causal_off - window_left, fx.Int32(0))
+        start_tile = kv_lo // fx.Int32(n_block)
+        start_tile = _min_i32(start_tile, fx.Int32(n_tiles) - fx.Int32(1))
+    else:
+        start_tile = fx.Int32(0)
 
     def _kv_valid(blk_row0):
         # How many rows of [blk_row0, blk_row0+n_block) are in-bounds, clamped to
@@ -504,54 +545,59 @@ def _core_attention(
         rem = _max_i32(kv_len_wg - blk_row0, fx.Int32(0))
         return _min_i32(rem, fx.Int32(n_block))
 
-    # Prologue: bulk-load tile 0's K and V into ping-pong buffer 0 — this is the
-    # ONLY use of the full-block ``async_load_vram_to_lds`` (issued once per wave).
-    # Every later tile is prefetched INSIDE the compute via per-write-tile
-    # ``async_load_vram_to_lds_wr_tile`` (interleaved with QK/softmax/PV, ordered by
-    # thread-trace tuning) — never here, and never as a bulk call in the loop.
+    # Prologue: bulk-load the first tile (start_tile)'s K and V into its ping-pong
+    # buffer — this is the ONLY use of the full-block ``async_load_vram_to_lds``
+    # (issued once per wave). Every later tile is prefetched INSIDE the compute via
+    # per-write-tile ``async_load_vram_to_lds_wr_tile`` (interleaved with QK/softmax/PV,
+    # ordered by thread-trace tuning) — never here, and never as a bulk call in the loop.
+    start_pp = start_tile % fx.Int32(N_KV_PP)
+    start_row0 = start_tile * fx.Int32(n_block)
     k_mgr.async_load_vram_to_lds(
-        ptr_lds=_k_lds_buf(0),
+        ptr_lds=_k_lds_buf(start_pp),
         ptr_K=ptr_K,
         stride_k_seq=stride_k_seq,
         stride_k_head=stride_k_head,
         kv_head=kv_head,
-        kv_row0=kv_start,
-        kv_valid=_kv_valid(fx.Int32(0)),
+        kv_row0=kv_start + start_row0,
+        kv_valid=_kv_valid(start_row0),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
     )
     v_mgr.async_load_vram_to_lds(
-        ptr_lds=_v_lds_buf(0),
+        ptr_lds=_v_lds_buf(start_pp),
         ptr_V=ptr_V,
         stride_v_seq=stride_v_seq,
         stride_v_head=stride_v_head,
         kv_head=kv_head,
-        kv_row0=kv_start,
-        kv_valid=_kv_valid(fx.Int32(0)),
+        kv_row0=kv_start + start_row0,
+        kv_valid=_kv_valid(start_row0),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
     )
 
     # ========================================================================
-    # Main KV loop — stream tiles [0, n_tiles) through the N_KV_PP ping-pong ring.
+    # Main KV loop — stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
+    # ring.
     #
     # v1 shape (raw scf.for_, per [[fdsl-ast-rewriter-scope]]): a single UNIFORM
     # loop, no first/last peel. Each iter opens by draining outstanding async and
     # barriering, after which the current tile's KV is GUARANTEED resident in LDS
-    # (tile 0 from the prologue; every later tile from THIS loop's end-of-body
+    # (start_tile from the prologue; every later tile from THIS loop's end-of-body
     # bulk prefetch into the other ping-pong buffer). The body computes on buffer
     # t % N_KV_PP, then prefetches tile t+1 into (t+1) % N_KV_PP.
     #
     # Loop-carried state (scf.for_ iter_args): the online-softmax running max
     # ``m`` and denom ``d`` (per-lane f32), followed by the ``d_tiles`` fp32 O
-    # accumulators. Seed m=-inf, d=0, O=0: tile 0's corr=exp2(m_prev-m_new)=0
+    # accumulators. Seed m=-inf, d=0, O=0: the first tile's corr=exp2(m_prev-m_new)=0
     # zeroes the (already-zero) O before its PV adds in — the standard flash seed.
+    # (Fully-masked leading tiles under a finite-left window would make exp2(-inf-
+    # (-inf))=NaN; _softmax sanitizes that on the q_min path.)
     #
     # Attention sink (compile-time): the sink is one extra ``exp(sink)`` term in the
     # softmax denominator. Fold it in by seeding m=sink[q_head] and d=1.0 (=exp(sink-
     # sink)); the rescales carry that d seed to exactly exp(sink - m_final), the sink
-    # denom term. (Without a sink, m=-inf makes tile 0's corr zero the d seed, so d=1
-    # would be identical to d=0 — the no-sink path keeps d=0 to stay byte-for-byte.)
+    # denom term. (Without a sink, m=-inf makes the first tile's corr zero the d seed,
+    # so d=1 would equal d=0 — the no-sink path keeps d=0 to stay byte-for-byte.)
     #
     # TODO(perf): replace the end-of-body bulk async_load with per-write-tile
     # async_load_vram_to_lds_wr_tile interleaved between QK/softmax/PV (order
@@ -560,20 +606,19 @@ def _core_attention(
     d_tiles = v_hdim // WMMA_M
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
-        m_seed = _load_sink_logit(ptr_sink, q_head_idx, num_heads_q)
-        d_seed = fx.Float32(1.0)
+        m_init = _load_sink_logit(ptr_sink, q_head_idx, num_heads_q)
+        d_init = fx.Float32(1.0)
     else:
-        m_seed = fx.Float32(float("-inf"))
-        d_seed = fx.Float32(0.0)
+        m_init = fx.Float32(float("-inf"))
+        d_init = fx.Float32(0.0)
+    # _init = [m, d, O_tile0 .. O_tile{d_tiles-1}] — running max, denom, then one v8-f32
+    # O accumulator per 16-wide output-dim tile (this lane's partial O[q, d]), all zero.
     _init = [
-        _raw(m_seed),
-        _raw(d_seed),
+        _raw(m_init),
+        _raw(d_init),
     ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
-    n_tiles = arith.ceildivui(
-        arith.unwrap(kv_len_wg), arith.constant(n_block, type=T.i32)
-    )
-    _lo = arith.index(0)
+    _lo = arith.index_cast(T.index, arith.unwrap(start_tile))
     _hi = arith.index_cast(T.index, n_tiles)
     _step = arith.index(1)
     for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
@@ -606,30 +651,29 @@ def _core_attention(
         )
 
         # ---- Softmax: online update over this KV tile's kv axis. ----
-        # Causal masks element kv position
-        # kv_tile_start+(l//16)*8+kvt*16+i > seq_idx+causal_off
-        # (causal_off = kv_len - q_len); q's sequence index is the GQA-aware seq_idx.
+        # This lane's query attends the band [q_min, q_max] (batch-relative kv), where
+        # q_max = seq_idx+causal_off+window_right, q_min = seq_idx+causal_off-window_left
+        # (causal_off = kv_len - q_len; seq_idx is the GQA-aware query seq). Pass only
+        # the bounds the compiled variant masks: q_max when mask_right, q_min when
+        # mask_left. kv_len is always passed — _softmax clamps q_max to kv_len-1 (folds
+        # the tail mask) when mask_right, else uses it as the standalone tail mask.
         #
         # TODO(perf): the per-element `.select` lowers to one v_cmp + v_cndmask_b32
         # per masked score (64 pairs for n_block=128). Split the KV loop into a
-        # fully-below-diagonal prefix (no mask) + a boundary region (only diagonal
-        # tiles masked) so the mask select is gone from the loop's steady state.
-        if is_causal:
-            q_max = seq_idx + (kv_len - q_len)
-        else:
-            q_max = None
+        # fully-in-band prefix (no mask) + boundary tiles so the mask select is gone
+        # from the loop's steady state.
+        q_max = seq_idx + causal_off + window_right if mask_right else None
+        q_min = seq_idx + causal_off - window_left if mask_left else None
         p, m_new, d_new, corr = _softmax(
             s=s,
             m_prev=m_prev,
             d_prev=d_prev,
             lane_idx=lane_idx,
             n_block=n_block,
-            is_causal=is_causal,
             kv_pos_base=kv_tile_start,
             q_max=q_max,
-            # Non-causal needs an explicit KV-length mask for the last tile's tail;
-            # causal's q_max already excludes kv >= kv_len, so leave it None there.
-            kv_len=(None if is_causal else kv_len),
+            q_min=q_min,
+            kv_len=kv_len,
         )
 
         # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. ----
@@ -650,7 +694,7 @@ def _core_attention(
         # would-be prefetch drops a dead async load into slot n_tiles%N_KV_PP --
         # exactly the slot the O epilogue reuses -- which races the epilogue's O
         # write across waves. Skipping it leaves that slot idle so the epilogue
-        # needs no barrier. nxt_valid still clamps the causal partial tail. ----
+        # needs no barrier. nxt_valid still clamps the mask_right partial tail. ----
         nxt = t + fx.Int32(1)
         nxt_pp = nxt % fx.Int32(N_KV_PP)
         nxt_row0 = nxt * fx.Int32(n_block)
@@ -780,7 +824,8 @@ def build_fmha_fwd_prefill_m16x8(
     v_hdim: int = DEFAULT_V_HDIM,
     n_block: int = DEFAULT_N_BLOCK,
     dtype_str: str = DEFAULT_DTYPE,
-    is_causal: bool = False,
+    mask_left: bool = False,
+    mask_right: bool = False,
     return_lse: bool = False,
     has_sink: bool = False,
     gqa_ratio: int = 1,
@@ -804,7 +849,8 @@ def build_fmha_fwd_prefill_m16x8(
     QK_HDIM = qk_hdim
     V_HDIM = v_hdim
     N_BLOCK = int(n_block)
-    CAUSAL = bool(is_causal)
+    MASK_LEFT = bool(mask_left)
+    MASK_RIGHT = bool(mask_right)
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
@@ -832,6 +878,8 @@ def build_fmha_fwd_prefill_m16x8(
             stride_o_head: fx.Int32,
             stride_lse_seq: fx.Int32,
             stride_lse_head: fx.Int32,
+            window_left: fx.Int32,
+            window_right: fx.Int32,
             max_seqlen_q: fx.Int32,
             max_seqlen_k: fx.Int32,
         ):
@@ -860,7 +908,8 @@ def build_fmha_fwd_prefill_m16x8(
                     qk_hdim=QK_HDIM,
                     v_hdim=V_HDIM,
                     n_block=N_BLOCK,
-                    is_causal=CAUSAL,
+                    mask_left=MASK_LEFT,
+                    mask_right=MASK_RIGHT,
                     return_lse=RET_LSE,
                     has_sink=HAS_SINK,
                     gqa_ratio=GQA_RATIO,
@@ -887,6 +936,8 @@ def build_fmha_fwd_prefill_m16x8(
                     q_len=q_len,
                     kv_start=kv_start,
                     kv_len=kv_len,
+                    window_left=window_left,
+                    window_right=window_right,
                 )
 
         return kn_fmha_fwd_prefill_m16x8_thd
@@ -911,6 +962,8 @@ def build_fmha_fwd_prefill_m16x8(
         stride_lse_seq: fx.Int32,
         stride_lse_head: fx.Int32,
         stride_lse_batch: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
     ):
@@ -931,7 +984,8 @@ def build_fmha_fwd_prefill_m16x8(
             qk_hdim=QK_HDIM,
             v_hdim=V_HDIM,
             n_block=N_BLOCK,
-            is_causal=CAUSAL,
+            mask_left=MASK_LEFT,
+            mask_right=MASK_RIGHT,
             return_lse=RET_LSE,
             has_sink=HAS_SINK,
             gqa_ratio=GQA_RATIO,
@@ -958,6 +1012,8 @@ def build_fmha_fwd_prefill_m16x8(
             q_len=seq_len_q,
             kv_start=batch * seq_len_k,
             kv_len=seq_len_k,
+            window_left=window_left,
+            window_right=window_right,
         )
 
     return kn_fmha_fwd_prefill_m16x8_bshd
@@ -970,16 +1026,21 @@ def build_fmha_fwd_prefill_m16x8(
 # no output yet — this wiring exists so the dispatch paths in fmha_kernels.py can
 # route qk_hdim==128 here while the kernel is being built out.
 
-_launch_fns = {}  # {(layout, is_causal, return_lse, gqa_ratio): @flyc.jit launch fn}
+_launch_fns = {}  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
 
 
-def _ensure_thd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ratio: int):
-    key = ("thd", bool(is_causal), bool(return_lse), bool(has_sink), int(gqa_ratio))
+def _ensure_thd_kernel(
+    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int
+):
+    key = (
+        "thd", bool(mask_left), bool(mask_right),
+        bool(return_lse), bool(has_sink), int(gqa_ratio),
+    )
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m16x8(
-        layout="thd", is_causal=is_causal, return_lse=return_lse,
-        has_sink=has_sink, gqa_ratio=gqa_ratio,
+        layout="thd", mask_left=mask_left, mask_right=mask_right,
+        return_lse=return_lse, has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
     @flyc.jit
@@ -1003,6 +1064,8 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ra
         stride_o_head: fx.Int32,
         stride_lse_seq: fx.Int32,
         stride_lse_head: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         num_heads_kv: fx.Int32,
@@ -1041,6 +1104,8 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ra
             stride_o_head,
             stride_lse_seq,
             stride_lse_head,
+            window_left,
+            window_right,
             max_seqlen_q,
             max_seqlen_k,
         )
@@ -1053,13 +1118,18 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ra
     _launch_fns[key] = _launch
 
 
-def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_ratio: int):
-    key = ("bshd", bool(is_causal), bool(return_lse), bool(has_sink), int(gqa_ratio))
+def _ensure_bshd_kernel(
+    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int
+):
+    key = (
+        "bshd", bool(mask_left), bool(mask_right),
+        bool(return_lse), bool(has_sink), int(gqa_ratio),
+    )
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m16x8(
-        layout="bshd", is_causal=is_causal, return_lse=return_lse,
-        has_sink=has_sink, gqa_ratio=gqa_ratio,
+        layout="bshd", mask_left=mask_left, mask_right=mask_right,
+        return_lse=return_lse, has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
     @flyc.jit
@@ -1082,6 +1152,8 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_r
         stride_lse_seq: fx.Int32,
         stride_lse_head: fx.Int32,
         stride_lse_batch: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
         num_heads_kv: fx.Int32,
@@ -1119,6 +1191,8 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, has_sink: bool, gqa_r
             stride_lse_seq,
             stride_lse_head,
             stride_lse_batch,
+            window_left,
+            window_right,
             seq_len_q,
             seq_len_k,
         )
@@ -1141,12 +1215,19 @@ def flash_attn_varlen_m16x8(
     max_seqlen_k: int,
     softmax_scale=None,
     causal=False,
+    window_size=(-1, -1),
     out=None,
     return_lse=False,
     sink=None,
     lse=None,
 ):
     """Host entry — varlen THD, qk_hdim=v_hdim=128, bf16.
+
+    ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
+    infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
+    ``right=0``. Finiteness is baked into the kernel (compile-time ``mask_left`` /
+    ``mask_right``); the window magnitudes are runtime args, so one variant serves
+    any window value.
 
     ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
     scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
@@ -1177,6 +1258,16 @@ def flash_attn_varlen_m16x8(
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
 
+    # Sliding window: causal forces right=0. Finiteness (>=0) is compile-time
+    # (mask_left/mask_right); the magnitudes ride along as runtime Int32 args.
+    win_left, win_right = int(window_size[0]), int(window_size[1])
+    if causal:
+        win_right = 0
+    mask_left = win_left >= 0
+    mask_right = win_right >= 0
+    window_left = max(win_left, 0)
+    window_right = max(win_right, 0)
+
     if out is None:
         out = torch.empty(
             (total_q_tokens, nheads_q, 128), dtype=torch.bfloat16, device=q.device
@@ -1206,10 +1297,12 @@ def flash_attn_varlen_m16x8(
     stride_v_head = v.stride(1) * bpp
     stride_o_head = out.stride(1)
 
-    _ensure_thd_kernel(bool(causal), bool(return_lse), has_sink, gqa)
+    _ensure_thd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)
 
     _run_compiled(
-        _launch_fns[("thd", bool(causal), bool(return_lse), has_sink, gqa)],
+        _launch_fns[
+            ("thd", mask_left, mask_right, bool(return_lse), has_sink, gqa)
+        ],
         out,
         q,
         k,
@@ -1229,6 +1322,8 @@ def flash_attn_varlen_m16x8(
         stride_o_head,
         stride_lse_seq,
         stride_lse_head,
+        window_left,
+        window_right,
         max_seqlen_q,
         max_seqlen_k,
         nheads_k,
@@ -1247,6 +1342,7 @@ def flash_attn_batch_m16x8(
     v: torch.Tensor,
     softmax_scale=None,
     causal=False,
+    window_size=(-1, -1),
     out=None,
     return_lse=False,
     sink=None,
@@ -1256,6 +1352,11 @@ def flash_attn_batch_m16x8(
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.
+
+    ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
+    infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
+    ``right=0``. Finiteness is baked into the kernel (compile-time ``mask_left`` /
+    ``mask_right``); the window magnitudes are runtime args.
 
     ``sink`` (optional): 1-D ``[nheads_q]`` fp32 per-head sink logits in the
     scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
@@ -1285,6 +1386,16 @@ def flash_attn_batch_m16x8(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
+
+    # Sliding window: causal forces right=0. Finiteness (>=0) is compile-time
+    # (mask_left/mask_right); the magnitudes ride along as runtime Int32 args.
+    win_left, win_right = int(window_size[0]), int(window_size[1])
+    if causal:
+        win_right = 0
+    mask_left = win_left >= 0
+    mask_right = win_right >= 0
+    window_left = max(win_left, 0)
+    window_right = max(win_right, 0)
 
     if out is None:
         out = torch.empty(
@@ -1323,10 +1434,12 @@ def flash_attn_batch_m16x8(
     stride_v_head = v.stride(2) * bpp
     stride_o_head = out.stride(2)
 
-    _ensure_bshd_kernel(bool(causal), bool(return_lse), has_sink, gqa)
+    _ensure_bshd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)
 
     _run_compiled(
-        _launch_fns[("bshd", bool(causal), bool(return_lse), has_sink, gqa)],
+        _launch_fns[
+            ("bshd", mask_left, mask_right, bool(return_lse), has_sink, gqa)
+        ],
         out,
         q,
         k,
@@ -1345,6 +1458,8 @@ def flash_attn_batch_m16x8(
         stride_lse_seq,
         stride_lse_head,
         stride_lse_batch,
+        window_left,
+        window_right,
         seq_len_q,
         seq_len_k,
         nheads_k,
