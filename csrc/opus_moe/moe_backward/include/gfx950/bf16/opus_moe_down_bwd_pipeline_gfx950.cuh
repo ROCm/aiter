@@ -180,6 +180,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::ISSUE_B_FIRST;
         return false;
     }();
+    constexpr int prefetch_a_tiles = []() constexpr {
+        if constexpr(requires { T::PREFETCH_A_TILES; })
+            return T::PREFETCH_A_TILES;
+        return 0;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -579,16 +584,38 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             auto v_b = down_bwd_load_rb_tr<T, decltype(mma)>(
                 s_b_current, lane_id, wave_id_n);
 
-            s_waitcnt_lgkmcnt(0_I);
-            __builtin_amdgcn_s_setprio(1);
-            opus::static_for<RouteTiles>([&](auto route_group) {
+            auto load_route_a = [&](auto route_group) {
                 auto s_a = make_smem(reinterpret_cast<D_A*>(
                     tile_storage + buffer * gemm_buffer_bytes +
                     route_group.value * ROUTE_M * BK * sizeof(D_A)));
-                auto v_a = s_a.template load<T::VEC_A>(u_ra);
-                v_c[route_group.value] =
-                    mma(v_a, v_b, v_c[route_group.value]);
-            });
+                return s_a.template load<T::VEC_A>(u_ra);
+            };
+            if constexpr(prefetch_a_tiles == 3 && RouteTiles >= 3)
+            {
+                auto v_a0 = load_route_a(opus::number<0>{});
+                auto v_a1 = load_route_a(opus::number<1>{});
+                auto v_a2 = load_route_a(opus::number<2>{});
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_setprio(1);
+                v_c[0] = mma(v_a0, v_b, v_c[0]);
+                v_c[1] = mma(v_a1, v_b, v_c[1]);
+                v_c[2] = mma(v_a2, v_b, v_c[2]);
+                opus::static_for<RouteTiles - 3>([&](auto route_group) {
+                    constexpr int group = route_group.value + 3;
+                    auto next_a = load_route_a(opus::number<group>{});
+                    v_c[group] = mma(next_a, v_b, v_c[group]);
+                });
+            }
+            else
+            {
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_setprio(1);
+                opus::static_for<RouteTiles>([&](auto route_group) {
+                    auto v_a = load_route_a(route_group);
+                    v_c[route_group.value] =
+                        mma(v_a, v_b, v_c[route_group.value]);
+                });
+            }
             __builtin_amdgcn_s_setprio(0);
 
             if(has_next)

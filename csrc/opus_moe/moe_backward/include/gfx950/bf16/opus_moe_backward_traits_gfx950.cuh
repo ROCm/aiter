@@ -146,6 +146,10 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
     // first so the transfer that gates vmcnt(0) starts as early as possible;
     // this wins across the BN256 shape family without changing resources.
     static constexpr bool ISSUE_B_FIRST = true;
+    // Queue three route-tile A reads behind the wider B transpose reads before
+    // waiting on LDS.  This overlaps their latency without crossing the live-
+    // range cliff observed when all four leading A fragments stay resident.
+    static constexpr int PREFETCH_A_TILES = 3;
     // After the GEMM mainloop, reuse its dead LDS allocation to coalesce the
     // otherwise lane-scattered Z reads.  One direct 16-byte global-to-LDS
     // issue per lane fills two adjacent route rows; a padded row-pair layout
