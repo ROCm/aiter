@@ -471,6 +471,60 @@ def _scaled_q_descale(q_descale: torch.Tensor, softmax_scale: float, head_size: 
     return q_descale * ratio
 
 
+def _dispatch_split_enabled() -> bool:
+    """Kill-switch for the mixed-batch dispatch split (read live so a benchmark
+    can A/B it in-process). Default on; ``AITER_UA_DISPATCH_SPLIT=0`` restores
+    the single unified call for a whole mixed batch."""
+    return os.environ.get("AITER_UA_DISPATCH_SPLIT", "1") != "0"
+
+
+def _partition_mixed(cu_seqlens_q, seqused_k, num_seqs):
+    """Partition a mixed batch into a contiguous prefill block and a contiguous
+    decode block, or return None when the layout isn't a clean two-block split.
+
+    A mixed batch is independent sequences, but the single launch below picks one
+    ``num_kv_splits`` for all of them -- wrong for one half. This finds the split
+    so each half can run on its own optimal path. Returns None (caller runs the
+    single unified call, still correct) unless every prefill seq (query_len > 1)
+    forms one contiguous run and every decode seq (query_len == 1) forms another,
+    both non-empty. Only that shape lets each half be a zero-copy view slice of
+    q/out. Interleaved layouts decline here and fall through to the single call.
+
+    On success returns (split_point, prefill_first, n_pre, n_dec, pre_max_q):
+      split_point   -- seq index where the second block begins
+      prefill_first -- True if prefills lead, False if decodes lead
+      n_pre, n_dec  -- sequence counts per block (both > 0)
+      pre_max_q     -- max query_len over the prefill block (grid.y for the 2d call)
+    Costs one device->host sync (all scalars pulled in a single transfer).
+    """
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]  # [num_seqs], device
+    is_dec = seqlens_q == 1
+    n_dec_t = is_dec.sum()
+    di = is_dec.to(torch.int32)
+    # Clean two-block <=> is_dec is monotonic: all-False-then-True (prefill-first)
+    # or all-True-then-False (decode-first). Both non-empty => exactly one holds.
+    asc = torch.all(di[1:] >= di[:-1])
+    desc = torch.all(di[1:] <= di[:-1])
+    pre_max_q_t = torch.where(is_dec, torch.zeros_like(seqlens_q), seqlens_q).max()
+    stats = torch.stack(
+        [
+            n_dec_t.to(torch.int64),
+            asc.to(torch.int64),
+            desc.to(torch.int64),
+            pre_max_q_t.to(torch.int64),
+        ]
+    ).tolist()
+    n_dec, asc_b, desc_b, pre_max_q = stats[0], bool(stats[1]), bool(stats[2]), stats[3]
+    n_pre = num_seqs - n_dec
+    if n_pre == 0 or n_dec == 0:
+        return None  # pure prefill or pure decode: nothing to split
+    if asc_b:
+        return (n_pre, True, n_pre, n_dec, pre_max_q)
+    if desc_b:
+        return (n_dec, False, n_pre, n_dec, pre_max_q)
+    return None  # interleaved: decline (single call stays correct)
+
+
 def flydsl_unified_attention(
     q,
     k,
@@ -538,6 +592,68 @@ def flydsl_unified_attention(
         skip_reduce,
     ):
         return None
+
+    # Mixed-batch dispatch split. The tier selection below picks ONE
+    # num_kv_splits for the whole launch, which is wrong for one half of a mixed
+    # batch: a machine-filling prefill chunk forced onto split-K, or riding
+    # decodes denied it. A mixed batch is independent sequences, so route each
+    # half to its own recursive call -- each re-runs tier selection and lands on
+    # its optimal path (prefill -> single-pass 2d, decode -> split-K 3d). Both
+    # halves are contiguous row-range VIEWS of q/out (no gather), writing
+    # disjoint output rows in place. Declines to a single call (still correct)
+    # unless the batch is a clean two-block prefill/decode split. Recursion
+    # terminates after one level: a pure-prefill sub-batch returns None from the
+    # partition, and a pure-decode sub-batch has max_seqlen_q == 1 so the guard
+    # below is false.
+    if _dispatch_split_enabled() and max_seqlen_q > 1 and num_seqs > 1:
+        part = _partition_mixed(cu_seqlens_q, seqused_k, num_seqs)
+        if part is not None:
+            split_point, prefill_first, n_pre, n_dec, pre_max_q = part
+            row_split = int(cu_seqlens_q[split_point])
+            total_q = q.shape[0]
+            if prefill_first:
+                pre_rows, dec_rows = (0, row_split), (row_split, total_q)
+                pre_seqs, dec_seqs = (0, split_point), (split_point, num_seqs)
+            else:
+                dec_rows, pre_rows = (0, row_split), (row_split, total_q)
+                dec_seqs, pre_seqs = (0, split_point), (split_point, num_seqs)
+
+            def _sub(rows, seqs, n_sub, max_q_sub):
+                r0, r1 = rows
+                s0, s1 = seqs
+                flydsl_unified_attention(
+                    q[r0:r1],
+                    k,
+                    v,
+                    out[r0:r1],
+                    cu_seqlens_q[s0 : s1 + 1] - cu_seqlens_q[s0],
+                    max_q_sub,
+                    seqused_k[s0:s1],
+                    max_seqlen_k,
+                    softmax_scale,
+                    causal,
+                    window_size,
+                    block_table[s0:s1],
+                    softcap,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    num_kv_heads=num_kv_heads,
+                    block_size=block_size,
+                    num_queries_per_kv=num_queries_per_kv,
+                    num_seqs=n_sub,
+                    q_scales=q_scales,
+                    alibi_slopes=alibi_slopes,
+                    output_scale=output_scale,
+                    qq_bias=qq_bias,
+                    sinks=sinks,
+                    shuffled_kv_cache=shuffled_kv_cache,
+                    skip_reduce=skip_reduce,
+                )
+
+            _sub(pre_rows, pre_seqs, n_pre, pre_max_q)  # prefill -> single-pass 2d
+            _sub(dec_rows, dec_seqs, n_dec, 1)  # decode -> split-K 3d
+            return out
 
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
