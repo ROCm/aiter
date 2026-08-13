@@ -205,6 +205,7 @@ def fp8_mqa_logits(
             block_kv = 64 if num_heads <= 32 else 32
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            grid = ((seq_len + block_m - 1) // block_m,)
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
@@ -216,6 +217,11 @@ def fp8_mqa_logits(
             num_chains = 8 if USE_FOLDED_REDUCTION else 0
             num_warps = 4
             block_kv = 128
+            # This kernel takes no BLOCK_M and derives its row from
+            # `num_programs(0)`, one row per program. A smaller grid would not
+            # fail -- it would leave the tail rows at the -inf they were
+            # initialised to, so the grid has to stay one program per row.
+            grid = (seq_len,)
             other = {"LOOP_VARIANT": loop_variant}
 
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
@@ -223,7 +229,7 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+        _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
