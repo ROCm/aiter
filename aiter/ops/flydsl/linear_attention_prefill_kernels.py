@@ -383,9 +383,14 @@ def _get_or_compile(
                 **_compile_kwargs
             )
         elif _ARCH == "gfx942":
+            # COMPUTE_OUTPUT=False selects the K5-only build of the shared
+            # gfx942 builder (the fused K5+K6 build is reached via
+            # _run_fused_gfx942).
             _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
                 **_compile_kwargs,
                 NR_SPLIT=num_waves // (BT // 16),
+                COMPUTE_OUTPUT=False,
+                STORE_H=True,
             )
         else:
             raise ValueError(
@@ -412,6 +417,8 @@ def _launch_kernel(
     ht_arg,
     cu_arg,
     co_arg,
+    q_arg,
+    o_arg,
     T,
     T_flat,
     stream,
@@ -431,6 +438,8 @@ def _launch_kernel(
         ht_arg,
         cu_arg,
         co_arg,
+        q_arg,
+        o_arg,
         T,
         T_flat,
         N,
@@ -697,6 +706,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         ht_arg,
         cu_arg,
         co_arg,
+        # q/o belong to the fused K5+K6 build (COMPUTE_OUTPUT=True); the K5
+        # kernel declares but never dereferences them, so dummies suffice.
+        dummy,
+        dummy,
         T,
         T_flat,
         stream,
@@ -789,10 +802,6 @@ def _run_fused_gfx942(
     num_decode_tokens, prefill_metadata, variant,
 ):
     """gfx942 fused K5+K6 launch. Mirrors the K5 wrapper's input prep."""
-    from .kernels.chunk_gated_delta_h_o_gfx942 import (
-        compile_chunk_gated_delta_h_o_gfx942,
-    )
-
     g_log2_scaled = bool(use_exp2)
 
     if initial_state is not None:
@@ -896,20 +905,28 @@ def _run_fused_gfx942(
         output_final_state, is_varlen, state_bf16, g_log2_scaled, NR_SPLIT,
     )
     if cache_key not in _compiled_fused_kernels:
-        _compiled_fused_kernels[cache_key] = compile_chunk_gated_delta_h_o_gfx942(
-            K=K, V=V, BT=BT, BV=BV, H=H, Hg=Hg, SCALE=float(scale),
+        # Fused build of the shared gfx942 builder: COMPUTE_OUTPUT appends the
+        # K6 stage, while STORE_H / SAVE_NEW_VALUE drop the two HBM drains that
+        # only the separate K6 kernel consumes -- that elision is the whole
+        # point of fusing.
+        _compiled_fused_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
+            K=K, V=V, BT=BT, BV=BV, H=H, Hg=Hg,
             USE_G=use_g, USE_GK=use_gk, USE_INITIAL_STATE=use_h0,
-            STORE_FINAL_STATE=output_final_state, IS_VARLEN=is_varlen,
+            STORE_FINAL_STATE=output_final_state, SAVE_NEW_VALUE=False,
+            IS_VARLEN=is_varlen,
             WU_CONTIGUOUS=True, STATE_DTYPE_BF16=state_bf16,
             G_IS_LOG2_SCALED=g_log2_scaled, NR_SPLIT=NR_SPLIT,
+            COMPUTE_OUTPUT=True, STORE_H=False, SCALE=float(scale),
         )
     launch_fn = _compiled_fused_kernels[cache_key]
 
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
+    # Unified kernel arg order; v_new and h are unused on the fused build.
     _run_compiled(
         launch_fn,
-        q, k, w, u, g_arg, gk_arg, o, h0_arg, ht_arg, cu_arg, co_arg,
+        k, u, w, dummy, g_arg, gk_arg, dummy, h0_arg, ht_arg, cu_arg, co_arg,
+        q, o,
         T, T_flat, N, grid_v, grid_nh, stream,
     )
 
@@ -994,23 +1011,14 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
         H = w.shape[1]
         o = u.new_empty(B, T, H, V, dtype=u.dtype)
 
-    # Bring-up escape hatch: FLYDSL_GDN_FUSED_PLACEHOLDER=1 forces the unfused
-    # K5->K6 orchestration (Phase 0 path) so the real kernel can be A/B'd
-    # against a known-correct baseline without editing call sites.
-    _force_placeholder = os.environ.get("FLYDSL_GDN_FUSED_PLACEHOLDER", "0") == "1"
-
-    if _force_placeholder or _ARCH != "gfx942":
-        from .kernels.chunk_gated_delta_h_o_gfx942 import (
-            chunk_gated_delta_h_o_placeholder,
-        )
-
-        return chunk_gated_delta_h_o_placeholder(
-            q=q, k=k, w=w, u=u, g=g, gk=gk, o=o, scale=scale,
-            initial_state=initial_state, output_final_state=output_final_state,
-            chunk_size=chunk_size, cu_seqlens=cu_seqlens, state_dtype=state_dtype,
-            use_exp2=use_exp2, num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
-            variant=variant,
+    # The fused kernel is gfx942-only: it is the sole implementation of this
+    # entry point (there is no separate-K5/K6 fallback here -- callers that need
+    # one route through the pipeline's K5K6Fusion.NEVER path instead).
+    if _ARCH != "gfx942":
+        raise NotImplementedError(
+            f"chunk_gated_delta_rule_fwd_h_o_flydsl: the fused GDN K5+K6 kernel "
+            f"is implemented for gfx942 only; got arch '{_ARCH}'. Use the "
+            f"separate K5 + Triton K6 path on this arch."
         )
 
     return _run_fused_gfx942(
