@@ -637,7 +637,9 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int logical_bn256_route_dx_kid = 13;
     constexpr int sorted_bn256_route_dx_kid = 14;
     constexpr int sorted_bn256_b_first_route_dx_kid = 15;
+    constexpr int sorted_bn256_m5_b_first_route_dx_kid = 16;
     constexpr int b_first_min_routes = 250000;
+    constexpr uint64_t m5_min_average_routes = 1536;
     constexpr int sorted_route_reduce_kid = 1;
     constexpr int full_row_sorted_route_reduce_kid = 2;
     const auto is_sorted_route_reduce_kid = [&](int kid) {
@@ -652,6 +654,12 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     const auto sorted_route_kid = [&](int logical_kid) {
         if(logical_kid != logical_bn256_route_dx_kid)
             return sorted_route_dx_kid;
+
+        const uint64_t average_padded_routes =
+            static_cast<uint64_t>(route_dx.route.sorted_capacity) /
+            static_cast<uint64_t>(route_dx.route.num_experts);
+        if(average_padded_routes >= m5_min_average_routes)
+            return sorted_bn256_m5_b_first_route_dx_kid;
 
         // The BN256/M3 stage moves about 16 KiB of W1 but only 6 KiB of dZ
         // per stage.  On long sorted streams, issuing W1 first starts the
@@ -669,7 +677,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     const auto is_sorted_route_kid = [&](int kid) {
         return kid == sorted_route_dx_kid ||
                kid == sorted_bn256_route_dx_kid ||
-               kid == sorted_bn256_b_first_route_dx_kid;
+               kid == sorted_bn256_b_first_route_dx_kid ||
+               kid == sorted_bn256_m5_b_first_route_dx_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&

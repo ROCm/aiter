@@ -91,6 +91,7 @@ def _select_internal_fixed_route_pair(
 
     l2_friendly_bytes = 128 * 1024 * 1024
     b_first_min_routes = 250_000
+    m5_min_average_routes = 1536
     working_set_bytes = (
         d_z_sorted.numel() * d_z_sorted.element_size()
         + w1.numel() * w1.element_size()
@@ -106,6 +107,9 @@ def _select_internal_fixed_route_pair(
         # halves dZ rereads when D is tile aligned, while BN128 remains the
         # remainder-safe large-working-set path.
         if w1.shape[2] % 256 == 0:
+            average_padded_routes = d_z_sorted.shape[0] // w1.shape[0]
+            if average_padded_routes >= m5_min_average_routes:
+                return 16, 1
             # Once the sorted route stream is this large, issue the wider W1
             # transfer before dZ so its vmcnt-critical tail enters the memory
             # pipeline earlier.  Below the measured crossover retain the

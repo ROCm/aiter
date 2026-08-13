@@ -316,6 +316,17 @@ struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPadSortedOutputBFirs
     static constexpr bool ISSUE_B_FIRST = true;
 };
 
+// Long per-expert reductions can amortize one BN256 W1 tile across five
+// adjacent sorter tiles.  B-first starts the larger weight transfer before
+// the 10-KiB dZ slab and preserves the expert-sorted K2/K3 workspace.
+struct RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM5Cohort10ASlabPadSortedOutputBFirst
+    : RouteDxBf16Gfx950Bm32Bn256Bk32WideStoreM3Cohort6ASlabPadSortedOutput
+{
+    static constexpr int ROUTE_COHORT_TILES = 10;
+    static constexpr int ROUTE_M_TILES = 5;
+    static constexpr bool ISSUE_B_FIRST = true;
+};
+
 struct RouteReduceBf16Gfx950Bm16Bn128
     : Bf16Traits<Family::RouteReduce,
                  16,
