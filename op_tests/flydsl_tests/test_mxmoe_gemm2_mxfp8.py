@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from aiter import ActivationType, dtypes
+from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
     _mxfp4_a_scale_sorted_shuffled,
     build_v2_inputs,
@@ -66,6 +66,68 @@ def test_v2_gemm2_wrapper_rejects_bn_outside_catalog(monkeypatch):
             BN=384,
             BK=128,
         )
+
+
+def test_v2_gemm2_wrapper_rejects_fp16_output_before_compile(monkeypatch):
+    import aiter.ops.flydsl.kernels.mxmoe_dispatcher as dispatcher
+
+    monkeypatch.setattr(
+        dispatcher,
+        "get_g2",
+        lambda *_args, **_kwargs: pytest.fail("fp16 output reached get_g2"),
+    )
+    with pytest.raises(
+        TypeError,
+        match=r"FlyDSL v2 GEMM2 supports only torch\.bfloat16 output, got torch\.float16",
+    ):
+        dispatcher.mxfp4_moe_gemm2(
+            inter_sorted_quant=None,
+            inter_sorted_shuffled_scale=None,
+            w2_u8=None,
+            w2_scale_u8=None,
+            sorted_expert_ids=None,
+            cumsum_tensor=None,
+            sorted_token_ids=None,
+            sorted_weights=None,
+            out=torch.empty((1, 128), dtype=torch.float16, device="cpu"),
+            M_logical=1,
+            max_sorted=32,
+            NE=1,
+            D_HIDDEN=128,
+            D_INTER=128,
+            topk=1,
+            BM=32,
+            BN=128,
+            BK=128,
+            a_dtype="fp8",
+            b_dtype="fp8",
+        )
+
+
+def test_v2_tuner_skips_fp16_output():
+    previous_device = torch.get_default_device()
+    try:
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+        info = (
+            "gfx950",
+            256,
+            16,
+            256,
+            256,
+            8,
+            2,
+            ActivationType.Swiglu,
+            dtypes.fp16,
+            dtypes.fp8,
+            dtypes.fp8,
+            QuantType.per_1x32,
+            1,
+            False,
+        )
+        assert FmoeTuner.gen_flydsl_v2_2stages_task(object(), info, [32]) == []
+    finally:
+        torch.set_default_device(previous_device)
 
 
 def test_fp8_b_pair_layout_matches_runtime_shuffle():

@@ -621,6 +621,14 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
+    if (
+        str(out_dtype).strip().lower() == "bf16"
+        and getattr(out, "dtype", None) != torch.bfloat16
+    ):
+        raise TypeError(
+            "FlyDSL v2 GEMM2 supports only torch.bfloat16 output, "
+            f"got {getattr(out, 'dtype', None)}"
+        )
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
