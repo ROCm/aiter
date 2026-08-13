@@ -3,25 +3,26 @@
 
 """MLA decode: large page_id, KV byte offset, and >4GB pools (gfx950 asm).
 
-Compares torch golden vs mla_decode_fwd (.co from hsa/<gfx>/mla/mla_asm.csv).
+Compares torch golden vs mla_decode_fwd (gfx950 asm).
 Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
+  python op_tests/test_mla_ltx.py
+    # default on gfx950: PR global-load .co sweep (8 presets, ps, boundary+page16m)
+  python op_tests/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
   python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
-  python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off
+  python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
   MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/test_mla_ltx.py --suites over4g
-  # omit --suites to run all case groups
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import itertools
 import os
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
 
 import pandas as pd
 import torch
@@ -50,8 +51,6 @@ PAGE_ID_16M = 16_000_000
 SEED_CHUNK_PAGES = 262_144
 SEQ_PAGE_BASE = -1  # sequential kv_indices 0..ctx-1
 
-SUB_KV_KERNEL = SUB_KV_TILE  # legacy alias for bench_mla_ckv.py
-
 # Built in main(); read by @benchmark test_mla_ltx.
 _KV_POOL: tuple[torch.Tensor, int] | None = None
 
@@ -74,7 +73,7 @@ def _csv_type_name(dtype) -> str:
         return "fp8"
     if dtype in (dtypes.bf16, torch.bfloat16):
         return "bf16"
-    raise ValueError(f"unsupported dtype for mla_asm.csv: {dtype}")
+    raise ValueError(f"unsupported dtype: {dtype}")
 
 
 def _dtype_element_size(dtype) -> int:
@@ -104,16 +103,6 @@ class Harness:
     def bytes_per_page(self) -> int:
         return QK_HEAD_DIM * _dtype_element_size(self.kv_dtype)
 
-    def csv_dispatch_keys(self) -> dict[str, object]:
-        return {
-            "qType": _csv_type_name(self.q_dtype),
-            "kvType": _csv_type_name(self.kv_dtype),
-            "Gqa": self.nhead,
-            "qSeqLen": self.decode_qlen,
-            "prefill": 0,
-            "causal": 0,
-        }
-
     def summary(self) -> str:
         q = _csv_type_name(self.q_dtype)
         kv = _csv_type_name(self.kv_dtype)
@@ -136,7 +125,8 @@ class Harness:
 
 
 # (q_dtype, kv_dtype, nhead/Gqa, decode_qlen/qSeqLen)
-# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=0, cprr=0).
+# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=1, cprr=0).
+# causal=0 rows are the msk0 non-masked builds, which this harness does not cover.
 PresetConfig = tuple[torch.dtype, torch.dtype, int, int]
 
 PRESETS: dict[str, PresetConfig] = {
@@ -149,6 +139,7 @@ PRESETS: dict[str, PresetConfig] = {
     "qh32_fp8_q2": (dtypes.fp8, dtypes.fp8, 32, 2),
     "qh32_fp8_q4": (dtypes.fp8, dtypes.fp8, 32, 4),
     "qh64_fp8_q1": (dtypes.fp8, dtypes.fp8, 64, 1),
+    "qh8_fp8_q4": (dtypes.fp8, dtypes.fp8, 8, 4),
     # bf16 / bf16 (mla_a16w16_* / mla_dec_stage1_*)
     "qh8_bf16_q1": (dtypes.bf16, dtypes.bf16, 8, 1),
     "qh8_bf16_q2": (dtypes.bf16, dtypes.bf16, 8, 2),
@@ -163,44 +154,23 @@ PRESETS: dict[str, PresetConfig] = {
 }
 DEFAULT_PRESET = "qh16_fp8_q1"
 
+# PR #4452 global-load .co: decode presets reachable via ps+lse off (skip cprr;
+# skip qh16_fp8_q4 nps -> unrefreshed qh64_qseqlen4 alias in mla_asm.csv).
+GLOBAL_LOAD_PRESETS: tuple[str, ...] = (
+    "qh32_bf16_q4",
+    "qh64_bf16_q1",
+    "qh16_fp8_q1",
+    "qh16_fp8_q4",
+    "qh32_fp8_q2",
+    "qh32_fp8_q4",
+    "qh8_fp8_q4",
+    "qh64_fp8_q1",
+)
 
-def _csv_name_to_dtype(name: str) -> torch.dtype:
-    if name == "fp8":
-        return dtypes.fp8
-    if name == "bf16":
-        return dtypes.bf16
-    raise ValueError(f"unsupported csv dtype {name!r}")
 
-
-def decode_presets_from_csv(
-    aiter_root: Path | None = None,
-) -> dict[str, PresetConfig]:
-    """Unique decode configs in mla_asm.csv (prefill=0, causal=0, qSeqLen>=1)."""
-    seen: set[tuple[str, str, int, int]] = set()
-    out: dict[str, PresetConfig] = {}
-    for row in _load_asm_csv(aiter_root):
-        if row["prefill"] != 0 or row["causal"] != 0:
-            continue
-        q_seq = int(row["qSeqLen"])
-        if q_seq < 1:
-            continue
-        q_type = str(row["qType"])
-        kv_type = str(row["kvType"])
-        if q_type == "bf16" and kv_type == "fp8":
-            continue
-        gqa = int(row["Gqa"])
-        key = (q_type, kv_type, gqa, q_seq)
-        if key in seen:
-            continue
-        seen.add(key)
-        name = f"qh{gqa}_{q_type}_q{q_seq}"
-        out[name] = (
-            _csv_name_to_dtype(q_type),
-            _csv_name_to_dtype(kv_type),
-            gqa,
-            q_seq,
-        )
-    return out
+def _default_ctx(h: Harness) -> int:
+    """Kernels need ctx >= decode_qlen; use 4 for q1/q2 smoke on ltx suites."""
+    return max(4, h.decode_qlen)
 
 
 def apply_config(
@@ -215,34 +185,10 @@ def apply_config(
         )
     global HARNESS
     HARNESS = Harness(q_dtype, kv_dtype, nhead, decode_qlen)
-    _sync_module_aliases()
-
-
-def apply_preset(name: str, decode_qlen: int | None = None) -> None:
-    if name not in PRESETS:
-        raise ValueError(f"unknown preset {name!r}, choose from {list(PRESETS)}")
-    q, kv, n, qlen = PRESETS[name]
-    apply_config(q, kv, n, decode_qlen if decode_qlen is not None else qlen)
-
-
-_apply_preset = apply_preset
 
 
 _q0, _kv0, _n0, _ql0 = PRESETS[DEFAULT_PRESET]
 HARNESS = Harness(_q0, _kv0, _n0, _ql0)
-NHEAD = HARNESS.nhead
-USE_FP8 = HARNESS.use_fp8
-BYTES_PER_PAGE = HARNESS.bytes_per_page
-PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-
-
-def _sync_module_aliases() -> None:
-    global NHEAD, USE_FP8, BYTES_PER_PAGE, PAGE_ID_FIRST_OVER_4G, DECODE_QLEN
-    NHEAD = HARNESS.nhead
-    USE_FP8 = HARNESS.use_fp8
-    BYTES_PER_PAGE = HARNESS.bytes_per_page
-    PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-    DECODE_QLEN = HARNESS.decode_qlen
 
 
 def _point_cases_for(h: Harness) -> list[PointCase]:
@@ -250,62 +196,25 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
     p2g1 = h.page_id_first_over_2g()
     p4g = h.page_id_last_safe_4g()
     p4g1 = h.page_id_first_over_4g()
+    ctx = _default_ctx(h)
     return [
-        PointCase(SAFE_PAGE_BASE, 1, "below_2g_offset", "boundary"),
-        PointCase(p2g, 1, "edge_2g_last_safe", "boundary"),
-        PointCase(p2g1, 1, "edge_2g_first_overflow", "boundary"),
-        PointCase(p4g, 1, "edge_4g_last_safe", "boundary"),
-        PointCase(p4g1, 1, "edge_4g_first_overflow", "boundary"),
+        PointCase(SAFE_PAGE_BASE, ctx, "below_2g_offset", "boundary"),
+        PointCase(p2g, ctx, "edge_2g_last_safe", "boundary"),
+        PointCase(p2g1, ctx, "edge_2g_first_overflow", "boundary"),
+        PointCase(p4g, ctx, "edge_4g_last_safe", "boundary"),
+        PointCase(p4g1, ctx, "edge_4g_first_overflow", "boundary"),
         PointCase(p4g1, 16, "seq16_from_4g_overflow", "boundary"),
         PointCase(p4g1, SUB_KV_TILE, "ctx128_at_4g_boundary", "over4g"),
         PointCase(65_409, SUB_KV_TILE, "cross_window_65536_subkv", "pa_window"),
-        PointCase(PAGE_ID_16M, 1, "page_id_16m", "page16m"),
+        PointCase(PAGE_ID_16M, ctx, "page_id_16m", "page16m"),
         PointCase(PAGE_ID_16M, SUB_KV_TILE, "page_id_16m_ctx128", "page16m"),
-        PointCase(1 << 24, 1, "page_id_2p24", "page16m"),
+        PointCase(1 << 24, ctx, "page_id_2p24", "page16m"),
+        PointCase(19_000_000, ctx, "page_id_19m", "page16m"),
     ]
 
 
 _POINT_CASES = _point_cases_for(HARNESS)
 _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
-
-_AML_ASM_CACHE: dict[str, list[dict[str, object]]] = {}
-
-
-def _aiter_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _co_dir(aiter_root: Path | None = None) -> Path:
-    root = aiter_root or _aiter_root()
-    return root / "hsa" / get_gfx() / "mla"
-
-
-def _load_asm_csv(aiter_root: Path | None = None) -> list[dict[str, object]]:
-    path = _co_dir(aiter_root) / "mla_asm.csv"
-    key = str(path.resolve())
-    if key not in _AML_ASM_CACHE:
-        ints = {"Gqa", "ps", "qSeqLen", "prefill", "causal", "lse", "cprr"}
-        with path.open(newline="") as f:
-            _AML_ASM_CACHE[key] = [
-                {k: (int(v) if k in ints else v) for k, v in row.items()}
-                for row in csv.DictReader(f)
-            ]
-    return _AML_ASM_CACHE[key]
-
-
-def co_name(persistent: bool, lse: bool, *, aiter_root: Path | None = None) -> str:
-    base = HARNESS.csv_dispatch_keys()
-    lse_flag = 1 if (lse and persistent) else 0
-    ps = 1 if persistent else 0
-    for row in _load_asm_csv(aiter_root):
-        if any(row.get(k) != v for k, v in base.items()):
-            continue
-        if row["ps"] == ps and row["lse"] == lse_flag and row["cprr"] == 0:
-            return str(row["co_name"])
-    raise KeyError(f"no csv row {HARNESS.summary()} ps={ps} lse={lse_flag} cprr=0")
-
-
-_co_name = co_name
 
 
 def ref_masked_attention(query, key, value, scale, dtype, is_causal=True):
@@ -484,80 +393,12 @@ def run_asm_mla_decode(
         kv_indices,
         kv_lens,
         HARNESS.decode_qlen,
+        g_kv_indptr=None,
+        cp_world_size=1,
+        cp_rank=0,
         **kw,
     )
     return out
-
-
-def mla_decode_asm(
-    kv_buffer,
-    num_pages,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    *,
-    persistent: bool,
-    return_lse: bool,
-    max_split: int,
-):
-    qlen = HARNESS.decode_qlen
-    q = torch.randn((qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
-    ref = run_torch_mla_decode(q, kv_buffer, qo_indptr, kv_indptr, kv_indices)
-    out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
-    run_asm_mla_decode(
-        q,
-        kv_buffer,
-        num_pages,
-        out,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, out
-
-
-_decode = mla_decode_asm
-
-
-def run_point(
-    kv_buffer, num_pages, page_base, ctx_len, *, persistent, return_lse, max_split
-):
-    qo, kv_i, kv_x = _make_indptr(ctx_len, page_base)
-    ref, asm = mla_decode_asm(
-        kv_buffer,
-        num_pages,
-        qo,
-        kv_i,
-        kv_x,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, asm, kv_x
-
-
-_run_mla_decode_point = run_point
-
-
-def run_sequential(kv_buffer, num_pages, ctx_len, *, persistent, return_lse, max_split):
-    qo, kv_i, kv_x = _make_indptr(ctx_len, None)
-    ref, asm = mla_decode_asm(
-        kv_buffer,
-        num_pages,
-        qo,
-        kv_i,
-        kv_x,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, asm, kv_x
-
-
-_run_mla_decode_sequential = run_sequential
 
 
 def _page_offset(page_id: int) -> int:
@@ -664,7 +505,6 @@ def test_mla_ltx(
 
     ret = {
         "gfx": get_gfx(),
-        "co": co_name(bool(persistent), bool(return_lse)),
         "label": label,
         "kv_off": kv_off,
         "off_gt_4g": int(kv_off >= (1 << 32)),
@@ -763,6 +603,21 @@ def _sweep_rows(
 
 
 def main():
+    if len(sys.argv) == 1 and get_gfx() in SUPPORTED_GFX:
+        sys.argv.extend(
+            [
+                "--preset",
+                *GLOBAL_LOAD_PRESETS,
+                "--suites",
+                "boundary",
+                "page16m",
+                "--ctx",
+                "4",
+                "--lse",
+                "off",
+            ]
+        )
+
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("mla_ltx unsupported on %s; skipping", get_gfx())
         return
@@ -777,7 +632,7 @@ def main():
         nargs="*",
         default=[],
         choices=sorted(PRESETS.keys()),
-        help="named decode configs from mla_asm.csv (overrides -d/-kvd/-n when set)",
+        help="named decode configs (overrides -d/-kvd/-n when set)",
     )
     parser.add_argument(
         "--suites",
@@ -888,7 +743,7 @@ def main():
         for page_base in args.page_base:
             if page_base > 0:
                 for ctx_ov in ctx_overrides:
-                    ctx = ctx_ov if ctx_ov > 0 else 1
+                    ctx = ctx_ov if ctx_ov > 0 else _default_ctx(HARNESS)
                     points = [
                         PointCase(page_base, ctx, f"page_id_{page_base}", "page16m")
                     ]

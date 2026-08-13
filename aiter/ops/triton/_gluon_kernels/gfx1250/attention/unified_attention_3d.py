@@ -11,6 +11,7 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
@@ -35,6 +36,7 @@ def apply_softcap(S, x):
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -556,6 +558,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     """Program state and core operations for the unified attention kernel."""
 
@@ -1298,7 +1301,7 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-                return gl.amd.gfx1250.local_load_packed_transposed(
+                return gl.amd.gfx1250.load_shared_fp4_repacked(
                     self.lds_unshuffle_v(buffer_id), layout=self.cfg.V_DOT_PACKED_LAYOUT
                 )
             else:
@@ -1531,7 +1534,7 @@ class AttentionProgram:
         p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
-            v = gl.amd.gfx1250.local_load_packed_transposed(
+            v = gl.amd.gfx1250.load_shared_fp4_repacked(
                 self.v_shared.index(buffer_id)
                 .reshape(
                     (

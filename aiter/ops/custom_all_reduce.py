@@ -134,6 +134,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    transpose_scale: bool = False,
 ) -> None: ...
 
 
@@ -224,6 +225,10 @@ def register_graph_buffers(
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def allocate_meta_buffer(size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def allocate_data_buffer(size: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)

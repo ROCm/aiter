@@ -3,16 +3,14 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from . import dpp_utils
 
-_PTR3 = "!llvm.ptr<3>"
 kStages = 2
 kBS_stride_k0_dw = 64
 
@@ -23,29 +21,34 @@ def _raw(v):
     return v
 
 
+def _udiv(x, d):
+    return fx.Int32(fx.Uint32(x) // fx.Uint32(d))
+
+
 def _lds_ptr3(base_i32, byte_off_i32):
-    addr_i64 = fx.Int64(base_i32 + byte_off_i32)
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
+    ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(base_i32 + byte_off_i32)))
 
 
 def _lds_base_ptr3(lds_view):
     base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32)))
+    return _lds_ptr3(base_i32, fx.Int32(0))
 
 
 def _gep3(base_ptr, byte_off_i32):
     return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
+        base_ptr, byte_offset=byte_off_i32, elem_type=T.i8
     )
 
 
 def _global_base_ptr1(addr_i64):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
+    ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(addr_i64)))
 
 
 def _gep1(base_ptr, byte_off_i32):
     return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
+        base_ptr, byte_offset=byte_off_i32, elem_type=T.i8
     )
 
 
@@ -55,42 +58,107 @@ def _global_ptr1(arg, byte_off_i32):
 
 def _buffer_rsrc(addr_i64, num_records_bytes):
     return buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(addr_i64)), num_records_bytes=num_records_bytes
+        fx.Int64(addr_i64), num_records_bytes=num_records_bytes
     )
 
 
-def _lds_swizzle_mask(row):
-    return (row & fx.Int32(14)) << fx.Int32(3)
+def _lds_swizzle_mask(row, row_bytes=128):
+    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns."""
+    assert row_bytes in (64, 128), f"unsupported FP4 LDS row width {row_bytes}"
+    return (row & fx.Int32(2 * (row_bytes // 16) - 2)) << fx.Int32(3)
+
+
+def lds_swizzle_mask_f8(row, row_bytes):
+    """XOR16 swizzle for an FP8 LDS row whose width is 128 or 256 bytes."""
+    return (row & (row_bytes // 16 - 1)) << 4
+
+
+def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):
+    """LDS dst view for buffer_load_lds DMA (AddressSpace.Shared = LDS enum 2, not addrspace 3)."""
+    if elem_ty is None:
+        elem_ty = T.i32
+    lds_ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
+    lds_ptr = fx.inttoptr(lds_ptr_ty, fx.Int32(base_i32 + byte_off_i32))
+    return fx.make_view(lds_ptr, fx.make_layout(1, 1))
+
+
+def global_typed_ptr(arg, elem_ty, align=4):
+    """Typed global fx.Pointer over a raw i64 device address; index in ELEMENTS (ptr[i]), not bytes."""
+    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
+    return fx.inttoptr(ptr_ty, fx.Int64(arg))
+
+
+def lds_typed_ptr(base_i32, elem_ty, align=4):
+    """Typed LDS (Shared) fx.Pointer over an i32 LDS base; index in ELEMENTS (ptr[i]), not bytes."""
+    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
+    return fx.inttoptr(ptr_ty, fx.Int32(base_i32))
+
+
+def lds_vec_load(base_i32, byte_off_i32, result_type, elem_ty, align=4):
+    """Typed LDS ds-read at a BYTE offset from the i32 LDS base; mirrors raw llvm.load (vector or scalar)."""
+    elem_ir_ty = elem_ty.ir_type if hasattr(elem_ty, "ir_type") else elem_ty
+    ptr = lds_typed_ptr(fx.Int32(base_i32) + byte_off_i32, elem_ir_ty, align=align)
+    return fx.ptr_load(ptr, result_type=result_type)
+
+
+def lds_dma_atom_128():
+    """BufferCopyLDS128b copy-atom (16B global->LDS DMA chunk)."""
+    return fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+
+
+def flat_buffer_view(
+    arg, base_elems, elem_ty, *, align, elem_bytes, fold=True, num_records_bytes=None
+):
+    """Flat buffer-tensor view over a RAW i64 addr; fold=True folds wave-uniform base to a VGPR voffset, fold=False keeps per-lane offset + num_records_bytes for OOB-zero."""
+    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
+    if fold:
+        base = fx.Uint32(fx.rocdl.readfirstlane(T.i32, base_elems))
+        off_i64 = fx.Uint64(base)
+        base_iter = fx.inttoptr(
+            ptr_ty,
+            fx.Uint64(arg) + off_i64 * fx.Uint64(elem_bytes),
+        )
+    else:
+        base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg))
+    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout((1, 1), (1, 1))))
+    if num_records_bytes is not None:
+        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
+    return fx.rocdl.make_buffer_tensor(view, max_size=True)
 
 
 def _fabs_f32(x):
-    return fx.Float32(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(x)], [], []))
+    return fmath.absf(x)
 
 
 def _e8m0_roundup(amax_f32):
-    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+    wi = (amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
-    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
-    return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
+    lt = fx.Uint32(bexp) < fx.Uint32(254)
+    return lt.select(bexp, fx.Int32(254))
 
 
 def _e8m0_from_amax(amax_f32):
     e8m0 = _e8m0_roundup(amax_f32)
-    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
+    qscale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, qscale
 
 
 def _umax_i32(a, b):
-    is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _raw(a), _raw(b))
-    return fx.Int32(arith.select(is_gt, _raw(a), _raw(b)))
+    is_gt = fx.Uint32(a) > fx.Uint32(b)
+    return is_gt.select(a, b)
+
+
+def _dpp_umax_step(a32, dpp_ctrl):
+    swapped = dpp_utils.update_dpp_i32(a32, a32, dpp_ctrl, 0xF, 0xF, True)
+    return _umax_i32(a32, fx.Int32(swapped))
 
 
 def _inline_dpp_quad_amax(a32):
-    a32 = fx.Int32(_raw(a32))
-    s1 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0xB1, 0xF, 0xF, True))
-    a32 = _umax_i32(a32, s1)
-    s2 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0x4E, 0xF, 0xF, True))
-    return _umax_i32(a32, s2)
+    return _dpp_umax_step(_dpp_umax_step(a32, 0xB1), 0x4E)
+
+
+def _inline_dpp_pair_amax(a32):
+    return _dpp_umax_step(a32, 0xB1)
 
 
 def k_half_for(k):
@@ -147,3 +215,32 @@ def kmchunks_for(BM):
 
 def lds_acc_bytes_for(rows, BN):
     return rows * BN * 4
+
+
+FP8OUT_SCALE_BLK = 32
+FP8OUT_SCALE_BLK_MIN = 8
+FP8OUT_PITCH_ALIGN = 64
+
+
+def fp8out_scale_blk(model_dim):
+    model_dim = int(model_dim)
+    blk = FP8OUT_SCALE_BLK
+    while blk > FP8OUT_SCALE_BLK_MIN and model_dim % blk:
+        blk //= 2
+    if model_dim % blk:
+        raise ValueError(
+            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK_MIN}"
+        )
+    return blk
+
+
+def fp8out_row_bytes(model_dim, scale_blk=None, pitch_align=FP8OUT_PITCH_ALIGN):
+    model_dim = int(model_dim)
+    scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)
+    if model_dim % scale_blk:
+        raise ValueError(f"model_dim {model_dim} must be a multiple of {scale_blk}")
+    pitch = model_dim + model_dim // scale_blk
+    align = int(pitch_align)
+    if align <= 0:
+        return pitch
+    return ((pitch + align - 1) // align) * align

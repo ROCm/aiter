@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from .prefill_batch_metadata import CausalConvPrefillMetadata
 
 MD_NAME = "module_causal_conv1d_fwd_split_qkv"
 
@@ -138,8 +139,24 @@ def causal_conv1d_split_qkv_hip_fn(
     else:
         has_initial_state = has_initial_state.to(torch.uint8)
 
-    nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
-    if nums_dict is not None and bm in nums_dict:
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=_cu_seqlen,
+            num_sequences=n_seqs,
+        )
+        grid = metadata.get_chunk_grid(bm)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        token_chunk_offset_ptr = grid.chunk_ids
+        nums_dict = None
+    else:
+        nums_dict = (
+            getattr(metadata, "nums_dict", None) if metadata is not None else None
+        )
+    if not isinstance(metadata, CausalConvPrefillMetadata) and (
+        nums_dict is not None and bm in nums_dict
+    ):
         # Reuse the precomputed schedule for the selected tile.
         entry = nums_dict[bm]
         tot = int(entry["tot"])
@@ -148,7 +165,7 @@ def causal_conv1d_split_qkv_hip_fn(
         if batch_ptr.device != x.device:
             batch_ptr = batch_ptr.to(x.device)
             token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-    else:
+    elif not isinstance(metadata, CausalConvPrefillMetadata):
         # Build the chosen tile's schedule once. When structured metadata is
         # present, memoize it back into the shared ``nums_dict`` so later calls
         # in the same step can reuse it instead of rebuilding.
