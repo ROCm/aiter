@@ -380,6 +380,16 @@ def _opus_moe_dgrad_swiglu_dscore_ragged_bf16_raw(
 
 @compile_ops(
     "module_moe_opus_bwd",
+    fc_name="opus_moe_build_dgrad_meta_i32",
+    develop=True,
+)
+def _opus_moe_build_dgrad_meta_i32_raw(
+    expert_offsets: Tensor, tile_metadata: Tensor
+) -> None: ...
+
+
+@compile_ops(
+    "module_moe_opus_bwd",
     fc_name="opus_moe_dgrad_mono_ragged_bf16",
     develop=True,
 )
@@ -905,6 +915,9 @@ def opus_moe_router_bwd_bf16(dp_sorted: Tensor, order: Tensor, topk_ids: Tensor,
 _DGRAD_B_M = 128
 _WGRAD_STREAMS = {}
 _WEIGHT_TRANSPOSE_CACHE = {}
+# Retain the host-built fallback for controlled performance comparisons and
+# non-capturable environments while the exact-shape GPU metadata path matures.
+_USE_GPU_DGRAD_METADATA = True
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -984,18 +997,46 @@ class OpusMoERefFunc(torch.autograd.Function):
         x_g = x[x_gather_idx].contiguous()
 
         offs = _offs_from_lens(lens)
-        (
-            seid,
-            bms,
-            bme,
-            uniform_m,
-            max_m,
-            mono_tile_offsets,
-            num_mono_tiles,
-        ) = _build_dgrad_block_meta(offs, _DGRAD_B_M)
+        exact_shape = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
+        gpu_dgrad_metadata = exact_shape and _USE_GPU_DGRAD_METADATA
+        if gpu_dgrad_metadata:
+            # One 64-thread GPU kernel builds E+1 tile prefix sums followed by
+            # the packed O(1) descriptor for every possible 192-row tile.  A
+            # fixed upper-bound grid has at most E-1 empty tiles and therefore
+            # needs neither a D2H sync nor a descriptor upload.
+            num_mono_tiles = (T * topk + 191) // 192 + E - 1
+            mono_tile_offsets = torch.empty(
+                E + 1 + num_mono_tiles,
+                dtype=torch.int32,
+                device=lens.device,
+            )
+            _opus_moe_build_dgrad_meta_i32_raw(offs, mono_tile_offsets)
+            seid = bms = bme = None
+            uniform_m = None
+            max_m = T * topk
+        else:
+            (
+                seid,
+                bms,
+                bme,
+                uniform_m,
+                max_m,
+                mono_tile_offsets,
+                num_mono_tiles,
+            ) = _build_dgrad_block_meta(offs, _DGRAD_B_M)
 
         def fwd_gemm(dy, w_nat):  # dh[m,n]=sum_k dy[m,k]*w_nat[e,n,k]
             out = torch.empty(dy.shape[0], w_nat.shape[1], device=dy.device, dtype=torch.bfloat16)
+            if gpu_dgrad_metadata:
+                return opus_moe_dgrad_mono_ragged_prepared(
+                    dy.contiguous(),
+                    w_nat,
+                    offs,
+                    mono_tile_offsets,
+                    num_mono_tiles,
+                    max_m,
+                    out,
+                )
             if uniform_m is not None and _mono_dgrad_shape_ok(dy, w_nat, uniform_m):
                 return opus_moe_dgrad_uniform_prepared(dy, w_nat, uniform_m, out)
             return opus_moe_dgrad_mfma_prepared(dy, w_nat, seid, bms, bme, out)

@@ -81,7 +81,8 @@ template<typename UserTraits,
          bool RAGGED = false,
          bool COMPACT_TILES = false,
          int FIXED_K = 0,
-         bool TARGET_EXACT = false>
+         bool TARGET_EXACT = false,
+         bool PADDED_GRID = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -117,6 +118,12 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
     if constexpr(COMPACT_TILES)
     {
+        if constexpr(PADDED_GRID)
+        {
+            const int total_tiles_m = kargs.tile_offsets[kargs.batch];
+            if(wgid >= total_tiles_m * num_tiles_n)
+                return;
+        }
         if constexpr(TARGET_EXACT)
         {
             // Prefix sums and one descriptor per 192-row M tile share the
@@ -493,12 +500,28 @@ inline void opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
     const bool target_exact =
-        kargs.compact_tiles == 2 && kargs.batch == 64 &&
+        (kargs.compact_tiles == 2 || kargs.compact_tiles == 4) &&
+        kargs.batch == 64 &&
         kargs.n == 1024 && kargs.k == 2048 &&
         kargs.stride_a == 2048 && kargs.stride_b == 2048 &&
         kargs.stride_act_input == 2048 && kargs.stride_dact == 2048 &&
         kargs.stride_b_batch == 1024 * 2048 && kargs.stride_dscore == 4;
-    if(target_exact)
+    if(target_exact && kargs.compact_tiles == 4)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true, 2048, true, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 4)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true, 0, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 3)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true, 2048, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(target_exact)
         opus_moe_dgrad_swiglu_kernel_gfx950<
             opus_moe_dgrad_swiglu_traits_gfx950,
             true, true, true, true, 2048, true>
@@ -523,12 +546,38 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
     const bool target_exact =
-        kargs.compact_tiles == 2 && kargs.batch == 64 &&
+        (kargs.compact_tiles == 2 || kargs.compact_tiles == 4) &&
+        kargs.batch == 64 &&
         kargs.n == 2048 && kargs.k == 2048 &&
         kargs.stride_a == 2048 && kargs.stride_b == 2048 &&
         kargs.stride_dact == 2048 &&
         kargs.stride_b_batch == 2048 * 2048;
-    if(target_exact)
+    if(target_exact && kargs.compact_tiles == 4)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 2048, true, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 4 && kargs.k == 2048)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 2048, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 4)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 0, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 3 && kargs.k == 2048)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 2048, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.compact_tiles == 3)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 0, false, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(target_exact)
         opus_moe_dgrad_swiglu_kernel_gfx950<
             opus_moe_dgrad_swiglu_traits_gfx950,
             false, false, true, true, 2048, true>

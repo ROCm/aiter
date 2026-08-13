@@ -112,6 +112,67 @@ void opus_moe_dgrad_bf16(aiter_tensor_t& dy,
         N);
 }
 
+// Build the target shape's compact 192-row tile table without bringing the
+// expert offsets back to the host.  One wave owns all 64 experts, so the
+// inclusive scan stays in registers and every packed descriptor has a unique
+// writer.  The fixed-size allocation may contain up to E-1 unused descriptor
+// slots; consumers guard their padded launch grid with metadata[64].
+__global__ __launch_bounds__(64)
+void opus_moe_build_dgrad_meta_i32_kernel(
+    const int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ metadata)
+{
+    const int lane = static_cast<int>(threadIdx.x);
+    const int rows = expert_offsets[lane + 1] - expert_offsets[lane];
+    const int tile_count = (rows + 191) / 192;
+
+    int inclusive = tile_count;
+#pragma unroll
+    for(int delta = 1; delta < 64; delta <<= 1)
+    {
+        const int previous = __shfl_up(inclusive, delta, 64);
+        if(lane >= delta)
+            inclusive += previous;
+    }
+    const int tile_start = inclusive - tile_count;
+
+    if(lane == 0)
+        metadata[0] = 0;
+    metadata[lane + 1] = inclusive;
+    for(int local_tile = 0; local_tile < tile_count; ++local_tile)
+    {
+        metadata[65 + tile_start + local_tile] =
+            lane | (local_tile << 8) | (tile_count << 19);
+    }
+}
+
+void opus_moe_build_dgrad_meta_i32(aiter_tensor_t& expert_offsets,
+                                   aiter_tensor_t& tile_metadata)
+{
+    constexpr int kExperts = 64;
+    constexpr int kRoutes = 32768 * 8;
+    constexpr int kMaxTiles = (kRoutes + 191) / 192 + kExperts - 1;
+    AITER_CHECK(expert_offsets.dim() == 1 &&
+                    static_cast<int>(expert_offsets.size(0)) == kExperts + 1,
+                "expert_offsets must have shape [65]");
+    AITER_CHECK(tile_metadata.dim() == 1 &&
+                    static_cast<int>(tile_metadata.size(0)) ==
+                        kExperts + 1 + kMaxTiles,
+                "tile_metadata must have shape [1494]");
+    AITER_CHECK(expert_offsets.dtype() == AITER_DTYPE_i32 &&
+                    tile_metadata.dtype() == AITER_DTYPE_i32,
+                "expert_offsets and tile_metadata must be int32");
+    AITER_CHECK(expert_offsets.is_contiguous() && tile_metadata.is_contiguous(),
+                "expert_offsets and tile_metadata must be contiguous");
+    AITER_CHECK(expert_offsets.device_id == tile_metadata.device_id,
+                "expert_offsets and tile_metadata must be on the same device");
+
+    opus_moe_build_dgrad_meta_i32_kernel<<<
+        1, 64, 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const int32_t*>(expert_offsets.data_ptr()),
+        reinterpret_cast<int32_t*>(tile_metadata.data_ptr()));
+}
+
 // Fused opus-MFMA grouped dgrad (BF16). COMPACT (unpadded) layout: dy/dh stay
 // expert-grouped compact [M,*]; the per-block tables map each B_M tile to its
 // expert + compact row range (built cheaply from offs, no operand padding).
@@ -290,8 +351,14 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     k.stride_b_batch = static_cast<int>(w.stride(0));
     k.stride_dscore = static_cast<int>(dscore_partials.stride(0));
     k.ragged = 1;
-    k.compact_tiles =
-        static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles ? 2 : 1;
+    const bool padded_target_grid =
+        E == 64 && M == 32768 * 8 &&
+        num_tiles == (M + 191) / 192 + E - 1;
+    const int metadata_size = static_cast<int>(tile_offsets.size(0));
+    const bool packed_tiles = metadata_size == E + 1 + num_tiles;
+    k.compact_tiles = padded_target_grid
+        ? (packed_tiles ? 4 : 3)
+        : (packed_tiles ? 2 : 1);
     k.num_tiles = num_tiles;
     opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());
@@ -341,8 +408,14 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
     k.stride_dact = static_cast<int>(out.stride(0));
     k.stride_b_batch = static_cast<int>(w.stride(0));
     k.ragged = 1;
-    k.compact_tiles =
-        static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles ? 2 : 1;
+    const bool padded_target_grid =
+        E == 64 && M == 32768 * 8 &&
+        num_tiles == (M + 191) / 192 + E - 1;
+    const int metadata_size = static_cast<int>(tile_offsets.size(0));
+    const bool packed_tiles = metadata_size == E + 1 + num_tiles;
+    k.compact_tiles = padded_target_grid
+        ? (packed_tiles ? 4 : 3)
+        : (packed_tiles ? 2 : 1);
     k.num_tiles = num_tiles;
     opus_moe_dgrad_plain_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());

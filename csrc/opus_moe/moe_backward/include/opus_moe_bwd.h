@@ -51,6 +51,11 @@ void opus_moe_dgrad_swiglu_dscore_bf16(aiter_tensor_t& dy,
                                        aiter_tensor_t& dscore_partials,
                                        int uniform_m);
 
+// Build target-shape compact 192-row dgrad tile metadata entirely on GPU.
+// tile_metadata stores E+1 prefix sums followed by packed tile descriptors.
+void opus_moe_build_dgrad_meta_i32(aiter_tensor_t& expert_offsets,
+                                   aiter_tensor_t& tile_metadata);
+
 // Ragged compact-route variant of the fused stage-2 dgrad/SwiGLU/dscore path.
 // expert_offsets [E+1] delimit operand rows; tile_offsets [E+1] delimit each
 // expert's compact 192-row tile interval and num_tiles is its final value.
