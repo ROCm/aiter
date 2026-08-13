@@ -27,8 +27,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -66,9 +64,6 @@ __launch_bounds__(TPB) __global__
                     const int num_cols,
                     const int input_row_stride)
 {
-    using BlockReduce = hipcub::BlockReduce<float, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
-
     __shared__ float normalizing_factor;
     __shared__ float float_max;
 
@@ -77,7 +72,7 @@ __launch_bounds__(TPB) __global__
     const int thread_row_offset = blockIdx.x * input_row_stride;
     const int output_row_offset = blockIdx.x * num_cols;
 
-    hipcub::Sum sum;
+    aiter::Sum sum;
     float threadData(-FLT_MAX);
 
     // Don't touch finished rows.
@@ -92,7 +87,7 @@ __launch_bounds__(TPB) __global__
         threadData    = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
+    const float maxElem = block_reduce<float, aiter::Max, TPB, true>(threadData, aiter::Max());
     if(threadIdx.x == 0)
     {
         float_max = maxElem;
@@ -107,7 +102,7 @@ __launch_bounds__(TPB) __global__
         threadData += exp((static_cast<float>(input[idx]) - float_max));
     }
 
-    const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
+    const auto Z = block_reduce<float, aiter::Sum, TPB, true>(threadData, sum);
 
     if(threadIdx.x == 0)
     {
@@ -139,12 +134,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const bool need_renorm)
 {
 
-    using cub_kvp     = hipcub::KeyValuePair<int, float>;
-    using BlockReduce = hipcub::BlockReduce<cub_kvp, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
+    using cub_kvp = aiter::KeyValuePair<int, float>;
 
     cub_kvp thread_kvp;
-    hipcub::ArgMax arg_max;
+    aiter::ArgMax arg_max;
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
@@ -177,7 +170,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             thread_kvp = arg_max(inp_kvp, thread_kvp);
         }
 
-        const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        // The __syncthreads() at the end of this loop body also separates
+        // consecutive block_reduce rounds, which share one smem staging buffer.
+        const cub_kvp result_kvp = block_reduce<cub_kvp, aiter::ArgMax, TPB, true>(thread_kvp, arg_max);
         if(threadIdx.x == 0)
         {
             // Ignore experts the node isn't responsible for with expert parallelism
@@ -318,9 +313,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     // here to avoid the dependency on CUTLASS.
     using AccessType = opus::vector_t<DTYPE, ELTS_PER_LDG>;
     using ChunkType  = opus::vector_t<float, ELTS_PER_LDG>;
-    using kvp        = hipcub::KeyValuePair<int, float>;
-    // hipcub::ArgMax arg_max;
-    // hipcub::ArgMin arg_min;
+    using kvp        = aiter::KeyValuePair<int, float>;
 
     // Finally, we pull in the data from global mem
     float row_chunk[VPT];

@@ -2582,18 +2582,28 @@ def compile_mixed_moe_gemm1_common(
                         quant_scale = (quant_exp << c23_i32).bitcast(T.f32)
 
                         if const_expr(need_fp4):
-                            fp4_vals = []
-                            for i in range_constexpr(e_vec):
-                                scaled_v = frag_vals[i] * quant_scale
-                                fp4_vals.append(f32_to_e2m1(scaled_v))
-
-                            packed_i32 = fp4_vals[0] | (fp4_vals[1] << c4_i32)
-                            for k in range_constexpr(1, e_vec // 2):
-                                byte_k = fp4_vals[2 * k] | (
-                                    fp4_vals[2 * k + 1] << c4_i32
+                            packed_i32 = c0_i32
+                            native_scale = (e8m0_biased << c23_i32).bitcast(T.f32)
+                            native_scale_raw = (
+                                native_scale._value
+                                if hasattr(native_scale, "_value")
+                                else native_scale
+                            )
+                            for k in range_constexpr(e_vec // 2):
+                                old_raw = (
+                                    packed_i32._value
+                                    if hasattr(packed_i32, "_value")
+                                    else packed_i32
                                 )
-                                packed_i32 = packed_i32 | (
-                                    byte_k << arith.constant(k * 8, type=T.i32)
+                                src0 = frag_vals[2 * k]
+                                src1 = frag_vals[2 * k + 1]
+                                packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
+                                    T.i32,
+                                    old_raw,
+                                    (src0._value if hasattr(src0, "_value") else src0),
+                                    (src1._value if hasattr(src1, "_value") else src1),
+                                    native_scale_raw,
+                                    k,
                                 )
 
                             ptr_addr_idx = row_byte_base + col_g0 // arith.constant(
