@@ -456,10 +456,7 @@ def test_persistent_lean_attention_outer(
 ):
     torch.manual_seed(20)
 
-    config = _get_config(
-        batch_size=batch,
-        causal=causal,
-    )
+    config = _get_config()
     sm_count = arch_info.get_num_sms()
 
     # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue

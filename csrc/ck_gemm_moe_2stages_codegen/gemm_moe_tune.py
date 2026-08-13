@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 import sys
 import tempfile
@@ -45,9 +46,14 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
-    _parse_mxfp4_g2_kname,
+    parse_g2_kname_any,
 )
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.ops.shuffle import (
@@ -80,6 +86,19 @@ if is_flydsl_available():
             get_flydsl_stage1_kernels_int4_bf16,
             get_flydsl_stage2_kernels,
             get_flydsl_stage2_kernels_int4_bf16,
+            get_flydsl_stage2_v2_kernels,
+        )
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+            build_v2_inputs as _v2_build_inputs,
+        )
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+            gen as _v2_gen,
+        )
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+            populate_v2_intermediate_from_ref as _v2_populate_stage2,
+        )
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+            v2_stage1_sorted_ref as _v2_stage1_ref,
         )
     except ImportError:
 
@@ -100,12 +119,25 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
-# SiTUv2 params (Kimi-K3 config.json), passed to BOTH the torch reference and
-# the kernel launch -- they used to fall back to their own differing defaults
-# ((2.0, 1.5) vs (1.0, 1.0)), which scored every SiTUv2 stage1 candidate at
-# ~35% err and failed them all against --errRatio.
-_TUNER_SITU_BETA = 4.0
-_TUNER_SITU_LINEAR_BETA = 25.0
+
+def _a16w_sorted_cos(ref, res, msg="", printLog=True):
+    """compare_fn for a16w-mix stage1/stage2 in SORTED layout: ref is the sorted bf16
+    reference ([max_sorted, inter], padding rows all-zero), res the kernel's sorted
+    output. Cosine-diff over the valid (non-zero-ref) rows only. Same semantics as
+    cosine_diff_compare (0 == exact); avoids the gather/re-sort that would otherwise
+    pollute the kernel's tuned latency.
+    """
+    n = ref.shape[0]
+    valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+    if valid.numel() == 0:
+        return 1.0
+    x = ref[valid].double().flatten()
+    y = res[:n][valid].double().flatten()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    if printLog:
+        tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
+        print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
+    return cos_diff
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -181,6 +213,37 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
     # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
     return cos_diff
+
+
+def _token_major_to_sorted_routes(
+    values, sorted_ids, num_valid_ids, token_num, *, mark_padding=False
+):
+    """Gather [token, topk, K] values into the padded sorted-route row ABI."""
+    packed = sorted_ids.to(torch.int64)
+    token = packed & 0x00FFFFFF
+    slot = (packed >> 24) & 0xFF
+    valid = (
+        (torch.arange(sorted_ids.numel(), device=sorted_ids.device) < num_valid_ids[0])
+        & (token < int(token_num))
+        & (slot < int(values.shape[1]))
+    )
+    out = torch.empty(
+        (sorted_ids.numel(), values.shape[-1]), dtype=values.dtype, device=values.device
+    )
+    if mark_padding:
+        out.fill_(float("nan"))
+    else:
+        out.zero_()
+    out[valid] = values[token[valid], slot[valid]]
+    return out
+
+
+def sorted_stage1_cosine_diff_compare(ref, res, msg="", printLog=True):
+    # Padding rows are intentionally not written by Stage1. The reference keeps
+    # them NaN, so compare only rows containing a real route. A real route that
+    # quantizes to all zeros remains valid and is still checked.
+    valid = ~torch.isnan(ref.float()).all(dim=-1)
+    return cosine_diff_compare(ref[valid], res[valid], msg=msg, printLog=printLog)
 
 
 def tensor_compare_diagnostics(
@@ -647,11 +710,6 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = (
-            "swiglu"
-            if act_type == ActivationType.Swiglu
-            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
-        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -669,9 +727,9 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=_out_dtype,
-            act=act,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            act=get_flydsl_activation_name(act_type),
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
@@ -694,6 +752,9 @@ class FmoeTuner(TunerCommon):
             else:
                 # fuse_fp8: out_raw is fp8 tensor, shape (token_num, topk, inter_dim)
                 return out_raw.reshape(token_num, topk, -1)
+        # a16w-mix (bf16/fp16 activation) returns the SORTED [sorted_size, inter] bf16
+        # intermediate as-is (kernel-only, so the tuned latency is clean); it is
+        # compared in sorted space against run_a16w_stage1_sorted_ref.
         return result
 
     @staticmethod
@@ -709,6 +770,8 @@ class FmoeTuner(TunerCommon):
         topk,
         kparams,
         blockM,
+        act_type,
+        output_sorted=False,
     ):
         from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
@@ -723,8 +786,10 @@ class FmoeTuner(TunerCommon):
             topk=topk,
             block_m=blockM,
             kernelName=str(kparams["kernelName"]),
+            activation=act_type,
             inter_dim_pad=0,
             bias=bias,
+            output_sorted=output_sorted,
         )
         return out
 
@@ -752,6 +817,13 @@ class FmoeTuner(TunerCommon):
 
         sort_block_m = kparams.get("sort_block_m", 0)
         persist = kparams.get("persist", None)
+
+        # a16w-mix (bf16 activation) stage2 consumes a SORTED bf16 intermediate; the
+        # tuner feeds the pre-sorted a2 ("a2_a16w_sorted", built once in generate_data,
+        # not per timed iter) and no inter-stage act scale.
+        if kparams["a_dtype"] == "bf16":
+            a2_scale = None
+
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled_flydsl,
@@ -775,6 +847,293 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+        )
+
+    @staticmethod
+    def generate_v2_stage1_data(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        blockM,
+        adtype,
+        act_type,
+        device="cuda",
+    ):
+        # Build the SAME inputs the runtime v2 gemm1 path consumes:
+        # aiter/fused_moe.py:_flydsl_stage1_wrapper -> flydsl_moe_stage1(
+        #   a=a1_qt, w1=w1_qt_shuf, w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
+        #   v2_output_layout=True, ...). Recipe mirrors
+        # mxfp4_v2_tune_utils.populate_baseline_v2_intermediate.
+        d = _v2_gen(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            blockM,
+            adtype=adtype,
+            activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        )
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        # Precompute the sorted A-scale here so it is NOT timed in the run func.
+        a1_scale_sort = moe_mxfp4_sort(
+            d["a1_scale"][:token, :].view(token, 1, -1),
+            sorted_ids=v["sti"],
+            num_valid_ids=v["cumsum"],
+            token_num=token,
+            block_size=blockM,
+        )
+        # Match the normal FlyDSL _fp8 tune variant: a_scale_one=True expects
+        # an unscaled bf16 -> fp8 cast, not a per-1x32 quantized activation.
+        a1_qt_fp8_cast = d["inp"].to(dtypes.fp8) if adtype == "fp8" else None
+        return {
+            "a1_qt": d["a1_qt"],
+            "a1_qt_fp8_cast": a1_qt_fp8_cast,
+            "w1_shuf": d["base"]["w1_qt_shuf"],
+            "w1_scale_shuf": d["base"]["w1_scale_shuf"],
+            "a1_scale_sort": a1_scale_sort,
+            "sti": v["sti"],
+            "sei": v["sei"],
+            "cumsum": v["cumsum"],
+            "isq": v["isq"],
+            "n": v["n"],
+            "ref1": d["ref1"],
+            "topk_ids": d["topk_ids"],
+        }
+
+    @staticmethod
+    def run_flydsl_v2_stage1_out(
+        a1_qt,
+        w1_shuf,
+        w1_scale_shuf,
+        a1_scale_sort,
+        sti,
+        sei,
+        cumsum,
+        isq,
+        n,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        blockM,
+        adtype,
+        act_type,
+        kparams,
+    ):
+        # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
+        # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
+        out, _scale = flydsl_moe_stage1(
+            a=a1_qt,
+            w1=w1_shuf,
+            out=isq,
+            sorted_token_ids=sti,
+            sorted_expert_ids=sei,
+            num_valid_ids=cumsum,
+            topk=topk,
+            tile_m=kparams["tile_m"],
+            tile_n=kparams["tile_n"],
+            tile_k=kparams["tile_k"],
+            a_dtype=kparams["a_dtype"],
+            b_dtype=kparams["b_dtype"],
+            out_dtype=kparams["out_dtype"],
+            act=get_flydsl_activation_name(act_type),
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            w1_scale=w1_scale_shuf,
+            a1_scale=a1_scale_sort,
+            sorted_weights=None,
+            use_async_copy=True,
+            k_batch=1,
+            waves_per_eu=kparams.get("waves_per_eu", 3),
+            b_nt=kparams.get("b_nt", 2),
+            gate_mode=kparams.get("gate_mode", "separated"),
+            a_scale_one=kparams.get("a_scale_one", False),
+            xcd_swizzle=kparams.get("xcd_swizzle", 0),
+            k_wave=kparams.get("k_wave", 1),
+            v2_output_layout=True,
+        )
+        return out.view(torch.uint8).view_as(isq)
+
+    @staticmethod
+    def generate_v2_stage2_data(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        blockM,
+        adtype,
+        act_type,
+        device="cuda",
+    ):
+        d = _v2_gen(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            blockM,
+            adtype=adtype,
+            activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        )
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        _v2_populate_stage2(d, v, token, topk, blockM)
+        return {
+            "isq": v["isq"],
+            "iss": v["iss"],
+            "w2u8": v["w2u8"],
+            "w2sc": v["w2sc"],
+            "sei": v["sei"],
+            "cumsum": v["cumsum"],
+            "sti": v["sti"],
+            "swt": v["swt"],
+            "n": v["n"],
+            "max_sorted": v["max_sorted"],
+            "ref2": d["ref2"],
+        }
+
+    @staticmethod
+    def run_flydsl_v2_stage2_out(
+        isq,
+        iss,
+        w2u8,
+        w2sc,
+        sei,
+        cumsum,
+        sti,
+        swt,
+        n,
+        max_sorted,
+        ref2,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        kparams,
+    ):
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+        token = ref2.shape[0]
+        epilog = kparams["epilog"]
+        bm_s2 = kparams["tile_m"]
+        sbm = kparams["sort_block_m"]
+        out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
+        inter = (
+            torch.empty((token, topk, model_dim), dtype=dtypes.bf16, device=isq.device)
+            if epilog == "reduce"
+            else None
+        )
+        gemm2_out = inter if epilog == "reduce" else out
+        if epilog != "reduce":
+            out.zero_()
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=isq,
+            inter_sorted_shuffled_scale=iss,
+            w2_u8=w2u8,
+            w2_scale_u8=w2sc,
+            sorted_expert_ids=sei,
+            cumsum_tensor=cumsum,
+            sorted_token_ids=sti,
+            sorted_weights=swt,
+            out=gemm2_out,
+            M_logical=token,
+            max_sorted=max_sorted,
+            NE=expert,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            BM=bm_s2,
+            BN=kparams["tile_n"],
+            BK=kparams["tile_k"],
+            use_nt=kparams["use_nt"],
+            a_dtype=kparams["a_dtype"],
+            epilog=epilog,
+            SBM=sbm,
+            persist=kparams["persist"],
+            n_sorted_padded=n,
+            model_dim_pad=0,
+            inter_dim_pad=0,
+        )
+        if epilog == "reduce":
+            from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+            _run_moe_reduction(inter, out, token, topk, model_dim)
+        return out
+
+    @staticmethod
+    def run_v2_stage2_ref(ref2):
+        return ref2
+
+    @staticmethod
+    def run_v2_stage1_sorted_ref(ref1, topk_ids, sti, sei, n, token, inter_dim, bm_s1):
+        return _v2_stage1_ref(
+            ref1,
+            topk_ids,
+            sti,
+            sei,
+            n,
+            token=token,
+            inter_dim=inter_dim,
+            bm_s1=bm_s1,
+            max_sorted=sti.numel(),
+        )
+
+    @staticmethod
+    def run_a16w_stage1_sorted_ref(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        dtype,
+        act_type,
+        quant_type,
+        doweight_stage1,
+        topk,
+        blockM,
+        inter_dim,
+    ):
+        """a16w-mix stage1 reference in SORTED [max_sorted, inter] bf16 layout, to
+        compare against the kernel's sorted output directly (so run_flydsl_stage1_out
+        stays kernel-only and its timing isn't polluted by a re-sort). Computes the
+        unsorted torch ref then gathers it to sorted order via the expert-match rule.
+        """
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            a1_scale=None,
+            w1_scale=w1_scale,
+            dtype=dtype,
+            activation=act_type,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            topk=topk,
+        )
+        n = int(num_valid_ids.reshape(-1)[0].item())
+        return _v2_stage1_ref(
+            ref1.view(a1_qt.shape[0], topk, inter_dim),
+            topk_ids,
+            sorted_ids,
+            sorted_expert_ids,
+            n,
+            token=a1_qt.shape[0],
+            inter_dim=inter_dim,
+            bm_s1=blockM,
+            max_sorted=sorted_ids.numel(),
         )
 
     @staticmethod
@@ -815,6 +1174,7 @@ class FmoeTuner(TunerCommon):
             )
         kid = kparams["kid"]
         reduce_block_n = kparams.get("reduce_block_n")
+        route_shape = {"token_num": int(moe_buf.shape[0]), "topk": int(topk)}
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
@@ -834,6 +1194,7 @@ class FmoeTuner(TunerCommon):
                 kernel_id=kid,
                 inter_dim_pad=0,
                 return_per_slot=True,
+                **route_shape,
             )
             if route_out.dtype == torch.uint8:  # MXFP8 route_out
                 return opus_moe_stage2_reduce_token_slot_route_output_fwd(
@@ -859,6 +1220,7 @@ class FmoeTuner(TunerCommon):
             block_m=blockM,
             kernel_id=kid,
             inter_dim_pad=0,
+            **route_shape,
         )
 
     @staticmethod
@@ -1337,10 +1699,10 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a in (dtypes.bf16, dtypes.fp16):
-            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): same wfp4 weight layout
-            # as a8w4 but separated gate (gate_up=False) and w2 scale via plain
-            # e8m0_shuffle (no act-scale interleave). Mirrors the reference
-            # op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py data prep.
+            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): standard GGUU (separated
+            # gate/up) W1 layout, matching main (moe_kernels a16w4 dispatch uses
+            # w_layout="standard"). w2 has no gate/up (gate_up=False), scale via
+            # plain e8m0_shuffle.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, False)
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, False)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
@@ -1349,17 +1711,26 @@ class FmoeTuner(TunerCommon):
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-            # a16wi4 int4 FlyDSL path: pack int8 -> int4, shuffle scales
-            E1 = w1_qt.shape[0]
-            N1, K1 = w1_qt.shape[1], w1_qt.shape[2]
-            w1_qt_shffle_flydsl = pack_int8_to_packed_int4(
-                shuffle_weight(w1_qt, (16, 16))
-            ).view(E1, N1, K1 // 2)
-            E2 = w2_qt.shape[0]
-            N2, K2 = w2_qt.shape[1], w2_qt.shape[2]
-            w2_qt_shffle_flydsl = pack_int8_to_packed_int4(
-                shuffle_weight(w2_qt, (16, 16))
-            ).view(E2, N2, K2 // 2)
+            # a16wi4 consumes the OLD FlyDSL int4 kernel's preshuffle:
+            # pack_int8_to_packed_int4(shuffle_weight(w.i8, (16,16))) kpack=8 +
+            # shuffle_scale_for_int4 (E,G//2,N,2). Byte-identical caller contract to the
+            # replaced kernel -- MUST match op_tests/test_moe_2stage.py / production.
+            E1, N1, K1 = w1_qt.shape
+            E2, N2, K2 = w2_qt.shape
+            w1_qt_shffle_flydsl = (
+                pack_int8_to_packed_int4(
+                    shuffle_weight(w1_qt.view(dtypes.i8), (16, 16))
+                )
+                .view(E1, N1, K1 // 2)
+                .view(dtypes.i4x2)
+            )
+            w2_qt_shffle_flydsl = (
+                pack_int8_to_packed_int4(
+                    shuffle_weight(w2_qt.view(dtypes.i8), (16, 16))
+                )
+                .view(E2, N2, K2 // 2)
+                .view(dtypes.i4x2)
+            )
             w1_scale_flydsl = (
                 shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
             )
@@ -1488,13 +1859,9 @@ class FmoeTuner(TunerCommon):
             )
             # ref1 is always bf16
             ref1_bf16 = ref1
+            a2_a16w_sorted = None  # a16w-mix stage2 pre-sorted input (set below)
 
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                # a16wi4: bf16 passthrough, no inter-stage quant
-                a2_qt = ref1
-                a2_scale = None
-                a2_scale_mxfp4_sort = None
-            elif q_type == QuantType.per_1x128:
+            if q_type == QuantType.per_1x128:
                 ref1, ref_scale = aiter.pertoken_quant(
                     ref1.view(ref1.shape[0], -1, 128), quant_dtype=q_dtype_a
                 )
@@ -1516,13 +1883,31 @@ class FmoeTuner(TunerCommon):
             elif (
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
-                and q_dtype_w == dtypes.fp4x2
+                and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
             ):
-                # a16w4 mxfp4: the abf16 stage2 consumes the bf16 intermediate
-                # directly -- no inter-stage activation quant (a2_scale=None).
+                # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
+                # bf16 intermediate directly -- no inter-stage activation quant
+                # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
+                # layout; build that once here (untimed) so run_flydsl_stage2_out stays
+                # kernel-only. Without this a16wi4 falls through to the generic
+                # per_1x32 torch_quant below, which hands stage2 a packed
+                # [token, topk, inter/32] tensor -- every candidate then dies on
+                # "requires D_INTER (K) % 64 == 0, got D_INTER=8" and stage2 is
+                # effectively untuned.
                 a2_qt = ref1
                 a2_scale = None
                 a2_scale_mxfp4_sort = None
+                a2_a16w_sorted = _v2_stage1_ref(
+                    ref1.view(token, topk, inter_dim),
+                    topk_ids,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    int(num_valid_ids.reshape(-1)[0].item()),
+                    token=token,
+                    inter_dim=inter_dim,
+                    bm_s1=blockM,
+                    max_sorted=sorted_ids.numel(),
+                )
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
                 # FlyDSL stage2 receives fp8 input
                 a2_qt = ref1.to(dtypes.fp8)
@@ -1572,6 +1957,7 @@ class FmoeTuner(TunerCommon):
                 "topk_weights": topk_weights,
                 "topk_ids": topk_ids,
                 "a2_scale_mxfp4_sort": a2_scale_mxfp4_sort,
+                "a2_a16w_sorted": a2_a16w_sorted,
                 "w2_scale_aiter": w2_scale_aiter,
                 "w1_qt_shffle_flydsl": w1_qt_shffle_flydsl,
                 "w2_qt_shffle_flydsl": w2_qt_shffle_flydsl,
@@ -1594,6 +1980,17 @@ class FmoeTuner(TunerCommon):
                     else None
                 ),
             }
+
+    @staticmethod
+    def generate_opus_sorted_stage2_data(*args, **kwargs):
+        data = FmoeTuner.generate_data_2stages(*args, **kwargs)
+        data["a2_qt_sorted"] = _token_major_to_sorted_routes(
+            data["a2_qt"],
+            data["sorted_ids"],
+            data["num_valid_ids"],
+            data["moe_buf"].shape[0],
+        )
+        return data
 
     @staticmethod
     def generate_data_1stage(
@@ -1708,6 +2105,9 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1731,8 +2131,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -1746,8 +2146,11 @@ class FmoeTuner(TunerCommon):
                 ref1.reshape(-1, inter_dim)
             )
             a2 = a2_fp8_bytes.view(dtypes.fp8).view(token_num, topk, inter_dim)
+            if output_sorted:
+                a2 = _token_major_to_sorted_routes(
+                    a2, sorted_ids, num_valid_ids, token_num, mark_padding=True
+                )
             return a2
-
         if quant_type == QuantType.per_1x128:
             ref1, _ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
@@ -2011,8 +2414,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
@@ -2619,6 +3022,16 @@ class FmoeTuner(TunerCommon):
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
+        # CK gemm1 codegen has no b16 x fp4x2 combo (get_gemm1_kernels_list
+        # raises "Unsupported data type combination: b16, fp4x2"); a16w4
+        # (bf16 activation x mxfp4 weight) is FlyDSL-only -> skip CK.
+        if (
+            q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and q_dtype_a == dtypes.bf16
+        ):
+            return tasks_ck
+
         # CK2stages codegen does not support SwiGLU activation. GPT-OSS MXFP4
         # cases are covered by FlyDSL (or the a8w4 CK-Tile path above).
         if (
@@ -3048,6 +3461,16 @@ class FmoeTuner(TunerCommon):
                 ):
                     continue
 
+                # a16w-mix gemm1 splits TILE_N across (4//k_wave) N-waves, each
+                # accumulating (TILE_N//n_waves)//16 MFMA n-tiles. When that is 0
+                # (e.g. tile_n=32 with k_wave=1) the epilogue writes nothing ->
+                # NaN/garbage output that times fast but is wrong; the tuner would
+                # otherwise pick it. Require num_acc_n >= 1 for a16w4.
+                if a_dtype_str == "bf16":
+                    _n_waves = max(1, 4 // _kw)
+                    if (kparams["tile_n"] // _n_waves) < 16:
+                        continue
+
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
                 #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations -> out_dtype="fp8"
@@ -3120,6 +3543,32 @@ class FmoeTuner(TunerCommon):
                         ref_args_extra = ref_args_extra + (False, True)
                     s1_ref_func = FmoeTuner.run_torch_moe_stage1
                     s1_ref_args = ref_args_extra
+                    if a_dtype_str == "bf16":
+                        # a16w-mix: kernel returns SORTED output; compare against a
+                        # SORTED torch ref (sorting done here in the untimed ref, not
+                        # in run_flydsl_stage1_out) so the tuned latency is kernel-only.
+                        s1_ref_func = FmoeTuner.run_a16w_stage1_sorted_ref
+                        s1_ref_args = (
+                            [
+                                "a1_qt",
+                                "w1_qt",
+                                "w2_qt",
+                                "topk_weights",
+                                "topk_ids",
+                                "w1_scale",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "num_valid_ids",
+                            ],
+                            dtype,
+                            act_type,
+                            q_type,
+                            doweight_stage1,
+                            topk,
+                            blockM,
+                            inter_dim,
+                        )
+                        s1_compare_fn = _a16w_sorted_cos
                     s1_ref_kwargs = {}
                     s1_ref = None
 
@@ -3182,6 +3631,19 @@ class FmoeTuner(TunerCommon):
                     continue
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
                 if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                    continue
+                # Skip a16w-mix stage2 candidates the port can't run correctly:
+                #  - _sbm (tile_m<blockM) re-tiles the SORTED [sorted_size, inter]
+                #    stream finer than the moe_sorting padding -> queue fault;
+                #  - tile_n=256 over-allocates LDS at large tile_m (compile failure
+                #    that takes the worker pool down); tile_n=128 covers the shape;
+                #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
+                #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
+                if a_dtype_str == "bf16" and (
+                    s2_tile_m != blockM
+                    or kparams["tile_n"] == 256
+                    or inter_dim % kparams["tile_k"] != 0
+                ):
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
@@ -3246,7 +3708,11 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                "a2_qt",
+                                (
+                                    "a2_a16w_sorted"
+                                    if a_dtype_str == "bf16"
+                                    else "a2_qt"
+                                ),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -3276,6 +3742,181 @@ class FmoeTuner(TunerCommon):
                 )
 
         return tasks_flydsl
+
+    def gen_flydsl_v2_2stages_task(self, info, blockMs):
+        tasks = []
+        if not is_flydsl_available():
+            return tasks
+        (
+            _gfx,
+            _cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            _dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            _doweight_stage1,
+        ) = info
+        # gate: per_1x32, fp4 weight + fp4/fp8 activation (fused), use_g1u1 (design 4.3)
+        if q_type != QuantType.per_1x32 or not use_g1u1:
+            return tasks
+        if q_dtype_w != dtypes.fp4x2:
+            return tasks
+        adtype = (
+            "fp4"
+            if q_dtype_a == dtypes.fp4x2
+            else ("fp8" if q_dtype_a == dtypes.fp8 else None)
+        )
+        if adtype is None:
+            return tasks
+
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
+
+        # v2 always fuses quant; dtype is bf16 out layout at the flydsl kernel level.
+        out_dtype_str = "bf16"
+        s1_kernels = get_flydsl_stage1_kernels(adtype, "fp4", out_dtype_str)
+
+        for blockM in blockMs:
+            if blockM not in (32, 64, 128):
+                continue
+            # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
+            # Mirror gen_flydsl_2stages_task's fused-variant construction so
+            # label == timed config == runtime config (kname1 encodes
+            # tile_n/waves/b_nt/gate_mode/xcd_swizzle/k_wave). v2 requires
+            # non-splitk (k_batch==1: _v2_output_layout = _fuse_any_quant and
+            # not _is_splitk, moe_kernels.py:1179) and tile_m == blockM.
+            s1_compare = functools.partial(
+                v2_stage1_dequant_cosine_err, inter_dim=inter_dim, adtype=adtype
+            )
+            for kname, kparams in s1_kernels.items():
+                if kparams.get("tile_m") != blockM:
+                    continue
+                if kparams.get("k_batch", 1) != 1:
+                    continue
+                # Only the FUSED variant (v2 always fuses quant). Fused name and
+                # params exactly as gen_flydsl_2stages_task builds them.
+                if adtype == "fp8":
+                    s1_name = kname + "_fp8"
+                    s1_params = {
+                        **kparams,
+                        "out_dtype": "fp8",
+                        "a_scale_one": True,
+                        "gate_mode": "interleave",
+                    }
+                else:
+                    s1_name = kname + "_fp4"
+                    s1_params = {**kparams, "out_dtype": "fp4"}
+                a1_key = "a1_qt_fp8_cast" if adtype == "fp8" else "a1_qt"
+                # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
+                tasks.append(
+                    (
+                        (info, "stage1", s1_name, blockM, 0, 1),
+                        FmoeTuner.generate_v2_stage1_data,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            blockM,
+                            adtype,
+                            act_type,
+                        ),
+                        FmoeTuner.run_flydsl_v2_stage1_out,
+                        (
+                            [
+                                a1_key,
+                                "w1_shuf",
+                                "w1_scale_shuf",
+                                "a1_scale_sort",
+                                "sti",
+                                "sei",
+                                "cumsum",
+                                "isq",
+                                "n",
+                            ],
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            blockM,
+                            adtype,
+                            act_type,
+                            s1_params,
+                        ),
+                        {},
+                        FmoeTuner.run_v2_stage1_sorted_ref,
+                        (
+                            ["ref1", "topk_ids", "sti", "sei", "n"],
+                            token,
+                            inter_dim,
+                            blockM,
+                        ),
+                        {},
+                        None,
+                        0.1,
+                        0.1,
+                        s1_compare,
+                    )
+                )
+            # ---- v2 stage2 tasks ----
+            for kn2, kp in get_flydsl_stage2_v2_kernels(
+                adtype, "fp4", "bf16", blockM, model_dim=model_dim, inter_dim=inter_dim
+            ).items():
+                kp = {**kp, "a_dtype": adtype}
+                # flat=0, v2=1
+                tasks.append(
+                    (
+                        (info, "stage2", kn2, blockM, 0, 1),
+                        FmoeTuner.generate_v2_stage2_data,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            blockM,
+                            adtype,
+                            act_type,
+                        ),
+                        FmoeTuner.run_flydsl_v2_stage2_out,
+                        (
+                            [
+                                "isq",
+                                "iss",
+                                "w2u8",
+                                "w2sc",
+                                "sei",
+                                "cumsum",
+                                "sti",
+                                "swt",
+                                "n",
+                                "max_sorted",
+                                "ref2",
+                            ],
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            kp,
+                        ),
+                        {},
+                        FmoeTuner.run_v2_stage2_ref,
+                        (["ref2"],),
+                        {},
+                        None,
+                        0.1,
+                        0.1,
+                        cosine_diff_compare,
+                    )
+                )
+        return tasks
 
     def gen_opus_2stages_task(
         self,
@@ -3327,24 +3968,18 @@ class FmoeTuner(TunerCommon):
         ):
             return tasks_opus
 
-        stage1_activation = {
-            ActivationType.Silu: "silu",
-            ActivationType.Swiglu: "swiglu",
-        }.get(act_type)
-
-        stage1_insts = (
-            opus_a8w4_stage1_instances_for_shape(
-                model_dim=model_dim,
-                logical_inter_dim=inter_dim,
-                inter_dim_pad=0,
-                activation=stage1_activation,
-            )
-            if stage1_activation is not None
-            else ()
+        stage1_insts = opus_a8w4_stage1_instances_for_shape(
+            model_dim=model_dim,
+            logical_inter_dim=inter_dim,
+            inter_dim_pad=0,
         )
 
         stage1_supported = (
-            dtype == dtypes.bf16 and not doweight_stage1 and bool(stage1_insts)
+            dtype == dtypes.bf16
+            and act_type
+            in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+            and not doweight_stage1
+            and bool(stage1_insts)
         )
 
         s1_ref_args = (
@@ -3399,6 +4034,7 @@ class FmoeTuner(TunerCommon):
             "moe_buf",
             "bias",
         ]
+        sorted_run_keys = ["a2_qt_sorted", *run_keys[1:]]
 
         for blockM in blockMs:
             if blockM not in (16, 32, 64, 128):
@@ -3446,6 +4082,7 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 s1_params,
                                 blockM,
+                                act_type,
                             ),
                             {},
                             FmoeTuner.run_torch_moe_stage1,
@@ -3455,6 +4092,55 @@ class FmoeTuner(TunerCommon):
                             0.01,
                             0.01,
                             cosine_diff_compare,
+                        )
+                    )
+                    tasks_opus.append(
+                        (
+                            (info, "stage1", inst.profile_name, blockM, 0, 1),
+                            FmoeTuner.generate_data_2stages,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                act_type,
+                                dtype,
+                                q_dtype_a,
+                                q_dtype_w,
+                                q_type,
+                                use_g1u1,
+                                doweight_stage1,
+                                blockM,
+                                1,
+                                True,
+                            ),
+                            FmoeTuner.run_opus_stage1_out,
+                            (
+                                [
+                                    "a1_qt_fp8_cast",
+                                    "w1_qt_shffle_ck",
+                                    "sorted_ids",
+                                    "sorted_expert_ids",
+                                    "num_valid_ids",
+                                    "w1_scale_aiter",
+                                    "a1_scale_e8m0_one_sort",
+                                    "bias",
+                                ],
+                                topk,
+                                s1_params,
+                                blockM,
+                                act_type,
+                                True,
+                            ),
+                            {},
+                            FmoeTuner.run_torch_moe_stage1,
+                            s1_ref_args[:-3] + (blockM, False, True),
+                            {"output_sorted": True},
+                            None,
+                            0.01,
+                            0.01,
+                            sorted_stage1_cosine_diff_compare,
                         )
                     )
             for kname, kparams in get_opus_a8w4_stage2_kernels(token=token).items():
@@ -3501,6 +4187,38 @@ class FmoeTuner(TunerCommon):
                         cosine_diff_compare,
                     )
                 )
+                tasks_opus.append(
+                    (
+                        (
+                            info,
+                            "stage2",
+                            kname.replace("opus_moe2_", "opus_moe2_layout_", 1),
+                            blockM,
+                            0,
+                            1,
+                        ),
+                        FmoeTuner.generate_opus_sorted_stage2_data,
+                        gen_args,
+                        FmoeTuner.run_opus_stage2_out,
+                        (
+                            sorted_run_keys,
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        s2_ref_args,
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        cosine_diff_compare,
+                    )
+                )
 
         return tasks_opus
 
@@ -3529,11 +4247,15 @@ class FmoeTuner(TunerCommon):
             return tasks_flydsl
 
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        # bf16 -> "bf16" (not "fp16"): a16wi4 IS the a16w-mix bf16-activation path, and
+        # a_dtype_str is what selects the SORTED bf16 intermediate ("a2_a16w_sorted")
+        # for the stage2 candidates below. Mapping it to "fp16" fed stage2 the packed
+        # a2_qt instead, so every stage2 candidate raised and none was ever timed.
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
-            dtypes.bf16: "fp16",
+            dtypes.bf16: "bf16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
 
@@ -3561,7 +4283,13 @@ class FmoeTuner(TunerCommon):
                     k_tiles = k_per_batch // kparams["tile_k"]
                     if k_tiles < 4 or k_tiles % 2 != 0:
                         continue
-                # Int4 kernels: no fuse_fp4_quant
+                # Int4 kernels: no fuse_fp4_quant. a16wi4 is the a16w-mix port, whose
+                # stage1 returns a SORTED [max_sorted, inter] intermediate, so it must
+                # be scored against the SORTED reference (same as the mxfp4 a16w4 arm
+                # in gen_flydsl_2stages_task). Against the unsorted run_torch_moe_stage1
+                # every candidate scored ~84% err and the whole shape was rejected
+                # ("stage1 and stage2 should be valid together"), so stage1 was never
+                # actually tuned.
                 ref_args_extra = (
                     [
                         "a1_qt",
@@ -3569,11 +4297,10 @@ class FmoeTuner(TunerCommon):
                         "w2_qt",
                         "topk_weights",
                         "topk_ids",
-                        "a1_scale",
                         "w1_scale",
                         "sorted_ids",
+                        "sorted_expert_ids",
                         "num_valid_ids",
-                        "bias",
                     ],
                     dtype,
                     act_type,
@@ -3581,6 +4308,7 @@ class FmoeTuner(TunerCommon):
                     doweight_stage1,
                     topk,
                     blockM,
+                    inter_dim,
                 )
                 tasks_flydsl.append(
                     (
@@ -3624,13 +4352,13 @@ class FmoeTuner(TunerCommon):
                             act_type,
                         ),
                         {},
-                        FmoeTuner.run_torch_moe_stage1,
+                        FmoeTuner.run_a16w_stage1_sorted_ref,
                         ref_args_extra,
                         {},
                         (None),
                         0.01,
                         0.01,
-                        True,
+                        _a16w_sorted_cos,
                     )
                 )
 
@@ -3708,7 +4436,11 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                "a2_qt",
+                                (
+                                    "a2_a16w_sorted"
+                                    if a_dtype_str == "bf16"
+                                    else "a2_qt"
+                                ),
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -3827,13 +4559,18 @@ class FmoeTuner(TunerCommon):
                 w1_scale_fmoe = w1_scale
                 w2_scale_fmoe = w2_scale
                 if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+                    # a16wi4 OLD-kernel preshuffle -- match production/test_moe_2stage.py.
                     w1_qt_fmoe = (
-                        pack_int8_to_packed_int4(shuffle_weight(w1_qt_fmoe, (16, 16)))
+                        pack_int8_to_packed_int4(
+                            shuffle_weight(w1_qt_fmoe.view(dtypes.i8), (16, 16))
+                        )
                         .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                         .view(dtypes.i4x2)
                     )
                     w2_qt_fmoe = (
-                        pack_int8_to_packed_int4(shuffle_weight(w2_qt_fmoe, (16, 16)))
+                        pack_int8_to_packed_int4(
+                            shuffle_weight(w2_qt_fmoe.view(dtypes.i8), (16, 16))
+                        )
                         .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
                         .view(dtypes.i4x2)
                     )
@@ -4179,6 +4916,8 @@ class FmoeTuner(TunerCommon):
                 tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             if _want("flydsl"):
                 tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            if _want("flydslv2"):
+                tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
@@ -4334,6 +5073,7 @@ class FmoeTuner(TunerCommon):
                 kernelName = tail[1]
                 block_m = tail[2]
                 flat_flag = int(tail[3]) if len(tail) > 3 else 0
+                v2_flag = int(tail[4]) if len(tail) > 4 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
@@ -4365,6 +5105,7 @@ class FmoeTuner(TunerCommon):
                         tflops,
                         bw,
                         flat_flag,
+                        v2_flag,
                     ]
                 )
 
@@ -4382,6 +5123,7 @@ class FmoeTuner(TunerCommon):
                     "tflops",
                     "bw",
                     "flat",
+                    "v2",
                 ],
             )
             prorfiles.append(profileDF)
@@ -4395,14 +5137,15 @@ class FmoeTuner(TunerCommon):
             ]
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
-            # fused kernel by raw us before that penalty runs.
+            # fused kernel by raw us before that penalty runs. Keep v2 and non-v2
+            # candidates separate as well because they use different layouts.
             profileDF["_is_fused"] = (
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
             profileDF = (
                 profileDF.sort_values("us")
                 .drop_duplicates(
-                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                    ["stage", "block_m", "flat", "v2", "_is_fused"], keep="first"
                 )
                 .drop(columns=["_is_fused"])
             )
@@ -4465,6 +5208,10 @@ class FmoeTuner(TunerCommon):
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
             asm_1stage_profileDF["run_1stage"] = 1
+            # v2 in the merge key isolates v2 gemm1<->v2 gemm2 pairing (and
+            # normal<->normal); it is a per-row constant tag (0 for all
+            # normal/asm rows, 1 for v2), so adding it to the key leaves
+            # normal-path grouping unchanged.
             profileDF = pd.merge(
                 stage1_profileDF,
                 stage2_profileDF,
@@ -4484,6 +5231,7 @@ class FmoeTuner(TunerCommon):
                     "use_g1u1",
                     "doweight_stage1",
                     "block_m",
+                    "v2",
                 ],
                 how="inner",
             )
@@ -4541,7 +5289,10 @@ class FmoeTuner(TunerCommon):
                 # (simple .to(dtypes.fp8)) and add it to kernels whose stage1 name does
                 # not end with _fp8 (those fuse the cast in stage1).
                 if q_dtype_a == dtypes.fp4x2:
-                    from aiter.ops.triton.quant.fused_mxfp4_quant import (
+                    # Benchmark the same implementation fused_moe_ dispatches to
+                    # (aiter.ops.quant, HIP); the triton one is never executed at
+                    # runtime, so timing it skews the non-fused fairness penalty.
+                    from aiter.ops.quant import (
                         fused_dynamic_mxfp4_quant_moe_sort,
                     )
                     from aiter.test_common import run_perftest
@@ -4576,11 +5327,14 @@ class FmoeTuner(TunerCommon):
                             f"  quant_sort benchmark: blockM={bm_int}, us={us_qs_cache[bm]}"
                         )
                     profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
-                    # _fp4 kernels already fuse the fp4-quant+sort; skip cost addition
+                    # _fp4 kernels already fuse the fp4-quant+sort; skip cost addition.
+                    # v2 pairs also fuse fp4-quant+sort into gemm1 -> skip.
                     is_fp4 = profileDF["kernelName1"].astype(str).str.endswith("_fp4")
-                    profileDF.loc[~is_fp4, "us1"] = (
-                        profileDF.loc[~is_fp4, "us1"]
-                        + profileDF.loc[~is_fp4, "us_quant_sort"]
+                    is_v2 = profileDF["v2"].astype(int) == 1
+                    add_qs = ~is_fp4 & ~is_v2
+                    profileDF.loc[add_qs, "us1"] = (
+                        profileDF.loc[add_qs, "us1"]
+                        + profileDF.loc[add_qs, "us_quant_sort"]
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
                 elif q_dtype_a == dtypes.fp8:
@@ -4606,9 +5360,11 @@ class FmoeTuner(TunerCommon):
                         us_qs_cache[bm] = us_fp8_cast
                     profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
                     is_fp8 = profileDF["kernelName1"].astype(str).str.endswith("_fp8")
-                    profileDF.loc[~is_fp8, "us1"] = (
-                        profileDF.loc[~is_fp8, "us1"]
-                        + profileDF.loc[~is_fp8, "us_quant_sort"]
+                    is_v2 = profileDF["v2"].astype(int) == 1
+                    add_cast = ~is_fp8 & ~is_v2
+                    profileDF.loc[add_cast, "us1"] = (
+                        profileDF.loc[add_cast, "us1"]
+                        + profileDF.loc[add_cast, "us_quant_sort"]
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
 
@@ -4880,6 +5636,14 @@ class FmoeTuner(TunerCommon):
                         "falling back to additive fairness"
                     )
 
+            # v2 is a transient tuning-time pairing marker; the persistent layout
+            # marker is kernelName2's ``_moe2_layout_`` segment. Drop it before the
+            # best-row selection so it never reaches the tuned CSV. (It still
+            # appears in the profile_fmoe.csv debug dump, since prorfiles
+            # captured the pre-strip DataFrame by reference; that is fine -- the
+            # dump already carries internal columns like stage/flat/ksplit.)
+            if "v2" in profileDF.columns:
+                profileDF = profileDF.drop(columns=["v2"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -5300,14 +6064,34 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
+        g2_bms = {v[0] for v in G2}
         cands = []
-        for bm in sorted({v[0] for v in G1} & {v[0] for v in G2}):
+        for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
-                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                    cands.append(
-                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
-                    )
+                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
+                if bm in g2_bms:
+                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                        cands.append(
+                            self._candidate_row(
+                                row, bm, kn1, self._g2_kname(bm, n2, ep)
+                            )
+                        )
+                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
+                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
+                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
+                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
+                for kn2v, kp in get_flydsl_stage2_v2_kernels(
+                    "fp4",
+                    "fp4",
+                    "bf16",
+                    bm,
+                    model_dim=int(row["model_dim"]),
+                    inter_dim=int(row["inter_dim"]),
+                ).items():
+                    if kp["tile_m"] != bm:
+                        continue
+                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
     @staticmethod
@@ -5346,8 +6130,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
-        BM = _parse_mxfp4_g2_kname(kn2)["BM"]
-        atomic = _parse_mxfp4_g2_kname(kn2)["atomic"]
+        # kn2 may name either gemm2 family (path B or native mxmoe).
+        _g2 = parse_g2_kname_any(kn2)
+        BM = _g2["BM"]
+        atomic = _g2["atomic"]
         BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(

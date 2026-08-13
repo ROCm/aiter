@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
-_launch_gemm_a8w8_ptpc = None
+_launch_gemm_a8w8 = None
 _ptr_arg = None
 _fx = None
 
@@ -22,15 +22,15 @@ _MAX_SPLIT_K = 1
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8_ptpc, _ptr_arg, _fx
-    if _launch_gemm_a8w8_ptpc is not None:
+    global _launch_gemm_a8w8, _ptr_arg, _fx
+    if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a8w8_ptpc_gfx1250 import launch_gemm_a8w8_ptpc
+    from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
     from .kernels.tensor_shim import ptr_arg
 
-    _launch_gemm_a8w8_ptpc = launch_gemm_a8w8_ptpc
+    _launch_gemm_a8w8 = launch_gemm_a8w8
     _ptr_arg = ptr_arg
     _fx = fx_mod
 
@@ -136,7 +136,7 @@ def run_preshuffle_gemm_a8_gfx1250(
         Out.zero_()  # split-k atomic-accumulates into Out
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8_ptpc(
+    _launch_gemm_a8w8(
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -146,6 +146,7 @@ def run_preshuffle_gemm_a8_gfx1250(
         stream,
         N,
         K,
+        0,
         lda,
         ldc,
         tile_m,
@@ -157,6 +158,7 @@ def run_preshuffle_gemm_a8_gfx1250(
         nb,
         cluster_m,
         cluster_n,
+        False,
     )
     return Out
 
