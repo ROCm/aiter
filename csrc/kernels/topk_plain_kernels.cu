@@ -33,6 +33,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <optional>
+
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
