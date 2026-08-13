@@ -37,11 +37,14 @@ from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
 
-# One whole tensor per wave for the four A/B/SA/SB TDM loads, instead of the
-# default one wave pair per job. Off by default: the four tensors are wildly
-# different sizes (A moves 64 KB per k-tile at t256x256x256, SA/SB a few
-# hundred bytes), so a whole-tensor split cannot balance bytes across waves.
-BALANCED_WAVE_SPEC_TDM = int(os.environ.get("BALANCED_WAVE_SPEC_TDM", "0"))
+NUM_WAVES_PER_TENSOR_TDM = int(
+    os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2")
+)
+if NUM_WAVES_PER_TENSOR_TDM not in (1, 2):
+    raise ValueError(
+        "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1 or 2, got "
+        f"{NUM_WAVES_PER_TENSOR_TDM}"
+    )
 
 
 @flyc.jit
@@ -115,12 +118,12 @@ def launch_gemm_a8w4_tdm(
     next_stage_on = (
         1 if (next_stage_prefetch and num_buffers >= 3 and KWS % 2 == 0) else 0
     )
-    # Env knob AND exactly four waves, so every wave owns one job: a wave in no
-    # owner list runs no copy of the unswitched loop and hangs the workgroup.
-    # No tile-size floor is needed. That floor exists for the pair split, whose
-    # seg = outer // 2 silently drops rows once an outer dim (SB's tile_n // 32)
-    # stops halving exactly; a solo owner takes seg = outer and never divides.
-    wave_spec_solo = 1 if (BALANCED_WAVE_SPEC_TDM and m_warp * n_warp == 4) else 0
+    # With one wave per tensor, exactly four waves are required so every wave
+    # owns one of A/B/SA/SB. The default uses two waves per tensor to balance
+    # work across the two TDM ports.
+    wave_spec_solo = (
+        1 if (NUM_WAVES_PER_TENSOR_TDM == 1 and m_warp * n_warp == 4) else 0
+    )
     cache_tag = (
         K,
         tile_m,
