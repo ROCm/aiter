@@ -90,6 +90,7 @@ def _select_internal_fixed_route_pair(
     """Select the internal K2/K3 workspace layout without exact-shape rules."""
 
     l2_friendly_bytes = 128 * 1024 * 1024
+    b_first_min_routes = 250_000
     working_set_bytes = (
         d_z_sorted.numel() * d_z_sorted.element_size()
         + w1.numel() * w1.element_size()
@@ -104,7 +105,16 @@ def _select_internal_fixed_route_pair(
         # Match the native full-pipeline selector: the BN256 route kernel
         # halves dZ rereads when D is tile aligned, while BN128 remains the
         # remainder-safe large-working-set path.
-        return (14 if w1.shape[2] % 256 == 0 else 11), 1
+        if w1.shape[2] % 256 == 0:
+            # Once the sorted route stream is this large, issue the wider W1
+            # transfer before dZ so its vmcnt-critical tail enters the memory
+            # pipeline earlier.  Below the measured crossover retain the
+            # original A-first BN256 kernel.
+            route_dx_kernel_id = (
+                15 if d_z_sorted.shape[0] >= b_first_min_routes else 14
+            )
+            return route_dx_kernel_id, 1
+        return 11, 1
     return -1, -1
 
 

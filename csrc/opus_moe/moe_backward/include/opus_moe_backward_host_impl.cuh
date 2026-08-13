@@ -636,6 +636,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int sorted_route_dx_kid = 11;
     constexpr int logical_bn256_route_dx_kid = 13;
     constexpr int sorted_bn256_route_dx_kid = 14;
+    constexpr int sorted_bn256_b_first_route_dx_kid = 15;
+    constexpr int b_first_min_routes = 250000;
     constexpr int sorted_route_reduce_kid = 1;
     constexpr int full_row_sorted_route_reduce_kid = 2;
     const auto is_sorted_route_reduce_kid = [&](int kid) {
@@ -648,9 +650,17 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                    : sorted_route_reduce_kid;
     };
     const auto sorted_route_kid = [&](int logical_kid) {
-        return logical_kid == logical_bn256_route_dx_kid
-                   ? sorted_bn256_route_dx_kid
-                   : sorted_route_dx_kid;
+        if(logical_kid != logical_bn256_route_dx_kid)
+            return sorted_route_dx_kid;
+
+        // The BN256/M3 stage moves about 16 KiB of W1 but only 6 KiB of dZ
+        // per stage.  On long sorted streams, issuing W1 first starts the
+        // vmcnt-critical transfer earlier; shorter streams retain A-first at
+        // the measured crossover.  This uses only runtime route geometry and
+        // deliberately avoids binding the policy to a model tuple.
+        return route_dx.route.sorted_capacity >= b_first_min_routes
+                   ? sorted_bn256_b_first_route_dx_kid
+                   : sorted_bn256_route_dx_kid;
     };
     const auto is_logical_large_route_kid = [&](int kid) {
         return kid == logical_route_dx_kid ||
@@ -658,7 +668,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     };
     const auto is_sorted_route_kid = [&](int kid) {
         return kid == sorted_route_dx_kid ||
-               kid == sorted_bn256_route_dx_kid;
+               kid == sorted_bn256_route_dx_kid ||
+               kid == sorted_bn256_b_first_route_dx_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&
