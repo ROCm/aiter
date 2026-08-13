@@ -7,8 +7,8 @@ Gated Delta Net K5 hidden-state recurrence kernel (@flyc.kernel API).
 HIP-aligned fork: same ``mfma_f32_16x16x16bf16_1k`` instruction and warp
 partition (BT split-M, K split across waves, V not split) as the hand-tuned
 HIP/C++ K5 kernel; writes the public [..., V, K] layout through a [V][K]
-transpose buffer + b128 store, or straight from the f32 accumulators when the
-snapshot is fp32. Serially over the NT chunks: store the h snapshot for K6,
+transpose buffer + b128 store (fp32 snapshots in two half-BV rounds, all the
+LDS budget fits). Serially over the NT chunks: store the h snapshot for K6,
 v_new = u - w @ h, then
 h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
 """
@@ -104,10 +104,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     ``SNAPSHOT_DTYPE_BF16`` (default) keeps the per-chunk ``h`` snapshot in
     bf16: the accumulators are demoted once for the GEMM1 B panel and the same
     registers go through the [V][K] transpose buffer for a coalesced b128
-    store. Setting it False emits fp32 snapshots straight from the f32
-    accumulators, mirroring the HIP kernel's ``SNAPSHOT_BF16=false``
-    specialization: no fp32 LDS (the transpose buffer would not fit at
-    BV>=32), and the bf16 specialization is left byte-identical.
+    store. Setting it False writes fp32 snapshots instead, the public dtype the
+    HIP kernel's ``SNAPSHOT_BF16=false`` specialization produces; the f32 tile
+    is twice the bytes and would not fit the same LDS budget whole, so it goes
+    out in two half-BV rounds. The bf16 specialization is byte-identical either
+    way.
     """
     # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
     # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
@@ -154,12 +155,28 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     )
 
     # [V][K] transpose buffer for the h snapshot store: V-major with K innermost
-    # so 8 adjacent K are one ds_read_b128 + one 16 B-aligned buffer_store. The
-    # fp32 specialization stores from registers and does not use it; a stub keeps
-    # the struct shape while reclaiming BV*K*2 B of LDS (16 KB at BV=64, where the
-    # bf16 layout sits exactly at the 64 KB limit).
+    # so 8 adjacent K are one ds_read_b128 + one 16 B-aligned buffer_store. Both
+    # snapshot dtypes go through it -- an MFMA C fragment only owns 16 K (64 B) of
+    # a V row, and the neighbouring 64 B belongs to another wave, so storing
+    # straight from the accumulators halves the coalescing width and doubles the
+    # store request count.
+    #
+    # The bf16 layout already sits exactly at the 64 KB LDS limit, so an fp32
+    # tile (2x the bytes) only fits in the same budget half the V rows at a time:
+    # SNAP_ROUNDS passes of SNAP_ROUND_SLOTS accumulator cells each. All the
+    # staging stays ahead of this chunk's gate decay, which is what the snapshot
+    # has to capture.
     LDS_HT_STRIDE = K
-    LDS_HT_ELEMS = BV * LDS_HT_STRIDE if SNAPSHOT_DTYPE_BF16 else 16
+    if SNAPSHOT_DTYPE_BF16:
+        HT_NUM = fx.BFloat16
+        SNAP_ROUNDS = 1
+    else:
+        HT_NUM = fx.Float32
+        SNAP_ROUNDS = 2 if N_REPEAT >= 2 else 1
+    assert SNAP_ROUNDS <= 2, "the chunk loop hand-places round 1, so 2 is the max"
+    SNAP_ROUND_SLOTS = N_REPEAT // SNAP_ROUNDS
+    SNAP_ROUND_ROWS = SNAP_ROUND_SLOTS * MFMA_N
+    LDS_HT_ELEMS = SNAP_ROUND_ROWS * LDS_HT_STRIDE
 
     # ``wp`` / ``hp`` must each stay one Array: their views span both 64-K
     # panels with a panel stride, so the panels have to be contiguous.
@@ -168,7 +185,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         wp: fx.Array[fx.BFloat16, LDS_WP_ELEMS, 16]
         kp: fx.Array[fx.BFloat16, LDS_KP_ELEMS, 16]
         hp: fx.Array[fx.BFloat16, LDS_HP_ELEMS, 16]
-        ht: fx.Array[fx.BFloat16, LDS_HT_ELEMS, 16]
+        ht: fx.Array[HT_NUM, LDS_HT_ELEMS, 16]
 
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
@@ -291,18 +308,21 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
         sK = [_k_panel_view(kb, 4) for kb in range(NUM_K_BLOCKS)]
         sKw = [_k_panel_view(kb, 2) for kb in range(NUM_K_BLOCKS)]
-        # [V][K] transpose buffer: [BV][K] row-major + S<4,2,5>, the layout form
-        # of the hand-written ``k_group ^ (v & 0xF)`` scatter.
-        if const_expr(SNAPSHOT_DTYPE_BF16):
-            sHT = lds.ht.view(
-                fx.make_composed_layout(
-                    fx.static(fx.SwizzleType.get(4, 2, 5)),
-                    fx.make_layout((BV, K // 4, 4), (K, 4, 1)),
-                )
+        # [V][K] transpose buffer: [rows][K] row-major + S<4,2,5>, the layout form
+        # of the hand-written ``k_group ^ (v & 0xF)`` scatter. A row is 2**7
+        # elements for both dtypes, so the same swizzle keeps the scatter write
+        # and the linear flush read at the minimum bank-cycle count either way.
+        sHT = lds.ht.view(
+            fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(4, 2, 5)),
+                fx.make_layout((SNAP_ROUND_ROWS, K // 4, 4), (K, 4, 1)),
             )
+        )
 
         # Every LDS <-> register move here is one k_group (4 bf16 = one b64).
         cp_lds_x4 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        # fp32 snapshot staging: one k_group is 4 f32 = one b128.
+        cp_lds_f32x4 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
 
         def _lds_read_x4(tile):
             return _load_vec(cp_lds_x4, tile, 4, fx.BFloat16)
@@ -602,6 +622,46 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             def _bt_abs_row(elem_i, i_t_i32=i_t_i32):
                 return i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
 
+            # One fp32 staging pass: the round's accumulator cells scatter into
+            # sHT, exactly like the bf16 path does for all of them at once.
+            def _snap_stage_round(rnd):
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for slot in range_constexpr(SNAP_ROUND_SLOTS):
+                        acc_j = rnd * SNAP_ROUND_SLOTS + slot
+                        acc_val = fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
+                        _store_vec(
+                            cp_lds_f32x4,
+                            fx.slice(
+                                sHT, (slot * 16 + lane_n, kb * 16 + row_block, None)
+                            ),
+                            acc_val,
+                            4,
+                            fx.Float32,
+                        )
+
+            # The round's rows leave LDS in tid order (K innermost), so one wave
+            # covers 1 KB of contiguous HBM instead of the 16 half-lines the
+            # accumulator layout would give. Called right after a GEMM so the
+            # MFMA chain covers the ds_read latency.
+            def _snap_flush_round(rnd, i_t_i32=i_t_i32):
+                K_VECS4 = K // 4
+                NUM_VECS = SNAP_ROUND_ROWS * K_VECS4
+                for vbase in range_constexpr(0, NUM_VECS, BLOCK_THREADS):
+                    vec_idx = vbase + tid
+                    kv = vec_idx % K_VECS4
+                    v_loc = vec_idx // K_VECS4
+                    val = _load_vec(
+                        cp_lds_f32x4, fx.slice(sHT, (v_loc, kv, None)), 4, fx.Float32
+                    )
+                    v_global = i_v * BV + rnd * SNAP_ROUND_ROWS + v_loc
+                    _store_vec(
+                        cp_snapshot_x4,
+                        fx.slice(h_view, (i_t_i32, v_global, kv, None)),
+                        val,
+                        4,
+                        fx.Float32,
+                    )
+
             # Stage h_accs into the h_state panels (GEMM1 B operand) and the
             # [V][K] transpose buffer (b128 HBM store).
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -619,23 +679,16 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         _lds_write_x4(
                             fx.slice(sHT, (hp_col, kb * 16 + row_block, None)), acc_bf16
                         )
-                    else:
-                        # The cell is 4 contiguous K, so an fp32 snapshot stores
-                        # as one buffer_store_dwordx4 with no LDS hop. It must be
-                        # issued here: the accumulators are the chunk-start state
-                        # only until this chunk's gate decay rescales them, while
-                        # the bf16 path can defer its HBM flush because LDS holds
-                        # the frozen snapshot.
-                        snap_col, snap_kgroup = _state_coord(kb, acc_j)
-                        _store_vec(
-                            cp_snapshot_x4,
-                            fx.slice(h_view, (i_t_i32, snap_col, snap_kgroup, None)),
-                            acc_val,
-                            4,
-                            fx.Float32,
-                        )
 
-            # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
+            if const_expr(not SNAPSHOT_DTYPE_BF16):
+                # bf16 stages every row here and defers one flush; the f32 tile
+                # only half fits, so the two rounds are staged at the two points
+                # that already have a barrier after them and still hold the
+                # chunk-start accumulators, then flushed behind a GEMM.
+                _snap_stage_round(0)
+
+            # w/k for this chunk already in LDS (prologue or prev GEMM2 end);
+            # also publishes the h_state panels and round 0's fp32 snapshot rows.
             gpu.barrier()
 
             next_chunk_end = (i_t_i32 + 1) * BT
@@ -721,9 +774,19 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
                 _gemm1_kblock(kb)
 
+            if const_expr(not SNAPSHOT_DTYPE_BF16):
+                _snap_flush_round(0)
+
             # WAR barrier: GEMM1 is done reading the h_state panels, so gated_v
             # may now overwrite panel 1.
             gpu.barrier()
+
+            if const_expr(SNAP_ROUNDS > 1):
+                # Round 1 rides the barriers the rest of the loop already needs:
+                # this one retires round 0's reads, and the pre-flush barrier
+                # below publishes these rows. The accumulators are still the
+                # chunk-start state here -- the gate decay is further down.
+                _snap_stage_round(1)
 
             if const_expr(USE_G):
                 exp_g_last = _fast_exp(g_last)
@@ -804,7 +867,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # h snapshot store: the transpose buffer is read-only from here and
             # gated_v is in a different LDS region, so the two do not conflict.
-            # fp32 snapshots already left through the accumulator store above.
+            if const_expr(SNAP_ROUNDS > 1):
+                _snap_flush_round(1)
+
             if const_expr(SNAPSHOT_DTYPE_BF16):
                 K_VECS = K // LOAD_VEC_WIDTH
                 NUM_HT_VECS = BV * K_VECS
