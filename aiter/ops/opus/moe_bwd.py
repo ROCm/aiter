@@ -957,6 +957,16 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         ctx.save_for_backward(x_g, w1, w2, act_input, h, y, p_sorted,
                               x_gather_idx, order, lens, topk_ids, topk_w)
+        # Exact router tail only needs these tensors as metadata.  Store compact
+        # INT32 copies during forward so the bandwidth-critical dx/router
+        # kernel avoids INT64 loads and address arithmetic in backward.
+        exact_router_tail = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
+        ctx.router_order_i32 = (
+            order.to(torch.int32).contiguous() if exact_router_tail else None
+        )
+        ctx.topk_ids_i32 = (
+            topk_ids.to(torch.int32).contiguous() if exact_router_tail else None
+        )
         ctx.dims = (T, H, E, I, topk)
         ctx.act_type = act_type
         ctx.dgrad_meta = (seid, bms, bme)
@@ -980,8 +990,16 @@ class OpusMoERefFunc(torch.autograd.Function):
         seid, bms, bme = ctx.dgrad_meta
         offs = ctx.offs
         w1t, w2t, w2_ref = ctx.w1t, ctx.w2t, ctx.w2_ref
-        order = ctx.saved_tensors[8]
-        topk_ids = ctx.saved_tensors[10]
+        order = (
+            ctx.router_order_i32
+            if ctx.router_order_i32 is not None
+            else ctx.saved_tensors[8]
+        )
+        topk_ids = (
+            ctx.topk_ids_i32
+            if ctx.topk_ids_i32 is not None
+            else ctx.saved_tensors[10]
+        )
         dscore_partials = None
         fused_dlogits = None
         ctx.fused_sparse_router_dx = False
