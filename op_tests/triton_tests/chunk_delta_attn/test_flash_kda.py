@@ -366,6 +366,29 @@ def test_weak_gate(lower_bound, chunks_per_seg):
     assert rel_err(o_fkda, o_ref) < 2e-2
 
 
+# Gaussian keys in 128 dimensions are near-orthogonal, so L's off-diagonal
+# entries sit at ~0.02 and every inverse of it looks accurate -- which is the
+# regime every other case here feeds. Repeated tokens in real text correlate the
+# keys instead, and with beta near 1 and a gate that barely decays L's entries
+# approach 1. The powers the inverse is built from then run to 5e7 across a
+# 32-wide chunk before cancelling back to a result bounded by 1, which no
+# storage precision survives: this case reached the model as 0.2% on gsm8k while
+# the rest of this file passed.
+@pytest.mark.parametrize("rho", [0.9, 1.0])
+def test_correlated_keys_weak_gate(rho):
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, 512, 4)
+    # rho=1 is a token repeated verbatim for the whole sequence.
+    k = (rho * k[:, :1] + (1.0 - rho) * k).to(dtype)
+    beta = torch.full_like(beta, 4.0)  # sigmoid(4) = 0.98, so L is barely shrunk
+    args = (q, k, v, g, beta, A_log, dt_bias, scale)
+    kw = {"lower_bound": -0.01}
+    gold, _ = fp32_gold(*args, **kw)
+    e_fkda = rel_err(run_flash(*args, **kw)[0], gold)
+    e_ref = rel_err(run_reference(*args, **kw)[0], gold)
+    assert e_fkda < 5e-2, f"flash_kda {e_fkda:.2e} against the fp32 recurrence"
+    assert e_fkda < 1.3 * e_ref, f"flash_kda {e_fkda:.2e} vs default {e_ref:.2e}"
+
+
 @pytest.mark.parametrize("lower_bound", [-5.0, -1.0, -0.01])
 def test_matches_fp32_recurrence(lower_bound):
     """Against the token-at-a-time fp32 recurrence both paths blockify.

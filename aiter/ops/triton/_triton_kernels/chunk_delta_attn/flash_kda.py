@@ -84,6 +84,12 @@ FLASH_KDA_K: int = 128
 # See the pivot comment in the prepare kernel.
 FLASH_KDA_CHUNK: int = 32
 
+# Width of the diagonal blocks the WY inverse is built from. The Neumann powers
+# used to invert them grow with the block width, so this bounds how far the
+# intermediates can run ahead of the O(1) result; 16 is also what the fla and
+# CUTLASS kernels use.
+FLASH_KDA_INV_BLOCK: int = 16
+
 
 @triton.heuristics(
     {
@@ -126,7 +132,9 @@ def _flash_kda_prepare_kernel(
     H: tl.constexpr,
     K: tl.constexpr,
     C: tl.constexpr,
+    BC: tl.constexpr,
     NUM_DOUBLING: tl.constexpr,
+    NUM_MERGE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
@@ -194,9 +202,25 @@ def _flash_kda_prepare_kernel(
     # state, which enters the chunk at row 0, so a row whose gate has decayed past
     # fp32 range genuinely contributes nothing and flushing it to zero is correct.
     b_exp_g = exp2(b_gcum)
-    b_kd = tl.where(m_ck, b_k * b_exp_g, 0.0).to(tl.bfloat16)
-    b_qd = tl.where(m_ck, b_q * b_exp_g * scale, 0.0).to(tl.bfloat16)
-    b_kr = tl.where(m_ck, b_k * exp2(b_g_last[None, :] - b_gcum), 0.0).to(tl.bfloat16)
+
+    # Stored here rather than at the end of the kernel: these are three C x K
+    # tiles, and holding them live across the inversion below costs more
+    # registers than K1 has to spare. At H = 64 that alone decided whether the
+    # kernel fit in 256 VGPRs, i.e. whether it ran at one or two waves per SIMD.
+    #
+    # Workspace is [H, TOTAL_TILES, ...] so one sequence's chunks stay contiguous
+    # for K2's sequential walk. Tail rows are zeroed rather than left unwritten:
+    # K2 accumulates k_restored^T @ U over all C rows, so garbage there would
+    # corrupt the recurrent state, not just the masked output rows.
+    ws_idx = i_h * TOTAL_TILES + g_tile
+    ck_off = ws_idx * C * K + o_c[:, None] * K + o_k[None, :]
+    tl.store(ws_kd + ck_off, tl.where(m_ck, b_k * b_exp_g, 0.0).to(tl.bfloat16))
+    tl.store(ws_qd + ck_off, tl.where(m_ck, b_q * b_exp_g * scale, 0.0).to(tl.bfloat16))
+    tl.store(
+        ws_kr + ck_off,
+        tl.where(m_ck, b_k * exp2(b_g_last[None, :] - b_gcum), 0.0).to(tl.bfloat16),
+    )
+    tl.store(ws_gt + ws_idx * K + o_k, b_g_total)
 
     p_beta = beta_raw + (bos + t_off) * H + i_h + o_c * H
     b_beta = tl.sigmoid(tl.load(p_beta, mask=m_c, other=0.0).to(tl.float32))
@@ -230,37 +254,48 @@ def _flash_kda_prepare_kernel(
     b_L = tl.dot(b_k_piv, tl.trans(b_k_inv))
     b_L = tl.where(o_i[:, None] > o_i[None, :], -b_L * b_beta[:, None], 0.0)
 
-    b_Mqk = tl.dot(b_q_piv, tl.trans(b_k_inv))
-    b_Mqk = tl.where(o_i[:, None] >= o_i[None, :], b_Mqk, 0.0).to(tl.bfloat16)
-
-    # Invert via (I+L)(I+L^2)(I+L^4)...(I+L^(C/2)). L is strictly lower
-    # triangular, hence nilpotent with L^C = 0, so this is exact in exact
-    # arithmetic.
-    # Summing I + L + L^2 + L^4 + ... instead would silently drop L^3, L^5, L^6,
-    # and every other non-power-of-two term; that is not the inverse, and on this
-    # L it is off by the magnitude of the matrix itself.
-    b_INV = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0) + b_L
-    b_Lp = tl.dot(b_L.to(tl.bfloat16), b_L.to(tl.bfloat16))
-    for _ in tl.static_range(NUM_DOUBLING):
-        b_INV = b_INV + tl.dot(b_INV.to(tl.bfloat16), b_Lp.to(tl.bfloat16))
-        b_Lp = tl.dot(b_Lp.to(tl.bfloat16), b_Lp.to(tl.bfloat16))
-    b_INV = b_INV.to(tl.bfloat16)
-
-    # Workspace is [H, TOTAL_TILES, ...] so one sequence's chunks stay contiguous
-    # for K2's sequential walk. Tail rows were zeroed above rather than left
-    # unwritten: K2 accumulates k_restored^T @ U over all C rows, so garbage
-    # there would corrupt the recurrent state, not just the masked output rows.
-    ws_idx = i_h * TOTAL_TILES + g_tile
-    ck_off = ws_idx * C * K + o_c[:, None] * K + o_k[None, :]
-    tl.store(ws_kd + ck_off, b_kd)
-    tl.store(ws_qd + ck_off, b_qd)
-    tl.store(ws_kr + ck_off, b_kr)
-
-    tl.store(ws_gt + ws_idx * K + o_k, b_g_total)
-
     cc_off = ws_idx * 2 * C * C + o_i[:, None] * C + o_i[None, :]
-    tl.store(ws_inv_mqk + cc_off, b_INV)
+    b_Mqk = tl.dot(b_q_piv, tl.trans(b_k_inv))
+    b_Mqk = tl.where(o_i[:, None] >= o_i[None, :], b_Mqk, 0.0)
     tl.store(ws_inv_mqk + cc_off + C * C, b_Mqk)
+
+    # Invert the BC-wide diagonal blocks via (I+D)(I+D^2)(I+D^4)...(I+D^(BC/2)),
+    # then fold the sub-diagonal blocks back in, doubling the block width each
+    # round. D is strictly lower triangular, hence nilpotent, and so is
+    # INV @ L_off at every merge level (it maps one sub-block into the one below
+    # and no further), so both halves are exact in exact arithmetic.
+    # Summing I + D + D^2 + D^4 + ... instead would silently drop D^3, D^5, D^6,
+    # and every other non-power-of-two term; that is not the inverse, and on this
+    # D it is off by the magnitude of the matrix itself.
+    #
+    # The block split is not about the answer but about the intermediates. L^k
+    # counts paths down the chunk, so across all C = 32 rows its entries reach
+    # 5e7 once the keys correlate and the gate stops damping L, while the inverse
+    # they sum to stays bounded by 1. Nothing survives that cancellation: the
+    # flat doubling comes out 400% wrong even in fp32, 1e5 wrong in bf16, and
+    # overflows fp16. Confined to BC = 16 rows the same powers peak at 2e3 and
+    # the result lands within 2e-4, at an identical matmul count.
+    b_D = tl.where(o_i[:, None] // BC == o_i[None, :] // BC, b_L, 0.0)
+    b_INV = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0) + b_D
+    b_Dp = tl.dot(b_D, b_D)
+    for _ in tl.static_range(NUM_DOUBLING):
+        b_INV = b_INV + tl.dot(b_INV, b_Dp)
+        b_Dp = tl.dot(b_Dp, b_Dp)
+
+    # fp32 throughout: the partial sums here are what the split keeps small, and
+    # narrowing the matmuls to fp16 puts the ill-conditioned case back at 100%
+    # error. This is the parallel kernel, so the width is nearly free; only the
+    # fp16 store below is seen by K2's serial walk.
+    w = BC
+    for _ in tl.static_range(NUM_MERGE):
+        m_off = (o_i[:, None] // (2 * w) == o_i[None, :] // (2 * w)) & (
+            o_i[:, None] // w != o_i[None, :] // w
+        )
+        b_off = tl.where(m_off, b_L, 0.0)
+        b_INV = b_INV + tl.dot(b_INV, tl.dot(b_off, b_INV))
+        w = 2 * w
+
+    tl.store(ws_inv_mqk + cc_off, b_INV)
 
 
 # K2 keeps three configs even with the global autotune flag off, where the other
@@ -415,20 +450,24 @@ def _flash_kda_segment_kernel(
 
         cc = ws_idx * 2 * C * C + o_c[:, None] * C + o_c[None, :]
         b_inv = tl.load(ws_inv_mqk + cc)
-        b_U = tl.dot(b_inv, b_u.to(tl.bfloat16)).to(tl.float32)
-        b_U_bf = b_U.to(tl.bfloat16)
+        b_U = tl.dot(b_inv, b_u.to(ws_inv_mqk.dtype.element_ty))
 
         if COMPUTE_OUTPUT:
             b_mqk = tl.load(ws_inv_mqk + cc + C * C)
             b_qd1 = tl.load(ws_qd + ck + o_c[:, None] * K + o_k1[None, :])
             b_qd2 = tl.load(ws_qd + ck + o_c[:, None] * K + o_k2[None, :])
             b_o = tl.dot(b_qd1, b_h1_bf) + tl.dot(b_qd2, b_h2_bf)
-            b_o += tl.dot(b_mqk, b_U_bf)
+            b_o += tl.dot(b_mqk, b_U.to(b_mqk.dtype))
             tl.store(out + vo_off, b_o.to(out.dtype.element_ty), mask=m_cw)
 
         b_gt1 = tl.load(ws_gt + ws_idx * K + o_k1).to(tl.float32)
         b_gt2 = tl.load(ws_gt + ws_idx * K + o_k2).to(tl.float32)
 
+        # The recurrence's own matmuls stay in bf16: widening them costs about
+        # 40% of the kernel and moved no error bound measurably, since the state
+        # they feed is accumulated in fp32 either way and U already carries
+        # whatever the inverse above lost.
+        b_U_bf = b_U.to(tl.bfloat16)
         b_kr1_t = tl.load(ws_kr + ck + o_k1[:, None] + o_c[None, :] * K)
         b_kr2_t = tl.load(ws_kr + ck + o_k2[:, None] + o_c[None, :] * K)
 
@@ -701,6 +740,7 @@ def flash_kda_fwd(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = FLASH_KDA_CHUNK
+    inv_block = min(FLASH_KDA_INV_BLOCK, C)
     dev = q.device
 
     if cu_seqlens is not None:
@@ -721,9 +761,16 @@ def flash_kda_fwd(
     ws_qd = torch.empty(ws_shape, dtype=torch.bfloat16, device=dev)
     ws_kr = torch.empty(ws_shape, dtype=torch.bfloat16, device=dev)
     ws_gt = torch.empty(H * total_tiles, K, dtype=torch.float32, device=dev)
-    ws_inv_mqk = torch.empty(
-        H * total_tiles, 2 * C, C, dtype=torch.bfloat16, device=dev
-    )
+    # fp16 rather than bf16, for the mantissa and not the range: the inverse the
+    # prepare kernel writes here is bounded by 1, and K2 walks it through a
+    # recurrence as long as the sequence, so the 8 mantissa bits of bf16 are what
+    # ends up limiting the fused path. On correlated keys with a weak gate, bf16
+    # here scores 1.1e-2 against an fp32 recurrence where fp16 scores 2.3e-3,
+    # which is the difference between losing to the default pipeline and beating
+    # it by 5x. Both are two bytes, and fp32 would cost 1.3-1.5x, since this is
+    # read twice per chunk on K2's serial path. The CUTLASS FlashKDA picks fp16
+    # here for the same reason.
+    ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
     _flash_kda_prepare_kernel[(total_tiles if cu_seqlens is not None else NT, B * H)](
         q=q,
@@ -747,7 +794,9 @@ def flash_kda_fwd(
         H=H,
         K=K,
         C=C,
-        NUM_DOUBLING=C.bit_length() - 2,
+        BC=inv_block,
+        NUM_DOUBLING=inv_block.bit_length() - 2,
+        NUM_MERGE=(C // inv_block).bit_length() - 1,
     )
 
     if cu_seqlens is not None:
