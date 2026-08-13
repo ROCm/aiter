@@ -160,6 +160,16 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::BATCH_SIGMOID;
         return false;
     }();
+    constexpr bool stage_z_in_lds = []() constexpr {
+        if constexpr(requires { T::STAGE_Z_IN_LDS; })
+            return T::STAGE_Z_IN_LDS;
+        return false;
+    }();
+    constexpr int z_lds_pair_pad = []() constexpr {
+        if constexpr(requires { T::Z_LDS_PAIR_PAD; })
+            return T::Z_LDS_PAIR_PAD;
+        return 0;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -192,12 +202,21 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     constexpr int smem_b_elems = T::SMEM_B_BYTES / sizeof(D_B);
     constexpr int ds_values = CTA_M * T::T_N;
     constexpr int ds_bytes = ds_values * sizeof(float);
+    constexpr int z_lds_pair_elems = 4 * BN + z_lds_pair_pad;
+    constexpr int z_lds_bytes =
+        stage_z_in_lds
+            ? (ROUTE_M / 2) * z_lds_pair_elems * sizeof(D_A)
+            : 0;
+    constexpr int epilogue_storage_bytes = z_lds_bytes + ds_bytes;
     constexpr int smem_a_bytes = smem_a_elems * sizeof(D_A);
     constexpr int smem_b_bytes = smem_b_elems * sizeof(D_B);
     constexpr int gemm_buffer_bytes = smem_a_bytes + smem_b_bytes;
     constexpr int gemm_smem_bytes = 2 * gemm_buffer_bytes;
     constexpr int tile_storage_bytes =
-        gemm_smem_bytes > ds_bytes ? gemm_smem_bytes : ds_bytes;
+        gemm_smem_bytes > epilogue_storage_bytes
+            ? gemm_smem_bytes
+            : epilogue_storage_bytes;
+    static_assert(!stage_z_in_lds || z_lds_pair_pad > 0);
 
     const int parts = inter_dim / BN;
     const int linear_block = static_cast<int>(blockIdx.x);
@@ -369,6 +388,12 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         static_cast<unsigned long long>(kargs.route.token_num) *
         static_cast<unsigned long long>(stride_do_t) * sizeof(D_A));
     auto g_a = make_gmem(d_out, d_out_bytes);
+
+    const D_A* z = reinterpret_cast<const D_A*>(kargs.z);
+    const unsigned int z_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.route.sorted_capacity) *
+        static_cast<unsigned long long>(stride_z_r) * sizeof(D_A));
+    auto g_z = make_gmem(z, z_bytes);
 
     const int64_t w2_expert_base =
         static_cast<int64_t>(expert_id) * stride_w2_e;
@@ -556,9 +581,48 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     }
     __syncthreads();
 
-    auto s_ds = make_smem(reinterpret_cast<float*>(tile_storage));
+    auto s_z = make_smem(reinterpret_cast<D_A*>(tile_storage));
+    auto s_ds = make_smem(reinterpret_cast<float*>(tile_storage + z_lds_bytes));
     OPUS_LDS_ADDR float* smem_ds =
         reinterpret_cast<OPUS_LDS_ADDR float*>(s_ds.ptr);
+
+    auto stage_z = [&](int route_group) {
+        if constexpr(stage_z_in_lds)
+        {
+            constexpr int z_async_vec = T::VEC_A;
+            constexpr int row_pairs = ROUTE_M / 2;
+            constexpr int pairs_per_wave = row_pairs / T::T_N;
+            static_assert(T::T_N * opus::get_warp_size() == T::BLOCK_SIZE);
+            static_assert(BN == 32 * z_async_vec);
+            static_assert(row_pairs % T::T_N == 0);
+            opus::static_for<2>([&](auto half) {
+                opus::static_for<pairs_per_wave>([&](auto pair_group) {
+                    const int local_pair =
+                        pair_group.value * T::T_N + wave_id_n;
+                    const int row_in_pair = lane_id / 32;
+                    const int local_row = 2 * local_pair + row_in_pair;
+                    const int local_m = route_group * ROUTE_M + local_row;
+                    const int sorted_row = route_base + local_m;
+                    const bool valid_row = sorted_row < valid_rows &&
+                                           sorted_row < expert_end_row;
+                    const int lds_offset =
+                        local_pair * z_lds_pair_elems + half.value * 2 * BN;
+                    const int source_row = valid_row
+                                               ? sorted_row
+                                               : kargs.route.sorted_capacity;
+                    const int64_t global_offset =
+                        static_cast<int64_t>(source_row) * stride_z_r +
+                        half.value * inter_dim + col_base +
+                        (lane_id % 32) * z_async_vec;
+                    g_z.template async_load<z_async_vec>(
+                        reinterpret_cast<void*>(
+                            reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_z.ptr) +
+                            lds_offset),
+                        static_cast<int>(global_offset));
+                });
+            });
+        }
+    };
 
     auto store_epilogue = [&](auto& accum, int route_group) {
         static_assert(ROUTE_M == 32);
@@ -669,12 +733,32 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 for(int group = 0; group < 2; ++group)
                 {
                     const int col = col_base + local_n0 + group * 16;
-                    const int64_t z_base =
-                        static_cast<int64_t>(sorted_row) * stride_z_r + col;
-                    z_gate_prefetch[group] =
-                        down_bwd_load_bf16x8_packed(kargs.z + z_base);
-                    z_up_prefetch[group] = down_bwd_load_bf16x8_packed(
-                        kargs.z + z_base + inter_dim);
+                    if constexpr(stage_z_in_lds)
+                    {
+                        const int z_local_row = local_m % ROUTE_M;
+                        const int pair_base =
+                            (z_local_row / 2) * z_lds_pair_elems;
+                        const int row_in_pair = z_local_row % 2;
+                        z_gate_prefetch[group] = __builtin_bit_cast(
+                            down_bwd_u32x4,
+                            s_z.template load<8>(pair_base +
+                                                  row_in_pair * BN +
+                                                  local_n0 + group * 16));
+                        z_up_prefetch[group] = __builtin_bit_cast(
+                            down_bwd_u32x4,
+                            s_z.template load<8>(pair_base + 2 * BN +
+                                                  row_in_pair * BN +
+                                                  local_n0 + group * 16));
+                    }
+                    else
+                    {
+                        const int64_t z_base =
+                            static_cast<int64_t>(sorted_row) * stride_z_r + col;
+                        z_gate_prefetch[group] =
+                            down_bwd_load_bf16x8_packed(kargs.z + z_base);
+                        z_up_prefetch[group] = down_bwd_load_bf16x8_packed(
+                            kargs.z + z_base + inter_dim);
+                    }
                 }
             }
 
@@ -767,6 +851,15 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     };
 
     opus::static_for<RouteTiles>([&](auto route_group) {
+        if constexpr(stage_z_in_lds)
+        {
+            if constexpr(route_group.value > 0)
+                __syncthreads();
+            stage_z(route_group.value);
+            s_waitcnt_vmcnt(0_I);
+            s_waitcnt_lgkmcnt(0_I);
+            __syncthreads();
+        }
         store_epilogue(v_c[route_group.value], route_group.value);
     });
     __syncthreads();

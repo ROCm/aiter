@@ -142,6 +142,12 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
     static constexpr int B_N = 256;
     static constexpr int E_N = 2;
     static constexpr bool BATCH_SIGMOID = true;
+    // After the GEMM mainloop, reuse its dead LDS allocation to coalesce the
+    // otherwise lane-scattered Z reads.  One direct 16-byte global-to-LDS
+    // issue per lane fills two adjacent route rows; a padded row-pair layout
+    // limits the subsequent epilogue reads to two-way same-bank sharing.
+    static constexpr bool STAGE_Z_IN_LDS = true;
+    static constexpr int Z_LDS_PAIR_PAD = 16; // BF16 elements = 32 bytes.
     static constexpr int SMEM_B_ROW_BYTES = B_N * sizeof(D_B);
     static constexpr int SMEM_B_GROUP_DATA_BYTES =
         SMEM_B_GROUP_ROWS * SMEM_B_ROW_BYTES;
