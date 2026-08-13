@@ -275,12 +275,17 @@ def _flash_kda_prepare_kernel(
     # flat doubling comes out 400% wrong even in fp32, 1e5 wrong in bf16, and
     # overflows fp16. Confined to BC = 16 rows the same powers peak at 2e3 and
     # the result lands within 2e-4, at an identical matmul count.
+    #
+    # input_precision is spelled out because an unannotated fp32 dot is not fp32
+    # everywhere: tl.dot resolves it to "tf32" on any target that allows it, and
+    # gfx942 then selects v_mfma_f32_32x32x4_xf32, which truncates to 19 bits
+    # without rounding. On a doubling this cancellation-prone that is 2e1 off.
     b_D = tl.where(o_i[:, None] // BC == o_i[None, :] // BC, b_L, 0.0)
     b_INV = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0) + b_D
-    b_Dp = tl.dot(b_D, b_D)
+    b_Dp = tl.dot(b_D, b_D, input_precision="ieee")
     for _ in tl.static_range(NUM_DOUBLING):
-        b_INV = b_INV + tl.dot(b_INV, b_Dp)
-        b_Dp = tl.dot(b_Dp, b_Dp)
+        b_INV = b_INV + tl.dot(b_INV, b_Dp, input_precision="ieee")
+        b_Dp = tl.dot(b_Dp, b_Dp, input_precision="ieee")
 
     # fp32 throughout: the partial sums here are what the split keeps small, and
     # narrowing the matmuls to fp16 puts the ill-conditioned case back at 100%
@@ -292,7 +297,11 @@ def _flash_kda_prepare_kernel(
             o_i[:, None] // w != o_i[None, :] // w
         )
         b_off = tl.where(m_off, b_L, 0.0)
-        b_INV = b_INV + tl.dot(b_INV, tl.dot(b_off, b_INV))
+        b_INV = b_INV + tl.dot(
+            b_INV,
+            tl.dot(b_off, b_INV, input_precision="ieee"),
+            input_precision="ieee",
+        )
         w = 2 * w
 
     tl.store(ws_inv_mqk + cc_off, b_INV)
