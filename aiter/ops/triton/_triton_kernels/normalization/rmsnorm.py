@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _int8_rne_sat
+
 
 @triton.jit
 def _per_token_quant(
@@ -32,7 +34,9 @@ def _per_token_quant(
 
     qx = x * scale_recip
 
-    if CLAMP_OUT:
+    if DTYPE_MAX == 127:
+        qx = _int8_rne_sat(qx)
+    elif CLAMP_OUT:
         qx = tl.clamp(qx, -DTYPE_MAX, DTYPE_MAX)
 
     tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.dtype.element_ty))

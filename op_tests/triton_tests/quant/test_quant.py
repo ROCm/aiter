@@ -14,8 +14,14 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 DEBUG = False
 
 
+def torch_scaled_quant_cast(x, dtype_quant):
+    if dtype_quant == torch.int8:
+        x = torch.round(x).clamp(-127, 127)
+    return x.to(dtype_quant)
+
+
 def torch_static_per_tensor_quant_fp8_i8(out, x, scale, dtype_quant):
-    out = (x / scale).to(dtype_quant)
+    out = torch_scaled_quant_cast(x / scale, dtype_quant)
 
     return out
 
@@ -66,7 +72,7 @@ def torch_dynamic_per_tensor_quant_fp8_i8(x, dtype_quant):
     )
     scale_out = x_max.to(torch.float32) / dtype_max
 
-    out = (x_f32 / scale_out).to(dtype=dtype_quant)
+    out = torch_scaled_quant_cast(x_f32 / scale_out, dtype_quant)
 
     return out, torch.tensor([scale_out], dtype=torch.float32, device=x.device)
 
@@ -115,7 +121,7 @@ def torch_dynamic_per_token_quant_fp8_i8(x, dtype_quant):
 
     scale_recip = 1 / scale_out[:, None]
     out = x * scale_recip
-    out = out.to(dtype_quant)
+    out = torch_scaled_quant_cast(out, dtype_quant)
 
     return out, scale_out
 
