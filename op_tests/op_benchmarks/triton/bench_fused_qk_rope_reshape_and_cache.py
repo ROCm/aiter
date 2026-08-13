@@ -408,15 +408,6 @@ def run_benchmark(args):
         args={"metric": args.metric, "args": args},
     )
 
-    print(
-        f"Benchmarking fused_qk_rope_reshape_and_cache on {DEVICE_ARCH}: "
-        f"cache_dtype={args.cache_dtype} cache_layout={args.cache_layout} "
-        f"slot_pattern={args.slot_pattern} qkv_layout={args.qkv_layout} "
-        f"max_pos={args.max_pos} rotate_style={args.rotate_style} "
-        f"reuse_freqs_front_part={args.reuse_freqs_front_part} offs={args.offs} "
-        f"zeros={args.output_zeros} upcast_operand={args.upcast_operand}"
-    )
-
     triton.testing.perf_report([benchmark])(bench_fn).run(
         save_path="." if args.o else None, print_data=True
     )
@@ -429,114 +420,111 @@ def parse_int_or_list(value):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = get_parser(kernel_name="Fused QK RoPE Reshape and Cache")
-    parser.set_defaults(metric="bandwidth")
+    parser = get_parser(kernel_name="fused_qk_rope_reshape_and_cache")
+    parser.set_defaults(metric="time")
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
         default=DEFAULT_M,
-        help="Number of tokens (single int or comma-separated list).",
+        help="Number of tokens (single int or comma-separated list for multiple)",
     )
-    parser.add_argument("-QH", type=int, default=DEFAULT_QH, help="Number of Q heads.")
-    parser.add_argument("-KH", type=int, default=DEFAULT_KH, help="Number of KV heads.")
-    parser.add_argument("-D", type=int, default=DEFAULT_D, help="Head dimension.")
+    parser.add_argument("-QH", type=int, default=DEFAULT_QH, help="Number of Q heads")
+    parser.add_argument("-KH", type=int, default=DEFAULT_KH, help="Number of KV heads")
+    parser.add_argument("-D", type=int, default=DEFAULT_D, help="Head dimension")
     parser.add_argument(
         "--num_blocks",
         type=int,
         default=DEFAULT_NUM_BLOCKS,
-        help="Number of KV cache blocks.",
+        help="Number of KV cache blocks",
     )
     parser.add_argument(
         "--block_size",
         type=int,
         default=DEFAULT_BLOCK_SIZE,
-        help="KV cache block size.",
+        help="KV cache block size",
     )
     parser.add_argument(
         "--max_embd_pos",
         type=int,
         default=DEFAULT_MAX_EMBD_POS,
-        help="Number of rows in the cos/sin table that positions gather from.",
+        help="Number of rows in the cos/sin table that positions gather from",
     )
     parser.add_argument(
         "--max_pos",
         type=int,
         default=DEFAULT_MAX_POS,
-        help="Upper bound on the sampled positions (the serving run only reaches "
-        "ISL + OSL, far below the table length).",
+        help="Max positions",
     )
     parser.add_argument(
         "--cache_dtype",
         type=str,
         choices=list(CACHE_DTYPES),
         default="bf16",
-        help="KV cache dtype. 'fp4' is packed NVFP4 (gfx1250 only).",
+        help="KV cache dtype",
     )
     parser.add_argument(
         "--cache_layout",
         type=str,
         choices=CACHE_LAYOUTS,
         default="nonflash_v_shuffle",
-        help="KV cache layout (ignored for --cache_dtype fp4, which is always shuffled).",
+        help="KV cache layout",
     )
     parser.add_argument(
         "--slot_pattern",
         type=str,
         choices=SLOT_PATTERNS,
         default="blocked",
-        help="How slot_mapping scatters tokens over the cache: 'blocked' models a "
-        "prefill chunk (contiguous slots within each block), 'random' models decode.",
+        help="How slot_mapping scatters tokens over the cache (blocked = prefill)",
     )
     parser.add_argument(
         "--qkv_layout",
         type=str,
         choices=QKV_LAYOUTS,
         default="packed",
-        help="'packed' makes q/k/v strided views of one fused QKV buffer, as the "
-        "model call site does; 'split' passes three separate contiguous tensors.",
+        help="qkv layout: packed/split",
     )
     parser.add_argument(
         "--rotate_style",
         type=str,
         choices=["gptj", "neox"],
         default="neox",
-        help="RoPE rotate style.",
+        help="RoPE rotate style, gptj/neox",
     )
     parser.add_argument(
         "--reuse_freqs_front_part",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="cos/sin hold only the front half of the frequencies (d_freq == D // 2).",
+        help="cos/sin hold only the front half of the frequencies (d_freq == D // 2)",
     )
     parser.add_argument(
         "--offs",
         action="store_true",
         default=False,
-        help="Add a per-token offset tensor to the positions.",
+        help="Add a per-token offset tensor to the positions",
     )
     parser.add_argument(
         "--output_zeros",
         action="store_true",
         default=False,
-        help="Also write the zeros_out tensor (the model call site does not).",
+        help="Also write the zeros_out tensor",
     )
     parser.add_argument(
         "--upcast_operand",
         action="store_true",
         default=False,
-        help="Upcast the RoPE operands to fp32 inside the kernel.",
+        help="Upcast the RoPE operands to fp32 inside the kernel",
     )
     parser.add_argument(
         "--rep",
         type=int,
         default=20,
-        help="Target measurement window in ms passed to do_bench_cudagraph.",
+        help="Target measurement window in ms passed to do_bench_cudagraph",
     )
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
         default=False,
-        help="Print VGPR usage for Triton kernels.",
+        help="Print VGPR usage for Triton kernels",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
