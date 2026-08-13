@@ -448,7 +448,7 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen3.5-397b-ptpc-ali-bf16snapshot",
+        model_name="varlen-qwen3.5-397b-ptpc-ali-bf16snapshot",
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
@@ -456,7 +456,7 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen3.5-397b-ptpc-ali-fp32snapshot",
+        model_name="varlen-qwen3.5-397b-ptpc-ali-fp32snapshot",
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
@@ -464,7 +464,7 @@ _PREFILL_GROUPS = [
         snapshot_dtype=torch.float32,
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen-ali-tp1-bf16snapshot",
+        model_name="varlen-qwen-ali-tp1-bf16snapshot",
         Hv=32,
         tps=[1],
         full_prompt_lens=[8192],
@@ -472,7 +472,7 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[8192],
     ),
     PrefillGroup(
-        model_name="varlen-64k-qwen-ali-tp1-fp32snapshot",
+        model_name="varlen-qwen-ali-tp1-fp32snapshot",
         Hv=32,
         tps=[1],
         full_prompt_lens=[8192],
