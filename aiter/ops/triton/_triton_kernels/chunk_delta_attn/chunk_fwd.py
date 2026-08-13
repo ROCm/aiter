@@ -18,6 +18,12 @@ import torch
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     RCP_LN2,
 )
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+    CHUNK_DELTA_ATTN_USE_FLASH_KDA,
+    FLASH_KDA_CHUNK,
+    flash_kda_fwd,
+    flash_kda_supported,
+)
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.gla_output import (
     chunk_gla_fwd_o,
@@ -36,6 +42,10 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h imp
     chunk_gated_delta_rule_fwd_h,
 )
 
+# What an unset `chunk_size` falls back to when the FlashKDA path cannot serve
+# the call.
+_DEFAULT_CHUNK_SIZE = 64
+
 
 def chunk_delta_attn_fwd(
     q: torch.Tensor,
@@ -48,7 +58,7 @@ def chunk_delta_attn_fwd(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-    chunk_size: int = 64,
+    chunk_size: int | None = None,
     safe_gate: bool = False,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
@@ -79,7 +89,9 @@ def chunk_delta_attn_fwd(
         output_final_state: Whether to return the final recurrent state.
         cu_seqlens:         Cumulative sequence lengths for variable-length mode.
         chunk_indices:      Pre-computed chunk index pairs (computed if None).
-        chunk_size:         Chunk size BT, either 32 or 64 (default 64).
+        chunk_size:         Chunk size BT, either 32 or 64. ``None`` lets this
+                            function choose: 32 when that lets the FlashKDA path
+                            serve the call, 64 otherwise.
         safe_gate:          Use the sub-chunk intra kernel (more stable at boundaries).
         lower_bound:        If set, use sigmoid gating; else softplus gating.
         use_gate_in_kernel: If True, fuse A_log / dt_bias into the gate cumsum.
@@ -101,6 +113,36 @@ def chunk_delta_attn_fwd(
           Akk         ``[B, T, HV, BT]``
           w, u, qg, kg or None depending on disable_recompute
     """
+    # ------------------------------------------------------------------
+    # Fast path — two-kernel FlashKDA split
+    # ------------------------------------------------------------------
+    # Returns None for every intermediate: the fused kernels never materialize
+    # g_cumsum / Aqk / Akk / w / u, so this can only serve callers that discard
+    # them, which is why `disable_recompute` gates it too.
+    #
+    # The dispatch and an unset `chunk_size` are decided together because the
+    # only reason to prefer 32 is that it is this path's entry ticket: inside
+    # the default pipeline 64 is faster at every shape measured, so resolving
+    # the two apart risks landing on the default pipeline at 32, the slowest
+    # combination of the three.
+    use_flash_kda = (
+        CHUNK_DELTA_ATTN_USE_FLASH_KDA
+        and not disable_recompute
+        and flash_kda_supported(
+            q=q,
+            v=v,
+            chunk_size=FLASH_KDA_CHUNK if chunk_size is None else chunk_size,
+            safe_gate=safe_gate,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            lower_bound=lower_bound,
+            A_log=A_log,
+        )
+    )
+    if chunk_size is None:
+        chunk_size = FLASH_KDA_CHUNK if use_flash_kda else _DEFAULT_CHUNK_SIZE
+
     if chunk_size not in (32, 64):
         raise ValueError(
             f"`chunk_size` must be either 32 or 64 for chunk_delta_attn, got {chunk_size}."
@@ -108,6 +150,25 @@ def chunk_delta_attn_fwd(
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+
+    if use_flash_kda:
+        o, final_state = flash_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            lower_bound=lower_bound,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        return o, final_state, None, None, None, None, None, None, None
 
     # ------------------------------------------------------------------
     # Step 0 — Optional QK L2 normalization (matches FLA API)
