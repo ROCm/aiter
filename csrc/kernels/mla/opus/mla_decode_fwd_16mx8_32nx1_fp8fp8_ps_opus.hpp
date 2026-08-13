@@ -42,6 +42,16 @@
 // one SIMD (one computes while the other waits) and only ~46 cycles per SIMD are dead.
 
 #include "mla_fp8fp8_def.h"
+
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
+
+template <class Traits>
+__global__ void mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel(mla_kargs)
+{
+}
+
+#else
+
 #include "mla_global_load.hpp"
 #include <bit>
 #include <cstdint>
@@ -1382,3 +1392,5 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         //     mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_kv, temperature_scale);
     }
 }
+
+#endif // !__HIP_DEVICE_COMPILE__ || !__gfx950__
