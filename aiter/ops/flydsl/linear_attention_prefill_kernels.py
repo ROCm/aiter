@@ -18,6 +18,7 @@ For an end-to-end GDN forward that uses this K5 wrapper, call
 
 from __future__ import annotations
 
+import csv
 import functools
 import math
 import os
@@ -680,7 +681,88 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 # gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
 # (SCHED_GFX942). ``get_rocm_arch()`` may return a feature-suffixed string like
 # ``gfx942:sramecc+:xnack-``; normalize before matching.
-_IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
+_GFX_ARCH = get_rocm_arch().split(":")[0]
+_IS_GFX942 = _GFX_ARCH.startswith("gfx942")
+
+# Offline-measured BV table for the mfma16_hip fork, consulted before the
+# CU/LDS rule below. See the csv header for the schema and how to extend it.
+_BV_TUNED_CSV = os.path.join(
+    os.path.dirname(__file__), "chunk_gdn_h_mfma16_hip_tuned.csv"
+)
+
+
+def _load_tuned_bv_table() -> dict[tuple, int]:
+    """Load the tuned BV table at import time.
+
+    Deliberately eager and stdlib-only: a lazy first-call load would put the
+    file read (0.15ms here, ~3.6ms via pandas) inside the first prefill of a
+    live server. A missing or malformed table is not fatal -- every lookup then
+    misses and the CU/LDS rule answers, which is the pre-table behaviour.
+    """
+    table: dict[tuple, int] = {}
+    try:
+        with open(_BV_TUNED_CSV, "r", encoding="utf-8", newline="") as f:
+            rows = csv.DictReader(
+                line for line in f if not line.lstrip().startswith("#")
+            )
+            for row in rows:
+                bv = (row.get("BV") or "").strip()
+                if not bv:
+                    continue  # AOT-only row: shape is pre-compiled, BV untuned
+                key = (
+                    (row["arch"] or "").strip(),
+                    int(row["H"]),
+                    int(row["Hg"]),
+                    int(row["V"]),
+                    row["is_varlen"].strip() == "True",
+                    row["snapshot_bf16"].strip() == "True",
+                    row["state_bf16"].strip() == "True",
+                    int(row["total_chunks"]),
+                    int(row["max_seq_chunks"]),
+                )
+                table[key] = int(bv)
+    except (OSError, KeyError, ValueError):
+        return {}
+    return table
+
+
+_BV_TUNED_TABLE = _load_tuned_bv_table()
+
+
+def _tuned_bv(
+    *,
+    H: int,
+    Hg: int,
+    V: int,
+    is_varlen: bool,
+    snapshot_bf16: bool,
+    state_bf16: bool,
+    total_chunks: int,
+    max_seq_chunks: int,
+) -> int | None:
+    """Measured BV for this exact batch shape, or None to use the rule.
+
+    Matching is exact rather than nearest-neighbour: every key component is
+    already on the host (no D2H), so this is a single dict probe (~0.09us,
+    against ~46us of wrapper host time per call), and an unmeasured shape falls
+    through to the rule instead of inheriting a neighbour's tile.
+    """
+    if not _BV_TUNED_TABLE:
+        return None
+    return _BV_TUNED_TABLE.get(
+        (
+            _GFX_ARCH,
+            H,
+            Hg,
+            V,
+            is_varlen,
+            snapshot_bf16,
+            state_bf16,
+            total_chunks,
+            max_seq_chunks,
+        )
+    )
+
 
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
@@ -1190,7 +1272,21 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
-    BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
+    # Offline-measured value first; the rule answers every shape the table does
+    # not cover (which is the common case -- the table only holds shapes that
+    # were actually benchmarked).
+    BV = _tuned_bv(
+        H=H,
+        Hg=Hg,
+        V=V,
+        is_varlen=is_varlen,
+        snapshot_bf16=snapshot_bf16,
+        state_bf16=state_bf16,
+        total_chunks=_total_chunks,
+        max_seq_chunks=_max_seq_chunks,
+    )
+    if BV is None:
+        BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
 
     # Env override for A/B BV sweeps; the hand-tuned HIP K5 reference is fixed
     # at BV=16 (FLYDSL_K5_MFMA16HIP_BV=16 reproduces it).
