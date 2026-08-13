@@ -15,8 +15,8 @@ Run:
 import csv
 import os
 import re
-import sys
 import subprocess
+import sys
 import unittest
 
 AITER_ROOT = os.path.dirname(
@@ -70,7 +70,7 @@ def _resolve_config_via_aiter(config_property):
         config_file = getattr(AITER_CONFIGS, config_property, None)
         if config_file and os.path.exists(config_file):
             return config_file
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return None
 
@@ -105,6 +105,7 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(
@@ -165,7 +166,7 @@ def _parse_all_benchmark_results(lines):
         stripped = line.strip()
         if "| " not in stripped:
             continue
-        if stripped.startswith("Shape") or stripped.startswith("-"):
+        if stripped.startswith(("Shape", "-")):
             continue
         parts = [p.strip() for p in stripped.split("|")]
         if len(parts) < 3:
@@ -267,6 +268,9 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "fmoe"],
+        # Merged CSV has ~15k shapes plus a production-op benchmark pass;
+        # the default 600s is not enough.
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
     },
     "a8w8_blockscale_bpreshuffle": {
@@ -274,6 +278,7 @@ TUNER_FAMILIES = {
         "csv_pattern": "a8w8_blockscale_bpreshuffle_tuned_gemm",
         "exclude_patterns": ["fmoe"],
         "extra_args": ["--preshuffle"],
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
     },
     "a4w4_blockscale": {
@@ -298,11 +303,18 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
         "csv_pattern": "tuned_fmoe",
         "exclude_patterns": ["untuned", "profile"],
-        "timeout": 1200,
+        # fmoe merges many model configs and JIT-builds many modules; needs >1h.
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_FMOE_FILE",
     },
     "gradlib_bf16": {
         "script": "gradlib/gradlib/gemm_tuner.py",
+        "csv_pattern": "bf16_tuned_gemm",
+        "exclude_patterns": ["batched"],
+        "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
+    },
+    "csrc_bf16": {
+        "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
         "csv_pattern": "bf16_tuned_gemm",
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
@@ -398,6 +410,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gradlib_bf16(self):
         self._test_family("gradlib_bf16")
+
+    def test_csrc_bf16(self):
+        self._test_family("csrc_bf16")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

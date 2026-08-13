@@ -175,6 +175,7 @@ jobs:
 
       - name: Download actions snapshot
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           name: actions-job-snapshot
           path: .
@@ -207,6 +208,7 @@ jobs:
 
       - name: Download actions snapshot
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           name: actions-job-snapshot
           path: .

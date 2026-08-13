@@ -1,16 +1,18 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
-from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from triton.language.core import _aggregate as aggregate
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 import math
+
+import torch
+import triton.experimental.gluon.language as gl
+import triton.language as tl
+from triton.experimental import gluon
+from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -34,6 +36,7 @@ def apply_softcap(S, x):
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -58,7 +61,6 @@ class AttentionConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -106,6 +108,7 @@ class AttentionConfig:
         self,
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
@@ -134,6 +137,7 @@ class AttentionConfig:
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
+        self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.NUM_BLOCKS_GATHER_PER_TILE = gl.constexpr(NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_SEGMENTS_PER_SEQ = gl.constexpr(NUM_SEGMENTS_PER_SEQ)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -149,7 +153,6 @@ class AttentionConfig:
         self.SCALE_K_WIDTH = gl.constexpr(SCALE_K_WIDTH)
         self.BLOCK_SCALES_SIZE = gl.constexpr(BLOCK_SCALES_SIZE)
         # Derived constants
-        self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
@@ -555,6 +558,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     """Program state and core operations for the unified attention kernel."""
 
@@ -1297,7 +1301,7 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-                return gl.amd.gfx1250.local_load_packed_transposed(
+                return gl.amd.gfx1250.load_shared_fp4_repacked(
                     self.lds_unshuffle_v(buffer_id), layout=self.cfg.V_DOT_PACKED_LAYOUT
                 )
             else:
@@ -1530,7 +1534,7 @@ class AttentionProgram:
         p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
-            v = gl.amd.gfx1250.local_load_packed_transposed(
+            v = gl.amd.gfx1250.load_shared_fp4_repacked(
                 self.v_shared.index(buffer_id)
                 .reshape(
                     (
@@ -1901,8 +1905,8 @@ def e2m1_packed_to_fp(
 unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
     "_unified_attention_gluon_kernel_3d",
     [
-        "num_query_heads",
-        "num_queries_per_kv",
+        "NUM_QUERY_HEADS",
+        "NUM_KV_HEADS",
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
@@ -1977,7 +1981,7 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  #
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH: gl.constexpr = 16,  # int
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
@@ -1993,6 +1997,7 @@ def _unified_attention_gluon_kernel_3d(
     cfg = AttentionConfig(
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
@@ -2123,9 +2128,9 @@ def _unified_attention_gluon_kernel_3d(
     )
     q_shared.store(Q_load)
     Q = q_shared.load(layout=cfg.Q_DOT_LAYOUT)
-    if QUERY_DTYPE != "nvfp4":
-        Q = Q.to(gl.float32) * qk_factor
-        Q = Q.to(query_ptr.type.element_ty)
+    # if QUERY_DTYPE != "nvfp4":
+    #     Q = Q.to(gl.float32) * qk_factor
+    #     Q = Q.to(query_ptr.type.element_ty)
 
     if QUERY_DTYPE == "nvfp4":
         # A4W4
@@ -2154,8 +2159,8 @@ def _unified_attention_gluon_kernel_3d(
         q_scales = q_scales_shared.load(layout=cfg.Q_SCALES_DOT_LAYOUT).to(
             e4m3_dtype, bitcast=True
         )
-        q_scales = q_scales.to(gl.float32) * qk_factor
-        q_scales = q_scales.to(e4m3_dtype)
+        # q_scales = q_scales.to(gl.float32) * qk_factor
+        # q_scales = q_scales.to(e4m3_dtype)
     elif KV_CACHE_DTYPE == "nvfp4":
         # A8W4
         q_scales = gl.full(
@@ -2280,8 +2285,11 @@ def _unified_attention_gluon_kernel_3d(
         cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
     if need_addtional_mask:
-        seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+        seq_offset = (
+            j_hbm_start * cfg.TILE_SIZE
+            + gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )[None, :]
         )
 
     # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride # no-paging expt
@@ -2313,11 +2321,11 @@ def _unified_attention_gluon_kernel_3d(
         pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
 
         S = pgm.compute_qk(k, q_scales, k_scales)
-        # S = S * qk_factor
+        S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
-            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
@@ -2356,7 +2364,7 @@ def _unified_attention_gluon_kernel_3d(
     if not need_addtional_mask:
         seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
-        )
+        )[None, :]
 
     if KV_CACHE_DTYPE == "nvfp4":
         k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
@@ -2367,10 +2375,10 @@ def _unified_attention_gluon_kernel_3d(
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         k_scales = None
     S = pgm.compute_qk(k, q_scales, k_scales)
-    # S = S * qk_factor
+    S = S * qk_factor
 
     S = pgm.apply_softcap(S)
-    seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
     S = gl.where(seq_mask, S, float("-inf"))
     if need_addtional_mask:
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)

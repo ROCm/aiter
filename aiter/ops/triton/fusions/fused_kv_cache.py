@@ -3,24 +3,32 @@
 
 import torch
 import triton
-from typing import Tuple
+
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+        _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
+    )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
+    gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
@@ -46,7 +54,8 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    upcast_operand: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
@@ -104,10 +113,11 @@ def fused_qk_rope_cat_and_cache_mla(
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    upcast_operand: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
-    the concatentaed k_nope and k_pe are copied to kv_cache inplace
+    the concatenated k_nope and k_pe are copied to kv_cache inplace
 
     Key parameters:
     - q_nope: Matrix X with shape (B, QH, D1).
@@ -117,7 +127,7 @@ def fused_qk_rope_cat_and_cache_mla(
     - kv_cache: Matrix W with shape (B_cache, KH, D1 + D2).
     - slot_mapping: Matrix W with shape (B_slot, ).
 
-    B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cahce is the max number of tokens of kv_cache
+    B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
 
     Returns:
@@ -134,6 +144,7 @@ def fused_qk_rope_cat_and_cache_mla(
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
+    d_freq = cos.shape[-1]
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -145,7 +156,7 @@ def fused_qk_rope_cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_pe // 16
         SCALE_K_WIDTH_NOPE = (
@@ -160,9 +171,9 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     # allow bk >= b to support prefill + decode mixed scenario
@@ -182,7 +193,6 @@ def fused_qk_rope_cat_and_cache_mla(
             dk_nope + d_pe == d_cache
         ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -204,13 +214,6 @@ def fused_qk_rope_cat_and_cache_mla(
         assert (
             b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out
         ), "q_out shape mismatch"
-        # The gluon kernel reuses qn_smem/qpe_smem (sized in q_nope dtype) to
-        # stage the q_out async_store. That requires the q_out dtype to match
-        # the input q_nope/q_pe dtype.
-        assert q_out.dtype == q_nope.dtype == q_pe.dtype, (
-            f"q_out dtype ({q_out.dtype}) must match q_nope dtype ({q_nope.dtype})"
-            f" and q_pe dtype ({q_pe.dtype})"
-        )
 
     if decode_q_pe_out is None:
         decode_q_pe_out = torch.empty(
@@ -257,8 +260,13 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
+        # arg for a uniform launch interface with the BLOCK kernel. Pass the
+        # cos/sin cache length to satisfy its signature.
+        _extra_uniform_args = (cos.shape[0],)
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _extra_uniform_args = ()
 
     _kernel[grid](
         q_nope,
@@ -277,6 +285,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
+        *_extra_uniform_args,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -306,6 +315,7 @@ def fused_qk_rope_cat_and_cache_mla(
         SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
+        UPCAST_OPERAND=upcast_operand,
         num_warps=1,
     )
 
@@ -332,14 +342,15 @@ def fused_qk_rope_reshape_and_cache(
     k_out: torch.Tensor = None,
     output_zeros: bool = True,
     zeros_out: torch.Tensor = None,
+    upcast_operand: bool = False,
 ):
     """
-    Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
+    Perform RoPE on q and k and along the last dimension and copy k and v into key_cache and value_cache inplace
 
     Key parameters:
     - q: shape (T, QH, D).
-    - k: shape (T_slot, KH, D).
-    - v: shape (T_slot, KH, D).
+    - k: shape (T, KH, D).
+    - v: shape (T, KH, D).
     - if flash_layout:
     -     key_cache: shape (T_cache, block_size, KH, D).
     -     value_cache: shape (T_cache, block_size, KH, D).
@@ -348,7 +359,7 @@ def fused_qk_rope_reshape_and_cache(
     -     value_cache: shape (T_cache, KH, D, block_size).
     - slot_mapping: shape (T_slot, ).
 
-    T is the number of decode tokens, T_cahce * block_size is the max number of tokens of kv_cache
+    T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
 
     Returns:
@@ -376,6 +387,8 @@ def fused_qk_rope_reshape_and_cache(
     SCALE_K_WIDTH = 4
     x_cache = 8
     value_shuffle_layout = False
+    max_embd_pos = cos.shape[0]
+    d_freq = cos.shape[-1]
     if kv_cache_dtype == torch.uint8:
         # always shuffled
         t_cache, kh_cache, block_size, d_cache = key_cache.shape
@@ -407,8 +420,8 @@ def fused_qk_rope_reshape_and_cache(
     (t_slot,) = slot_mapping.shape
 
     assert (
-        t == tk == tv and t_slot <= tk
-    ), f"Number of tokens should be identical for q, kand v. The number of tokens of slot_mapping should no more than that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
+        t == tk == tv and t <= t_slot
+    ), f"Number of tokens should be identical for q, kand v. The number of tokens of slot_mapping should no more less that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
     assert (
         block_size == block_size_v
     ), f"block size should be identical for key_cache, and value_cache {block_size} {block_size_v}"
@@ -444,7 +457,6 @@ def fused_qk_rope_reshape_and_cache(
         block_size
     ), "block_size should be power of 2"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d // 2) or (
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -520,9 +532,25 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_slot_chunk = 0
         value_cache_stride_x = 0
 
-    n_pid = t * qh + (t_slot - t) * kh
+    # On gfx1250 the gluon 2D kernel handles all bf16/fp8 cache layouts in
+    # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
+    # kernel (no NVFP4 support in the 2D gluon kernel yet).
+    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+        if t < 1024:
+            BLOCK_T = 1
+        elif t < 2048:
+            BLOCK_T = 2
+        else:
+            BLOCK_T = 16
+        n_pid = triton.cdiv(t, BLOCK_T) * qh + triton.cdiv(t_slot - t, BLOCK_T) * kh
+        _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
+        _extra_args = {"BLOCK_T": BLOCK_T}
+    else:
+        n_pid = t * qh + (t_slot - t) * kh
+        _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
+        _extra_args = {}
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_reshape_and_cache_kernel[grid](
+    _kernel[grid](
         q,
         k,
         v,
@@ -538,6 +566,7 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out,
         t,
         t_slot,
+        max_embd_pos,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -556,25 +585,6 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_b,
         value_cache_stride_slot_chunk,
         value_cache_stride_x,
-        # key_cache.stride(0) if not flash_layout else key_cache.stride(0),
-        # key_cache.stride(1) if not flash_layout else key_cache.stride(2),
-        # key_cache.stride(2) if not flash_layout else key_cache.stride(3),
-        # key_cache.stride(3) if not flash_layout else key_cache.stride(1),
-        # key_cache.stride(4) if not flash_layout else 0,
-        # value_cache.stride(0) if not flash_layout else value_cache.stride(0),
-        # value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        # (
-        #     value_cache.stride(3)
-        #     if (not flash_layout and value_shuffle_layout)
-        #     else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
-        # ),
-        # (
-        #     0
-        #     if (not flash_layout and value_shuffle_layout)
-        #     else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
-        # ),
-        # value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
-        # value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
         zeros_out.stride(0) if zeros_out is not None else 0,
         zeros_out.stride(1) if zeros_out is not None else 0,
         zeros_out.stride(2) if zeros_out is not None else 0,
@@ -596,7 +606,9 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         HAVE_ZEROS=output_zeros,
+        UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **_extra_args,
     )
 
     if zeros_out is not None:
@@ -623,12 +635,12 @@ def fused_qk_rope_cosine_cache_llama(
     q_out: torch.Tensor = None,
 ):
     """
-    Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
+    Perform RoPE on q and k and along the last dimension and copy k and v into key_cache and value_cache inplace
 
     Key parameters:
     - q: shape (T, QH, D).
-    - k: shape (T_slot, KH, D).
-    - v: shape (T_slot, KH, D).
+    - k: shape (T, KH, D).
+    - v: shape (T, KH, D).
     - if flash_layout:
     -     key_cache: shape (T_cache, block_size, KH, D).
     -     value_cache: shape (T_cache, block_size, KH, D).
@@ -637,7 +649,7 @@ def fused_qk_rope_cosine_cache_llama(
     -     value_cache: shape (T_cache, KH, D, block_size).
     - slot_mapping: shape (T_slot, ).
 
-    T is the number of decode tokens, T_cahce * block_size is the max number of tokens of kv_cache
+    T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
 
     Returns:
@@ -662,8 +674,8 @@ def fused_qk_rope_cosine_cache_llama(
     (t_slot,) = slot_mapping.shape
 
     assert (
-        t == tk == tv and t_slot <= tk
-    ), f"Number of tokens should be identical for q, kand v. The number of tokens of slot_mapping should no more than that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
+        t == tk == tv and t <= t_slot
+    ), f"Number of tokens should be identical for q, k and v. The number of tokens of slot_mapping should be no less than that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
     assert (
         block_size == block_size_v
     ), f"block size should be identical for key_cache, and value_cache {block_size} {block_size_v}"
@@ -716,12 +728,12 @@ def fused_qk_rope_cosine_cache_llama(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
-        key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+        key_cache.stride(0),
         key_cache.stride(1) if not flash_layout else key_cache.stride(2),
         key_cache.stride(2) if not flash_layout else key_cache.stride(3),
         key_cache.stride(3) if not flash_layout else key_cache.stride(1),
         key_cache.stride(4) if not flash_layout else 0,
-        value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+        value_cache.stride(0),
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
         value_cache.stride(2) if not flash_layout else value_cache.stride(3),
         value_cache.stride(3) if not flash_layout else value_cache.stride(1),

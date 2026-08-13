@@ -7,14 +7,16 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 --shape_grouped with profile row count comparison.
 """
 
+import csv
 import glob
 import os
+import subprocess
 import sys
-import csv
 import tempfile
 import textwrap
-import subprocess
 import unittest
+from typing import Any, ClassVar
+
 import pandas as pd
 
 AITER_ROOT = os.path.dirname(
@@ -37,7 +39,7 @@ def _get_platform_dtypes():
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
-    except Exception:
+    except Exception:  # noqa: BLE001
         gfx = "gfx942"
     if gfx in ("gfx950", "gfx1250"):
         return "torch.float8_e4m3fn", "QuantType.per_1x128"
@@ -101,6 +103,7 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         _cleanup_stale_lock_files()
@@ -283,6 +286,56 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "csrc_bf16": {
+                "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
+                "header": [
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
+                "shapes": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                    (
+                        512,
+                        5120,
+                        1280,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "shapes_mp1": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "keys": ["M", "N", "K"],
+                "timeout": 900,
+                "timeout_mp1": 1800,
+            },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
                 "header": [
@@ -296,7 +349,6 @@ class TestTunePipeline(unittest.TestCase):
                     "bpreshuffle",
                 ],
                 "shapes": [
-                    # decode (M=1): hipBLASLt/ASM typically wins
                     (
                         1,
                         1024,
@@ -307,20 +359,8 @@ class TestTunePipeline(unittest.TestCase):
                         "False",
                         "False",
                     ),
-                    # prefill (large M): FlyDSL has a chance to win
-                    (
-                        512,
-                        5120,
-                        1280,
-                        "False",
-                        "torch.bfloat16",
-                        "torch.bfloat16",
-                        "False",
-                        "False",
-                    ),
                 ],
                 "shapes_mp1": [
-                    # single small decode shape for mp=1
                     (
                         1,
                         1024,
@@ -464,6 +504,12 @@ class TestTunePipeline(unittest.TestCase):
     def test_fmoe_mp_default(self):
         self._run_one("fmoe", mp=None)
 
+    def test_csrc_bf16_mp1(self):
+        self._run_one("csrc_bf16", mp=1)
+
+    def test_csrc_bf16_mp_default(self):
+        self._run_one("csrc_bf16", mp=None)
+
     def _run_gradlib(self, mp):
         """gradlib spawns an internal subprocess; use /tmp paths that persist."""
         cfg = self.TUNERS["gradlib_bf16"]
@@ -507,7 +553,7 @@ class TestTunePipeline(unittest.TestCase):
 class TestShapeGrouped(unittest.TestCase):
     """Test --shape_grouped: same profile count, correct tuned row count."""
 
-    CONFIGS = {
+    CONFIGS: ClassVar[dict[str, Any]] = {
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
@@ -587,7 +633,7 @@ class TestShapeGrouped(unittest.TestCase):
 class TestComparePipeline(unittest.TestCase):
     """Test --compare --update_improved end-to-end."""
 
-    CONFIGS = {
+    CONFIGS: ClassVar[dict[str, Any]] = {
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
@@ -695,6 +741,10 @@ class TestOnlineTuneE2E(unittest.TestCase):
         env = os.environ.copy()
         env["AITER_ONLINE_TUNE"] = "1"
         env["AITER_CONFIG_FMOE"] = tuned_csv
+        # Force subprocess to import aiter from this checkout, not any editable
+        # install on PYTHONPATH (e.g. an older /app/aiter-test with the stale
+        # fmoe_2stages/tune.py online-tune path).
+        env["PYTHONPATH"] = AITER_ROOT + os.pathsep + env.get("PYTHONPATH", "")
 
         try:
             result = subprocess.run(
@@ -704,6 +754,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
                 timeout=timeout,
                 cwd=AITER_ROOT,
                 env=env,
+                check=False,
             )
         except subprocess.TimeoutExpired as e:
             raise AssertionError(
@@ -717,7 +768,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
     def test_online_tune_triggers_and_succeeds(self):
         """AITER_ONLINE_TUNE=1 with empty config -> tuner runs, op succeeds."""
         with tempfile.TemporaryDirectory() as tmp:
-            result, tuned_csv, untuned_csv = self._run_online_tune_script(tmp)
+            result, tuned_csv, _untuned_csv = self._run_online_tune_script(tmp)
 
             if result.returncode != 0:
                 print(f"\n=== ONLINE TUNE E2E STDOUT ===\n{result.stdout[-3000:]}")

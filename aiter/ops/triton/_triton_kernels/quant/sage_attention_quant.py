@@ -1,7 +1,6 @@
 import triton
 import triton.language as tl
 
-
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 ################# Sage V2 quantization kernels ####################
@@ -549,22 +548,21 @@ def _rotate_quantize_qk_kernel(
     )  # (BLOCK_M, D)
     original_dtype = qk_tile.dtype
 
-    if is_q_pid:
-        if q_smoothing:
-            ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
-            m_row_mean = (
-                tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M
-            )  # Sum over BLOCK_M -> shape [D]
-            qk_tile -= m_row_mean[None, :]
-            qk_tile = qk_tile.to(original_dtype)
-            mean_ptr = (
-                Q_mean
-                + pid_b * stride_mb
-                + pid_h * stride_mh
-                + pid_m * stride_mm
-                + offs_d * stride_md
-            )
-            tl.store(mean_ptr, m_row_mean * sm_scale)
+    if is_q_pid and q_smoothing:
+        ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
+        m_row_mean = (
+            tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M
+        )  # Sum over BLOCK_M -> shape [D]
+        qk_tile -= m_row_mean[None, :]
+        qk_tile = qk_tile.to(original_dtype)
+        mean_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m * stride_mm
+            + offs_d * stride_md
+        )
+        tl.store(mean_ptr, m_row_mean * sm_scale)
 
     if hadamard_rotation:
         r_ptr = (
@@ -839,6 +837,80 @@ def _compute_delta_s_kernel(
         + offs_n * stride_sn
     )
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
+
+
+@triton.jit
+def _q_smooth_int8_kernel(
+    Q,
+    Q_out,
+    Q_mean,
+    sm_scale,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_qob,
+    stride_qoh,
+    stride_qom,
+    stride_qod,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_md,
+    n_heads,
+    seq_len,
+    d_model,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Block Q smoothing for INT8 Sage v1 (no Hadamard): center Q per block, store block mean."""
+    pid_bh = tl.program_id(0).to(tl.int64)
+    pid_m = tl.program_id(1).to(tl.int64)
+    pid_d = tl.program_id(2).to(tl.int64)
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    q_ptr = (
+        Q
+        + pid_b * stride_qb
+        + pid_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    q_tile = tl.load(
+        q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
+    )
+    if sm_scale is not None:
+        q_tile = q_tile * sm_scale
+
+    m_row_mean = tl.sum(q_tile, axis=0) / BLOCK_M
+    q_tile = q_tile - m_row_mean[None, :]
+
+    mean_ptr = (
+        Q_mean
+        + pid_b * stride_mb
+        + pid_h * stride_mh
+        + pid_m * stride_mm
+        + offs_d * stride_md
+    )
+    tl.store(mean_ptr, m_row_mean, mask=offs_d < d_model)
+
+    out_ptr = (
+        Q_out
+        + pid_b * stride_qob
+        + pid_h * stride_qoh
+        + offs_m[:, None] * stride_qom
+        + offs_d[None, :] * stride_qod
+    )
+    tl.store(
+        out_ptr,
+        q_tile,
+        mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
+    )
 
 
 ################# Sage V1 quantization kernels ####################

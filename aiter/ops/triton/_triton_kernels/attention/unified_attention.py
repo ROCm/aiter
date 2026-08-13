@@ -1,10 +1,11 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import torch
 import triton
 import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -845,7 +846,18 @@ def kernel_unified_attention_3d(
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
-@triton.jit
+_reduce_segments_repr = make_kernel_repr(
+    "reduce_segments",
+    [
+        "num_query_heads",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "NUM_SEGMENTS_PER_SEQ",
+    ],
+)
+
+
+@triton.jit(repr=_reduce_segments_repr)
 def reduce_segments(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,

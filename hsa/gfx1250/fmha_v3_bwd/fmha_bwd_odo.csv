@@ -1,0 +1,2 @@
+dtype,hdim_q,hdim_v,mask,atomic32,pssk,pddv,mode,bf16_cvt,ts_qo,ts,knl_name,co_name
+bf16,128,128,0,0,0,0,0,3,0,128,_ZN5aiter23fmha_bwd_hd128_odo_bf16E,bwd_hd128_odo_bf16.co

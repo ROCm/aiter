@@ -1,0 +1,433 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// gfx1250 F4GEMM ASM dispatch (preload SGPR mode).
+// Two entrypoints:
+//   - mxfp4_gemm_asm: D = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
+//   - nvfp4_gemm_asm: D = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
+// Output D is bf16 [M,N], packed FP4 [M,N/2] (fp4x2, cvt_scale=1), or fp8:
+// FP8 e4m3 [M,N] data + a per-128-block E8M0 scale [M,N/128] (out_scale).
+//
+// KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1): pointers
+// first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW,
+// keyed by intype (dw18..21 layout) and whether the output is fp8:
+//   MXFP4      : 80B (struct minus the 2 trailing persistent log2 dwords)
+//   MXFP4 + fp8: 88B (ScaleD overlaid on the unused dw20/21 log2 slots)
+//   NVFP4      : 88B (full struct incl. GlobalScaleA/B + trailing log2)
+//   NVFP4 + fp8: 96B (full struct + dedicated dw22/23 ScaleD pointer)
+//
+// The fp8 output-scale pointer reuses the per-intype overlay trick that log2
+// does: NVFP4 gets a dedicated slot (dw22/23); MXFP4 (no GlobalScale, log2 in
+// dw18/19) overlays ScaleD onto its still-unused dw20/21 slots.
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
+#include "asm_f4gemm_configs.hpp"
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <memory>
+#include <hip/hip_runtime.h>
+
+constexpr int MXFP4_SCALE_BLOCK = 32;
+constexpr int NVFP4_SCALE_BLOCK = 16;
+
+// Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
+// kernarg byte offsets the preload-aware shader s_load's from.
+struct __attribute__((packed)) KernelArgs
+{
+    void*        ptr_D;            // dw 0..1   (off 0x00)
+    void*        ptr_A;           // dw 2..3   (off 0x08)
+    void*        ptr_B;           // dw 4..5   (off 0x10)
+    void*        ptr_ScaleA;       // dw 6..7   (off 0x18)
+    void*        ptr_ScaleB;       // dw 8..9   (off 0x20)
+    unsigned int strideD0;         // dw 10     (off 0x28)
+    unsigned int strideA0;         // dw 11     (off 0x2C)
+    unsigned int strideB0;        // dw 12     (off 0x30)
+    unsigned int ScaleA_stride0;   // dw 13     (off 0x34)
+    unsigned int ScaleB_stride0;  // dw 14     (off 0x38)
+    unsigned int M;                // dw 15     (off 0x3C)
+    unsigned int N;                // dw 16     (off 0x40)
+    unsigned int K;                // dw 17     (off 0x44)
+    float        GlobalScaleA;     // dw 18     (off 0x48) NVFP4 only
+    float        GlobalScaleB;     // dw 19     (off 0x4C) NVFP4 only
+    unsigned int log2_grid_x;      // dw 20     NVFP4 persistent; MXFP4+fp8: ScaleD low
+    unsigned int log2_grid_y;      // dw 21     NVFP4 persistent; MXFP4+fp8: ScaleD high
+    void*        ptr_ScaleD;       // dw 22..23 (off 0x58) NVFP4+fp8 output E8M0 scale
+};
+// 5 ptrs (40B) + 8 scalars (32B) + GlobalScaleA/B (8B) + 2 log2 (8B) + ScaleD (8B) = 96B.
+// Only fp8 outputs ship ScaleD; other outputs ship 80B (MXFP4) / 88B (NVFP4).
+static_assert(sizeof(KernelArgs) == 96, "f4gemm preload KernelArgs must be 96B");
+
+static std::tuple<std::string, int> get_heuristic_kernel(
+    int M, int N, int K, std::string arch_id, const std::string& intype,
+    const std::string& outtype, int a_preshuffle, CFG* cfgs)
+{
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+    uint32_t num_cu        = dev_prop.multiProcessorCount;
+    uint32_t empty_cu      = num_cu;
+    uint32_t tg_num        = 0;
+    uint32_t round         = 0xffffffff;
+    float compute2mem_effi = 1.0f;
+    std::string selectedKernelName = "";
+
+    for(const auto& el : *cfgs)
+    {
+        if(el.first.find(arch_id) != 0)
+            continue;
+        const auto& cfg = el.second;
+        if(cfg.intype != intype || cfg.a_preshuffle != a_preshuffle)
+            continue;
+        // (intype, a_preshuffle, outtype) maps to a single .co in the CSV; the
+        // scale mode is baked into that variant (fp4 output is a noscale .co).
+        if(cfg.outtype != outtype)
+            continue;
+        // Persistent/cluster shaders don't mask partial tiles, so the problem
+        // must tile both dims exactly.
+        if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
+            continue;
+
+        int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;  // tiles in M (gdy)
+        int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;  // tiles in N (gdx)
+
+        // Cluster dims (compile-time per .co, declared in the CSV) must evenly
+        // divide the tile grid; otherwise this variant can't run this shape.
+        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
+        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+        if((cl_x > 1 && (tg_num_N % cl_x) != 0) || (cl_y > 1 && (tg_num_M % cl_y) != 0))
+            continue;
+
+        tg_num               = tg_num_M * tg_num_N;
+        uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+
+        float local_compute2mem_effi =
+            (float)(cfg.tile_m * cfg.tile_n) / (cfg.tile_m + cfg.tile_n);
+
+        bool is_earlier_round        = (local_round < round);
+        bool is_same_round           = (local_round == round);
+        bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
+        bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
+
+        if(is_earlier_round ||
+           (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
+        {
+            round              = local_round;
+            empty_cu           = local_round * num_cu - tg_num;
+            compute2mem_effi   = local_compute2mem_effi;
+            selectedKernelName = el.first;
+        }
+    }
+
+    AITER_CHECK(selectedKernelName != "",
+                __func__,
+                ": cannot get heuristic kernel for intype=",
+                intype,
+                ", outtype=",
+                outtype,
+                ", a_preshuffle=",
+                a_preshuffle,
+                ", M=",
+                M,
+                ", N=",
+                N,
+                ", K=",
+                K);
+    return std::make_tuple(selectedKernelName, 1);
+}
+
+// Shared dispatch body. arg_size (shipped bytes) is set per (intype, out_is_fp8)
+// below; see the KernelArgs ABI table at the top of this file.
+static void f4gemm_launch(aiter_tensor_t* A,
+                                aiter_tensor_t* B,
+                                aiter_tensor_t* ScaleA,
+                                aiter_tensor_t* ScaleB,
+                                aiter_tensor_t* out,
+                                aiter_tensor_t* out_scale,   // fp8 output E8M0 scale (null otherwise)
+                                const char*     kernelName,
+                                const std::string& intype,
+                                int             a_preshuffle,
+                                float           GlobalScaleA,
+                                float           GlobalScaleB,
+                                hipStream_t     stream)
+{
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp4x2 ||
+                    out->dtype() == AITER_DTYPE_fp8,
+                __func__,
+                " only supports BFloat16, packed FP4 (fp4x2) or FP8 (e4m3 + E8M0 scale) output");
+    const bool out_is_fp4 = (out->dtype() == AITER_DTYPE_fp4x2);
+    const bool out_is_fp8 = (out->dtype() == AITER_DTYPE_fp8);
+    // CSV outtype name (fp4|fp8|bf16); const char* to avoid a per-call alloc.
+    const char* out_type = out_is_fp4 ? "fp4" : (out_is_fp8 ? "fp8" : "bf16");
+    AITER_CHECK(!out_is_fp8 || out_scale != nullptr,
+                __func__,
+                " fp8 output requires an out_scale (E8M0) tensor");
+    AITER_CHECK(intype == "mxfp4" || intype == "nvfp4",
+                __func__,
+                " unsupported intype ",
+                intype);
+    AITER_CHECK(a_preshuffle == 0 || a_preshuffle == 1,
+                __func__,
+                " a_preshuffle must be 0 or 1");
+
+    int Mdim = A->size(0);
+    int Ndim = B->size(0);
+    int Kdim = A->size(1) * 2; // packed fp4: stored dim = K/2 bytes
+
+    int scale_block = (intype == "nvfp4") ? NVFP4_SCALE_BLOCK : MXFP4_SCALE_BLOCK;
+    AITER_CHECK(Kdim % scale_block == 0,
+                __func__,
+                " K must be divisible by scale block size (",
+                scale_block,
+                ")");
+
+    // Strides in bytes.
+    unsigned int stride_a = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
+    unsigned int stride_b = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
+    // Output row stride in bytes: bf16 = Ndim*2; packed fp4 (e2m1, 2 vals/byte,
+    // cvt_scale=1) = Ndim/2; fp8 (fp8 e4m3, 1 byte/val) = Ndim. Output format is
+    // compile-time per .co; the host only needs the matching stride + buffer dtype.
+    unsigned int stride_d =
+        out_is_fp4 ? static_cast<unsigned int>(Ndim / 2)
+                   : (out_is_fp8 ? static_cast<unsigned int>(Ndim)
+                                 : static_cast<unsigned int>(Ndim) * 2);
+    unsigned int stride_sa = static_cast<unsigned int>(Kdim / scale_block);
+    unsigned int stride_sb = static_cast<unsigned int>(Kdim / scale_block);
+
+    KernelArgs args{};                       // zero-init; log2_grid_x/y set below if persistent
+    args.ptr_D           = out->ptr;
+    args.ptr_A           = A->ptr;
+    args.ptr_B           = B->ptr;
+    args.ptr_ScaleA      = ScaleA->ptr;
+    args.ptr_ScaleB      = ScaleB->ptr;
+    args.strideD0        = stride_d;
+    args.strideA0        = stride_a;
+    args.strideB0        = stride_b;
+    args.ScaleA_stride0  = stride_sa;
+    args.ScaleB_stride0  = stride_sb;
+    args.M               = Mdim;
+    args.N               = Ndim;
+    args.K               = Kdim;
+    if(intype == "nvfp4")
+    {
+        args.GlobalScaleA = GlobalScaleA;
+        args.GlobalScaleB = GlobalScaleB;
+    }
+
+    // Bytes shipped to HW: each .co declares a matching kernarg segment size, so
+    // this must be exact (HIP validates against it). Sizes: MXFP4 80B, NVFP4 /
+    // MXFP4+fp8 88B, NVFP4+fp8 96B (see the ABI table at the top of this file).
+    size_t arg_size;
+    if(out_is_fp8)
+        arg_size = (intype == "nvfp4") ? sizeof(KernelArgs)
+                                               : offsetof(KernelArgs, ptr_ScaleD);
+    else
+        arg_size = (intype == "nvfp4")
+                       ? offsetof(KernelArgs, ptr_ScaleD)
+                       : (offsetof(KernelArgs, ptr_ScaleD) - 2 * sizeof(unsigned int));
+
+    const HipDeviceGuard device_guard(A->device_id);
+
+    static CFG* config_map = &cfg_f4gemm;
+    AITER_CHECK(!config_map->empty(),
+                __func__,
+                " no kernel registered for f4gemm; check AITER_GPU_ARCHS=gfx1250");
+
+    std::string arch_id = get_gpu_arch();
+    std::string selectedName =
+        (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
+
+    // All-int cache key: the hot lookup hashes ints, not std::strings.
+    const int intype_id = (intype == "nvfp4") ? 1 : 0;   // else mxfp4
+    const int out_id    = out_is_fp4 ? 2 : (out_is_fp8 ? 1 : 0);  // bf16=0
+    using DictKey = std::tuple<int, int, int, int, int, int>; // M,N,K,intype_id,apre,out_id
+    struct DictHash
+    {
+        size_t operator()(const DictKey& k) const
+        {
+            const auto& [m, n, kk, it, ap, ot] = k;
+            size_t h = 1469598103934665603ull;
+            for(int v : {m, n, kk, it, ap, ot})
+                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
+            return h;
+        }
+    };
+    static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
+
+    if(selectedName.empty())
+    {
+        selectedName = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, intype_id, a_preshuffle, out_id), [&]() {
+                auto [name, _] = get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, intype, std::string(out_type),
+                    a_preshuffle, config_map);
+                return name;
+            });
+    }
+
+    auto it = config_map->find(selectedName);
+    AITER_CHECK(it != config_map->end(),
+                __func__,
+                " kernel not in cfg_f4gemm: ",
+                selectedName);
+
+    const auto& cfg     = it->second;
+    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
+    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
+    // output buffer for a different element width -> device-side OOB write.
+    AITER_CHECK(cfg.intype == intype && cfg.a_preshuffle == a_preshuffle &&
+                    cfg.outtype == out_type,
+                __func__,
+                " selected kernel ",
+                selectedName,
+                " mismatches requested intype/a_preshuffle/outtype (got intype=",
+                cfg.intype,
+                ", outtype=",
+                cfg.outtype,
+                "; requested intype=",
+                intype,
+                ", outtype=",
+                out_type,
+                ")");
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
+
+    // ----- Launch geometry: cluster + persistent -----
+    const int SUBM      = cfg.tile_m;
+    const int SUBN      = cfg.tile_n;
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
+    const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+
+    // Persistent dispatch is hardcoded on: all f4gemm .co are persistent
+    // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
+    // .co), so they're fixed here at the default; gridX is derived.
+    constexpr int PERSISTENT    = 1;
+    constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
+    constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
+
+    const int tiles_x = Ndim / SUBN;   // N-direction output tiles (exact: see heuristic)
+    const int tiles_y = Mdim / SUBM;   // M-direction output tiles (exact: see heuristic)
+
+    // Cluster dims must evenly tile the work grid (cluster is compile-time per .co).
+    if(cluster_x > 1 || cluster_y > 1)
+    {
+        AITER_CHECK(tiles_x >= cluster_x && (tiles_x % cluster_x) == 0,
+                    __func__, " cluster_x=", cluster_x, " requires N tiles (", tiles_x,
+                    ") to be a multiple of it; N=", Ndim, " must be a multiple of ",
+                    SUBN * cluster_x);
+        AITER_CHECK(tiles_y >= cluster_y && (tiles_y % cluster_y) == 0,
+                    __func__, " cluster_y=", cluster_y, " requires M tiles (", tiles_y,
+                    ") to be a multiple of it; M=", Mdim, " must be a multiple of ",
+                    SUBM * cluster_y);
+    }
+
+    int          gdx         = tiles_x;
+    int          gdy         = tiles_y;
+    int          gdz         = 1;
+    unsigned int log2_grid_x = 0;
+    unsigned int log2_grid_y = 0;
+
+    if(PERSISTENT)
+    {
+        AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
+                    __func__, " persistent_tg=", PERSISTENT_TG,
+                    " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
+        const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
+        AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
+                    __func__, " grid_y=", PERSISTENT_GY,
+                    " must be a nonzero divisor of cluster count ", clusters);
+        const int gridY = PERSISTENT_GY;
+        const int gridX = clusters / gridY;
+        // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
+        // cluster count, so cluster count and both grid dims must be power-of-two.
+        AITER_CHECK((clusters & (clusters - 1)) == 0,
+                    __func__, " persistent cluster count ", clusters, " must be power-of-two");
+        AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
+                    __func__, " persistent gridX=", gridX, " gridY=", gridY,
+                    " must each be power-of-two");
+
+        // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
+        // scaled by the cluster dims.
+        gdx = gridX * cluster_x;
+        gdy = gridY * cluster_y;
+        gdz = 1;
+
+        for(int g = gridX; g > 1; g >>= 1)
+            log2_grid_x++;
+        for(int g = gridY; g > 1; g >>= 1)
+            log2_grid_y++;
+
+        // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
+        // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
+        // GlobalScale slots (dw18/19).
+        if(intype == "nvfp4")
+        {
+            args.log2_grid_x = log2_grid_x;
+            args.log2_grid_y = log2_grid_y;
+        }
+        else
+        {
+            std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
+            std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
+        }
+    }
+
+    // fp8 output E8M0 scale pointer (set after the persistent block so the log2
+    // writes can't clobber it): NVFP4 uses dw22/23; MXFP4 overlays it on dw20/21.
+    if(out_is_fp8)
+    {
+        if(intype == "nvfp4")
+            args.ptr_ScaleD = out_scale->ptr;
+        else
+            std::memcpy(&args.log2_grid_x, &out_scale->ptr, sizeof(void*));
+    }
+
+    const int bdx = 128; // 4 wave * 32 thread on gfx1250
+
+    impl_ptr->launch_kernel(
+        {&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream, cluster_x, cluster_y, 1});
+}
+
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mxfp4_gemm_asm,
+    (aiter_tensor_t* A,         // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+     aiter_tensor_t* B,         // B:[N, K/2] fp4x2 (always preshuffled)
+     aiter_tensor_t* ScaleA,    // ScaleA:[M, K/32] e8m0 (shuffled)
+     aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e8m0 (shuffled)
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out_scale, // fp8 only: E8M0 [M, N/128] (null otherwise)
+     const char*     kernelName,
+     int             a_preshuffle,
+     hipStream_t     stream),
+    (A, B, ScaleA, ScaleB, out, out_scale, kernelName, a_preshuffle, stream))
+{
+    f4gemm_launch(A, B, ScaleA, ScaleB, out, out_scale,
+                        kernelName, "mxfp4", a_preshuffle,
+                        0.0f, 0.0f, stream);
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    nvfp4_gemm_asm,
+    (aiter_tensor_t* A,         // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+     aiter_tensor_t* B,         // B:[N, K/2] fp4x2 (always preshuffled)
+     aiter_tensor_t* ScaleA,    // ScaleA:[M, K/32] e4m3 (shuffled)
+     aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e4m3 (shuffled)
+     float           GlobalScaleA,
+     float           GlobalScaleB,
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out_scale, // fp8 only: E8M0 [M, N/128] (null otherwise)
+     const char*     kernelName,
+     int             a_preshuffle,
+     hipStream_t     stream),
+    (A, B, ScaleA, ScaleB, GlobalScaleA, GlobalScaleB,
+     out, out_scale, kernelName, a_preshuffle, stream))
+{
+    f4gemm_launch(A, B, ScaleA, ScaleB, out, out_scale,
+                        kernelName, "nvfp4", a_preshuffle,
+                        GlobalScaleA, GlobalScaleB, stream);
+}

@@ -15,27 +15,38 @@ import torch
 # Triton
 import triton
 
-# AITER: GMM defaults and utility functions
-from aiter.ops.triton.utils.gmm_common import (
-    SUPPORTED_DTYPES_STR,
-    DTYPE_STR,
-    dtype_from_str,
-    DTYPE,
-    str_from_dtype,
-    TRANS_LHS,
-    TRANS_RHS,
-    RNG_SEED,
-    NUM_GROUP_SIZES,
-    gen_gmm_tensors,
-    gen_tgmm_tensors,
-)
-
 # AITER: Triton kernel wrappers
 from aiter.ops.triton.gmm import (
     gmm as triton_gmm,
-    ptgmm as triton_ptgmm,
+)
+from aiter.ops.triton.gmm import (
     nptgmm as triton_nptgmm,
 )
+from aiter.ops.triton.gmm import (
+    ptgmm as triton_ptgmm,
+)
+
+# AITER: GMM defaults and utility functions
+from aiter.ops.triton.utils.gmm_common import (
+    DTYPE,
+    DTYPE_STR,
+    GROUP_SIZES_DTYPE,
+    GROUP_SIZES_DTYPE_STR,
+    NUM_GROUP_SIZES,
+    RNG_SEED,
+    SUPPORTED_DTYPES_STR,
+    SUPPORTED_GROUP_SIZES_DTYPES_STR,
+    TRANS_LHS,
+    TRANS_RHS,
+    dtype_from_str,
+    gen_gmm_tensors,
+    gen_tgmm_tensors,
+    group_sizes_dtype_from_str,
+    str_from_dtype,
+    str_from_group_sizes_dtype,
+)
+
+logger = logging.getLogger(__name__)
 
 # Benchmark.
 # ------------------------------------------------------------------------------
@@ -58,6 +69,7 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
     ( 393216,  2048,  1408,  64),  # deepseekv2-16B
     (  32768,  6144, 16384,   8),  # Mixtral 8x22B
     (  32768, 16384,  6144,   8),  # Mixtral 8x22B
+    ( 267424,  1280,  2560,  32),  # real workload, but unknown model
 ]
 # fmt: on
 
@@ -113,6 +125,7 @@ def benchmark_gmm(
     bench_shape: tuple[int, int, int, int] | None = None,
     in_dtype: torch.dtype = DTYPE,
     out_dtype: torch.dtype = DTYPE,
+    group_sizes_dtype: torch.dtype = GROUP_SIZES_DTYPE,
     trans_lhs: bool = TRANS_LHS,
     trans_rhs: bool = TRANS_RHS,
     rng_seed: int = RNG_SEED,
@@ -121,6 +134,8 @@ def benchmark_gmm(
     metric: str = DEFAULT_METRIC,
     use_bias: bool = False,
     accumulate: bool = False,
+    grid_dim: int | None = None,
+    work_stealing: bool = False,
     output: bool = False,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
@@ -128,14 +143,31 @@ def benchmark_gmm(
 
     desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
 
-    in_dtype_str = str_from_dtype(in_dtype)
-    out_dtype_str = str_from_dtype(out_dtype)
-    dtypes_desc = f"i{in_dtype_str}_o{out_dtype_str}"
-    layout_desc = (
-        "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n"
-    )
-    unit = METRIC_UNITS[metric]
-    triton_provider = f"triton_{gmm_type}_{dtypes_desc}_{layout_desc}_{unit}"
+    in_dtype_str: str = str_from_dtype(in_dtype)
+    out_dtype_str: str = str_from_dtype(out_dtype)
+    group_sizes_dtype_str: str = str_from_group_sizes_dtype(group_sizes_dtype)
+    unit: str = METRIC_UNITS[metric]
+    has_grid_dim: bool = gmm_type != "nptgmm" and grid_dim is not None
+    has_work_stealing: bool = gmm_type == "gmm" and work_stealing
+    triton_provider_desc: list[str] = [
+        "triton",
+        gmm_type,
+        # data types
+        f"i{in_dtype_str}",
+        f"o{out_dtype_str}",
+        f"g{group_sizes_dtype_str}",
+        # layout description
+        "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n",
+    ]
+    # grid dim
+    if has_grid_dim:
+        triton_provider_desc.append(f"gd{grid_dim}")
+    # work stealing
+    if has_work_stealing:
+        triton_provider_desc.append("ws")
+    # unit of benchmark metric
+    triton_provider_desc.append(unit)
+    triton_provider: str = "_".join(triton_provider_desc)
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -150,7 +182,7 @@ def benchmark_gmm(
         )
     )
     def benchmark(M: int, K: int, N: int, G: int, provider: str):
-        logging.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
+        logger.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
 
         lhs, rhs, multiple_group_sizes, out, bias = gen_tensors(
             M,
@@ -160,6 +192,7 @@ def benchmark_gmm(
             num_group_sizes,
             input_type=in_dtype,
             output_type=out_dtype,
+            group_sizes_dtype=group_sizes_dtype,
             trans_lhs=trans_lhs,
             trans_rhs=trans_rhs,
             rng_seed=rng_seed,
@@ -175,7 +208,7 @@ def benchmark_gmm(
         gb_sum = 0.0
 
         for group_sizes in multiple_group_sizes:
-            logging.debug(
+            logger.debug(
                 "      group_sizes (first 5) = %s", str(group_sizes[:5].tolist())
             )
 
@@ -189,12 +222,16 @@ def benchmark_gmm(
 
             if gmm_type == "gmm":
                 kwargs["bias"] = bias
+                kwargs["work_stealing"] = work_stealing
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 kwargs["bias_grad"] = bias
                 kwargs["accumulate"] = accumulate
 
+            if has_grid_dim:
+                kwargs["grid_dim"] = grid_dim
+
             p50_ms, p20_ms, p80_ms = triton.testing.do_bench(
-                lambda: kernel_wrapper(**kwargs),
+                lambda kwargs=kwargs: kernel_wrapper(**kwargs),
                 quantiles=quantiles,
             )
 
@@ -239,19 +276,19 @@ def benchmark_gmm(
         p20_gbps = round(gb_sum / p80_s_sum, 2)
         p80_gbps = round(gb_sum / p20_s_sum, 2)
 
-        logging.info(
+        logger.info(
             "      ms: p20 = %7.4f, p50 = %7.4f, p80 = %7.4f",
             p20_ms,
             p50_ms,
             p80_ms,
         )
-        logging.info(
+        logger.info(
             "      TFLOPS: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
             p20_tflops,
             p50_tflops,
             p80_tflops,
         )
-        logging.info(
+        logger.info(
             "      GB/s: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
             p20_gbps,
             p50_gbps,
@@ -265,26 +302,31 @@ def benchmark_gmm(
         if metric == "bandwidth":
             return p50_gbps, p20_gbps, p80_gbps
 
-    logging.info("Benchmarking Triton %s kernel:", desc)
-    logging.info(
-        "  input_type = %s, output_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
+    logger.info("Benchmarking Triton %s kernel:", desc)
+    logger.info(
+        "  input_type = %s, output_type = %s, group_sizes_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
         in_dtype_str,
         out_dtype_str,
+        group_sizes_dtype_str,
         rng_seed,
         use_bias,
         accumulate,
     )
-    logging.info(
+    logger.info(
         "  trans_lhs = %s, trans_rhs = %s",
         trans_lhs,
         trans_rhs,
     )
-    logging.info(
+    logger.info(
         "  num_group_sizes = %d, unif_group_sizes = %s",
         num_group_sizes,
         unif_group_sizes,
     )
-    logging.info(
+    if has_grid_dim:
+        logger.info("  overridden persistent grid_dim = %d", grid_dim)
+    if has_work_stealing:
+        logger.info("  work stealing enabled")
+    logger.info(
         "  metric = %s (in %s)",
         metric,
         unit,
@@ -384,6 +426,13 @@ def parse_args() -> argparse.Namespace:
         default=DTYPE_STR,
         help=f"output data type (default: {DTYPE_STR})",
     )
+    parser.add_argument(
+        "--group-sizes-type",
+        type=str.lower,
+        choices=SUPPORTED_GROUP_SIZES_DTYPES_STR,
+        default=GROUP_SIZES_DTYPE_STR,
+        help=f"group sizes data type (default: {GROUP_SIZES_DTYPE_STR})",
+    )
 
     # Transposition
     add_trans_arg(parser, "lhs", TRANS_LHS)
@@ -418,7 +467,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Other arguments
-    parser.add_argument("--verbose", action="store_true", help="enable verbose output")
     parser.add_argument(
         "--use-bias",
         action="store_true",
@@ -430,10 +478,23 @@ def parse_args() -> argparse.Namespace:
         help="accumulate bias gradient",
     )
     parser.add_argument(
+        "--grid-dim",
+        type=positive_int,
+        default=None,
+        help="override grid dimension config of persistent kernels",
+    )
+    parser.add_argument(
+        "--work-stealing",
+        action="store_true",
+        help="enable work stealing dynamic load-balancing of persistent kernels",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="write performance results to CSV file in the current directory",
     )
+    parser.add_argument("--verbose", action="store_true", help="enable verbose output")
+
     try:
         return validate_args(parser.parse_args())
     except argparse.ArgumentError as arg_error:
@@ -460,12 +521,14 @@ def main() -> None:
     shape = (args.M, args.K, args.N, args.G)
     in_dtype = dtype_from_str(args.input_type)
     out_dtype = dtype_from_str(args.output_type)
+    group_sizes_dtype = group_sizes_dtype_from_str(args.group_sizes_type)
 
     benchmark_gmm(
         args.gmm_type,
         bench_shape=None if all(arg is None for arg in shape) else shape,
         in_dtype=in_dtype,
         out_dtype=out_dtype,
+        group_sizes_dtype=group_sizes_dtype,
         trans_lhs=args.trans_lhs,
         trans_rhs=args.trans_rhs,
         rng_seed=args.rng_seed,
@@ -474,6 +537,8 @@ def main() -> None:
         metric=args.metric,
         use_bias=args.use_bias,
         accumulate=args.accumulate,
+        grid_dim=args.grid_dim,
+        work_stealing=args.work_stealing,
         output=args.o,
     )
 

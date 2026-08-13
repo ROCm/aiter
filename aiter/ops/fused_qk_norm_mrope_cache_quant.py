@@ -2,11 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
+
 from ..jit.core import compile_ops
-from typing import List, Optional
 
 
-@compile_ops("module_fused_qk_norm_mrope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_mrope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
@@ -19,7 +19,7 @@ def fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section_: List[int],
+    mrope_section_: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
@@ -28,11 +28,12 @@ def fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     slot_mapping: Tensor,
     per_tensor_k_scale: Tensor,
     per_tensor_v_scale: Tensor,
-    k_out: Optional[Tensor],
-    v_out: Optional[Tensor],
+    k_out: Tensor | None,
+    v_out: Tensor | None,
     return_kv: bool,
     use_shuffle_layout: bool,
     block_size: int,
     x: int,
     rotary_dim: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...

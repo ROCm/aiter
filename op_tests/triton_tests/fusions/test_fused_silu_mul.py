@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.activation import fused_silu_mul
 
