@@ -103,6 +103,15 @@ def kernel_unified_attention_2d(
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    # Per-token (per KV slot) fp8 dequant scales, [num_blks, num_kv_heads,
+    # blk_size] float32. Mutually exclusive with the scalar k/v_descale_ptr:
+    # a per-token scale cannot be folded into qk_scale / one_over_L because it
+    # varies along the key axis, so it rides on the score columns (K) and on
+    # the softmax probabilities (V) instead.
+    k_token_scale_ptr=None,
+    v_token_scale_ptr=None,
+    stride_kv_tok_scale_0: tl.int64 = 0,
+    stride_kv_tok_scale_1: tl.int64 = 0,
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -256,6 +265,23 @@ def kernel_unified_attention_2d(
     else:
         k_descale = None
         v_descale = None
+    # Per-token descales vary along the key axis, so neither can be hoisted:
+    # K's is applied to the score columns inside the loop and V's to the
+    # probabilities (see below). v_descale stays None so the epilogue keeps
+    # one_over_L = 1/L.
+    PER_TOKEN_KV_DESCALE: tl.constexpr = k_token_scale_ptr is not None
+    if PER_TOKEN_KV_DESCALE:
+        # SHUFFLED pins TILE_SIZE == BLOCK_SIZE, so a tile is exactly one page
+        # and its scale row is a contiguous, always in-bounds [BLOCK_SIZE]
+        # slice -- which is why the scale loads below need no mask. The
+        # non-shuffled layout spreads a tile over several pages via a block
+        # table that can run past the sequence, so it would need masking; the
+        # host rejects that combination (_validate_per_token_kv_descale), and
+        # this keeps the two in lockstep instead of carrying an untested path.
+        tl.static_assert(
+            SHUFFLED_KV_CACHE,
+            "per-token KV descale requires the shuffled KV cache layout",
+        )
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
@@ -269,6 +295,7 @@ def kernel_unified_attention_2d(
         k_mask = None
         v_mask = None
         other = None
+        kv_tok_scale_offset = None
         if SHUFFLED_KV_CACHE:
             physical_block_idx_shfl = tl.load(
                 block_tables_ptr + block_table_offset + j
@@ -284,6 +311,14 @@ def kernel_unified_attention_2d(
                 + kv_head_idx * stride_v_cache_1
                 + offs_shfl
             )
+            if PER_TOKEN_KV_DESCALE:
+                # SHUFFLED pins TILE_SIZE == BLOCK_SIZE, so one tile is exactly
+                # one page and its scales are a contiguous [BLOCK_SIZE] row.
+                kv_tok_scale_offset = (
+                    physical_block_idx_shfl * stride_kv_tok_scale_0
+                    + kv_head_idx * stride_kv_tok_scale_1
+                    + offs_t
+                )
         else:
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -350,6 +385,16 @@ def kernel_unified_attention_2d(
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
+        if PER_TOKEN_KV_DESCALE:
+            # Per-token K descale on the score columns. Cache slots past the
+            # sequence end are never written and may hold garbage; their scores
+            # are masked to -inf below, but a non-finite scale would produce NaN
+            # before the mask, so zero it (x * 0.0 == 0.0 iff x is finite).
+            k_tok_scale = tl.load(
+                k_token_scale_ptr + kv_tok_scale_offset,
+            )
+            k_tok_scale = tl.where(k_tok_scale * 0.0 == 0.0, k_tok_scale, 0.0)
+            S = S * k_tok_scale[None, :]
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -410,6 +455,15 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        if PER_TOKEN_KV_DESCALE:
+            # sum_n P[m,n] * V[n,d] * v_scale[n]: the per-token V descale cannot
+            # leave the sum, so it rides on P. Strictly after l_j above -- the
+            # softmax denominator L must see the unscaled probabilities.
+            v_tok_scale = tl.load(
+                v_token_scale_ptr + kv_tok_scale_offset,
+            )
+            v_tok_scale = tl.where(v_tok_scale * 0.0 == 0.0, v_tok_scale, 0.0)
+            P = P * v_tok_scale[None, :]
         acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
