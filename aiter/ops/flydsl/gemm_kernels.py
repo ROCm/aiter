@@ -16,9 +16,18 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
+from .kernels.gemm_a16w16_gfx950 import (
+    GEMM_A16W16_DTYPE_BF16,
+    GEMM_A16W16_DTYPE_FP16,
+    GEMM_A16W16_DTYPE_FP32,
+    make_gemm_a16w16_param_and_validate,
+)
+from .kernels.gemm_a16w16_gfx950 import (
+    gemm_a16w16 as gemm_a16w16_gfx950,
+)
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
@@ -26,7 +35,11 @@ from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
+    "flydsl_gfx950_hgemm",
+    "flydsl_gfx950_kernel_name",
     "flydsl_hgemm",
+    "get_flydsl_hgemm_kernel_params",
+    "get_flydsl_hgemm_kernels",
 ]
 
 
@@ -42,6 +55,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+KERNEL_FAMILY_GFX950 = "gfx950_a16w16"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -62,6 +76,19 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
     r")?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
+)
+_GFX950_HGEMM_KERNEL_RE = re.compile(
+    r"^flydsl_hgemm_"
+    r"a(?P<a_dtype>bf16|f16|fp16)_"
+    r"w(?P<w_dtype>bf16|f16|fp16)_"
+    r"(?P<out_dtype>bf16|f16|fp16|f32|fp32)_"
+    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)x(?P<stages>\d+)_"
+    r"ks(?P<split_k>\d+)_"
+    r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
+    r"bias(?P<has_bias>[01])_"
+    r"gm(?P<group_m>\d+)_"
+    r"p(?P<policy>ft|ht|hti)_"
+    r"(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
 SplitKStreamKey = tuple[int, int]
@@ -113,6 +140,298 @@ def _normalize_supported_kernel_metadata(
             f"got c_to_lds={c_to_lds}"
         )
     return KERNEL_ASYNC_COPY, FIXED_C_TO_LDS
+
+
+def _normalize_gfx950_dtype_name(dtype: str, *, allow_fp32: bool = False) -> str:
+    normalized = dtype.lower()
+    aliases = {
+        "fp16": "f16",
+        "float16": "f16",
+        "bfloat16": "bf16",
+        "fp32": "f32",
+        "float32": "f32",
+    }
+    normalized = aliases.get(normalized, normalized)
+    supported = {"bf16", "f16"}
+    if allow_fp32:
+        supported.add("f32")
+    if normalized not in supported:
+        expected = "bf16/f16/f32" if allow_fp32 else "bf16/f16"
+        raise ValueError(f"Unsupported dtype {dtype!r}; expected {expected}")
+    return normalized
+
+
+def _get_runtime_gfx(device: torch.device | None = None) -> str:
+    """Return the live architecture, preferring the selected torch device."""
+
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(
+            torch.cuda.current_device() if device is None else device
+        )
+        arch = str(getattr(props, "gcnArchName", "")).split(":")[0]
+        if not arch:
+            raise RuntimeError(
+                "Unable to determine the active ROCm device architecture"
+            )
+        return arch
+    return get_gfx_runtime()
+
+
+def flydsl_gfx950_kernel_name(
+    *,
+    dtype: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    has_bias: bool,
+    group_m: int,
+    use_half_tile_interleaved: bool,
+    target_gfx: str = "gfx950",
+) -> str:
+    """Return the stable tuned-config name for the layout-based gfx950 kernel."""
+
+    dtype = _normalize_gfx950_dtype_name(dtype)
+    out_dtype = _normalize_gfx950_dtype_name(out_dtype, allow_fp32=True)
+    policy = "hti" if use_half_tile_interleaved else "ft"
+    return (
+        f"flydsl_hgemm_a{dtype}_w{dtype}_{out_dtype}_"
+        f"t{tile_m}x{tile_n}x{tile_k}x{stages}_ks{split_k}_"
+        f"w{m_waves}x{n_waves}x{k_waves}_bias{int(has_bias)}_"
+        f"gm{group_m}_p{policy}_{target_gfx}"
+    )
+
+
+def _parse_gfx950_hgemm_kernel_params(name: str) -> dict | None:
+    match = _GFX950_HGEMM_KERNEL_RE.fullmatch(name)
+    if match is None or match.group("a_dtype") != match.group("w_dtype"):
+        return None
+
+    dtype = _normalize_gfx950_dtype_name(match.group("a_dtype"))
+    out_dtype = _normalize_gfx950_dtype_name(match.group("out_dtype"), allow_fp32=True)
+    policy = match.group("policy")
+    return {
+        "kernel_family": KERNEL_FAMILY_GFX950,
+        "dtype": dtype,
+        "out_dtype": out_dtype,
+        "tile_m": int(match.group("tile_m")),
+        "tile_n": int(match.group("tile_n")),
+        "tile_k": int(match.group("tile_k")),
+        "stages": int(match.group("stages")),
+        "split_k": int(match.group("split_k")),
+        "block_m_warps": int(match.group("m_waves")),
+        "block_n_warps": int(match.group("n_waves")),
+        "block_k_warps": int(match.group("k_waves")),
+        "has_bias": match.group("has_bias") == "1",
+        "group_m": int(match.group("group_m")),
+        "policy": "hti" if policy in {"ht", "hti"} else "ft",
+        "use_half_tile_interleaved": policy in {"ht", "hti"},
+        "target_gfx": match.group("target_gfx"),
+        # Generic metadata consumers use these fields when filtering catalogs.
+        "async_copy": True,
+        "b_to_lds": True,
+        "b_preshuffle": False,
+        "c_to_lds": False,
+    }
+
+
+def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
+    """Look up either the new gfx950 family or a legacy generic HGEMM name."""
+
+    config = _parse_gfx950_hgemm_kernel_params(name)
+    if config is not None:
+        return config
+    return get_flydsl_splitk_hgemm_kernel_params(name)
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _gfx950_split_k_padded(k: int, tile_k: int, split_k: int) -> int:
+    working_k = _ceil_div(k, split_k)
+    padded_k = 0
+    for split_idx in range(split_k):
+        remaining_k = max(k - split_idx * working_k, 0)
+        part_k = min(working_k, remaining_k)
+        if part_k > 0:
+            padded_k += _ceil_div(part_k, tile_k) * tile_k
+    return padded_k
+
+
+def _gfx950_config_iou(
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    split_k: int,
+) -> float:
+    padded_m = _ceil_div(m, tile_m) * tile_m
+    padded_n = _ceil_div(n, tile_n) * tile_n
+    padded_k = _gfx950_split_k_padded(k, tile_k, split_k)
+    return (m * n * k) / (padded_m * padded_n * padded_k)
+
+
+def get_flydsl_hgemm_kernels(
+    dtype: str,
+    out_dtype: str,
+    has_bias: bool,
+    *,
+    m: int,
+    n: int,
+    k: int,
+) -> dict[str, dict]:
+    """Enumerate validated gfx950 mixed-policy HGEMM tuning candidates."""
+
+    target_gfx = _get_runtime_gfx()
+    if target_gfx != "gfx950":
+        return {}
+
+    dtype = _normalize_gfx950_dtype_name(dtype)
+    out_dtype = _normalize_gfx950_dtype_name(out_dtype, allow_fp32=True)
+    if out_dtype not in {dtype, "f32"}:
+        return {}
+
+    in_dtype_id = GEMM_A16W16_DTYPE_FP16 if dtype == "f16" else GEMM_A16W16_DTYPE_BF16
+    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == "f32" else in_dtype_id
+    split_k_options = (1,) + tuple(
+        split_k for split_k in range(2, 10) if k % split_k == 0
+    )
+    tile_m_options = (16, 32, 48, 64, 80, 96, 128, 256)
+    tile_n_options = (16, 32, 64, 80, 96, 128, 256)
+    tile_k_options = (64, 128, 256)
+    stage_options = tuple(range(2, 10))
+    wave_options = (1, 2, 4)
+    k_wave_options = (1, 2)
+    group_m_options = (0, 4)
+    policy_options = (False, True)
+
+    base_ious = {
+        (tile_m, tile_n, tile_k, split_k): _gfx950_config_iou(
+            m, n, k, tile_m, tile_n, tile_k, split_k
+        )
+        for tile_m, tile_n, tile_k, split_k in product(
+            tile_m_options,
+            tile_n_options,
+            tile_k_options,
+            split_k_options,
+        )
+    }
+    keep_ratio = 0.75 if m <= 32 else 0.85 if m <= 128 else 0.95
+    iou_threshold = max(base_ious.values()) * keep_ratio
+    is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
+
+    kernels: dict[str, dict] = {}
+    for (
+        tile_m,
+        tile_n,
+        tile_k,
+        stages,
+        split_k,
+        m_waves,
+        n_waves,
+        k_waves,
+        group_m,
+        use_half_tile_interleaved,
+    ) in product(
+        tile_m_options,
+        tile_n_options,
+        tile_k_options,
+        stage_options,
+        split_k_options,
+        wave_options,
+        wave_options,
+        k_wave_options,
+        group_m_options,
+        policy_options,
+    ):
+        if base_ious[(tile_m, tile_n, tile_k, split_k)] < iou_threshold:
+            continue
+        if is_large_gemm:
+            if not (
+                use_half_tile_interleaved
+                and tile_m == 256
+                and tile_n == 256
+                and tile_k == 64
+                and stages == 2
+                and split_k == 1
+                and m_waves == 2
+                and n_waves == 4
+                and k_waves == 1
+            ):
+                continue
+        elif not use_half_tile_interleaved:
+            mma_m_iters = tile_m // m_waves // 16
+            mma_n_iters = tile_n // n_waves // 16
+            if mma_m_iters > 4 or mma_n_iters > 4:
+                continue
+
+        validation_config = {
+            "in_dtype_id": in_dtype_id,
+            "out_dtype_id": out_dtype_id,
+            "block_m": tile_m,
+            "block_n": tile_n,
+            "block_k": tile_k,
+            "stages": stages,
+            "split_k": split_k,
+            "m_waves": m_waves,
+            "n_waves": n_waves,
+            "k_waves": k_waves,
+            "group_m": group_m,
+            "use_half_tile_interleaved": use_half_tile_interleaved,
+            "has_bias": bool(has_bias),
+        }
+        param = make_gemm_a16w16_param_and_validate(m, n, k, validation_config)
+        if param is None:
+            continue
+
+        config = {
+            "kernel_family": KERNEL_FAMILY_GFX950,
+            "dtype": dtype,
+            "out_dtype": out_dtype,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "stages": stages,
+            "split_k": split_k,
+            "block_m_warps": m_waves,
+            "block_n_warps": n_waves,
+            "block_k_warps": k_waves,
+            "has_bias": bool(has_bias),
+            "group_m": group_m,
+            "policy": "hti" if use_half_tile_interleaved else "ft",
+            "use_half_tile_interleaved": use_half_tile_interleaved,
+            "target_gfx": target_gfx,
+            "async_copy": True,
+            "b_to_lds": True,
+            "b_preshuffle": False,
+            "c_to_lds": False,
+        }
+        name = flydsl_gfx950_kernel_name(
+            dtype=dtype,
+            out_dtype=out_dtype,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            stages=stages,
+            split_k=split_k,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            k_waves=k_waves,
+            has_bias=has_bias,
+            group_m=group_m,
+            use_half_tile_interleaved=use_half_tile_interleaved,
+            target_gfx=target_gfx,
+        )
+        kernels[name] = config
+    return kernels
 
 
 def flydsl_kernel_name(
@@ -856,6 +1175,129 @@ def _compile_flydsl_hgemm(
     return launcher
 
 
+def flydsl_gfx950_hgemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    bias: torch.Tensor | None = None,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 64,
+    split_k: int = 1,
+    block_m_warps: int = 2,
+    block_n_warps: int = 2,
+    block_k_warps: int = 1,
+    stages: int = 2,
+    group_m: int = 0,
+    policy: str = "ft",
+    out_dtype: torch.dtype | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Run the layout-based mixed-policy gfx950 HGEMM.
+
+    The public aiter convention is preserved: ``a`` is ``[M, K]`` and ``b`` is
+    an unshuffled weight tensor with shape ``[N, K]``. The kernel consumes the
+    column-major logical ``[K, N]`` view produced by ``b.t()``.
+    """
+
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError(f"Expected 2D inputs, got a.dim={a.dim()} and b.dim={b.dim()}")
+    if a.device.type != "cuda" or b.device.type != "cuda":
+        raise ValueError("FlyDSL gfx950 HGEMM only supports CUDA/ROCm tensors")
+    if a.device != b.device:
+        raise ValueError(
+            f"`a` and `b` must share a device, got {a.device} and {b.device}"
+        )
+    target_gfx = _get_runtime_gfx(a.device)
+    if target_gfx != "gfx950":
+        raise RuntimeError(
+            f"The mixed-policy FlyDSL HGEMM only supports gfx950, got {target_gfx}"
+        )
+    launch_stream = (
+        torch.cuda.current_stream(device=a.device) if stream is None else stream
+    )
+    if launch_stream.device != a.device:
+        raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
+    if a.dtype != b.dtype or a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "FlyDSL gfx950 HGEMM requires matching fp16/bf16 inputs, "
+            f"got a.dtype={a.dtype} and b.dtype={b.dtype}"
+        )
+
+    m, k = a.shape
+    n, weight_k = b.shape
+    if weight_k != k:
+        raise ValueError(
+            f"Incompatible GEMM shapes: a={tuple(a.shape)} b={tuple(b.shape)}"
+        )
+
+    if out_dtype is None:
+        out_dtype = a.dtype if out is None else out.dtype
+    if out_dtype not in (a.dtype, torch.float32):
+        raise ValueError(
+            f"`out_dtype` must be {a.dtype} or torch.float32, got {out_dtype}"
+        )
+    if out is not None:
+        if out.shape != (m, n):
+            raise ValueError(f"`out` must have shape {(m, n)}, got {tuple(out.shape)}")
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"`out` dtype must match out_dtype={out_dtype}, got {out.dtype}"
+            )
+        if out.device != a.device:
+            raise ValueError(f"`out` must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("`out` must be contiguous")
+
+    if bias is not None:
+        if bias.shape != (n,):
+            raise ValueError(f"`bias` must have shape {(n,)}, got {tuple(bias.shape)}")
+        if bias.dtype != a.dtype or bias.device != a.device:
+            raise ValueError(
+                f"`bias` must have dtype={a.dtype} on {a.device}, "
+                f"got dtype={bias.dtype} device={bias.device}"
+            )
+
+    normalized_policy = policy.lower()
+    if normalized_policy not in {"ft", "ht", "hti"}:
+        raise ValueError(
+            f"Unsupported gfx950 HGEMM policy {policy!r}; expected 'ft' or 'hti'"
+        )
+    use_half_tile_interleaved = normalized_policy in {"ht", "hti"}
+    user_kwargs = {
+        "block_m": tile_m,
+        "block_n": tile_n,
+        "block_k": tile_k,
+        "stages": stages,
+        "split_k": split_k,
+        "m_waves": block_m_warps,
+        "n_waves": block_n_warps,
+        "k_waves": block_k_warps,
+        "group_m": group_m,
+        "use_half_tile_interleaved": use_half_tile_interleaved,
+    }
+
+    with torch.cuda.stream(launch_stream):
+        if not a.is_contiguous():
+            a = a.contiguous()
+        if not b.is_contiguous():
+            b = b.contiguous()
+        if bias is not None and not bias.is_contiguous():
+            bias = bias.contiguous()
+
+        return gemm_a16w16_gfx950(
+            a,
+            b.t(),
+            out=out,
+            bias=bias,
+            user_kwargs=user_kwargs,
+            stream=launch_stream,
+            layout="nt",
+            out_dtype=out_dtype,
+        )
+
+
 def flydsl_hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -881,9 +1323,36 @@ def flydsl_hgemm(
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
     kernel_family: str | None = None,
+    group_m: int = 0,
+    policy: str | None = None,
+    out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
+
+    if kernel_family == KERNEL_FAMILY_GFX950 or policy is not None:
+        if b_preshuffle or auto_shuffle_b:
+            raise ValueError(
+                "gfx950 mixed-policy FlyDSL HGEMM requires unshuffled weights"
+            )
+        return flydsl_gfx950_hgemm(
+            a,
+            b,
+            out=out,
+            bias=bias,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            split_k=split_k,
+            block_m_warps=block_m_warps,
+            block_n_warps=block_n_warps,
+            block_k_warps=block_k_warps,
+            stages=stages,
+            group_m=group_m,
+            policy="ft" if policy is None else policy,
+            out_dtype=out_dtype,
+            stream=stream,
+        )
 
     m, n, k = _validate_hgemm_inputs(a, b, out, bias)
     kernel_dtype = _to_kernel_dtype(a.dtype)

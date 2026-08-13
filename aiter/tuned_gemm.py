@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
@@ -204,8 +204,29 @@ def is_skinny_default_shape(
     )
 
 
+def _get_active_runtime_target() -> tuple[str, int]:
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        gfx = str(getattr(props, "gcnArchName", "")).split(":")[0]
+        if not gfx:
+            raise RuntimeError(
+                "Unable to determine the active ROCm device architecture"
+            )
+        cu_num = int(getattr(props, "multi_processor_count", 0))
+        if cu_num <= 0:
+            raise RuntimeError("Unable to determine the active ROCm device CU count")
+        return gfx, cu_num
+    try:
+        gfx = get_gfx_runtime()
+    except Exception:  # noqa: BLE001
+        gfx = get_gfx()
+    return gfx, get_cu_num()
+
+
 @functools.lru_cache(maxsize=4096)
-def get_GEMM_A16W16_config(
+def _get_GEMM_A16W16_config_cached(
+    gfx: str,
+    cu_num: int,
     M: int,
     N: int,
     K: int,
@@ -216,10 +237,8 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
 ):
     cfg = get_GEMM_A16W16_config_()
-    cu_num = get_cu_num()
     padded_M = M
     config = None
-    gfx = get_gfx()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -240,8 +259,10 @@ def get_GEMM_A16W16_config(
         if config is not None:
             if config["libtype"] == "flydsl":
                 if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                        config["kernelName"]
+                    flydsl_config = (
+                        aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
+                            config["kernelName"]
+                        )
                     )
                     if flydsl_config is None:
                         logger.warning(
@@ -298,6 +319,34 @@ def get_GEMM_A16W16_config(
         return default_config
 
     return config
+
+
+def get_GEMM_A16W16_config(
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool = False,
+    bpreshuffle: bool = False,
+):
+    gfx, cu_num = _get_active_runtime_target()
+    return _get_GEMM_A16W16_config_cached(
+        gfx,
+        cu_num,
+        M,
+        N,
+        K,
+        bias,
+        dtype,
+        otype,
+        scaleAB,
+        bpreshuffle,
+    )
+
+
+get_GEMM_A16W16_config.cache_clear = _get_GEMM_A16W16_config_cached.cache_clear
 
 
 def save_shapes(
@@ -550,9 +599,11 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )
+    if flydsl_config is None:
+        raise ValueError(f"Unknown FlyDSL HGEMM kernel {config['kernelName']!r}")
     stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
@@ -561,31 +612,58 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
-        inp,
-        weights,
-        bias=fused_bias,
-        kernel_family=flydsl_config.get("kernel_family"),
-        tile_m=flydsl_config["tile_m"],
-        tile_n=flydsl_config["tile_n"],
-        tile_k=flydsl_config["tile_k"],
-        split_k=flydsl_config["split_k"],
-        block_m_warps=flydsl_config["block_m_warps"],
-        block_n_warps=flydsl_config["block_n_warps"],
-        block_k_warps=flydsl_config.get("block_k_warps", 1),
-        n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
-        persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
-        waves_per_eu=flydsl_config.get("waves_per_eu", 0),
-        b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=flydsl_config.get("async_copy", False),
-        b_to_lds=flydsl_config["b_to_lds"],
-        b_preshuffle=flydsl_config.get("b_preshuffle", False),
-        c_to_lds=flydsl_config.get("c_to_lds", False),
-    )
+    is_gfx950_mixed = flydsl_config.get("kernel_family") == "gfx950_a16w16"
+    if is_gfx950_mixed:
+        if bpreshuffle:
+            raise ValueError(
+                "gfx950 mixed-policy FlyDSL HGEMM requires unshuffled weights"
+            )
+        kernel_out_dtype = torch.float32 if otype == torch.float32 else inp.dtype
+        out = aiter.ops.flydsl.gemm_kernels.flydsl_gfx950_hgemm(
+            inp,
+            weights,
+            bias=fused_bias,
+            tile_m=flydsl_config["tile_m"],
+            tile_n=flydsl_config["tile_n"],
+            tile_k=flydsl_config["tile_k"],
+            split_k=flydsl_config["split_k"],
+            block_m_warps=flydsl_config["block_m_warps"],
+            block_n_warps=flydsl_config["block_n_warps"],
+            block_k_warps=flydsl_config.get("block_k_warps", 1),
+            stages=stages,
+            group_m=flydsl_config.get("group_m", 0),
+            policy=flydsl_config.get("policy", "ft"),
+            out_dtype=kernel_out_dtype,
+        )
+    else:
+        out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+            inp,
+            weights,
+            bias=fused_bias,
+            kernel_family=flydsl_config.get("kernel_family"),
+            tile_m=flydsl_config["tile_m"],
+            tile_n=flydsl_config["tile_n"],
+            tile_k=flydsl_config["tile_k"],
+            split_k=flydsl_config["split_k"],
+            block_m_warps=flydsl_config["block_m_warps"],
+            block_n_warps=flydsl_config["block_n_warps"],
+            block_k_warps=flydsl_config.get("block_k_warps", 1),
+            n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
+            persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
+            waves_per_eu=flydsl_config.get("waves_per_eu", 0),
+            b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
+            stages=stages,
+            async_copy=flydsl_config.get("async_copy", False),
+            b_to_lds=flydsl_config["b_to_lds"],
+            b_preshuffle=flydsl_config.get("b_preshuffle", False),
+            c_to_lds=flydsl_config.get("c_to_lds", False),
+        )
 
     if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
+        if is_gfx950_mixed and out.dtype == bias.dtype:
+            out.add_(bias)
+        else:
+            out = out.to(bias.dtype) + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
