@@ -44,6 +44,25 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     return 1
 
 
+def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
+    """Selects the CSV value or falls back to the environment setting."""
+    if csv_num_waves in (1, 2, 4):
+        return csv_num_waves
+
+    try:
+        num_waves = int(os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
+    except ValueError as exc:
+        raise ValueError(
+            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
+        ) from exc
+    if num_waves not in (1, 2, 4):
+        raise ValueError(
+            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got "
+            f"{num_waves}"
+        )
+    return num_waves
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -72,6 +91,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale=None,
     quant_wmma_rep=1,
     cluster_n=-1,
+    waves_per_tensor_tdm=-1,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -91,6 +111,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
@@ -125,6 +146,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_scale_tensor,
         cluster_n,
         _next_stage_prefetch(),
+        waves_per_tensor_tdm,
         float(situ_beta),
         float(situ_linear_beta),
     )

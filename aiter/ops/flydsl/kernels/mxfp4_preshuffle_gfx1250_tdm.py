@@ -4,7 +4,6 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
-import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -37,15 +36,6 @@ from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
 
-NUM_WAVES_PER_TENSOR_TDM = int(
-    os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2")
-)
-if NUM_WAVES_PER_TENSOR_TDM not in (1, 2):
-    raise ValueError(
-        "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1 or 2, got "
-        f"{NUM_WAVES_PER_TENSOR_TDM}"
-    )
-
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
@@ -77,6 +67,7 @@ def launch_gemm_a8w4_tdm(
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 1,
+    num_waves_per_tensor_tdm: Constexpr[int] = 2,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
 ):
@@ -118,12 +109,6 @@ def launch_gemm_a8w4_tdm(
     next_stage_on = (
         1 if (next_stage_prefetch and num_buffers >= 3 and KWS % 2 == 0) else 0
     )
-    # With one wave per tensor, exactly four waves are required so every wave
-    # owns one of A/B/SA/SB. The default uses two waves per tensor to balance
-    # work across the two TDM ports.
-    wave_spec_solo = (
-        1 if (NUM_WAVES_PER_TENSOR_TDM == 1 and m_warp * n_warp == 4) else 0
-    )
     cache_tag = (
         K,
         tile_m,
@@ -142,7 +127,7 @@ def launch_gemm_a8w4_tdm(
         quant_wmma_rep,
         cluster_n,
         next_stage_on,
-        wave_spec_solo,
+        num_waves_per_tensor_tdm,
     )
     _ = cache_tag
     warp_tile_m = tile_m // m_warp
@@ -199,12 +184,14 @@ def launch_gemm_a8w4_tdm(
     _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
-    _bws = "_bws" if wave_spec_solo else ""
+    _waves_per_tensor = (
+        f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
+    )
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_bws}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -349,11 +336,20 @@ def launch_gemm_a8w4_tdm(
         a_off0 = blk_m64 * A_KROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
-        WS8 = num_waves >= 8
-        WAVE_SPEC = num_waves >= 4 and tile_m >= 64 and tile_n >= 64
+        assert num_waves_per_tensor_tdm in (
+            1,
+            2,
+            4,
+        ), "num_waves_per_tensor_tdm must be 1, 2, or 4"
+        assert (
+            num_waves_per_tensor_tdm <= num_waves
+        ), "waves per tensor cannot exceed workgroup waves"
+        assert (
+            4 * num_waves_per_tensor_tdm
+        ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
         # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
         # Both the tensorcnt arithmetic and the WMMA interleave count in these.
-        TDM_PER = 1 if wave_spec_solo else ((1 if WS8 else 2) if WAVE_SPEC else 4)
+        TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -361,21 +357,12 @@ def launch_gemm_a8w4_tdm(
         p32_shared = fx.PointerType.get(
             elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
         )
-        if const_expr(wave_spec_solo):
-            # One wave per tensor: four full-extent descriptors, where the pair
-            # split below issues eight half-extent ones. Four waves exactly.
-            waves = [(0,), (1,), (2,), (3,)]
-            nw = 1
-        elif const_expr(WAVE_SPEC):
-            waves = [
-                (0, 1),
-                (2, 3),
-                (4, 5) if WS8 else (0, 1),
-                (6, 7) if WS8 else (2, 3),
-            ]
-            nw = 1
-        else:
-            waves, nw = [(None,)] * 4, num_waves
+        wave_groups = [
+            tuple(range(i, i + num_waves_per_tensor_tdm))
+            for i in range(0, num_waves, num_waves_per_tensor_tdm)
+        ]
+        waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
+        nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
         # Waves in one ``wv`` differ only in runtime atom state, so the whole list
@@ -403,6 +390,11 @@ def launch_gemm_a8w4_tdm(
             split_inner=False,
         ):
             split_i = split_inner and len(wv) > 1
+            if const_expr(len(wv) > 1):
+                if const_expr(split_i):
+                    assert inner % len(wv) == 0, "TDM inner extent must divide owners"
+                else:
+                    assert outer % len(wv) == 0, "TDM outer extent must divide owners"
             seg = outer if split_i else outer // len(wv)
             inner_seg = inner // len(wv) if split_i else inner
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
@@ -500,10 +492,8 @@ def launch_gemm_a8w4_tdm(
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
-        # owner list is the floor. ``unswitch`` callers pass my_jobs and get none.
-        job_waves = (
-            sorted({j.waves for j in jobs}) if jobs[0].waves[0] is not None else []
-        )
+        # owner list is the floor. Dispatched bodies receive their jobs directly.
+        job_waves = sorted({j.waves for j in jobs})
 
         def owns(wv):
             """Runtime predicate: is this wave one of ``wv``?"""
@@ -528,9 +518,6 @@ def launch_gemm_a8w4_tdm(
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
                     emit(j)
-            elif const_expr(not job_waves):
-                for j in jobs:
-                    emit(j)
             else:
                 for g in range_constexpr(len(job_waves)):
                     if owns(job_waves[g]):
@@ -538,22 +525,11 @@ def launch_gemm_a8w4_tdm(
                             if const_expr(j.waves == job_waves[g]):
                                 emit(j)
 
-        def unswitch(body):
-            """Run ``body`` once per owner list, with that list's jobs bound.
-
-            Hoisting the ownership test out of the k-loop leaves the loop body free
-            of any wave comparison: each copy issues its list's TDMs unconditionally.
-            The copies are identical apart from those descriptors, and every wave
-            appears in exactly one list, so it runs exactly one copy and the barrier
-            and tensorcnt counts per iteration are the same as before the split. A
-            wave in no list would skip the barriers and hang the workgroup.
-            """
-            if const_expr(not job_waves):
-                body(None)
-            else:
-                for g in range_constexpr(len(job_waves)):
-                    if owns(job_waves[g]):
-                        body([j for j in jobs if j.waves == job_waves[g]])
+        def dispatch_wave_job(fn):
+            """Run ``fn`` with the current wave's jobs."""
+            for g in range_constexpr(len(job_waves)):
+                if owns(job_waves[g]):
+                    fn([j for j in jobs if j.waves == job_waves[g]])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -722,40 +698,22 @@ def launch_gemm_a8w4_tdm(
             # as a scale destination and the backend gates that WAR with vm_vsrc.
             lds_addr_keepalive(*lds_bases(buf))
 
-        def k_step(cur, nxt=None, load_nxt=None, fence=None, issue_fn=None):
-            """Compute one k128 out of ``cur`` while ``load_nxt`` fills ``nxt``.
-
-            ``load_nxt`` is emitted before the WMMA so its ds_reads interleave
-            with them. It must therefore target a slot no WMMA here reads.
-
-            ``fence`` is the tensorcnt covering the buffer ``load_nxt`` reads. It
-            belongs here, at the tail of the tile, rather than at the next tile's
-            top: the TDM then gets this tile's whole compute to land. Its barrier
-            is not optional -- under WAVE_SPEC a wave's tensorcnt covers only the
-            TDMs it issued itself, while this load reads rows another wave loaded.
-            That same barrier is the REUSE barrier for ``issue_fn``, which
-            overwrites the buffer this tile computed from, making this the
-            earliest legal issue point -- a whole tile-tail before the next top.
-            """
-            if load_nxt is not None and nxt is cur:
-                raise ValueError(
-                    "k_step cannot prefetch into the slot it computes from: the "
-                    "store would have to follow the WMMA that reads it, and "
-                    "there the ds_reads no longer interleave -- the allocator "
-                    "coalesces the new value onto the same registers, leaving a "
-                    "WAR the scheduler cannot hoist across. Measured on "
-                    "tile_k=128 (KWS=1) that placement left 13 of 15 ds_reads "
-                    "behind the WMMA and lost to no prefetch at all, so it is "
-                    "not supported. Pass load_nxt=None and let the next tile "
-                    "load at its own top; next_stage_on already gates the "
-                    "cross-tile carry on an even KWS for exactly this reason."
-                )
-            if const_expr(fence is not None):
-                pipeline_fence(outstanding=fence)
+        def k_step(
+            cur,
+            nxt=None,
+            load_nxt_fn=None,
+            num_outstanding_tdm=None,
+            issue_fn=None,
+        ):
+            """Compute one k128 while optionally loading the next LDS slot."""
+            if load_nxt_fn is not None and nxt is cur:
+                raise ValueError("k_step cannot load into its current compute slot")
+            if const_expr(num_outstanding_tdm is not None):
+                pipeline_fence(outstanding=num_outstanding_tdm)
             if const_expr(issue_fn is not None):
                 issue_fn()
-            if const_expr(load_nxt is not None):
-                load_nxt()
+            if const_expr(load_nxt_fn is not None):
+                load_nxt_fn()
             sa_k, sb_k = cur.sa.load(), cur.sb.load()
             mma_rows(FRONT, cur.a[:front_wm], cur.b, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
@@ -780,8 +738,9 @@ def launch_gemm_a8w4_tdm(
             ``next_stage_buf``, emitted at that last k128 instead of by the caller
             at the tile top; pass None only when an earlier fence already covers it.
 
-            ``my_jobs`` is the owner list already selected by ``unswitch``; it only
-            reaches ``issue`` and is unused when ``prefetch_kt`` is None.
+            ``my_jobs`` is the owner list already selected by
+            ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
+            ``prefetch_kt`` is None.
             """
             # With the carry, the issue rides the last k128's fence instead of the
             # tile top; without one it stays at the top, walled off by a barrier.
@@ -856,17 +815,19 @@ def launch_gemm_a8w4_tdm(
                 # or -- on the last one -- the next tile's subtile 0, into slot 0.
                 if const_expr(not is_last):
                     nxt = rmem_slots[(ksl + 1) % 2]
-                    load_nxt = lambda n=nxt, k=ksl + 1: load_state(n, buf, k)
+                    load_nxt_fn = lambda n=nxt, k=ksl + 1: load_state(n, buf, k)
                 elif const_expr(carries):
                     nxt = rmem_slots[0]
-                    load_nxt = lambda n=nxt: load_state(n, next_stage_buf, 0)
+                    load_nxt_fn = lambda n=nxt: load_state(n, next_stage_buf, 0)
                 else:
-                    nxt, load_nxt = None, None
+                    nxt, load_nxt_fn = None, None
                 k_step(
                     rmem_slots[ksl % 2],
                     nxt,
-                    load_nxt,
-                    fence=next_stage_wait if const_expr(carries) else None,
+                    load_nxt_fn,
+                    num_outstanding_tdm=(
+                        next_stage_wait if const_expr(carries) else None
+                    ),
                     issue_fn=do_issue if const_expr(tail_issue and is_last) else None,
                 )
                 # One region per k128: sched_group_barrier only partitions
@@ -892,7 +853,7 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - num_buffers
                 if const_expr(next_stage_on):
                     # Every rolled iteration reads the carry, so prime it here --
-                    # outside ``unswitch``, since every wave runs this once.
+                    # outside ``dispatch_wave_job``, since every wave runs this once.
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
                     load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
@@ -912,7 +873,7 @@ def launch_gemm_a8w4_tdm(
                         workgroup_barrier()
                         issue(s, kt + num_buffers, my_jobs)
 
-                unswitch(steady_post)
+                dispatch_wave_job(steady_post)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
@@ -969,7 +930,7 @@ def launch_gemm_a8w4_tdm(
                             ),
                         )
 
-                unswitch(steady_mid)
+                dispatch_wave_job(steady_mid)
                 for j in range_constexpr(PRE):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
