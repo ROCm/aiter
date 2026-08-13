@@ -70,16 +70,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         bz, bx, by = xcd_remap(raw_bx, raw_by, raw_bz, gdx, gdy, gdz)
         m_start = bx * TILE_N
 
-        # ── Load seqlens + OOB setup ──
-        gptr_ty = glb_ptr_ty()
-        def load_cu_seqlen_scalar(ptr_tensor, idx_i32):
-            addr_ptr = llvm_dialect.inttoptr(gptr_ty, ptr_base_i64(ptr_tensor) + fx.Int64(idx_i32 * 4))
-            return rocdl.readfirstlane(T.i32, llvm_dialect.load(T.i32, addr_ptr))
-
-        q_start_tok = load_cu_seqlen_scalar(ptr_cu_seqlens_q, bz)
-        q_end_tok = load_cu_seqlen_scalar(ptr_cu_seqlens_q, bz + 1)
-        k_start_tok = load_cu_seqlen_scalar(ptr_cu_seqlens_k, bz)
-        k_end_tok = load_cu_seqlen_scalar(ptr_cu_seqlens_k, bz + 1)
+        # ── Load seqlens ──
+        q_start_tok = load_scalar_from_tensor(ptr_cu_seqlens_q, bz)
+        q_end_tok = load_scalar_from_tensor(ptr_cu_seqlens_q, bz + 1)
+        k_start_tok = load_scalar_from_tensor(ptr_cu_seqlens_k, bz)
+        k_end_tok = load_scalar_from_tensor(ptr_cu_seqlens_k, bz + 1)
         actual_q_len = q_end_tok - q_start_tok
         actual_kv_len = k_end_tok - k_start_tok
 
@@ -144,51 +139,17 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                    "actual_kv_len": actual_kv_len, "actual_q_len": actual_q_len,
                    "q_start_tok": q_start_tok, "o_oob_dim1": o_oob_dim1,
                    "q_frags": q_frags, "sgpr_state": sgpr_state, "RETURN_LSE": RETURN_LSE}
-            zero_f32 = arith.constant(0.0, type=T.f32)
-            neg_inf = arith.constant(float("-inf"), type=T.f32)
-            zero_v8f32 = fx.constant_vector(0.0, T.vec(8, T.f32))
-
             # ── Prologue: Tile 0 QK + softmax ──
-            rocdl.sched_barrier(0)
-            TDM.load_k_only(ptr_K, k_offset, stride_k_seq, stride_k_32, wave_id, k_a_base_i32, oob_dg1_list=k_oob_dg1)
-            rocdl.sched_barrier(0)
-            all_su_sp_tiles = []
-            for su in fx.range_constexpr(CNT_SU):
-                fresh_sp = qk_gemm_pure(ty, 0, su, q_frags, Fragment.load_k_su(ty, kv_lds_addrs_a, 0, su),
-                                        [[zero_v8f32] for msb in fx.range_constexpr(NUM_MSB)])
-                all_su_sp_tiles.append(fresh_sp)
-            TDM.load_v_only(ptr_V, v_offset, stride_v_seq, stride_v_32, wave_id, v_a_base_i32, oob_dg1_list=v_oob_dg1)
-            causal_offset = actual_kv_len - actual_q_len
-            if const_expr(IS_CAUSAL):
-                apply_causal_mask(ctx, all_su_sp_tiles, -causal_offset)
-            apply_kv_oob_mask(ctx, all_su_sp_tiles, actual_kv_len)
-            sp_pairs_all_pro = Softmax.tiles_to_pairs(all_su_sp_tiles)
-            softmax_state_pro = make_softmax_state(
-                [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                sp_pairs_prev=sp_pairs_all_pro)
-            Softmax.part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
-            pro_part2_ops = Softmax.build_all_part2_ops(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
-            for m in fx.range_constexpr(NUM_MSB):
-                for op in pro_part2_ops[m][:PART2_SPLIT]:
-                    op()
+            softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles, causal_offset, zero_v8f32 = prologue_tile0(
+                ctx, ty, q_frags, kv_lds_addrs_a, k_a_base_i32, v_a_base_i32,
+                k_oob_dg1, v_oob_dg1, IS_CAUSAL, sgpr_state)
             tile_n_const = TILE_N
             ctx["tile_n_const"] = tile_n_const
             ctx["zero_v8f32"] = zero_v8f32
-            kv_tiles_avail = (actual_kv_len + (TILE_N - 1)) // tile_n_const
-            if const_expr(IS_CAUSAL):
-                sk_sq_diff = actual_kv_len - actual_q_len
-                sk_sq_tiles = (sk_sq_diff + (TILE_N - 1)) // tile_n_const
-                bx_plus_1 = bx + 1
-                causal_tiles = bx_plus_1 + sk_sq_tiles
-                num_tiles = arith.minui(causal_tiles.ir_value(), kv_tiles_avail)
-            else:
-                num_tiles = kv_tiles_avail
-            num_tiles_idx = arith.index_cast(T.index, num_tiles)
-            num_tiles_minus1 = num_tiles - 1
-            num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
+
+            # ── Compute tile counts + causal split ──
+            num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = compute_num_tiles(
+                actual_kv_len, actual_q_len, bx, tile_n_const, causal_offset, IS_CAUSAL)
 
             # ── K(tile 1) prefetch ──
             rocdl.sched_barrier(0)
@@ -204,16 +165,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 k_b_base_i32, v_a_base_i32, k_a_base_i32, v_b_base_i32)
 
             # ── Main KV Loop: non-causal tiles ──
-            if const_expr(IS_CAUSAL):
-                first_causal_tile = bx + causal_offset // tile_n_const
-                first_causal_tile = arith.maxsi(
-                    first_causal_tile.ir_value(), arith.constant(1, type=T.i32)
-                )
-                first_causal_tile = arith.minui(first_causal_tile, num_tiles_minus1)
-                first_causal_tile_idx = arith.index_cast(T.index, first_causal_tile)
-            else:
-                first_causal_tile_idx = num_tiles_minus1_idx
-
             for tile_idx, iter_args, loop1_results in scf.for_(
                 arith.index(1),
                 first_causal_tile_idx,
@@ -235,32 +186,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
             # ── Epilogue: endtile + rescale + store ──
             ep = unpack_loop_results(loop_results, lane_id)
-            ep_v_endtile_offset = v_offset + (num_tiles - 1) * tile_n_const * stride_v_seq
             emit_void("s_wait_idle")
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
             if num_tiles >= 2:
-                et_sp_t = [[set_vgpr_bank(zero_v8f32, m)] for m in fx.range_constexpr(NUM_MSB)]
-                et_sfx = make_softmax_state(ep["old_max"], ep["local_max"], ep["delta"], ep["row_sums"],
-                    sp_pairs_prev=[[ep["partial_sp_pairs"][m][i] for i in fx.range_constexpr(N_SP_PAIRS)] for m in fx.range_constexpr(NUM_MSB)])
-                et_tdm = {"v_g0": fx.constant_vector(0, T.vec(4, T.i32)), "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-                           "k_g0": fx.constant_vector(0, T.vec(4, T.i32)), "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-                           "v_salu_queue": [], "k_salu_queue": []}
-                et_o = [[ep["o_tiles"][d][n] for n in range(N_PV_WMMA_N)] for d in range(NUM_MSB)]
-                et_causal_ns = (arith.index_cast(T.i32, num_tiles_idx) - 1) * TILE_N - causal_offset if const_expr(IS_CAUSAL) else None
-                et_kv_remain = actual_kv_len - (num_tiles - 1) * tile_n_const
-                et_v_oob_dg1 = TDM.build_oob_dg1_list(_V_CFG, 128, stride_v_seq >> 1, et_kv_remain, wave_id)
-                _, _, et_o, _, et_psp_lo, et_psp_hi, et_ped = fmha_pipeline_ctx(
-                    ctx, ty, False, q_frags, ep["kv_tiles"], et_sp_t, et_o, ep["kv_lds_addrs"], et_tdm,
-                    et_sfx, sgpr_state, gemm2=True, tdm_v_offset=ep_v_endtile_offset,
-                    tdm_v_target=ep["v_next_base"], tdm_k_offset=None,
-                    kv_lds_addrs_next=ep["kv_lds_addrs_next"], gemm1_tdm_is_v=True,
-                    ia_exp_delta=ep["exp_delta"], causal_n_start=et_causal_ns,
-                    endtile_v_oob_dg1=et_v_oob_dg1, kv_oob_cols=et_kv_remain)
-                et_psp = [[make_v2f32(et_psp_lo[m * N_SP_PAIRS + i], et_psp_hi[m * N_SP_PAIRS + i], m) for i in fx.range_constexpr(N_SP_PAIRS)] for m in fx.range_constexpr(NUM_MSB)]
-                tdm_wait_and_barrier()
-                _ep_finish(ctx, et_o, et_psp, et_ped, ep["v_next_base"],
-                           et_sfx["old_max"], et_sfx["local_max"], et_sfx["delta"], et_sfx["row_sums"], ep["k_cur_base"])
+                endtile_pipeline(ctx, ty, ep, q_frags, sgpr_state, num_tiles, num_tiles_idx,
+                                 tile_n_const, causal_offset, IS_CAUSAL, _V_CFG, zero_v8f32)
             else:
                 _ep_finish(ctx, [[ep["o_tiles"][d][n] for n in range(N_PV_WMMA_N)] for d in range(NUM_MSB)],
                            ep["partial_sp_pairs"], ep["exp_delta"],
