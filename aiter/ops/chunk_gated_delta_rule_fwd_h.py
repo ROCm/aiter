@@ -155,6 +155,15 @@ def _prepare_state_args(
     )
 
 
+def _resolve_snapshot_dtype(
+    snapshot_dtype: torch.dtype | None, input_dtype: torch.dtype
+) -> torch.dtype:
+    dtype = input_dtype if snapshot_dtype is None else snapshot_dtype
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"`snapshot_dtype` must be fp32 or bf16, got {dtype}.")
+    return dtype
+
+
 def _normalize_g_tensor(
     g: Tensor | None,
     *,
@@ -209,14 +218,17 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """
-    HIP hidden-state forward with h layout [V, K] (K=128, V=128, bf16), always
+    HIP hidden-state forward with h layout [V, K] (K=128, V=128), always
     returning ``(h, v_new, final_state)``.
 
     w, u: [B, H, T, K/V] head-major contiguous.
     h snapshots: [B, NT, H, V, K]; v_new output: [B, H, T_flat, V].
     `g` is a 3-D tensor, token-major [B, T, H] or head-major [B, H, T].
+    ``state_dtype`` controls initial/final persistent state. ``snapshot_dtype``
+    independently controls temporary chunk snapshots and defaults to ``k.dtype``.
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     In varlen mode, pass ``prefill_metadata`` (preferred for reuse) or
     ``seq_lens_cpu`` to avoid reading chunk scheduling values back from the GPU.
@@ -343,11 +355,6 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     else:
         gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 
-    h = torch.empty(
-        (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
-        device=k.device,
-        dtype=torch.bfloat16,
-    )
     v_new = (
         torch.empty((B, H, T_flat, V), device=k.device, dtype=torch.bfloat16)
         if save_new_value
@@ -379,6 +386,13 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         state_tensor = state.tensor
         has_initial_state = state.has_initial_state
         resolved_state_dtype = state_tensor.dtype
+
+    resolved_snapshot_dtype = _resolve_snapshot_dtype(snapshot_dtype, k.dtype)
+    h = torch.empty(
+        (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
+        device=k.device,
+        dtype=resolved_snapshot_dtype,
+    )
 
     if not output_final_state:
         final_state = torch.empty(0, device=k.device, dtype=resolved_state_dtype)
