@@ -242,50 +242,45 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
-def get_kernel_config_gluon(m, n, k, routing_data):
+def m2bucket(m):
+    if m <= 8:
+        return "tiny"
+    if m <= 32:
+        return "small"
+    if m <= 128:
+        return "medium"
+    if m <= 256:
+        return "medium2"
+    if m <= 512:
+        return "large"
+    return "xlarge"
+
+
+def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_buffers = 3
     split_k = 1
-    block_k = 512
-    use_persistent = False
-    persistent_iters = 0
 
-    if block_m == 16:
-        block_k = 512
-        num_warps = 4
-        if k <= 768:
-            use_persistent = True
-            persistent_iters = 3
-            block_n = 128
-            block_k = 256
-            num_buffers = 2
-        elif n <= 1536:
-            block_n = 128
-            num_buffers = 3
-        elif n <= 3072:
-            block_n = 128
-            num_buffers = 2
-        elif n <= 4096:
-            block_n = 256
-            num_buffers = 1
-        else:
-            block_n = 512
-            num_buffers = 1
-
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        else:
-            block_n = 256
-            num_warps = 4
-
+    if block_m == 16 and k <= 768:
+        use_persistent = True
+        persistent_iters = 3
     else:
-        block_n = 256
-        block_k = 256
-        num_warps = 4
+        use_persistent = False
+        persistent_iters = 0
+
+    bucket = m2bucket(m)
+    tuned = _get_a8w4_dispatch(get_arch())
+    key = f"bm{block_m}_n{n}_k{k}_{bucket}"
+    if key not in tuned:
+        key = f"bm{block_m}_any"
+    cfg = tuned[key]
+    block_n, block_k, num_buffers, num_warps = (
+        cfg["block_n"],
+        cfg["block_k"],
+        cfg["num_buffers"],
+        cfg["num_warps"],
+    )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
 
@@ -363,11 +358,6 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
-    # Temporary: TDM async_gather over mxfp8 activations and prefill is broken on gfx1250
-    if use_gluon and gather_indx is not None and M > 1024 and x_has_mx:
-        warnings.warn(
-            "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
-        )
     if preshuffled:
         # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
         N = w.shape[-1] * 16
@@ -385,7 +375,7 @@ def moe_gemm_a8w4(
         w_scales = w_scales.transpose(1, 2)
     # compute optimization flags
     if use_gluon:
-        config = get_kernel_config_gluon(M, N, K, routing_data)
+        config = get_kernel_config_gluon(M, N, K, routing_data, out_mx_quant)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
@@ -443,7 +433,7 @@ def moe_gemm_a8w4(
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
-        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
+        n_out = padded_N // reduction_n_matmul  # post-swiglu width
         assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
         m_out = y.shape[-2]
         y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
@@ -574,6 +564,10 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon:
         _moe_gemm_a8w4_prefill_gluon[(grid,)](

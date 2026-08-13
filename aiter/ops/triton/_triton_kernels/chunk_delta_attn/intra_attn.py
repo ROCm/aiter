@@ -19,16 +19,20 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     IS_GATHER_SUPPORTED,
     IS_TF32_SUPPORTED,
     autotune_cache_kwargs,
     chunk_delta_attn_autotune_configs,
     exp2,
     input_guard,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from .wy_fast import recompute_w_u_fwd
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.wy_fast import (
+    recompute_w_u_fwd,
+)
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
