@@ -451,8 +451,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 _if_lead = scf.IfOp(_raw(c.is_block_lead))
                 with ir.InsertionPoint(_if_lead.then_block):
                     dst_scale_dword = (
-                        dst.scale_row_dword_base
-                        + scale_dword * c.c_wmma_rep * 16
+                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                     )
                     dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                     buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)

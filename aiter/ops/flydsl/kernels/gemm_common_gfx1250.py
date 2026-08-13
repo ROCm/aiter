@@ -360,8 +360,8 @@ __all__ = [
     "fused_silu_swiglu_elem",
     "fused_situv2_elem",
     "make_lds_copy_ops",
-    "vgpr_keepalive",
     "pipeline_fence",
     "situv2_consts",
+    "vgpr_keepalive",
     "workgroup_barrier",
 ]

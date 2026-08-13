@@ -22,8 +22,8 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     lds_addr_keepalive,
-    make_sgpr_opaque,
     make_lds_copy_ops,
+    make_sgpr_opaque,
     pipeline_fence,
     situv2_consts,
     vgpr_keepalive,
@@ -402,19 +402,11 @@ def launch_gemm_a8w4_tdm(
             split_i = split_inner and len(wv) > 1
             seg = outer if split_i else outer // len(wv)
             inner_seg = inner // len(wv) if split_i else inner
-            wave_outer_off = (
-                0
-                if split_i or len(wv) == 1
-                else (wave - wv[0]) * seg
-            )
-            wave_inner_off = (
-                (wave - wv[0]) * inner_seg if split_i else 0
-            )
+            wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
+            wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
             gt = global_view(
                 g_base,
-                g_off
-                + fx.Int64(wave_outer_off) * g_stride
-                + fx.Int64(wave_inner_off),
+                g_off + fx.Int64(wave_outer_off) * g_stride + fx.Int64(wave_inner_off),
                 (seg, inner_seg),
                 (g_stride, 1),
             )
@@ -826,15 +818,15 @@ def launch_gemm_a8w4_tdm(
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = (
-                    min(MMA_GROUP_WITH_ACT if stage1_act else MMA_GROUP_NO_ACT,
-                        mma_total)
+                    min(
+                        MMA_GROUP_WITH_ACT if stage1_act else MMA_GROUP_NO_ACT,
+                        mma_total,
+                    )
                     if KWS > 1
                     else 1
                 )
                 schedule_slots = mma_total // mma_group
-                future_schedule = spread(
-                    STATE_DS if has_next else 0, schedule_slots
-                )
+                future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
@@ -878,9 +870,11 @@ def launch_gemm_a8w4_tdm(
                 # within a region, and only sched_barrier delimits one.
                 emit_hints(
                     ksl,
-                    FENCE_COVER_MMA
-                    if (not is_last and next_stage_buf is not None)
-                    else 0,
+                    (
+                        FENCE_COVER_MMA
+                        if (not is_last and next_stage_buf is not None)
+                        else 0
+                    ),
                 )
                 rocdl.sched_barrier(0)
 
@@ -965,9 +959,11 @@ def launch_gemm_a8w4_tdm(
                             my_jobs,
                             # At the fence, before this tile's issue: kt+PRE tiles
                             # are out and everything through kt+1 must have landed.
-                            TDM_PER * (num_buffers - 2)
-                            if const_expr(next_stage_on)
-                            else None,
+                            (
+                                TDM_PER * (num_buffers - 2)
+                                if const_expr(next_stage_on)
+                                else None
+                            ),
                         )
 
                 unswitch(steady_mid)

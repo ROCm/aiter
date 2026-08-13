@@ -269,8 +269,7 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
     # deep with N/2 independent maxes per level for the scheduler to interleave.
     level = [arith.constant(0.0, type=T.f32)] + [
-        llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        for v in all_vals
+        llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], []) for v in all_vals
     ]
     while len(level) > 1:
         nxt = [
