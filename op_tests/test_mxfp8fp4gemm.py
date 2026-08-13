@@ -5,17 +5,25 @@
 #   a8w8 -> gemm_a8w8_mxfp8: D = A @ B^T, A/B mxfp8 e4m3, e8m0 per-32 scales
 #   a8w4 -> gemm_a8w4_mxfp8: D = A @ B^T, A mxfp8 e4m3, B mxfp4 e2m1, e8m0 per-32
 #
-# Modes (mirror the POC run.sh / run_compute.sh):
-#   func    : correctness only (golden check vs a torch f32 reference)
-#   perf    : correctness + latency/TFLOPS/TB-s summary table
-#   profile : perf + a torch profiler trace dumped under ./aiter_logs
-#
-# Shape constraints (persistent + cluster):
-#   256x256 tile (cluster 4x4): M % 1024 == 0, N % 1024 == 0
-#   64x512  tile (cluster 1x4): N % 2048 == 0  (M unconstrained: partial M-tile
-#                               allowed since M is not clustered)
-#   all:    K % 128 == 0
-# The .cu heuristic picks whichever registered tile fits the shape.
+# ============================================================================
+# gfx1250 F8GEMM ASM Support Matrix
+# ----------------------------------------------------------------------------
+#  OUTTYPE | A_PRESHUFFLE | B_INTYPE |   M    |   N    |   K
+# ---------+--------------+----------+--------+--------+--------
+#  BF16    |      0       |  MXFP8   | %1==0  | %16==0 | %128==0
+#  BF16    |      0       |  MXFP4   | %1==0  | %16==0 | %128==0
+#  BF16    |      1       |  MXFP8   | %2==0  | %16==0 | %128==0
+#  BF16    |      1       |  MXFP4   | %2==0  | %16==0 | %128==0
+# ----------------------------------------------------------------------------
+# Notes:
+#  - Output is always BF16 (no fp8/fp4 out path, unlike f4gemm).
+#  - B is always pre-shuffled (16x16); A_PRESHUFFLE=1 tightens M from %1 to %2.
+#  - K is always %128 (e8m0 scale-shuffle + kernel K_ALIGN), even for apre=0.
+#  - Persistent+cluster dispatch has NO partial-N masking, so N must tile the
+#    cluster exactly (beyond the %16 layout minimum): a kernel is found only when
+#    256x256 (cluster 4x4) fits (M%1024 & N%1024) or 64x512 (cluster 1x4) fits
+#    (N%2048, any M); shapes fitting neither are marked "not support".
+# ============================================================================
 
 import argparse
 import itertools
@@ -47,7 +55,64 @@ pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
 MX_SCALE_BLOCK = 32
+K_ALIGN = 128  # kernel requires K % 128 == 0 (mirrors asm_mxfp8fp4gemm.cu K_ALIGN)
 SUPPORTED_GFX = ["gfx1250"]  # ASM kernels are gfx1250-only (kernarg preload)
+
+# perf/profile: throughput squares (union of the POC run.sh/run_compute.sh perf
+# matrices). The .cu heuristic picks the registered tile that fits each shape.
+PERF_SHAPES = [
+    # compute-bound
+    (32768, 16384, 8192),
+    (16384, 16384, 16384),
+    # memory-bound (N16K x BS64 folded into M)
+    (2, 1048576, 16384),
+    (2, 1048576, 8192),
+]
+# func: correctness shapes mirroring test_gemm_a8w8.py (qkv_proj / attn_out /
+# hipmm groups). Many don't fit the mxfp8fp4 persistent+cluster tile constraints;
+# those are marked "not support" by _support_reason rather than crashing.
+FUNC_SHAPES = [
+    # qkv_proj
+    (1, 1280, 8192),
+    (32, 1280, 8192),
+    (64, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
+    (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
+    (16384, 1280, 8192),
+    # attn_out
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
+    (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
+    (16384, 8192, 1024),
+    # hipmm gelu_bias
+    (32, 3072, 768),
+    (4096, 3072, 768),
+    (8192, 3072, 768),
+    # hipmm preshuffle
+    (16, 7424, 8192),
+    (32, 7424, 8192),
+    (48, 7424, 8192),
+    (64, 7424, 8192),
+    (4096, 7424, 8192),
+    (5120, 7424, 8192),
+    (8192, 7424, 8192),
+]
 
 # checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
 # verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
@@ -58,6 +123,24 @@ def _verdict(err):
     if err == 0:
         return "pass"
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
+
+
+def _support_reason(apre, M, N, K):
+    """Support-matrix gate (see header). Returns None if (apre,M,N,K) is
+    dispatchable, else a short reason string (row marked "not support"). Mirrors
+    the shuffle prep + asm_mxfp8fp4gemm.cu heuristic so unfittable shapes are
+    skipped before prep rather than crashing on an assert."""
+    if K % K_ALIGN != 0:
+        return "K%128"
+    if N % 16 != 0:
+        return "N%16"  # B 16x16 preshuffle
+    if apre and M % 2 != 0:
+        return "apre M%2"  # A (m/2,k/128) preshuffle
+    fits_256 = (M % 1024 == 0) and (N % 1024 == 0)
+    fits_512 = N % 2048 == 0
+    if not (fits_256 or fits_512):
+        return "no tile fits"
+    return None
 
 
 def _ref(intype, A, B, sA, sB, M, N):
@@ -124,9 +207,41 @@ def _prep(
 
 @benchmark()  # intype, M, N, K, apre, data_init, scale_init, ... -> table columns
 def test_gemm(
-    intype, M, N, K, apre, data_init="uniform", scale_init="auto", seed=0, mode="perf"
+    intype,
+    M,
+    N,
+    K,
+    apre,
+    data_init="uniform",
+    scale_init="auto",
+    seed=0,
+    mode="perf",
+    knl_name=None,
 ):
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
+
+    # Skip unfittable shapes up front (before prep/shuffle) so they show as
+    # "not support" rather than crashing on a shape assert / missing kernel.
+    reason = _support_reason(apre, M, N, K)
+    if reason is not None:
+        aiter.logger.warning(
+            "mxfp8fp4 not supported (%s): intype=%s apre=%s M=%s N=%s K=%s",
+            reason,
+            intype,
+            apre,
+            M,
+            N,
+            K,
+        )
+        return {
+            "gfx": get_gfx(),
+            "knl_name": knl_name or "(heuristic)",
+            "asm us": float("nan"),
+            "asm TFLOPS": float("nan"),
+            "asm TB/s": float("nan"),
+            "asm err": float("nan"),
+            "asm result": f"not support ({reason})",
+        }
 
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     inp, ref = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
@@ -134,11 +249,15 @@ def test_gemm(
     num_iters = 5 if mode == "func" else 101
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
-    # run_perftest can rotate them (defeats the L2 hot-cache).
+    # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
+    # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
     kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
+    knl = knl_name or ""
 
     def run_asm(A, B, sA, sB):
-        return kern(A, B, sA, sB, dtype=dtypes.bf16, a_preshuffle=bool(apre))
+        return kern(
+            A, B, sA, sB, dtype=dtypes.bf16, a_preshuffle=bool(apre), kernelName=knl
+        )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
     candidates = {"asm": (run_asm, asm_args)}
@@ -146,7 +265,7 @@ def test_gemm(
     flops = 2 * M * N * K
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + inp["sA"].nbytes + inp["sB"].nbytes
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
     for name, (cand, cand_args) in candidates.items():
         out, us = run_perftest(
             cand, *cand_args, num_iters=num_iters, needTrace=needTrace
@@ -235,15 +354,14 @@ def main():
         default=0,
         help="RNG seed; same seed -> bit-identical data/scale buffers",
     )
-    # Default (M,N,K) = union of the POC perf matrices (run.sh + run_compute.sh).
-    # The .cu heuristic picks the registered tile that fits each shape.
-    #   run_compute.sh perf -> 256x256 tile (cluster 4x4, BS=1, init 10):
-    #     fp8: (16384,16384,8192) (16384,16384,16384) (8192,8192,16384)
-    #     fp4: (16384,16384,16384) (16384,16384,32768) (8192,8192,32768) (8192,8192,65536)
-    #   run.sh perf -> 64x512 tile (cluster 1x4, init {10,1}), BS=64 folded into
-    #   M (M_eff = M*BS; aiter forces batch_size=1, so M*BS is FLOP-equivalent):
-    #     fp8 (K=8192):  (1024,16384,8192)  (128,16384,8192)    # M=16*64, 2*64
-    #     fp4 (K=16384): (1024,16384,16384) (128,16384,16384)   # M=16*64, 2*64
+    parser.add_argument(
+        "--knl-name",
+        dest="knl_name",
+        default=None,
+        help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
+        ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and shape. Any other "
+        "value = force that exact mangled knl_name for all runs (developer debug).",
+    )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -251,18 +369,11 @@ def main():
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[
-            # compute-bound
-            (32768, 16384, 8192),
-            (16384, 16384, 16384),
-            # memory-bound
-            # N16K x BS64
-            # (16, 1048576, 16384),
-            (2, 1048576, 16384),
-            # (16, 1048576, 8192),
-            (2, 1048576, 8192),
-        ],
-        help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384",
+        # Unset -> per-mode defaults: perf/profile = PERF_SHAPES (throughput
+        # squares), func = FUNC_SHAPES (many small/odd correctness shapes).
+        default=None,
+        help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; "
+        "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
     args = parser.parse_args()
 
@@ -281,6 +392,13 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
+    # Shapes: explicit --shape wins; otherwise func sweeps the many small/odd
+    # correctness shapes and perf/profile sweep the throughput squares.
+    if args.shape is not None:
+        shapes = args.shape
+    else:
+        shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
+
     # init pair is the OUTERMOST product term -> rows are grouped by
     # (data_init,scale_init) within the single summary table.
     rows = [
@@ -294,21 +412,22 @@ def main():
             scale_init=si,
             seed=args.seed,
             mode=args.mode,
+            knl_name=args.knl_name,
         )
         for (di, si), intype, (M, N, K), apre in itertools.product(
-            init_pairs, args.intype, args.shape, args.apre
+            init_pairs, args.intype, shapes, args.apre
         )
     ]
 
-    if rows and args.mode != "func":
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "mxfp8fp4gemm %s summary (markdown):\n%s",
-            args.mode,
-            df.to_markdown(index=False),
-        )
-        if args.mode == "profile":
-            aiter.logger.info("profiler traces written under ./aiter_logs/")
+    df = pd.DataFrame(rows)
+    # Keep knl_name (the dispatched .co); drop the columns constant within a table.
+    df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
+    aiter.logger.info(
+        "mxfp8fp4gemm (F8GEMM) summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    if args.mode == "profile":
+        aiter.logger.info("profiler traces written under ./aiter_logs/")
 
 
 if __name__ == "__main__":
