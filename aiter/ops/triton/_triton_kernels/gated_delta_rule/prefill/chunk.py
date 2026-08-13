@@ -15,6 +15,7 @@ import torch
 
 from ..utils import (
     GatedDeltaRulePrefillMetadata,
+    K5K6Fusion,
     build_gated_delta_rule_prefill_metadata,
     chunk_local_cumsum,
     chunk_scaled_dot_kkt_fwd,
@@ -226,7 +227,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
-    use_chunk_flydsl_fused: bool = False,
+    fusion: K5K6Fusion = K5K6Fusion.AUTO,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
@@ -256,11 +257,15 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         output_final_state: bool
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state (K5)
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
-        use_chunk_flydsl_fused: bool — use the FlyDSL fused K5+K6 kernel, which
-            computes both the hidden state and the output ``o`` in one dispatch.
-            Mutually exclusive with the other two flags; skips the separate K6
-            call and returns early.
+        use_chunk_flydsl: bool — use the FlyDSL backend for the K5+K6 stage.
+        fusion: K5K6Fusion — whether to run the fused FlyDSL K5+K6 kernel (one
+            dispatch producing both the hidden state and the output ``o``) or the
+            separate K5 + K6 pipeline. ``AUTO`` (default) lets the shape heuristic
+            decide (gfx942 and BV=64 grid fill ``ceil(V/64)*N*H / CU >= 0.5``);
+            ``ALWAYS`` forces the fused kernel; ``NEVER`` forces the separate
+            path. When the fused kernel runs it skips the separate K6 call and
+            returns early. ``fusion`` is dependent on the ``use_chunk_flydsl`` 
+            flag and requires it to be set to True.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -284,11 +289,33 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
     """
-    if sum([use_chunk_hip, use_chunk_flydsl, use_chunk_flydsl_fused]) > 1:
+    if use_chunk_hip and use_chunk_flydsl:
         raise ValueError(
-            "use_chunk_hip, use_chunk_flydsl, and use_chunk_flydsl_fused are "
-            "mutually exclusive; set at most one."
+            "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
+            "set at most one."
         )
+    fusion = K5K6Fusion.coerce(fusion)
+
+    # Using fusion requires that we have opted for the FlyDSL chunk backend.
+    if use_chunk_flydsl:
+        if fusion is K5K6Fusion.ALWAYS:
+            use_chunk_flydsl_fused = True
+        elif fusion is K5K6Fusion.AUTO:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                should_use_fused_gfx942,
+            )
+
+            _N = (
+                len(cu_seqlens) - 1 - num_decodes
+                if cu_seqlens is not None
+                else v.shape[0]
+            )
+            use_chunk_flydsl_fused = should_use_fused_gfx942(H=v.shape[2], N=_N, V=v.shape[-1])
+        else:
+            use_chunk_flydsl_fused = False
+    else:
+        use_chunk_flydsl_fused = False
+
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
             raise ValueError(

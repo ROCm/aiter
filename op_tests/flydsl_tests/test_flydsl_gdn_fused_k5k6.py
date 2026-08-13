@@ -15,7 +15,7 @@ from the FlyDSL K5 kernel itself (whose correctness is covered by
 Two levels:
   * ``test_fused_unit``     — call the fused wrapper directly.
   * ``test_fused_pipeline`` — call the end-to-end pipeline with
-    ``use_chunk_flydsl_fused=True`` and compare to the Triton-only baseline.
+    ``fusion=K5K6Fusion.ALWAYS`` and compare to the NEVER/Triton baseline.
 """
 
 from __future__ import annotations
@@ -191,41 +191,123 @@ def test_fused_final_state():
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline test: use_chunk_flydsl_fused vs Triton-only baseline
+# Pipeline tests: the K5K6Fusion API on chunk_gated_delta_rule_fwd_opt_vk.
+#
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("H,Hg", [(4, 2), (8, 4)])
-@pytest.mark.parametrize("seq_lens", [[512], [512, 512]])
-def test_fused_pipeline(H, Hg, seq_lens):
-    """End-to-end pipeline with use_chunk_flydsl_fused matches Triton baseline."""
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
-        chunk_gated_delta_rule_fwd_opt_vk,
-    )
-
+def _pipeline_inputs(H, Hg, seq_lens, device="cuda"):
     K = V = 128
     T_flat = sum(seq_lens)
     N = len(seq_lens)
-    device = "cuda"
     dtype = torch.bfloat16
     cu = _make_cu_seqlens(seq_lens, device) if N > 1 else None
-    scale = K ** -0.5
-
     q = torch.randn(1, T_flat, Hg, K, dtype=dtype, device=device) * 0.1
     k = torch.randn(1, T_flat, Hg, K, dtype=dtype, device=device) * 0.1
     v = torch.randn(1, T_flat, H, V, dtype=dtype, device=device) * 0.1
     g = torch.randn(1, T_flat, H, dtype=torch.float32, device=device) * -0.5
     beta = torch.randn(1, T_flat, H, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
-
-    common = dict(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+    return dict(
+        q=q, k=k, v=v, g=g, beta=beta, scale=K ** -0.5,
         initial_state=h0, output_final_state=True, cu_seqlens=cu,
     )
+
+
+@pytest.mark.parametrize("H,Hg", [(4, 2), (8, 4)])
+@pytest.mark.parametrize("seq_lens", [[512], [512, 512]])
+def test_fused_pipeline(H, Hg, seq_lens):
+    """fusion=ALWAYS (FlyDSL backend) matches the pure-Triton baseline."""
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
+        chunk_gated_delta_rule_fwd_opt_vk,
+    )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
+
+    common = _pipeline_inputs(H, Hg, seq_lens)
+    # Baseline: pure Triton (no FlyDSL backend -> fusion ignored regardless).
     _, o_base, fs_base = chunk_gated_delta_rule_fwd_opt_vk(**common)
+    # Force the fused FlyDSL kernel. NOTE: fusion is gated behind
+    # use_chunk_flydsl, so both flags are required.
     _, o_fused, fs_fused = chunk_gated_delta_rule_fwd_opt_vk(
-        use_chunk_flydsl_fused=True, **common
+        use_chunk_flydsl=True, fusion=K5K6Fusion.ALWAYS, **common
     )
 
     ratio_o = _rmse_ratio(o_fused, o_base)
     assert ratio_o < _RMSE_TOL, f"pipeline o mismatch: rmse_ratio={ratio_o:.3e}"
     ratio_fs = _rmse_ratio(fs_fused, fs_base)
     assert ratio_fs < _RMSE_TOL, f"pipeline final_state mismatch: {ratio_fs:.3e}"
+
+
+# --------------------------------------------------------------------------- #
+# Fusion-selection heuristic (fill64 >= 0.5)
+# --------------------------------------------------------------------------- #
+def test_fused_selection_heuristic():
+    """``should_use_fused_gfx942`` matches the fill64 = 2*N*H/CU >= 0.5 rule."""
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        should_use_fused_gfx942,
+        _device_cu_count,
+        _FUSED_MIN_FILL64,
+        _ARCH,
+    )
+
+    if _ARCH != "gfx942":
+        pytest.skip(f"fusion heuristic is gfx942-only; arch={_ARCH}")
+
+    cu = _device_cu_count()
+    for H, N in [(24, 8), (12, 8), (24, 4), (12, 4), (4, 8), (96, 1), (12, 1)]:
+        fill64 = 2 * N * H / cu  # V=128 -> ceil(V/64)=2
+        expect = fill64 >= _FUSED_MIN_FILL64
+        got = should_use_fused_gfx942(H=H, N=N, V=128)
+        assert got == expect, (
+            f"H={H} N={N} fill64={fill64:.2f}: got {got}, want {expect}"
+        )
+
+
+@pytest.mark.parametrize(
+    "H,Hg,seq_lens,expect_fused",
+    [
+        (24, 24, [512] * 8, True),    # fill64=1.26 -> heuristic picks fused
+        (8, 4, [512] * 4, False),     # fill64=0.21 -> heuristic picks separate
+    ],
+)
+def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
+    """fusion=AUTO (with use_chunk_flydsl) routes by the heuristic, stays correct.
+
+    High-fill routes to the fused kernel (matches the pure-Triton baseline within
+    tolerance). Low-fill routes to the separate FlyDSL-K5 + Triton-K6 path, which
+    differs from pure Triton only in the K5 backend -- still within tolerance.
+    Both must match; the routing itself is asserted via should_use_fused_gfx942.
+    """
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
+        chunk_gated_delta_rule_fwd_opt_vk,
+    )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        should_use_fused_gfx942,
+        _ARCH,
+    )
+
+    N = len(seq_lens)
+    if _ARCH == "gfx942":
+        assert should_use_fused_gfx942(H=H, N=N, V=128) is expect_fused, (
+            "heuristic prediction changed; update the test expectation"
+        )
+
+    common = _pipeline_inputs(H, Hg, seq_lens)
+    _, o_base, _ = chunk_gated_delta_rule_fwd_opt_vk(**common)  # pure Triton
+    _, o_auto, _ = chunk_gated_delta_rule_fwd_opt_vk(
+        use_chunk_flydsl=True, fusion=K5K6Fusion.AUTO, **common
+    )
+    ratio = _rmse_ratio(o_auto, o_base)
+    assert ratio < _RMSE_TOL, f"auto-routed o mismatch: rmse={ratio:.3e}"
+
+
+def test_fusion_enum_coerce():
+    """K5K6Fusion.coerce accepts enum / str / None; rejects garbage."""
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
+
+    assert K5K6Fusion.coerce(None) is K5K6Fusion.AUTO
+    assert K5K6Fusion.coerce("always") is K5K6Fusion.ALWAYS
+    assert K5K6Fusion.coerce("NEVER") is K5K6Fusion.NEVER
+    assert K5K6Fusion.coerce(K5K6Fusion.AUTO) is K5K6Fusion.AUTO
+    with pytest.raises(ValueError):
+        K5K6Fusion.coerce("sometimes")
+

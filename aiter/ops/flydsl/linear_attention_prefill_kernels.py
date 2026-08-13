@@ -26,6 +26,7 @@ import triton
 
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
+    K5K6Fusion,  # noqa: F401  re-exported: the fused-vs-separate selection enum
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
@@ -63,7 +64,10 @@ _RCP_LN2 = math.log2(math.e)
 
 
 __all__ = [
+    "K5K6Fusion",
     "chunk_gated_delta_rule_fwd_h_flydsl",
+    "chunk_gated_delta_rule_fwd_h_o_flydsl",
+    "should_use_fused_gfx942",
 ]
 
 
@@ -704,6 +708,26 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 # -- Fused K5+K6 compile cache + launch (gfx942) -------------------------
 
 _compiled_fused_kernels: dict = {}
+
+
+# Fused-vs-unfused selection threshold. The fused K5+K6 kernel wins whenever its
+# BV=64 grid fills the device: fill64 = ceil(V/64)*N*H / CU >= 0.5. Established by
+# the 171-shape MI325X graph-mode sweep. Below 0.5 the result is mixed and the 
+# small-grid losses can be steep.
+_FUSED_MIN_FILL64 = 0.5
+
+def should_use_fused_gfx942(*, H: int, N: int, V: int) -> bool:
+    """Heuristic: is the fused K5+K6 kernel the faster choice for this shape?
+
+    True on gfx942 when the BV=64 grid over-fills the device by at least
+    ``_FUSED_MIN_FILL64`` (fill64 = ceil(V/64)*N*H / CU_count). Callers that pass
+    an "auto" mode use this to route between the fused kernel and the separate
+    K5+K6 pipeline. Off-arch always returns False (fused kernel is tested only on gfx942).
+    """
+    if _ARCH != "gfx942":
+        return False
+    fill64 = _grid_ctas(H=H, V=V, N=N, BV=64) / max(_device_cu_count(), 1)
+    return fill64 >= _FUSED_MIN_FILL64
 
 
 # Fused wave-widening: auto uses num_waves=8 (NR_SPLIT=2) when it selects BV=64

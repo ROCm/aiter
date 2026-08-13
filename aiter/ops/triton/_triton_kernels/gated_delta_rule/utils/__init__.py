@@ -7,6 +7,7 @@ from .cumsum import (
     chunk_local_cumsum_scalar,
     chunk_local_cumsum_vector,
 )
+from .fusion import K5K6Fusion
 from .index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -23,6 +24,7 @@ from .wy_representation import chunk_scaled_dot_kkt_fwd, recompute_w_u_fwd
 
 __all__ = [
     "GatedDeltaRulePrefillMetadata",
+    "K5K6Fusion",
     "build_gated_delta_rule_prefill_metadata",
     "chunk_local_cumsum",
     "chunk_local_cumsum_scalar",
