@@ -50,6 +50,7 @@ def _ref_kda_decode(
         bias=None,
         activation="silu",
         conv_state_indices=ssm_state_indices,
+        use_gluon=False,
     )
 
     # Kernel 2: recurrence (aiter uses softplus gating, not KDA lower-bound)

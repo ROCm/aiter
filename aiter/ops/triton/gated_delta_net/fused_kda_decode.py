@@ -7,13 +7,12 @@ Single Triton kernel launch. Fuses three separate operations into one,
 eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
-from __future__ import annotations
-
 import torch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def fused_kda_decode(
@@ -113,6 +112,6 @@ def fused_kda_decode(
         stride_beta_tok=stride_beta_tok,
         stride_og_tok=stride_og_tok,
         stride_ssm_slot=ssm_state.stride(0),
-        num_warps=4,
+        num_warps=2 if get_arch() == "gfx942" else 4,
     )
     return out
