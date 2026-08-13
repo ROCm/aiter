@@ -1186,9 +1186,11 @@ void opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16_kernel(
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            const opus_bf16x8 v =
-                *reinterpret_cast<const opus_bf16x8*>(
-                    src + static_cast<int64_t>(tr[k]) * H + h);
+            // Random route rows are consumed once; avoid filling caches with
+            // the 1-GiB source while preserving wide 16-byte transactions.
+            const opus_bf16x8 v = __builtin_nontemporal_load(
+                reinterpret_cast<const opus_bf16x8*>(
+                    src + static_cast<int64_t>(tr[k]) * H + h));
 #pragma unroll
             for(int i = 0; i < 8; ++i)
                 acc[i] += static_cast<float>(v[i]);
@@ -1291,9 +1293,11 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            const opus_bf16x8 v =
-                *reinterpret_cast<const opus_bf16x8*>(
-                    src + static_cast<int64_t>(tr[k]) * H + h);
+            // Random route rows are consumed once; avoid filling caches with
+            // the 1-GiB source while preserving wide 16-byte transactions.
+            const opus_bf16x8 v = __builtin_nontemporal_load(
+                reinterpret_cast<const opus_bf16x8*>(
+                    src + static_cast<int64_t>(tr[k]) * H + h));
 #pragma unroll
             for(int i = 0; i < 8; ++i)
                 acc[i] += static_cast<float>(v[i]);
