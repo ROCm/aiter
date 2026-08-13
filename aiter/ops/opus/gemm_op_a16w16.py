@@ -40,7 +40,6 @@ module when that lands.
 """
 
 import logging
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -57,7 +56,7 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -80,7 +79,7 @@ def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -253,10 +252,10 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return Y
 
@@ -271,21 +270,44 @@ def _opus_gemm_bf16_dispatch(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor: ...
 
 
 # ---- High-level shape-driven API -----------------------------------------
 
-# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
-# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
+# splitk kids main kernel only has the <fp32_t> instantiation (traits
+# static_assert D_C==float, fp32 workspace). The reduce kernel
 # (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
 # __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
-# outputs are valid. Kept here only as a documentation anchor; the dispatch
-# code below no longer needs to special-case Y.dtype against splitk kids.
+# outputs are valid. The dispatch code below no longer needs to special-case
+# Y.dtype against splitk kids.
+#
+# splitk kid ranges, one half-open [lo, hi) interval per device family. Kept
+# in exact lockstep with the C++ authority `opus_kid_is_splitk` in
+# csrc/opus_gemm/opus_gemm.cu -- adding a new device's splitk band means
+# appending one row HERE and there. Consumed by is_splitk_kid() below, which
+# gates the split-K workspace prewarm in aiter/tuned_gemm.py (non-splitk kids
+# never touch the workspace, so warming it for them is pure waste).
+_SPLITK_KID_RANGES = (
+    (200, 300),  # gfx950 base
+    (1200, 1300),  # gfx950 non-OOB mirror (+1000)
+    (10200, 10300),  # gfx942 (+10000)
+    (20000, 21000),  # gfx1250 cluster/TDM split-K
+)
+
+
+def is_splitk_kid(kid: int) -> bool:
+    """True iff `kid` selects a split-K opus a16w16 kernel (fp32 workspace +
+    reduce). Mirrors C++ `opus_kid_is_splitk`; keep the two in sync."""
+    kid = int(kid)
+    return any(lo <= kid < hi for lo, hi in _SPLITK_KID_RANGES)
+
+
+# Back-compat: the old gfx950-only single-band constants some callers imported.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -426,12 +448,12 @@ def _finalize_output(Y: Tensor, reshape_out_to_2d: bool) -> Tensor:
 def gemm_a16w16_opus(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     *,
-    kernelId: Optional[int] = None,
-    splitK: Optional[int] = None,
-    out: Optional[Tensor] = None,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
 ) -> Tensor:
     """Shape-driven opus a16w16 GEMM.
 
@@ -471,7 +493,7 @@ def gemm_a16w16_opus(
     -------
     Tensor with shape [M, N] when A was 2D, [batch, M, N] when A was 3D.
     """
-    XQ, WQ, Y, M, N, K, batch, reshape_out_to_2d = _validate_and_reshape(
+    XQ, WQ, Y, M, N, K, _batch, reshape_out_to_2d = _validate_and_reshape(
         A, B, bias, dtype, out
     )
 
@@ -530,7 +552,8 @@ def opus_gemm_workspace_init() -> None: ...
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
+    "is_splitk_kid",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
 ]

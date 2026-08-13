@@ -1,6 +1,7 @@
-from collections import namedtuple
-import os
 import concurrent.futures
+import os
+from collections import namedtuple
+
 from csrc.cpp_itfs.pa.pa_ragged import compile
 
 PAConfig = namedtuple(
@@ -94,7 +95,7 @@ def main():
                         )
 
     with concurrent.futures.ProcessPoolExecutor(
-        os.environ.get("MAX_JOBS", 16)
+        os.environ.get("MAX_JOBS", "16")
     ) as executor:
         executor.map(process_config, configs)
 

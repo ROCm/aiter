@@ -134,7 +134,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
         auto p = reinterpret_cast<const int*>(qbase);
         const uint32_t u0 = (uint32_t)(NT_HINTS ? __builtin_nontemporal_load(p) : *p);
 
-        const auto fp4pack = __builtin_bit_cast(opus::array<opus::fp4_t, 4>, u0);
+        const auto fp4pack = __builtin_bit_cast(opus::array<opus::fp4_t, 8>, u0);   // 8 fp4 values in a u32
         const opus::fp32x8_t d = opus::fp4_to_fp32_packed_x8(fp4pack, s);
         #pragma unroll
         for (int k = 0; k < 8; ++k) acc[k] = fmaf(d[k], w, acc[k]);

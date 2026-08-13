@@ -24,6 +24,7 @@
 #include <hip/hip_runtime.h>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <string>
@@ -94,6 +95,215 @@ DINLINE out_dtype downcast_s(opus::fp32_t val)
 template <>
 DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 { return val; }
+
+// ---------------------------------------------------------------------------
+// LL (low-latency) small-message all-reduce
+// ---------------------------------------------------------------------------
+// Ported from the standalone PoC (formerly custom_all_reduce_ll_poc.*), now
+// folded into the gfx1250 path. Flag-in-data, zero GPU barrier: each 16B line
+// carries 8B payload + two 4B epoch flags. A rank publishes its sendbuff into
+// every peer's staging scratch, then polls its own scratch for the peers' lines
+// (spinning on the flag) and reduces in fp32. The scratch lives appended to the
+// shared Signal meta buffer (offset kLLScratchOffset), so no extra cross-rank
+// exchange is needed — peer scratch base = (char*)sg_.signals[i] + off.
+
+// gfx1250 AR supports world_size <= 4; size scratch for the max.
+constexpr int    kLLMaxRanks       = 4;
+// Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
+constexpr size_t kLLArMaxBytes     = 131072;            // 128 KiB
+// Hard per-message payload cap (one slot). Comfortably above the routing
+// threshold so all dtypes at <=128 KiB fit.
+constexpr size_t kLLScratchCapBytes = 262144;           // 256 KiB
+// Per-rank staging slot capacity, in 8-byte packets.
+constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 32768
+
+// 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
+union LLPackedMsg
+{
+    struct
+    {
+        uint32_t data0;
+        uint32_t flag0;
+        uint32_t data1;
+        uint32_t flag1;
+    };
+    uint4 raw;
+};
+static_assert(sizeof(LLPackedMsg) == 16, "LLPackedMsg must be exactly 16 bytes");
+
+// Per-rank scratch footprint: 2 banks * kLLMaxRanks slots * slotStride * 16B.
+// 4 MiB at the 256 KiB / 4-rank defaults. Uniform across ranks so the
+// double-buffered slot layout is identical everywhere.
+constexpr size_t llScratchBytes()
+{
+    return (size_t)2 * kLLMaxRanks * kLLPackCapacity * sizeof(LLPackedMsg);
+}
+
+// Byte offset of the LL scratch within the shared meta buffer: right after the
+// Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
+// kLLScratchOffset + llScratchBytes() and zero-initialized, which doubles as the
+// LL flag reset (flag 0 == cleared line).
+constexpr size_t kLLScratchOffset =
+    ((sizeof(Signal) + 127) / 128) * 128;
+
+// gfx1250 128-bit global load/store at *system* scope ("" == system). A single
+// 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__) &&                   \
+    __has_builtin(__builtin_amdgcn_global_store_b128) &&                         \
+    __has_builtin(__builtin_amdgcn_global_load_b128)
+#define AITER_GFX1250_HAVE_B128 1
+using llx_v4u      = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
+using llx_v4u_gptr = __attribute__((address_space(1))) llx_v4u*;
+#else
+#define AITER_GFX1250_HAVE_B128 0
+#endif
+
+DINLINE void ll_store_b128(uint32_t* dst, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+#if AITER_GFX1250_HAVE_B128
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.w[0] = a0;
+    u.w[1] = a1;
+    u.w[2] = a2;
+    u.w[3] = a3;
+    __builtin_amdgcn_global_store_b128((llx_v4u_gptr)dst, u.v, "");
+#else
+    __builtin_nontemporal_store(a0, dst + 0);
+    __builtin_nontemporal_store(a1, dst + 1);
+    __builtin_nontemporal_store(a2, dst + 2);
+    __builtin_nontemporal_store(a3, dst + 3);
+#endif
+    asm volatile("" ::: "memory");
+}
+
+DINLINE void ll_load_b128(
+    const uint32_t* src, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3)
+{
+    asm volatile("" ::: "memory");
+#if AITER_GFX1250_HAVE_B128
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.v = __builtin_amdgcn_global_load_b128((llx_v4u_gptr)src, "");
+    o0  = u.w[0];
+    o1  = u.w[1];
+    o2  = u.w[2];
+    o3  = u.w[3];
+#else
+    o0 = __builtin_nontemporal_load(src + 0);
+    o1 = __builtin_nontemporal_load(src + 1);
+    o2 = __builtin_nontemporal_load(src + 2);
+    o3 = __builtin_nontemporal_load(src + 3);
+#endif
+}
+
+// LL flat all-reduce. 1D grid over 8-byte packets.
+//
+// Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
+// slot[rank], as LL lines carrying the epoch flag.
+// Phase 2 (reduce): rank polls its own scratch slots for the other ranks
+// (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
+// and writes recvbuff. Self is read directly from sendbuff.
+//
+// Graph-safe device epoch: each block owns a persistent device flag
+// block_flags[blockIdx.x] that the kernel itself bumps (mirrors Signal::_flag).
+// A packet is always published+consumed by the same (blockIdx, threadIdx) on
+// every rank, so only the *same block across ranks* must agree on the flag; each
+// block runs once per launch, keeping per-block flags in lockstep. Scratch is
+// double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
+// lines, so no clearing is needed and it survives CUDA-graph replay.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 2) ar_ll_gfx1250(
+    T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
+    T* __restrict__ recvbuff,
+    const T* __restrict__ sendbuff,
+    size_t nPk,          // number of 8-byte packets = bytes / 8
+    int rank,
+    uint32_t* __restrict__ block_flags) // device array[gridDim.x], persisted
+{
+    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
+    using PL         = typename opus::vector_t<T, LP>;
+    using AL         = typename opus::vector_t<opus::fp32_t, LP>;
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 1u; // flag is never 0 (0 == cleared scratch)
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
+
+    // Phase 1: publish my payload into every peer's slot[rank].
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint32_t d0 = in[2 * pk];
+        const uint32_t d1 = in[2 * pk + 1];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
+        }
+    }
+
+    // Phase 2: poll my slots for the other ranks, reduce with my own data.
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
+        AL acc;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            acc[j] = upcast_s(selfv[j]);
+
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int                   peer = (rank + r) % ngpus;
+            volatile LLPackedMsg* src  = myBase + (size_t)peer * slot;
+            uint32_t d0, f0, d1, f1;
+            do
+            {
+                ll_load_b128(
+                    reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
+                    d0, f0, d1, f1);
+            } while(f0 != flag || f1 != flag);
+
+            const uint32_t w[2] = {d0, d1};
+            PL             pv   = *reinterpret_cast<const PL*>(w);
+#pragma unroll
+            for(int j = 0; j < LP; ++j)
+                acc[j] += upcast_s(pv[j]);
+        }
+
+        PL ov;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            ov[j] = downcast_s<T>(acc[j]);
+        reinterpret_cast<PL*>(recvbuff)[pk] = ov;
+    }
+
+    if(threadIdx.x == 0)
+        block_flags[blockIdx.x] = flag;
+}
 
 // ---------------------------------------------------------------------------
 // Synchronisation primitives (ROCm path only)
@@ -718,6 +928,19 @@ public:
     std::vector<void*> graph_unreg_input_buffers_;
     std::vector<void*> graph_unreg_output_buffers_;
 
+    // Opened hipIpc handles, kept so they can be closed at destruction. Only
+    // populated on the IPC transport path (ROCm >= 7.15, where hipIpc works on
+    // gfx1250). Empty on the VMM path — the destructor is then a no-op.
+    using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
+    std::map<IPC_KEY, char*> ipc_handles_;
+
+    // LL small-message fast path. Device table of per-rank scratch bases (each
+    // = peer meta base + kLLScratchOffset, i.e. the region right after the peer
+    // Signal in the shared meta buffer) and a persistent per-block epoch array.
+    // Allocated lazily by ensure_ll_tables_() on the first LL launch.
+    void**    d_ll_peers_       = nullptr;
+    uint32_t* d_ll_block_flags_ = nullptr;
+
     // gfx1250: hipIpc is not available. Instead, each rank's Signal buffer
     // is a torch-shared tensor whose device pointer is exchanged via the
     // distributed store.  The constructor receives the remote pointers
@@ -739,6 +962,138 @@ public:
         {
             sg_.signals[i] = reinterpret_cast<Signal*>(all_meta_ptrs[i]);
         }
+        // Build the LL scratch/epoch tables now, at construction, rather than
+        // lazily on the first LL launch. The lazy path would run hipMalloc /
+        // hipMemcpy / hipMemset the first time allreduce() routes to LL, and if
+        // that first call happens inside a CUDA-graph capture (no eager warm-up
+        // before capture) those runtime calls are illegal mid-capture and abort.
+        // sg_.signals[] is populated above, so the peer scratch bases are ready.
+        if(ll_enabled())
+            ensure_ll_tables_();
+    }
+
+    // IPC transport overload (ROCm >= 7.15): hipIpc works on gfx1250, so peer
+    // meta buffers are shared via IPC handles instead of VMM-exported fds. This
+    // mirrors the old-arch path — resolve each remote handle to a local VA via
+    // hipIpcOpenMemHandle and add its offset. The kernel is unchanged; only how
+    // the peer pointers are obtained differs.
+    CustomAllreduce(Signal* meta,
+                    void* rank_data,
+                    size_t rank_data_sz,
+                    const hipIpcMemHandle_t* handles,
+                    const std::vector<int64_t>& offsets,
+                    int rank,
+                    bool fully_connected = true)
+        : rank_(rank),
+          world_size_(offsets.size()),
+          full_nvlink_(fully_connected),
+          self_sg_(meta),
+          d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
+          d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
+    {
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle(&handles[i]);
+                handle += offsets[i];
+                sg_.signals[i] = reinterpret_cast<Signal*>(handle);
+            }
+            else
+            {
+                sg_.signals[i] = self_sg_;
+            }
+        }
+        // Eager LL-table build (see the VMM-overload constructor above): keeps
+        // hipMalloc/hipMemcpy/hipMemset out of the first LL allreduce, which may
+        // land inside a CUDA-graph capture and abort. sg_.signals[] is ready.
+        if(ll_enabled())
+            ensure_ll_tables_();
+    }
+
+    char* open_ipc_handle(const void* ipc_handle)
+    {
+        auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
+        if(new_handle)
+        {
+            char* ipc_ptr;
+            HIP_CALL(hipIpcOpenMemHandle((void**)&ipc_ptr,
+                                         *((const hipIpcMemHandle_t*)ipc_handle),
+                                         hipIpcMemLazyEnablePeerAccess));
+            it->second = ipc_ptr;
+        }
+        return it->second;
+    }
+
+    ~CustomAllreduce()
+    {
+        // No-op on the VMM path (ipc_handles_ empty); closes opened peer
+        // handles on the IPC path.
+        for(auto [_, ptr] : ipc_handles_)
+        {
+            HIP_CALL(hipIpcCloseMemHandle(ptr));
+        }
+        if(d_ll_peers_)
+            (void)hipFree(d_ll_peers_);
+        if(d_ll_block_flags_)
+            (void)hipFree(d_ll_block_flags_);
+    }
+
+    // Whether the LL small-message fast path is enabled. On by default; set
+    // AITER_CUSTOM_AR_DISABLE_LL=1 to force the naive kernel for all sizes.
+    static bool ll_enabled()
+    {
+        static const bool disabled = []() {
+            const char* e = std::getenv("AITER_CUSTOM_AR_DISABLE_LL");
+            if(!e)
+                return false;
+            std::string v(e);
+            return v == "1" || v == "true" || v == "yes" || v == "on" ||
+                   v == "TRUE" || v == "YES" || v == "ON";
+        }();
+        return !disabled;
+    }
+
+    // Lazily build the per-rank LL scratch pointer table and per-block epoch.
+    // sg_.signals[i] is each rank's meta base (populated by both constructors);
+    // the LL scratch sits at + kLLScratchOffset. The shared meta buffer is
+    // zero-initialized by the caller, which resets the LL flags (0 == cleared).
+    void ensure_ll_tables_()
+    {
+        if(d_ll_peers_)
+            return;
+        std::vector<void*> peers(world_size_);
+        for(int i = 0; i < world_size_; ++i)
+            peers[i] = reinterpret_cast<char*>(sg_.signals[i]) + kLLScratchOffset;
+        HIP_CALL(hipMalloc(&d_ll_peers_, sizeof(void*) * world_size_));
+        HIP_CALL(hipMemcpy(
+            d_ll_peers_, peers.data(), sizeof(void*) * world_size_, hipMemcpyHostToDevice));
+        HIP_CALL(hipMalloc(&d_ll_block_flags_, sizeof(uint32_t) * kMaxBlocks));
+        HIP_CALL(hipMemset(d_ll_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
+    }
+
+    // LL small-message all-reduce. Reads `input` locally, pushes to peer scratch,
+    // reduces into `output`. numel is the element count; bytes must be a multiple
+    // of 16 and <= kLLScratchCapBytes (guaranteed by the routing threshold).
+    template <typename T>
+    void allreduce_ll(hipStream_t stream, const T* input, T* output, int numel)
+    {
+        ensure_ll_tables_();
+        const size_t bytes = (size_t)numel * sizeof(T);
+        const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
+
+        constexpr int threads = 256;
+        int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
+        if(blocks < 1)
+            blocks = 1;
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
+        if(world_size_ == 2)
+            ar_ll_gfx1250<T, 2><<<blocks, threads, 0, stream>>>(
+                peers, output, input, nPk, rank_, d_ll_block_flags_);
+        else
+            ar_ll_gfx1250<T, 4><<<blocks, threads, 0, stream>>>(
+                peers, output, input, nPk, rank_, d_ll_block_flags_);
     }
 
     // gfx1250: return raw device pointers (no hipIpc handles).
@@ -780,6 +1135,55 @@ public:
         RankData data;
         for(int i = 0; i < world_size_; i++)
             data.ptrs[i] = (i != rank_) ? (void*)all_ptrs[i] : self;
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        output_buffers_[self] = d_data;
+    }
+
+    // IPC transport overloads (ROCm >= 7.15): resolve peer handles to VAs.
+    void register_input_buffer(const hipIpcMemHandle_t* handles,
+                               const int64_t* offsets,
+                               void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle((void*)&handles[i]);
+                handle += offsets[i];
+                data.ptrs[i] = handle;
+            }
+            else
+            {
+                data.ptrs[i] = self;
+            }
+        }
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        input_buffer[self] = d_data;
+    }
+
+    void register_output_buffer(const hipIpcMemHandle_t* handles,
+                                const int64_t* offsets,
+                                void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle((void*)&handles[i]);
+                handle += offsets[i];
+                data.ptrs[i] = handle;
+            }
+            else
+            {
+                data.ptrs[i] = self;
+            }
+        }
         auto d_data = d_rank_data_base_++;
         HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
         output_buffers_[self] = d_data;
@@ -1012,6 +1416,18 @@ public:
         if(size % d != 0)
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
+
+        // LL small-message fast lane: bytes <= kLLArMaxBytes (128 KiB) route to
+        // the flag-in-data kernel, which reads input locally and pushes to the
+        // shared peer scratch — no registered peer-input table (_input_dp) is
+        // needed, so branch before get_buffer_RD.
+        const size_t bytes = (size_t)size * sizeof(T);
+        if(ll_enabled() && bytes <= kLLArMaxBytes &&
+           (world_size_ == 2 || world_size_ == 4))
+        {
+            allreduce_ll<T>(stream, input, output, size);
+            return;
+        }
 
         RankData* input_ptrs = get_buffer_RD(stream, input);
         RankData* output_ptrs = nullptr;

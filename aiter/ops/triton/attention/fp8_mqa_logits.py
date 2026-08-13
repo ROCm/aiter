@@ -1,12 +1,13 @@
+import inspect
+
 import torch
+import triton
+from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-import inspect
-from packaging.version import Version
-import triton
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -23,7 +24,7 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
 
 
@@ -60,6 +61,21 @@ def _permute_accepts_constexpr_tuple() -> bool:
 
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
+
+# gfx942 (MI300X) LDS size per CU.
+_GFX942_CU_LDS_BYTES = 64 * 1024
+
+
+def _gfx942_tile_fits_lds(
+    block_kv: int, head_size: int, num_stages: int, occupancy: int
+) -> bool:
+    # Only the double-buffered KV tile lives in LDS (Q and the fp32 scores
+    # accumulator stay in registers in Triton 3.6+). Account for `occupancy`
+    # co-resident workgroups and keep a 0.9 safety factor for compiler
+    # overhead.
+    # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
+    lds_bytes = occupancy * num_stages * block_kv * head_size
+    return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
 def fp8_mqa_logits(
@@ -117,7 +133,17 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        block_kv = 128
+        # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
+        # the default (128, 2) tile would not fit two co-resident workgroups
+        # on a CU; keep the default tile otherwise.
+        if arch == "gfx942" and not _gfx942_tile_fits_lds(
+            block_kv=128, head_size=head_size, num_stages=2, occupancy=2
+        ):
+            block_kv = 64
+            num_stages = 1
+        else:
+            block_kv = 128
+            num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
@@ -163,7 +189,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=2,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
@@ -173,11 +199,17 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 3
+            waves_per_eu = 4
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 1
-            block_kv = 32
-            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            num_warps = 2 if num_heads <= 32 else 1
+            block_kv = 64 if num_heads <= 32 else 32
+            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            other = {
+                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                "BLOCK_M": block_m,
+                "MFMA_NONK_DIM": mfma_nonk_dim,
+            }
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -191,7 +223,7 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
+        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,

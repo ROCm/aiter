@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Tuple
 
 import torch
 import triton
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
@@ -13,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
     _triton_fused_rms_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
@@ -117,14 +117,14 @@ def _fused_rmsnorm(
 
 def _fused_rmsnorm_add_fake(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(x)
 
 
 @torch_compile_guard(gen_fake=_fused_rmsnorm_add_fake)
 def _fused_rmsnorm_add(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     out1, out_res1 = _fused_rmsnorm_add_core(x, weight, epsilon, res1)
     return out1, out_res1
 

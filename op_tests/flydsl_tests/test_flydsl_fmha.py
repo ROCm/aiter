@@ -5,14 +5,12 @@
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import pytest
 import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.ops.flydsl import is_flydsl_available, flydsl_flash_attn_func  # noqa: E402
+from aiter.ops.flydsl import flydsl_flash_attn_func, is_flydsl_available
 
 if not is_flydsl_available():
     pytest.skip("flydsl is not available", allow_module_level=True)
@@ -23,7 +21,7 @@ def _is_gfx1201() -> bool:
         return False
     try:
         arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return arch.lower().split(":")[0].startswith("gfx1201")
 
@@ -58,7 +56,7 @@ def _make_qkv(
     dtype: torch.dtype,
     seed: int = 0,
     device: str = "cuda",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=device).manual_seed(seed)
     shape = (batch, seq_len, num_heads, head_dim)
     q = torch.randn(shape, generator=g, dtype=dtype, device=device)
@@ -222,6 +220,7 @@ def test_flydsl_fmha_correctness_multi_device():
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if "MULTI_DEVICE_OK" in proc.stdout:

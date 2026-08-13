@@ -1,13 +1,13 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
+    _sum_bitmatrix_rows_fused,
+)
 from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage1,
     _expt_data_compute_stage2,
     _expt_data_compute_stage2_fused,
-)
-from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
-    _sum_bitmatrix_rows_fused,
 )
 
 
@@ -197,7 +197,7 @@ def _combined_routing(
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
     ExpertHist,
-    n_expts_tot,
+    n_expts_tot: tl.constexpr,
     TokenStart,
     TileStart,
     blocks1a,

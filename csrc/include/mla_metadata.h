@@ -4,12 +4,7 @@
 #pragma once
 
 #include <torch/all.h>
-
-enum class MlaVersion : int32_t
-{
-    V32 = 0,
-    V40 = 1,
-};
+#include "aiter_enum.h"
 
 void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr,
                          const torch::Tensor& seqlens_kv_indptr,

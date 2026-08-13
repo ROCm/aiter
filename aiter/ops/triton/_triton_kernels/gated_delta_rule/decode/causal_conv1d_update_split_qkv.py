@@ -75,9 +75,8 @@ def _causal_conv1d_update_split_qkv_kernel(
     else:
         conv_state_batch_coord = idx_seq
 
-    if USE_PAD_SLOT:
-        if conv_state_batch_coord == pad_slot_id:
-            return
+    if USE_PAD_SLOT and conv_state_batch_coord == pad_slot_id:
+        return
 
     # Load the current convolution state.
     conv_states_base = (
@@ -364,9 +363,8 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
     else:
         conv_state_batch_coord = idx_seq
 
-    if USE_PAD_SLOT:
-        if conv_state_batch_coord == pad_slot_id:
-            return
+    if USE_PAD_SLOT and conv_state_batch_coord == pad_slot_id:
+        return
 
     # Load the current convolution state.
     conv_states_base = (
@@ -549,9 +547,8 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     else:
         conv_state_batch_coord = idx_seq
 
-    if USE_PAD_SLOT:
-        if conv_state_batch_coord == pad_slot_id:
-            return
+    if USE_PAD_SLOT and conv_state_batch_coord == pad_slot_id:
+        return
 
     # Load the current convolution state into explicit variables.
     conv_states_base = (

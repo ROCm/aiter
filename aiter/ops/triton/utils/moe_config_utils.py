@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from typing import Any, Dict, Optional
-import os
-import json
 import functools
-from ._triton import arch_info
-from .core import AITER_TRITON_CONFIGS_PATH
 import warnings
+from typing import Any
+
+import torch
+
+from ._triton import arch_info
+from .core import AITER_TRITON_CONFIGS_PATH, USE_LRU_CACHE, load_config_json
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -16,11 +16,11 @@ M_THRESHOLD_MEDIUM = 1024
 
 def get_config_dtype_str(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
 ):
     if use_fp8_w8a8:
         return "FP8_W8A8"
@@ -39,8 +39,8 @@ def get_config_dtype_str(
     return None
 
 
-@functools.lru_cache
-def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_moe_configs(dtype: str | None) -> dict[int, Any] | None:
     """
     Return optimized configurations for the fused MoE kernel.
 
@@ -53,12 +53,11 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     # directory
     dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_arch()
-    config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
-
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            # If a configuration has been found, return it
-            return {key: val for key, val in json.load(f).items()}
+    configs = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json", required=False
+    )
+    if configs is not None:
+        return configs
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -70,11 +69,11 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
 
 def get_optimal_moe_config(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
@@ -82,14 +81,13 @@ def get_optimal_moe_config(
     )
     # print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
-    if configs is not None:
-        if configs:
-            if M < M_THRESHOLD_SMALL:
-                config = configs["small_M"]
-            elif M < M_THRESHOLD_MEDIUM:
-                config = configs["medium_M"]
-            else:
-                config = configs["large_M"]
+    if configs:
+        if M < M_THRESHOLD_SMALL:
+            config = configs["small_M"]
+        elif M < M_THRESHOLD_MEDIUM:
+            config = configs["medium_M"]
+        else:
+            config = configs["large_M"]
     else:
         # default config
         config = {
@@ -110,11 +108,11 @@ def get_optimal_moe_config(
 
 def get_optimal_moe_config_func(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
 ):
     return functools.partial(
         get_optimal_moe_config,

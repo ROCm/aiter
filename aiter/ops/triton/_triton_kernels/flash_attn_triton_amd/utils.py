@@ -9,40 +9,40 @@ This module contains essential runtime utilities:
 """
 
 import functools
-import os
 import json
 import logging
+import os
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
-import triton.language as tl
+from typing import Literal
 
 import torch
 import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
 AutotuneMode = Literal["off", "on", "sweep"]
 
 __all__ = [
-    # Runtime info
-    "get_arch",
-    "is_hip",
+    "AUTOTUNE",
+    "BWD_MODE",
+    "DEBUG",
+    "PHILOX_OFFSET",
+    "PHILOX_SEED",
+    "SHAPE_EXPECTATIONS",
+    "USE_EXP2",
+    "USE_TRITON_ROCM",
     # Global config
     "AutotuneMode",
-    "AUTOTUNE",
-    "DEBUG",
-    "USE_TRITON_ROCM",
-    "BWD_MODE",
-    "USE_EXP2",
-    "PHILOX_SEED",
-    "PHILOX_OFFSET",
-    "SHAPE_EXPECTATIONS",
-    # FP8
-    "is_fp8",
+    # Runtime info
+    "get_arch",
+    "get_padded_headsize",
     # Shape/stride helpers
     "get_shape_from_layout",
     "get_stride_from_layout",
-    "get_padded_headsize",
+    # FP8
+    "is_fp8",
+    "is_hip",
     # Misc helpers
     "round_multiple",
 ]
@@ -81,7 +81,7 @@ class GpuArch:
     """GPU architecture information."""
 
     name: str  # e.g., "gfx942", "gfx1100"
-    family: Optional[ArchFamily] = None
+    family: ArchFamily | None = None
 
     @property
     def is_cdna(self) -> bool:
@@ -139,7 +139,7 @@ try:
             num_stages=conf.pop("num_stages", 1),
             num_warps=conf.pop("num_warps", 4),
         )
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     logger.warning(f"FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: {e}")
 
 # Unified debug level:
@@ -174,7 +174,7 @@ _FP8_DTYPES = frozenset(
 
 
 def is_fp8(
-    x: Union[torch.dtype, torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...]],
+    x: torch.dtype | torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
 ) -> bool:
     """Check if dtype/tensor(s) are FP8.
 
@@ -224,8 +224,8 @@ def is_fp8(
 def get_shape_from_layout(
     x: torch.Tensor,
     layout: Literal["bshd", "bhsd", "thd"],
-    cu_seqlens: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Extract (batch, max_seqlen, num_heads, head_dim) from tensor based on layout."""
     if layout == "bhsd":
@@ -233,13 +233,13 @@ def get_shape_from_layout(
     elif layout == "bshd":
         batch, max_seqlen_final, num_heads, head_dim = x.shape
     elif layout == "thd":
-        total_seqlen, num_heads, head_dim = x.shape
+        _total_seqlen, num_heads, head_dim = x.shape
         if cu_seqlens is None:
             raise ValueError("cu_seqlens must be provided for varlen (thd) layout")
         if max_seqlen is None:
             raise ValueError("max_seqlen must be provided for varlen (thd) layout")
 
-        batch, max_seqlen_final, num_heads, head_dim = (
+        batch, max_seqlen_final, num_heads, head_dim = (  # noqa: PLW0127
             len(cu_seqlens) - 1,
             max_seqlen,
             num_heads,

@@ -181,10 +181,11 @@ inline __device__ auto opus_moe_stage2_a8w4_layout_sa(int lane_id, int wave_id_m
 }
 
 template<typename T>
-inline __device__ auto opus_moe_stage2_a8w4_layout_gb(int lane_id, int wave_id_n)
+inline __device__ auto opus_moe_stage2_a8w4_layout_gb(int lane_id,
+                                                      int wave_id_n,
+                                                      int b_payload_row_stride_bytes)
 {
-    constexpr int packed_col_group_bytes =
-        T::MMA_M * T::B_PAYLOAD_ROW_STRIDE_BYTES;
+    const int packed_col_group_bytes = T::MMA_M * b_payload_row_stride_bytes;
     constexpr int packed_k_group_bytes = T::B_PAYLOAD_KLANE_STRIDE_BYTES;
 
     constexpr auto block_shape = opus::make_tuple(
@@ -204,7 +205,7 @@ inline __device__ auto opus_moe_stage2_a8w4_layout_gb(int lane_id, int wave_id_n
         opus::unfold_x_stride(
             block_dim,
             block_shape,
-            opus::tuple{opus::number<packed_col_group_bytes>{},
+            opus::tuple{packed_col_group_bytes,
                         opus::number<packed_k_group_bytes>{},
                         opus::number<1>{}}),
         opus::unfold_p_coord(
@@ -214,20 +215,10 @@ inline __device__ auto opus_moe_stage2_a8w4_layout_gb(int lane_id, int wave_id_n
 
 template<typename T>
 inline __device__ int opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset(int col_base,
-                                                                           int k_base)
+                                                                           int k_base,
+                                                                           int b_payload_row_stride_bytes)
 {
-    constexpr auto block_shape = opus::make_tuple(opus::number<1>{}, opus::number<1>{});
-    constexpr auto block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}));
-    constexpr auto u = opus::make_layout<-1>(
-        block_shape,
-        opus::unfold_x_stride(
-            block_dim,
-            block_shape,
-            opus::tuple{opus::number<T::B_PAYLOAD_ROW_STRIDE_BYTES>{},
-                        opus::number<T::B_PAYLOAD_K_STRIDE_BYTES>{}}));
-    return static_cast<int>(u(col_base, k_base));
+    return col_base * b_payload_row_stride_bytes + k_base * T::B_PAYLOAD_K_STRIDE_BYTES;
 }
 
 template<typename T>
@@ -246,21 +237,13 @@ inline __device__ int opus_moe_stage2_a8w4_b_lane_k(int gb_offset)
 }
 
 template<typename T>
-inline __device__ int opus_moe_stage2_a8w4_b_wave_id_n(int gb_offset)
-{
-    constexpr int b_wave_stride_bytes =
-        T::N_MFMA_PER_WAVE * T::MMA_N * T::B_PAYLOAD_ROW_STRIDE_BYTES;
-    return gb_offset / b_wave_stride_bytes;
-}
-
-template<typename T>
 inline __device__ int opus_moe_stage2_a8w4_b_scale_base_word_offset(int scale_row_col_base,
-                                                                    int gb_offset)
+                                                                    int gb_offset,
+                                                                    int wave_id_n)
 {
     const int row_pack =
         scale_row_col_base / T::SCALE_ROWS_PER_ROW_PACK +
-        opus_moe_stage2_a8w4_b_wave_id_n<T>(gb_offset) *
-            T::HALF_N_MFMA_PER_WAVE;
+        wave_id_n * T::HALF_N_MFMA_PER_WAVE;
     constexpr auto u = opus_moe_stage2_a8w4_layout_scale_word<T>();
     return static_cast<int>(u(row_pack,
                               opus_moe_stage2_a8w4_b_lane_k<T>(gb_offset),

@@ -1,25 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Union
+import os
+
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_kernel,
-    _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
+    _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-
-import os
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -66,12 +65,12 @@ def fused_gemm_afp4wfp4_mul_add(
     w,
     x_scales,
     w_scales,
-    a: Union[torch.Tensor, float, int],
-    b: Union[torch.Tensor, float, int],
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    fuse_type: Optional[int] = 0,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    fuse_type: int | None = 0,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -100,7 +99,7 @@ def fused_gemm_afp4wfp4_mul_add(
         f"FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
-    if isinstance(a, float) or isinstance(a, int):
+    if isinstance(a, (float, int)):
         IS_A_SCALAR = True
         IS_A_TENSOR = False
     elif isinstance(a, torch.Tensor) and a.is_contiguous():
@@ -109,7 +108,7 @@ def fused_gemm_afp4wfp4_mul_add(
             IS_A_SCALAR = True
         else:
             IS_A_SCALAR = False
-    if isinstance(b, float) or isinstance(b, int):
+    if isinstance(b, (float, int)):
         IS_B_SCALAR = True
         IS_B_TENSOR = False
     elif isinstance(b, torch.Tensor) and b.is_contiguous():
@@ -154,7 +153,7 @@ def fused_gemm_afp4wfp4_mul_add(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -242,13 +241,13 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
     w,
     x_scales,
     w_scales,
-    a: Union[torch.Tensor, float, int],
-    b: Union[torch.Tensor, float, int],
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    use_aot: Optional[bool] = True,
-    fuse_type: Optional[int] = 0,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    use_aot: bool | None = True,
+    fuse_type: int | None = 0,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled weight scales.
@@ -278,7 +277,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
-    if isinstance(a, float) or isinstance(a, int):
+    if isinstance(a, (float, int)):
         IS_A_SCALAR = True
         IS_A_TENSOR = False
     elif isinstance(a, torch.Tensor) and a.is_contiguous():
@@ -287,7 +286,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             IS_A_SCALAR = True
         else:
             IS_A_SCALAR = False
-    if isinstance(b, float) or isinstance(b, int):
+    if isinstance(b, (float, int)):
         IS_B_SCALAR = True
         IS_B_TENSOR = False
     elif isinstance(b, torch.Tensor) and b.is_contiguous():
@@ -343,7 +342,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
