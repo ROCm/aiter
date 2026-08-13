@@ -182,13 +182,17 @@ inline int select_fixed_down_kernel_id(const DownBwdKargs& kargs,
     constexpr int five_route_tiles_predecoded_kid = 9;
     constexpr int six_route_tiles_predecoded_kid = 10;
     constexpr int bn256_six_route_tiles_predecoded_kid = 11;
+    constexpr int bn256_deferred_z_wait_kid = 12;
+    constexpr int deferred_z_wait_min_routes = 65536;
     constexpr uint64_t grouped_min_ctas = 256;
     constexpr uint64_t six_route_min_ctas = 640;
     if(kargs.route.expert_offsets == nullptr || kargs.d_scores_parts <= 1)
         return legacy_kid;
 
     if(select_fixed_down_bn256_geometry(kargs))
-        return bn256_six_route_tiles_predecoded_kid;
+        return kargs.route.sorted_capacity >= deferred_z_wait_min_routes
+                   ? bn256_deferred_z_wait_kid
+                   : bn256_six_route_tiles_predecoded_kid;
 
     // Select from the useful M6 launch geometry rather than a model tuple or
     // an indirect tensor-byte proxy.  Each compact group owns up to six
@@ -1369,7 +1373,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
         static_cast<int>(sorted_expert_ids.size(0));
     geometry.inter_dim = inter_dim;
     const bool use_bn256 =
-        kernel_id == 11 ||
+        kernel_id == 11 || kernel_id == 12 ||
         (kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              geometry));
@@ -2206,7 +2210,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         static_cast<int>(sorted_expert_ids.size(0));
     down_geometry.inter_dim = inter_dim;
     const bool use_bn256 =
-        down_kernel_id == 11 ||
+        down_kernel_id == 11 || down_kernel_id == 12 ||
         (down_kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              down_geometry));

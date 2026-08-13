@@ -170,6 +170,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::Z_LDS_PAIR_PAD;
         return 0;
     }();
+    constexpr bool defer_z_lds_wait = []() constexpr {
+        if constexpr(requires { T::DEFER_Z_LDS_WAIT; })
+            return T::DEFER_Z_LDS_WAIT;
+        return false;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -709,6 +714,16 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         static_cast<int64_t>(token) * stride_score_t + slot];
             }
         }
+        if constexpr(stage_z_in_lds && defer_z_lds_wait)
+        {
+            // Z is deposited directly into LDS and does not extend any VGPR
+            // live range.  Hide its VMEM latency under the accumulator lane
+            // permutation and route/score decode above, synchronizing only
+            // immediately before the first LDS Z read below.
+            s_waitcnt_vmcnt(0_I);
+            s_waitcnt_lgkmcnt(0_I);
+            __syncthreads();
+        }
         const down_bwd_f32x2 score2{score, score};
         const down_bwd_f32x2 one{1.0f, 1.0f};
         float ds_wave_partial = 0.0f;
@@ -856,9 +871,12 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             if constexpr(route_group.value > 0)
                 __syncthreads();
             stage_z(route_group.value);
-            s_waitcnt_vmcnt(0_I);
-            s_waitcnt_lgkmcnt(0_I);
-            __syncthreads();
+            if constexpr(!defer_z_lds_wait)
+            {
+                s_waitcnt_vmcnt(0_I);
+                s_waitcnt_lgkmcnt(0_I);
+                __syncthreads();
+            }
         }
         store_epilogue(v_c[route_group.value], route_group.value);
     });
