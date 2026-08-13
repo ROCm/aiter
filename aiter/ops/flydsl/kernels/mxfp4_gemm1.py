@@ -103,6 +103,7 @@ def _gemm1_body(
     TOPK,
     interleave=False,
     v2_output_layout=False,
+    native_scale_layout=False,
     wide_mfma=False,
     wide_accumulators=1,
     num_waves=4,
@@ -1311,11 +1312,13 @@ def _gemm1_body(
                     fx.Int32(0),
                 )
 
-        # One scale chunk covers 32 sorted rows. Derive the runtime chunk extent
-        # from the active M blocks instead of using an oversized placeholder.
+        # Generic scale chunks cover 32 sorted rows; native BM16 GEMM2 consumes
+        # one padded chunk per M block. Derive the active runtime extent.
         num_scale_chunks = (
-            i32_total_m_blocks * fx.Int32(BM) + fx.Int32(31)
-        ) // fx.Int32(32)
+            i32_total_m_blocks
+            if native_scale_layout
+            else (i32_total_m_blocks * fx.Int32(BM) + fx.Int32(31)) // fx.Int32(32)
+        )
         ascaleout_layout = fx.make_layout(
             (num_scale_chunks, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
         )
@@ -1353,14 +1356,30 @@ def _gemm1_body(
                 scale_wave_grp = wave_grp
                 ikxdl = n_block_idx & fx.Int32(1)
             if const_expr(BM == 16):
-                chunk = m_block_idx >> fx.Int32(1)
-                row_half = m_block_idx & fx.Int32(1)
-                dword_off = _layout_idx(
-                    ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
-                )
-                byte_pos = ikxdl * fx.Int32(2) + row_half
-                packed_scale = scales_per_mr[0] << (byte_pos * fx.Int32(8))
-                atomic_add_scale(dword_off, packed_scale)
+                if const_expr(native_scale_layout):
+                    # Native GEMM2 addresses one padded scale chunk per BM16
+                    # block. Each A scale is duplicated for GEMM2's two N16
+                    # MFMA selectors.
+                    chunk = m_block_idx
+                    dword_off = _layout_idx(
+                        ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
+                    )
+                    duplicated_scale = scales_per_mr[0] | (
+                        scales_per_mr[0] << fx.Int32(8)
+                    )
+                    packed_scale = duplicated_scale << (ikxdl * fx.Int32(16))
+                    atomic_add_scale(dword_off, packed_scale)
+                else:
+                    # Generic v2 GEMM2 packs two BM16 blocks into one 32-row
+                    # scale chunk.
+                    chunk = m_block_idx >> fx.Int32(1)
+                    row_half = m_block_idx & fx.Int32(1)
+                    dword_off = _layout_idx(
+                        ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
+                    )
+                    byte_pos = ikxdl * fx.Int32(2) + row_half
+                    packed_scale = scales_per_mr[0] << (byte_pos * fx.Int32(8))
+                    atomic_add_scale(dword_off, packed_scale)
             elif const_expr(num_waves == 2):
                 chunk = m_block_idx
                 row_half = m_lane >> fx.Int32(4)
@@ -1459,6 +1478,7 @@ def compile_gemm1_a4w4_port(
     swiglu_limit=7.0,
     enable_bias=False,
     v2_output_layout=False,
+    native_scale_layout=False,
     wide_mfma=False,
     wide_accumulators=1,
     num_waves=4,
@@ -1516,6 +1536,10 @@ def compile_gemm1_a4w4_port(
         ), "BN64 is restricted to BM32 A4W4 non-inline separated SiTUv2"
     if num_waves == 2:
         assert BN == 64, "the two-wave specialization requires effective BN64"
+    if native_scale_layout:
+        assert (
+            BM == 16 and out_dtype == "fp4"
+        ), "native scale layout is restricted to BM16 FP4 output"
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     assert (
         D_HIDDEN % BK == 0
@@ -1533,6 +1557,8 @@ def compile_gemm1_a4w4_port(
     gu_tag = "il" if interleave else "sep"
     output_layout_tag = "" if v2_output_layout else f"_denseout_tk{TOPK}"
     name_suffix = f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}{output_layout_tag}"
+    if native_scale_layout:
+        name_suffix += "_native_scale"
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
@@ -1651,6 +1677,7 @@ def compile_gemm1_a4w4_port(
                 TOPK=TOPK,
                 interleave=interleave,
                 v2_output_layout=v2_output_layout,
+                native_scale_layout=native_scale_layout,
                 wide_mfma=wide_mfma,
                 wide_accumulators=wide_accumulators,
                 num_waves=num_waves,

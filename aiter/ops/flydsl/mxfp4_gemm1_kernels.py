@@ -59,6 +59,7 @@ def _get_compiled_mxfp4_gemm1_port(
     swiglu_limit=7.0,
     enable_bias=False,
     v2_output_layout=True,
+    native_scale_layout=False,
     wide_mfma=False,
     wide_accumulators=1,
     num_waves=4,
@@ -85,6 +86,7 @@ def _get_compiled_mxfp4_gemm1_port(
         swiglu_limit=swiglu_limit,
         enable_bias=enable_bias,
         v2_output_layout=v2_output_layout,
+        native_scale_layout=native_scale_layout,
         wide_mfma=wide_mfma,
         wide_accumulators=wide_accumulators,
         num_waves=num_waves,
@@ -110,6 +112,7 @@ def _assert_supported(
     swiglu_limit=7.0,
     interleave=False,
     num_waves=4,
+    native_scale_layout=False,
 ):
     if a_dtype not in _SUPPORTED_BY_DTYPE:
         raise NotImplementedError(
@@ -172,6 +175,10 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 two-wave specialization requires effective BN64"
         )
+    if native_scale_layout and not (BM == 16 and out_dtype == "fp4"):
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 native scale layout requires BM16 FP4 output"
+        )
     if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
@@ -206,6 +213,7 @@ def flydsl_mxfp4_gemm1(
     xcd_swizzle=0,
     sorted_token_ids=None,
     v2_output_layout=True,
+    native_scale_layout=False,
     a_dtype="fp4",
     out_dtype="fp4",
     act="silu",
@@ -252,6 +260,7 @@ def flydsl_mxfp4_gemm1(
         swiglu_limit=swiglu_limit,
         interleave=interleave,
         num_waves=num_waves,
+        native_scale_layout=native_scale_layout,
     )
     if not v2_output_layout and sorted_token_ids is None:
         raise ValueError(
@@ -279,13 +288,14 @@ def flydsl_mxfp4_gemm1(
         swiglu_limit,
         bias is not None,
         v2_output_layout,
+        native_scale_layout,
         wide_mfma,
         wide_accumulators,
         num_waves,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     if BM == 16:
-        # Two M blocks atomically pack scale bytes into each dword. The GEMM
+        # BM16 scale dwords are assembled by multiple atomic writers. The GEMM
         # uses the current/default stream, so this clear is ordered before it.
         inter_sorted_shuffled_scale.zero_()
     _moe_kernels._run_compiled(

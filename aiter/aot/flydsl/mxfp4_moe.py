@@ -81,6 +81,7 @@ def _job_key(job: dict) -> tuple:
             job["swiglu_limit"],
             job["enable_bias"],
             job["interleave"],
+            job["native_scale_layout"],
         )
     return (
         2,
@@ -251,6 +252,8 @@ def parse_csv(csv_path: str):
                         "swiglu_limit": 7.0,
                         "enable_bias": p1["enable_bias"],
                         "interleave": p1["interleave"],
+                        "native_scale_layout": p1["BM"] == 16
+                        and kn2.startswith("flydsl_mxmoe_g2_"),
                     }
                 )
 
@@ -359,6 +362,7 @@ def _compile_stage1(job):
         swiglu_limit=job["swiglu_limit"],
         bias=d if job["enable_bias"] else None,
         interleave=job["interleave"],
+        native_scale_layout=job["native_scale_layout"],
         stream=0,
     )
 

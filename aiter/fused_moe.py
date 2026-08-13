@@ -1310,6 +1310,14 @@ def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
 
 
+def _mxfp4_activation_name(activation):
+    if activation == ActivationType.Swiglu:
+        return "swiglu"
+    if activation == getattr(ActivationType, "Situv2", None):
+        return "situv2"
+    return "silu"
+
+
 def _normalize_bias_for_kernel(
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
@@ -1576,6 +1584,7 @@ def _mxfp4_a4w4_stage1(
     use_nt=False,
     interleave=False,
     num_waves=4,
+    native_scale_layout=False,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -1664,6 +1673,7 @@ def _mxfp4_a4w4_stage1(
         interleave=interleave,
         xcd_swizzle=_xcd1,
         v2_output_layout=True,
+        native_scale_layout=native_scale_layout,
         a_dtype=a_dtype,
         out_dtype=out_dtype,
         act=act,
@@ -1838,6 +1848,7 @@ def _mxfp4_a4w4_stage1_fw(
     swiglu_limit: float | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    native_scale_layout=False,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -1907,6 +1918,7 @@ def _mxfp4_a4w4_stage1_fw(
         use_nt=p1["use_nt"],
         interleave=p1["interleave"] or interleave,
         num_waves=p1.get("num_waves", 4),
+        native_scale_layout=native_scale_layout,
     )
     return inter_sorted_quant, inter_sorted_scale
 
@@ -2007,11 +2019,14 @@ def _mxfp4_a4w4_stage2_fw(
     return moe_out
 
 
-@functools.lru_cache(maxsize=2048)
 def _mxfp4_scale_u8(scale):
     """FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
     same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
-    uint8, or None) unchanged."""
+    uint8, or None) unchanged.
+
+    Do not cache tensor views here: inference and config sweeps pass distinct
+    weight tensors, and a cached view keeps each tensor's GPU storage alive.
+    """
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
@@ -2376,6 +2391,17 @@ def get_2stage_cfgs(
                 f"activation {activation}; using default heuristics"
             )
 
+    if cfg is not None and _is_mxfp4_kname(kn1):
+        configured_act = _parse_mxfp4_g1_kname(kn1)["act"]
+        expected_act = _mxfp4_activation_name(activation)
+        if configured_act != expected_act:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding MXMOE config with activation "
+                f"{configured_act!r} for runtime activation {expected_act!r}; "
+                "using default heuristics"
+            )
+
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
         if kn2.startswith("opus_"):
@@ -2503,15 +2529,7 @@ def get_2stage_cfgs(
                 "interleave": gate_mode == GateMode.INTERLEAVE,
             }
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
-        expected_act = (
-            "swiglu"
-            if activation == ActivationType.Swiglu
-            else (
-                "situv2"
-                if activation == getattr(ActivationType, "Situv2", None)
-                else "silu"
-            )
-        )
+        expected_act = _mxfp4_activation_name(activation)
         if _p1.get("act", expected_act) != expected_act:
             raise ValueError(
                 f"MXMOE GEMM1 activation {_p1.get('act')!r} does not match "
@@ -2547,6 +2565,9 @@ def get_2stage_cfgs(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
                 interleave=_p1["interleave"] or (gate_mode == GateMode.INTERLEAVE),
+                native_scale_layout=_bm == 16
+                and isinstance(kernelName2, str)
+                and kernelName2.startswith("flydsl_mxmoe_g2_"),
             ),
             stage2=stage2_func,
             block_m=_bm,
