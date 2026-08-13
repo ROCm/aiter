@@ -1376,7 +1376,7 @@ void opus_moe_gather_sum_dscore_router_token8_h2048_e64_bf16(
         T);
 }
 
-template<typename Index, bool FLAT_META = false>
+template<typename Index, bool FLAT_META = false, bool CACHE_META = false>
 __global__ __launch_bounds__(512, 1)
 void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
     const __bf16* __restrict__ src,
@@ -1405,15 +1405,24 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
     const int32_t* tr =
         token_routes + static_cast<int64_t>(t) * TOPK;
     __shared__ float selected_grad_by_token[TOKENS_PER_BLOCK][TOPK];
+    __shared__ int32_t route_by_token[
+        TOKENS_PER_BLOCK][CACHE_META ? TOPK : 1];
+    __shared__ int32_t expert_by_token[
+        TOKENS_PER_BLOCK][CACHE_META ? TOPK : 1];
     if(valid_token && wave_in_token == 0 && lane < E)
         dlogits[static_cast<int64_t>(t) * E + token_thread] =
             static_cast<__bf16>(0.0f);
     if(valid_token && wave_in_token == 0 && lane < TOPK)
     {
         float scaled_dp = 0.0f;
+        int32_t grouped_route = 0;
+        if constexpr(!FLAT_META || CACHE_META)
+            grouped_route = tr[lane];
+        if constexpr(CACHE_META)
+            route_by_token[token_in_block][lane] = grouped_route;
         const int32_t route = FLAT_META
             ? t * TOPK + lane
-            : tr[lane];
+            : grouped_route;
 #pragma unroll
         for(int i = 0; i < PARTIALS; ++i)
             scaled_dp +=
@@ -1432,6 +1441,8 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
             static_cast<float>(grad_bf16);
         const int expert =
             topk_ids[static_cast<int64_t>(t) * TOPK + rank];
+        if constexpr(CACHE_META)
+            expert_by_token[token_in_block][rank] = expert;
         dlogits[static_cast<int64_t>(t) * E + expert] = grad_bf16;
     }
     __syncthreads();
@@ -1448,9 +1459,12 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
         {
             // Random route rows are consumed once; avoid filling caches with
             // the 1-GiB source while preserving wide 16-byte transactions.
+            const int32_t route = CACHE_META
+                ? route_by_token[token_in_block][k]
+                : tr[k];
             const opus_bf16x8 v = __builtin_nontemporal_load(
                 reinterpret_cast<const opus_bf16x8*>(
-                    src + static_cast<int64_t>(tr[k]) * H + h));
+                    src + static_cast<int64_t>(route) * H + h));
 #pragma unroll
             for(int i = 0; i < 8; ++i)
                 acc[i] += static_cast<float>(v[i]);
@@ -1458,8 +1472,9 @@ void opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel(
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            const int expert =
-                topk_ids[static_cast<int64_t>(t) * TOPK + k];
+            const int expert = CACHE_META
+                ? expert_by_token[token_in_block][k]
+                : topk_ids[static_cast<int64_t>(t) * TOPK + k];
             const opus_bf16x8 v =
                 *reinterpret_cast<const opus_bf16x8*>(
                     router_w + expert * H + h);
@@ -1553,6 +1568,48 @@ void opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
     const dim3 block(512);
     opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel<
         int32_t, true>
+        <<<grid, block, 0, aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const __bf16*>(src.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(route_scores.data_ptr()),
+        reinterpret_cast<const float*>(partials.data_ptr()),
+        nullptr,
+        reinterpret_cast<const int32_t*>(topk_ids.data_ptr()),
+        reinterpret_cast<const __bf16*>(router_w.data_ptr()),
+        reinterpret_cast<__bf16*>(dst.data_ptr()),
+        reinterpret_cast<__bf16*>(dlogits.data_ptr()),
+        T);
+}
+
+void opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& partials,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& router_w,
+    aiter_tensor_t& dst,
+    aiter_tensor_t& dlogits)
+{
+    const int T = static_cast<int>(dst.size(0));
+    AITER_CHECK(T == 32768 && static_cast<int>(src.size(0)) == T * 8 &&
+                    static_cast<int>(src.size(1)) == 2048,
+                "cached-meta route tail requires [32768*8,2048] src");
+    AITER_CHECK(static_cast<int>(route_scores.size(0)) == T &&
+                    static_cast<int>(route_scores.size(1)) == 8 &&
+                    static_cast<int>(partials.size(0)) == T * 8 &&
+                    static_cast<int>(partials.size(1)) == 4,
+                "invalid cached-meta route score tensors");
+    AITER_CHECK(token_routes.dtype() == AITER_DTYPE_i32 &&
+                    token_routes.is_contiguous() &&
+                    topk_ids.dtype() == AITER_DTYPE_i32 &&
+                    topk_ids.is_contiguous(),
+                "cached-meta route tail requires contiguous int32 metadata");
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const dim3 grid((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK);
+    const dim3 block(512);
+    opus_moe_gather_sum_dscore_router_dx_token8_h2048_e64_bf16_kernel<
+        int32_t, true, true>
         <<<grid, block, 0, aiter::getCurrentHIPStream()>>>(
         reinterpret_cast<const __bf16*>(src.data_ptr()),
         reinterpret_cast<const int32_t*>(token_routes.data_ptr()),

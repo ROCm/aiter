@@ -875,6 +875,23 @@ def _opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16",
+    develop=True,
+)
+def _opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16_raw(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+    dst: Tensor,
+    dlogits: Tensor,
+) -> None: ...
+
+
 def build_token_routes(gather: Tensor, T: int, topk: int) -> Tensor:
     """Fixed top-k reverse map for the dx gather-sum: token_routes[t,k] = the
     compact route index of token t's k-th selection. Built once per moe-sort
@@ -970,6 +987,31 @@ def opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
     return dx, dlogits
 
 
+def opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    partials: Tensor,
+    topk_ids: Tensor,
+    router_w: Tensor,
+):
+    """Flat-dscore full tail caching route and expert ids once per token."""
+    T = route_scores.shape[0]
+    dx = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+    dlogits = torch.empty(T, 64, device=src.device, dtype=torch.bfloat16)
+    _opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16_raw(
+        src.contiguous(),
+        token_routes,
+        route_scores.contiguous(),
+        partials,
+        topk_ids.contiguous(),
+        router_w.contiguous(),
+        dx,
+        dlogits,
+    )
+    return dx, dlogits
+
+
 # --- M5 R7: router backward (opus kernel) ---
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_router_bwd_bf16", develop=True)
 def _opus_moe_router_bwd_bf16_raw(
@@ -1019,6 +1061,7 @@ _WEIGHT_TRANSPOSE_CACHE = {}
 # non-capturable environments while the exact-shape GPU metadata path matures.
 _USE_GPU_DGRAD_METADATA = True
 _USE_FLAT_DSCORE_LAYOUT = True
+_USE_CACHED_TAIL_METADATA = True
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -1101,6 +1144,9 @@ class OpusMoERefFunc(torch.autograd.Function):
         exact_shape = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
         ctx.use_flat_dscore_layout = (
             exact_shape and ctx.use_sparse_router_dx and _USE_FLAT_DSCORE_LAYOUT
+        )
+        ctx.use_cached_tail_metadata = (
+            ctx.use_flat_dscore_layout and _USE_CACHED_TAIL_METADATA
         )
         gpu_dgrad_metadata = exact_shape and _USE_GPU_DGRAD_METADATA
         if gpu_dgrad_metadata:
@@ -1318,6 +1364,19 @@ class OpusMoERefFunc(torch.autograd.Function):
         # deterministic dx (no atomics): gather-sum over each token's topk routes
         def dx_gather_sum(src, gather, T):
             nonlocal fused_dlogits
+            if ctx.use_cached_tail_metadata and dscore_partials is not None:
+                dx, fused_dlogits = (
+                    opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16(
+                        src,
+                        ctx.token_routes,
+                        ctx.saved_tensors[11],
+                        dscore_partials,
+                        topk_ids,
+                        ctx.full_router_w,
+                    )
+                )
+                ctx.fused_sparse_router_dx = True
+                return dx
             if ctx.use_flat_dscore_layout and dscore_partials is not None:
                 dx, fused_dlogits = (
                     opus_moe_gather_sum_dscore_router_dx_flat_meta_token8_h2048_e64_bf16(
