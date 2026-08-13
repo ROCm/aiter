@@ -10,8 +10,8 @@ import triton.language as tl
 
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
-from aiter.utility.dtypes import _aiter_dtype_id
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
@@ -1531,13 +1531,15 @@ def get_mla_metadata_v1_no_redundant(
                 (qo_tile_idx + 1) * packed_qo_tile_len, num_heads
             )
             s = kv_len_init + kv_len_slop
-            result = s if s < kv_len else kv_len
+            # C++: s < kv_len ? s : kv_len
+            result = min(s, kv_len)
         return result
 
     # This version just follows Flashinfer.
     def cal_workload_limit_global_v0(cum_workload, num_clusters, kv_gran):
         avg_workload_raw = integer_divide_ceil(cum_workload, num_clusters)
-        avg_workload = avg_workload_raw if avg_workload_raw > 1 else 1
+        # C++: avg_workload_raw > 1 ? avg_workload_raw : 1
+        avg_workload = max(1, avg_workload_raw)
         if avg_workload <= 8:
             limit = 32
         elif avg_workload <= 16:
@@ -1737,7 +1739,6 @@ def get_mla_metadata_v1_no_redundant(
     num_works = work_indptr[-1]
 
     reduce_final_map_size = num_reduce_row if no_redundant else total_qo_clusters
-    reduce_indptr_size = reduce_final_map_size + 1
     reduce_final_map = []
     reduce_indptr = [0]
     global_cluster_q_idx = 0
