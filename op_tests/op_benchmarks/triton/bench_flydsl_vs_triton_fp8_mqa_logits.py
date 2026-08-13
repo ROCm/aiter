@@ -7,7 +7,7 @@ identical inputs and prints one table per shape, with each variant as a row
 (columns: time_us, TFLOPs, verify, vs_triton ratio).
 
 The FlyDSL kernel ships several versions, registered in
-``aiter.ops.flydsl.kernels.fp8_mqa_logits`` (``KERNEL_VARIANTS``): ``"mfma"`` is
+``aiter.ops.flydsl.kernels.mqa_logits.fp8_mqa_logits`` (``KERNEL_VARIANTS``): ``"mfma"`` is
 the baseline, ``"scalar"`` the correctness-first fallback, and new versions can
 be added there. Pick which to benchmark with ``--flydsl-variants`` (default:
 all registered variants). Each becomes its own row, e.g. ``fly:mfma``.
@@ -336,7 +336,7 @@ PRESET_SHAPES = [
     (1, 1024, 1024, 32, 128),  # rows 1,024
     (4, 1024, 1024, 32, 128),  # rows 4,096
     (8, 1024, 1024, 32, 128),  # rows 8,192
-    (16, 1024, 1024, 32, 128), # rows 16,384
+    (16, 1024, 1024, 32, 128),  # rows 16,384
     (1, 2048, 2048, 32, 128),  # rows 2,048
     (2, 2048, 2048, 32, 128),  # rows 4,096
     (4, 2048, 2048, 32, 128),  # rows 8,192
@@ -347,7 +347,7 @@ PRESET_SHAPES = [
     # -- H = 64 (DSV4) --
     (4, 1024, 1024, 64, 128),  # rows 4,096
     (8, 1024, 1024, 64, 128),  # rows 8,192
-    (16, 1024, 1024, 64, 128), # rows 16,384
+    (16, 1024, 1024, 64, 128),  # rows 16,384
     (2, 2048, 2048, 64, 128),  # rows 4,096
     (4, 2048, 2048, 64, 128),  # rows 8,192
     (8, 2048, 2048, 64, 128),  # rows 16,384
@@ -479,8 +479,8 @@ def run(args):
 
 
 def _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke):
-    """Build a timed closure for one impl.
-    """
+    """Build a timed closure for one impl."""
+
     def closure():
         fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
 
@@ -584,7 +584,7 @@ def _run_one(idx, impls, shape, args, q_fp8_dtype=None, kv_fp8_dtype=None):
     auto_resolved = {}
     auto_key = FLYDSL_PREFIX + "auto"
     if auto_key in impls:
-        from aiter.ops.flydsl.kernels.fp8_mqa_logits import _auto_variant
+        from aiter.ops.flydsl.kernels.mqa_logits.fp8_mqa_logits import _auto_variant
 
         auto_resolved[auto_key] = _auto_variant(
             shape.seq_q_l, shape.seq_kv_l, shape.num_heads_q

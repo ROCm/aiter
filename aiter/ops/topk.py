@@ -286,7 +286,7 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
-@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill")
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill", develop=True)
 def _top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -298,11 +298,18 @@ def _top_k_per_row_prefill(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
 @compile_ops("module_top_k_per_row")
 def topk_mb_workspace_size(
+    numRows: int, stride0: int, k: int, is_decode: bool
+) -> int: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_ob_workspace_size(
     numRows: int, stride0: int, k: int, is_decode: bool
 ) -> int: ...
 
@@ -342,6 +349,20 @@ def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
     return _get_topk_mb_workspace_keyed(device, stream.cuda_stream, alloc)
 
 
+def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
+    """Return an exact-size scratch workspace for the one-block (ob) / radix
+    top-k paths.
+
+    Unlike the multi-block buffer (get_topk_mb_workspace), these kernels do their
+    own internal memset on each launch, so the buffer need not be zero-initialized
+    and need not be a persistent, reused buffer. This mirrors how the C++ side
+    originally allocated it — a plain, exactly-sized ``torch.empty`` per call —
+    only moved to the Python side so the host code never allocates device scratch
+    itself. torch's caching allocator reuses freed blocks, so no explicit cache
+    (or size bucketing) is needed here."""
+    return torch.empty(max(1, int(size)), dtype=torch.uint8, device=device)
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -352,14 +373,24 @@ def top_k_per_row_prefill(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    stable: bool = False,
 ) -> None:
-    """Per-row top-k (prefill). The multi-block path runs on a persistent,
-    zero-initialized workspace (memset-free; see get_topk_mb_workspace); the
-    one-block path allocates its own scratch internally."""
-    workspace = None
-    if topk_use_mulblocks(numRows, stride0):
+    """Per-row top-k (prefill). Both the multi-block and one-block paths run on a
+    caller-provided workspace allocated (and cached) on the Python side, so the
+    C++ kernels never allocate device scratch. The mb path needs a zeroed,
+    self-reset buffer (get_topk_mb_workspace); the ob path uses plain scratch
+    (get_topk_scratch_workspace).
+
+    When stable=True, the one-block path is forced with deterministic,
+    ascending-index ordered, smallest-index tie-breaking emit so every
+    tensor-parallel rank selects and orders an identical KV set; the caller sizes
+    the workspace for the ob path in that case."""
+    if not stable and topk_use_mulblocks(numRows, stride0):
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
+    else:
+        size = topk_ob_workspace_size(numRows, stride0, k, False)
+        workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_prefill(
         logits,
         rowStarts,
@@ -371,6 +402,7 @@ def top_k_per_row_prefill(
         stride1,
         k,
         workspace,
+        stable,
     )
 
 
@@ -387,7 +419,7 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode")
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode", develop=True)
 def _top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -398,6 +430,7 @@ def _top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -410,17 +443,33 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    stable: bool = False,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel — the C++
-    side ignores the workspace argument for decode."""
+    """Per-row top-k (decode). Always uses the one-block kernel; the scratch
+    workspace is allocated + cached on the Python side and passed in, so the C++
+    side never allocates device scratch.
+
+    When stable=True, the deterministic ascending-ordered, smallest-index
+    tie-break emit is used so every TP rank selects and orders an identical
+    KV set."""
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
     # The original mb dispatch is commented out below for reference:
-    #   workspace = None
     #   if topk_use_mulblocks(numRows, stride0):
     #       size = topk_mb_workspace_size(numRows, stride0, k, True)
     #       workspace = get_topk_mb_workspace(logits.device, size)
+    size = topk_ob_workspace_size(numRows, stride0, k, True)
+    workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_decode(
-        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+        stable,
     )
 
 
