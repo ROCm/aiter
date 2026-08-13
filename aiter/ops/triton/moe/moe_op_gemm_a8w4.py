@@ -671,6 +671,10 @@ def moe_gemm_a8w4(
             num_ctas=config["num_ctas"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
             **layouts,
         )
     else:
