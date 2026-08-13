@@ -22,6 +22,7 @@
 # limitations under the License.
 """Rotary Positional Embeddings."""
 
+import logging
 import math
 
 # from custom_op import CustomOp
@@ -41,6 +42,29 @@ from aiter import (
 AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", "0")) == 1
 AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", "0")) == 1
 AITER_ROPE_FUSED_QKNORM = int(os.environ.get("AITER_ROPE_FUSED_QKNORM", "0")) == 1
+
+
+logger = logging.getLogger(__name__)
+
+
+def _get_rope_param(rope_scaling, key, default, scaling_type):
+    """Get a parameter from rope_scaling, warning instead of raising if absent.
+
+    transformers v5 exposes config.rope_scaling as an alias of rope_parameters,
+    which is populated even when no scaling is configured (rope_type="default").
+    Callers may therefore reach a scaled branch without the keys that branch
+    expects. Mirrors sglang's rotary_embedding.factory._get_rope_param.
+    """
+    if key in rope_scaling:
+        return rope_scaling[key]
+    logger.warning(
+        "rope_scaling (type=%s) missing key '%s', defaulting to %s. "
+        "This may indicate a v5 config issue - check model accuracy.",
+        scaling_type,
+        key,
+        default,
+    )
+    return default
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -1782,7 +1806,9 @@ def get_rope(
         if scaling_type == "llama3":
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+            )
             rotary_emb = Llama3RotaryEmbedding(
                 head_size,
                 rotary_dim,
@@ -1851,7 +1877,9 @@ def get_rope(
                 dtype,
             )
         elif scaling_type == "yarn":
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -1869,7 +1897,9 @@ def get_rope(
                 **extra_kwargs,
             )
         elif scaling_type == "deepseek_yarn":
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+            )
             # assert max_position == original_max_position * scaling_factor
             extra_kwargs = {
                 k: v
@@ -1899,7 +1929,9 @@ def get_rope(
         elif scaling_type == "su" or scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
