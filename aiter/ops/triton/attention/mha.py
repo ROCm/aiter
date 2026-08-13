@@ -55,27 +55,25 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     _MHA_IMPL = impl
 
 
-def _use_gluon_fwd(
-    q, k, v, o, alibi_slopes, sink, enable_dropout, return_softmax, IS_FP8,
-    pe_head_dim, v_head_dim, BLOCK_DMODEL_POW2, config,
-) -> bool:
+def _use_gluon_fwd(q, k, v, enable_dropout, IS_FP8, config) -> bool:
     """Whether the gfx1250 gluon forward can serve this call.
 
-    The kernel is bf16-only and implements causal / varlen / GQA / sliding
-    window / sink / LSE. Everything it does not implement stays on Triton.
+    The kernel implements causal / varlen / GQA / sliding window / sink / LSE /
+    alibi / padded head / PE head dim / return_scores, in bf16 and fp8. Dropout
+    is the one forward feature it does not implement (gluon has no philox), and
+    that stays on Triton.
     """
     if _gluon_attn_fwd is None or _MHA_GLUON_ENV == "0":
         return False
     if _MHA_SWIZZLE != "default":
         return False
-    if not all(t.dtype is torch.bfloat16 for t in (q, k, v)):
+    # bf16 throughout, or fp8 throughout -- no mixed-precision q/k/v.
+    if not (
+        all(t.dtype is torch.bfloat16 for t in (q, k, v))
+        or (IS_FP8 and q.dtype is k.dtype is v.dtype)
+    ):
         return False
-    if enable_dropout or return_softmax or IS_FP8:
-        return False
-    if alibi_slopes is not None or pe_head_dim != 0:
-        return False
-    # No padded head: the kernel indexes the full BLOCK_DMODEL_POW2 columns.
-    if v_head_dim != BLOCK_DMODEL_POW2:
+    if enable_dropout:
         return False
     # The K/V TDM descriptors hardcode a unit innermost stride
     # (`strides=[stride_kn, 1]`). Q and O are indexed with explicit strides, so
@@ -330,11 +328,8 @@ def _flash_attn_forward(
 
         fwd_impl = (
             _gluon_attn_fwd
-            if _use_gluon_fwd(
-                q, k, v, o, alibi_slopes, sink, enable_dropout, return_softmax,
-                IS_FP8, pe_head_dim, v_head_dim, BLOCK_DMODEL_POW2, config,
-            )
-            else _attn_fwd
+            if _use_gluon_fwd(q, k, v, enable_dropout, IS_FP8, config)
+            else _gluon_attn_fwd
         )
 
         fwd_impl[grid](
