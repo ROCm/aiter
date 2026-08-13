@@ -476,6 +476,7 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
 // =============================================================================
 #include <opus/opus.hpp>
 #include <bit>
+#include <cstdint>
 
 using opus::operator""_I;
 
