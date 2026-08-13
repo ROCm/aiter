@@ -169,6 +169,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::PREFETCH_REDUCTION_A;
         return false;
     }();
+    constexpr bool swap_route_sources = []() constexpr {
+        if constexpr(requires { T::SWAP_ROUTE_SOURCES; })
+            return T::SWAP_ROUTE_SOURCES;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -280,8 +285,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
 
     const D_A* a = reinterpret_cast<const D_A*>(kargs.a);
     const D_B* b = reinterpret_cast<const D_B*>(kargs.b);
-    const int a_rows = kargs.route.sorted_capacity;
-    const int b_rows = kargs.route.token_num;
+    const int a_rows = swap_route_sources ? kargs.route.token_num
+                                          : kargs.route.sorted_capacity;
+    const int b_rows = swap_route_sources ? kargs.route.sorted_capacity
+                                          : kargs.route.token_num;
     const unsigned int a_bytes = static_cast<unsigned int>(
         static_cast<unsigned long long>(a_rows) *
         static_cast<unsigned long long>(kargs.stride_a_row) * sizeof(D_A));
@@ -389,7 +396,17 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         const int source_b_split = token_a < kargs.route.token_num
                                        ? token_a
                                        : kargs.route.token_num;
-        return TileSources{source_a, source_b0, source_b1, source_b_split};
+        if constexpr(swap_route_sources)
+        {
+            static_assert(split_b_n64,
+                          "swapped K32 route sources require split-B loads");
+            return TileSources{source_b_split, 0, 0, source_a};
+        }
+        else
+        {
+            return TileSources{source_a, source_b0, source_b1,
+                               source_b_split};
+        }
     };
 
     auto issue_direct_tile = [&](const TileSources& sources,
@@ -1418,7 +1435,8 @@ template<typename Traits>
 inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
 {
     using T = opus::remove_cvref_t<Traits>;
-    static_assert(T::B_K == 64, "dw2 registers the K64 kernel");
+    static_assert(T::B_K == 32 || T::B_K == 64,
+                  "dw2 registers a K32 or K64 kernel");
     AITER_CHECK(kargs.split_k == 1,
                 "dw2: first Opus instance requires split_k=1");
     if constexpr(requires { T::ADAPTIVE_ROUTE_SPLIT; })
@@ -1461,12 +1479,20 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
             static_cast<unsigned int>(args.output_m / T::B_M),
             static_cast<unsigned int>(args.output_n / T::B_N));
     }
-    hipLaunchKernelGGL((weight_bwd_swizzled_kernel_gfx950<T>),
-                       grid,
-                       dim3(T::BLOCK_SIZE),
-                       0,
-                       stream,
-                       args);
+    if constexpr(T::B_K == 32)
+        hipLaunchKernelGGL((weight_bwd_swizzled_k32_kernel_gfx950<T>),
+                           grid,
+                           dim3(T::BLOCK_SIZE),
+                           0,
+                           stream,
+                           args);
+    else
+        hipLaunchKernelGGL((weight_bwd_swizzled_kernel_gfx950<T>),
+                           grid,
+                           dim3(T::BLOCK_SIZE),
+                           0,
+                           stream,
+                           args);
 }
 
 } // namespace opus_moe_backward::gfx950

@@ -303,6 +303,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int cohort1_bm128_dual_lds_kid = 9;
     constexpr int bm128x128_adaptive_routes_kid = 10;
     constexpr int bm256x128_direct_kid = 11;
+    constexpr int bm256x128_k32_double_lds_kid = 12;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the larger output tile.  Require at least
@@ -335,7 +336,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         // rows, and each wave pipelines four K16 fragments through eight
         // independent native C tiles.  Bound the per-expert run length so
         // sparse routing cannot leave a very wide expert-major tail.  The
-        // The single BM256 kernel wins from short balanced reductions through
+        // The BM256 family wins from short balanced reductions through
         // 24k-route experts and maximally skewed routing, avoiding the launch
         // and empty-grid cost of the retired two-kernel route split.
         constexpr uint64_t bm256_min_output_blocks = 4096;
@@ -343,7 +344,17 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
         if(bm256x128_compatible &&
            bm256_output_blocks >= bm256_min_output_blocks &&
            bm256_blocks_per_expert <= bm256_max_blocks_per_expert)
-            return bm256x128_direct_kid;
+        {
+            // K32 uses the same BM256xBN128 output tile but alternates two
+            // 24-KiB operand stages, overlapping the next route tile's
+            // global-to-LDS transfer with current MFMA.  The extra pipeline
+            // boundary pays off from roughly 1024 padded routes per expert;
+            // shorter reductions retain K64's lower loop/barrier count.
+            constexpr uint64_t k32_min_average_routes = 1024;
+            return average_padded_routes >= k32_min_average_routes
+                       ? bm256x128_k32_double_lds_kid
+                       : bm256x128_direct_kid;
+        }
         return bm128x128_adaptive_routes_kid;
     }
     const uint64_t source_row_elements =

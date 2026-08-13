@@ -818,6 +818,53 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk64SwizzledCohort4DualLdsWave2x2
     static constexpr bool PREFETCH_REDUCTION_A = true;
 };
 
+// Reuse the K32 double-stage weight-gradient pipeline for dW2.  The route
+// source direction is the inverse of dW1: dO gathers token rows while
+// a_scaled stays in expert-sorted rows.  Two 24-KiB stages preserve the
+// production BM256xBN128 output tile while overlapping the next K32 load.
+struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4DoubleLds
+    : Bf16Traits<Family::Dw2, 256, 128, 32, 256, 1, false>
+{
+    static constexpr int EXPERT_COHORT = 4;
+    static constexpr bool DIRECT_GMEM_TO_LDS = true;
+    static constexpr bool DOUBLE_BUFFER = true;
+    static constexpr bool PIPELINE_REDUCTION_FRAGMENTS = true;
+    static constexpr bool PREFETCH_REDUCTION_A = true;
+    static constexpr bool SPLIT_B_N64_SWIZZLE = true;
+    static constexpr bool SWAP_ROUTE_SOURCES = true;
+    static constexpr int EMPTY_M_TILES_PER_CTA = 8;
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_ACC = opus::fp32_t;
+
+    static constexpr int E_M = 4;
+    static constexpr int E_N = 2;
+    static constexpr int E_K = 2;
+    static constexpr int VEC_A = 16 / sizeof(D_A);
+    static constexpr int VEC_B = 16 / sizeof(D_B);
+    static constexpr int VEC_TR_B = 8 / sizeof(D_B);
+    static constexpr int VEC_C = 4;
+
+    static constexpr int SMEM_B_GROUP_ROWS = 0;
+    static constexpr int SMEM_B_ROW_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_DATA_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_PAD_BYTES = 0;
+    static constexpr int SMEM_B_GROUP_BYTES = 0;
+    static constexpr int SMEM_B_GROUPS = 0;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 0;
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
     : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {
