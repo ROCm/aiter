@@ -22,6 +22,7 @@ import csv
 import functools
 import math
 import os
+import warnings
 
 # NOTE (mfma16_hip fork): ``get_rocm_arch`` is imported here for the additive
 # HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
@@ -715,12 +716,28 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                     int(row["Hg"]),
                     int(row["V"]),
                     row["is_varlen"].strip() == "True",
+                    row["use_h0"].strip() == "True",
+                    row["store_fs"].strip() == "True",
                     row["snapshot_bf16"].strip() == "True",
                     row["state_bf16"].strip() == "True",
                     int(row["total_chunks"]),
                     int(row["max_seq_chunks"]),
                 )
-                table[key] = int(bv)
+                bv_int = int(bv)
+                # Two rows can describe the same physical batch shape under
+                # different model names (a 4x8192 varlen batch is the same work
+                # whichever sweep produced it). Identical values are fine; a
+                # disagreement means the table contradicts itself, and silently
+                # keeping the last row read would hide that.
+                if table.get(key, bv_int) != bv_int:
+                    warnings.warn(
+                        f"chunk_gdn_h_mfma16_hip tuned table disagrees on "
+                        f"{key}: BV {table[key]} vs {bv_int}; keeping "
+                        f"{table[key]}.",
+                        stacklevel=2,
+                    )
+                    continue
+                table[key] = bv_int
     except (OSError, KeyError, ValueError):
         return {}
     return table
@@ -735,6 +752,8 @@ def _tuned_bv(
     Hg: int,
     V: int,
     is_varlen: bool,
+    use_h0: bool,
+    store_fs: bool,
     snapshot_bf16: bool,
     state_bf16: bool,
     total_chunks: int,
@@ -756,6 +775,8 @@ def _tuned_bv(
             Hg,
             V,
             is_varlen,
+            use_h0,
+            store_fs,
             snapshot_bf16,
             state_bf16,
             total_chunks,
@@ -1280,6 +1301,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         Hg=Hg,
         V=V,
         is_varlen=is_varlen,
+        use_h0=use_h0,
+        store_fs=bool(output_final_state),
         snapshot_bf16=snapshot_bf16,
         state_bf16=state_bf16,
         total_chunks=_total_chunks,
