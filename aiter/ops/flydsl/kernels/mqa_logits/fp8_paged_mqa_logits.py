@@ -52,7 +52,7 @@ from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf
 from flydsl._mlir import ir
 
-from .tensor_shim import GTensor, _run_compiled, _to_raw
+from ..tensor_shim import GTensor, _run_compiled, _to_raw
 from ._mqa_logits_common import (
     MFMA_M,
     MFMA_N,

@@ -56,7 +56,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
-    from .kernels.fp8_paged_mqa_logits import (
+    from .kernels.mqa_logits.fp8_paged_mqa_logits import (
         flydsl_fp8_paged_mqa_logits,
         KERNEL_VARIANTS as FP8_PAGED_MQA_LOGITS_VARIANTS,
         DEFAULT_VARIANT as FP8_PAGED_MQA_LOGITS_DEFAULT_VARIANT,

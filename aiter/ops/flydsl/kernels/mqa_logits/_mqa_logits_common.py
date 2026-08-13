@@ -28,7 +28,7 @@ from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
 
-from .tensor_shim import GTensor, _to_raw
+from ..tensor_shim import GTensor, _to_raw
 
 Vec = fx.Vector
 
