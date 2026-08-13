@@ -58,68 +58,49 @@ jobs:
             exit 0
           fi
 
-          requires_aiter_tests() {
-            local file="$1"
-
-            case "${file}" in
-              .github/workflows/aiter-test.yaml)
-                return 0
-                ;;
-              *.md|docs/*|LICENSE|.gitignore|.github/scripts/sglang_downstream.py)
-                return 1
-                ;;
-              .github/workflows/*)
-                return 1
-                ;;
-              *)
-                return 0
-                ;;
-            esac
-          }
-
           mapfile -t changed_files < <(
             gh api --paginate \
               "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
               --jq '.[].filename'
           )
 
-          run_files=()
-          ignored_files=()
+          run_tests=false
+          reason=only_ignored_changed_files
           for file in "${changed_files[@]}"; do
-            if requires_aiter_tests "${file}"; then
-              run_files+=("${file}")
-            else
-              ignored_files+=("${file}")
-            fi
+            case "${file}" in
+              .github/workflows/aiter-test.yaml)
+                run_tests=true
+                reason=matching_changed_files
+                break
+                ;;
+              *.md|docs/*|LICENSE|.gitignore|.github/scripts/sglang_downstream.py|.github/workflows/*)
+                ;;
+              *)
+                run_tests=true
+                reason=matching_changed_files
+                break
+                ;;
+            esac
           done
 
-          if [ "${#run_files[@]}" -gt 0 ]; then
-            echo "run_tests=true" >> "$GITHUB_OUTPUT"
-            echo "reason=matching_changed_files" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_tests=false" >> "$GITHUB_OUTPUT"
-            echo "reason=only_ignored_changed_files" >> "$GITHUB_OUTPUT"
-          fi
+          echo "run_tests=${run_tests}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
 
           {
             echo "## Aiter Test Scope"
             echo
             echo "- Changed files: ${#changed_files[@]}"
-            echo "- Files requiring Aiter tests: ${#run_files[@]}"
-            echo "- Ignored files: ${#ignored_files[@]}"
-            echo
-            if [ "${#run_files[@]}" -gt 0 ]; then
+            echo "- Aiter tests required: ${run_tests}"
+            echo "- Reason: ${reason}"
+            if [ "${run_tests}" = "true" ]; then
               echo "Aiter tests are required because at least one changed file matches the Aiter test scope."
-              echo
-              echo "Files requiring Aiter tests:"
-              printf '%s\n' "${run_files[@]}" | sed 's/^/- `/' | sed 's/$/`/'
             else
               echo "Aiter tests are not required for this pull request."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   check-signal:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     needs: detect_aiter_test_scope
     runs-on: ubuntu-latest
     steps:
@@ -133,7 +114,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_wheels:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     runs-on: build-only-aiter
     needs: [detect_aiter_test_scope, check-signal]
     permissions:
@@ -413,7 +394,7 @@ jobs:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
 
   split_aiter_tests:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     runs-on: ubuntu-latest
     needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
@@ -435,7 +416,7 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     needs: [detect_aiter_test_scope, check-signal]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
@@ -446,7 +427,6 @@ jobs:
   standard:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
     needs: [detect_aiter_test_scope, build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
@@ -764,7 +744,6 @@ jobs:
   standard-test-finish:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      !github.event.pull_request.draft &&
       github.event.action != 'labeled'
     name: Standard Test Results
     runs-on: ubuntu-latest
@@ -1044,7 +1023,6 @@ jobs:
       always() &&
       !cancelled() &&
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      !github.event.pull_request.draft &&
       github.event.action != 'labeled' &&
       github.event_name != 'schedule'
     runs-on: ubuntu-latest
