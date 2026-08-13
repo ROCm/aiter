@@ -30,12 +30,15 @@ from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
 from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 
+_SUPPORTED_GFX12_ARCHS = frozenset({"gfx1200", "gfx1201"})
 
-def _is_gfx12_runtime(device: torch.device) -> bool:
+
+def _is_unsupported_gfx12_runtime(device: torch.device) -> bool:
     try:
         props = torch.cuda.get_device_properties(device)
         arch = getattr(props, "gcnArchName", "")
-        return arch.split(":")[0].startswith("gfx12") if arch else False
+        arch = arch.split(":")[0] if arch else ""
+        return arch.startswith("gfx12") and arch not in _SUPPORTED_GFX12_ARCHS
     except Exception:  # noqa: BLE001
         return False
 
@@ -233,6 +236,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     num_decode_tokens: int = 0,
     seq_lens_cpu: Sequence[int] | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -272,6 +278,13 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             shared K1--K6 schedule without device readback.
         prefill_metadata: Prebuilt reusable host/device schedule. This is the
             preferred path when multiple layers process the same batch.
+        initial_state_indices: Optional ``[N]`` state-pool slot indices. When
+            provided, K5 gathers from and writes back to ``initial_state`` in
+            place. Supported by the HIP and Triton VK K5 paths only.
+        inplace_final_state: Controls in-place K5 state-pool write-back. It
+            defaults to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -283,6 +296,13 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         raise ValueError(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
+        )
+    if use_chunk_flydsl and (
+        initial_state_indices is not None or inplace_final_state is True
+    ):
+        raise ValueError(
+            "Indexed state pools and in-place final-state write-back are not "
+            "supported by the FlyDSL K5 path."
         )
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
@@ -299,9 +319,18 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
 
     if use_chunk_hip and (
-        _is_gfx12_runtime(q.device) or (num_decodes > 0 and prefill_metadata is None)
+        _is_unsupported_gfx12_runtime(q.device)
+        or (num_decodes > 0 and prefill_metadata is None)
     ):
         use_chunk_hip = False
+    if use_chunk_flydsl:
+        if _is_unsupported_gfx12_runtime(q.device):
+            use_chunk_flydsl = False
+        elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError(
+                "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
+                f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
+            )
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
@@ -341,22 +370,32 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
             prefill_metadata=prefill_metadata,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=inplace_final_state,
         )
     elif use_chunk_flydsl:
-        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
-        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
-        # head-major, so pass it through directly. The wrapper accepts
-        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
+            raise ValueError(
+                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
+                "omit it or pass `k.dtype`."
+            )
+        # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
+        # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
+        # mirrors the HIP g-layout contract (default token-major), so pass
+        # g_head_major=True explicitly to select the head-major layout. The
+        # wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
+        # internally.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl,
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k=k,
             w=w,
             u=u,
@@ -368,6 +407,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            g_head_major=True,
             prefill_metadata=prefill_metadata,
         )
     else:
@@ -381,8 +421,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=inplace_final_state,
             prefill_metadata=prefill_metadata,
         )
 

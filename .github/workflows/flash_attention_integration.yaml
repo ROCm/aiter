@@ -457,25 +457,29 @@ jobs:
       - name: Fetch baseline from PR base.sha
         if: steps.current.outputs.found == 'true'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 10
         with:
           workflow: flash_attention_integration.yaml
           commit: ${{ github.event.pull_request.base.sha }}
           name: flash-attention-triton-benchmark-MI35X
           path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Fallback baseline from latest main
         if: steps.current.outputs.found == 'true'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 10
         with:
           workflow: flash_attention_integration.yaml
           branch: main
           name: flash-attention-triton-benchmark-MI35X
           path: /tmp/baseline_main/
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Compare
