@@ -1790,20 +1790,6 @@ def test_chunk_opt_vk_k5_hip_matches_triton_tail_gfx12():
     assert_close("tail state HIP vs Triton", final_state_triton, final_state_hip, 0.005)
 
 
-def test_chunk_opt_vk_rejects_indexed_flydsl_state_pool():
-    with pytest.raises(ValueError, match="not supported by the FlyDSL K5 path"):
-        chunk_gated_delta_rule_opt_vk(
-            q=torch.empty(1, 1, 1, 128),
-            k=torch.empty(1, 1, 1, 128),
-            v=torch.empty(1, 1, 1, 128),
-            g=torch.empty(1, 1, 1),
-            beta=torch.empty(1, 1, 1),
-            initial_state=torch.empty(1, 1, 128, 128),
-            initial_state_indices=torch.zeros(1, dtype=torch.int32),
-            use_chunk_flydsl=True,
-        )
-
-
 def test_chunk_opt_vk_rejects_dense_index_count_mismatch():
     with pytest.raises(ValueError, match="state indices.*2 rather than 1"):
         chunk_gated_delta_rule_opt_vk(

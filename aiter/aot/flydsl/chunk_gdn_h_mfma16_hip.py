@@ -20,10 +20,12 @@ The csv's ``BV`` column is deliberately *not* used to narrow the fan-out: it
 records the best tile for the batch shapes that were benchmarked, while any
 other batch shape falls through to the ``_hipeq_select_bv`` rule and can land on
 a different tile. Pre-compiling only the tuned values would leave those shapes
-JIT-ing mid-serving, so every legal BV is built. Same reasoning for
-``snapshot_bf16`` / ``state_bf16``: they are caller-selected dtypes
-(``snapshot_dtype`` / ``state_dtype``), so both are built. The remaining
-switches are pinned by the production dispatch (see ``_FIXED_SWITCHES``).
+JIT-ing mid-serving, so every legal BV is built. Same reasoning for the other
+caller-visible knobs: ``snapshot_bf16`` / ``state_bf16`` are caller-selected
+dtypes, ``g_head_major`` differs between the wrapper default and what chunk.py
+passes, and ``use_state_indices`` follows whether a state pool is in play, so all
+of them are fanned out. The switches that remain pinned are the ones no caller
+can reach through the production dispatch (see ``_FIXED_SWITCHES``).
 
 Usage:
     # Compile every configuration from the default tuned table
@@ -93,17 +95,25 @@ _BV_CANDIDATES = (64, 32, 16)
 _SNAPSHOT_BF16 = (True, False)
 _STATE_BF16 = (False, True)
 
-# Switches the production dispatch pins: chunk.py always passes head-major
-# g_cumsum with use_exp2 pre-scaling, never gk, always saves v_new, and rejects
-# indexed state pools on the FlyDSL path.
+# chunk.py pins head-major, but False is the *wrapper's* default (token-major,
+# the HIP g-layout contract), so a caller reaching the wrapper directly gets the
+# value AOT would otherwise skip. Both are cheap to build.
+_G_HEAD_MAJOR = (True, False)
+
+# Indexed state pools: only legal with an initial state and final-state
+# write-back (the wrapper rejects the other combinations), so this fans out on
+# the rows that allow it rather than unconditionally.
+_USE_STATE_INDICES = (False, True)
+
+# Switches the production dispatch pins: chunk.py always passes g_cumsum with
+# use_exp2 pre-scaling, never gk, and always saves v_new. wu_contig is not even
+# a wrapper argument -- the call site hardcodes True.
 _FIXED_SWITCHES: dict[str, bool] = {
     "use_g": True,
     "use_gk": False,
     "save_vn": True,
     "wu_contig": True,
-    "g_head_major": True,
     "g_log2_scaled": True,
-    "use_state_indices": False,
     "bf16_convert_trunc": True,
 }
 
@@ -197,8 +207,15 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
         if not bvs:
             print(f"  [WARN] no legal BV for V={V}, skipping shape in {csv_path}")
             continue
-        for bv, snapshot_bf16, state_bf16 in itertools.product(
-            bvs, _SNAPSHOT_BF16, _STATE_BF16
+        indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
+        for (
+            bv,
+            snapshot_bf16,
+            state_bf16,
+            g_head_major,
+            use_state_indices,
+        ) in itertools.product(
+            bvs, _SNAPSHOT_BF16, _STATE_BF16, _G_HEAD_MAJOR, indices
         ):
             job = {
                 "kernel_name": _KERNEL_NAME,
@@ -215,6 +232,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 "store_fs": store_fs,
                 "snapshot_bf16": snapshot_bf16,
                 "state_bf16": state_bf16,
+                "g_head_major": g_head_major,
+                "use_state_indices": use_state_indices,
                 **_FIXED_SWITCHES,
             }
             key = job_identity(job)

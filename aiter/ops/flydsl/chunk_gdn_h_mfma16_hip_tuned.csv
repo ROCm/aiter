@@ -7,8 +7,9 @@
 #            the _hipeq_select_bv CU/LDS rule, so partial coverage is fine.
 #   build    aiter/aot/flydsl/chunk_gdn_h_mfma16_hip.py pre-compiles every
 #            (arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)
-#            appearing here, fanned out over all legal BV x snapshot x state,
-#            so no batch shape can hit the JIT.
+#            appearing here, fanned out over all legal BV x snapshot x state x
+#            g_head_major (x state-pool indices where the row allows one), so no
+#            batch shape can hit the JIT.
 #
 # Adding a model means adding its rows here; no code change. Rows whose ``BV``
 # is empty are AOT-only (shape gets pre-compiled, runtime keeps using the rule),
