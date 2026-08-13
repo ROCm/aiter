@@ -20,9 +20,13 @@ from ..utility import dtypes
 def _fmha_kv_byte_extent_ge_u32(
     max_seqlen_k: int, k: torch.Tensor, v: torch.Tensor
 ) -> bool:
-    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit."""
-    k_bytes = int(max_seqlen_k) * int(k.stride(1)) * k.element_size()
-    v_bytes = int(max_seqlen_k) * int(v.stride(1)) * v.element_size()
+    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit.
+
+    dim -3 is the token axis in both layouts this is called with: dense BSHD
+    [B, S, H, D] and packed varlen THD [total, H, D].
+    """
+    k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
+    v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
     return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
 
 
@@ -2851,7 +2855,7 @@ def _flash_attn_varlen_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
-        if hdim_q == 192 and hdim_v == 128:
+        if hdim_q == 192 and hdim_v == 128 and block_table is None:
             ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
