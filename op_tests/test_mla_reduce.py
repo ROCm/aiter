@@ -336,8 +336,8 @@ def main():
 
     # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
     heads_for_dim = {
-        # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
-        128: [1, 16, 96, 128],
+        # Kimi K3 TP2 and PP8 use the 48- and 96-head, 128-dimension reducers.
+        128: [1, 16, 48, 96, 128],
         512: [8, 16, 24, 128],
     }
 
