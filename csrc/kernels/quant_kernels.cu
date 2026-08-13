@@ -35,7 +35,13 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      // Runtime rather than template: the two MX
+                                      // tilings differ by a handful of integer ops
+                                      // in the store, and templating it would
+                                      // double every instantiation in this file.
+                                      const aiter::MxScaleShuffleLayout scale_layout =
+                                          aiter::MxScaleShuffleLayout::N32K8)
 {
     static_assert(!emit_e8m0_scale
                       || std::is_same_v<DTYPE_O, opus::fp4_t>
@@ -132,7 +138,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             if constexpr(shuffle_scale)
             {
                 if constexpr(group_size == 32)
-                    groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+                    groupId = aiter::mx_scale_shuffle_idx(
+                        scaleN_pad, static_cast<int>(x), y, scale_layout);
                 else
                     groupId = y * ori_rows + x;
             }
@@ -845,12 +852,25 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     int group_size,
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
-                                    int num_rows_factor)
+                                    int num_rows_factor,
+                                    int scale_shuffle_layout)
 {
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
     AITER_CHECK(out.is_contiguous());
+    AITER_CHECK(scale_shuffle_layout == 0 || scale_shuffle_layout == 1,
+                __func__,
+                " scale_shuffle_layout must be 0 (N32K8, gfx942/gfx950) or "
+                "1 (N16K4, gfx1250), got ",
+                scale_shuffle_layout);
+    // N16K4 only exists as a 1x32 MX scale tiling; group_size 64/128 shuffle is
+    // a plain transpose with no tile structure to pick.
+    AITER_CHECK(scale_shuffle_layout == 0 || group_size == 32,
+                __func__,
+                " scale_shuffle_layout=1 (N16K4) requires group_size == 32, got ",
+                group_size);
+    const auto scale_layout = static_cast<aiter::MxScaleShuffleLayout>(scale_shuffle_layout);
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
@@ -915,7 +935,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         row_stride,
                         oob_size,
                         num_rows_ptr,
-                        num_rows_factor);
+                        num_rows_factor,
+                        scale_layout);
                 });
         };
 
@@ -967,13 +988,20 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         int group_size,
                                         bool shuffle_scale,
                                         std::optional<aiter_tensor_t> num_rows,
-                                        int num_rows_factor)
+                                        int num_rows_factor,
+                                        int scale_shuffle_layout)
 {
     AITER_CHECK(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8,
                 __func__,
                 " expects fp4x2 / uint8 output; use dynamic_per_group_scaled_quant for fp8/i8");
-    dynamic_per_group_scaled_quant(
-        out, input, scales, group_size, shuffle_scale, num_rows, num_rows_factor);
+    dynamic_per_group_scaled_quant(out,
+                                   input,
+                                   scales,
+                                   group_size,
+                                   shuffle_scale,
+                                   num_rows,
+                                   num_rows_factor,
+                                   scale_shuffle_layout);
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \

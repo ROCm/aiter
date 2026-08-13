@@ -10,6 +10,7 @@ from .mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
     MxScaleRoundModeInt,
+    MxScaleShuffleLayoutInt,
 )
 
 
@@ -221,10 +222,18 @@ def e8m0_to_f32(scale_e8m0_biased):
     return scale_f32
 
 
-def e8m0_shuffle(scale):
+def e8m0_shuffle(scale, layout: int = MxScaleShuffleLayoutInt.N32K8):
+    """Preshuffle an e8m0 scale for the MX GEMM kernels.
+
+    ``layout`` is an :class:`MxScaleShuffleLayoutInt`. It defaults to N32K8 --
+    the CDNA tiling every caller predating gfx1250 assumes, including the
+    flydsl/triton MoE paths that run on gfx1250 too -- so consumers wanting the
+    gfx1250 WMMA tiling must ask for N16K4 explicitly. Getting this wrong is not
+    caught by shape: both layouts produce the same buffer.
+    """
     from aiter.ops.shuffle import shuffle_scale
 
-    return shuffle_scale(scale)
+    return shuffle_scale(scale, layout=layout)
 
 
 def down_size(size):

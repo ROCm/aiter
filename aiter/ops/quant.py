@@ -21,6 +21,7 @@ from ..utility.mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
     MxScaleRoundModeInt,
+    MxScaleShuffleLayoutInt,
 )
 from . import triton
 from .enum import ActivationType, QuantType
@@ -28,6 +29,25 @@ from .enum import ActivationType, QuantType
 # Type alias for round-mode parameters; Union keeps int interop without
 # triggering the JIT build that loading MxScaleRoundMode would cause.
 RoundModeLike = Union[int, "MxScaleRoundMode"]
+
+# Re-exported for callers that pass `scale_shuffle_layout=`; see
+# MxScaleShuffleLayoutInt for what the two tilings mean.
+MX_SCALE_SHUFFLE_N32K8 = MxScaleShuffleLayoutInt.N32K8
+MX_SCALE_SHUFFLE_N16K4 = MxScaleShuffleLayoutInt.N16K4
+
+
+@functools.lru_cache(maxsize=4)
+def mx_scale_shuffle_layout_for_gfx(gfx: str | None = None) -> int:
+    """The MX scale swizzle the GEMM kernels on ``gfx`` expect.
+
+    Cached: callers hit this per forward, and ``get_gfx()`` goes through a
+    torch custom op.
+    """
+    return (
+        MX_SCALE_SHUFFLE_N16K4
+        if (gfx or get_gfx()) == "gfx1250"
+        else MX_SCALE_SHUFFLE_N32K8
+    )
 
 
 def __getattr__(name):
@@ -491,6 +511,7 @@ def per_1x32_mx_quant_hip(
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
+    scale_shuffle_layout: int = MX_SCALE_SHUFFLE_N32K8,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -509,6 +530,12 @@ def per_1x32_mx_quant_hip(
               ``mxfp4_moe_sort_hip`` and MXFP8 GEMM kernels, enabling the
               MXFP8 "split" path  (per_1x32 quant -> sorted-scale shuffle)
               that mirrors the existing MXFP4 split path.
+
+    ``scale_shuffle_layout`` selects the ``shuffle=True`` swizzle:
+    :data:`MX_SCALE_SHUFFLE_N32K8` (gfx942/gfx950, the default) or
+    :data:`MX_SCALE_SHUFFLE_N16K4` (gfx1250 WMMA). The buffer shape is the same
+    either way -- only the byte permutation and therefore the row pitch the
+    consumer must use differ, so it has to match the GEMM that reads it.
 
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
@@ -593,6 +620,7 @@ def per_1x32_mx_quant_hip(
         shuffle_scale=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        scale_shuffle_layout=scale_shuffle_layout,
     )
     return y, scale
 
@@ -772,6 +800,7 @@ def dynamic_per_group_scaled_quant(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    scale_shuffle_layout: int = 0,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -787,6 +816,13 @@ def dynamic_per_group_scaled_quant(
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
 
+    ``scale_shuffle_layout`` picks which swizzle (``group_size == 32`` only):
+    ``0`` = N32K8, the gfx942/gfx950 tiling; ``1`` = N16K4, the gfx1250 WMMA
+    tiling. The two are not interchangeable -- a consumer handed the wrong one
+    reads both the wrong scales and past the end of the buffer -- so this must
+    match the GEMM that will read the scales. See
+    :data:`MX_SCALE_SHUFFLE_N32K8` / :data:`MX_SCALE_SHUFFLE_N16K4`.
+
     Only ``group_size`` in {32, 64, 128} is supported.
     """
 
@@ -800,6 +836,7 @@ def dynamic_per_group_scaled_quant_fp4(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    scale_shuffle_layout: int = 0,
 ) -> None:
     """Backward-compat fp4x2-only forwarder; delegates to
     ``dynamic_per_group_scaled_quant``.

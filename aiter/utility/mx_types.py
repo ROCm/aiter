@@ -54,6 +54,26 @@ class MxDtypeInt:
     FP8_E4M3_FNUZ = 2
 
 
+class MxScaleShuffleLayoutInt:
+    """Bare-int mirror of C++ ``MxScaleShuffleLayout`` (mx_quant_utils.h).
+
+    Which tiling a preshuffled e8m0 scale buffer is written in. Both produce the
+    same ``(pad256(rows), pad8(scaleN))`` buffer, but the byte permutation --
+    and therefore the row pitch a consumer must stride by -- differs, so a
+    buffer written in one layout is not readable as the other:
+
+    * ``N32K8``: 32-row stripes, 8 scale-groups per k-chunk. gfx942 / gfx950
+      (CDNA), and what every consumer predating gfx1250 assumes. Rows are
+      ``rows // 32``, pitch ``scaleN * 32``.
+    * ``N16K4``: 16-row stripes, 4 scale-groups per k-chunk. gfx1250 (RDNA
+      WMMA), consumed by the gluon ``gemm_mxfp4_preshuffle_gfx1250`` kernel.
+      Rows are ``rows // 16``, pitch ``scaleN * 16``.
+    """
+
+    N32K8 = 0
+    N16K4 = 1
+
+
 # --------------------------------------------------------------------------
 # Project-wide default round mode (Python single source of truth).
 # Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; the

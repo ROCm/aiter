@@ -5,6 +5,10 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.mx_types import MxScaleShuffleLayoutInt
+
+MX_SCALE_SHUFFLE_N32K8 = MxScaleShuffleLayoutInt.N32K8
+MX_SCALE_SHUFFLE_N16K4 = MxScaleShuffleLayoutInt.N16K4
 
 
 def _moe_tile_shuffle(
@@ -341,12 +345,24 @@ def shuffle_scale(
     experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
+    layout: int = MX_SCALE_SHUFFLE_N32K8,
 ) -> torch.Tensor:
+    """Host mirror of the device MX e8m0 scale swizzle.
+
+    ``layout`` picks the tiling, matching ``aiter::MxScaleShuffleLayout`` and
+    ``per_1x32_mx_quant_hip(scale_shuffle_layout=...)``:
+    :data:`MX_SCALE_SHUFFLE_N32K8` (gfx942/gfx950) or
+    :data:`MX_SCALE_SHUFFLE_N16K4` (gfx1250 WMMA). Output shape is
+    ``(pad256(m), pad8(n))`` either way -- only the permutation, and hence the
+    row pitch the consuming GEMM must stride by, differs.
+    """
     if src is None:
         return src
     if src.dtype == torch.float32:
         return src
     assert src.ndim == 2, "scale must be a 2D tensor"
+    if layout not in (MX_SCALE_SHUFFLE_N32K8, MX_SCALE_SHUFFLE_N16K4):
+        raise ValueError(f"unknown MX scale shuffle layout {layout}")
 
     if not is_guinterleave:
         m, n = src.shape
@@ -360,9 +376,18 @@ def shuffle_scale(
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape
+        if layout == MX_SCALE_SHUFFLE_N16K4:
+            # 16-row stripes, 4 groups per lane -> (sm/16, sn/4, 16, 4).
+            scale = scale.view(sm // 16, 16, sn // 4, 4)
+            scale = scale.permute(0, 2, 1, 3).contiguous()
+            return scale.view(sm, sn)
         scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
         scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
         return scale.view(sm, sn)
+    if layout != MX_SCALE_SHUFFLE_N32K8:
+        raise NotImplementedError(
+            "gate/up-interleaved scale shuffle only implements the N32K8 layout"
+        )
 
     if experts_cnt is None:
         raise ValueError("experts_cnt is required when is_guinterleave=True")

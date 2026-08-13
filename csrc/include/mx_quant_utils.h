@@ -205,20 +205,59 @@ __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
     return fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, MxDtype::FP4_E2M1>(amax);
 }
 
+// Which MX scale swizzle a consumer expects. The two tilings pack a different
+// number of rows per stripe and scale-groups per lane, so a buffer written in
+// one layout is NOT readable as the other -- a consumer fed the wrong one both
+// reads the wrong scales and strides off the end of the buffer.
+enum class MxScaleShuffleLayout : int
+{
+    // gfx942 / gfx950 (CDNA) MX scale-load layout: 32-row stripes, 8 groups per
+    // k-chunk. Host mirror: `aiter.ops.shuffle.shuffle_scale` /
+    // `shuffle_scale_gemm(arch="gfx950", preshuffle_factor=32, scale_kwidth=8)`.
+    N32K8 = 0,
+    // gfx1250 (RDNA WMMA) MX scale-load layout: 16-row stripes, 4 groups per
+    // k-chunk. Host mirror: `shuffle_scale_gemm(arch="gfx1250",
+    // preshuffle_factor=16, scale_kwidth=4)`. Consumed by the gluon
+    // `gemm_mxfp4_preshuffle_gfx1250` kernel.
+    N16K4 = 1,
+};
+
 // Compute the swizzled E8M0 scale index for the tiled MX layout.
 // Used by both MXFP4 and MXFP8 paths (the e8m0 byte layout is identical
-// regardless of the element dtype). Legacy `fp4_scale_shuffle_idx` kept as
-// an alias below.
-__device__ __forceinline__ int mx_scale_shuffle_idx(int scaleN_pad, int x, int y)
+// regardless of the element dtype).
+__device__ __forceinline__ int mx_scale_shuffle_idx_n32k8(int scaleN_pad, int x, int y)
 {
     return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
            (y % 8) / 4 * 2 + (x % 32) / 16;
 }
 
+// gfx1250 tiling. A stripe is 16 rows of `scaleN_pad` groups, and within it each
+// lane owns SCALE_KWIDTH=4 contiguous groups, so one ds_load_b32 fetches a
+// lane's whole WMMA scale operand. Row pitch is `scaleN_pad * 16` bytes -- half
+// the stripe count and twice the row length of N32K8 over the same buffer.
+__device__ __forceinline__ int mx_scale_shuffle_idx_n16k4(int scaleN_pad, int x, int y)
+{
+    return (x / 16) * (scaleN_pad * 16) + (y / 4) * 64 + (x % 16) * 4 + (y % 4);
+}
+
+__device__ __forceinline__ int
+mx_scale_shuffle_idx(int scaleN_pad, int x, int y, MxScaleShuffleLayout layout)
+{
+    return layout == MxScaleShuffleLayout::N16K4
+               ? mx_scale_shuffle_idx_n16k4(scaleN_pad, x, y)
+               : mx_scale_shuffle_idx_n32k8(scaleN_pad, x, y);
+}
+
+// Defaults to the CDNA tiling, which is what every pre-gfx1250 caller means.
+__device__ __forceinline__ int mx_scale_shuffle_idx(int scaleN_pad, int x, int y)
+{
+    return mx_scale_shuffle_idx_n32k8(scaleN_pad, x, y);
+}
+
 // Backward-compat alias. New code should call `mx_scale_shuffle_idx` directly.
 __device__ __forceinline__ int fp4_scale_shuffle_idx(int scaleN_pad, int x, int y)
 {
-    return mx_scale_shuffle_idx(scaleN_pad, x, y);
+    return mx_scale_shuffle_idx_n32k8(scaleN_pad, x, y);
 }
 
 } // namespace aiter
