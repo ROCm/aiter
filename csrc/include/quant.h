@@ -26,13 +26,17 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
 // For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an
 // fp32 per-group scale.
+// `scale_shuffle_layout` picks the e8m0 swizzle when `shuffle_scale` and
+// `group_size == 32`: 0 = N32K8 (gfx942/gfx950), 1 = N16K4 (gfx1250). It must
+// match what the consuming GEMM expects -- see aiter::MxScaleShuffleLayout.
 void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
                                     aiter_tensor_t& scales,
                                     int group_size                             = 32,
                                     bool shuffle_scale                         = true,
                                     std::optional<aiter_tensor_t> num_rows     = std::nullopt,
-                                    int num_rows_factor                        = 1);
+                                    int num_rows_factor                        = 1,
+                                    int scale_shuffle_layout                   = 0);
 
 // Backward-compat fp4-only entry; delegates to dynamic_per_group_scaled_quant.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
@@ -41,7 +45,8 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         int group_size                             = 32,
                                         bool shuffle_scale                         = true,
                                         std::optional<aiter_tensor_t> num_rows     = std::nullopt,
-                                        int num_rows_factor                        = 1);
+                                        int num_rows_factor                        = 1,
+                                        int scale_shuffle_layout                   = 0);
 
 void smooth_per_token_scaled_quant(
     aiter_tensor_t& out,         // [..., d]

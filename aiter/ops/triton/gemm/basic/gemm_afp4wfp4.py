@@ -416,6 +416,53 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
+# gfx1250 MX scale preshuffle: 16 rows per stripe, 4 scale-groups per lane.
+# Mirrors PRESHUFFLE_FACTOR / SCALE_KWIDTH in the gluon kernel and
+# MxScaleShuffleLayoutInt.N16K4.
+_GFX1250_SCALE_PRESHUFFLE_FACTOR = 16
+_MX_SCALE_GROUP_ELEMS = 32
+
+
+def _check_gfx1250_scale_shape(
+    scales: torch.Tensor, dim: int, K_elems: int, name: str, dim_name: str
+) -> None:
+    """Reject scale views the gluon kernel would read out of bounds.
+
+    The descriptor reads ``ceil(dim/16)`` rows at the tensor's row pitch, so the
+    pitch has to be the N16K4 one and the tensor has to actually have that many
+    rows. Trailing rows beyond that are fine -- the quantizer pads its scale
+    buffer to 256 rows and the descriptor simply never reaches them.
+    """
+    pf = _GFX1250_SCALE_PRESHUFFLE_FACTOR
+    need_rows = triton.cdiv(dim, pf)
+    want_pitch = (K_elems // _MX_SCALE_GROUP_ELEMS) * pf
+    if (
+        scales.dim() == 2
+        and scales.stride(-1) == 1
+        and scales.stride(-2) == want_pitch
+        and scales.shape[-2] >= need_rows
+    ):
+        return
+
+    hint = ""
+    # Passing the N32K8 view of a correctly-sized buffer is the overwhelmingly
+    # likely mistake, so name it rather than just printing the expected shape.
+    if scales.dim() == 2 and scales.stride(-2) == want_pitch * 2:
+        hint = (
+            " This is the gfx942/gfx950 N32K8 view of the buffer: half the rows"
+            " at twice the pitch. gfx1250 needs the N16K4 layout -- quantize"
+            " with scale_shuffle_layout=MX_SCALE_SHUFFLE_N16K4 (or"
+            " e8m0_shuffle(..., layout=MxScaleShuffleLayoutInt.N16K4) for"
+            " weights) and view it as (rows // 16, -1)."
+        )
+    raise ValueError(
+        f"gemm_afp4wfp4_preshuffle: on gfx1250 {name} must be an N16K4 "
+        f"preshuffled view with row pitch {want_pitch} and at least "
+        f"{need_rows} rows for {dim_name}={dim}, K={K_elems}; got shape "
+        f"{tuple(scales.shape)} stride {tuple(scales.stride())}.{hint}"
+    )
+
+
 # TODO: Split-K support
 # TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
@@ -474,6 +521,20 @@ def gemm_afp4wfp4_preshuffle(
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
     if use_gluon:
+        # The gluon kernel's TDM descriptors index the preshuffled scales in the
+        # gfx1250 N16K4 tiling -- ceil(rows/16) rows of K_elems//2 bytes -- but
+        # take the row stride straight from the tensor. Hand it the CDNA N32K8
+        # view (ceil(rows/32), K_elems) over the same buffer and every descriptor
+        # strides twice as far as it should: wrong scales, and ~2x the buffer
+        # length read off the end. Both layouts hold the same bytes, so the shape
+        # is the only thing that distinguishes them -- check it here rather than
+        # let it become a page fault inside the kernel. w_scales is preshuffled
+        # for every M; x_scales only for M >= 32 (the M < 32 un-shuffled layout
+        # is asserted separately, just before the launch).
+        if M >= 32:
+            _check_gfx1250_scale_shape(x_scales, M, K_elems, "x_scales", "M")
+        _check_gfx1250_scale_shape(w_scales, N, K_elems, "w_scales", "N")
+
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
