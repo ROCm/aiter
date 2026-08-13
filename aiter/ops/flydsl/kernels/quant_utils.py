@@ -265,11 +265,21 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     c23 = arith.constant(23, type=T.i32)
     c_wave = arith.constant(wave_size, type=T.i32)
 
-    block_amax = arith.constant(0.0, type=T.f32)
-    for v in all_vals:
-        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        block_amax = arith.maxnumf(block_amax, abs_v)
-    block_amax = arith.minnumf(block_amax, c_flt_max)
+    # Pairwise tree, not a linear accumulate: a chain of N maxes is N deep and
+    # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
+    # deep with N/2 independent maxes per level for the scheduler to interleave.
+    level = [arith.constant(0.0, type=T.f32)] + [
+        llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
+        for v in all_vals
+    ]
+    while len(level) > 1:
+        nxt = [
+            arith.maxnumf(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    block_amax = arith.minnumf(level[0], c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
     block_amax = arith.maxnumf(block_amax, peer)
 
