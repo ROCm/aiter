@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
+import multiprocessing as mp
+import os
+import sys
+import traceback
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import os
+
 import aiter
-from aiter.test_common import checkAllclose, perftest
-from aiter.dist.parallel_state import graph_capture
 from aiter import dtypes
-import sys
-import traceback
-import logging
-import multiprocessing as mp
-import argparse
+from aiter.dist.parallel_state import graph_capture
+from aiter.test_common import checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 
@@ -38,11 +40,9 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
 
         if withGraph:
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    # run inplace here, to test accuracy, we need this
-                    x.copy_(input)
-                    out = aiter.all_reduce_asm(x)
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                x.copy_(input)
+                out = aiter.all_reduce_asm(x)
             torch.cuda.synchronize()
             out.fill_(0)
             dist.barrier()
@@ -62,7 +62,7 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
         torch.cuda.synchronize()
         print(gpuID, "finished")
         out = out.cpu()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))
@@ -70,7 +70,7 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
         )
     finally:
         aiter.destroy_dist_env()
-        return out, us
+    return out, us
 
 
 def test_communication(tp_size, shape, dtype, withGraph=False):
@@ -121,11 +121,10 @@ def run_all_reduce_rmsnorm(
                 return graph.replay()
 
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out = aiter.all_reduce_rmsnorm(
-                        input, residual_in, weight, bias, epsilon
-                    )
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out, residual_out = aiter.all_reduce_rmsnorm(
+                    input, residual_in, weight, bias, epsilon
+                )
             torch.cuda.synchronize()
             out.fill_(0)
             residual_out.fill_(0)
@@ -142,7 +141,7 @@ def run_all_reduce_rmsnorm(
         print(f"{gpuID=} finished")
         out = out.cpu()
         residual_out = residual_out.cpu()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))
@@ -150,7 +149,7 @@ def run_all_reduce_rmsnorm(
         )
     finally:
         aiter.destroy_dist_env()
-        return (out, residual_out), us
+    return (out, residual_out), us
 
 
 def run_all_reduce_rmsnorm_quant(
@@ -183,11 +182,10 @@ def run_all_reduce_rmsnorm_quant(
                 return graph.replay()
 
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out, ysacle = aiter.all_reduce_rmsnorm_quant(
-                        input, residual_in, xscale, weight, bias, epsilon
-                    )
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out, residual_out, ysacle = aiter.all_reduce_rmsnorm_quant(
+                    input, residual_in, xscale, weight, bias, epsilon
+                )
             torch.cuda.synchronize()
             out.fill_(0)
             residual_out.fill_(0)
@@ -207,7 +205,7 @@ def run_all_reduce_rmsnorm_quant(
         out = out.cpu()
         residual_out = residual_out.cpu()
         ysacle = ysacle.cpu()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))
@@ -215,7 +213,7 @@ def run_all_reduce_rmsnorm_quant(
         )
     finally:
         aiter.destroy_dist_env()
-        return (out, residual_out, ysacle), us
+    return (out, residual_out, ysacle), us
 
 
 def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=False):

@@ -165,7 +165,7 @@ class TestOnlineTuneDecision(unittest.TestCase):
                 SAMPLE_KEYS,
                 "1",
                 mp_lock_fn=lambda: None,
-                reload_fn=lambda: {},
+                reload_fn=dict,
                 logger_obj=logger_obj,
             )
         self.assertTrue(mp_lock_called)
@@ -177,7 +177,7 @@ class TestOnlineTuneDecision(unittest.TestCase):
         new_cfg_2stages = {SAMPLE_KEYS: SAMPLE_CFG}
         logger_obj = logging.getLogger("test_online_tune")
 
-        cfg, updated_cfgs, mp_lock_called = simulate_online_tune_path(
+        cfg, _updated_cfgs, mp_lock_called = simulate_online_tune_path(
             None,
             SAMPLE_KEYS,
             "1",
@@ -417,7 +417,7 @@ class TestGetCfg2stages(unittest.TestCase):
             f.write(
                 "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
                 "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
-                "1,0,32,0,flydsl_k1,flydsl_k2,50.0,flydsl_fallback\n"
+                "1,0,32,0,legacy_k1,legacy_k2,50.0,legacy_tag\n"
             )
             path = f.name
 

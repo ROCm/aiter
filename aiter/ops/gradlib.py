@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
+
 from ..jit.core import compile_ops
 
 
@@ -18,12 +18,13 @@ def gen_hipb_mm_fake_tensor(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     solution_index: int,
-    bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    scaleA: Optional[torch.Tensor] = None,
-    scaleB: Optional[torch.Tensor] = None,
-    scaleOut: Optional[torch.Tensor] = None,
-    bpreshuffle: Optional[bool] = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    scaleA: torch.Tensor | None = None,
+    scaleB: torch.Tensor | None = None,
+    scaleOut: torch.Tensor | None = None,
+    bpreshuffle: bool | None = None,
+    use_gelu: bool | None = None,
 ):
     mat1_sizes = mat1.size()
     mat2_sizes = mat2.size()
@@ -41,12 +42,13 @@ def hipb_mm(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     solution_index: int,
-    bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    scaleA: Optional[torch.Tensor] = None,
-    scaleB: Optional[torch.Tensor] = None,
-    scaleOut: Optional[torch.Tensor] = None,
-    bpreshuffle: Optional[bool] = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    scaleA: torch.Tensor | None = None,
+    scaleB: torch.Tensor | None = None,
+    scaleOut: torch.Tensor | None = None,
+    bpreshuffle: bool | None = None,
+    use_gelu: bool | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -54,12 +56,13 @@ def hipb_mm(
 def hipb_findallsols(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    scaleA: Optional[torch.Tensor] = None,
-    scaleB: Optional[torch.Tensor] = None,
-    scaleC: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    scaleA: torch.Tensor | None = None,
+    scaleB: torch.Tensor | None = None,
+    scaleC: torch.Tensor | None = None,
     bpreshuffle: bool = False,
+    use_gelu: bool = False,
 ) -> list[int]: ...
 
 

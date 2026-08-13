@@ -1,18 +1,19 @@
-import triton
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-import torch
-import sys
 import argparse
 import itertools
+import sys
+
+import torch
+import triton
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_model_configs,
+    print_vgpr,
+)
 from op_tests.triton_tests.attention.test_mla_decode_rope import (
     input_helper,
     ref_preprocess,
@@ -52,7 +53,7 @@ def model_benchmark_configs(args: argparse.Namespace):
     fa_configs = []
     batch_size = args.B if args.B else 4
 
-    for model_name, config in configs.items():
+    for config in configs.values():
         num_q_heads = config["num_attention_heads"]
         num_kv_heads = config["num_key_value_heads"]
         assert (
