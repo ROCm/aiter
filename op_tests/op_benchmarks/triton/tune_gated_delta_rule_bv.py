@@ -47,6 +47,8 @@ import torch
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     _GFX_ARCH,
     _hipeq_select_bv,
+)
+from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip as k5,
 )
 
@@ -107,20 +109,20 @@ def _build_k5_inputs(case, snapshot_dtype, seed=0):
             device=dev,
         )
 
-    args = dict(
-        k=torch.randn((batch, T_flat, Hg, case.K), device=dev, dtype=case.dtype),
-        w=torch.randn((batch, H, T_flat, case.K), device=dev, dtype=case.dtype),
-        u=torch.randn((batch, H, T_flat, case.V), device=dev, dtype=case.dtype),
-        g=torch.randn((batch, H, T_flat), device=dev, dtype=torch.float32) * -0.1,
-        initial_state=torch.zeros(
+    args = {
+        "k": torch.randn((batch, T_flat, Hg, case.K), device=dev, dtype=case.dtype),
+        "w": torch.randn((batch, H, T_flat, case.K), device=dev, dtype=case.dtype),
+        "u": torch.randn((batch, H, T_flat, case.V), device=dev, dtype=case.dtype),
+        "g": torch.randn((batch, H, T_flat), device=dev, dtype=torch.float32) * -0.1,
+        "initial_state": torch.zeros(
             (num_states, H, case.V, case.K), device=dev, dtype=case.ssm_state_dtype
         ),
-        output_final_state=case.output_final_state,
-        cu_seqlens=cu_seqlens,
-        state_dtype=case.ssm_state_dtype,
-        snapshot_dtype=snapshot_dtype,
-        g_head_major=True,
-    )
+        "output_final_state": case.output_final_state,
+        "cu_seqlens": cu_seqlens,
+        "state_dtype": case.ssm_state_dtype,
+        "snapshot_dtype": snapshot_dtype,
+        "g_head_major": True,
+    }
     total_chunks, max_seq_chunks = _chunk_counts(context_lens, batch)
     return args, T_flat, num_states, total_chunks, max_seq_chunks
 
