@@ -244,7 +244,14 @@ def test_hip_and_flydsl_agree_on_a_gated_shape():
     s0, s1 = logits.stride(0), logits.stride(1)
 
     hip_idx = torch.empty_like(indices).fill_(-1)
-    topk_mod._top_k_per_row_decode(logits, 1, seq_lens, hip_idx, rows, s0, s1, k, None)
+    # The C++ entry no longer allocates its own scratch, so a direct call has to
+    # size and hand one over the way top_k_per_row_decode does.
+    hip_ws = topk_mod.get_topk_scratch_workspace(
+        logits.device, topk_mod.topk_ob_workspace_size(rows, s0, k, True)
+    )
+    topk_mod._top_k_per_row_decode(
+        logits, 1, seq_lens, hip_idx, rows, s0, s1, k, hip_ws
+    )
     fly_idx = torch.empty_like(indices).fill_(-1)
     flydsl_top_k_per_row_decode(
         logits, 1, seq_lens, fly_idx, rows, s0, s1, k, ordered=False, workspace=None
@@ -310,8 +317,12 @@ def test_caller_workspace_bypasses_the_cache():
 
 
 @pytestmark_gpu
-def test_hip_fallback_allocates_no_workspace():
-    """A shape that falls back must not leave a FlyDSL buffer cached behind it."""
+def test_hip_fallback_caches_no_flydsl_workspace():
+    """A shape that falls back must not leave a FlyDSL buffer cached behind it.
+
+    The HIP path does take a workspace of its own now, but it is plain ob scratch
+    sized per call, not the cached FlyDSL buffer, so the FlyDSL cache stays empty.
+    """
     topk_mod.clear_flydsl_topk_decode_workspace_cache()
     rows, width, k = 1, 8192, 512
     logits, seq_lens, indices = make_inputs(rows, width, width, k)

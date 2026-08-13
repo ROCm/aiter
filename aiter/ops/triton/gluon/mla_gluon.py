@@ -801,8 +801,8 @@ def _mla_softmax_reducev_kernel(
         tile_max = tl.max(lse, axis=0)  # scalar; masked/empty splits are -inf
         n_e_max = tl.maximum(e_max, tile_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
-        # w=0 for empty/causal-masked splits (lse=-inf) so NaN logits never poison acc.
         w = tl.where(lse == -float("inf"), 0.0, tl.exp(lse - n_e_max))  # [BLOCK_S]
+        logits = tl.where(lse[:, None] == -float("inf"), 0.0, logits)
         acc = acc * old_scale + tl.sum(w[:, None] * logits, axis=0)
         e_sum = e_sum * old_scale + tl.sum(w, axis=0)
         e_max = n_e_max
