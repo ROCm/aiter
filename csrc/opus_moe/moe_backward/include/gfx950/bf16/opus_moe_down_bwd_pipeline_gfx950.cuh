@@ -185,6 +185,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::PREFETCH_A_TILES;
         return 0;
     }();
+    constexpr bool write_a_scaled = []() constexpr {
+        if constexpr(requires { T::WRITE_A_SCALED; })
+            return T::WRITE_A_SCALED;
+        return true;
+    }();
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -871,13 +876,16 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                             q * z_up_pair * sigmoid *
                             (one + z_gate_pair * (one - sigmoid));
                         const down_bwd_f32x2 d_up = q * silu;
-                        const down_bwd_f32x2 scaled = score2 * activation;
                         d_gate_store[pair] = down_bwd_cvt_pk_bf16_f32(
                             d_gate[0], d_gate[1]);
                         d_up_store[pair] = down_bwd_cvt_pk_bf16_f32(
                             d_up[0], d_up[1]);
-                        scaled_store[pair] = down_bwd_cvt_pk_bf16_f32(
-                            scaled[0], scaled[1]);
+                        if constexpr(write_a_scaled)
+                        {
+                            const down_bwd_f32x2 scaled = score2 * activation;
+                            scaled_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                                scaled[0], scaled[1]);
+                        }
                         ds_partial += g[0] * activation[0] +
                                       g[1] * activation[1];
                     }
@@ -891,12 +899,15 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         d_gate_store;
                     *reinterpret_cast<u32x4*>(
                         kargs.d_z + dz_base + inter_dim) = d_up_store;
-                    const int64_t a_scaled_base =
-                        static_cast<int64_t>(sorted_row) *
-                            stride_a_scaled_r +
-                        col;
-                    *reinterpret_cast<u32x4*>(
-                        kargs.a_scaled + a_scaled_base) = scaled_store;
+                    if constexpr(write_a_scaled)
+                    {
+                        const int64_t a_scaled_base =
+                            static_cast<int64_t>(sorted_row) *
+                                stride_a_scaled_r +
+                            col;
+                        *reinterpret_cast<u32x4*>(
+                            kargs.a_scaled + a_scaled_base) = scaled_store;
+                    }
                 }
                 ds_wave_partial += ds_partial;
             }

@@ -79,7 +79,10 @@ fallback when a genuinely different working-set regime needs it.
 | K1 `down_bwd` | 2 | `BM32 x BN128 x BK64` |
 | K1 `down_bwd` medium grid | 9 | `BM32 x BN128 x BK32`, M5/twenty-route cohort + CTA-local route metadata |
 | K1 `down_bwd` large grid | 10 | `BM32 x BN128 x BK32`, M6/twenty-four-route cohort + CTA-local route metadata |
-| K1 `down_bwd` wide-N grid | 11 | `BM32 x BN256 x BK32`, M6 cohort + packed-Z/batched-sigmoid epilogue |
+| K1 `down_bwd` wide-N grid | 11 | `BM32 x BN256 x BK32`, M6 cohort + immediate Z wait |
+| K1 `down_bwd` long wide-N grid | 12 | kid 11 geometry + deferred Z wait |
+| K1 `down_bwd` forward-cache grid | 13 | kid 11 without the `a_scaled` scale/pack/store epilogue |
+| K1 `down_bwd` long forward-cache grid | 14 | kid 12 without the `a_scaled` scale/pack/store epilogue |
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
@@ -135,6 +138,19 @@ Within each eight-column group, the eight independent `exp2`/reciprocal
 sigmoid chains are issued as a batch before the SwiGLU arithmetic. This gives
 the transcendental pipeline independent work without extending Z across an
 MFMA-result permutation or changing the activation's numerical order.
+
+Forward may optionally save the BF16 tensor
+`a_scaled = route_weight * SwiGLU(z_sorted)` in expert-sorted route-major
+layout.  The fixed Python wrappers then map the same generic BN256 geometry to
+kid 13 for fewer than 65,536 sorted-capacity rows and kid 14 otherwise.  These
+instances retain K1's dO@W2, dZ and dScore work, but compile out the scale,
+BF16 pack and global `a_scaled` store; K5 consumes the supplied cache directly.
+The cache has shape `[sorted_capacity,I]`, must have been produced with the
+same sorting metadata, and is non-differentiable.  Sorter padding rows are
+ignored.  Shapes that do not select the general BN256 geometry reject this
+fast path instead of silently falling back to a kernel that overwrites the
+cache.  The default path remains kids 2/9/10/11/12 and has no API or numerical
+change.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
 tuple. Kid 11 is selected once the average padded expert interval reaches

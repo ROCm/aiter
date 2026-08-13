@@ -126,9 +126,9 @@ def _select_fixed_down_block_n(
 ) -> int:
     """Mirror native K1 dispatch so workspace shape and kernel stay coupled."""
 
-    if kernel_id == 11:
+    if kernel_id in (11, 12, 13, 14):
         if inter_dim % 256 != 0:
-            raise ValueError("down kernel 11 requires I divisible by 256")
+            raise ValueError("BN256 down kernels require I divisible by 256")
         return 256
     if kernel_id != -1 or inter_dim < 512 or inter_dim % 256 != 0:
         return 128
@@ -142,6 +142,56 @@ def _select_fixed_down_block_n(
     padded_groups = ((groups + 3) // 4) * 4
     candidate_ctas = padded_groups * (inter_dim // 256)
     return 256 if candidate_ctas >= 384 else 128
+
+
+def _select_saved_a_scaled_down_kernel(
+    inter_dim: int,
+    sorted_capacity: int,
+    sorted_expert_ids: Tensor,
+    expert_padded_offsets: Tensor,
+    kernel_id: int,
+) -> int:
+    """Map a BN256 K1 policy to its no-a_scaled-write counterpart."""
+
+    if kernel_id in (13, 14):
+        return kernel_id
+    if kernel_id == 11:
+        return 13
+    if kernel_id == 12:
+        return 14
+    if kernel_id != -1:
+        raise ValueError(
+            "saved_a_scaled currently supports auto or BN256 down kernels"
+        )
+    block_n = _select_fixed_down_block_n(
+        inter_dim, sorted_expert_ids, expert_padded_offsets, kernel_id
+    )
+    if block_n != 256:
+        raise ValueError(
+            "saved_a_scaled currently requires the general BN256 K1 geometry"
+        )
+    return 14 if sorted_capacity >= 65_536 else 13
+
+
+def _validate_saved_a_scaled(
+    saved_a_scaled: Tensor,
+    sorted_capacity: int,
+    inter_dim: int,
+    device: torch.device,
+) -> None:
+    """Validate the forward cache container; metadata defines live route rows.
+
+    Live rows must contain the BF16-rounded value
+    ``route_weight * SwiGLU(z_sorted)`` in expert-sorted route-major order.
+    Sorter padding rows are never consumed and need not be initialized.
+    """
+
+    if saved_a_scaled.dtype != torch.bfloat16:
+        raise TypeError("saved_a_scaled must be BF16")
+    if saved_a_scaled.shape != (sorted_capacity, inter_dim):
+        raise ValueError("saved_a_scaled must have shape [sorted_capacity,I]")
+    if saved_a_scaled.device != device or not saved_a_scaled.is_contiguous():
+        raise ValueError("saved_a_scaled must be contiguous on the common device")
 
 
 @dataclass(frozen=True)
@@ -533,8 +583,16 @@ def opus_moe_down_backward(
     *,
     block_m: int,
     kernel_id: int = -1,
+    saved_a_scaled: Tensor | None = None,
 ) -> OpusMoeDownBackwardOutput:
-    """Launch the first gfx950 BF16 K1 family on sorted-major saved state."""
+    """Launch the first gfx950 BF16 K1 family on sorted-major saved state.
+
+    ``saved_a_scaled`` is an optional non-differentiable forward cache with
+    shape ``[sorted_capacity, I]``.  When supplied, K1 skips recomputing and
+    writing ``route_weight * SwiGLU(z_sorted)``; the returned ``a_scaled`` is
+    the same tensor and K5 consumes it directly.  Only routed rows identified
+    by the sorting metadata are live; padding contents are ignored.
+    """
 
     if d_out.dtype != torch.bfloat16 or any(
         tensor.dtype != torch.bfloat16 for tensor in (z_sorted, w2)
@@ -557,15 +615,30 @@ def opus_moe_down_backward(
         )
 
     route_num = int(topk_weights.numel())
+    if saved_a_scaled is not None:
+        _validate_saved_a_scaled(
+            saved_a_scaled, z_sorted.shape[0], inter_dim, z_sorted.device
+        )
+        kernel_id = _select_saved_a_scaled_down_kernel(
+            inter_dim,
+            z_sorted.shape[0],
+            sorted_expert_ids,
+            expert_padded_offsets,
+            kernel_id,
+        )
     down_block_n = _select_fixed_down_block_n(
         inter_dim, sorted_expert_ids, expert_padded_offsets, kernel_id
     )
     d_scores_parts = (inter_dim + down_block_n - 1) // down_block_n
     d_z = torch.empty_like(z_sorted)
-    a_scaled = torch.empty(
-        (z_sorted.shape[0], inter_dim),
-        dtype=z_sorted.dtype,
-        device=z_sorted.device,
+    a_scaled = (
+        saved_a_scaled
+        if saved_a_scaled is not None
+        else torch.empty(
+            (z_sorted.shape[0], inter_dim),
+            dtype=z_sorted.dtype,
+            device=z_sorted.device,
+        )
     )
     d_scores = torch.empty_like(topk_weights, dtype=torch.float32)
     d_scores_workspace = torch.empty(
@@ -1399,8 +1472,16 @@ def opus_moe_backward(
     dw2_kernel_id: int = -1,
     db1_kernel_id: int = -1,
     bias_kernel_id: int = -1,
+    saved_a_scaled: Tensor | None = None,
 ) -> OpusMoeBackwardOutput:
-    """Run the complete checked fixed-top-k K1--K5 backward chain."""
+    """Run the complete checked fixed-top-k K1--K5 backward chain.
+
+    A BF16 ``saved_a_scaled=[sorted_capacity,I]`` may be supplied by forward
+    to remove K1's scale/pack/global-store epilogue.  It must use the same
+    sorting metadata and contain ``route_weight * SwiGLU(z_sorted)`` for each
+    routed row; sorter padding rows are ignored.  The cache is treated as
+    non-differentiable because K1 still computes dZ and dScore explicitly.
+    """
 
     if not isinstance(metadata, OpusMoeFixedMetadata):
         raise TypeError("opus_moe_backward requires OpusMoeFixedMetadata")
@@ -1408,6 +1489,17 @@ def opus_moe_backward(
         d_out, x, z_sorted, w1, w2, route_weights, metadata, b1, b2
     )
     sorted_capacity = metadata.sorted_token_ids.numel()
+    if saved_a_scaled is not None:
+        _validate_saved_a_scaled(
+            saved_a_scaled, sorted_capacity, inter_dim, x.device
+        )
+        down_kernel_id = _select_saved_a_scaled_down_kernel(
+            inter_dim,
+            sorted_capacity,
+            metadata.sorted_expert_ids,
+            metadata.expert_padded_offsets,
+            down_kernel_id,
+        )
     down_block_n = _select_fixed_down_block_n(
         inter_dim,
         metadata.sorted_expert_ids,
@@ -1423,8 +1515,12 @@ def opus_moe_backward(
         device=x.device,
     )
     d_z = torch.empty_like(z_sorted)
-    a_scaled = torch.empty(
-        (sorted_capacity, inter_dim), dtype=torch.bfloat16, device=x.device
+    a_scaled = (
+        saved_a_scaled
+        if saved_a_scaled is not None
+        else torch.empty(
+            (sorted_capacity, inter_dim), dtype=torch.bfloat16, device=x.device
+        )
     )
     d_scores = torch.empty_like(route_weights)
     d_x_route = torch.empty(
@@ -1801,18 +1897,27 @@ class _OpusMoeDownProjectionFunction(torch.autograd.Function):
         route_weights: Tensor,
         metadata: OpusMoeFixedMetadata | OpusMoeVarlenMetadata,
         b2: Tensor | None,
+        saved_a_scaled: Tensor | None,
     ) -> Tensor:
         saved_b2 = b2 if b2 is not None else w2.new_empty((0, 0))
-        ctx.save_for_backward(z_sorted, w2, route_weights, saved_b2)
+        saved_scaled = (
+            saved_a_scaled
+            if saved_a_scaled is not None
+            else w2.new_empty((0, 0))
+        )
+        ctx.save_for_backward(
+            z_sorted, w2, route_weights, saved_b2, saved_scaled
+        )
         ctx.opus_metadata = metadata
         ctx.has_b2 = b2 is not None
+        ctx.has_saved_a_scaled = saved_a_scaled is not None
         ctx.set_materialize_grads(False)
         return out
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_out: Tensor | None):
-        z_sorted, w2, route_weights, saved_b2 = ctx.saved_tensors
+        z_sorted, w2, route_weights, saved_b2, saved_a_scaled = ctx.saved_tensors
         metadata = ctx.opus_metadata
         need_dz = ctx.needs_input_grad[2]
         need_dw2 = ctx.needs_input_grad[3]
@@ -1847,6 +1952,9 @@ class _OpusMoeDownProjectionFunction(torch.autograd.Function):
                         metadata.num_valid_ids,
                         metadata.expert_padded_offsets,
                         block_m=metadata.block_m,
+                        saved_a_scaled=(
+                            saved_a_scaled if ctx.has_saved_a_scaled else None
+                        ),
                     )
                 if need_dz:
                     d_z = result.d_z_sorted
@@ -1880,7 +1988,7 @@ class _OpusMoeDownProjectionFunction(torch.autograd.Function):
                         d_b2 = bias.d_b2
                 if need_dscore and result is not None:
                     d_scores = result.d_scores
-        return None, None, d_z, d_w2, d_scores, None, d_b2
+        return None, None, d_z, d_w2, d_scores, None, d_b2, None
 
 
 def opus_moe_attach_backward(
@@ -1895,22 +2003,43 @@ def opus_moe_attach_backward(
     *,
     b1: Tensor | None = None,
     b2: Tensor | None = None,
+    saved_a_scaled: Tensor | None = None,
 ) -> Tensor:
     """Attach native backward to saved tensors produced by an Opus forward.
 
     No routing, TopK, projection, activation, or output computation happens
     here. Forward owns out/A_sorted/Z_sorted and passes the exact sorting
-    metadata used to produce them.
+    metadata used to produce them.  It may also pass the non-differentiable
+    BF16 ``saved_a_scaled=route_weight*SwiGLU(z_sorted)`` cache in the same
+    expert-sorted route-major layout; sorter padding rows are ignored.
     """
 
     _validate_attach_contract(
         out, a_sorted, z_sorted, x, w1, w2, route_weights, metadata, b1, b2
     )
+    if saved_a_scaled is not None:
+        if isinstance(metadata, OpusMoeVarlenMetadata):
+            raise ValueError(
+                "saved_a_scaled fast path currently supports fixed top-k"
+            )
+        _validate_saved_a_scaled(
+            saved_a_scaled,
+            metadata.sorted_token_ids.numel(),
+            w2.shape[2],
+            x.device,
+        )
     attached_a, attached_z = _OpusMoeUpProjectionFunction.apply(
         a_sorted, z_sorted, x, w1, metadata, b1
     )
     return _OpusMoeDownProjectionFunction.apply(
-        out, attached_a, attached_z, w2, route_weights, metadata, b2
+        out,
+        attached_a,
+        attached_z,
+        w2,
+        route_weights,
+        metadata,
+        b2,
+        saved_a_scaled,
     )
 
 

@@ -172,6 +172,18 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24PredecodedDeferredZWait
     static constexpr bool DEFER_Z_LDS_WAIT = true;
 };
 
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SavedAScaled
+    : DownBwdBf16Gfx950Bm32Bn256Bk32PaddedM6Cohort24Predecoded
+{
+    static constexpr bool WRITE_A_SCALED = false;
+};
+
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6DeferredZWaitSavedAScaled
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SavedAScaled
+{
+    static constexpr bool DEFER_Z_LDS_WAIT = true;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>

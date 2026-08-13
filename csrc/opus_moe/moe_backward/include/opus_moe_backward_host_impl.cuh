@@ -1385,6 +1385,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     geometry.inter_dim = inter_dim;
     const bool use_bn256 =
         kernel_id == 11 || kernel_id == 12 ||
+        kernel_id == 13 || kernel_id == 14 ||
         (kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              geometry));
@@ -2222,6 +2223,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
     down_geometry.inter_dim = inter_dim;
     const bool use_bn256 =
         down_kernel_id == 11 || down_kernel_id == 12 ||
+            down_kernel_id == 13 || down_kernel_id == 14 ||
         (down_kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              down_geometry));
