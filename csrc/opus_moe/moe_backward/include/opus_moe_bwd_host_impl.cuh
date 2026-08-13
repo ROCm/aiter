@@ -253,8 +253,10 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     AITER_CHECK(max_m > 0, "max_m must be positive");
     AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1,
                 "expert_offsets must have E + 1 elements");
-    AITER_CHECK(static_cast<int>(tile_offsets.size(0)) == E + 1,
-                "tile_offsets must have E + 1 elements");
+    AITER_CHECK(static_cast<int>(tile_offsets.size(0)) == E + 1 ||
+                    static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles,
+                "tile_offsets must have E + 1 prefix sums and may append "
+                "num_tiles packed descriptors");
     AITER_CHECK(num_tiles > 0, "num_tiles must be positive");
     AITER_CHECK(static_cast<int>(dy.size(1)) == K, "dy K must match weight K");
     AITER_CHECK(static_cast<int>(act_input.size(0)) == M &&
@@ -288,7 +290,8 @@ void opus_moe_dgrad_swiglu_dscore_ragged_bf16(
     k.stride_b_batch = static_cast<int>(w.stride(0));
     k.stride_dscore = static_cast<int>(dscore_partials.stride(0));
     k.ragged = 1;
-    k.compact_tiles = 1;
+    k.compact_tiles =
+        static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles ? 2 : 1;
     k.num_tiles = num_tiles;
     opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());
@@ -309,8 +312,10 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
     AITER_CHECK(max_m > 0, "max_m must be positive");
     AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1,
                 "expert_offsets must have E + 1 elements");
-    AITER_CHECK(static_cast<int>(tile_offsets.size(0)) == E + 1,
-                "tile_offsets must have E + 1 elements");
+    AITER_CHECK(static_cast<int>(tile_offsets.size(0)) == E + 1 ||
+                    static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles,
+                "tile_offsets must have E + 1 prefix sums and may append "
+                "num_tiles packed descriptors");
     AITER_CHECK(num_tiles > 0, "num_tiles must be positive");
     AITER_CHECK(static_cast<int>(dy.size(1)) == K, "dy K must match weight K");
     AITER_CHECK(static_cast<int>(out.size(0)) == M &&
@@ -336,7 +341,8 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
     k.stride_dact = static_cast<int>(out.stride(0));
     k.stride_b_batch = static_cast<int>(w.stride(0));
     k.ragged = 1;
-    k.compact_tiles = 1;
+    k.compact_tiles =
+        static_cast<int>(tile_offsets.size(0)) == E + 1 + num_tiles ? 2 : 1;
     k.num_tiles = num_tiles;
     opus_moe_dgrad_plain_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());

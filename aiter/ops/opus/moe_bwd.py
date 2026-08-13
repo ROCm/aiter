@@ -190,14 +190,27 @@ def _build_dgrad_block_meta(offs: Tensor, B_M: int):
 
     if uniform_m is None:
         mono_tile_offsets = [0]
-        for m in lens:
-            mono_tile_offsets.append(mono_tile_offsets[-1] + (m + 191) // 192)
+        mono_tile_metadata = []
+        pack_target_tiles = E == 64 and o[-1] == 32768 * 8
+        for e, m in enumerate(lens):
+            tiles = (m + 191) // 192
+            mono_tile_offsets.append(mono_tile_offsets[-1] + tiles)
+            # Append one descriptor per compact 192-row tile to the same
+            # allocation as the E+1 prefix sums.  Keeping the descriptor in
+            # this tensor avoids adding another dgrad kernarg/pointer:
+            # [7:0] expert, [18:8] local tile, [30:19] expert tile count.
+            if pack_target_tiles:
+                mono_tile_metadata.extend(
+                    e | (local_tile << 8) | (tiles << 19)
+                    for local_tile in range(tiles)
+                )
         num_mono_tiles = mono_tile_offsets[-1]
     else:
         mono_tile_offsets = []
+        mono_tile_metadata = []
         num_mono_tiles = 0
     meta = torch.tensor(
-        e_ids + bms + bme + mono_tile_offsets,
+        e_ids + bms + bme + mono_tile_offsets + mono_tile_metadata,
         dtype=torch.int32,
         device=dev,
     )
@@ -205,7 +218,7 @@ def _build_dgrad_block_meta(offs: Tensor, B_M: int):
     return (
         meta[:n],
         meta[n:2 * n],
-        meta[2 * n:],
+        meta[2 * n:3 * n],
         uniform_m,
         max_m,
         mono_tile_offsets,
@@ -460,7 +473,7 @@ def opus_moe_dgrad_swiglu_dscore_ragged_prepared(
         or act_input.shape != expected
         or out.shape != expected
         or expert_offsets.shape != (E + 1,)
-        or tile_offsets.shape != (E + 1,)
+        or tile_offsets.numel() not in (E + 1, E + 1 + num_tiles)
         or dscore_partials.shape != (dy.shape[0], N // 256)
     ):
         raise ValueError("invalid ragged fused dgrad inputs")
@@ -493,7 +506,7 @@ def opus_moe_dgrad_mono_ragged_prepared(
         dy.shape[1] != K
         or out.shape != (dy.shape[0], N)
         or expert_offsets.shape != (E + 1,)
-        or tile_offsets.shape != (E + 1,)
+        or tile_offsets.numel() not in (E + 1, E + 1 + num_tiles)
     ):
         raise ValueError("invalid ragged mono dgrad inputs")
     _opus_moe_dgrad_mono_ragged_bf16_raw(

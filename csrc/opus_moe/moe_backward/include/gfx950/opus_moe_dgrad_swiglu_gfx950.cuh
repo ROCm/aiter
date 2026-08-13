@@ -80,7 +80,8 @@ template<typename UserTraits,
          bool APPLY_SWIGLU = true,
          bool RAGGED = false,
          bool COMPACT_TILES = false,
-         int FIXED_K = 0>
+         int FIXED_K = 0,
+         bool TARGET_EXACT = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 {
@@ -94,29 +95,61 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
 
+    constexpr int TARGET_N = APPLY_SWIGLU ? 1024 : 2048;
+    const int problem_n = TARGET_EXACT ? TARGET_N : kargs.n;
+    const int problem_batch = TARGET_EXACT ? 64 : kargs.batch;
+    const int stride_a = TARGET_EXACT ? 2048 : kargs.stride_a;
+    const int stride_b = TARGET_EXACT ? 2048 : kargs.stride_b;
+    const int stride_act_input =
+        TARGET_EXACT ? 2048 : kargs.stride_act_input;
+    const int stride_dact = TARGET_EXACT ? 2048 : kargs.stride_dact;
+    const int stride_b_batch = TARGET_EXACT
+        ? TARGET_N * 2048
+        : kargs.stride_b_batch;
+    const int stride_dscore = TARGET_EXACT
+        ? TARGET_N / T::B_N
+        : kargs.stride_dscore;
+
     const int wgid = block_id_x();
-    const int num_tiles_n = kargs.n / T::B_N;
+    const int num_tiles_n = problem_n / T::B_N;
     int batch_id = block_id_z();
     int local_wgid = wgid;
     int num_tiles_m = (kargs.m + T::B_M - 1) / T::B_M;
     if constexpr(COMPACT_TILES)
     {
-        // Locate the expert whose variable-sized block interval owns this CTA.
-        // tile_offsets is tiny (65 int32 values) and remains hot in cache.
-        int lo = 0;
-        int hi = kargs.batch;
-        while(lo + 1 < hi)
+        if constexpr(TARGET_EXACT)
         {
-            const int mid = (lo + hi) / 2;
-            if(wgid >= kargs.tile_offsets[mid] * num_tiles_n)
-                lo = mid;
-            else
-                hi = mid;
+            // Prefix sums and one descriptor per 192-row M tile share the
+            // existing tile_offsets allocation.  Exact N turns both div/mod
+            // operations into shifts/masks; one scalar load replaces the
+            // six-step expert-prefix search in every CTA.
+            const int global_tile_m = wgid / num_tiles_n;
+            const uint32_t tile_desc = static_cast<uint32_t>(
+                kargs.tile_offsets[problem_batch + 1 + global_tile_m]);
+            batch_id = tile_desc & 0xffu;
+            const int local_tile_m = (tile_desc >> 8) & 0x7ffu;
+            num_tiles_m = tile_desc >> 19;
+            local_wgid =
+                local_tile_m * num_tiles_n + wgid % num_tiles_n;
         }
-        batch_id = lo;
-        const int first_tile = kargs.tile_offsets[batch_id];
-        num_tiles_m = kargs.tile_offsets[batch_id + 1] - first_tile;
-        local_wgid = wgid - first_tile * num_tiles_n;
+        else
+        {
+            // Generic compact routing retains the prefix-search fallback.
+            int lo = 0;
+            int hi = kargs.batch;
+            while(lo + 1 < hi)
+            {
+                const int mid = (lo + hi) / 2;
+                if(wgid >= kargs.tile_offsets[mid] * num_tiles_n)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            batch_id = lo;
+            const int first_tile = kargs.tile_offsets[batch_id];
+            num_tiles_m = kargs.tile_offsets[batch_id + 1] - first_tile;
+            local_wgid = wgid - first_tile * num_tiles_n;
+        }
     }
     int tile_m;
     int tile_n;
@@ -139,34 +172,34 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
 
     auto g_a = make_gmem(
         reinterpret_cast<const D_A*>(kargs.ptr_a) +
-            (RAGGED ? batch_row_start * kargs.stride_a
+            (RAGGED ? batch_row_start * stride_a
                     : batch_id * kargs.stride_a_batch) +
-            row * kargs.stride_a,
-        (batch_m - row) * kargs.stride_a * sizeof(D_A));
+            row * stride_a,
+        (batch_m - row) * stride_a * sizeof(D_A));
     auto g_b = make_gmem(
         reinterpret_cast<const D_B*>(kargs.ptr_b) +
-            batch_id * kargs.stride_b_batch + col * kargs.stride_b,
-        (kargs.n - col) * kargs.stride_b * sizeof(D_B));
+            batch_id * stride_b_batch + col * stride_b,
+        (problem_n - col) * stride_b * sizeof(D_B));
     auto g_act_input = make_gmem(
         reinterpret_cast<const D_C*>(kargs.ptr_act_input) +
-            (RAGGED ? batch_row_start * kargs.stride_act_input
+            (RAGGED ? batch_row_start * stride_act_input
                     : batch_id * kargs.stride_act_input_batch) +
-            row * kargs.stride_act_input,
-        (batch_m - row) * kargs.stride_act_input * sizeof(D_C));
+            row * stride_act_input,
+        (batch_m - row) * stride_act_input * sizeof(D_C));
     auto g_dact = make_gmem(
         reinterpret_cast<D_C*>(kargs.ptr_dact) +
-            (RAGGED ? batch_row_start * kargs.stride_dact
+            (RAGGED ? batch_row_start * stride_dact
                     : batch_id * kargs.stride_dact_batch) +
-            row * kargs.stride_dact,
-        (batch_m - row) * kargs.stride_dact * sizeof(D_C));
+            row * stride_dact,
+        (batch_m - row) * stride_dact * sizeof(D_C));
 
     const int wave_id_m = wave_id / T::T_N;
     const int wave_id_n = wave_id % T::T_N;
 
-    auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
+    auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, stride_a);
     auto u_sa = make_layout_sa<T>(lane_id, wave_id_m, wave_id_n);
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
-    auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+    auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, stride_b);
     auto u_sb = make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
 
@@ -298,7 +331,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     if(wave_id_m == 0)
         __builtin_amdgcn_s_barrier();
 
-    auto u_gc = make_layout_gc<T>(lane_id, 0, wave_id_n, kargs.stride_dact);
+    auto u_gc = make_layout_gc<T>(lane_id, 0, wave_id_n, stride_dact);
     auto v_dh = cast<D_C>(v_c);
     static_assert(sizeof(D_C) * 8 % sizeof(u32_t) == 0);
     constexpr int u32_per_chunk = sizeof(D_C) * 8 / sizeof(u32_t);
@@ -318,7 +351,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     constexpr auto r_elem = GCLoad::r_elem;
     auto offsets = layout_to_offsets<T::VEC_C>(u_gc);
     const int output_offset =
-        wave_id_m * (T::B_M / T::T_M) * kargs.stride_dact + col;
+        wave_id_m * (T::B_M / T::T_M) * stride_dact + col;
     if constexpr(!APPLY_SWIGLU)
     {
         store<T::VEC_C>(g_dact, v_dh, u_gc, output_offset);
@@ -355,7 +388,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         g_dact.template store<T::VEC_C>(
             dgate, offsets[i.value], output_offset);
         g_dact.template store<T::VEC_C>(
-            dup, offsets[i.value], output_offset + kargs.n);
+            dup, offsets[i.value], output_offset + problem_n);
         return vec_dot;
     };
     if constexpr(WRITE_DSCORE)
@@ -367,12 +400,12 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             auto gate0 = g_act_input.template load<T::VEC_C>(
                 offsets[i0.value], output_offset);
             auto up0 = g_act_input.template load<T::VEC_C>(
-                offsets[i0.value], output_offset + kargs.n);
+                offsets[i0.value], output_offset + problem_n);
             auto gate1 = g_act_input.template load<T::VEC_C>(
                 offsets[i1.value], output_offset);
             float route_dot = apply_swiglu(i0, gate0, up0);
             auto up1 = g_act_input.template load<T::VEC_C>(
-                offsets[i1.value], output_offset + kargs.n);
+                offsets[i1.value], output_offset + problem_n);
             route_dot += apply_swiglu(i1, gate1, up1);
             route_dot += __shfl_down(route_dot, 16, 64);
             route_dot += __shfl_down(route_dot, 32, 64);
@@ -400,7 +433,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                     ? batch_row_start + route_row
                     : batch_id * kargs.m + route_row;
                 reinterpret_cast<float*>(kargs.ptr_dscore_partials)[
-                    compact_row * kargs.stride_dscore +
+                    compact_row * stride_dscore +
                     n_tile] = partial;
             }
         }
@@ -411,7 +444,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             auto gate = g_act_input.template load<T::VEC_C>(
                 offsets[i.value], output_offset);
             auto up = g_act_input.template load<T::VEC_C>(
-                offsets[i.value], output_offset + kargs.n);
+                offsets[i.value], output_offset + problem_n);
             (void)apply_swiglu(i, gate, up);
         });
     }
@@ -459,7 +492,18 @@ inline void opus_moe_dgrad_swiglu_dscore_ragged_launch_gfx950(
     const int num_tiles_n = kargs.n / 256;
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
-    if(kargs.k == 2048)
+    const bool target_exact =
+        kargs.compact_tiles == 2 && kargs.batch == 64 &&
+        kargs.n == 1024 && kargs.k == 2048 &&
+        kargs.stride_a == 2048 && kargs.stride_b == 2048 &&
+        kargs.stride_act_input == 2048 && kargs.stride_dact == 2048 &&
+        kargs.stride_b_batch == 1024 * 2048 && kargs.stride_dscore == 4;
+    if(target_exact)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            true, true, true, true, 2048, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.k == 2048)
         opus_moe_dgrad_swiglu_kernel_gfx950<
             opus_moe_dgrad_swiglu_traits_gfx950,
             true, true, true, true, 2048>
@@ -478,7 +522,18 @@ inline void opus_moe_dgrad_plain_ragged_launch_gfx950(
     const int num_tiles_n = kargs.n / 256;
     dim3 grid(kargs.num_tiles * num_tiles_n, 1, 1);
     dim3 block(512);
-    if(kargs.k == 2048)
+    const bool target_exact =
+        kargs.compact_tiles == 2 && kargs.batch == 64 &&
+        kargs.n == 2048 && kargs.k == 2048 &&
+        kargs.stride_a == 2048 && kargs.stride_b == 2048 &&
+        kargs.stride_dact == 2048 &&
+        kargs.stride_b_batch == 2048 * 2048;
+    if(target_exact)
+        opus_moe_dgrad_swiglu_kernel_gfx950<
+            opus_moe_dgrad_swiglu_traits_gfx950,
+            false, false, true, true, 2048, true>
+            <<<grid, block, 0, stream>>>(kargs);
+    else if(kargs.k == 2048)
         opus_moe_dgrad_swiglu_kernel_gfx950<
             opus_moe_dgrad_swiglu_traits_gfx950,
             false, false, true, true, 2048>
