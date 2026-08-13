@@ -21,8 +21,14 @@ aiter/ops/triton/
 ├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/
 ├── attention/             # MHA, MLA, lean attention, unified attention, ...
 ├── moe/                   # Mixture-of-experts ops
-├── normalization/  quant/  rope/  fusions/  comms/  conv/
-├── gated_delta_net/  kimi_delta_attn/
+├── normalization/         # RMSNorm / LayerNorm and fused add+norm variants
+├── quant/                 # FP8 / MXFP4 / MXFP8 quantization and fused-quant kernels
+├── rope/                  # RoPE and fused QKV-split + RoPE variants
+├── fusions/               # small fused glue kernels (mul+add, clamp-act-mul, KV-cache fusions, ...)
+├── comms/                 # multi-GPU communication kernels (all-gather, reduce-scatter, comm+compute fusions)
+├── conv/                  # convolution kernels (see conv/README.md and conv/DESIGN.md)
+├── gated_delta_net/       # Gated DeltaNet ops (gated delta rule, causal conv1d prefill/decode)
+├── kimi_delta_attn/       # Kimi Delta Attention (chunked delta attention)
 ├── gluon/                 # Gluon-backend wrappers
 ├── _triton_kernels/       # @triton.jit kernel bodies (mirrors the wrapper layout)
 ├── _gluon_kernels/        # Gluon kernel bodies
@@ -33,6 +39,8 @@ aiter/ops/triton/
 Public wrapper modules live in the categorized folders; the kernel bodies live
 in `_triton_kernels/` (and `_gluon_kernels/`) under the same category path.
 Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
+Kernel bodies are internal: tests, benchmarks, and external code call the
+public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
 
 Legacy flat imports (`from aiter.ops.triton.gemm_a16w16 import ...`) still
 resolve through `_BACKWARD_COMPAT_MAP` in `__init__.py`, but **new code must
@@ -75,7 +83,10 @@ Rules that follow from the layout:
   **MOE has no nested-layout resolver yet** — MOE configs stay in
   `configs/moe/` with the arch prefix until `get_moe_config()` lands
   (design in `configs/CLAUDE.md` §5).
-- gfx950 configs do not carry `kpack` — don't reintroduce it.
+- `kpack` is deprecated starting from gfx950: the Triton AMD backend warns
+  and force-overrides `kpack = 1` there, and the parameter is slated for
+  removal. Configs for gfx950 and newer must not carry it; only gfx942
+  configs may still set it.
 
 ### How GEMM configs resolve — `get_gemm_config()`
 
@@ -89,8 +100,10 @@ It returns `(config, is_tuned)`:
 
 - the config is a fresh deep copy, safe to mutate;
 - `is_tuned` is `True` only when a specialized (`N=…-K=…`, `B=…-N=…-K=…`, or
-  `specialized_filename`) file was hit. **Do not discard it** — downstream
-  heuristics depend on it.
+  `specialized_filename`) file was hit. `_get_config()` passes the pair
+  through unchanged; the flag is there so callers and tuning tooling can
+  detect shapes running on untuned defaults (call sites that don't need it
+  may ignore it).
 
 The per-kernel `_get_config()` must stay a thin wrapper:
 
@@ -265,8 +278,12 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 
 ## Checklist for a new kernel
 
+- Reuse first: check `utils/`, `_triton_kernels/common/`, and existing
+  kernels before writing new helpers — don't duplicate code that already
+  exists in the tree.
 - Wrapper in the right category folder; kernel body under `_triton_kernels/`
-  (or `_gluon_kernels/`) at the same path. No new top-level flat files.
+  (or `_gluon_kernels/`) at the same path, launched only through the wrapper.
+  No new top-level flat files.
 - `_get_config()` is a thin `get_gemm_config(...)` call; split-K goes through
   `compute_splitk_params()`. No tuning values in Python.
 - Config JSON in the **nested layout** (`configs/<arch>/<backend>/<op>/<d_type>/`),
@@ -274,4 +291,7 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 - `make_kernel_repr(...)` + `@triton.jit(repr=...)`.
 - Weight/scale shuffling imported from `utils/shuffle.py`.
 - Arch checks against `gfx*` identifiers.
-- Wrapper docstring; tests under `op_tests/triton_tests/<category>/`.
+- Wrapper docstring.
+- Unit test under `op_tests/triton_tests/<category>/` and a benchmark script
+  under `op_tests/op_benchmarks/triton/bench_<op>.py` — a kernel ships as
+  kernel + wrapper + test + benchmark.

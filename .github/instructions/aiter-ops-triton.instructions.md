@@ -1,14 +1,21 @@
 ---
-applyTo:
-  - "aiter/ops/triton/**"
-  - "op_tests/triton_tests/**"
-  - "op_tests/op_benchmarks/triton/**"
+applyTo: "aiter/ops/triton/**,op_tests/triton_tests/**,op_tests/op_benchmarks/triton/**"
 ---
 
 # AITER Triton ops — PR review rules
 
 When a change violates one of these rules, flag it and point the author to the
 relevant rule — reviewers may not know these conventions yet.
+
+## Reuse before adding
+
+Always prefer reusing existing code over adding new code. Before a PR adds a
+helper, kernel, or utility, the existing ones should have been checked:
+`utils/` (config loading, shuffling, arch info, logging, `kernel_repr`),
+`_triton_kernels/common/` (shared split-K reduce), and existing kernels and
+test helpers. Flag new code that duplicates functionality already in the
+tree, even partially — the fix is to extend or import the existing
+implementation, not to add a parallel copy.
 
 ## Folder structure and imports
 
@@ -60,8 +67,10 @@ deprecated. Flag:
 - Deleting or renaming `.gitkeep` placeholder directories under `configs/`.
 - A config file that is both moved and content-edited in the same commit —
   migrations must be pure `git mv` renames, content changes in a follow-up.
-- `kpack` appearing in any gfx950 config file — it was deliberately removed
-  from all gfx950 configs and must not be reintroduced.
+- `kpack` in a config file for gfx950 or a newer arch. Triton's AMD backend
+  deprecates `kpack` starting from gfx950 — it warns and force-overrides
+  `kpack = 1` there, and the parameter is slated for removal. Only gfx942
+  configs may still carry `kpack`.
 - Checked-in files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`
   — these are runtime AOT caches, never committed.
 
@@ -100,8 +109,12 @@ Tuning values live in JSON, never in Python. Flag:
       return get_gemm_config("GEMM-A16W16", M, N, K)
   ```
 
-- Discarding the `is_tuned` flag returned by `get_gemm_config()`
-  (e.g. `config, _ = get_gemm_config(...)` or `get_gemm_config(...)[0]`).
+- A `_get_config()` that swallows the `is_tuned` flag: the standardized
+  signature returns `(config, is_tuned)` straight from `get_gemm_config()`,
+  so flag `_get_config()` implementations that return a bare config dict.
+  Call sites may legitimately ignore the flag (`config, _ = _get_config(...)`
+  is fine) — it exists so callers and tuning tooling can detect a shape
+  resolving to the untuned default and log or re-tune.
 - Raw config-file reads — `json.load(open(...))` or function-attribute caches
   like `_get_config._config_dict` — instead of
   `aiter.ops.triton.utils.core.load_config_json` (which caches per path,
@@ -141,6 +154,11 @@ All weight/scale pre-shuffle helpers are unified in
   `_gemm_splitk_reduce_kernel` / `_batched_gemm_splitk_reduce_kernel` from
   `aiter/ops/triton/_triton_kernels/common/splitk_reduce.py`. Flag any new
   per-kernel reduce kernel that duplicates it.
+- Triton and Gluon kernel bodies are internal: they must be launched only
+  from their public wrapper under `aiter/ops/triton/`. Flag any direct
+  import or launch of a kernel from `_triton_kernels/` or `_gluon_kernels/`
+  in tests, benchmarks, or code outside the wrapper layer — and flag new
+  kernels that ship without a public wrapper.
 - Arch handling: flag product names (`MI300`, `MI350`, `MI355`, ...) in
   identifiers, filenames, comments-as-logic, or any parsing of product
   strings. Compare architecture identifiers instead:
@@ -163,7 +181,8 @@ All weight/scale pre-shuffle helpers are unified in
   `op_tests/triton_tests/<category>/`, mirroring the kernel's category (a new
   `gemm/basic/` kernel gets `op_tests/triton_tests/gemm/basic/test_<op>.py`).
   Flag PRs that add a kernel wrapper without adding or extending a matching
-  test.
+  test. Likewise flag a new kernel with no benchmark script — a kernel ships
+  as kernel + wrapper + unit test + benchmark.
 - Tests must follow the existing pattern: pytest-style `test_<op>.py` files
   inside the category folder, shared helpers in the existing
   `*_test_utils.py` / `utils/` modules. Flag tests added flat at the
