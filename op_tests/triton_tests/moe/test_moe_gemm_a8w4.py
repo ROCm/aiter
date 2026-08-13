@@ -6,7 +6,7 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
-from aiter.ops.shuffle import shuffle_weight_gfx1250
+from aiter.ops.shuffle import moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
@@ -27,7 +27,18 @@ from aiter.ops.triton.moe.quant_moe import (
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+
+
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
 
 # ---------------
 # initialize data
@@ -303,7 +314,7 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if preshuffled:
-        w_tri = shuffle_weight_gfx1250(w_tri)
+        w_tri = preshuffle_moe_weight(w_tri)
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
@@ -453,7 +464,7 @@ def test_op_mxfp8_out(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if preshuffled:
-        w_tri = shuffle_weight_gfx1250(w_tri)
+        w_tri = preshuffle_moe_weight(w_tri)
     swizzle_mx_scale = None
 
     if act_mxfp8:

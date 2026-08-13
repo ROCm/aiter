@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from aiter.ops.shuffle import shuffle_weight_gfx1250
+from aiter.ops.shuffle import moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     get_gluon_a8w4_ctas_per_cga,
@@ -20,7 +20,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -151,6 +151,16 @@ def check_and_shuffle_scales(scale, N, K):
         return scale, None
 
 
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
 def quantize(x, dtype):
     if dtype == "bf16":
         x = x.to(torch.bfloat16).transpose(-1, -2).contiguous().transpose(-1, -2)
@@ -255,8 +265,8 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
     if preshuffle:
-        w1 = shuffle_weight_gfx1250(w1)
-        w2 = shuffle_weight_gfx1250(w2)
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype
