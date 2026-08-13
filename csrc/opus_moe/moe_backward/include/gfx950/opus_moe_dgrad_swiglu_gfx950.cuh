@@ -254,6 +254,8 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     if(wave_id_m == 1)
         __builtin_amdgcn_s_barrier();
 
+    if constexpr(TARGET_EXACT)
+        __builtin_amdgcn_s_setprio(1);
 #pragma unroll 4
     for(int tile = 0; tile < loops - 2; tile += 2)
     {
@@ -267,11 +269,13 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        __builtin_amdgcn_s_setprio(1);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(1);
         v_c = mma(v_a, v_b, v_c);
         __builtin_amdgcn_sched_barrier(0);
         s_waitcnt_vmcnt(number<T::b_buffer_load_insts>{});
-        __builtin_amdgcn_s_setprio(0);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -286,11 +290,13 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        __builtin_amdgcn_s_setprio(1);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(1);
         v_c = mma(v_a, v_b, v_c);
         __builtin_amdgcn_sched_barrier(0);
         s_waitcnt_vmcnt(number<T::b_buffer_load_insts>{});
-        __builtin_amdgcn_s_setprio(0);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -312,11 +318,13 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        __builtin_amdgcn_s_setprio(1);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(1);
         v_c = mma(v_a, v_b, v_c);
         __builtin_amdgcn_sched_barrier(0);
         s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_setprio(0);
+        if constexpr(!TARGET_EXACT)
+            __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
