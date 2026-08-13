@@ -114,7 +114,19 @@ def main():
     kv = torch.randn(CTX, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM, device=dev).to(dtypes.fp8)
 
     N = 8
-    det_env = os.getenv("AITER_MLA_DECODE_DETERMINISTIC", "0") not in ("0", "")
+    # The clamp in get_mla_metadata_v1 fires for EITHER knob, so the verification
+    # branch must too. Mirror its int() parse: it collapses to a single split for
+    # DETERMINISTIC=1 or MAX_SPLIT_PER_BATCH=1 (only n=1 is reproducible; n>1 just
+    # lowers the ceiling, so we don't assert equality there).
+    _mspb = os.getenv("AITER_MLA_DECODE_MAX_SPLIT_PER_BATCH")
+    try:
+        _mspb_i = int(_mspb) if _mspb is not None else None
+    except ValueError:
+        _mspb_i = None
+    det_env = (
+        os.getenv("AITER_MLA_DECODE_DETERMINISTIC", "0") not in ("0", "")
+        or _mspb_i == 1
+    )
 
     o1a = _run_decode(q, kv, 1)
     o1b = _run_decode(q, kv, 1)
@@ -133,7 +145,7 @@ def main():
     if det_env:
         # With the workaround, get_mla_metadata_v1 clamps to a single split, so
         # even the "N" request collapses onto the split=1 baseline.
-        print(f"[det] AITER_MLA_DECODE_DETERMINISTIC set: split={N} now matches split=1? "
+        print(f"[det] deterministic clamp set: split={N} now matches split=1? "
               f"max|d| = {_maxdiff(oNa, o1a):.3e}")
         ok = d_s1 == 0 and _maxdiff(oNa, o1a) == 0
         print(f"[det] {'PASS' if ok else 'FAIL'}: deterministic single-split path.")
