@@ -218,6 +218,13 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::DEFER_Z_LDS_WAIT;
         return false;
     }();
+    constexpr bool request_pipeline_z_route_groups = []() constexpr {
+        if constexpr(requires { T::PIPELINE_Z_ROUTE_GROUPS; })
+            return T::PIPELINE_Z_ROUTE_GROUPS;
+        return false;
+    }();
+    constexpr bool pipeline_z_route_groups =
+        request_pipeline_z_route_groups && RouteTiles > 1;
     constexpr bool issue_b_first = []() constexpr {
         if constexpr(requires { T::ISSUE_B_FIRST; })
             return T::ISSUE_B_FIRST;
@@ -278,7 +285,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         stage_z_in_lds
             ? (ROUTE_M / 2) * z_lds_pair_elems * sizeof(D_A)
             : 0;
-    constexpr int epilogue_storage_bytes = z_lds_bytes + ds_bytes;
+    constexpr int z_lds_stages = pipeline_z_route_groups ? 2 : 1;
+    constexpr int z_lds_total_bytes = z_lds_stages * z_lds_bytes;
+    constexpr int epilogue_storage_bytes = z_lds_total_bytes + ds_bytes;
     constexpr int smem_a_bytes = smem_a_elems * sizeof(D_A);
     constexpr int smem_b_bytes = smem_b_elems * sizeof(D_B);
     constexpr int gemm_buffer_bytes = smem_a_bytes + smem_b_bytes;
@@ -288,6 +297,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             ? gemm_smem_bytes
             : epilogue_storage_bytes;
     static_assert(!stage_z_in_lds || z_lds_pair_pad > 0);
+    static_assert(!request_pipeline_z_route_groups ||
+                      (stage_z_in_lds && defer_z_lds_wait),
+                  "route-group Z pipeline requires deferred staged Z");
 
     const int parts = inter_dim / BN;
     const int linear_block = static_cast<int>(blockIdx.x);
@@ -715,11 +727,12 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     __syncthreads();
 
     auto s_z = make_smem(reinterpret_cast<D_A*>(tile_storage));
-    auto s_ds = make_smem(reinterpret_cast<float*>(tile_storage + z_lds_bytes));
+    auto s_ds =
+        make_smem(reinterpret_cast<float*>(tile_storage + z_lds_total_bytes));
     OPUS_LDS_ADDR float* smem_ds =
         reinterpret_cast<OPUS_LDS_ADDR float*>(s_ds.ptr);
 
-    auto stage_z = [&](int route_group) {
+    auto stage_z = [&](int route_group, auto& s_z_tile) {
         if constexpr(stage_z_in_lds)
         {
             constexpr int z_async_vec = T::VEC_A;
@@ -749,7 +762,7 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         (lane_id % 32) * z_async_vec;
                     g_z.template async_load<z_async_vec>(
                         reinterpret_cast<void*>(
-                            reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_z.ptr) +
+                            reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_z_tile.ptr) +
                             lds_offset),
                         static_cast<int>(global_offset));
                 });
@@ -757,7 +770,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
     };
 
-    auto store_epilogue = [&](auto& accum, int route_group) {
+    auto store_epilogue = [&](auto& accum,
+                              int route_group,
+                              auto& s_z_tile) {
         static_assert(ROUTE_M == 32);
         static_assert(BN == T::T_N * T::W_N * T::E_N);
         static_assert(T::T_M == 1 && T::T_N == 4);
@@ -842,7 +857,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         static_cast<int64_t>(token) * stride_score_t + slot];
             }
         }
-        if constexpr(stage_z_in_lds && defer_z_lds_wait)
+        if constexpr(stage_z_in_lds && defer_z_lds_wait &&
+                     !pipeline_z_route_groups)
         {
             // Z is deposited directly into LDS and does not extend any VGPR
             // live range.  Hide its VMEM latency under the accumulator lane
@@ -884,14 +900,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         const int row_in_pair = z_local_row % 2;
                         z_gate_prefetch[group] = __builtin_bit_cast(
                             down_bwd_u32x4,
-                            s_z.template load<8>(pair_base +
-                                                  row_in_pair * BN +
-                                                  local_n0 + group * 16));
+                            s_z_tile.template load<8>(pair_base +
+                                                       row_in_pair * BN +
+                                                       local_n0 + group * 16));
                         z_up_prefetch[group] = __builtin_bit_cast(
                             down_bwd_u32x4,
-                            s_z.template load<8>(pair_base + 2 * BN +
-                                                  row_in_pair * BN +
-                                                  local_n0 + group * 16));
+                            s_z_tile.template load<8>(pair_base + 2 * BN +
+                                                       row_in_pair * BN +
+                                                       local_n0 + group * 16));
                     }
                     else
                     {
@@ -999,21 +1015,57 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             smem_ds[wave_id_n * CTA_M + local_m] = ds_wave_partial;
     };
 
-    opus::static_for<RouteTiles>([&](auto route_group) {
-        if constexpr(stage_z_in_lds)
-        {
-            if constexpr(route_group.value > 0)
-                __syncthreads();
-            stage_z(route_group.value);
-            if constexpr(!defer_z_lds_wait)
+    if constexpr(pipeline_z_route_groups)
+    {
+        auto s_z_next = make_smem(
+            reinterpret_cast<D_A*>(tile_storage + z_lds_bytes));
+        stage_z(0, s_z);
+        s_waitcnt_vmcnt(0_I);
+        s_waitcnt_lgkmcnt(0_I);
+        __syncthreads();
+        stage_z(1, s_z_next);
+
+        opus::static_for<RouteTiles>([&](auto route_group) {
+            if constexpr(route_group.value % 2 == 0)
+                store_epilogue(
+                    v_c[route_group.value], route_group.value, s_z);
+            else
+                store_epilogue(
+                    v_c[route_group.value], route_group.value, s_z_next);
+
+            if constexpr(route_group.value + 1 < RouteTiles)
             {
                 s_waitcnt_vmcnt(0_I);
                 s_waitcnt_lgkmcnt(0_I);
                 __syncthreads();
+                if constexpr(route_group.value + 2 < RouteTiles)
+                {
+                    if constexpr(route_group.value % 2 == 0)
+                        stage_z(route_group.value + 2, s_z);
+                    else
+                        stage_z(route_group.value + 2, s_z_next);
+                }
             }
-        }
-        store_epilogue(v_c[route_group.value], route_group.value);
-    });
+        });
+    }
+    else
+    {
+        opus::static_for<RouteTiles>([&](auto route_group) {
+            if constexpr(stage_z_in_lds)
+            {
+                if constexpr(route_group.value > 0)
+                    __syncthreads();
+                stage_z(route_group.value, s_z);
+                if constexpr(!defer_z_lds_wait)
+                {
+                    s_waitcnt_vmcnt(0_I);
+                    s_waitcnt_lgkmcnt(0_I);
+                    __syncthreads();
+                }
+            }
+            store_epilogue(v_c[route_group.value], route_group.value, s_z);
+        });
+    }
     __syncthreads();
 
     static_assert(T::T_N == 4);

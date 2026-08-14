@@ -150,9 +150,17 @@ MFMA-result permutation or changing the activation's numerical order.
 Forward may optionally save the BF16 tensor
 `a_scaled = route_weight * SwiGLU(z_sorted)` in expert-sorted route-major
 layout.  The fixed Python wrappers then map the same generic BN256 geometry to
-kid 13 for fewer than 65,536 sorted-capacity rows and kid 14 otherwise.  These
+kid 13 for fewer than 65,536 sorted-capacity rows and kid 16 otherwise.  These
 instances retain K1's dO@W2, dZ and dScore work, but compile out the scale,
 BF16 pack and global `a_scaled` store; K5 consumes the supplied cache directly.
+Kid 16 retains kid 15's split-N64 W2 and exact MFMA/activation order, but uses
+two 12-KiB Z slabs.  While the current route group's SwiGLU epilogue runs, its
+global-to-LDS transfer for the following group is already outstanding.  The
+gfx950 trace reports 72,192 bytes of LDS, 128 VGPRs and zero scratch, retaining
+two CTAs per CU.  Balanced, active-eight, skewed, K=4, E=8, T=8K--65K and
+smaller D/I family screens were bit-exact and favored the pipelined instance;
+the selector remains a sorted-capacity/BN256 geometry policy rather than an
+exact model-shape check.  Kids 14 and 15 remain explicit comparison overrides.
 The cache has shape `[sorted_capacity,I]`, must have been produced with the
 same sorting metadata, and is non-differentiable.  Sorter padding rows are
 ignored.  Shapes that do not select the general BN256 geometry reject this

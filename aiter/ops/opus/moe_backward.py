@@ -140,7 +140,7 @@ def _select_fixed_down_block_n(
 ) -> int:
     """Mirror native K1 dispatch so workspace shape and kernel stay coupled."""
 
-    if kernel_id in (11, 12, 13, 14, 15):
+    if kernel_id in (11, 12, 13, 14, 15, 16):
         if inter_dim % 256 != 0:
             raise ValueError("BN256 down kernels require I divisible by 256")
         return 256
@@ -167,7 +167,7 @@ def _select_saved_a_scaled_down_kernel(
 ) -> int:
     """Map a BN256 K1 policy to its no-a_scaled-write counterpart."""
 
-    if kernel_id in (13, 14, 15):
+    if kernel_id in (13, 14, 15, 16):
         return kernel_id
     if kernel_id == 11:
         return 13
@@ -184,10 +184,10 @@ def _select_saved_a_scaled_down_kernel(
         raise ValueError(
             "saved_a_scaled currently requires the general BN256 K1 geometry"
         )
-    # Long BN256 reductions use the split-N64 W2 LDS encoding: it preserves
-    # the kid14 MFMA/epilogue order while reducing transpose-read conflicts.
+    # Long BN256 streams use split-N64 W2 staging and pipeline the next
+    # route-group Z transfer under the current group's activation epilogue.
     # Keep kid13 for short streams where deferred-Z scheduling is not selected.
-    return 15 if sorted_capacity >= 65_536 else 13
+    return 16 if sorted_capacity >= 65_536 else 13
 
 
 def _validate_saved_a_scaled(
