@@ -417,7 +417,6 @@ def gemm_afp4wfp4_preshuffled_scales(
 
 
 # TODO: Split-K support
-# TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -456,11 +455,11 @@ def gemm_afp4wfp4_preshuffle(
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
-    # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_elems
 
     if config is None:
-        config, _ = _get_config(M, N, K_cfg, True)
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
+        # matching the non-preshuffled path.
+        config, _ = _get_config(M, N, K_bytes, True)
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -502,8 +501,13 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
-        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
+        # Kernel consumes preshuffled scales directly for M >= 32 (address math
+        # inverts the shuffle in registers) and un-shuffled (M, K // 32) scales for M < 32
+        if M < 32:
+            assert x_scales.shape[-1] == K_elems // 32 and x_scales.stride(-1) == 1, (
+                "x_scales must be un-shuffled (M, K // 32) K-contiguous for "
+                f"M < 32, got shape {tuple(x_scales.shape)}"
+            )
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,

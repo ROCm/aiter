@@ -14,12 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so we never pull in the c10 half/bfloat16 headers. The output is
+// written into a caller-provided aiter_tensor_t, and the non-tile-friendly
+// fallback (formerly torch::tanh / torch::sigmoid) now lives in the Python
+// wrapper, so none of the torch/ATen headers are needed here.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
-#include <torch/torch.h>
+#include "aiter_dispatch.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include <cmath>
 
 #include <hip/hip_bf16.h>
@@ -68,11 +72,6 @@ namespace aiter
             //              :);
             // return static_cast<T>(y);
         }
-
-        static torch::Tensor compute(torch::Tensor &input)
-        {
-            return torch::tanh(input);
-        }
     };
 
     struct SigmoidOp
@@ -94,11 +93,6 @@ namespace aiter
             float result = __builtin_amdgcn_rcpf(denom);
 
             return static_cast<T>(result);
-        }
-
-        static torch::Tensor compute(torch::Tensor &input)
-        {
-            return torch::sigmoid(input);
         }
     };
 
@@ -130,52 +124,49 @@ namespace aiter
     }
 }
 
+// The tile fast-path requires N % 8 == 0 and K % vec == 0 (vec = 16 bytes worth
+// of elements) on a contiguous input; the Python wrapper enforces this and
+// otherwise falls back to torch, so here we assume the input is tile-friendly.
 template <typename Operation>
-torch::Tensor unary_operation(torch::Tensor &input)
+void unary_operation(aiter_tensor_t &out, aiter_tensor_t &input)
 {
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
     int dim = input.dim();
-    bool is_support = true;
-    is_support &= input.is_contiguous() == true;
     int M = dim == 2 ? 1 : input.size(0);
     int N = dim == 2 ? input.size(0) : input.size(1);
     int K = dim == 2 ? input.size(1) : input.size(2);
     const uint32_t rows = 8;
-    const uint32_t vec = 16 / sizeof(input.dtype());
-    is_support &= N % rows == 0;
-    is_support &= K % vec == 0;
-    if (is_support)
-    {
-        auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-        auto output = torch::empty(input.sizes(), options);
-        void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
-        void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
-        int elements = N * K;
+    void *buf_c = reinterpret_cast<void *>(out.data_ptr());
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    // Total elements across all M rows: the kernel indexes its tile id over
+    // M * n_tiles * k_tiles, so the grid must be sized from M*N*K (not just N*K,
+    // which would leave every row past the first unwritten for 3-D inputs).
+    int64_t elements = (int64_t)M * N * K;
 
-        constexpr uint32_t wg = 256;
-        int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-        const dim3 grid_dim(grid_x, 1, 1);
-        const dim3 block_dim(wg, 1, 1);
-
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "unary_operator_tile_kernel", [&]
-            { aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K); });
-        return output;
-    }
-    else
-    {
-        return Operation::compute(input);
-    }
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+        input.dtype(), "unary_operator_tile_kernel", [&]
+        {
+            // vec = number of elements spanning 16 bytes for this dtype
+            // (fp16/bf16 -> 8, fp32 -> 4). Must be a compile-time constant here
+            // because it is a kernel template argument.
+            constexpr uint32_t vec = 16 / sizeof(scalar_t);
+            constexpr uint32_t wg = 256;
+            int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+            const dim3 grid_dim(grid_x, 1, 1);
+            const dim3 block_dim(wg, 1, 1);
+            aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K); });
 }
 
-torch::Tensor aiter_sigmoid(torch::Tensor &input)
+void aiter_sigmoid(aiter_tensor_t &out, aiter_tensor_t &input)
 {
-    return unary_operation<aiter::SigmoidOp>(input);
+    unary_operation<aiter::SigmoidOp>(out, input);
 }
 
-torch::Tensor aiter_tanh(torch::Tensor &input)
+void aiter_tanh(aiter_tensor_t &out, aiter_tensor_t &input)
 {
-    return unary_operation<aiter::TanhOp>(input);
+    unary_operation<aiter::TanhOp>(out, input);
 }
