@@ -2,20 +2,23 @@
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import shutil
-import os
-import subprocess
-from jinja2 import Template
-import ctypes
-from packaging.version import parse, Version
-from collections import OrderedDict
-from functools import lru_cache, partial
 import binascii
+import ctypes
 import hashlib
-import logging
-import time
 import inspect
 import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import time
+from collections import OrderedDict
+from collections.abc import Callable
+from functools import cache, lru_cache, partial
+
+from jinja2 import Template
+from packaging.version import Version, parse
 
 
 def get_git_commit_id_short():
@@ -41,33 +44,52 @@ if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 
 
-def get_amdgpu_arch():
-    """Find amdgpu-arch and return the detected GPU architecture."""
-    result = subprocess.run(
-        "which amdgpu-arch", shell=True, capture_output=True, text=True
-    )
-    amdgpu_arch_path = (
-        result.stdout.strip()
-        if result.returncode == 0
-        else "/opt/rocm/llvm/bin/amdgpu-arch"
-    )
-    result = subprocess.run(
-        amdgpu_arch_path, shell=True, capture_output=True, text=True
-    )
-    return result.stdout.strip().split("\n")[0]
+def get_amdgpu_arch() -> str:
+    """Detect one native GPU target across system and Python ROCm layouts."""
+    commands = []
+
+    amdgpu_arch = shutil.which("amdgpu-arch")
+    legacy_amdgpu_arch = "/opt/rocm/llvm/bin/amdgpu-arch"
+    if amdgpu_arch is None and os.access(legacy_amdgpu_arch, os.X_OK):
+        amdgpu_arch = legacy_amdgpu_arch
+    if amdgpu_arch is not None:
+        commands.append([amdgpu_arch])
+
+    rocm_agent_enumerator = shutil.which("rocm_agent_enumerator")
+    if rocm_agent_enumerator is not None:
+        commands.append([rocm_agent_enumerator, "-name"])
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            arch = line.strip().split(":", 1)[0].lower()
+            if re.fullmatch(r"gfx[0-9a-f]+", arch):
+                return arch
+    return ""
 
 
 DEFAULT_GPU_ARCH = get_amdgpu_arch()
 GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
-AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
-AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
-AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
-AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
+AITER_DEBUG = int(os.getenv("AITER_DEBUG", "0"))
+AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", "0"))
 
 if AITER_REBUILD >= 1:
     # Wipe the build dir without a shell: BUILD_DIR is recreated just below.
@@ -99,9 +121,9 @@ clean:
 
 def mp_lock(
     lock_path: str,
-    main_func: callable,
-    final_func: callable = None,
-    wait_func: callable = None,
+    main_func: Callable,
+    final_func: Callable | None = None,
+    wait_func: Callable | None = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -127,12 +149,16 @@ def mp_lock(
 def get_hip_version():
     hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
+        f"{hipconfig_home} --version",
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
 
-@lru_cache()
+@lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
@@ -153,6 +179,7 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
+        "gfx1151",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -278,10 +305,10 @@ def run_lib(func_name, folder=None):
 
 
 def hash_signature(signature: str):
-    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+    return hashlib.md5(signature.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_default_func_name(md_name, args: tuple):
     signature = "_".join([str(arg).lower() for arg in args])
     return f"{md_name}_{hash_signature(signature)}"
@@ -330,16 +357,18 @@ def transfer_hsaco(hsaco_path):
 
 
 def str_to_bool(s):
-    return True if s.lower() == "true" else False
+    return s.lower() == "true"
 
 
 def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
+    import torch
     import triton
     import triton.language as tl
-    import torch
 
     if not isinstance(kernel, triton.JITFunction):
-        raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+        raise ValueError(  # noqa: TRY004  ValueError is this helper's established contract; not changed in a style pass
+            f"Kernel {kernel} is not a triton.JITFunction"
+        )
     sig = inspect.signature(kernel.fn)
     valid_param_names = set(sig.parameters.keys())
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_param_names}
@@ -422,7 +451,7 @@ def check_hsaco(func_name, constexprs=None):
     return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_hsaco_launcher(hsaco_name, kernel_name):
     from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
 
@@ -456,15 +485,17 @@ class HsacoKernel:
         import triton
 
         if not isinstance(kernel, triton.JITFunction):
-            raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+            raise ValueError(  # noqa: TRY004
+                f"Kernel {kernel} is not a triton.JITFunction"
+            )
         self.triton_kernel = kernel
         self.stream = stream
 
     def __getitem__(self, grid):
         def _call(*args, **kwargs):
             if AITER_USE_HSACO:
-                import triton.language as tl
                 import torch
+                import triton.language as tl
 
                 sig = inspect.signature(self.triton_kernel.fn)
                 valid_param_names = set(sig.parameters.keys())

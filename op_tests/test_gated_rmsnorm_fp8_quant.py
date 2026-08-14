@@ -11,12 +11,14 @@ Tests the fused HIP kernel that performs:
 Constraint: ONLY supports head_dim=128 and group_size=128
 """
 
+import argparse
+
 import pandas as pd
 import torch
+
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
-import argparse
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:

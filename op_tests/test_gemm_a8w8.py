@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import random
+
 import torch
 import torch.nn.functional as F
-import random
-import os
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, hipb_create_extension, hipb_findallsols, hipb_mm
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import hipb_mm, hipb_create_extension, hipb_findallsols
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -19,9 +21,10 @@ except ModuleNotFoundError as e:
     if e.name != "tuned_op_bench_utils":
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
-import pandas as pd
 import argparse
 from functools import lru_cache
+
+import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
@@ -53,7 +56,7 @@ def is_shape_tuned(
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
                     df[mask][["M", "N", "K", "q_dtype_w"]].apply(tuple, axis=1)
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Warning: Could not load tuned shapes: {e}")
                 _TUNED_SHAPES_CACHE[tuned_file] = set()
         else:
@@ -167,7 +170,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    a, _avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only; run_gemm_ck_bpreshuffle is unaffected (gated by quantDtype below)
     if skip_ck:
         avg_b = err_b = None
@@ -365,7 +368,7 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )
@@ -577,15 +580,15 @@ def _iter_flydsl_csv_cases():
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
         yield (
-            dict(
-                dtype=dtypes.bf16,
-                m=int(row["M"]),
-                n=int(row["N"]),
-                k=int(row["K"]),
-                quantDtype=q_dtype,
-                pad_a=128,
-                skip_ck=True,
-            ),
+            {
+                "dtype": dtypes.bf16,
+                "m": int(row["M"]),
+                "n": int(row["N"]),
+                "k": int(row["K"]),
+                "quantDtype": q_dtype,
+                "pad_a": 128,
+                "skip_ck": True,
+            },
             {
                 "source": "flydsl_csv",
                 "libtype": str(row.get("libtype", "")),

@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
 import argparse
-import random
-from typing import Optional, Tuple, Union, Dict
-import subprocess
-import multiprocessing
 import concurrent.futures
+import multiprocessing
+import random
+import subprocess
+import sys
 from multiprocessing import cpu_count
 
 import pandas as pd
@@ -18,12 +17,12 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark
+from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
+    pa_decode_gluon_aot,
+)
 from csrc.cpp_itfs.utils import (
     BUILD_DIR,
     get_default_func_name,
-)
-from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
-    pa_decode_gluon_aot,
 )
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
@@ -85,8 +84,8 @@ def run_gluon_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     use_aot_impl: bool = False,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention.
@@ -147,7 +146,7 @@ def run_gluon_kernel(
 def run_pa_gluon_test(
     context_length: int,
     batch_size: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     compute_type: torch.dtype,
@@ -159,7 +158,7 @@ def run_pa_gluon_test(
     use_aot_impl: bool,
     quant_q: bool,
     quant_kv: bool,
-) -> Dict[str, Union[float, str]]:
+) -> dict[str, float | str]:
     """Test paged attention decode with gluon implementations."""
     results = {}
     data_type = compute_type
@@ -647,8 +646,8 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     num_processes=None,
-    sinks_options=[False],
-    sliding_window_options=[0],
+    sinks_options=None,
+    sliding_window_options=None,
 ) -> pd.DataFrame:
     """
     Run all tests using multiprocessing for parallel execution.
@@ -660,6 +659,10 @@ def run_multi_pa_gluon_test(
     Returns:
         DataFrame containing all test results
     """
+    if sliding_window_options is None:
+        sliding_window_options = [0]
+    if sinks_options is None:
+        sinks_options = [False]
     cdna_version = 3
     # Generate all test configurations
     test_configs = []
@@ -888,14 +891,18 @@ def get_so_files_size_and_count():
     """Get the total size and number of so files in aiter build directory."""
     try:
         du_result = subprocess.run(
-            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=100
+            ["du", "-sh", BUILD_DIR],
+            capture_output=True,
+            text=True,
+            timeout=100,
+            check=False,
         )
         if du_result.returncode == 0:
             total_size_of_so_files = du_result.stdout.split()[0]
             print(
                 f"The total size of so files in aiter build directory: {total_size_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the total size of so files in aiter build directory: {e}"
         )
@@ -906,13 +913,14 @@ def get_so_files_size_and_count():
             capture_output=True,
             text=True,
             timeout=100,
+            check=False,
         )
         if so_count_result.returncode == 0:
             number_of_so_files = so_count_result.stdout.strip()
             print(
                 f"The number of so files in aiter build directory: {number_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the number of so files in aiter build directory: {e}"
         )
@@ -925,12 +933,10 @@ def prebuild_normal_accuracy_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
@@ -973,12 +979,10 @@ def prebuild_normal_performance_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS

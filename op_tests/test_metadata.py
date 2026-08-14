@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
 import argparse
+import os
 import random
 
-import torch
 import pandas as pd
+import torch
 
 import aiter
 from aiter import dtypes
@@ -91,20 +91,20 @@ def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, se
         fast_mode=True,
     )
 
-    inputs = dict(
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_last_page_lens=kv_last_page_lens,
-        nhead=nhead,
-    )
-    out_meta = dict(
-        work_meta_data=(work_meta_data_size, work_meta_data_type),
-        work_indptr=(work_indptr_size, work_indptr_type),
-        work_info_set=(work_info_set_size, work_info_set_type),
-        reduce_indptr=(reduce_indptr_size, reduce_indptr_type),
-        reduce_final_map=(reduce_final_map_size, reduce_final_map_type),
-        reduce_partial_map=(reduce_partial_map_size, reduce_partial_map_type),
-    )
+    inputs = {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_last_page_lens": kv_last_page_lens,
+        "nhead": nhead,
+    }
+    out_meta = {
+        "work_meta_data": (work_meta_data_size, work_meta_data_type),
+        "work_indptr": (work_indptr_size, work_indptr_type),
+        "work_info_set": (work_info_set_size, work_info_set_type),
+        "reduce_indptr": (reduce_indptr_size, reduce_indptr_type),
+        "reduce_final_map": (reduce_final_map_size, reduce_final_map_type),
+        "reduce_partial_map": (reduce_partial_map_size, reduce_partial_map_type),
+    }
     return inputs, out_meta, kv_lens
 
 
@@ -207,7 +207,7 @@ def compare_metadata(golden, test):
 
 @benchmark()
 def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters):
-    inputs, out_meta, kv_lens = build_decode_inputs(
+    inputs, out_meta, _kv_lens = build_decode_inputs(
         batch_size, ctx_len, dtype, kvtype, nhead, jitter=jitter, seed=seed
     )
 

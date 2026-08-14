@@ -34,7 +34,10 @@ def analyze_isa(co_path: str, mcpu: str):
         sys.exit(1)
 
     result = subprocess.run(
-        [objdump, "-d", f"--mcpu={mcpu}", co_path], capture_output=True, text=True
+        [objdump, "-d", f"--mcpu={mcpu}", co_path],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
         print(f"Error: llvm-objdump failed:\n{result.stderr}", file=sys.stderr)
@@ -180,7 +183,7 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
             for name, vgpr, agpr, sgpr, lds in c.fetchall():
                 display = name[:48]
                 print(f"  {display:<50s} {vgpr:>6d} {agpr:>6d} {sgpr:>6d} {lds:>8d}")
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
 
     conn.close()

@@ -36,4 +36,3 @@ def gated_rmsnorm_fp8_group_quant(
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """
-    ...

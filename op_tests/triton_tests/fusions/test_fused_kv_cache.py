@@ -1,27 +1,27 @@
-import torch
 import pytest
+import torch
 import triton
 
-from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
-from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from op_tests.triton_tests.attention.test_mla import (
-    shuffle_kv_buffer,
-    dynamic_nvfp4_quant_kv_buffer,
-)
-from op_tests.triton_tests.attention.test_unified_attention import (
-    shuffle_kv_cache,
-    dynamic_nvfp4_quant_kv_cache,
-)
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
-from op_tests.triton_tests.test_kv_cache import check_kv_buffer
-from aiter.test_common import checkAllclose
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
-    fused_qk_rope_reshape_and_cache,
     fused_qk_rope_cosine_cache_llama,
+    fused_qk_rope_reshape_and_cache,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
+from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
+from op_tests.triton_tests.attention.test_mla import (
+    dynamic_nvfp4_quant_kv_buffer,
+    shuffle_kv_buffer,
+)
+from op_tests.triton_tests.attention.test_unified_attention import (
+    dynamic_nvfp4_quant_kv_cache,
+    shuffle_kv_cache,
+)
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
+from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
+from op_tests.triton_tests.test_kv_cache import check_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -102,9 +102,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     dtype = torch.bfloat16
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -190,8 +189,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch_q = torch.cat((torch_q_nope, torch_q_pe), dim=-1)
     torch_decode_q_pe = torch_q_pe
     if cache_dtype == torch.bfloat16:
-        torch_k_lora = torch_k_lora
-        torch_k_pe = torch_k_pe
+        torch_k_lora = torch_k_lora  # noqa: PLW0127
+        torch_k_pe = torch_k_pe  # noqa: PLW0127
     elif cache_dtype == e4m3_dtype:
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
         torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(torch.bfloat16)
@@ -299,9 +298,8 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -577,7 +575,7 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     offs = False
 
     torch.manual_seed(0)
-    q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    q, k, _, _, _freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
         KH,

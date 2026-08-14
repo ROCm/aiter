@@ -1,12 +1,13 @@
+import inspect
+
 import torch
+import triton
+from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-import inspect
-from packaging.version import Version
-import triton
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -23,7 +24,7 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
 
 
@@ -198,11 +199,17 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 3
+            waves_per_eu = 4
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 1
-            block_kv = 32
-            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            num_warps = 2 if num_heads <= 32 else 1
+            block_kv = 64 if num_heads <= 32 else 32
+            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            other = {
+                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                "BLOCK_M": block_m,
+                "MFMA_NONK_DIM": mfma_nonk_dim,
+            }
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -216,7 +223,7 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
+        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,

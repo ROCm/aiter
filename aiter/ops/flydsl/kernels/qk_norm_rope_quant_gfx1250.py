@@ -43,9 +43,6 @@ path.
 
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
-
-import torch
 
 # NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
 # whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
@@ -54,17 +51,16 @@ import torch
 # module load time crashes setup with ``KeyError: 'module_aiter_core'``.
 # Defer the import until the first runtime call instead -- sibling modules
 # (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
+import torch
+from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T, Int32, Stream
-from flydsl.expr.vector import ReductionOp
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
-from .tensor_shim import GTensor, _to_raw, _run_compiled
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -72,9 +68,13 @@ from .tensor_shim import GTensor, _to_raw, _run_compiled
 # (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+)
+
+from .tensor_shim import GTensor, _run_compiled, _to_raw
 
 _STATIC_ADAPTOR_CACHE = {}
 _STATIC_ADAPTOR_CACHE_MAX = 64
@@ -374,10 +374,11 @@ def _build_kernel(
         kv_scale: fx.Pointer,  # [T, NG]           f32 or uint8 (e8m0)
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
         swa_kv: fx.Pointer,  # [num_slots, cache_size, D] bf16 (dummy if not kv_write)
-        state_slot_mapping: fx.Pointer,  # [bs] i32 (dummy if not kv_write)
+        swa_index: fx.Pointer,  # paged: block_tables; direct: [T] dest rows
         batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
+        swa_num_rows: Int32,  # rows in the SWA pool; bounds the final row
         swa_cache_size: Int32,  # ring slot count
         num_tokens: Int32,  # valid tokens in this launch chunk (for tail clamp)
     ):
@@ -668,15 +669,14 @@ def _build_kernel(
                 _store_bf16_vec(
                     final_list, bf16_out_rsrc, bf16_out_row_base_bytes, tid, VEC
                 )
-                if const_expr(kv_write):
-                    if do_swa:
-                        _store_bf16_vec(
-                            final_list,
-                            swa_out_rsrc,
-                            swa_out_row_base_bytes,
-                            tid,
-                            VEC,
-                        )
+                if const_expr(kv_write) and do_swa:
+                    _store_bf16_vec(
+                        final_list,
+                        swa_out_rsrc,
+                        swa_out_row_base_bytes,
+                        tid,
+                        VEC,
+                    )
 
         # ============ runtime dispatch on bid_x < H ============
         q_tok_off_bytes = arith.MulIOp(
@@ -817,34 +817,93 @@ def _build_kernel(
                     bid_i32 = buffer_ops.buffer_load(
                         bid_rsrc, bid_t, vec_width=1, dtype=i32
                     )
-                    do_swa = ArithValue(bid_i32) >= 0
+                    # A stale token carries a negative position. `divsi`/`remsi`
+                    # truncate toward zero, so pos=-300 with block_size=128 gives
+                    # blk=-2 and in_blk=-44: the block index passes an upper-bound
+                    # test, reads the PREVIOUS request's table entry, and lands
+                    # the write 44 rows before that block. The C++ sibling's first
+                    # gate is `bid < 0 || pos < 0`; match it, in both modes.
+                    pos_ok = ArithValue(pos_i32) >= 0
+                    do_swa = arith.andi(
+                        _to_raw(ArithValue(bid_i32) >= 0), _to_raw(pos_ok)
+                    )
                     bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
+                    pos_safe = arith.select(
+                        _to_raw(pos_ok), pos_i32, arith.constant(0, type=i32)
+                    )
                     if const_expr(paged):
-                        blk = arith.divsi(pos_i32, _to_raw(swa_cache_size))
+                        blk = arith.divsi(pos_safe, _to_raw(swa_cache_size))
+                        # The other two gates the C++ sibling applies (see
+                        # `swa_row_for_token`): a position past the table's last
+                        # block would read the NEXT request's entry, and `-1`
+                        # marks a block outside the window. Clamp for the load,
+                        # gate the store on the unclamped test. The wrapper pins
+                        # stride(0) == max_blocks, so the row stride is both the
+                        # table width and the distance between two requests' rows.
+                        blk_ok = ArithValue(blk) < ArithValue(swa_slot_stride)
+                        blk_safe = arith.select(
+                            _to_raw(blk_ok), _to_raw(blk), arith.constant(0, type=i32)
+                        )
                         bt_off = ArithValue(bid_safe) * ArithValue(
                             swa_slot_stride
-                        ) + ArithValue(blk)
-                        bt_rsrc = _ptr_buffer_resource(state_slot_mapping)
+                        ) + ArithValue(blk_safe)
+                        bt_rsrc = _ptr_buffer_resource(swa_index)
                         phys = buffer_ops.buffer_load(
                             bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
                         )
-                        in_blk = arith.remsi(pos_i32, _to_raw(swa_cache_size))
+                        in_blk = arith.remsi(pos_safe, _to_raw(swa_cache_size))
                         row = ArithValue(phys) * ArithValue(
                             swa_cache_size
                         ) + ArithValue(in_blk)
-                        swa_off_elems = ArithValue(row) * ArithValue(swa_pos_stride)
-                    else:
-                        slot_rsrc = _ptr_buffer_resource(state_slot_mapping)
-                        slot = buffer_ops.buffer_load(
-                            slot_rsrc, bid_safe, vec_width=1, dtype=i32
+                        # Bound the final row against the pool, as the C++ does:
+                        # a phys id left over from a larger pool would otherwise
+                        # write past the end of swa_kv.
+                        row_ok = arith.andi(
+                            arith.andi(_to_raw(blk_ok), _to_raw(ArithValue(phys) >= 0)),
+                            _to_raw(ArithValue(row) < ArithValue(swa_num_rows)),
                         )
-                        ring = arith.remsi(pos_i32, _to_raw(swa_cache_size))
-                        swa_off_elems = ArithValue(slot) * ArithValue(
-                            swa_slot_stride
-                        ) + ArithValue(ring) * ArithValue(swa_pos_stride)
+                        do_swa = arith.andi(do_swa, row_ok)
+                        # Clamp too: a negative row would move the descriptor
+                        # base backwards, out of this tensor entirely.
+                        row_safe = arith.select(
+                            row_ok, _to_raw(row), arith.constant(0, type=i32)
+                        )
+                    else:
+                        # Direct: the caller already resolved this token's row.
+                        # A `-1` row means "skip", same as a `-1` batch id --
+                        # a caller whose window is not expressible here needs a
+                        # way to say so per token, not just per request.
+                        row_rsrc = _ptr_buffer_resource(swa_index)
+                        row = buffer_ops.buffer_load(
+                            row_rsrc, bid_t, vec_width=1, dtype=i32
+                        )
+                        # Bounded against the pool as well: the caller owns the
+                        # row, but a stale entry must not write past swa_kv.
+                        dest_ok = arith.andi(
+                            _to_raw(ArithValue(row) >= 0),
+                            _to_raw(ArithValue(row) < ArithValue(swa_num_rows)),
+                        )
+                        do_swa = arith.andi(do_swa, dest_ok)
+                        row_safe = arith.select(
+                            dest_ok, _to_raw(row), arith.constant(0, type=i32)
+                        )
+                    # The row index fits 32 bits; `row * D * 2` does not. A
+                    # unified V4 pool runs to ~150M rows, so a 32-bit byte
+                    # offset wraps 3% of the way in, and the sliding windows
+                    # this writes live at the far end. Widen before either
+                    # multiply, and let it reach the descriptor through the
+                    # base address (`static_bytes_offset_i64`) rather than
+                    # through the 32-bit offset field, whose window is 4 GiB.
                     swa_off_bytes = arith.index_cast(
-                        T.index, _to_raw(swa_off_elems)
-                    ) * arith.constant(2, type=T.index)
+                        T.index,
+                        arith.muli(
+                            arith.muli(
+                                arith.extsi(T.i64, row_safe),
+                                arith.extsi(T.i64, _to_raw(swa_pos_stride)),
+                            ),
+                            arith.constant(2, type=T.i64),
+                        ),
+                    )
                     swa_g_tmp = GTensor(
                         swa_kv,
                         dtype=T.bf16,
@@ -883,13 +942,14 @@ def _build_kernel(
         kv_scale: fx.Pointer,
         kv_in_row_stride: fx.Int32,
         swa_kv: fx.Pointer,
-        state_slot_mapping: fx.Pointer,
+        swa_index: fx.Pointer,
         batch_id_per_token: fx.Pointer,
         swa_slot_stride: fx.Int32,
         swa_pos_stride: fx.Int32,
+        swa_num_rows: fx.Int32,
         swa_cache_size: fx.Int32,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         # grid.y = ceil(num_tokens / ROWS_PER_WG): each workgroup covers
         # ROWS_PER_WG tokens (one per wave via thread_idx.y).
@@ -913,10 +973,11 @@ def _build_kernel(
             kv_scale,
             kv_in_row_stride,
             swa_kv,
-            state_slot_mapping,
+            swa_index,
             batch_id_per_token,
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
             num_tokens,
         )
@@ -982,25 +1043,25 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     num_q_heads: int,
     head_dim: int,
     rope_head_dim: int,
-    q_weight: Optional[torch.Tensor] = None,
+    q_weight: torch.Tensor | None = None,
     quant: bool = False,
-    quant_group_size: Optional[int] = None,
+    quant_group_size: int | None = None,
     scale_dtype: str = SCALE_DTYPE_FP32,
-    q_out: Optional[torch.Tensor] = None,
-    kv_out: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    kv_scale: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
-) -> Tuple[
+    q_out: torch.Tensor | None = None,
+    kv_out: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    swa_kv: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """Fused RMSNorm + GPT-J RoPE + optional FP8 quant (gfx1250 wave32).
 
@@ -1114,28 +1175,54 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             )
         if swa_block_tables.dim() != 2 or swa_block_tables.dtype != torch.int32:
             raise TypeError("swa_block_tables must be 2-D [bs, max_blocks] int32")
+        # The kernel indexes the table as `bid * stride(0) + blk` and bounds
+        # `blk` against stride(0). For that bound to be the table WIDTH (what
+        # the C++ sibling checks, via size(1)) and not merely the distance
+        # between rows, the table must be dense: a `full[:, :n]` view would
+        # leave stride(0) > n, letting a far-future position read a stale
+        # padding column instead of being skipped.
+        if swa_block_tables.stride(1) != 1:
+            raise ValueError("swa_block_tables must be contiguous in the last dim")
+        if swa_block_tables.stride(0) != swa_block_tables.shape[1]:
+            raise ValueError(
+                "swa_block_tables must be densely packed "
+                f"(stride(0)={swa_block_tables.stride(0)} != "
+                f"max_blocks={swa_block_tables.shape[1]}); a padded view would "
+                "widen the in-kernel block-index bound past the real table"
+            )
         swa_slot_stride = swa_block_tables.stride(0)
+        swa_num_rows = swa_kv.shape[0]
         swa_pos_stride = swa_kv.stride(0)
         swa_cache_size = swa_block_size
         swa_kv_arg = swa_kv
         ssm_arg = swa_block_tables
         bid_arg = batch_id_per_token
     elif kv_write:
-        if state_slot_mapping is None:
-            raise ValueError("ring kv_write requires state_slot_mapping")
-        if swa_kv.dim() != 3 or swa_kv.shape[2] != D:
-            raise ValueError(f"swa_kv must be [S, C, D={D}], got {tuple(swa_kv.shape)}")
-        if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
-            raise TypeError("state_slot_mapping must be 1-D int32")
-        swa_slot_stride = swa_kv.stride(0)
-        swa_pos_stride = swa_kv.stride(1)
-        swa_cache_size = swa_kv.shape[1]
+        if swa_dest_rows is None:
+            raise ValueError("direct kv_write requires swa_dest_rows")
+        if swa_kv.dim() != 2 or swa_kv.shape[1] != D:
+            raise ValueError(
+                f"direct swa_kv must be flat [num_rows, D={D}], "
+                f"got {tuple(swa_kv.shape)}"
+            )
+        if swa_dest_rows.dim() != 1 or swa_dest_rows.dtype != torch.int32:
+            raise TypeError("swa_dest_rows must be 1-D int32")
+        if swa_dest_rows.shape[0] < T_tok:
+            raise ValueError(
+                f"swa_dest_rows len {swa_dest_rows.shape[0]} < T={T_tok}; it is "
+                "indexed by token, not by request"
+            )
+        swa_slot_stride = 0
+        swa_pos_stride = swa_kv.stride(0)
+        swa_num_rows = swa_kv.shape[0]
+        swa_cache_size = 1
         swa_kv_arg = swa_kv
-        ssm_arg = state_slot_mapping
+        ssm_arg = swa_dest_rows
         bid_arg = batch_id_per_token
     else:
         swa_slot_stride = 0
         swa_pos_stride = 0
+        swa_num_rows = 0
         swa_cache_size = 1
         swa_kv_arg = kv_out  # bf16 dummy
         ssm_arg = q.new_empty(1, dtype=torch.int32)
@@ -1198,11 +1285,15 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
+            # `swa_index` is sliced iff it is indexed by token: block tables
+            # are per request and stay whole, destination rows are per token
+            # and must follow the chunk exactly as positions do.
             _ptr_arg(swa_kv_arg),
-            _ptr_arg(ssm_arg),
+            _ptr_arg(ssm_arg[start:end] if (kv_write and not paged) else ssm_arg),
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
             swa_slot_stride,
             swa_pos_stride,
+            swa_num_rows,
             swa_cache_size,
             n,
             _stream_arg(),

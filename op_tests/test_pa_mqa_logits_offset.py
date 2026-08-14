@@ -29,9 +29,9 @@ always computed correctly.
 
 import pytest
 import torch
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from aiter import dtypes
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 dev = "cuda"
 SEED = 1234

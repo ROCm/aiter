@@ -63,9 +63,7 @@ def _is_winograd_eligible(R, S, stride, dilation, C=None):
         return False
     # F(4,3) output transform amplifies bf16 rounding by up to 361x (AT row3 L1=19).
     # With very few input channels the tolerance budget is too small to absorb this.
-    if C is not None and C < 4:
-        return False
-    return True
+    return not (C is not None and C < 4)
 
 
 def _require_winograd_eligible(name, R, S, stride, dilation, C):

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <hip/hip_bfloat16.h>
 
+#include "opus_moe_stage1_a8w4_meta.h"
 #include "opus_moe_stage2_a8w4_meta.h"
 
 namespace opus_moe

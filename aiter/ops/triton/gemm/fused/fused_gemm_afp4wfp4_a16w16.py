@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import os
+
 import torch
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
-    _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
+    _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _get_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
@@ -28,14 +29,14 @@ def fused_gemm_afp4wfp4_a16w16(
     x_bf16: torch.Tensor,
     w_bf16: torch.Tensor,
     is_fp4_preshuffled: bool = True,
-    bias_fp4: Optional[torch.Tensor] = None,
-    bias_bf16: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y_fp4: Optional[torch.Tensor] = None,
-    y_bf16: Optional[torch.Tensor] = None,
-    skip_reduce: Optional[bool] = False,
-    config: Optional[dict] = None,
-    use_aot: Optional[bool] = True,
+    bias_fp4: torch.Tensor | None = None,
+    bias_bf16: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y_fp4: torch.Tensor | None = None,
+    y_bf16: torch.Tensor | None = None,
+    skip_reduce: bool | None = False,
+    config: dict | None = None,
+    use_aot: bool | None = True,
 ):
     """
     Computes the 8 bit matmul Y = X x WT + B using the block-scale quantization approach for x_fp4 and w_fp4.
@@ -63,6 +64,8 @@ def fused_gemm_afp4wfp4_a16w16(
     _LOGGER.info(
         f"FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp4={tuple(x_fp4.shape)} w_fp4={tuple(w_fp4.shape)} x_fp4_scale={tuple(x_fp4_scale.shape)} w_fp4_scale={tuple(w_fp4_scale.shape)} x_bf16={tuple(x_bf16.shape)} w_bf16={tuple(w_bf16.shape)}"
     )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x_fp4.shape
     N_fp4, K = w_fp4.shape
@@ -142,7 +145,7 @@ def fused_gemm_afp4wfp4_a16w16(
                 config["BLOCK_SIZE_M"] >= 32
             ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
