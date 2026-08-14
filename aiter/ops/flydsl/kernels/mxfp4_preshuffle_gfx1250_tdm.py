@@ -16,11 +16,11 @@ from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
+    addr_keepalive,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
-    lds_addr_keepalive,
     make_lds_copy_ops,
     make_sgpr_opaque,
     pipeline_fence,
@@ -627,8 +627,7 @@ def launch_gemm_a8w4_tdm(
 
         # Hint shape for compute_ktile. Re-swept on t256x256x256 with random
         # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
-        MMA_GROUP_WITH_ACT = 4
-        MMA_GROUP_NO_ACT = 4
+        MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
         # REUSE fence; the prefetch reads interleave evenly over the rest.
         FENCE_COVER_MMA = 8
@@ -696,17 +695,17 @@ def launch_gemm_a8w4_tdm(
                 slot.a[wm].store(load_a(buf, wm, ksl))
             # Pin all four past the scale loads, or the allocator reuses a base
             # as a scale destination and the backend gates that WAR with vm_vsrc.
-            lds_addr_keepalive(*lds_bases(buf))
+            addr_keepalive(*lds_bases(buf))
 
         def k_step(
-            cur,
-            nxt=None,
+            cur_rmem,
+            next_rmem=None,
             load_nxt_fn=None,
             num_outstanding_tdm=None,
             issue_fn=None,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
-            if load_nxt_fn is not None and nxt is cur:
+            if load_nxt_fn is not None and next_rmem is cur_rmem:
                 raise ValueError("k_step cannot load into its current compute slot")
             if const_expr(num_outstanding_tdm is not None):
                 pipeline_fence(outstanding=num_outstanding_tdm)
@@ -714,10 +713,10 @@ def launch_gemm_a8w4_tdm(
                 issue_fn()
             if const_expr(load_nxt_fn is not None):
                 load_nxt_fn()
-            sa_k, sb_k = cur.sa.load(), cur.sb.load()
-            mma_rows(FRONT, cur.a[:front_wm], cur.b, sa_k, sb_k)
+            sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur.a[front_wm:], cur.b, sa_k, sb_k)
+                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
 
         def compute_ktile(
             buf,
@@ -755,9 +754,9 @@ def launch_gemm_a8w4_tdm(
                 rocdl.sched_barrier(0)
             # Form and pin the bases here so the tile pays one va_vdst(0) drain
             # instead of one per scattered address v_add; unpinned they remat.
-            lds_addr_keepalive(*lds_bases(buf))
+            addr_keepalive(*lds_bases(buf))
             if const_expr(next_stage_buf is not None):
-                lds_addr_keepalive(*lds_bases(next_stage_buf))
+                addr_keepalive(*lds_bases(next_stage_buf))
 
             def spread(total, slots):
                 counts = []
@@ -779,14 +778,7 @@ def launch_gemm_a8w4_tdm(
                 mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = (
-                    min(
-                        MMA_GROUP_WITH_ACT if stage1_act else MMA_GROUP_NO_ACT,
-                        mma_total,
-                    )
-                    if KWS > 1
-                    else 1
-                )
+                mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
                 future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
@@ -814,16 +806,16 @@ def launch_gemm_a8w4_tdm(
                 # At most one prefetch per k128: the next subtile of this tile,
                 # or -- on the last one -- the next tile's subtile 0, into slot 0.
                 if const_expr(not is_last):
-                    nxt = rmem_slots[(ksl + 1) % 2]
-                    load_nxt_fn = lambda n=nxt, k=ksl + 1: load_state(n, buf, k)
+                    next_rmem = rmem_slots[(ksl + 1) % 2]
+                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_state(n, buf, k)
                 elif const_expr(carries):
-                    nxt = rmem_slots[0]
-                    load_nxt_fn = lambda n=nxt: load_state(n, next_stage_buf, 0)
+                    next_rmem = rmem_slots[0]
+                    load_nxt_fn = lambda n=next_rmem: load_state(n, next_stage_buf, 0)
                 else:
-                    nxt, load_nxt_fn = None, None
+                    next_rmem, load_nxt_fn = None, None
                 k_step(
                     rmem_slots[ksl % 2],
-                    nxt,
+                    next_rmem,
                     load_nxt_fn,
                     num_outstanding_tdm=(
                         next_stage_wait if const_expr(carries) else None

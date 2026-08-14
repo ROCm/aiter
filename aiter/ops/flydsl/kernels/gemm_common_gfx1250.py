@@ -43,8 +43,8 @@ def make_lds_copy_ops(bits):
     return load, store
 
 
-def lds_addr_keepalive(*bases_idx):
-    """Pin LDS base-address registers live to this program point.
+def addr_keepalive(*base_indices):
+    """Pin address registers live to this program point.
 
     At full VGPR pressure the allocator reuses a ds_load's base-address register
     as the *destination* of a later ds_load once that address is dead. Earlier
@@ -57,23 +57,14 @@ def lds_addr_keepalive(*bases_idx):
     side-effect marker reach the allocator. Assumes VGPR headroom (occupancy
     already at the floor and no spills).
     """
-    ops = [_raw(arith.index_cast(T.i32, ArithValue(b))) for b in bases_idx]
-    if not ops:
-        return
-    llvm_dialect.InlineAsmOp(
-        res=None,
-        operands_=ops,
-        asm_string="; lds addr keepalive",
-        constraints=",".join(["v"] * len(ops)),
-        has_side_effects=True,
-        is_align_stack=False,
-    )
+    ops = [_raw(arith.index_cast(T.i32, ArithValue(base))) for base in base_indices]
+    vgpr_keepalive(*ops)
 
 
 def vgpr_keepalive(*raw_vals):
     """Pin arbitrary VGPR *data* values live to this program point.
 
-    The data-register analogue of :func:`lds_addr_keepalive`. Where that pins ds
+    The data-register analogue of :func:`addr_keepalive`. Where that pins ds
     base *addresses*, this pins whole register values passed in raw, reading each
     through a side-effecting no-op so its live range extends past this point and
     the allocator cannot reuse its physical register(s) for an earlier def.
