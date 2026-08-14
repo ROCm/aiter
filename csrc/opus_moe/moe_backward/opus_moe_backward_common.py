@@ -524,6 +524,30 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         launcher="opus_moe_backward::gfx950::route_dx_launch_gfx950",
     ),
     OpusMoeBackwardInstance(
+        kid=19,
+        name=(
+            "route_dx_bf16_gfx950_bm32_bn512_bk32_m3_binary_compact_"
+            "cohort6_sorted_b_first_n_fast"
+        ),
+        family=OpusMoeBackwardFamily.ROUTE_DX,
+        arch="gfx950",
+        dtype="bf16",
+        route_layout=OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        block_m=32,
+        block_n=512,
+        block_k=32,
+        block_threads=256,
+        min_blocks_per_cu=2,
+        has_oob=False,
+        split_k=1,
+        trait=(
+            "opus_moe_backward::gfx950::"
+            "RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompact"
+            "Cohort6ASlabPadSortedOutputBFirstNFast"
+        ),
+        launcher="opus_moe_backward::gfx950::route_dx_launch_gfx950",
+    ),
+    OpusMoeBackwardInstance(
         kid=1,
         name="route_reduce_bf16_gfx950_bm16_bn128_sorted_input",
         family=OpusMoeBackwardFamily.ROUTE_REDUCE,

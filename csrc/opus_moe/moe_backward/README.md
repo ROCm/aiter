@@ -90,6 +90,11 @@ fallback when a genuinely different working-set regime needs it.
 | K2 `route_dx` large sorted output | 11 | kid 9 geometry, sorted route workspace for K3 reverse gather |
 | K2 `route_dx` wide-N logical output | 13 | `BM32 x BN256 x BK32`, M3/six-route cohort + 96-byte A-slab rotation |
 | K2 `route_dx` wide-N sorted output | 14 | kid 13 geometry, sorted route workspace for K3 reverse gather |
+| K2 `route_dx` wide-N sorted B-first | 15 | kid 14 geometry, issue the wider W1 transfer before dZ |
+| K2 `route_dx` wide-N M5 sorted B-first | 16 | `BM32 x BN256 x BK32`, M5/ten-route compact cohort |
+| K2 `route_dx` wide-N M5 binary compact | 17 | kid 16 geometry with binary expert-boundary decode |
+| K2 `route_dx` BN512 binary compact | 18 | `BM32 x BN512 x BK32`, M3/six-route compact cohort |
+| K2 `route_dx` BN512 N-fast | 19 | kid 18 compute; contiguous output-N traversal, selected for four/eight-tile grids |
 | K3 `route_reduce` | 0 | `BM16 x BN128` |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |

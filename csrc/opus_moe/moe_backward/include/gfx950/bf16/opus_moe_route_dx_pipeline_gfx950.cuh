@@ -149,6 +149,11 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::COMPACT_ROUTE_GROUP_GRID && RouteTiles > 1;
         return false;
     }();
+    constexpr bool compact_output_n_fast = []() constexpr {
+        if constexpr(requires { T::COMPACT_OUTPUT_N_FAST; })
+            return T::COMPACT_OUTPUT_N_FAST;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
@@ -189,9 +194,12 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
         const int blocks_per_cohort = group_cohort * n_tiles;
         const int cohort_id = linear_block / blocks_per_cohort;
         const int within_cohort = linear_block % blocks_per_cohort;
-        output_n_tile = within_cohort / group_cohort;
-        const int compact_group =
-            cohort_id * group_cohort + within_cohort % group_cohort;
+        const int compact_group = cohort_id * group_cohort +
+            (compact_output_n_fast ? within_cohort / n_tiles
+                                   : within_cohort % group_cohort);
+        output_n_tile = compact_output_n_fast
+                            ? within_cohort % n_tiles
+                            : within_cohort / group_cohort;
 
         if(kargs.route.expert_offsets == nullptr)
             return;

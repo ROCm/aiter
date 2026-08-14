@@ -205,6 +205,7 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     // they share W1, while dZ is revisited after only one cohort.
     static constexpr int ROUTE_COHORT_TILES = 0;
     static constexpr int ROUTE_M_TILES = 2;
+    static constexpr bool COMPACT_OUTPUT_N_FAST = false;
     static constexpr int ROUTE_M = 32;
     static constexpr int SMEM_A_SLAB_PAD = 0;
     static constexpr bool WRITE_SORTED_ROUTES = false;
@@ -361,6 +362,16 @@ struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSort
     static constexpr int SMEM_B_GROUPS = B_K / SMEM_B_GROUP_ROWS;
     static constexpr int SMEM_B_BYTES = SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
     static_assert(B_N == T_N * W_N * E_N);
+};
+
+// Preserve the BN512/M3 compute and compact expert grid, but walk every
+// output-N tile of one route group before advancing to the adjacent group.
+// This shortens reuse of the much larger dZ stream while the four W1 slabs
+// remain comfortably inside L2 for the neighboring group.
+struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirstNFast
+    : RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirst
+{
+    static constexpr bool COMPACT_OUTPUT_N_FAST = true;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128

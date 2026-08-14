@@ -640,6 +640,7 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int sorted_bn256_m5_b_first_route_dx_kid = 16;
     constexpr int sorted_bn256_m5_binary_route_dx_kid = 17;
     constexpr int sorted_bn512_m3_binary_route_dx_kid = 18;
+    constexpr int sorted_bn512_m3_binary_n_fast_route_dx_kid = 19;
     constexpr int b_first_min_routes = 250000;
     constexpr uint64_t m5_min_average_routes = 1536;
     constexpr uint64_t bn512_min_dz_bytes = 1024ull * 1024ull * 1024ull;
@@ -673,7 +674,12 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
             // M5 kernel for smaller working sets and standalone dispatch.
             if(route_dx.model_dim % 512 == 0 &&
                route_dz_bytes >= bn512_min_dz_bytes)
-                return sorted_bn512_m3_binary_route_dx_kid;
+            {
+                const int output_n_tiles = route_dx.model_dim / 512;
+                return output_n_tiles == 4 || output_n_tiles == 8
+                           ? sorted_bn512_m3_binary_n_fast_route_dx_kid
+                           : sorted_bn512_m3_binary_route_dx_kid;
+            }
             return sorted_bn256_m5_binary_route_dx_kid;
         }
 
@@ -696,7 +702,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                kid == sorted_bn256_b_first_route_dx_kid ||
                kid == sorted_bn256_m5_b_first_route_dx_kid ||
                kid == sorted_bn256_m5_binary_route_dx_kid ||
-               kid == sorted_bn512_m3_binary_route_dx_kid;
+               kid == sorted_bn512_m3_binary_route_dx_kid ||
+               kid == sorted_bn512_m3_binary_n_fast_route_dx_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&
