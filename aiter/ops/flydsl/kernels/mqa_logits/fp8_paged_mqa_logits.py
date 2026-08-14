@@ -253,12 +253,12 @@ def _build_paged_kernel(
         # loop-invariant, so hoist it out of the per-column gather below.
         block_byte_stride = fx.Int32(KVB) * index_dim
 
-        tile_lo = _to_raw(fx.Index(tile_lo_col))
-        tile_hi = _to_raw(fx.Index(fx.Int32(tile_hi_col)))
-        tile_step = _to_raw(fx.Index(fx.Int32(BKV)))
-        tile_loop = scf.ForOp(tile_lo, tile_hi, tile_step, [])
-        with ir.InsertionPoint(tile_loop.body):
-            col0 = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
+        for iv in scf.for_(
+            _to_raw(fx.Index(tile_lo_col)),
+            _to_raw(fx.Index(fx.Int32(tile_hi_col))),
+            _to_raw(fx.Index(fx.Int32(BKV))),
+        ):
+            col0 = fx.Int32(arith.index_cast(T.i32, iv))
             wave_ni_base = wave * N_TILES_PER_WAVE
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 abs_ni = wave_ni_base + ni
@@ -316,8 +316,6 @@ def _build_paged_kernel(
                 with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
                     out_row_t[col] = fx.Float32(col_sum)
                     scf.YieldOp([])
-
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_fp8_paged_mqa_logits(
