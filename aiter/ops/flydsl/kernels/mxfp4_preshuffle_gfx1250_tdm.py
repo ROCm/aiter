@@ -870,13 +870,10 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     has_next = next_stage_on and j + 1 < num_buffers
-                    # The last drain tile needs no fence: the previous tile's
-                    # rotated fence already covers the only buffer it reads.
-                    if const_expr(j != num_buffers - 1):
-                        pipeline_fence(
-                            outstanding=TDM_PER
-                            * max(0, num_buffers - 1 - j - (1 if has_next else 0))
-                        )
+                    pipeline_fence(
+                        outstanding=TDM_PER
+                        * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                    )
                     next_stage_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
