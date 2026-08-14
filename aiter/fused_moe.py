@@ -1380,7 +1380,28 @@ def _normalize_bias_for_kernel(
     return bias
 
 
-# TODO: remove this function once kernel handles padding in the runtime
+def _is_prepared_stage1_input(
+    metadata: MOEMetadata,
+    hidden_states: torch.Tensor,
+    q_dtype_a: torch.dtype | None,
+    a1_scale: torch.Tensor | None,
+) -> bool:
+    return (
+        metadata.prequant
+        and q_dtype_a == dtypes.fp8
+        and hidden_states.dtype == dtypes.fp8
+        and hidden_states.ndim == 2
+        and hidden_states.shape[1] % 32 == 0
+        and hidden_states.is_contiguous()
+        and a1_scale is not None
+        and a1_scale.dtype == dtypes.fp8_e8m0
+        and a1_scale.device == hidden_states.device
+        and a1_scale.ndim == 2
+        and a1_scale.shape[1] == hidden_states.shape[1] // 32
+        and a1_scale.is_contiguous()
+    )
+
+
 def _get_padding_for_flydsl(
     inter_dim_pad,
     model_dim_pad,
@@ -3012,7 +3033,12 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
-    if not metadata.prequant:
+    if _is_prepared_stage1_input(metadata, hidden_states, q_dtype_a, a1_scale):
+        # The caller already prepared the stage-1 activation and its sorted
+        # scale layout; consuming it directly avoids quantizing the same input
+        # a second time.
+        a1 = hidden_states
+    elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif (
