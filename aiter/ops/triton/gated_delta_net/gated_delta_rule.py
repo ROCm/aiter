@@ -457,6 +457,7 @@ def chunk_gated_delta_rule_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_prepare_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     num_decodes: int = 0,
@@ -484,7 +485,8 @@ def chunk_gated_delta_rule_opt_vk(
         k (torch.Tensor): keys of shape `[B, T, H, K]`.
         v (torch.Tensor): values of shape `[B, T, H, V]`.
         o (torch.Tensor, optional): pre-allocated `[B, T, H, V]` output buffer
-            written in place by K6. If None, a fresh buffer is allocated.
+            written in place by the output stage. If None, a fresh buffer is
+            allocated.
         g (torch.Tensor): g (decays in log space) of shape `[B, T, H]`.
         beta (torch.Tensor): betas of shape `[B, T, H]`.
         scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
@@ -493,24 +495,21 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state (bool): Whether to output final state `[N, H, V, K]`.
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
-        use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
-        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
+        use_chunk_hip (bool): Use HIP kernel for hidden state.
+        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state.
             Mutually exclusive with ``use_chunk_hip``.
+        use_prepare_flydsl (bool): Use the fused FlyDSL kernel for the prepare
+            stages without materializing `A_raw`. It is independent of the
+            hidden-state flags and falls back to Triton when unsupported.
+            Variable-length input also requires a prefill schedule.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
-        num_decodes (int): number of leading decode-only sequences to skip in
-            ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
-            cache-stable ``cu_seqlens`` (decode prefix included) and the data
-            tensors (`q/k/v/g/beta/o`) pre-sliced to the prefill region; the
-            offsets are rebased internally by the cached prologue helpers, so
-            the chunk-index / offset builds stay cache-warm across forward
-            calls (no per-forward `.tolist()` D2H).
+        num_decodes (int): Leading decode-only sequences in the original
+            ``cu_seqlens``. Data tensors contain only prefill tokens.
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
-        seq_lens_cpu: Original sequence lengths on the host, including any
-            leading decode-only sequences. When supplied, one shared metadata
-            schedule is built for K1--K6 without reading device values.
+        seq_lens_cpu: Original host sequence lengths used to build a schedule.
         prefill_metadata: Reusable schedule created by
             ``build_gated_delta_rule_prefill_metadata``. Prefer this over
             ``seq_lens_cpu`` when several GDR layers process the same batch.
@@ -576,6 +575,7 @@ def chunk_gated_delta_rule_opt_vk(
         cu_seqlens=cu_seqlens,
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
+        use_prepare_flydsl=use_prepare_flydsl,
         state_dtype=state_dtype,
         snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,
