@@ -49,21 +49,34 @@ shapes/dtypes/batches and emits a joined **FlyDSL/CK ratio table**.
 
 ### Group A — CK harness parity (CK-side changes)
 
-#### A1 — flip CK to cold  [ ]
-- [ ] `make_cfg()` in `ck_bench_warp_decode.cpp`: set `flush_cache_=true` and
-      `rotating_count_>1` (start 2–4); expose via env (`CK_WD_FLUSH`, `CK_WD_ROTATE`).
-- [ ] Check rotating-buffer memory: CK rotates the kernel-arg buffers, so `rotating_count_`
-      copies of the GB-scale weight pool can OOM (DeepSeek gate_up ~3.75 GB ×2). Confirm what
-      `rotating_buffers.hpp` duplicates; cap the count or rotate only the weight pointer.
-- [ ] Rebuild via `build_ck_bench.sh`; re-run the smoke test.
-- [ ] **Verify the flush works:** cold numbers must **drop** vs the current warm ones (esp.
-      the small Qwen `down` shape that was fully cache-resident); if unchanged, the flush
-      isn't hitting the weight reads → revisit mechanism.
-- [ ] Note the residual mechanism difference (CK scratch-flush vs FlyDSL disjoint-expert
-      rotation) as a caveat even once both are "cold".
-- Context: CK defaults `flush_cache_=false`, `rotating_count_=1`, and `make_cfg` only sets
-  `cold_niters_` (warmup) + `nrepeat_` → CK currently measures **warm** (fixed random router
-  ⇒ selected TOPK experts stay MALL-resident where they fit).
+#### A1 — flip CK to cold  [x] DONE (2026-08-14)
+**Mechanism change vs the original recipe:** the `stream_config` `flush_cache_` /
+`rotating_count_` flags are **no-ops on this launcher**. `launch_warp_decode_*` →
+`launch_kernel()` only ever calls `timing_loop_impl()` (it never reads those fields — they
+are consumed by `launch_kernel_time_mask_flush_cache` and the gemm-universal profiler), and
+ck_tile's `flush_cache()` is `s_icache_inv` (flushes the **instruction** cache, not the
+L2/MALL **data** cache holding the weights). So flipping the flags would compile, run, and
+change nothing. Instead A1 implements the cold mechanism **in the bench itself**, mirroring
+the FlyDSL cold harness.
+- [x] Replaced `make_cfg` + `launch_warp_decode_*` with a manual hipEvent timing loop
+      (`bench_cold<Kern>`) that rotates `a.p_router_ids` over precomputed disjoint expert
+      groups tiling the full E pool, using a **continuous** launch counter across
+      warmup+timed so every launch reads a fresh expert group (any reuse is a full-pool
+      sweep apart → cold). Env `CK_WD_ROTATE` (`<=0` = auto `ceil(E/BK)`, `1` = warm
+      baseline, `>1` = that many groups).
+- [x] Memory: rotation only grows the tiny router-id buffer (`rotate*B*K` int32, KB-scale);
+      the GB weight pool is unchanged, so **no OOM** (verified DeepSeek B=1 and B=32).
+- [x] Rebuilt via `build_ck_bench.sh`; smoke test passes.
+- [x] **Verified cold works:** cold numbers drop vs warm (`CK_WD_ROTATE=1`), most on the
+      previously cache-resident small Qwen shapes — e.g. B=1 `down_h2_d2` 4977→2999 GB/s
+      (0.60×), `down_fp4_h2` 4299→2339 GB/s (0.54×), `gate_bf16_d2` 7830→5560 GB/s (0.71×).
+- [x] Emits a provenance line to stderr (commit, cold/iters/rotate, mechanism), keeping
+      stdout clean for the A2 parser.
+- **Residual mechanism caveat (document in the compare table):** CK cold = disjoint-expert
+  router rotation over the full pool (now *structurally the same* as FlyDSL's), not a scratch
+  cache-flush; note this next to the numbers.
+- Context: CK previously measured **warm** (fixed seed-42 router ⇒ the same TOPK experts
+  stay MALL-resident where they fit).
 
 #### A2 — machine-readable, FlyDSL-compatible CK output  [ ]
 - [ ] Add a machine-readable output mode behind `CK_WD_FORMAT=csv`: stable schema
@@ -236,3 +249,8 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 ## 6. Status log
 - 2026-08-14 — plan drafted from `SILOTIGER-667-bench-TODO.txt`; per-stage G9 items folded
   here. Full-MoE / AITER-default track kept separate in the TODO file (deferred).
+- 2026-08-14 — **A1 done.** Discovered the `stream_config` flush/rotate flags are no-ops on
+  the warp-decode launcher (and ck_tile's flush is icache-only); implemented cold in the
+  bench via a manual hipEvent loop + disjoint-expert router rotation (`CK_WD_ROTATE`).
+  Verified cold numbers drop vs warm on the small Qwen shapes; no OOM on DeepSeek B=1/32.
+  `tickets/667/harness/ck_bench_warp_decode.cpp` updated + rebuilt.
