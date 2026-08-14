@@ -253,7 +253,8 @@ def _moe_ref_forward_impl(ctx, x, w1, w2, router_logits, topk, act_type, dgrad,
 def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
                            dx_scatter=None, router_bwd=None,
                            dgrad_actbwd=None, stage2_wgrad_start=None,
-                           stage2_wgrad_finish=None):
+                           stage2_wgrad_finish=None,
+                           early_dx_scatter=None):
     (x_g, w1, w2, act_input, h, y, p_sorted, x_gather_idx, order, lens,
      topk_ids, topk_w) = ctx.saved_tensors
     T, H, E, _I, topk = ctx.dims
@@ -285,10 +286,15 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
 
     # stage1
     dA_route = dgrad(d_act, w1, lens)                             # [M,H] = d_act @ W1
+    early_dx = None
+    if early_dx_scatter is not None:
+        early_dx = early_dx_scatter(dA_route, x_gather_idx, T)
     dW1 = wgrad(d_act, x_g, lens)                                  # [E,2I,H]
 
     # dx: sum topk route contribs back to token
-    if dx_scatter is not None:
+    if early_dx is not None:
+        dx = early_dx.to(dtype)
+    elif dx_scatter is not None:
         dx = dx_scatter(dA_route, x_gather_idx, T).to(dtype)
     else:
         dx = torch.zeros(T, H, device=dout.device, dtype=torch.float32)

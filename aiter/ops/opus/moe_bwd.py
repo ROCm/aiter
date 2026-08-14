@@ -1107,6 +1107,7 @@ _WEIGHT_TRANSPOSE_CACHE = {}
 _USE_GPU_DGRAD_METADATA = True
 _USE_FLAT_DSCORE_LAYOUT = False
 _USE_CACHED_TAIL_METADATA = True
+_USE_EARLY_TAIL = True
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -1477,6 +1478,46 @@ class OpusMoERefFunc(torch.autograd.Function):
                 return dx
             return opus_moe_gather_sum_bf16(src, ctx.token_routes, T)
 
+        def early_dx_gather_sum(src, gather, T):
+            """Run the exact dx/router tail while stage1 output is cache-hot."""
+            nonlocal fused_dlogits
+            if not (
+                ctx.use_cached_tail_metadata and
+                dscore_partials is not None and
+                ctx.dims == (32768, 2048, 64, 1024, 8)
+            ):
+                return None
+
+            dx = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+            fused_dlogits = torch.empty(
+                T, 64, device=src.device, dtype=torch.bfloat16
+            )
+            if ctx.use_flat_dscore_layout:
+                _opus_moe_gather_sum_dscore_router_dx_cached_meta_token8_h2048_e64_bf16_raw(
+                    src.contiguous(),
+                    ctx.token_routes,
+                    ctx.saved_tensors[11].contiguous(),
+                    dscore_partials,
+                    topk_ids.contiguous(),
+                    ctx.full_router_w.contiguous(),
+                    dx,
+                    fused_dlogits,
+                )
+            else:
+                _opus_moe_gather_sum_dscore_router_dx_grouped_cached_meta_token8_h2048_e64_bf16_raw(
+                    src.contiguous(),
+                    ctx.token_routes,
+                    ctx.saved_tensors[6].contiguous(),
+                    dscore_partials,
+                    order.contiguous(),
+                    topk_ids.contiguous(),
+                    ctx.full_router_w.contiguous(),
+                    dx,
+                    fused_dlogits,
+                )
+            ctx.fused_sparse_router_dx = True
+            return dx
+
         def wgrad_prepared(dy_op, a_op, _lens):
             return opus_moe_wgrad_tn_bf16(
                 dy_op, a_op, offs, offs.numel() - 1, ctx.uniform_m or 0
@@ -1513,7 +1554,10 @@ class OpusMoERefFunc(torch.autograd.Function):
             router_bwd=router_bwd_prepared,
             dgrad_actbwd=dgrad_actbwd_prepared,
             stage2_wgrad_start=stage2_wgrad_start,
-            stage2_wgrad_finish=stage2_wgrad_finish)
+            stage2_wgrad_finish=stage2_wgrad_finish,
+            early_dx_scatter=(
+                early_dx_gather_sum if _USE_EARLY_TAIL else None
+            ))
 
 
 class OpusMoEFullFunc(torch.autograd.Function):
