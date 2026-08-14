@@ -69,7 +69,7 @@ def mp_lock(
             return ret
         # Could not acquire: another process holds the lock. Wait for it.
         # wait() returns True if the holder released normally (work done),
-        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
         if baton.wait():
             if WaitFunc is not None:
@@ -131,6 +131,18 @@ AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
 AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_BF16_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+
+# fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
+# (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
+# future fp32 rowwise-scale variant lands in a separate CSV and never collides
+# on key. The scale type is identified by the filename alone. The
+# per-model tuned data currently lives under model_configs/ (e.g.
+# dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
+# get_config_file; this canonical path may not exist on disk.
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 
 AITER_CONFIG_GEMM_BF16 = os.getenv(
@@ -214,6 +226,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
 
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE,
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
@@ -269,11 +289,10 @@ class AITER_CONFIG:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
 
         ## get keys from untuned file to drop_duplicates
-        untuned_name = (
-            re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
-            if re.search(r"(?:_)?tuned$", merge_name)
-            else merge_name.replace("tuned", "untuned")
-        )
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
@@ -283,6 +302,11 @@ class AITER_CONFIG:
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
+            # Only key on columns actually present in the merged frame. Most
+            # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+            # table) key on gfx and never carry cu_num; keeping a missing column
+            # in the subset would raise inside pandas' duplicated().
+            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())

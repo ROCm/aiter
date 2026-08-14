@@ -320,7 +320,8 @@
     "module_deepgemm_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/opus_gemm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'"
+            "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/opus_bmm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -1617,7 +1618,6 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_device.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_host.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_device.cuh'"
         ],
         "flags_extra_cc": [],
@@ -1780,6 +1780,23 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gdr_decode_packed_bf16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gdr_decode_packed_bf16_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gdr_decode_packed_bf16.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_split_gdr_update": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
@@ -1801,7 +1818,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mwavefrontsize64'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

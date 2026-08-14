@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -43,20 +44,39 @@ if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 
 
-def get_amdgpu_arch():
-    """Find amdgpu-arch and return the detected GPU architecture."""
-    result = subprocess.run(
-        "which amdgpu-arch", shell=True, capture_output=True, text=True, check=False
-    )
-    amdgpu_arch_path = (
-        result.stdout.strip()
-        if result.returncode == 0
-        else "/opt/rocm/llvm/bin/amdgpu-arch"
-    )
-    result = subprocess.run(
-        amdgpu_arch_path, shell=True, capture_output=True, text=True, check=False
-    )
-    return result.stdout.strip().split("\n")[0]
+def get_amdgpu_arch() -> str:
+    """Detect one native GPU target across system and Python ROCm layouts."""
+    commands = []
+
+    amdgpu_arch = shutil.which("amdgpu-arch")
+    legacy_amdgpu_arch = "/opt/rocm/llvm/bin/amdgpu-arch"
+    if amdgpu_arch is None and os.access(legacy_amdgpu_arch, os.X_OK):
+        amdgpu_arch = legacy_amdgpu_arch
+    if amdgpu_arch is not None:
+        commands.append([amdgpu_arch])
+
+    rocm_agent_enumerator = shutil.which("rocm_agent_enumerator")
+    if rocm_agent_enumerator is not None:
+        commands.append([rocm_agent_enumerator, "-name"])
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            arch = line.strip().split(":", 1)[0].lower()
+            if re.fullmatch(r"gfx[0-9a-f]+", arch):
+                return arch
+    return ""
 
 
 DEFAULT_GPU_ARCH = get_amdgpu_arch()
