@@ -747,7 +747,7 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
         static_cast<uint64_t>(2 * down.inter_dim) * sizeof(hip_bfloat16);
     const bool uses_saved_a_and_sorted_x =
         (down_kernel_id == 14 || down_kernel_id == 15) &&
-        dw1_kernel_id == 15;
+        (dw1_kernel_id == 15 || dw1_kernel_id == 17);
     const bool launch_saved_dw2_before_down =
         mid_width_d && uses_saved_a_and_sorted_x &&
         dz_bytes >= dz_k5_before_route_min_bytes;
@@ -2315,7 +2315,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                         z.size(1) == gate_up_dim,
                     "z must have shape [sorted_capacity,2I]");
         const bool uses_sorted_x =
-            dw1_kernel_id == 14 || dw1_kernel_id == 15;
+            dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
+            dw1_kernel_id == 17;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,

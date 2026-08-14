@@ -190,6 +190,12 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::ISSUE_DIRECT_B_FIRST;
         return false;
     }();
+    constexpr bool triple_buffer = []() constexpr {
+        if constexpr(requires { T::TRIPLE_BUFFER; })
+            return T::TRIPLE_BUFFER;
+        return false;
+    }();
+    static_assert(!triple_buffer || T::DOUBLE_BUFFER);
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -295,7 +301,7 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr int smem_a_bytes = BM * BK * sizeof(D_A);
     constexpr int smem_b_bytes = BN * BK * sizeof(D_B);
     constexpr int smem_stage_bytes = smem_a_bytes + smem_b_bytes;
-    constexpr int smem_stages = T::DOUBLE_BUFFER ? 2 : 1;
+    constexpr int smem_stages = triple_buffer ? 3 : (T::DOUBLE_BUFFER ? 2 : 1);
     __shared__ __align__(16) char tile_storage[smem_stages * smem_stage_bytes];
     auto s_a = make_smem(reinterpret_cast<D_A*>(tile_storage));
     auto s_b =
@@ -755,7 +761,112 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         __builtin_amdgcn_sched_barrier(0);
     };
 
-    if constexpr(T::DOUBLE_BUFFER)
+    if constexpr(triple_buffer)
+    {
+        static_assert(T::DIRECT_GMEM_TO_LDS && split_b_n64 && sorted_b_rows,
+                      "triple-buffered K4 requires the sorted-X direct path");
+        static_assert(BM == 256 && BN == 128 && T::BLOCK_SIZE == 256,
+                      "triple-buffered K4 requires the wave4 production tile");
+        constexpr int direct_loads_per_tile = a_m_slabs + 2;
+        static_assert(direct_loads_per_tile == 6);
+
+        auto s_a_1 = make_smem(
+            reinterpret_cast<D_A*>(tile_storage + smem_stage_bytes));
+        auto s_b_1 = make_smem(reinterpret_cast<D_B*>(
+            tile_storage + smem_stage_bytes + smem_a_bytes));
+        auto s_a_2 = make_smem(
+            reinterpret_cast<D_A*>(tile_storage + 2 * smem_stage_bytes));
+        auto s_b_2 = make_smem(reinterpret_cast<D_B*>(
+            tile_storage + 2 * smem_stage_bytes + smem_a_bytes));
+
+        if(loops > 0)
+        {
+            issue_direct_tile(tile_sources(0), s_a, s_b);
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+
+            if(loops > 1)
+                issue_direct_tile(tile_sources(1), s_a_1, s_b_1);
+            if(loops > 2)
+                issue_direct_tile(tile_sources(2), s_a_2, s_b_2);
+
+            int tile_k = 0;
+            for(; tile_k + 5 < loops; tile_k += 3)
+            {
+                compute_tile(s_a, s_b);
+                s_waitcnt_vmcnt(opus::number<direct_loads_per_tile>{});
+                __builtin_amdgcn_s_barrier();
+                issue_direct_tile(
+                    tile_sources(tile_k + 3), s_a, s_b);
+
+                compute_tile(s_a_1, s_b_1);
+                s_waitcnt_vmcnt(opus::number<direct_loads_per_tile>{});
+                __builtin_amdgcn_s_barrier();
+                issue_direct_tile(
+                    tile_sources(tile_k + 4), s_a_1, s_b_1);
+
+                compute_tile(s_a_2, s_b_2);
+                s_waitcnt_vmcnt(opus::number<direct_loads_per_tile>{});
+                __builtin_amdgcn_s_barrier();
+                issue_direct_tile(
+                    tile_sources(tile_k + 5), s_a_2, s_b_2);
+            }
+
+            // At most five tiles remain.  Preserve the same three-stage ring
+            // while draining it, but retire every outstanding load before the
+            // last ready stage when no younger request remains in flight.
+            if(tile_k < loops)
+            {
+                compute_tile(s_a, s_b);
+                if(tile_k + 1 < loops)
+                {
+                    if(tile_k + 2 < loops)
+                        s_waitcnt_vmcnt(
+                            opus::number<direct_loads_per_tile>{});
+                    else
+                        s_waitcnt_vmcnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                    if(tile_k + 3 < loops)
+                        issue_direct_tile(
+                            tile_sources(tile_k + 3), s_a, s_b);
+
+                    compute_tile(s_a_1, s_b_1);
+                    if(tile_k + 2 < loops)
+                    {
+                        if(tile_k + 3 < loops)
+                            s_waitcnt_vmcnt(
+                                opus::number<direct_loads_per_tile>{});
+                        else
+                            s_waitcnt_vmcnt(0_I);
+                        __builtin_amdgcn_s_barrier();
+                        if(tile_k + 4 < loops)
+                            issue_direct_tile(
+                                tile_sources(tile_k + 4), s_a_1, s_b_1);
+
+                        compute_tile(s_a_2, s_b_2);
+                        if(tile_k + 3 < loops)
+                        {
+                            if(tile_k + 4 < loops)
+                                s_waitcnt_vmcnt(
+                                    opus::number<direct_loads_per_tile>{});
+                            else
+                                s_waitcnt_vmcnt(0_I);
+                            __builtin_amdgcn_s_barrier();
+                            compute_tile(s_a, s_b);
+
+                            if(tile_k + 4 < loops)
+                            {
+                                s_waitcnt_vmcnt(0_I);
+                                __builtin_amdgcn_s_barrier();
+                                compute_tile(s_a_1, s_b_1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if constexpr(T::DOUBLE_BUFFER)
     {
         static_assert(T::DIRECT_GMEM_TO_LDS,
                       "double-buffered K4 requires direct GMEM-to-LDS");

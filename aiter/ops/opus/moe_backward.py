@@ -246,26 +246,28 @@ def _select_saved_x_dw1_kernel(
     """Select direct sorted-X K4 from the production grouped-GEMM geometry.
 
     The cache-backed instance shares kid 13's BM256xBN128xBK32 output tile,
-    reverse cohort-4 schedule, and register/LDS footprint.  Auto therefore
-    uses the same long-reduction and output-grid crossover instead of a model
-    tuple.  Explicit kids 14/15 remain available for family benchmarking.
+    reverse cohort-4 schedule.  Auto uses the same long-reduction and
+    output-grid crossover instead of a model tuple, then enables a third LDS
+    stage while two future BK32 tiles can remain in flight.  Explicit kids
+    14/15/17 remain available for family benchmarking.
     """
 
     if gate_up_dim % 256 != 0 or model_dim % 128 != 0:
         raise ValueError(
             "saved_x_sorted K4 requires 2I divisible by 256 and D by 128"
         )
-    if kernel_id not in (-1, 14, 15):
+    if kernel_id not in (-1, 14, 15, 17):
         raise ValueError(
-            "saved_x_sorted currently supports auto or K4 kernel_id=14/15"
+            "saved_x_sorted currently supports auto or K4 "
+            "kernel_id=14/15/17"
         )
-    if kernel_id in (14, 15):
+    if kernel_id in (14, 15, 17):
         return kernel_id
 
     if num_experts < 2:
         raise ValueError(
             "saved_x_sorted auto requires at least two experts; use "
-            "kernel_id=14/15 only for explicit tuning"
+            "kernel_id=14/15/17 only for explicit tuning"
         )
     average_padded_routes = sorted_capacity // num_experts
     inter_dim = gate_up_dim // 2
@@ -282,13 +284,21 @@ def _select_saved_x_dw1_kernel(
     ):
         raise ValueError(
             "saved_x_sorted auto requires the production long-reduction "
-            "BM256 K4 geometry; use kernel_id=14/15 only for explicit tuning"
+            "BM256 K4 geometry; use kernel_id=14/15/17 only for explicit "
+            "tuning"
         )
     # Long reductions with sufficiently wide output/reduction grids can hide
     # both K16 LDS fragments behind the first MFMA.  Issue sorted-X before dZ
     # so the smaller reused operand enters the direct-to-LDS pipeline first.
     # Keep the lower-register production schedule for narrow D or I families.
     if inter_dim >= 768 and model_dim >= 1536:
+        # Three 24-KiB stages keep two future BK32 tiles in flight.  The
+        # extra LDS/VGPR footprint wins through the tested medium/long route
+        # family, but very long per-expert reductions favor the two-stage
+        # kernel's lower resource footprint.  This is a reduction-geometry
+        # boundary (roughly 200 BK32 tiles), not a model-shape special case.
+        if average_padded_routes <= 6400:
+            return 17
         return 15
     return 14
 
@@ -296,8 +306,8 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15):
-        raise ValueError("K4 kernel_id=14/15 requires saved_x_sorted")
+    if int(kernel_id) in (14, 15, 17):
+        raise ValueError("K4 kernel_id=14/15/17 requires saved_x_sorted")
 
 
 @dataclass(frozen=True)

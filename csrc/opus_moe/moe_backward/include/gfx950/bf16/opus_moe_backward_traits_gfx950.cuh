@@ -703,6 +703,15 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoub
     static constexpr bool ISSUE_DIRECT_B_FIRST = true;
 };
 
+// The wave4 accumulator footprint already limits this path to two CTAs/CU.
+// A third 24-KiB stage therefore preserves occupancy while allowing two
+// future BK32 tiles to remain in flight behind the current 16 MFMAs.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstTripleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoubleLds
+{
+    static constexpr bool TRIPLE_BUFFER = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

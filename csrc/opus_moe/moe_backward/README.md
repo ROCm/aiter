@@ -103,6 +103,8 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` wide/long production | 11 | `BM256 x BN128 x BK32`, 256 threads + eight native C tiles per wave |
 | K4 `dw1` long-reduction production | 13 | kid 11 geometry + reverse cohort4 + A-fragment prefetch |
 | K4 `dw1` forward-saved sorted-X | 14 | kid 13 geometry + direct padded sorted-row X reads |
+| K4 `dw1` sorted-X pipelined | 15 | kid 14 geometry + both K16 fragments prefetched, sorted-X issued first |
+| K4 `dw1` sorted-X three-stage | 17 | kid 15 geometry + two future BK32 tiles in flight |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
@@ -178,8 +180,16 @@ token-major X gather while retaining kid 13's generic geometry policy.  The
 cache is `[sorted_capacity,D]` BF16 and every sorter-padding row must be exact
 zero.  It is forward-owned: constructing it as a standalone backward gather
 costs more than the K4 saving.  On the target shape it occupies about 1.08 GB.
-Auto selects it only when kid 13's long-reduction, `I <= 1024`, and BM256
-output-grid conditions hold; explicit kid 14 remains a tuning override.
+Kid 15 additionally places both second-K16 operand fragments before the first
+MFMA and issues the smaller sorted-X transfer before dZ.  Kid 17 extends that
+path from two 24-KiB LDS stages to three.  After the first stage is ready it
+keeps two future BK32 tiles outstanding, uses `vmcnt(6)` to retire only the
+older tile, and overlaps the younger tile with the next 16 MFMAs.  Its 72-KiB
+LDS and 116 VGPR footprint retains two CTAs per gfx950 CU.  Auto selects kid 17
+when kid 13's long-reduction, `I <= 1024`, BM256 output-grid conditions hold,
+`I >= 768`, `D >= 1536`, and average padded routes are at most 6400.  Longer
+reductions retain two-stage kid 15.  These are runtime grouped-GEMM geometry
+boundaries; explicit kids 14/15/17 remain tuning overrides.
 
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output
