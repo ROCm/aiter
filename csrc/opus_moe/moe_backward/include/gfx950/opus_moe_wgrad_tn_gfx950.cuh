@@ -504,13 +504,19 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
             constexpr int TILES_M = FIXED_P / BM;
             constexpr int TILES_PER_EXPERT = TILES_M * (FIXED_Q / BN);
             constexpr int EXPERT_GROUP = 4;
+            // Keep the two N panels of one M tile adjacent before rotating to
+            // the next expert. This retains four-expert tail balancing while
+            // restoring short-range reuse of the shared A panel.
+            constexpr int TILES_PER_TURN = 2;
             const int schedule = blockIdx.x;
             const int expert_group =
                 schedule / (TILES_PER_EXPERT * EXPERT_GROUP);
             const int group_work =
                 schedule % (TILES_PER_EXPERT * EXPERT_GROUP);
-            e = expert_group * EXPERT_GROUP + group_work % EXPERT_GROUP;
-            linear = group_work / EXPERT_GROUP;
+            const int turn = group_work / (EXPERT_GROUP * TILES_PER_TURN);
+            const int in_turn = group_work % (EXPERT_GROUP * TILES_PER_TURN);
+            e = expert_group * EXPERT_GROUP + in_turn / TILES_PER_TURN;
+            linear = turn * TILES_PER_TURN + in_turn % TILES_PER_TURN;
         }
         else
             linear = blockIdx.y * tiles_n + blockIdx.x;
