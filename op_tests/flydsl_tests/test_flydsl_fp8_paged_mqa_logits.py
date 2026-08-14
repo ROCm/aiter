@@ -313,20 +313,105 @@ def test_fp8_paged_mqa_logits(
     }
 
 
-# Preshuffle is a distinct correctness branch (production shuffle_weight(16x16)
-# data layout, KVBlockSize % 16 == 0). A small fixed set covers what differs from
-# the block-flat path -- KVBlockSize 16 and 64, head_dim 64 and 128, the FN->FNUZ
-# Q patch, and a couple of grid/context shapes -- without re-running the whole
-# block-flat sweep.
-# (batch_size, next_n, heads, head_dim, avg_kv, q_dtype, kv_block_size)
-PRESHUFFLE_CASES = [
-    (1, 1, 64, 128, 1024, "fnuz", 16),
-    (1, 2, 64, 128, 1024, "fnuz", 64),
-    (2, 1, 128, 128, 8192, "fnuz", 64),
-    (1, 1, 64, 64, 1024, "fnuz", 16),  # head_dim=64 (single K-step)
-    (1, 1, 64, 128, 1024, "fn", 64),  # exercises the gfx942 FN->FNUZ Q patch
-    (4, 2, 64, 128, 8192, "fnuz", 64),
-]
+# The kernel specialises at compile time on (heads, head_dim, KVBlockSize,
+# Preshuffle); batch, next_n, context length, SplitKV and the Q dtype are
+# runtime values. Those axes do not interact -- nothing couples head_dim to
+# SplitKV, or the dtype to KVBlockSize -- so crossing all seven produced 864
+# cases that compiled only 12 distinct kernels and re-ran each about 72 times.
+#
+# Instead: cross the compile-time axes, vary each runtime axis alone from a
+# base, and add back the few combinations where the tile-range arithmetic
+# genuinely couples. `--exhaustive` still runs the full product.
+_BASE = {
+    "batch_size": 2,
+    "next_n": 2,
+    "heads": 64,
+    "head_dim": 128,
+    "avg_kv_length": 1024,
+    "q_dtype": "fnuz",
+}
+_SHAPES = [(64, 64), (64, 128), (128, 64), (128, 128)]
+
+
+def default_cases():
+    """Curated case list; each entry is a kwargs dict for the test body."""
+    cases = []
+    # Compile-time cross: one entry per distinct compiled kernel.
+    for heads, head_dim in _SHAPES:
+        for kvb in (1, 64):
+            cases.append({**_BASE, "heads": heads, "head_dim": head_dim, "block_size": kvb})
+        for kvb in (16, 64):  # Preshuffle needs KVBlockSize % 16 == 0
+            cases.append(
+                {
+                    **_BASE,
+                    "heads": heads,
+                    "head_dim": head_dim,
+                    "block_size": kvb,
+                    "preshuffle": True,
+                }
+            )
+    # Runtime axes, one at a time off the base.
+    for bs, nn in ((1, 1), (1, 2), (4, 2), (8, 1)):
+        cases.append({**_BASE, "batch_size": bs, "next_n": nn, "block_size": 64})
+    for kv in (128, 8192):  # 128 is shorter than one ChunkK tile
+        cases.append({**_BASE, "avg_kv_length": kv, "block_size": 64})
+    for sk in (1, 4):  # 1 disables splitting; base uses the auto formula
+        cases.append({**_BASE, "split_kv": sk, "block_size": 64})
+    cases.append({**_BASE, "q_dtype": "fn", "block_size": 64})  # FN->FNUZ Q patch
+    # Interactions: SplitKV against the context length it partitions, and
+    # against the preshuffled layout (which the old matrix never crossed).
+    cases.append({**_BASE, "avg_kv_length": 128, "split_kv": 4, "block_size": 64})
+    cases.append({**_BASE, "avg_kv_length": 8192, "split_kv": 1, "block_size": 64})
+    cases.append({**_BASE, "split_kv": 4, "block_size": 64, "preshuffle": True})
+    cases.append({**_BASE, "split_kv": 1, "block_size": 16, "preshuffle": True})
+    return cases
+
+
+def exhaustive_cases():
+    """The original 7-way cartesian product, for release validation."""
+    cases = []
+    for (bs, nn), nh, hd, kv, qd, sk, kvb in itertools.product(
+        [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (8, 1)],
+        [64, 128],
+        [64, 128],
+        [128, 1024, 8192],
+        ["fnuz", "fn"],
+        [0, 1, 4],
+        [1, 64],
+    ):
+        cases.append(
+            {
+                "batch_size": bs,
+                "next_n": nn,
+                "heads": nh,
+                "head_dim": hd,
+                "avg_kv_length": kv,
+                "q_dtype": qd,
+                "split_kv": sk,
+                "block_size": kvb,
+            }
+        )
+    for bs, nn, nh, hd, kv, qd, kvb in [
+        (1, 1, 64, 128, 1024, "fnuz", 16),
+        (1, 2, 64, 128, 1024, "fnuz", 64),
+        (2, 1, 128, 128, 8192, "fnuz", 64),
+        (1, 1, 64, 64, 1024, "fnuz", 16),
+        (1, 1, 64, 128, 1024, "fn", 64),
+        (4, 2, 64, 128, 8192, "fnuz", 64),
+    ]:
+        cases.append(
+            {
+                "batch_size": bs,
+                "next_n": nn,
+                "heads": nh,
+                "head_dim": hd,
+                "avg_kv_length": kv,
+                "q_dtype": qd,
+                "block_size": kvb,
+                "preshuffle": True,
+            }
+        )
+    return cases
 
 
 def main():
@@ -340,70 +425,24 @@ def main():
         return
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL paged fp8_mqa_logits correctness sweep",
+        description="FlyDSL paged fp8_mqa_logits correctness sweep"
     )
     parser.add_argument(
-        "-b",
-        "--batch-next-n",
-        type=dtypes.str2tuple,
-        nargs="*",
-        default=[(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (8, 1)],
-        help="(batch_size, next_n) pairs",
-    )
-    parser.add_argument("--num-heads", type=int, nargs="*", default=[64, 128])
-    parser.add_argument("--head-dim", type=int, nargs="*", default=[64, 128])
-    parser.add_argument(
-        "--avg-kv-length", type=int, nargs="*", default=[128, 1024, 8192]
-    )
-    parser.add_argument(
-        "--q-dtype",
-        type=str,
-        nargs="*",
-        default=["fnuz", "fn"],
-        choices=["fnuz", "fn"],
-    )
-    parser.add_argument(
-        "--split-kv",
-        type=int,
-        nargs="*",
-        default=[0, 1, 4],
-        help="0 == auto (production formula); else explicit SplitKV (1 disables)",
-    )
-    parser.add_argument(
-        "--kv-block-size",
-        type=int,
-        nargs="*",
-        default=[1, 64],
-        help="KVBlockSize (paged block-flat page size); 1 == per-token slots",
-    )
-    parser.add_argument(
-        "--no-preshuffle",
+        "--exhaustive",
         action="store_true",
-        help="skip the preshuffle (shuffle_weight 16x16 layout) correctness cases",
+        help="run the full 7-way cartesian product (870 cases) instead of the "
+        "curated matrix; for release validation",
+    )
+    parser.add_argument(
+        "--no-preshuffle", action="store_true", help="skip the preshuffle cases"
     )
     args = parser.parse_args()
 
-    df = []
-    for (bs, nn), nh, hd, kv, qd, sk, kvb in itertools.product(
-        args.batch_next_n,
-        args.num_heads,
-        args.head_dim,
-        args.avg_kv_length,
-        args.q_dtype,
-        args.split_kv,
-        args.kv_block_size,
-    ):
-        df.append(test_fp8_paged_mqa_logits(bs, nn, nh, hd, kv, qd, sk, block_size=kvb))
+    cases = exhaustive_cases() if args.exhaustive else default_cases()
+    if args.no_preshuffle:
+        cases = [c for c in cases if not c.get("preshuffle")]
 
-    if not args.no_preshuffle:
-        for bs, nn, nh, hd, kv, qd, kvb in PRESHUFFLE_CASES:
-            df.append(
-                test_fp8_paged_mqa_logits(
-                    bs, nn, nh, hd, kv, qd, 0, block_size=kvb, preshuffle=True
-                )
-            )
-
+    df = [test_fp8_paged_mqa_logits(**c) for c in cases]
     df = pd.DataFrame(df)
     try:
         summary = df.to_markdown(index=False)
