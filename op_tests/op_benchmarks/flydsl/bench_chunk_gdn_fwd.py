@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A/B benchmark: GDN K5 inter-chunk state scan (SILOTIGER-859).
+"""Unified benchmark: GDN K5 and K5+K6 forward kernels.
 
-Compares three implementations of ``chunk_gated_delta_rule_fwd_h``:
+Two subcommands share a common set of preset shapes, input builders, and
+timing infrastructure:
 
-* ``triton`` — Triton baseline (``chunk_gated_delta_rule_fwd_h_opt_vk``)
-* ``flydsl`` — arch-aware FlyDSL (gfx950: native; gfx942: NOT_IMPL until ported)
-* ``hip``    — HIP kernel; available on both gfx942 and gfx950
+  k5    — A/B benchmark of the inter-chunk state-scan (K5) kernel in isolation.
+           Compares: FlyDSL (variant-parametrized), Triton, HIP.
 
-The baseline for speedup columns is configurable via ``--baseline`` (default: triton).
+  k5k6  — A/B benchmark of the full K5+K6 pipeline (state scan + output).
+           Compares: FlyDSL fused K5+K6, FlyDSL K5 + Triton K6, Triton K5 +
+           Triton K6, HIP K5 + Triton K6, and the auto-dispatch combined
+           wrapper (K5K6_combined) that applies the fused-vs-separate heuristic.
 
 Usage
 -----
     # List preset shapes:
-    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h.py --list
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5 --list
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5k6 --list
 
-    # Time one shape, all impls, graph mode, verify against reference:
-    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h.py \\
-        --shape-index 1 --mode graph --verify
+    # K5 bench: shape 1, graph mode, verify against reference:
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5 \\
+        --shape-index 1 --mode graph --verification reference
 
-    # Full run with HIP as baseline, write Markdown + PNG:
-    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h.py \\
-        --baseline hip --mode all --output /tmp/gdn_bench.md
+    # K5+K6 bench: all impls including the combined auto-dispatch wrapper:
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5k6 \\
+        --shape-index 1 --mode graph --impl all
 
-    # Filter to KDA shapes only:
-    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd_h.py --gate gk
+    # Auto-dispatch combined wrapper only, shapes 1-5:
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5k6 \\
+        --impl K5K6_combined --shape-range 1-5 --mode graph
 
-Environment
------------
-    AITER_TRITON_ONLY=1   — load Triton only (skip FlyDSL / HIP imports)
+    # KDA shapes, FlyDSL all variants vs Triton:
+    PYTHONPATH=. python op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py k5 \\
+        --gate gk --flydsl-variants all --baseline triton
 """
 
 from __future__ import annotations
@@ -37,7 +42,6 @@ from __future__ import annotations
 import argparse
 import functools
 import importlib.util
-import os
 import random
 import sys
 import warnings
@@ -67,13 +71,13 @@ from utils.bench_common import (
 from utils.plot_perf import (
     category_label,
     make_bar_chart,
+    make_fill_scatter,
     make_summary_md,
     parse_bench_md,
 )
 
 # --------------------------------------------------------------------------- #
-# Preset shapes
-# gate_mode: "g" = scalar (GDN/Qwen3), "gk" = per-channel (KDA/Kimi-K3)
+# Preset shapes  (shared by both subcommands)
 # --------------------------------------------------------------------------- #
 # Shape tuple: (model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern)
 #
@@ -305,8 +309,6 @@ PRESET_SHAPES: list[tuple] = [
     ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew_last"),  # fill64=2.53
 ]
 
-_BENCH_TITLE = "GDN K5 inter-chunk state scan"
-
 # The bench builds gates (``g``/``gk``) in the natural-log domain and the fp32
 # reference applies ``torch.exp``. The K5 wrapper's ``use_exp2=True`` path expects
 # the scalar ``g`` already pre-scaled to log2 by an upstream K1+K2 producer (it does
@@ -316,23 +318,11 @@ _BENCH_TITLE = "GDN K5 inter-chunk state scan"
 _USE_EXP2 = False
 
 
+# --------------------------------------------------------------------------- #
+# Shared utilities
+# --------------------------------------------------------------------------- #
 def _make_seqlens(pattern: str, T_flat: int, N: int, BT: int = 64) -> list[int]:
-    """Per-sequence token counts for ``pattern``, summing exactly to ``T_flat``.
-
-    Deterministic, so a shape means the same thing across runs and machines.
-    Lengths are not rounded to a multiple of BT -- the ragged patterns should
-    exercise the padded tail chunk as well as the imbalance.
-
-    Patterns:
-      equal    every sequence the same length (the historical behaviour)
-      ragged   lengths drawn uniformly in [0.3, 1.7] x mean -- generic imbalance
-      bimodal  alternating short (0.35x) and long (1.65x) -- the serving mix of
-               short prompts interleaved with long ones
-      skew_last same as skew, but the long sequence is last in the batch
-      skew     one sequence holds ~half the tokens, the rest share the remainder.
-               Worst case for static CTA->sequence assignment: with 1 CTA/CU the
-               makespan is set by that one sequence while the others finish early.
-    """
+    """Per-sequence token counts for ``pattern``, summing exactly to ``T_flat``."""
     if N <= 1:
         return [T_flat]
     if pattern == "equal":
@@ -341,10 +331,6 @@ def _make_seqlens(pattern: str, T_flat: int, N: int, BT: int = 64) -> list[int]:
     if pattern == "skew":
         weights = [float(N - 1)] + [1.0] * (N - 1)
     elif pattern == "skew_last":
-        # Same distribution as "skew" but the long sequence is last. Dispatch
-        # order is linear in the block id and sequence i_n owns a contiguous
-        # range, so this decides whether the long sequence's CTAs land in the
-        # first scheduling round or are deferred behind the short ones.
         weights = [1.0] * (N - 1) + [float(N - 1)]
     elif pattern == "bimodal":
         weights = [0.35 if i % 2 == 0 else 1.65 for i in range(N)]
@@ -375,16 +361,8 @@ def _shape_label(idx: int, shape: tuple) -> str:
             f"gate={gate}{varlen}")
 
 
-# --------------------------------------------------------------------------- #
-# Input tensor construction
-# --------------------------------------------------------------------------- #
 def _make_inputs(shape: tuple, device="cuda"):
-    """Build all K5 input tensors for the given shape tuple.
-
-    ``N`` is the number of variable-length sequences packed into the flat
-    ``T_flat`` token axis. When ``N > 1`` a ``cu_seqlens`` of ``N`` equal-length
-    sequences is built and the varlen path is exercised (matching the pytest
-    fixture); the SSM state ``h0`` is ``[N, H, V, K]`` (one state per sequence).
+    """Build K5 input tensors for the given shape tuple.
 
     Returns:
         k, w_hm, u_hm, w_tm, g, gk, initial_state, cu_seqlens
@@ -396,9 +374,9 @@ def _make_inputs(shape: tuple, device="cuda"):
     dtype = torch.bfloat16
 
     k    = torch.randn(B, T_flat, Hg, K, dtype=dtype, device=device) * 0.1
-    w_tm = torch.randn(B, T_flat, H,  K, dtype=dtype, device=device) * 0.1  # token-major
+    w_tm = torch.randn(B, T_flat, H,  K, dtype=dtype, device=device) * 0.1
     u_tm = torch.randn(B, T_flat, H,  V, dtype=dtype, device=device) * 0.1
-    w_hm = w_tm.permute(0, 2, 1, 3).contiguous()  # head-major for kernel
+    w_hm = w_tm.permute(0, 2, 1, 3).contiguous()
     u_hm = u_tm.permute(0, 2, 1, 3).contiguous()
 
     g, gk = None, None
@@ -411,7 +389,6 @@ def _make_inputs(shape: tuple, device="cuda"):
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
 
-    # cu_seqlens: split T_flat across N sequences per ``seq_pattern``.
     if N > 1:
         lens = _make_seqlens(seq_pattern, T_flat, N, BT)
         bounds = [0]
@@ -426,22 +403,165 @@ def _make_inputs(shape: tuple, device="cuda"):
 
 
 # --------------------------------------------------------------------------- #
-# Implementation registry
+# HIP graph-capture machinery  (shared by both subcommands)
 # --------------------------------------------------------------------------- #
-_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
+# Maps id(cu_seqlens tensor) -> reusable GatedDeltaRulePrefillMetadata, built
+# once per shape BEFORE warmup/capture so neither the HIP adapter nor the
+# Triton K6 call does a device-to-host read inside the graph-captured closure.
+_hip_meta_cache: dict = {}
 
-# FlyDSL kernel variants get one row each, keyed ``flydsl:<tag>``. The K5 kernel's
-# only compile-time tuning axis is BV (the V-tile width) -- BT=64 is fixed by the
-# K1-K3 pipeline -- so the tags are ``bv16``/``bv32``/``bv64`` plus the special
-# ``auto``, which defers to the kernel's shape-adaptive heuristic per shape.
+
+class _CaptureSafeMeta:
+    """Thin proxy over ``GatedDeltaRulePrefillMetadata`` that no-ops ``validate``.
+
+    The production metadata's ``validate()`` raises unconditionally while a HIP/
+    CUDA graph is capturing. Everything else the HIP wrapper and Triton K6 touch
+    on the metadata (``get_chunk_schedule``) is capture-safe. The bench validates
+    the metadata once before capture, so the in-capture no-op is sound.
+    """
+
+    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
+                 num_sequences):
+        self._meta = meta
+        meta.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            num_decodes=0,
+            num_decode_tokens=0,
+            total_prefill_tokens=total_prefill_tokens,
+            num_sequences=num_sequences,
+        )
+
+    def validate(self, *args, **kwargs):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._meta, name)
+
+
+def _adapt_hip(hip_fn):
+    """Wrap the HIP K5 wrapper so it accepts the same call shape as FlyDSL/Triton.
+
+    Reshapes the 2-D ``g`` tensor from ``[H, T_flat]`` to ``[1, H, T_flat]``
+    and sets ``g_head_major=True``. Looks up reusable prefill metadata from
+    ``_hip_meta_cache`` so graph capture doesn't trigger a device-to-host read.
+    """
+    @functools.wraps(hip_fn)
+    def _wrapped(*, k, w, u, g=None, gk=None, cu_seqlens=None, **kwargs):
+        g_hip = g.unsqueeze(0) if (g is not None and g.dim() == 2) else g
+        prefill_metadata = _hip_meta_cache.get(
+            id(cu_seqlens) if cu_seqlens is not None else None
+        )
+        return hip_fn(
+            k=k, w=w, u=u, g=g_hip, gk=gk,
+            cu_seqlens=cu_seqlens, g_head_major=True,
+            prefill_metadata=prefill_metadata,
+            **kwargs,
+        )
+    return _wrapped
+
+
+def _build_hip_meta(cu, T_flat, BT):
+    """Build and cache a capture-safe prefill metadata object for the given cu."""
+    try:
+        from aiter.ops.prefill_batch_metadata import build_gated_delta_rule_prefill_metadata
+        bounds = cu.detach().to("cpu", torch.int64)
+        seq_lens = (bounds[1:] - bounds[:-1]).tolist()
+        meta = build_gated_delta_rule_prefill_metadata(
+            seq_lens, cu_seqlens=cu, chunk_size=BT,
+        )
+        _hip_meta_cache[id(cu)] = _CaptureSafeMeta(
+            meta, cu,
+            chunk_size=BT,
+            total_prefill_tokens=int(T_flat),
+            num_sequences=len(seq_lens),
+        )
+    except Exception as e:
+        warnings.warn(f"prefill metadata build failed: {e}")
+
+
+def _filter_shapes(shapes_all, gate_filter, shape_index, shape_range):
+    """Return (idx, shape) pairs for the requested subset."""
+    n = len(shapes_all)
+    if shape_index is not None:
+        if not (1 <= shape_index <= n):
+            print(f"--shape-index must be 1–{n}", file=sys.stderr)
+            sys.exit(1)
+        return [(shape_index, shapes_all[shape_index - 1])]
+    if shape_range is not None:
+        lo, hi = shape_range
+        if not (1 <= lo <= hi <= n):
+            print(f"--shape-range must satisfy 1 <= START <= END <= {n}", file=sys.stderr)
+            sys.exit(1)
+        return [(i, shapes_all[i - 1]) for i in range(lo, hi + 1)]
+    return [
+        (i + 1, s) for i, s in enumerate(shapes_all)
+        if gate_filter == "all" or s[8] == gate_filter
+    ]
+
+
+def _shape_range_type(s: str) -> tuple[int, int]:
+    """Parse ``START-END`` (1-based, inclusive) or a single ``N`` into (lo, hi)."""
+    parts = s.split("-")
+    try:
+        if len(parts) == 1:
+            v = int(parts[0])
+            return (v, v)
+        if len(parts) == 2:
+            return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(
+        f"--shape-range expects 'START-END' or 'N' (1-based); got {s!r}"
+    )
+
+
+def _add_shape_args(parser):
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument(
+        "--shape-index", type=int, default=None, metavar="N",
+        help="Run one preset shape by 1-based index (see --list).",
+    )
+    grp.add_argument(
+        "--shape-range", type=_shape_range_type, default=None, metavar="START-END",
+        help="Run a 1-based inclusive range of shapes, e.g. '5-8' or a single 'N'.",
+    )
+    grp.add_argument(
+        "--list", action="store_true",
+        help="List all preset shapes with indices and exit.",
+    )
+
+
+def _list_shapes():
+    print(f"{'#':>3}  {'label':<60}  gate")
+    print("-" * 75)
+    for i, s in enumerate(PRESET_SHAPES, 1):
+        model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern = s
+        sp = "" if seq_pattern == "equal" else f"  seqs={seq_pattern}"
+        label = f"{model_tag}  H={H} Hg={Hg} T={T_flat} N={N} K={K} V={V}{sp}"
+        print(f"{i:>3}  {label:<60}  {gate}")
+
+
+# =========================================================================== #
+# K5 subcommand
+# =========================================================================== #
+_K5_BENCH_TITLE = "GDN K5 inter-chunk state scan"
+
 FLYDSL_PREFIX = "flydsl:"
 AUTO_VARIANT = "auto"
 
 
-def _available_variants():
+def _calculate_tflops_k5(N, H, T_flat, K, V, time_us, BT=64, seq_lens=None):
+    """Total FLOPs for K5 = GEMM1 (w@h^T) + GEMM2 (k^T@v_new) = 4·BT·K·V per chunk."""
+    if time_us <= 0:
+        return float("nan")
+    lens = list(seq_lens) if seq_lens else [T_flat]
+    n_chunks = sum(-(-length // BT) for length in lens)
+    return 4 * H * n_chunks * BT * K * V / (time_us * 1e-6) / 1e12
+
+
+def _available_k5_variants():
     """``(tuple_of_tags, default_tag)``, or ``(None, None)`` if FlyDSL is absent."""
-    if _TRITON_ONLY:
-        return None, None
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             K5_DEFAULT_VARIANT,
@@ -453,40 +573,22 @@ def _available_variants():
 
 
 def _auto_variant_for_shape(shape, cu) -> str | None:
-    """The tag the heuristic picks for this shape, for display purposes.
-
-    Lets the table show ``flydsl:auto(bv64)`` instead of a bare ``auto``, so a
-    sweep records what actually ran. Returns None if it cannot be determined.
-    """
+    """The BV tag the K5 heuristic picks for this shape (for display)."""
     _tag, H, Hg, T_flat, N, _K, V, _BT, _gate, _pat = shape
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
-
-        return _auto_variant(
-            H=H,
-            Hg=Hg,
-            V=V,
-            T_flat=T_flat,
-            N=N,
-            is_varlen=cu is not None,
-            gate=_gate,
-        )
+        return _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
+                             is_varlen=cu is not None, gate=_gate)
     except Exception:
         return None
 
 
-def _load_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
-    """Return {impl_name: callable} for the requested set.
-
-    ``flydsl_variants`` is a list of variant tags (or the specials ``all`` /
-    ``auto``); each becomes its own ``flydsl:<tag>`` entry. Defaults to ``auto``,
-    which reproduces the historical single-row behaviour exactly.
-    """
+def _load_k5_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
     requested = {s.strip() for s in which.split(",")} if which != "all" else None
     if flydsl_variants is None:
         flydsl_variants = [AUTO_VARIANT]
 
-    def _want(name: str) -> bool:
+    def _want(name):
         return requested is None or name in requested
 
     impls: dict = {}
@@ -500,25 +602,22 @@ def _load_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
         except ImportError as e:
             warnings.warn(f"Triton K5 not available: {e}")
 
-    if _want("flydsl") and not _TRITON_ONLY:
+    if _want("flydsl"):
         try:
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_flydsl,
             )
-            available, _default = _available_variants()
+            available, _default = _available_k5_variants()
             tags = list(flydsl_variants)
             if tags == ["all"]:
                 tags = list(available or ())
             for tag in tags:
                 if tag == AUTO_VARIANT:
-                    # variant=None -> the kernel's own shape-adaptive selection.
-                    impls[FLYDSL_PREFIX + AUTO_VARIANT] = (
-                        chunk_gated_delta_rule_fwd_h_flydsl
-                    )
+                    impls[FLYDSL_PREFIX + AUTO_VARIANT] = chunk_gated_delta_rule_fwd_h_flydsl
                     continue
                 if available is not None and tag not in available:
                     raise SystemExit(
-                        f"[error] unknown FlyDSL variant {tag!r}; available: "
+                        f"[error] unknown FlyDSL K5 variant {tag!r}; available: "
                         f"{list(available)} (or {AUTO_VARIANT!r})."
                     )
                 impls[FLYDSL_PREFIX + tag] = functools.partial(
@@ -527,8 +626,7 @@ def _load_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
         except ImportError as e:
             warnings.warn(f"FlyDSL K5 not available: {e}")
 
-    # HIP is available on both gfx942 and gfx950 (disabled only on gfx12).
-    if _want("hip") and not _TRITON_ONLY:
+    if _want("hip"):
         try:
             from aiter.ops.chunk_gated_delta_rule_fwd_h import (
                 chunk_gated_delta_rule_fwd_h_hip_fn,
@@ -540,116 +638,21 @@ def _load_impls(which: str, flydsl_variants: list[str] | None = None) -> dict:
     return impls
 
 
-def _adapt_hip(hip_fn):
-    """Wrap the HIP K5 wrapper so it accepts the same call shape as flydsl/triton.
-
-    The bench closures call every impl uniformly as
-    ``fn(k=, w=, u=, g=, gk=, initial_state=, output_final_state=,
-        save_new_value=, cu_seqlens=, use_exp2=)`` with ``g`` in the FlyDSL/Triton
-    2-D head-major ``[H, T_flat]`` layout. The production HIP wrapper
-    (``chunk_gated_delta_rule_fwd_h_hip_fn``) instead requires a **3-D** ``g``
-    (``[B, H, T]`` head-major or ``[B, T, H]`` token-major) and a ``g_head_major``
-    flag. This adapter reshapes ``g`` to ``[1, H, T_flat]`` and sets
-    ``g_head_major=True`` so the HIP kernel can be benchmarked without editing any
-    production code. ``gk`` (``[T_flat, H, K]``) already matches HIP's expected
-    layout and is forwarded unchanged.
-
-    Graph capture: the HIP wrapper otherwise (a) does a device-to-host read of the
-    chunk schedule during launch and (b) *builds* the prefill metadata inside the
-    call -- both illegal under CUDA-graph capture ("operation not permitted when
-    stream is capturing" / "GDR metadata cannot be built during ... capture"). The
-    fix is to build a reusable ``GatedDeltaRulePrefillMetadata`` ONCE before capture
-    (in ``_run_one``) and pass it as ``prefill_metadata=``; the captured call then
-    only reuses it. The metadata is looked up here by ``cu_seqlens`` tensor identity
-    (no device sync). With no ``cu_seqlens`` (single sequence) there is no schedule
-    to build, so nothing extra is needed.
-    """
-    import functools
-
-    @functools.wraps(hip_fn)
-    def _wrapped(*, k, w, u, g=None, gk=None, cu_seqlens=None, **kwargs):
-        g_hip = g
-        if g is not None:
-            # [H, T_flat] -> [1, H, T_flat] (batch=1, head-major).
-            g_hip = g.unsqueeze(0) if g.dim() == 2 else g
-        prefill_metadata = _hip_meta_cache.get(
-            id(cu_seqlens) if cu_seqlens is not None else None
-        )
-        return hip_fn(
-            k=k,
-            w=w,
-            u=u,
-            g=g_hip,
-            gk=gk,
-            cu_seqlens=cu_seqlens,
-            g_head_major=True,
-            prefill_metadata=prefill_metadata,
-            **kwargs,
-        )
-
-    return _wrapped
+def _make_k5_closure(fn, k, w_hm, u_hm, g, gk, h0, cu):
+    def _run():
+        fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
+           initial_state=h0, output_final_state=True, save_new_value=True,
+           cu_seqlens=cu, use_exp2=_USE_EXP2)
+    return _run
 
 
-# Maps id(cu_seqlens tensor) -> reusable GatedDeltaRulePrefillMetadata, built once
-# per shape in _run_one BEFORE warmup/capture so the HIP adapter never builds
-# metadata (or does a device-to-host read) inside the timed / graph-captured
-# closure.
-_hip_meta_cache: dict = {}
+_k5_ref_fn = None
 
 
-class _CaptureSafeMeta:
-    """Thin proxy over ``GatedDeltaRulePrefillMetadata`` that no-ops ``validate``.
-
-    The production metadata's ``validate()`` raises unconditionally while a HIP/
-    CUDA graph is capturing ("Typed prefill metadata cannot be used during ...
-    capture"). Everything else the HIP wrapper touches on the metadata
-    (``get_chunk_schedule`` -> returns precomputed on-device tensors) is
-    capture-safe. The bench validates the metadata ONCE before capture (below),
-    so skipping the redundant in-capture ``validate`` is sound and lets the HIP
-    kernel be graph-captured. This is a benchmark-only shim; it does not alter any
-    production code path (the real wrapper still runs identically outside capture).
-    """
-
-    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
-                 num_sequences):
-        self._meta = meta
-        # One-time, pre-capture validation using the real implementation
-        # (keyword-only signature; see GatedDeltaRulePrefillMetadata.validate).
-        meta.validate(
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            num_decodes=0,
-            num_decode_tokens=0,
-            total_prefill_tokens=total_prefill_tokens,
-            num_sequences=num_sequences,
-        )
-
-    def validate(self, *args, **kwargs):
-        return None  # already validated pre-capture
-
-    def __getattr__(self, name):
-        return getattr(self._meta, name)
-
-
-# --------------------------------------------------------------------------- #
-# Reference (same as the unit test suite)
-# --------------------------------------------------------------------------- #
-_ref_fn = None   # loaded lazily on first use
-
-
-def _load_ref():
-    """Load ``ref_chunk_gated_delta_rule_fwd_h`` from the unit test module.
-
-    Import via the package path (``importlib.import_module``) rather than
-    ``spec_from_file_location``: the test module has top-level
-    ``pytest.skip(..., allow_module_level=True)`` guards that only trip inside a
-    pytest session, so a normal import resolves the reference cleanly. Falls back
-    to file-loading if the package import is unavailable (e.g. run from a tree
-    where ``op_tests`` is not importable).
-    """
-    global _ref_fn
-    if _ref_fn is not None:
-        return _ref_fn
+def _load_k5_ref():
+    global _k5_ref_fn
+    if _k5_ref_fn is not None:
+        return _k5_ref_fn
     try:
         mod = importlib.import_module(
             "op_tests.flydsl_tests.test_flydsl_linear_attention_prefill"
@@ -662,55 +665,12 @@ def _load_ref():
         spec = importlib.util.spec_from_file_location("_test_prefill", test_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-    _ref_fn = mod.ref_chunk_gated_delta_rule_fwd_h
-    return _ref_fn
+    _k5_ref_fn = mod.ref_chunk_gated_delta_rule_fwd_h
+    return _k5_ref_fn
 
 
-# --------------------------------------------------------------------------- #
-# TFLOPS
-# --------------------------------------------------------------------------- #
-def calculate_tflops(
-    N: int, H: int, T_flat: int, K: int, V: int, time_us: float, BT: int = 64,
-    seq_lens: list[int] | None = None,
-) -> float:
-    """Total FLOPs for K5 = GEMM1 (w @ h^T) + GEMM2 (k^T @ v_new).
-
-    Both GEMMs cost 2·BT·K·V per chunk per head, so 4·BT·K·V for the pair.
-
-    ``T_flat`` is the TOTAL token count across all ``N`` sequences -- they are
-    packed into a single flat token axis by ``_make_inputs`` (every tensor is
-    ``[B=1, T_flat, ...]`` and ``cu_seqlens`` merely splits that axis).
-
-    Chunks are counted per sequence with ceil(), because the kernel pads each
-    sequence's final chunk out to BT and issues the full BT-wide MFMA work for
-    it. That matches what the hardware actually executes: this formula
-    reproduces SQ_INSTS_MFMA x 8192 exactly on the preset shapes.
-
-    ``seq_lens`` MUST be the actual per-sequence lengths -- with a ragged batch
-    the ceil() padding differs from the equal-split assumption, so deriving them
-    from T_flat//N here would misreport the ragged shapes.
-    """
-    if time_us <= 0:
-        return float("nan")
-    lens = list(seq_lens) if seq_lens else [T_flat]
-    n_chunks = sum(-(-length // BT) for length in lens)
-    return 4 * H * n_chunks * BT * K * V / (time_us * 1e-6) / 1e12
-
-
-# --------------------------------------------------------------------------- #
-# Per-shape timing
-# --------------------------------------------------------------------------- #
-def _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu):
-    def _run():
-        fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
-           initial_state=h0, output_final_state=True, save_new_value=True,
-           cu_seqlens=cu, use_exp2=_USE_EXP2)
-    return _run
-
-
-def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification: str,
-                 baseline_fn=None) -> str:
-    """Run correctness check. Returns a grade string."""
+def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
+                    baseline_fn=None) -> str:
     if verification == "none":
         return "N/A"
     try:
@@ -726,8 +686,7 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification: str,
 
     if verification == "reference":
         try:
-            ref = _load_ref()
-            # Reference expects token-major w; accepts exactly one of g/gk.
+            ref = _load_k5_ref()
             h_ref, _, _ = ref(k=k, w=w_tm, u=u_hm.permute(0, 2, 1, 3),
                                g=g, gk=gk, initial_state=h0,
                                output_final_state=True, cu_seqlens=cu)
@@ -750,13 +709,9 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification: str,
     return "N/A"
 
 
-def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> dict:
-    """Time and verify all impls for one shape."""
+def _run_one_k5(idx, impls, shape, args, cfg: MeasureConfig) -> dict:
     model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode, seq_pattern = shape
-    # actual per-sequence lengths: the ragged patterns pad a different
-    # number of tail chunks than an equal split would, so TFLOPs must use
-    # these rather than re-deriving T_flat//N.
-    _seq_lens_of_shape = _make_seqlens(seq_pattern, T_flat, N, BT)
+    seq_lens = _make_seqlens(seq_pattern, T_flat, N, BT)
     label = _shape_label(idx, shape)
 
     try:
@@ -764,41 +719,16 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
     except Exception as e:
         return {"label": label, "error": str(e)}
 
-    # Build reusable HIP prefill metadata ONCE (before any warmup/capture) so the
-    # HIP adapter never builds metadata or does a device-to-host read inside the
-    # timed / graph-captured closure. Only needed for the varlen (N>1) path and
-    # only when HIP is among the impls.
     if cu is not None and "hip" in impls:
-        try:
-            from aiter.ops.prefill_batch_metadata import (
-                build_gated_delta_rule_prefill_metadata,
-            )
-            _bounds = cu.detach().to("cpu", torch.int64)
-            _seq_lens = (_bounds[1:] - _bounds[:-1]).tolist()
-            _meta = build_gated_delta_rule_prefill_metadata(
-                _seq_lens, cu_seqlens=cu, chunk_size=BT,
-            )
-            _hip_meta_cache[id(cu)] = _CaptureSafeMeta(
-                _meta, cu,
-                chunk_size=BT,
-                total_prefill_tokens=int(T_flat),
-                num_sequences=len(_seq_lens),
-            )
-        except Exception as e:
-            warnings.warn(f"HIP prefill metadata build failed: {e}")
+        _build_hip_meta(cu, T_flat, BT)
 
     modes = ["eager", "graph"] if args.mode == "all" else [args.mode]
     baseline_name = args.baseline
     baseline_fn = impls.get(baseline_name)
-
-    baseline_times: dict[str, float] = {}
+    baseline_times: dict = {}
     results_by_impl: dict = {}
 
-    # Report the auto row under the concrete variant the heuristic picked for
-    # THIS shape -- i.e. "flydsl:bv32", exactly the label an explicit
-    # --flydsl-variants run produces, so rows are directly comparable across
-    # runs. Keys may differ per shape; both output tables iterate row["impls"]
-    # per row, so that is fine.
+    # Relabel the auto row to show the concrete variant chosen for this shape.
     auto_key = FLYDSL_PREFIX + AUTO_VARIANT
     auto_label = None
     if auto_key in impls:
@@ -806,23 +736,20 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
         if resolved:
             auto_label = FLYDSL_PREFIX + resolved
             if auto_label in impls:
-                # The same variant was ALSO requested explicitly; it is the same
-                # kernel, so drop the duplicate rather than benchmark it twice
-                # (and rather than let one row silently overwrite the other).
                 print(f"  [skip] {auto_key} resolves to {auto_label}, already requested")
-                impls = {k: v for k, v in impls.items() if k != auto_key}
+                impls = {k2: v for k2, v in impls.items() if k2 != auto_key}
 
     for impl_name, fn in impls.items():
         if impl_name == auto_key and auto_label:
             impl_name = auto_label
         print(f"  {impl_name}...", end=" ", flush=True)
-        closure = _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu)
+        closure = _make_k5_closure(fn, k, w_hm, u_hm, g, gk, h0, cu)
 
         try:
             closure()
             torch.cuda.synchronize()
         except NotImplementedError as e:
-            print(f"NOT_IMPL")
+            print("NOT_IMPL")
             results_by_impl[impl_name] = {"error": f"NOT_IMPL: {e}"}
             continue
         except Exception as e:
@@ -836,8 +763,8 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
             try:
                 stats = _time_measure(closure, mode, cfg)
                 timing[mode] = stats
-                tflops_d[mode] = calculate_tflops(
-                    N, H, T_flat, K, V, stats.median_us, BT, seq_lens=_seq_lens_of_shape
+                tflops_d[mode] = _calculate_tflops_k5(
+                    N, H, T_flat, K, V, stats.median_us, BT, seq_lens=seq_lens
                 )
             except EmptyGraphCaptureError as e:
                 timing[mode] = f"GRAPH-FAIL: {e}"
@@ -848,7 +775,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
 
         verify_str = "N/A"
         if args.verification != "none":
-            verify_str = _verify_impl(
+            verify_str = _verify_k5_impl(
                 fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu,
                 verification=args.verification,
                 baseline_fn=baseline_fn if impl_name != baseline_name else None,
@@ -864,7 +791,6 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
                 if hasattr(t, "median_us"):
                     baseline_times[mode] = t.median_us
 
-        # Console summary line
         for mode in modes:
             t = timing.get(mode)
             tf = tflops_d.get(mode)
@@ -879,185 +805,570 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
         print(f"  verify={verify_str}")
 
     return {
-        "label": label,
-        "shape": shape,
-        "impls": results_by_impl,
-        "baseline_times": baseline_times,
-        "baseline_name": baseline_name,
-        "modes": modes,
-        "N": N, "H": H, "T_flat": T_flat, "K": K, "V": V,
+        "label": label, "shape": shape, "impls": results_by_impl,
+        "baseline_times": baseline_times, "baseline_name": baseline_name,
+        "modes": modes, "N": N, "H": H, "T_flat": T_flat, "K": K, "V": V,
     }
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def run(args):
-    impls = _load_impls(args.impl, getattr(args, "flydsl_variants", None))
+def run_k5(args):
+    impls = _load_k5_impls(args.impl, getattr(args, "flydsl_variants", None))
     if not impls:
-        print("No implementations available.", file=sys.stderr)
+        print("No K5 implementations available.", file=sys.stderr)
         sys.exit(1)
-
     if args.baseline not in impls:
         warnings.warn(
             f"Baseline '{args.baseline}' not in loaded impls {list(impls)}; "
             "speedup columns will be empty."
         )
-
     cfg = make_measure_config(args)
-
-    n_shapes = len(PRESET_SHAPES)
-    if args.shape_index is not None:
-        idx = args.shape_index
-        if not (1 <= idx <= n_shapes):
-            print(f"--shape-index must be 1–{n_shapes}", file=sys.stderr)
-            sys.exit(1)
-        shapes_to_run = [(idx, PRESET_SHAPES[idx - 1])]
-    elif getattr(args, "shape_range", None) is not None:
-        lo, hi = args.shape_range
-        if not (1 <= lo <= hi <= n_shapes):
-            print(
-                f"--shape-range must satisfy 1 <= START <= END <= {n_shapes}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        shapes_to_run = [(i, PRESET_SHAPES[i - 1]) for i in range(lo, hi + 1)]
-    else:
-        gate_filter = getattr(args, "gate", "all")
-        shapes_to_run = [
-            (i + 1, s) for i, s in enumerate(PRESET_SHAPES)
-            if gate_filter == "all" or s[-1] == gate_filter
-        ]
-
-    all_rows: list[dict] = []
+    shapes_to_run = _filter_shapes(
+        PRESET_SHAPES, args.gate, args.shape_index, getattr(args, "shape_range", None)
+    )
+    all_rows = []
     for idx, shape in shapes_to_run:
         print(f"\n{'='*60}\n{_shape_label(idx, shape)}\n{'='*60}")
-        row = _run_one(idx, impls, shape, args, cfg)
+        row = _run_one_k5(idx, impls, shape, args, cfg)
         print_result_table(row)
         all_rows.append(row)
 
     if args.output:
         env = collect_env_info()
         write_bench_markdown(
-            args.output, _BENCH_TITLE, all_rows, env,
+            args.output, _K5_BENCH_TITLE, all_rows, env,
             baseline_name=args.baseline,
         )
         print(f"\nMarkdown report written to {args.output}")
-
         try:
             results = parse_bench_md(args.output)
             stem = Path(args.output).stem
             out_dir = Path(args.output).parent
             png_path = str(out_dir / f"{stem}-plot.png")
             modes_plot = ["eager", "graph"] if args.mode == "all" else [args.mode]
-            make_bar_chart(results, png_path, title=_BENCH_TITLE,
+            make_bar_chart(results, png_path, title=_K5_BENCH_TITLE,
                            mode=modes_plot[0], baseline_label=category_label(args.baseline))
             summary_md = str(out_dir / f"{stem}-summary.md")
             make_summary_md(results, summary_md, png_path, args.output,
-                            title=_BENCH_TITLE, mode=modes_plot[0],
+                            title=_K5_BENCH_TITLE, mode=modes_plot[0],
                             baseline_label=category_label(args.baseline))
         except Exception as e:
             warnings.warn(f"Plot/summary generation failed: {e}")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="A/B benchmark: GDN K5 inter-chunk state scan (SILOTIGER-859)."
-    )
+# =========================================================================== #
+# K5+K6 subcommand
+# =========================================================================== #
+_K5K6_BENCH_TITLE = "GDN K5+K6 fused forward"
 
-    def _shape_range(s: str) -> tuple[int, int]:
-        """Parse ``START-END`` (1-based, inclusive) or a single ``N`` into (lo, hi)."""
-        parts = s.split("-")
-        try:
-            if len(parts) == 1:
-                v = int(parts[0]); return (v, v)
-            if len(parts) == 2:
-                return (int(parts[0]), int(parts[1]))
-        except ValueError:
-            pass
-        raise argparse.ArgumentTypeError(
-            f"--shape-range expects 'START-END' or 'N' (1-based); got {s!r}"
+FUSED_PREFIX = "K5K6_flydsl_fused"
+COMBINED_KEY = "K5K6_combined"
+FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8", "bv64w16")
+
+_K5K6_IMPL_KEYS = (
+    "K5_triton+K6_triton",
+    "K5_hip+K6_triton",
+    "K5_flydsl+K6_triton",
+    FUSED_PREFIX,
+    COMBINED_KEY,
+)
+
+
+def _calculate_tflops_k5k6(N, H, T_flat, K, V, time_us, BT=64, seq_lens=None):
+    """Total FLOPs = K5 + K6 per chunk per head."""
+    if time_us <= 0:
+        return float("nan")
+    lens = list(seq_lens) if seq_lens else [T_flat]
+    n_chunks = sum(-(-length // BT) for length in lens)
+    per_chunk = (
+        4 * K * V        # K5: GEMM1 (w@h) + GEMM2 (k^T@v_new)
+        + 2 * K * V      # K6 GEMM3: q@h
+        + 2 * BT * K     # K6 GEMM4a: q@k^T
+        + 2 * BT * V     # K6 GEMM4b: A@v_new
+    )
+    return H * n_chunks * BT * per_chunk / (time_us * 1e-6) / 1e12
+
+
+def _fused_auto_variant_for_shape(shape, cu) -> str | None:
+    """The BV tag the fused kernel's auto selection picks for this shape."""
+    _tag, H, Hg, T_flat, N, _K, V, _BT, gate, _pat = shape
+    try:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import _fused_bv_for_shape
+        bv, num_waves = _fused_bv_for_shape(
+            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
+            is_varlen=cu is not None, gate=gate, variant=None,
         )
+        return f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
+    except Exception:
+        return None
 
-    shape_grp = parser.add_mutually_exclusive_group()
-    shape_grp.add_argument(
-        "--shape-index", type=int, default=None, metavar="N",
-        help="Run one preset shape by 1-based index (see --list).",
-    )
-    shape_grp.add_argument(
-        "--shape-range", type=_shape_range, default=None, metavar="START-END",
-        help="Run a 1-based inclusive range of preset shapes, e.g. '96-103' "
-             "(or a single 'N'). Useful for benchmarking only newly-added shapes.",
-    )
-    shape_grp.add_argument(
-        "--list", action="store_true",
-        help="List all preset shapes with indices and exit.",
-    )
 
-    parser.add_argument(
+def _combined_dispatch_label_for_shape(shape, cu) -> str | None:
+    """Show whether the combined wrapper would pick fused or separate for this shape."""
+    _tag, H, Hg, T_flat, N, _K, V, _BT, gate, _pat = shape
+    try:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            should_use_fused_gfx942,
+            _fused_bv_for_shape,
+            _auto_variant,
+        )
+        n = (cu.shape[0] - 1) if cu is not None else 1
+        if should_use_fused_gfx942(H=H, N=n, V=V):
+            bv, num_waves = _fused_bv_for_shape(
+                H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
+                is_varlen=cu is not None, gate=gate, variant=None,
+            )
+            tag = f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
+            return f"fused:{tag}"
+        else:
+            tag = _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
+                                is_varlen=cu is not None, gate=gate)
+            return f"separate:{tag}"
+    except Exception:
+        return None
+
+
+def _make_q(shape, device="cuda"):
+    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode, seq_pattern = shape
+    return torch.randn(1, T_flat, Hg, K, dtype=torch.bfloat16, device=device) * 0.1
+
+
+def _separate_runner(k5_fn, k6_fn):
+    """Closure running a separate K5 then Triton K6, returning o."""
+    def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
+        meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
+        h, v_new, _ = k5_fn(
+            k=k, w=w, u=u, g=g, gk=gk, initial_state=h0,
+            output_final_state=True, save_new_value=True,
+            cu_seqlens=cu, use_exp2=_USE_EXP2,
+        )
+        k6_fn(
+            q=q, k=k, v=v_new, o=o, h=h, g=g, scale=scale,
+            cu_seqlens=cu, use_exp2=_USE_EXP2, prefill_metadata=meta,
+        )
+        return o
+    return _run
+
+
+def _make_fused_runner(fused_fn, variant):
+    """Closure running the fused K5+K6 kernel with a fixed variant (or None for auto)."""
+    def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
+        meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
+        fused_fn(
+            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
+            initial_state=h0, output_final_state=True,
+            cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
+            prefill_metadata=meta, variant=variant,
+        )
+        return o
+    return _run
+
+
+def _make_combined_runner(combined_fn):
+    """Closure running the auto-dispatch combined wrapper."""
+    def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
+        meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
+        combined_fn(
+            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
+            initial_state=h0, output_final_state=True,
+            cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
+            prefill_metadata=meta,
+        )
+        return o
+    return _run
+
+
+def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dict:
+    requested = {s.strip() for s in which.split(",")} if which != "all" else None
+    if fused_variants is None:
+        fused_variants = [AUTO_VARIANT]
+
+    def _want(name):
+        return requested is None or name in requested
+
+    impls: dict = {}
+
+    k6_triton = None
+    try:
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+            chunk_fwd_o_opt_vk,
+        )
+        k6_triton = chunk_fwd_o_opt_vk
+    except ImportError as e:
+        warnings.warn(f"Triton K6 not available: {e}")
+
+    if _want("K5_triton+K6_triton") and k6_triton is not None:
+        try:
+            from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+                chunk_gated_delta_rule_fwd_h_opt_vk,
+            )
+            impls["K5_triton+K6_triton"] = _separate_runner(
+                chunk_gated_delta_rule_fwd_h_opt_vk, k6_triton
+            )
+        except ImportError as e:
+            warnings.warn(f"Triton K5 not available: {e}")
+
+    if _want("K5_hip+K6_triton") and k6_triton is not None:
+        try:
+            from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+                chunk_gated_delta_rule_fwd_h_hip_fn,
+            )
+            impls["K5_hip+K6_triton"] = _separate_runner(
+                _adapt_hip(chunk_gated_delta_rule_fwd_h_hip_fn), k6_triton
+            )
+        except ImportError as e:
+            warnings.warn(f"HIP K5 not available: {e}")
+
+    if _want("K5_flydsl+K6_triton") and k6_triton is not None:
+        try:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                chunk_gated_delta_rule_fwd_h_flydsl,
+            )
+            impls["K5_flydsl+K6_triton"] = _separate_runner(
+                chunk_gated_delta_rule_fwd_h_flydsl, k6_triton
+            )
+        except ImportError as e:
+            warnings.warn(f"FlyDSL K5 not available: {e}")
+
+    if _want(FUSED_PREFIX):
+        try:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                chunk_gated_delta_rule_fwd_h_o_flydsl,
+            )
+            tags = list(fused_variants)
+            if tags == ["all"]:
+                tags = list(FUSED_VARIANTS)
+            for tag in tags:
+                if tag == AUTO_VARIANT:
+                    impls[FUSED_PREFIX] = _make_fused_runner(
+                        chunk_gated_delta_rule_fwd_h_o_flydsl, None
+                    )
+                    continue
+                if tag not in FUSED_VARIANTS:
+                    raise SystemExit(
+                        f"[error] unknown fused variant {tag!r}; available: "
+                        f"{list(FUSED_VARIANTS)} (or {AUTO_VARIANT!r})."
+                    )
+                impls[f"{FUSED_PREFIX}:{tag}"] = _make_fused_runner(
+                    chunk_gated_delta_rule_fwd_h_o_flydsl, tag
+                )
+        except ImportError as e:
+            warnings.warn(f"FlyDSL fused K5+K6 not available: {e}")
+
+    if _want(COMBINED_KEY):
+        try:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                chunk_gated_delta_rule_fwd_h_o_auto,
+            )
+            impls[COMBINED_KEY] = _make_combined_runner(chunk_gated_delta_rule_fwd_h_o_auto)
+        except ImportError as e:
+            warnings.warn(f"FlyDSL combined K5+K6 not available: {e}")
+
+    return impls
+
+
+def _make_k5k6_closure(fn, q, k, w_hm, u_hm, g, gk, h0, cu, scale, o):
+    def _run():
+        fn(q=q, k=k, w=w_hm, u=u_hm, g=g, gk=gk, h0=h0, cu=cu, scale=scale, o=o)
+    return _run
+
+
+def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
+    model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode, seq_pattern = shape
+    seq_lens = _make_seqlens(seq_pattern, T_flat, N, BT)
+    label = _shape_label(idx, shape)
+
+    try:
+        k, w_hm, u_hm, w_tm, g, gk, h0, cu = _make_inputs(shape)
+        q = _make_q(shape)
+    except Exception as e:
+        return {"label": label, "error": str(e)}
+
+    scale = K ** -0.5
+    o = u_hm.new_empty(1, T_flat, H, V)
+
+    if cu is not None:
+        _build_hip_meta(cu, T_flat, BT)
+
+    modes = ["eager", "graph"] if args.mode == "all" else [args.mode]
+    baseline_name = args.baseline
+    baseline_times: dict = {}
+    results_by_impl: dict = {}
+    o_ref = None
+
+    # Per-shape display labels for auto-selected impls.
+    fused_auto_display = None
+    if FUSED_PREFIX in impls:
+        resolved = _fused_auto_variant_for_shape(shape, cu)
+        if resolved:
+            fused_auto_display = f"{FUSED_PREFIX} ({resolved})"
+
+    combined_display = None
+    if COMBINED_KEY in impls:
+        resolved = _combined_dispatch_label_for_shape(shape, cu)
+        if resolved:
+            combined_display = f"{COMBINED_KEY} ({resolved})"
+
+    for impl_name, fn in impls.items():
+        if impl_name == FUSED_PREFIX and fused_auto_display:
+            display_name = fused_auto_display
+        elif impl_name == COMBINED_KEY and combined_display:
+            display_name = combined_display
+        else:
+            display_name = impl_name
+
+        print(f"  {display_name}...", end=" ", flush=True)
+        closure = _make_k5k6_closure(fn, q, k, w_hm, u_hm, g, gk, h0, cu, scale, o)
+
+        try:
+            closure()
+            torch.cuda.synchronize()
+        except NotImplementedError as e:
+            print("NOT_IMPL")
+            results_by_impl[display_name] = {"error": f"NOT_IMPL: {e}"}
+            continue
+        except Exception as e:
+            print(f"PROBE-FAIL: {e}")
+            results_by_impl[display_name] = {"error": str(e)}
+            continue
+
+        verify_str = "N/A"
+        if args.verification != "none":
+            o_now = o.detach().clone()
+            if o_ref is None:
+                o_ref = o_now
+                verify_str = "REF"
+            else:
+                diff = (o_now.float() - o_ref.float()).pow(2).mean().sqrt()
+                denom = o_ref.float().pow(2).mean().sqrt() + 1e-8
+                ratio = (diff / denom).item()
+                verify_str = f"{'PASS' if ratio < 5e-2 else 'FAIL'}(rmse={ratio:.2e})"
+
+        timing: dict = {}
+        tflops_d: dict = {}
+        for mode in modes:
+            try:
+                stats = _time_measure(closure, mode, cfg)
+                timing[mode] = stats
+                tflops_d[mode] = _calculate_tflops_k5k6(
+                    N, H, T_flat, K, V, stats.median_us, BT, seq_lens=seq_lens
+                )
+            except EmptyGraphCaptureError as e:
+                timing[mode] = f"GRAPH-FAIL: {e}"
+                tflops_d[mode] = None
+            except Exception as e:
+                timing[mode] = f"ERROR: {e}"
+                tflops_d[mode] = None
+
+        results_by_impl[display_name] = {
+            "timing": timing, "tflops": tflops_d, "verify": verify_str,
+        }
+        if impl_name == baseline_name:
+            for mode in modes:
+                t = timing.get(mode)
+                if hasattr(t, "median_us"):
+                    baseline_times[mode] = t.median_us
+
+        for mode in modes:
+            t = timing.get(mode)
+            tf = tflops_d.get(mode)
+            if hasattr(t, "median_us"):
+                base = baseline_times.get(mode)
+                sp = (f"  ×{base / t.median_us:.2f}"
+                      if (base and impl_name != baseline_name and t.median_us > 0) else "")
+                tf_s = f"{tf:.3f}" if tf is not None else "—"
+                print(f"[{mode}] {t.median_us:.1f} us  {tf_s} TFLOPs{sp}", end="  ")
+            else:
+                print(f"[{mode}] {t}", end="  ")
+        print(f"  verify={verify_str}")
+
+    return {
+        "label": label, "shape": shape, "impls": results_by_impl,
+        "baseline_times": baseline_times, "baseline_name": baseline_name,
+        "modes": modes, "N": N, "H": H, "T_flat": T_flat, "K": K, "V": V,
+    }
+
+
+def run_k5k6(args):
+    impls = _load_k5k6_impls(args.impl, getattr(args, "fused_variants", None))
+    if not impls:
+        print("No K5+K6 implementations available.", file=sys.stderr)
+        sys.exit(1)
+    if args.baseline not in impls:
+        warnings.warn(
+            f"Baseline '{args.baseline}' not in loaded impls {list(impls)}; "
+            "speedup columns will be empty."
+        )
+    cfg = make_measure_config(args)
+    shapes_to_run = _filter_shapes(
+        PRESET_SHAPES, args.gate, args.shape_index, getattr(args, "shape_range", None)
+    )
+    all_rows = []
+    for idx, shape in shapes_to_run:
+        print(f"\n{'='*60}\n{_shape_label(idx, shape)}\n{'='*60}")
+        row = _run_one_k5k6(idx, impls, shape, args, cfg)
+        print_result_table(row)
+        all_rows.append(row)
+
+    if args.output:
+        env = collect_env_info()
+        write_bench_markdown(
+            args.output, _K5K6_BENCH_TITLE, all_rows, env,
+            baseline_name=args.baseline,
+        )
+        print(f"\nMarkdown report written to {args.output}")
+        modes_out = ["eager", "graph"] if args.mode == "all" else [args.mode]
+        plot_mode = "graph" if "graph" in modes_out else modes_out[0]
+        try:
+            results = parse_bench_md(args.output)
+            png = str(Path(args.output).with_suffix("")) + "-fill-scatter.png"
+            make_fill_scatter(
+                results, png,
+                title=f"{_K5K6_BENCH_TITLE}: speedup vs grid fill ({plot_mode})",
+                mode=plot_mode,
+            )
+        except Exception as e:
+            warnings.warn(f"fill-scatter generation failed: {e}")
+
+
+# =========================================================================== #
+# Argument parsers
+# =========================================================================== #
+def _build_k5_parser(sub):
+    p = sub.add_parser(
+        "k5",
+        help="Benchmark K5 (inter-chunk state scan) in isolation.",
+        description="A/B benchmark: GDN K5 inter-chunk state scan.",
+    )
+    _add_shape_args(p)
+    p.add_argument(
         "--impl", default="all", metavar="IMPLS",
-        help="Comma-separated implementations: triton, flydsl, hip. Default: all.",
+        help="Comma-separated: triton, flydsl, hip. Default: all.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--baseline", default="triton", choices=("triton", "hip"),
-        help="Implementation used as speedup baseline (default: triton).",
+        help="Speedup baseline (default: triton).",
     )
-    parser.add_argument(
+    p.add_argument(
         "--flydsl-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
         help=(
-            "Comma-separated FlyDSL kernel-variant tags to benchmark, each as its "
-            "own row (see --list-variants). 'all' runs every registered variant; "
-            "'auto' (default) defers to the kernel's shape-adaptive selection, "
-            "picking one variant per shape."
+            "Comma-separated FlyDSL K5 variant tags: bv16, bv32, bv64, bv64w8, … "
+            "'all' runs every registered variant; 'auto' (default) uses the "
+            "shape-adaptive heuristic."
         ),
     )
-    parser.add_argument(
+    p.add_argument(
         "--list-variants", action="store_true",
-        help="List the registered FlyDSL kernel variants and exit.",
+        help="List the registered FlyDSL K5 variants and exit.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--gate", default="all", choices=("g", "gk", "all"),
         help="Filter shapes by gate type: g (GDN), gk (KDA), all (default).",
     )
+    add_timing_args(p)
+    add_output_args(p)
+    add_verification_args(p)
+    return p
 
-    add_timing_args(parser)
-    add_output_args(parser)
-    add_verification_args(parser)
 
-    args = parser.parse_args()
+def _build_k5k6_parser(sub):
+    p = sub.add_parser(
+        "k5k6",
+        help="Benchmark K5+K6 (state scan + output), fused vs separate.",
+        description="A/B benchmark: GDN K5+K6 fused forward.",
+    )
+    _add_shape_args(p)
+    p.add_argument(
+        "--impl", default="all", metavar="IMPLS",
+        help=(
+            f"Comma-separated impls: {', '.join(_K5K6_IMPL_KEYS)}. "
+            "Default: all. "
+            f"'{COMBINED_KEY}' is the heuristic-driven combined wrapper."
+        ),
+    )
+    p.add_argument(
+        "--baseline", default="K5_flydsl+K6_triton",
+        choices=_K5K6_IMPL_KEYS,
+        help="Speedup baseline (default: K5_flydsl+K6_triton).",
+    )
+    p.add_argument(
+        "--fused-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
+        help=(
+            "Comma-separated fused-kernel BV variant tags (bv16, bv32, bv64, bv64w8, …). "
+            "'all' runs every variant; 'auto' (default) uses shape-adaptive selection. "
+            f"Applies only to '{FUSED_PREFIX}'; the separate and combined paths are not "
+            "variant-parametrized."
+        ),
+    )
+    p.add_argument(
+        "--list-fused-variants", action="store_true",
+        help="List the fused-kernel BV variants and exit.",
+    )
+    p.add_argument(
+        "--gate", default="all", choices=("g", "gk", "all"),
+        help="Filter shapes by gate type.",
+    )
+    add_timing_args(p)
+    add_output_args(p)
+    add_verification_args(p)
+    return p
 
-    if args.list_variants:
-        avail, default = _available_variants()
-        if avail is None:
-            print("FlyDSL is unavailable; no variants to list.")
-        else:
-            print("FlyDSL GDN K5 kernel variants (BV = V-tile width):")
-            for v in avail:
-                print(f"    {v}")
-            print(
-                f"  {'*' if default == AUTO_VARIANT else ' '} {AUTO_VARIANT}"
-                "  (shape-adaptive: picks a variant per shape via _heuristic_bv)"
-            )
-        return
 
-    # Resolve the requested FlyDSL variants (comma list). Validation against what
-    # is actually registered happens in _load_impls, so a --impl triton run still
-    # works when FlyDSL is unavailable.
-    args.flydsl_variants = [
-        v.strip() for v in args.flydsl_variants.split(",") if v.strip()
-    ] or [AUTO_VARIANT]
+def main():
+    top = argparse.ArgumentParser(
+        description="Unified GDN K5 / K5+K6 benchmark.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = top.add_subparsers(dest="bench_mode", required=True,
+                             title="subcommands",
+                             description="Choose which benchmark to run.")
+    _build_k5_parser(sub)
+    _build_k5k6_parser(sub)
 
-    if args.list:
-        print(f"{'#':>3}  {'label':<60}  gate")
-        print("-" * 75)
-        for i, s in enumerate(PRESET_SHAPES, 1):
-            model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern = s
-            _sp = "" if seq_pattern == "equal" else f"  seqs={seq_pattern}"
-            label = f"{model_tag}  H={H} Hg={Hg} T={T_flat} N={N} K={K} V={V}{_sp}"
-            print(f"{i:>3}  {label:<60}  {gate}")
-        return
+    args = top.parse_args()
 
-    run(args)
+    if args.bench_mode == "k5":
+        if args.list_variants:
+            avail, default = _available_k5_variants()
+            if avail is None:
+                print("FlyDSL is unavailable; no K5 variants to list.")
+            else:
+                print("FlyDSL GDN K5 kernel variants (BV = V-tile width):")
+                for v in avail:
+                    print(f"    {v}")
+                print(
+                    f"  {'*' if default == AUTO_VARIANT else ' '} {AUTO_VARIANT}"
+                    "  (shape-adaptive)"
+                )
+            return
+
+        args.flydsl_variants = [
+            v.strip() for v in args.flydsl_variants.split(",") if v.strip()
+        ] or [AUTO_VARIANT]
+
+        if args.list:
+            _list_shapes()
+            return
+
+        run_k5(args)
+
+    else:  # k5k6
+        if args.list_fused_variants:
+            print("Fused GDN K5+K6 kernel BV variants:")
+            for v in FUSED_VARIANTS:
+                note = "  (aliases lds_A onto lds_h to fit LDS)" if v == "bv64" else ""
+                print(f"    {v}{note}")
+            print(f"  * {AUTO_VARIANT}  (shape-adaptive)")
+            return
+
+        args.fused_variants = [
+            v.strip() for v in args.fused_variants.split(",") if v.strip()
+        ] or [AUTO_VARIANT]
+
+        if args.list:
+            _list_shapes()
+            return
+
+        run_k5k6(args)
 
 
 if __name__ == "__main__":

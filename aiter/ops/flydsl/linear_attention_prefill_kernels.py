@@ -67,6 +67,7 @@ __all__ = [
     "K5K6Fusion",
     "chunk_gated_delta_rule_fwd_h_flydsl",
     "chunk_gated_delta_rule_fwd_h_o_flydsl",
+    "chunk_gated_delta_rule_fwd_h_o_auto",
     "should_use_fused_gfx942",
 ]
 
@@ -1029,3 +1030,86 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
         num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
         variant=variant,
     )
+
+
+def chunk_gated_delta_rule_fwd_h_o_auto(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    prefill_metadata=None,
+    variant: str | None = None,
+    o: torch.Tensor | None = None,
+    fusion=None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Combined K5+K6 wrapper that applies the fused-vs-separate heuristic.
+
+    Routes to ``chunk_gated_delta_rule_fwd_h_o_flydsl`` (fused, gfx942 only)
+    when ``should_use_fused_gfx942`` returns True, otherwise falls back to
+    FlyDSL K5 + Triton K6 run sequentially.
+
+    Args:
+        fusion: ``K5K6Fusion`` enum value (or string / None). None / AUTO lets
+            the shape heuristic decide. ALWAYS forces the fused path; NEVER
+            forces the separate path. On non-gfx942 archs, AUTO and NEVER both
+            use the separate path (fused is gfx942-only).
+        All other args: same as ``chunk_gated_delta_rule_fwd_h_o_flydsl``.
+
+    Returns:
+        (o, final_state) as ``chunk_gated_delta_rule_fwd_h_o_flydsl``.
+    """
+    resolved_fusion = K5K6Fusion.coerce(fusion)
+    H = w.shape[1]
+    V = u.shape[-1]
+    N = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else q.shape[0]
+
+    use_fused = (
+        resolved_fusion == K5K6Fusion.ALWAYS
+        or (resolved_fusion == K5K6Fusion.AUTO and should_use_fused_gfx942(H=H, N=N, V=V))
+    )
+
+    if use_fused:
+        return chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
+            initial_state=initial_state, output_final_state=output_final_state,
+            chunk_size=chunk_size, cu_seqlens=cu_seqlens, state_dtype=state_dtype,
+            use_exp2=use_exp2, num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
+            variant=variant, o=o,
+        )
+
+    # Separate path: FlyDSL K5 + Triton K6.
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+        k=k, w=w, u=u, g=g, gk=gk, initial_state=initial_state,
+        output_final_state=output_final_state, chunk_size=chunk_size,
+        save_new_value=True, cu_seqlens=cu_seqlens, state_dtype=state_dtype,
+        use_exp2=use_exp2, num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens, prefill_metadata=prefill_metadata,
+        variant=variant,
+    )
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if o is None:
+        B, T = q.shape[:2]
+        o = u.new_empty(B, T, H, V)
+    from ..triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+        chunk_fwd_o_opt_vk,
+    )
+    chunk_fwd_o_opt_vk(
+        q=q, k=k, v=v_new, o=o, h=h, g=g, scale=scale,
+        cu_seqlens=cu_seqlens, use_exp2=use_exp2,
+        num_decodes=num_decodes, num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
+    )
+    return o, final_state
