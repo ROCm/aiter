@@ -434,12 +434,40 @@ DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 # B, and they stay in anyway: a b_preshuffled=True caller has no row-major kernel
 # to fall back to, and each row already names the fastest preshuffled kid the
 # entry can dispatch (re-swept over the whole pool at re-drawn placements). Two of
-# them are twin-vs-twin, which is what makes them worth recording rather than
-# re-tuning: g16/m128/k4096 is kid326 against kid230 (+11%) and g16/m256/k4096 is
-# kid325 against kid229 (+14%) -- same tile, same sfpreload, only B's layout and
-# its LDS hop differ, so that is what preshuffling costs at the 128-wide tiles
-# rather than a tuning miss. The other two are g2/m512/k1024 (+6.4%) and
-# g2/m1024/k1024 (+4.2%), where the row-major side is the heuristic, not a row.
+# them are twin-vs-twin -- g16/m128/k4096 is kid326 against kid230 (+11%) and
+# g16/m256/k4096 is kid325 against kid229 (+14%) -- and neither is a cost of the
+# layout. Those two kids compile to identical VGPR/AGPR/LDS with no spill, and the
+# preshuffled one issues fewer instructions with the same 210 ds_read / 86
+# buffer_load / 288 MFMA, so they move the same bytes doing the same work. Run as
+# a pair across a g x m grid at both K they are a wash on 39 of 40 cells; the
+# exception is the cell where the grid is exactly one occupancy wave (256
+# workgroups on 256 CUs), where all workgroups march through K in phase and the
+# memory pipe is already at its deepest queue. Profiled, the two are identical on
+# every volume counter (L2 requests, hit rate, EA read requests all within 0.1%)
+# and both spread perfectly evenly over the 128 memory channels, so it is not
+# camping; the preshuffled side even takes 3x fewer tag stalls. It holds the
+# channels 14% longer (TCC_BUSY), and that is the only counter that tracks the
+# gap -- the +11-15% EA read latency it also carries is present at 2 and 4 waves
+# too, where preshuffle wins anyway. Thread trace puts the extra wave-time on
+# s_barrier and takes it off the B loads, i.e. the consumers wait longer at the
+# rendezvous for B to reach LDS, and shows workgroup durations spreading 13%
+# across CUs inside one dispatch -- at one wave the kernel is the max of that
+# spread, so a 1-3% shift in it is a 4-6% kernel. What the counters cannot see is
+# the L2 set index: 16 channels x 128 B means it advances per 2 KiB and wraps at
+# 256 KiB, so the 64 KiB panel stride puts the tile's 8 chunks on 4 sets, and the
+# n-tile and batch strides are whole multiples of the wrap so every workgroup
+# picks the same 4. Padding stride_b (a kargs field taken from wo_a.stride(1), so
+# no kernel change) to 72 KiB takes the cell from 0.87x to 0.98x and does nothing
+# at the strides and wave counts that were already fine; across a wider pad sweep
+# every stride landing on 8 sets runs 0.98-1.00x and every one landing on <=4 runs
+# 0.87-0.94x. This is the stride and not the shuffle -- the shuffle only multiplies
+# B's stride by 16 (K -> 16*K, four bits out of the set index), and forcing a
+# 16 KiB row stride on the row-major baseline costs it 20%, more than preshuffle
+# ever loses. Not shipped: 12.5% of weight memory for one cell. split_k>1 breaks
+# the lockstep but costs more than it saves.
+#
+# The other two are g2/m512/k1024 (+6.4%) and g2/m1024/k1024 (+4.2%), where the
+# row-major side is the heuristic, not a row.
 #
 # g2/m32768/k4096 was a fifth at +2.4%, and was not a layout cost at all: kid196
 # (kid158's own pipeline reading a preshuffled B) and kid205 both land within 1%
