@@ -1,0 +1,276 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search &mdash; AITER 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+    
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <script src="_static/searchtools.js"></script>
+    <script src="_static/language_data.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="#" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            AITER
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="#" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#system-requirements">System Requirements</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#software-dependencies">Software Dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#method-1-from-pypi-recommended">Method 1: From PyPI (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#method-2-from-source">Method 2: From Source</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#basic-installation">Basic Installation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#development-mode-jit">Development Mode (JIT)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#precompiled-installation">Precompiled Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#example-configurations">Example Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#method-3-docker">Method 3: Docker</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verifying-installation">Verifying Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#optional-triton-communication-support">Optional: Triton Communication Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#rocm-not-found">ROCm Not Found</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#compilation-errors">Compilation Errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#import-errors">Import Errors</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#verify-installation">Verify Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#first-example-flash-attention">First Example: Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#variable-length-sequences">Variable-Length Sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#common-issues">Common Issues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#get-help">Get Help</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="tutorials/index.html">Tutorials</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/basic_usage.html">Basic Usage</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#installation-check">Installation Check</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#hello-world-flash-attention">Hello World: Flash Attention</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/basic_usage.html#understanding-the-parameters">Understanding the Parameters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/basic_usage.html#comparing-with-pytorch">Comparing with PyTorch</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#working-with-different-precisions">Working with Different Precisions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#rmsnorm-example">RMSNorm Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#batched-operations">Batched Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#error-handling">Error Handling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#memory-management">Memory Management</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#common-gotchas">Common Gotchas</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/add_new_op.html">How to Add a New Operator</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-1-define-the-operator-interface">Step 1: Define the Operator Interface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-2-implement-the-rocm-kernel">Step 2: Implement the ROCm Kernel</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-3-create-python-bindings">Step 3: Create Python Bindings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-4-update-build-configuration">Step 4: Update Build Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-5-add-tests">Step 5: Add Tests</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-6-build-and-install">Step 6: Build and Install</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-7-register-in-main-module">Step 7: Register in Main Module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#advanced-optimizations">Advanced: Optimizations</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#use-ck-composable-kernel-for-better-performance">Use CK (Composable Kernel) for Better Performance</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#use-triton-for-easier-kernel-development">Use Triton for Easier Kernel Development</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#common-patterns">Common Patterns</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-1-fused-operations">Pattern 1: Fused Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-2-in-place-operations">Pattern 2: In-Place Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-3-autograd-support">Pattern 3: Autograd Support</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#best-practices">Best Practices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#debugging-tips">Debugging Tips</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#print-kernel-launches">Print Kernel Launches</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#check-for-memory-errors">Check for Memory Errors</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#profile-your-operator">Profile Your Operator</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#example-complete-rmsnorm-implementation">Example: Complete RMSNorm Implementation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#contributing">Contributing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#tutorial-overview">Tutorial Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#basic-tutorials">Basic Tutorials</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#advanced-topics">Advanced Topics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#integration-guides">Integration Guides</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#example-data">Example Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#jupyter-notebooks">Jupyter Notebooks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#running-examples">Running Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#community-examples">Community Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#contributing-tutorials">Contributing Tutorials</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/attention.html">Attention Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#flash-attention">Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#flash-attention-with-kv-cache">Flash Attention with KV Cache</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#grouped-query-attention-gqa">Grouped Query Attention (GQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#multi-query-attention-mqa">Multi-Query Attention (MQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#variable-sequence-attention">Variable Sequence Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#supported-architectures">Supported Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/gemm.html">GEMM Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#grouped-gemm">Grouped GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#batched-gemm">Batched GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#fused-gemm-operations">Fused GEMM Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-bias">GEMM + Bias</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-gelu">GEMM + GELU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-relu">GEMM + ReLU</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#cutlass-style-gemm">CUTLASS-style GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#sparse-gemm">Sparse GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#int8-quantized-gemm">INT8 Quantized GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#optimization-tips">Optimization Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#example-optimal-moe-forward-pass">Example: Optimal MoE Forward Pass</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/operators.html">Core Operators</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#layernorm">LayerNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#softmax">SoftMax</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#gelu">GELU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#swiglu">SwiGLU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#rotary-position-embedding-rope">Rotary Position Embedding (RoPE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#sampling-operations">Sampling Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/operators.html#top-k-sampling">Top-K Sampling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/operators.html#top-p-nucleus-sampling">Top-P (Nucleus) Sampling</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#performance-notes">Performance Notes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#supported-data-types">Supported Data Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">AITER</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Search</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <noscript>
+  <div id="fallback" class="admonition warning">
+    <p class="last">
+      Please activate JavaScript to enable the search functionality.
+    </p>
+  </div>
+  </noscript>
+
+  
+  <div id="search-results">
+  
+  </div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>
+  <script>
+    jQuery(function() { Search.loadIndex("searchindex.js"); });
+  </script>
+  
+  <script id="searchindexloader"></script>
+   
+
+
+</body>
+</html>
