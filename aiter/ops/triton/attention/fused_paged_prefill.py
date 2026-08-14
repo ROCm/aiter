@@ -254,10 +254,12 @@ def is_supported(
 ):
     """Return (supported, reason). Callers MUST gate on this before dispatching.
 
-    This is deliberately exhaustive over every argument of
-    `aiter.ops.mha.mha_batch_prefill_func` that changes what the op computes, so that
-    adding an argument there and forgetting it here fails closed rather than open.
-    Arguments the CK-tile path itself ignores (`deterministic`) are not listed.
+    This covers every argument of `aiter.ops.mha.mha_batch_prefill_func` that changes
+    what the op computes, as of that function's current signature. Arguments the
+    CK-tile path itself ignores (`deterministic`) are not listed. Note that the caller
+    names these explicitly, so an argument added to that function later will not reach
+    this predicate: it has to be added here in the same change, or calls using it will
+    be dispatched with it silently ignored.
 
     Most conditions describe a feature this kernel does not implement, and getting
     one wrong would be loud. The four that would be SILENT are:
