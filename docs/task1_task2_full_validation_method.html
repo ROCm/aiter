@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OPUS Task1 / Task2 全量测试与性能验证方法</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #596579;
+      --line: #d9e0ea;
+      --panel: #ffffff;
+      --page: #f4f7fb;
+      --blue: #1d5fd1;
+      --blue-soft: #eaf2ff;
+      --green: #19724b;
+      --green-soft: #e8f7ef;
+      --amber: #9b5b00;
+      --amber-soft: #fff5df;
+      --red: #a73333;
+      --red-soft: #fff0f0;
+      --violet: #6d3bb7;
+      --violet-soft: #f3ecff;
+      --shadow: 0 10px 28px rgba(24, 40, 72, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 15px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { width: min(1220px, calc(100% - 32px)); margin: 28px auto 56px; }
+    header, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+      padding: 28px 32px;
+    }
+    header {
+      color: #fff;
+      border: 0;
+      background:
+        radial-gradient(circle at 88% 15%, rgba(255,255,255,.18), transparent 28%),
+        linear-gradient(135deg, #173b73, #245fa8 58%, #3874b8);
+    }
+    h1 { margin: 0 0 8px; font-size: clamp(26px, 4vw, 40px); line-height: 1.2; }
+    h2 { margin: 0 0 18px; font-size: 24px; line-height: 1.3; }
+    h3 { margin: 24px 0 10px; font-size: 18px; }
+    h4 { margin: 18px 0 8px; font-size: 16px; }
+    p { margin: 8px 0 14px; }
+    a { color: var(--blue); }
+    header a { color: #fff; }
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #eef2f7;
+      color: #17365f;
+      font: 0.92em ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    header code { background: rgba(255,255,255,.16); color: #fff; }
+    pre {
+      margin: 12px 0 18px;
+      padding: 15px 17px;
+      overflow-x: auto;
+      border: 1px solid #293a52;
+      border-radius: 10px;
+      background: #101827;
+      color: #e7edf7;
+      line-height: 1.55;
+      tab-size: 2;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; white-space: pre; }
+    .meta { margin: 0; color: rgba(255,255,255,.86); }
+    .status {
+      display: inline-block;
+      margin-top: 14px;
+      padding: 5px 10px;
+      border: 1px solid rgba(255,255,255,.45);
+      border-radius: 999px;
+      background: rgba(255,255,255,.12);
+      font-weight: 700;
+    }
+    .links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    .links a {
+      padding: 7px 11px;
+      border: 1px solid rgba(255,255,255,.4);
+      border-radius: 8px;
+      text-decoration: none;
+      background: rgba(255,255,255,.08);
+    }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .card {
+      border: 1px solid var(--line);
+      border-top: 5px solid var(--blue);
+      border-radius: 10px;
+      padding: 15px 17px;
+      background: #fbfdff;
+    }
+    .card.pass { border-top-color: var(--green); background: var(--green-soft); }
+    .card.blocked { border-top-color: var(--red); background: var(--red-soft); }
+    .card.method { border-top-color: var(--violet); background: var(--violet-soft); }
+    .card strong { display: block; margin-bottom: 4px; font-size: 16px; }
+    .note, .warning, .danger {
+      margin: 16px 0;
+      padding: 13px 16px;
+      border-radius: 9px;
+      border-left: 5px solid var(--blue);
+      background: var(--blue-soft);
+    }
+    .warning { border-left-color: var(--amber); background: var(--amber-soft); }
+    .danger { border-left-color: var(--red); background: var(--red-soft); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 800px; }
+    th, td { border: 1px solid var(--line); padding: 10px 12px; vertical-align: top; text-align: left; }
+    th { background: #edf2f8; }
+    tbody tr:nth-child(even) { background: #fafbfd; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .tag.runnable { background: var(--green-soft); color: var(--green); }
+    .tag.partial { background: var(--amber-soft); color: var(--amber); }
+    .tag.blocked { background: var(--red-soft); color: var(--red); }
+    .tag.info { background: var(--blue-soft); color: var(--blue); }
+    ol, ul { padding-left: 23px; }
+    li { margin: 7px 0; }
+    .gate {
+      display: grid;
+      grid-template-columns: 44px minmax(0, 1fr);
+      gap: 12px;
+      margin: 11px 0;
+      align-items: start;
+    }
+    .gate-num {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--blue);
+      font-weight: 800;
+    }
+    .formula {
+      padding: 12px 15px;
+      border: 1px dashed #9fb2cb;
+      border-radius: 9px;
+      background: #f8fbff;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-x: auto;
+    }
+    footer { color: var(--muted); text-align: center; padding: 8px; }
+    @media (max-width: 820px) {
+      main { width: min(100% - 18px, 1220px); margin-top: 10px; }
+      header, section { padding: 20px 16px; border-radius: 11px; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>OPUS Task1 / Task2 全量测试与性能验证方法</h1>
+    <p class="meta">适用代码：B 分支 <code>cf895074</code> · 文档基点：<code>810f9ebb</code> · 命令按当前测试脚本参数核对</p>
+    <span class="status">这是执行方法，不是已通过报告</span>
+    <nav class="links" aria-label="相关文档">
+      <a href="task1_task2_change_process.html">修改流程记录</a>
+      <a href="task1_modified_files.html">Task1 文件变化</a>
+      <a href="task2_modified_files.html">Task2 文件变化</a>
+      <a href="../aiter/ops/opus/README.md">Python 接口</a>
+      <a href="../csrc/opus_gemm/README.md">C++ / codegen</a>
+    </nav>
+  </header>
+
+  <section id="definition">
+    <h2>1. “全量通过”的定义</h2>
+    <p>
+      本文的“全量”限定为 <strong>Task1/Task2 影响到的 OPUS 接口、A16/A8 family、workspace、
+      exact-kid dispatch、Graph/stream 和性能</strong>，不表示整个 AITER 仓库所有算子都已执行。
+      全量结论必须依次通过以下门：
+    </p>
+    <div class="grid">
+      <article class="card"><strong>合同与生成门</strong>registry、接口、codegen、workspace 计划、subset compile、跨架构拒绝。</article>
+      <article class="card pass"><strong>目标 GPU 正确性门</strong>代表性 GPU 测试加该架构全部 canonical kid；目标架构不得 skip。</article>
+      <article class="card method"><strong>性能门</strong>同机、同环境、同输入、独立 JIT 端点，按 ABBA 顺序分层比较并先做数值断言。</article>
+    </div>
+    <div class="warning">
+      <strong>状态只能使用：</strong><code>PASS</code>、<code>FAIL</code>、<code>NOT RUN</code>、
+      <code>BLOCKED</code>。目标架构 skip、无空闲 GPU、缺历史端点或只做 CPU/codegen 检查都不能写成 PASS。
+    </div>
+  </section>
+
+  <section id="matrix">
+    <h2>2. 当前仓库可执行覆盖矩阵</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>架构</th><th>canonical A16 范围</th><th>A8 范围</th><th>当前全 kid runner</th><th>性能脚本</th><th>完整状态能力</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>gfx942</strong><br>MI300 / MI308</td>
+            <td>22：8 workspace + 14 direct</td>
+            <td>bpreshuffle kid 11000</td>
+            <td><code>test_opus_gfx942_exhaustive.py</code><br><code>test_opus_gfx942_gpu.py</code></td>
+            <td>两个 benchmark 均支持 <code>--arch gfx942</code></td>
+            <td><span class="tag runnable">可执行</span></td>
+          </tr>
+          <tr>
+            <td><strong>gfx950</strong><br>MI35x</td>
+            <td>140：48 workspace + 92 direct</td>
+            <td>kid 1、2；45 个 MXFP8 BMM id</td>
+            <td><code>test_opus_gfx950_exhaustive.py</code><br>BMM CLI / m_align guard</td>
+            <td>两个 benchmark 均支持 <code>--arch gfx950</code></td>
+            <td><span class="tag runnable">可执行</span></td>
+          </tr>
+          <tr>
+            <td><strong>gfx1250</strong></td>
+            <td>1874 workspace：496 two-stage + 1378 fused</td>
+            <td>OPUS A8 tables 当前为空</td>
+            <td>只有代表 kid、Graph、workspace/codegen 合同；没有 1874-kid GPU runner</td>
+            <td>两个现有 benchmark 都不接受 <code>gfx1250</code></td>
+            <td><span class="tag blocked">全量 BLOCKED</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      gfx1250 可以执行 focused suite 并形成“代表性实机通过”结论；在补齐动态 1874-kid shard runner
+      和 two-stage/fused 分层 benchmark 前，不得形成 gfx1250 全量或无性能回退结论。
+    </p>
+  </section>
+
+  <section id="preflight">
+    <h2>3. 每个目标 GPU 的隔离环境</h2>
+    <div class="danger">
+      性能开始前必须确认 GPU 空闲。不要终止不属于本次验证的进程；有其他计算进程、持续利用率或显存波动时，
+      记录 <code>BLOCKED</code> 并等待或换卡。
+    </div>
+    <p>每个架构使用一个新 shell，且在第一次 import Torch/AITER 前设置变量：</p>
+    <pre><code>set -euo pipefail
+
+export OPUS_VALIDATION_ROOT="$(git rev-parse --show-toplevel)"
+export OPUS_VALIDATION_ARCH=gfx942       # gfx942 / gfx950 / gfx1250
+export OPUS_GPU_SLOT=0
+export OPUS_CPU_CORE=0
+export HIP_VISIBLE_DEVICES="$OPUS_GPU_SLOT"
+export GPU_ARCHS="$OPUS_VALIDATION_ARCH"
+
+export OPUS_RUN_DIR
+OPUS_RUN_DIR="$(mktemp -d "/tmp/opus-task12-$OPUS_VALIDATION_ARCH.XXXXXX")"
+export AITER_JIT_DIR="$OPUS_RUN_DIR/jit-current"
+export OPUS_LOG_DIR="$OPUS_RUN_DIR/logs"
+mkdir -p "$AITER_JIT_DIR/build" "$OPUS_LOG_DIR"
+cd "$OPUS_VALIDATION_ROOT"
+
+git rev-parse HEAD | tee "$OPUS_LOG_DIR/git_head.txt"
+git status --short | tee "$OPUS_LOG_DIR/git_status.txt"
+git diff --check | tee "$OPUS_LOG_DIR/git_diff_check.txt"
+python3 --version 2&gt;&amp;1 | tee "$OPUS_LOG_DIR/python_version.txt"
+/opt/rocm/bin/hipcc --version 2&gt;&amp;1 | tee "$OPUS_LOG_DIR/hipcc_version.txt"
+/opt/rocm/bin/rocm-smi --showproductname --showuse --showmemuse --showpids \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/gpu_before.txt"</code></pre>
+
+    <h3>3.1 断言真实运行架构</h3>
+    <pre><code>python3 - &lt;&lt;'PY' | tee "$OPUS_LOG_DIR/runtime_arch.txt"
+import os
+import torch
+
+assert torch.cuda.is_available(), "ROCm GPU is not visible"
+props = torch.cuda.get_device_properties(0)
+actual = str(getattr(props, "gcnArchName", "")).split(":", 1)[0].lower()
+expected = os.environ["OPUS_VALIDATION_ARCH"].lower()
+print(f"device={props.name}")
+print(f"gcnArchName={getattr(props, 'gcnArchName', None)}")
+print(f"cu={props.multi_processor_count}")
+print(f"torch={torch.__version__}")
+print(f"torch.version.hip={torch.version.hip}")
+assert actual == expected, (actual, expected)
+PY</code></pre>
+  </section>
+
+  <section id="build">
+    <h2>4. 一次 fresh build，随后固定同一模块</h2>
+    <p>
+      exhaustive runner 必须使用包含当前架构全部 canonical A16 kid 的模块。先生成 sidecar，再用
+      <code>AITER_REBUILD=1</code> 单进程构建一次；回归和性能阶段统一使用 <code>AITER_REBUILD=0</code>。
+    </p>
+    <pre><code>python3 - &lt;&lt;'PY'
+import json
+import os
+from pathlib import Path
+
+from csrc.opus_gemm.opus_gemm_common import get_kernel_instance, kernels_list
+
+arch = os.environ["OPUS_VALIDATION_ARCH"]
+kids = sorted(
+    int(kid)
+    for kid, instance in kernels_list.items()
+    if get_kernel_instance(arch, "a16w16", int(kid)) is instance
+)
+build = Path(os.environ["AITER_JIT_DIR"]) / "build"
+build.mkdir(parents=True, exist_ok=True)
+sidecar = build / "compiled_kids_opus.json"
+sidecar.write_text(json.dumps(kids) + "\n", encoding="utf-8")
+print(f"arch={arch} a16_kids={len(kids)} sidecar={sidecar}")
+PY
+
+AITER_REBUILD=1 python3 - &lt;&lt;'PY' \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/fresh_build.log"
+import hashlib
+import pathlib
+
+from aiter.jit.core import get_module
+
+module = get_module("module_deepgemm_opus")
+path = pathlib.Path(module.__file__).resolve()
+print(f"module={path}")
+print(f"sha256={hashlib.sha256(path.read_bytes()).hexdigest()}")
+PY
+
+export AITER_REBUILD=0</code></pre>
+    <ul>
+      <li>期望 sidecar A16 数量：gfx942 = 22、gfx950 = 140、gfx1250 = 1874。</li>
+      <li>gfx950 的 A8 mandatory kids 和 45 个 MXFP8 BMM route 由生成器的 family 规则并入，不用伪装成 A16 sidecar 条目。</li>
+      <li>构建失败后保留日志，换一个新的 <code>AITER_JIT_DIR</code> 重试；不要在失败目录并行重建。</li>
+    </ul>
+  </section>
+
+  <section id="focused">
+    <h2>5. 所有架构先跑 focused / ABI / codegen 门</h2>
+    <pre><code>set -o pipefail
+python3 -m pytest -q -rs \
+  op_tests/test_opus_interfaces.py \
+  op_tests/test_opus_dispatch.py \
+  op_tests/test_opus_workspace.py \
+  op_tests/test_opus_graph.py \
+  op_tests/test_opus_ctypes.py \
+  op_tests/test_opus_a16w16_gemm.py \
+  op_tests/test_gemm_codegen.py \
+  op_tests/tuning_tests/test_config_shape_collision.py \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/focused_pytest.log"
+
+./op_tests/opus/run_tests.sh \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/opus_cpp_device.log"</code></pre>
+    <p>通过要求：</p>
+    <ul>
+      <li>两个命令退出码都为 0，<code>failed = 0</code>；所有 warning 保存并分类。</li>
+      <li>当前目标架构对应的测试不能 skip；其他架构、第二张 GPU 专属负例可以记录为预期 skip。</li>
+      <li>目标 GPU 的数值、workspace raw ABI、Graph、双 stream 和 bias 项必须实际执行。</li>
+      <li>CPU fixture、registry 数量和 full codegen 通过只证明静态合同，不代替目标 GPU all-kid sweep。</li>
+    </ul>
+  </section>
+
+  <section id="exhaustive">
+    <h2>6. 按架构执行全 kid 正确性</h2>
+
+    <h3>6.1 gfx942：22 个 A16 + A8 kid 11000</h3>
+    <pre><code>OPUS_GFX942_EXHAUSTIVE=1 \
+python3 -m pytest -q -s -rs \
+  op_tests/test_opus_gfx942_exhaustive.py \
+  op_tests/test_opus_gfx942_gpu.py \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/gfx942_exhaustive.log"</code></pre>
+    <ul>
+      <li>22/22 A16：8 workspace、14 direct；目标架构 skip = 0。</li>
+      <li>FP32-workspace kids 覆盖 BF16/FP32 Y；BF16-workspace kids 覆盖 BF16 Y，并明确拒绝不支持的 FP32 Y。</li>
+      <li>自动 workspace、caller reuse、释放、Graph、双 stream、kid 11000 raw/public/tuned 路径和负例均通过。</li>
+    </ul>
+
+    <h3>6.2 gfx950：140 个 A16，顺序执行四个 shard</h3>
+    <pre><code>for OPUS_SHARD_INDEX in 0 1 2 3; do
+  OPUS_GFX950_EXHAUSTIVE=1 \
+  OPUS_GFX950_SHARD_COUNT=4 \
+  OPUS_GFX950_SHARD_INDEX="$OPUS_SHARD_INDEX" \
+  python3 -m pytest -q -s -rs \
+    op_tests/test_opus_gfx950_exhaustive.py \
+    2&gt;&amp;1 | tee "$OPUS_LOG_DIR/gfx950_shard_$OPUS_SHARD_INDEX.log"
+done</code></pre>
+    <ul>
+      <li>四个 shard 合计 140/140：48 workspace、92 direct；不要把 shard 放到同一张卡并行计时。</li>
+      <li>每个声明支持的 Y dtype 对 Torch FP32 golden，通过 caller workspace 与自动分配合同。</li>
+    </ul>
+
+    <h3>6.3 gfx950 MXFP8 BMM</h3>
+    <pre><code>python3 op_tests/test_opus_a8w8_bmm.py \
+  -d bf16 fp32 -g 2 8 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/gfx950_bmm_shapes.log"
+
+python3 op_tests/test_opus_a8w8_bmm.py --check-m-align \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/gfx950_bmm_all_kids_m_align.log"</code></pre>
+    <p>
+      第一条覆盖 token-major/batch-major、tuned/public、workspace/Graph 和固定 tileN 回归；第二条逐个检查
+      45 个 BMM kid 的声明对齐与实际 launcher 行为。需要重新评价所有候选性能时，另用
+      <code>csrc/opus_gemm/opus_bmm_mxscale_tune.py</code>，不要用 shape sweep 代替 tuner。
+    </p>
+
+    <h3>6.4 gfx1250：当前缺口</h3>
+    <div class="danger">
+      当前没有 <code>test_opus_gfx1250_exhaustive.py</code>。focused suite 只能覆盖代表性 two-stage
+      kid 20000、workspace/Graph/bias 以及 fused 的静态计划/codegen；不能宣称 1874 个 GPU kernel 全量通过。
+    </div>
+    <p>补齐 runner 时必须从 registry 动态取 1874 个 kid，并至少做到：</p>
+    <ul>
+      <li>496 个 two-stage 与 1378 个 fused 数量不减少，按 ordinal 可重复分 shard。</li>
+      <li>每个 kid 按声明的 output/workspace dtype、tile、batch 和 compile-time split-K 生成合法 case。</li>
+      <li>caller workspace、自动 workspace、NaN poison、Torch golden、Graph replay 和无隐藏 Tensor 持有。</li>
+      <li>fused tile-major extent/counter 对齐、two-stage split-major extent、错误 dtype/容量/device 明确拒绝。</li>
+      <li>目标架构不匹配时 fail 或明确 NOT RUN；不能安静 skip 后签字。</li>
+    </ul>
+  </section>
+
+  <section id="performance-prep">
+    <h2>7. 性能比较必须准备三个可证明端点</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>端点</th><th>固定来源</th><th>用途</th><th>要求</th></tr></thead>
+        <tbody>
+          <tr><td>A0 原始基线</td><td><code>ca68b4f3</code></td><td>Task1 前：C++ internal workspace</td><td>独立 source/JIT，记录 module SHA-256</td></tr>
+          <tr><td>A1 Task1 frozen</td><td><code>2352c46c</code></td><td>Task1 完成、Task2 canonical family 收敛前</td><td>保留 B0 ABI；独立 source/JIT</td></tr>
+          <tr><td>B 当前</td><td>B 代码 <code>cf895074</code></td><td>Task1 + Task2 最终状态</td><td>当前 source/JIT；与正确性使用同一模块</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>建议变量：</p>
+    <pre><code>export OPUS_BASELINE_SRC=/absolute/path/to/ca68b4f3-worktree
+export OPUS_TASK1_SRC=/absolute/path/to/2352c46c-worktree
+export OPUS_CURRENT_SRC="$OPUS_VALIDATION_ROOT"
+
+export OPUS_BASELINE_JIT=/absolute/path/to/baseline-jit-for-this-arch
+export OPUS_TASK1_JIT=/absolute/path/to/task1-jit-for-this-arch
+export OPUS_CURRENT_JIT="$AITER_JIT_DIR"</code></pre>
+    <div class="warning">
+      三个端点必须在同一目标节点、同一 ROCm/PyTorch/编译器下构建，且 JIT 目录不能共用。缺少
+      <code>2352c46c</code> 对应模块时，Task2 历史性能结论是 <code>BLOCKED</code>，不能用当前模块猜测。
+    </div>
+  </section>
+
+  <section id="performance-run">
+    <h2>8. ABBA 性能执行方法</h2>
+    <p>统一口径：固定同一 CPU core；每 case warmup 20、9 rounds、每 round 100 次；每轮取 median。每次 endpoint 使用新进程。</p>
+
+    <h3>8.1 Task1：internal workspace 与 Torch workspace production path</h3>
+    <p>
+      <code>bench_opus_gfx950_workspace_ab.py</code> 同时支持 gfx942/gfx950。
+      B 端用 <code>ctypes</code> 测当前 production C ABI；再用 <code>current</code>（历史 pybind 标签）
+      作为相邻控制，区分 workspace 变化和 Python/C ABI 开销。
+    </p>
+    <pre><code>export OPUS_WORKSPACE_BENCH="$OPUS_CURRENT_SRC/op_tests/bench_opus_gfx950_workspace_ab.py"
+
+taskset -c "$OPUS_CPU_CORE" env \
+  OPUS_BENCH_SOURCE_ROOT="$OPUS_BASELINE_SRC" \
+  PYTHONPATH="$OPUS_BASELINE_SRC" \
+  AITER_JIT_DIR="$OPUS_BASELINE_JIT" AITER_REBUILD=0 \
+  python3 "$OPUS_WORKSPACE_BENCH" \
+    --arch "$OPUS_VALIDATION_ARCH" --endpoint baseline --pass-id A1 \
+    --warmup 20 --rounds 9 --iters 100 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/workspace_baseline_A1.log"
+
+for OPUS_PASS_ID in B1 B2; do
+  taskset -c "$OPUS_CPU_CORE" env \
+    OPUS_BENCH_SOURCE_ROOT="$OPUS_CURRENT_SRC" \
+    PYTHONPATH="$OPUS_CURRENT_SRC" \
+    AITER_JIT_DIR="$OPUS_CURRENT_JIT" AITER_REBUILD=0 \
+    python3 "$OPUS_WORKSPACE_BENCH" \
+      --arch "$OPUS_VALIDATION_ARCH" --endpoint ctypes \
+      --pass-id "$OPUS_PASS_ID" \
+      --warmup 20 --rounds 9 --iters 100 \
+    2&gt;&amp;1 | tee "$OPUS_LOG_DIR/workspace_current_$OPUS_PASS_ID.log"
+done
+
+taskset -c "$OPUS_CPU_CORE" env \
+  OPUS_BENCH_SOURCE_ROOT="$OPUS_BASELINE_SRC" \
+  PYTHONPATH="$OPUS_BASELINE_SRC" \
+  AITER_JIT_DIR="$OPUS_BASELINE_JIT" AITER_REBUILD=0 \
+  python3 "$OPUS_WORKSPACE_BENCH" \
+    --arch "$OPUS_VALIDATION_ARCH" --endpoint baseline --pass-id A2 \
+    --warmup 20 --rounds 9 --iters 100 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/workspace_baseline_A2.log"</code></pre>
+
+    <h3>8.2 Task1 frozen 与当前 Task2/public 分层</h3>
+    <p>
+      <code>bench_opus_task1_task2_interfaces.py</code> 支持 gfx942/gfx950，并在每个 timing case 后执行
+      数值断言。它分别报告 high-level/private、compile_ops raw、direct pybind/C++ 和 Graph replay。
+    </p>
+    <pre><code>export OPUS_INTERFACE_BENCH="$OPUS_CURRENT_SRC/op_tests/bench_opus_task1_task2_interfaces.py"
+
+taskset -c "$OPUS_CPU_CORE" env \
+  PYTHONPATH="$OPUS_CURRENT_SRC" \
+  AITER_JIT_DIR="$OPUS_TASK1_JIT" AITER_REBUILD=0 \
+  python3 "$OPUS_INTERFACE_BENCH" \
+    --arch "$OPUS_VALIDATION_ARCH" --endpoint task1 --pass-id A1 \
+    --warmup 20 --rounds 9 --iters 100 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/interface_task1_A1.log"
+
+for OPUS_PASS_ID in B1 B2; do
+  taskset -c "$OPUS_CPU_CORE" env \
+    PYTHONPATH="$OPUS_CURRENT_SRC" \
+    AITER_JIT_DIR="$OPUS_CURRENT_JIT" AITER_REBUILD=0 \
+    python3 "$OPUS_INTERFACE_BENCH" \
+      --arch "$OPUS_VALIDATION_ARCH" --endpoint current \
+      --pass-id "$OPUS_PASS_ID" \
+      --warmup 20 --rounds 9 --iters 100 \
+    2&gt;&amp;1 | tee "$OPUS_LOG_DIR/interface_current_$OPUS_PASS_ID.log"
+done
+
+taskset -c "$OPUS_CPU_CORE" env \
+  PYTHONPATH="$OPUS_CURRENT_SRC" \
+  AITER_JIT_DIR="$OPUS_TASK1_JIT" AITER_REBUILD=0 \
+  python3 "$OPUS_INTERFACE_BENCH" \
+    --arch "$OPUS_VALIDATION_ARCH" --endpoint task1 --pass-id A2 \
+    --warmup 20 --rounds 9 --iters 100 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/interface_task1_A2.log"</code></pre>
+
+    <h3>8.3 只测统一 public 路由增量</h3>
+    <p>
+      在同一个当前 JIT 上按 <code>task2 A1 → current B1 → current B2 → task2 A2</code> 运行。
+      <code>task2</code> 直接走当前 private family，<code>current</code> 增加统一
+      <code>opus_gemm</code> router；这样 kernel、kid、workspace 和 C++ module 完全相同。
+    </p>
+    <pre><code>set -o pipefail
+run_current_interface() {
+  OPUS_ENDPOINT="$1"
+  OPUS_PASS_ID="$2"
+  taskset -c "$OPUS_CPU_CORE" env \
+    PYTHONPATH="$OPUS_CURRENT_SRC" \
+    AITER_JIT_DIR="$OPUS_CURRENT_JIT" AITER_REBUILD=0 \
+    python3 "$OPUS_INTERFACE_BENCH" \
+      --arch "$OPUS_VALIDATION_ARCH" \
+      --endpoint "$OPUS_ENDPOINT" --pass-id "$OPUS_PASS_ID" \
+      --warmup 20 --rounds 9 --iters 100 \
+    2&gt;&amp;1 | tee "$OPUS_LOG_DIR/router-$OPUS_ENDPOINT-$OPUS_PASS_ID.log"
+}
+
+run_current_interface task2 A1
+run_current_interface current B1
+run_current_interface current B2
+run_current_interface task2 A2</code></pre>
+    <div class="note">
+      gfx1250 当前不在这两个 benchmark 的 <code>--arch</code> choices 中。没有新增 gfx1250
+      two-stage/fused 分层 case 前，禁止通过删除参数 guard 来运行 gfx942/gfx950 的固定 kid。
+    </div>
+
+    <h3>8.4 gfx950 MXFP8 BMM 性能</h3>
+    <p>
+      第 6.3 节的 shape sweep 会报告 kid 8000 与 tuned/public 路径的 us、TFLOPS、带宽和 error ratio。
+      若要评价各候选 kid/split-K，使用正式 tuner，并把输出写到临时 CSV：
+    </p>
+    <pre><code>PYTHONPATH="$OPUS_CURRENT_SRC" \
+AITER_JIT_DIR="$OPUS_CURRENT_JIT" AITER_REBUILD=0 \
+python3 csrc/opus_gemm/opus_bmm_mxscale_tune.py \
+  -g 16 -m 1,16,64 -n 1024 -k 4096 \
+  -o "$OPUS_LOG_DIR/bmm_tuned.csv" --mp 1 \
+  2&gt;&amp;1 | tee "$OPUS_LOG_DIR/bmm_tuner.log"</code></pre>
+    <p>
+      该 tuner 是当前端点的候选选择工具，不是历史 ABBA harness。若要证明 B 相对其父提交
+      <code>a43694f1</code> 的 BMM 无回退，必须让两端使用同一份外置 benchmark、独立 JIT，并按
+      <code>A1 → B1 → B2 → A2</code> 交替运行；分别运行两个 worktree 自带的不同脚本不能作为严格对比。
+    </p>
+  </section>
+
+  <section id="interpretation">
+    <h2>9. 正确性与性能判定</h2>
+
+    <h3>9.1 正确性</h3>
+    <ul>
+      <li>pytest/assert runner：退出码 0、failed = 0、目标架构 skip = 0、输出与 workspace 均有限值。</li>
+      <li>使用测试中按 family 规定的 tolerance；不得因为 upstream 某门更宽松，就把当前严格 gate 的失败改写成通过。</li>
+      <li>Graph、双 stream、caller workspace、自动 workspace 和错误合同分别记录，不能用 eager 数值代替。</li>
+      <li>MOE 不属于这两个 Task 的 OPUS 验收范围；若 PR CI 跑 MOE，应单独列为仓库级回归，不和本页 BMM/A16 结论合并。</li>
+    </ul>
+
+    <h3>9.2 BMM 的 <code>failed!</code> 与正式 gate</h3>
+    <div class="warning">
+      <code>test_opus_a8w8_bmm.py</code> 中的 <code>checkAllclose</code> 是诊断函数：逐元素
+      <code>rtol=atol=0.01</code> 超限时可能打印 <code>warning!</code> 或 <code>failed!</code>，
+      返回 mismatch ratio，但除 catastrophic error 外不一定让进程退出非零。因此“命令退出码 0”本身不是 BMM 严格通过证据。
+    </div>
+    <ul>
+      <li>shape sweep 必须保存每行 <code>err</code>、最大误差、NaN/Inf 和所用 kid/split-K。</li>
+      <li>all-kid m_align、tileN column-map、workspace/Graph guard 是 assertion gate，任何失败都必须失败退出。</li>
+      <li>正式 tuner 使用 signed、分块变幅输入、FP32 dequant reference、<code>rtol=atol=0.01</code>，
+        并只保留 mismatch fraction <code>&lt;= --errRatio</code>（默认 0.02）的候选。</li>
+      <li>若项目要求“每个元素都在 1% 内”，必须另外使用 strict assert；不能把 tuner 的 2% mismatch-fraction gate 解释成逐元素全通过。</li>
+    </ul>
+
+    <h3>9.3 ABBA 统计</h3>
+    <p>每个 case、每个层独立计算，不用总和掩盖单个退化：</p>
+    <div class="formula">A = median(A1, A2)
+B = median(B1, B2)
+delta = B / A - 1
+repeat_drift = max(|A2-A1| / A, |B2-B1| / B)</div>
+    <ul>
+      <li><code>|delta| &lt;= repeat_drift</code>：在本次观测噪声内，报告“未分辨出变化”，不要声称确定提升。</li>
+      <li><code>delta &gt; repeat_drift</code>：存在可分辨退化，必须定位到 public/private、raw、direct 或 Graph 层；未解释前为 FAIL。</li>
+      <li><code>delta &lt; -repeat_drift</code>：存在可分辨提升，仍保存两端重复漂移与逐 case 数据。</li>
+      <li>GPU 型号、CU/partition、时钟/功耗、ROCm、PyTorch、module SHA、shape、kid、split-K 或 workspace 不同的结果不能直接比较。</li>
+    </ul>
+  </section>
+
+  <section id="artifacts">
+    <h2>10. 日志、结果表与 Definition of Done</h2>
+    <h3>10.1 每个架构必须保存</h3>
+    <ul>
+      <li>UTC 时间、git HEAD/status/diff-check、GPU 型号/gcnArchName/CU、ROCm/hipcc、Python/PyTorch。</li>
+      <li>sidecar、fresh-build 日志、current/baseline/Task1 module 绝对路径与 SHA-256。</li>
+      <li>focused、C++/device、exhaustive、BMM、ABBA 的原始日志；不得只保留人工摘要。</li>
+      <li>每个 skip 的原因和分类，以及 PASS/FAIL/NOT RUN/BLOCKED 总表。</li>
+    </ul>
+    <pre><code>find "$OPUS_LOG_DIR" -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+  | sort -z \
+  | xargs -0 sha256sum \
+  &gt; "$OPUS_LOG_DIR/SHA256SUMS"</code></pre>
+
+    <h3>10.2 结果模板</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>门</th><th>状态</th><th>执行数/期望数</th><th>日志</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>focused / ABI / codegen</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>目标架构 all-kid A16</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>A8 / BMM family</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>Graph / 双 stream / workspace</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>Task1 workspace ABBA</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>Task1 frozen → 当前接口 ABBA</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>private family → unified public ABBA</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>未解释退化</td><td></td><td>必须为 0</td><td></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>10.3 完成条件</h3>
+    <div class="gate"><div class="gate-num">1</div><div>目标 GPU 与声明架构一致，模块只针对正确架构构建，证据可复现。</div></div>
+    <div class="gate"><div class="gate-num">2</div><div>focused、ABI、codegen、目标架构 all-kid 与 A8 family 全部执行，无目标架构 skip。</div></div>
+    <div class="gate"><div class="gate-num">3</div><div>每个 correctness case 使用真实 final kid、合法 workspace 和明确 reference；所有预期拒绝也实际发生。</div></div>
+    <div class="gate"><div class="gate-num">4</div><div>Task1 与 Task2 性能端点来源和 module SHA 可证明，ABBA 每层完成，数值断言先于计时结论。</div></div>
+    <div class="gate"><div class="gate-num">5</div><div>无未解释性能退化；原始日志及 SHA256SUMS 已封存。gfx1250 在 runner/benchmark 补齐前保持 BLOCKED。</div></div>
+  </section>
+
+  <footer>OPUS Task1 / Task2 full validation method · method only, not an execution report</footer>
+</main>
+</body>
+</html>
