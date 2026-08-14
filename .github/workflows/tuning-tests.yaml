@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKER_IMAGE: rocm/pytorch:latest
+  DOCKER_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
   GPU_ARCHS: gfx950
   REPORT_DIR: tuning_test_reports
   LOG_DIR: .github/test-logs/tuning-tests

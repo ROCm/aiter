@@ -2055,7 +2055,9 @@ namespace py = pybind11;
           py::arg("q_descale"),                                        \
           py::arg("k_descale"),                                        \
           py::arg("q_unquantized"),                                    \
-          py::arg("k_unquantized"));                                   \
+          py::arg("k_unquantized"),                                    \
+          py::arg("q_partial_amax"),                                   \
+          py::arg("k_partial_amax"));                                  \
     m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                 \
           &aiter::fused_qk_norm_rope_2way_fp8_perhead_quant,           \
           py::arg("q0"),                                               \
@@ -2081,18 +2083,22 @@ namespace py = pybind11;
           py::arg("q_descale"),                                        \
           py::arg("k_descale"),                                        \
           py::arg("q_unquantized"),                                    \
-          py::arg("k_unquantized"));                                   \
+          py::arg("k_unquantized"),                                    \
+          py::arg("q_partial_amax"),                                   \
+          py::arg("k_partial_amax"));                                  \
     m.def("v_2way_per_head_fp8_quant",                                 \
           &aiter::v_2way_per_head_fp8_quant,                           \
           py::arg("v0"),                                               \
           py::arg("v1"),                                               \
           py::arg("v_fp8"),                                            \
-          py::arg("v_descale"));                                       \
+          py::arg("v_descale"),                                        \
+          py::arg("v_amax"));                                          \
     m.def("v_1way_per_head_fp8_quant",                                 \
           &aiter::v_1way_per_head_fp8_quant,                           \
           py::arg("v"),                                                \
           py::arg("v_fp8"),                                            \
-          py::arg("v_descale"));
+          py::arg("v_descale"),                                        \
+          py::arg("v_amax"));
 
 #define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
     m.def("inverse_rope_group_quant",                  \
@@ -2191,6 +2197,7 @@ namespace py = pybind11;
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
 #define TOP_K_PER_ROW_PYBIND                     \
+    AITER_SET_STREAM_PYBIND;                      \
     m.def("top_k_per_row_prefill",               \
           &top_k_per_row_prefill,                \
           py::arg("logits"),                     \
@@ -2222,44 +2229,48 @@ namespace py = pybind11;
           py::arg("stride0"),                    \
           py::arg("k"),                          \
           py::arg("is_decode"));                 \
-    m.def("topk_use_mulblocks",                  \
-          &topk_use_mulblocks,                   \
+    m.def("topk_ob_workspace_size",              \
+          &topk_ob_workspace_size,               \
           py::arg("numRows"),                    \
-          py::arg("stride0"));
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("is_decode"));                 \
+    m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
-#define MLA_METADATA_PYBIND                                 \
-    m.def("get_mla_metadata_v1",                            \
-          &get_mla_metadata_v1,                             \
-          "get_mla_metadata_v1",                            \
-          py::arg("seqlens_qo_indptr"),                     \
-          py::arg("seqlens_kv_indptr"),                     \
-          py::arg("kv_last_page_lens"),                     \
-          py::arg("num_heads_per_head_k"),                  \
-          py::arg("num_heads_k"),                           \
-          py::arg("is_causal"),                             \
-          py::arg("work_metadata_ptrs"),                    \
-          py::arg("work_info_set"),                         \
-          py::arg("work_indptr"),                           \
-          py::arg("reduce_indptr"),                         \
-          py::arg("reduce_final_map"),                      \
-          py::arg("reduce_partial_map"),                    \
-          py::arg("page_size")           = 1,               \
-          py::arg("kv_granularity")      = 16,              \
-          py::arg("max_seqlen_qo")       = -1,              \
-          py::arg("uni_seqlen_qo")       = -1,              \
-          py::arg("fast_mode")           = true,            \
-          py::arg("topk")                = -1,              \
-          py::arg("max_split_per_batch") = -1,              \
-          py::arg("intra_batch_mode")    = false,           \
-          py::arg("is_cp_round_robin")   = false,           \
-          py::arg("mla_version")         = MlaVersion::V32, \
-          py::arg("dtype_q_nope")        = std::nullopt,    \
-          py::arg("dtype_q_rope")        = std::nullopt,    \
-          py::arg("dtype_kv_nope")       = std::nullopt,    \
-          py::arg("dtype_kv_rope")       = std::nullopt);         \
-    m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
+#define MLA_METADATA_PYBIND                              \
+    AITER_SET_STREAM_PYBIND;                             \
+    m.def("get_mla_metadata_v1",                         \
+          &get_mla_metadata_v1,                          \
+          "get_mla_metadata_v1",                         \
+          py::arg("seqlens_qo_indptr"),                  \
+          py::arg("seqlens_kv_indptr"),                  \
+          py::arg("kv_last_page_lens"),                  \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("num_heads_k"),                        \
+          py::arg("is_causal"),                          \
+          py::arg("work_metadata_ptrs"),                 \
+          py::arg("work_info_set"),                      \
+          py::arg("work_indptr"),                        \
+          py::arg("reduce_indptr"),                      \
+          py::arg("reduce_final_map"),                   \
+          py::arg("reduce_partial_map"),                 \
+          py::arg("page_size")           = 1,            \
+          py::arg("kv_granularity")      = 16,           \
+          py::arg("max_seqlen_qo")       = -1,           \
+          py::arg("uni_seqlen_qo")       = -1,           \
+          py::arg("fast_mode")           = true,         \
+          py::arg("topk")                = -1,           \
+          py::arg("max_split_per_batch") = -1,           \
+          py::arg("intra_batch_mode")    = false,        \
+          py::arg("is_cp_round_robin")   = false,        \
+          py::arg("mla_version")         = 0,            \
+          py::arg("dtype_q_nope")        = std::nullopt, \
+          py::arg("dtype_q_rope")        = std::nullopt, \
+          py::arg("dtype_kv_nope")       = std::nullopt, \
+          py::arg("dtype_kv_rope")       = std::nullopt);
 
 #define PA_METADATA_PYBIND                       \
+    AITER_SET_STREAM_PYBIND;                     \
     m.def("get_pa_metadata_v1",                  \
           &get_pa_metadata_v1,                   \
           "get_pa_metadata_v1",                  \
@@ -2284,6 +2295,7 @@ namespace py = pybind11;
           py::arg("max_split_per_batch") = -1);
 
 #define PS_METADATA_PYBIND                    \
+    AITER_SET_STREAM_PYBIND;                  \
     m.def("get_ps_metadata_v1",               \
           &get_ps_metadata_v1,                \
           "get_ps_metadata_v1",               \
@@ -2319,6 +2331,7 @@ namespace py = pybind11;
           py::arg("final_lse") = std::nullopt);
 
 #define TOPK_PLAIN_PYBIND                         \
+    AITER_SET_STREAM_PYBIND;                      \
     m.def("topk_plain",                           \
           &topk_plain,                            \
           py::arg("values"),                      \
@@ -2326,10 +2339,16 @@ namespace py = pybind11;
           py::arg("topk_out"),                    \
           py::arg("topk"),                        \
           py::arg("largest")   = true,            \
-          py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("rowStarts") = std::nullopt,    \
+          py::arg("rowEnds")   = std::nullopt,    \
           py::arg("stride0")   = -1,              \
-          py::arg("stride1")   = 1);
+          py::arg("stride1")   = 1,               \
+          py::arg("workspace") = std::nullopt);   \
+    m.def("topk_plain_workspace_size",            \
+          &topk_plain_workspace_size,             \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
     AITER_SET_STREAM_PYBIND;                 \
@@ -2395,6 +2414,7 @@ namespace py = pybind11;
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \
+    AITER_SET_STREAM_PYBIND;                      \
     m.def("mhc_pre_gemm_sqrsum",                  \
           &aiter::mhc_pre_gemm_sqrsum,            \
           "mhc_pre_gemm_sqrsum",                  \
