@@ -14,7 +14,11 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-from .combine import _make_combine_fused_reduce, _XDB_FLAG_SLOTS
+from .combine import (
+    _make_combine_fused_reduce,
+    _make_combine_fused_sync,
+    _XDB_FLAG_SLOTS,
+)
 from .config import _FUSED_COMBINE_TIERS, _select_dispatch_config
 from .dispatch import _make_dispatch
 from .types import Stage2ScatterContext, _from_gpu_ptr
@@ -416,9 +420,28 @@ class MegaMoEGfx1250:
                 for spec in dispatch_specs
             }
 
+        # Fused combine splits the cross-device barrier into its own 1-block
+        # kernel so the reduce grid is unconstrained. On by default;
+        # SCATTER_COMB_SPLIT=0 restores the single-kernel variant.
+        #
+        # The two paths are mutually EXCLUSIVE within a run, not a per-call
+        # choice: the sync kernel keeps its phase in xdb_flag[0] only, while the
+        # single-kernel variant keeps one counter per block, so mixing them would
+        # let a block read a stale counter and clear its barrier without waiting.
+        self._fused_split = os.environ.get("SCATTER_COMB_SPLIT", "1") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         combine_override = os.environ.get("SCATTER_COMB_BW")
         if combine_override:
             combine_specs = [tuple(int(value) for value in combine_override.split(","))]
+            self._combine_tiers = None
+        elif self._fused_split:
+            # Barrier split out into its own kernel -> reduce grid is free; 512x16
+            # measured best-or-tied at every token count. One geometry, one variant.
+            combine_specs = [(512, 16)]
             self._combine_tiers = None
         else:
             self._combine_tiers = _FUSED_COMBINE_TIERS
@@ -435,9 +458,16 @@ class MegaMoEGfx1250:
                 off_comb_inp=self._arena.offset("comb_inp"),
                 off_xdb_mem=self._arena.offset("cross_device_barrier"),
                 slot_stride_nbytes=config.combine_slot_stride_bytes,
+                include_sync=not self._fused_split,
             )
             for spec in combine_specs
         }
+        if self._fused_split:
+            self._combine_sync = _make_combine_fused_sync(
+                rank=config.rank,
+                npes=config.world_size,
+                off_xdb_mem=self._arena.offset("cross_device_barrier"),
+            )
 
     def _build_mori_dispatch(self, config: MegaMoEStage2Config) -> dict:
         """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
@@ -618,6 +648,16 @@ class MegaMoEGfx1250:
     def _combine(self, routing: Routing) -> torch.Tensor:
         spec = self._select_combine(routing.token_count)
         stream = fx.Stream(torch.cuda.current_stream())
+        if self._fused_split:
+            # 1-block cross-device barrier, then the barrier-free reduce on the
+            # same stream (the kernel boundary is what gives the reduce its
+            # visibility, so no in-kernel fence is needed).
+            self._combine_sync(
+                self._arena.handle,
+                self._cross_device_flag.data_ptr(),
+                self._config.rank,
+                stream,
+            )
         self._combine_variants[spec](
             self._arena.handle,
             self._arena.local_ptr("comb_inp"),
