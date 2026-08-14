@@ -193,14 +193,25 @@ class MegaMoEGfx1250:
         inter_dim: int,
         experts: int,
         topk: int,
-        w1: torch.Tensor,
-        w1_scale: torch.Tensor,
-        w2: torch.Tensor,
-        w2_scale: torch.Tensor,
         max_tokens_per_rank: int,
+        activation: ActivationType = ActivationType.Silu,
+        gate_mode: int = GateMode.INTERLEAVE.value,
+        quant_type: QuantType = QuantType.per_1x32,
+        hidden_pad: int = 0,
+        intermediate_pad: int = 0,
         swiglu_limit: float = 0.0,
+        situ_beta: torch.Tensor | None = None,
+        situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
     ):
+        """Everything here is fixed for the whole model; forward() takes the rest.
+
+        A model's MoE layers share their geometry, expert-GEMM recipe (activation,
+        gate mode, quant type, padding) and communication arena, and differ only in
+        their weights -- so one instance serves every layer and the per-layer
+        weights are forward() arguments. That also keeps a single cco symmetric
+        arena for the model instead of one per layer.
+        """
         gfx = get_gfx()
         if gfx != "gfx1250":
             raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
@@ -227,6 +238,10 @@ class MegaMoEGfx1250:
             )
         if swiglu_limit < 0:
             raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit}")
+        if hidden_pad < 0 or intermediate_pad < 0:
+            raise ValueError(
+                f"padding must be non-negative, got {hidden_pad}, {intermediate_pad}"
+            )
 
         self.model_dim = int(model_dim)
         self.inter_dim = int(inter_dim)
@@ -234,24 +249,16 @@ class MegaMoEGfx1250:
         self.experts_per_rank = self.experts // world_size
         self.topk = int(topk)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
+        self.activation = activation
+        self.gate_mode = gate_mode
+        self.quant_type = quant_type
+        self.hidden_pad = int(hidden_pad)
+        self.intermediate_pad = int(intermediate_pad)
         self.swiglu_limit = float(swiglu_limit)
-        self.w1 = w1.contiguous()
-        self.w1_scale = w1_scale.contiguous()
-        self.w2 = w2.contiguous()
-        self.w2_scale = w2_scale.contiguous()
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
 
-        if self.w1.shape[0] != self.experts_per_rank:
-            raise ValueError(
-                f"w1 has {self.w1.shape[0]} local experts, "
-                f"expected {self.experts_per_rank}"
-            )
-        if self.w2.shape[0] != self.experts_per_rank:
-            raise ValueError(
-                f"w2 has {self.w2.shape[0]} local experts, "
-                f"expected {self.experts_per_rank}"
-            )
-
-        device = self.w1.device
+        device = torch.device("cuda", torch.cuda.current_device())
         self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
         first_expert = rank * self.experts_per_rank
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
@@ -278,7 +285,28 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+        a1_scale: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        recv_token_bound: int | None = None,
     ) -> torch.Tensor:
+        """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
+
+        The weights are this layer's; everything shared by the model was fixed at
+        construction. ``recv_token_bound`` caps how many recv slots the GEMM is
+        shown: dispatch always fills a world_size*max_tokens_per_rank arena, so a
+        caller that knows a tighter static bound (e.g. a uniform decode batch,
+        where it is graph_bs*topk*world_size) can shrink the GEMM's grid with it.
+        It must be a python int so the shape stays static under graph capture, and
+        it must not cut below the received count -- the kernels still skip the
+        tail past the device-side count on their own.
+        """
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -302,26 +330,53 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
+        for name, weight in (("w1", w1), ("w2", w2)):
+            if weight.shape[0] != self.experts_per_rank:
+                raise ValueError(
+                    f"{name} has {weight.shape[0]} local experts, "
+                    f"expected {self.experts_per_rank}"
+                )
 
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
+        if recv_token_bound is not None:
+            bound = int(recv_token_bound)
+            if bound <= 0 or bound > recv_x.shape[0]:
+                raise ValueError(
+                    f"recv_token_bound must be in (0, {recv_x.shape[0]}], "
+                    f"got {recv_token_bound}"
+                )
+            recv_x = recv_x[:bound]
+            recv_weights = recv_weights[:bound]
+            recv_ids = recv_ids[:bound]
+        extra = {}
+        if self.activation == ActivationType.Situv2:
+            extra["beta"] = self.situ_beta
+            extra["linear_beta"] = self.situ_linear_beta
         fused_moe(
             recv_x,
-            self.w1,
-            self.w2,
+            w1,
+            w2,
             recv_weights,
             recv_ids,
             expert_mask=self.expert_mask,
-            activation=ActivationType.Silu,
-            gate_mode=GateMode.INTERLEAVE.value,
-            quant_type=QuantType.per_1x32,
-            w1_scale=self.w1_scale,
-            w2_scale=self.w2_scale,
+            activation=self.activation,
+            gate_mode=self.gate_mode,
+            quant_type=self.quant_type,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            bias1=bias1,
+            bias2=bias2,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
             dtype=dtypes.bf16,
             num_local_tokens=total_recv,
             swiglu_limit=self.swiglu_limit,
             stage2_scatter=self._scatter_context(routing),
+            **extra,
         )
         return self._combine(routing)
 

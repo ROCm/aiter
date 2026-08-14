@@ -488,6 +488,8 @@ class DeviceMoEPipeline:
                 )
             from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
+            # Geometry + the expert-GEMM recipe are per-model, so they are fixed
+            # here; the weights are per-layer and go to each forward() call.
             self.mega = MegaMoEGfx1250(
                 communicator=self.comm,
                 rank=r,
@@ -496,11 +498,10 @@ class DeviceMoEPipeline:
                 inter_dim=self.idim,
                 experts=self.E,
                 topk=self.topk,
-                w1=self.w1_a,
-                w1_scale=self.w1_s,
-                w2=self.w2_a,
-                w2_scale=self.w2_s,
                 max_tokens_per_rank=self.ct,
+                activation=self.spec["activation"],
+                gate_mode=self.spec["gate_mode"].value,
+                quant_type=self.spec["aiter_qtype"],
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -522,7 +523,15 @@ class DeviceMoEPipeline:
         ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
         if self.mega is not None:
-            y = self.mega(xn, wts, ids)
+            y = self.mega(
+                xn,
+                wts,
+                ids,
+                w1=self.w1_a,
+                w2=self.w2_a,
+                w1_scale=self.w1_s,
+                w2_scale=self.w2_s,
+            )
             if self.sw1 is not None:
                 y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
             return x + y
