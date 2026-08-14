@@ -228,9 +228,7 @@ def test_attn_res_gate_add_hidden2_requires_add_hidden():
     )
     add_hidden2 = torch.randn(32, 256, device="cuda")
     with pytest.raises(ValueError, match="add_hidden2 requires add_hidden"):
-        attn_res_gate(
-            prefix, block_residual, score_weight, 1e-6, None, add_hidden2
-        )
+        attn_res_gate(prefix, block_residual, score_weight, 1e-6, None, add_hidden2)
 
 
 @pytest.mark.parametrize("B", [1, 3, 7])
@@ -242,8 +240,8 @@ def test_attn_res_gate_output_rms_eps_independent_of_eps(B, dtype):
     # noticeably changes the RMSNorm denominator) -- large enough to clear
     # even bf16's loose comparison tolerance in the negative check below.
     eps, output_rms_eps = 1e-6, 1.0
-    prefix, block_residual, score_weight, add_hidden, _ = (
-        generate_attn_res_gate_inputs(N, D, B, dtype, with_add=True)
+    prefix, block_residual, score_weight, add_hidden, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=True
     )
     output_rms_weight = torch.randn(D, dtype=dtype, device="cuda")
 

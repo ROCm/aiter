@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import triton
 import triton.language as tl
+
+# Dev-time tuning escape hatch (off by default). See the block below the kernel
+# for what this actually does and why it's not the production path.
+ATTN_RES_TRITON_AUTOTUNE: bool = os.getenv("ATTN_RES_TRITON_AUTOTUNE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 # num_warps / num_stages / BL come from the static per-token-count table in the
@@ -219,3 +230,47 @@ def attnres_fwd_kernel(
         b_ow = tl.load(ow + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_o = b_o * b_o_rstd * b_ow
     tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
+
+
+# fla-style tuning escape hatch: ATTN_RES_TRITON_AUTOTUNE=1 lets Triton's own
+# autotune search (BL, num_warps, num_stages) instead of the wrapper's static
+# per-token-count table (aiter/ops/triton/fusions/attn_res.py). This mirrors
+# aiter's existing pattern for a live-search opt-in (see
+# AITER_TRITON_CONV_AUTOTUNE / CHUNK_DELTA_ATTN_TRITON_AUTOTUNE), which itself
+# mirrors fla's approach of keeping @triton.autotune available but not on the
+# hot path by default: fla's `fla_cache_autotune` loads a pre-tuned config from
+# an on-disk cache and only falls back to a live triton.autotune search on a
+# cache miss, so a fresh key never stalls (or breaks CUDAGraph capture on) a
+# production call. aiter has no fla runtime dependency (attn_res is a
+# dependency-free port), so this reproduces the same net effect with aiter's own
+# idiom instead: production always uses the static table (bounded compile cost,
+# CUDAGraph-safe, zero benchmarking on the critical path) with values obtained
+# BY running this autotune search offline (see scratch/tune_attn_res.py) and
+# copying the winners into the static table -- i.e. the disk-cache step happens
+# by hand, once, at tuning time, rather than automatically per-process.
+#
+# `cache_results=True` still gives in-process caching across repeated calls
+# with the same key within a run of this flag, same as fla's `cache_results`
+# kwarg (see aiter/ops/triton/_triton_kernels/chunk_delta_attn/chunk_delta_attn_utils.py).
+if ATTN_RES_TRITON_AUTOTUNE:
+    _ATTN_RES_AUTOTUNE_CONFIGS = [
+        triton.Config({"BL": BL}, num_warps=num_warps, num_stages=num_stages)
+        for BL in (1, 2, 4, 8)
+        for num_warps in (4, 8, 16)
+        for num_stages in (1, 2)
+    ]
+    attnres_fwd_kernel = triton.autotune(
+        configs=_ATTN_RES_AUTOTUNE_CONFIGS,
+        key=[
+            "N",
+            "L2",
+            "D",
+            "HAS_ONORM",
+            "IS_PACKED",
+            "HAS_PREFIX",
+            "WRITE_BLOCK_CAT",
+        ],
+        warmup=10,
+        rep=20,
+        cache_results=True,
+    )(attnres_fwd_kernel)

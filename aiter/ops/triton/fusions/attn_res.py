@@ -35,12 +35,16 @@ shared expert outputs) and its independently-epsilon'd output RMSNorm
 (``output_rms_eps``, distinct from the per-candidate ``eps``).
 """
 
+import logging
 from collections.abc import Sequence
 
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions.attn_res import attnres_fwd_kernel
+from aiter.ops.triton._triton_kernels.fusions.attn_res import (
+    ATTN_RES_TRITON_AUTOTUNE,
+    attnres_fwd_kernel,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -75,6 +79,20 @@ _ATTN_RES_SEQ_CONFIGS = (
 )
 _ATTN_RES_SEQ_CATCHALL = (16, 1)  # N > largest bucket
 
+#
+# Verified 2026-08-13 with a real search, not just inference from the ATOM
+# origin: scratch/tune_attn_res.py wraps attnres_fwd_kernel with
+# @triton.autotune (ATTN_RES_TRITON_AUTOTUNE=1, see
+# _triton_kernels/fusions/attn_res.py -- an fla-style tuning escape hatch, off
+# by default for the same CUDAGraph/compile-cost reasons noted above) and
+# benchmarks the full (BL, num_warps, num_stages) grid across Kimi-K3's real
+# (T, B) shapes. Result: the search reproduces BL=2/num_warps=8 almost
+# everywhere this table already has it, and the one bucket where the search
+# initially looked different (the N>2048 catchall) turned out to be noise on
+# closer, same-process A/B (scratch/verify_catchall_2x2.py) -- every
+# alternative tried was within ~5-10% either way with no consistent winner
+# across N. No changes made; this table is already at/near the tiling
+# optimum for this kernel.
 _ATTN_RES_PACKED_CONFIGS = (
     # (max_tokens, num_warps, num_stages, BL)
     (8, 8, 2, 2),
@@ -92,12 +110,50 @@ def _pick_attn_res_seq_config(tokens: int) -> tuple[int, int]:
     return _ATTN_RES_SEQ_CATCHALL
 
 
+def _fast_reshape2d(t: torch.Tensor, d: int) -> torch.Tensor:
+    # Skip reshape()/contiguous() (each a real dispatcher call) when the tensor
+    # is already exactly the shape/layout the kernel wants -- the common case
+    # for a caller like ATOM's AttnRes, whose inputs are already [N, D]
+    # contiguous from the previous layer. Only pay for the general path
+    # (leading-dim collapse and/or a real copy) when actually needed.
+    if t.dim() == 2 and t.shape[1] == d and t.is_contiguous():
+        return t
+    return t.reshape(-1, d).contiguous()
+
+
+def _fast_reshape3d(t: torch.Tensor, b: int, d: int) -> torch.Tensor:
+    if t.dim() == 3 and t.shape[1] == b and t.shape[2] == d and t.is_contiguous():
+        return t
+    return t.reshape(-1, b, d).contiguous()
+
+
+def _fast_flatten1d(t: torch.Tensor) -> torch.Tensor:
+    if t.dim() == 1 and t.is_contiguous():
+        return t
+    return t.flatten().contiguous()
+
+
 def _pick_attn_res_packed_config(tokens: int, l2: int) -> tuple[int, int, int]:
     for max_tokens, num_warps, num_stages, bl in _ATTN_RES_PACKED_CONFIGS:
         if tokens <= max_tokens:
             return num_warps, num_stages, min(bl, l2)
     num_warps, num_stages, bl = _ATTN_RES_PACKED_CATCHALL
     return num_warps, num_stages, min(bl, l2)
+
+
+def _launch_tune_kwargs(num_warps: int, num_stages: int, bl: int | None = None) -> dict:
+    # When ATTN_RES_TRITON_AUTOTUNE is on, attnres_fwd_kernel is itself wrapped by
+    # @triton.autotune (see _triton_kernels/fusions/attn_res.py): BL/num_warps/
+    # num_stages become meta-parameters the decorator supplies from its own config
+    # search, so the launch must NOT also pass them explicitly (that would just be
+    # a redundant/duplicate value, not an override). Otherwise, launch with the
+    # wrapper's static per-token-count picks, as today.
+    if ATTN_RES_TRITON_AUTOTUNE:
+        return {}
+    kwargs = {"num_warps": num_warps, "num_stages": num_stages}
+    if bl is not None:
+        kwargs["BL"] = bl
+    return kwargs
 
 
 def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
@@ -203,7 +259,6 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         eps=rms_eps,
         out_eps=rms_eps,
         scale=scale,
-        BL=L2,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -215,8 +270,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         WRITE_PREF=False,
         WRITE_BLOCK_CAT=False,
         HAS_W=True,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **_launch_tune_kwargs(num_warps, num_stages, L2),
     )
     return o.view(output_shape)
 
@@ -270,7 +324,6 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         eps=rms_eps,
         out_eps=rms_eps,
         scale=scale,
-        BL=bl,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -282,8 +335,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         WRITE_PREF=False,
         WRITE_BLOCK_CAT=False,
         HAS_W=True,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **_launch_tune_kwargs(num_warps, num_stages, bl),
     )
     return o.view(output_shape)
 
@@ -300,7 +352,9 @@ def attn_res_gate(
     output_rms_eps: float = 1e-6,
     scale: float = 1.0,
     close_block: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
     Same math as :func:`attn_res_fwd` on the packed layout, specialized for the
@@ -348,19 +402,20 @@ def attn_res_gate(
     if add_hidden2 is not None and add_hidden is None:
         raise ValueError("add_hidden2 requires add_hidden")
 
-    _LOGGER.info(
-        f"ATTN_RES_GATE: prefix={tuple(prefix.shape)} "
-        f"block_residual={tuple(block_residual.shape)}"
-    )
+    if _LOGGER.get_logger().isEnabledFor(logging.INFO):
+        _LOGGER.info(
+            f"ATTN_RES_GATE: prefix={tuple(prefix.shape)} "
+            f"block_residual={tuple(block_residual.shape)}"
+        )
 
     output_shape = prefix.shape  # [.., D]
     D = output_shape[-1]
     B = block_residual.shape[-2]
     L = B + 1  # candidates: the B packed rows plus the prefix
 
-    br = block_residual.reshape(-1, B, D).contiguous()
-    pf = prefix.reshape(-1, D).contiguous()
-    sw = score_weight.flatten().contiguous()
+    br = _fast_reshape3d(block_residual, B, D)
+    pf = _fast_reshape2d(prefix, D)
+    sw = _fast_flatten1d(score_weight)
     N = pf.shape[0]
     if br.shape[0] != N:
         raise ValueError(
@@ -369,20 +424,20 @@ def attn_res_gate(
         )
 
     has_onorm = output_rms_weight is not None
-    ow = output_rms_weight.flatten().contiguous() if has_onorm else sw
+    ow = _fast_flatten1d(output_rms_weight) if has_onorm else sw
 
     y = torch.empty((N, D), device=pf.device, dtype=pf.dtype)
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
     if do_add:
-        hs = add_hidden.reshape(-1, D).contiguous()
+        hs = _fast_reshape2d(add_hidden, D)
         prefix_out = torch.empty_like(pf)
     else:
         # add_hidden / prefix_out are unused (DO_ADD / WRITE_PREF are off) but
         # Triton still needs a tensor argument, so reuse the prefix.
         hs = pf
         prefix_out = pf
-    hs2 = add_hidden2.reshape(-1, D).contiguous() if do_add2 else pf
+    hs2 = _fast_reshape2d(add_hidden2, D) if do_add2 else pf
 
     if close_block:
         block_out = torch.empty((N, B + 1, D), device=br.device, dtype=br.dtype)
@@ -422,7 +477,6 @@ def attn_res_gate(
         eps=eps,
         out_eps=output_rms_eps,
         scale=scale,
-        BL=bl,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
         SAVE_OPRE=False,
@@ -434,8 +488,7 @@ def attn_res_gate(
         WRITE_PREF=do_add,
         WRITE_BLOCK_CAT=close_block,
         HAS_W=False,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **_launch_tune_kwargs(num_warps, num_stages, bl),
     )
     y_out = y.view(output_shape)
     prefix_result = prefix_out.view(output_shape) if do_add else prefix
