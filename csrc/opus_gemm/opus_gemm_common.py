@@ -105,10 +105,11 @@ class OpusGemmInstance:
     # so there is no panel to stage. Maps to the wave8 kernel's trailing
     # `bool SFA_MPACK_GLOBAL`; see needs_mpacked_sfa for the caller's side of it.
     mpack_sfa: bool = False
-    # a8w8_mxscale BMM wave8 families only: both scale panels arrive in the
-    # reference kernel's layout (shuffle_scale_a / _b) and are read from
-    # global one dword per (M subtile pair, K tile pair). Maps to the wave8
-    # kernel's trailing `bool SHUFFLE_SCALE`; see needs_shuffle_scale for the caller's side.
+    # a8w8_mxscale BMM wave8 families and flatmm-splitK: both scale panels arrive
+    # in the reference kernel's layout (shuffle_scale_a / _b) and are read from
+    # global one dword per (M subtile pair, K tile pair). Maps to the trailing
+    # `bool SHUFFLE_SCALE` of either kernel; see needs_shuffle_scale for the
+    # caller's side. Mutually exclusive with preload_sf, which it replaces.
     shuffle_scale: bool = False
     # a8w8_mxscale BMM wave8 families only: band height in M tiles for the L2
     # rasterization of the workgroup -> tile map, 0 for the plain linear map. Maps
@@ -150,7 +151,8 @@ class OpusGemmInstance:
         # tag inserts shift right by one slot when arch_prefix is set
         tag_at = 1 + (1 if self.arch_prefix else 0)
         if self.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
-            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload][_scaleprefetch]
+            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload]
+            #     [_scaleprefetch][_sfpreload][_sfshuf]
             parts.insert(tag_at, "a8w8_mxscale_flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.direct_only:
@@ -159,6 +161,14 @@ class OpusGemmInstance:
                 parts.append("scaleprefetch")
             if self.preload_sf:
                 parts.append("sfpreload")
+            # Same trap as the bdirect branch below, and this one was live: the
+            # flatmm split-K kernel has implemented SHUFFLE_SCALE all along and the
+            # codegen spells it on every kid of that kernel, but no suffix here
+            # meant a shuffle_scale kid would have deduplicated onto its plain
+            # sibling and been emitted as the plain one -- measuring as "the layout
+            # makes no difference" with nothing raised.
+            if self.shuffle_scale:
+                parts.append("sfshuf")
         elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_bdirect":
             # opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_<geom>_wgpcu{N}
             #     [_scaleprefetch][_sfpreload]
@@ -184,11 +194,13 @@ class OpusGemmInstance:
                 parts.append("sfpreload")
         elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave8n4":
             # opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_<geom>_wgpcu{N}_sfpreload
-            #     [_sfgmpack][_sfshuf]
+            #     [_xcd{N}][_sfgmpack][_sfshuf]
             parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_wave8n4")
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.preload_sf:
                 parts.append("sfpreload")
+            if self.xcd_wgm:
+                parts.append(f"xcd{self.xcd_wgm}")
             if self.mpack_sfa:
                 parts.append("sfgmpack")
             if self.shuffle_scale:
@@ -492,7 +504,8 @@ a8w8_scale_kernels_list = {
 
 
 def _a8w8_mxscale_bmm_flatmm_splitk(
-    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False
+    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
+    shuffle_scale=False,
 ):
     """fp8 e8m0 mxscale BATCHED matmul flatmm split-K tile.
 
@@ -528,6 +541,14 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
     inst.direct_only = direct_only
     inst.prefetch_scale = prefetch_scale
     inst.preload_sf = preload_sf
+    # The kernel's static_asserts: the shuffle_scale dword pairs adjacent M
+    # subtiles and spans at most two K blocks, and it replaces the LDS panels
+    # rather than filling them. SFA_MB = T_M*W_M = 32 for this family.
+    if shuffle_scale:
+        assert not preload_sf, "shuffle_scale replaces the LDS scale panels"
+        assert bm % 64 == 0, f"B_M={bm}: shuffle_scale needs COM_REP_M even"
+        assert bk // 128 <= 2, f"B_K={bk}: shuffle_scale spans at most two K blocks"
+    inst.shuffle_scale = shuffle_scale
     return inst
 
 
@@ -1088,8 +1109,8 @@ a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
 
 
 
-def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, mpack_sfa=False,
-                                          shuffle_scale=False):
+def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
+                                          mpack_sfa=False, shuffle_scale=False):
     """256x256 preshuffled-B tile over eight all-compute waves, on a 2x4 grid.
 
     This is the T_M sweep's shallow end and, with wavetm1's 1x8/1x4, all that is
@@ -1131,6 +1152,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, mpack_sfa=False
     )
     inst.name_root = "opus_bmm"
     inst.preload_sf = True
+    inst.xcd_wgm = xcd_wgm
     inst.mpack_sfa = mpack_sfa
     inst.shuffle_scale = shuffle_scale
     return inst
