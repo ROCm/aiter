@@ -184,6 +184,17 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6DeferredZWaitSavedAScaled
     static constexpr bool DEFER_Z_LDS_WAIT = true;
 };
 
+// Preserve the production BN256/M6 compute geometry while encoding W2 as
+// four independently swizzled [K32,N64] slabs.  This removes the 64-byte pad
+// from every four-row group and gives each native N32 MFMA tile the same
+// low-conflict transpose-read layout used by the production K4 pipeline.
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64DeferredZWaitSavedAScaled
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6DeferredZWaitSavedAScaled
+{
+    static constexpr bool SPLIT_B_N64_SWIZZLE = true;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>

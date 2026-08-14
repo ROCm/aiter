@@ -125,6 +125,49 @@ inline __device__ auto down_bwd_load_rb_tr(opus::smem<typename T::D_B>& s_b,
     return result;
 }
 
+// Read four independently swizzled [K32,N64] slabs.  Within a slab two
+// native N32 fragments differ by one 64-byte XOR phase; consecutive K16
+// fragments differ by 2048 bytes.  This is the same physical encoding used
+// by K4's split-B path, adapted here to the BN256 down-backward operand.
+template<typename T, typename Mma>
+inline __device__ auto
+down_bwd_load_rb_tr_split_n64(opus::smem<typename T::D_B>& s_b,
+                              int lane_id,
+                              int wave_id_n)
+{
+    static_assert(T::B_N == 256 && T::B_K == 32);
+    static_assert(T::T_N == 4 && T::E_N == 2 && T::E_K == 2);
+    static_assert(T::W_N == 32 && T::W_K == 16);
+    static_assert(T::VEC_TR_B == 4);
+
+    const int lane_mix = lane_id & 0x2c;
+    const int read_base =
+        (lane_mix << 5) |
+        (((lane_id << 1) & 0x70) ^ ((lane_id << 3) & 0x18));
+
+    typename Mma::vtype_b result;
+    opus::static_for<T::E_N>([&](auto en) {
+        opus::static_for<T::E_K>([&](auto ek) {
+            const int native_n = en.value * T::T_N + wave_id_n;
+            int base = read_base + (native_n / 2) * 4096;
+            base ^= (native_n % 2) * 0x40;
+            constexpr int k_byte_offset = ek.value * 2048;
+            auto lo = s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(base);
+            auto hi = s_b.template _tr_load<T::VEC_TR_B, k_byte_offset>(
+                base ^ 0x220);
+            constexpr int fragment = en.value * T::E_K + ek.value;
+#pragma unroll
+            for(int j = 0; j < T::VEC_TR_B; ++j)
+            {
+                result[fragment * 2 * T::VEC_TR_B + j] = lo[j];
+                result[fragment * 2 * T::VEC_TR_B + T::VEC_TR_B + j] =
+                    hi[j];
+            }
+        });
+    });
+    return result;
+}
+
 __device__ __forceinline__ float down_bwd_sigmoid(float value)
 {
     constexpr float kNegLog2E = -1.4426950408889634f;
@@ -190,6 +233,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::WRITE_A_SCALED;
         return true;
     }();
+    constexpr bool split_b_n64 = []() constexpr {
+        if constexpr(requires { T::SPLIT_B_N64_SWIZZLE; })
+            return T::SPLIT_B_N64_SWIZZLE;
+        return false;
+    }();
+    static_assert(!split_b_n64 ||
+                      (BN == 256 && BK == 32 && T::BLOCK_SIZE == 256),
+                  "split-B down backward requires the four-wave BN256 tile");
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -455,55 +506,80 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 reinterpret_cast<OPUS_LDS_ADDR D_B*>(stage_lds + smem_a_bytes);
 
             auto issue_b = [&]() __attribute__((always_inline)) {
-                constexpr int vectors_per_group =
-                    T::SMEM_B_GROUP_DATA_BYTES /
-                    (T::VEC_B * sizeof(D_B));
-                static_assert(vectors_per_group % opus::get_warp_size() == 0);
-                constexpr int b_loads_per_wave =
-                    vectors_per_group / opus::get_warp_size();
-                constexpr int n_vectors = BN / T::VEC_B;
-                static_assert(opus::get_warp_size() % n_vectors == 0);
-                constexpr int source_rows_per_issue =
-                    opus::get_warp_size() / n_vectors;
-                static_assert(source_rows_per_issue * b_loads_per_wave ==
-                              T::SMEM_B_GROUP_ROWS);
-                static_assert(T::SMEM_B_GROUPS == 4 * T::E_K);
-                constexpr int mfma_stage_groups =
-                    T::W_K / T::SMEM_B_GROUP_ROWS;
-                constexpr int mfma_stage_bytes =
-                    mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
-                constexpr int mfma_stage_rows = T::W_K;
-                const int b_local_n =
-                    (lane_id % n_vectors) * T::VEC_B;
-                OPUS_LDS_ADDR char* b_wave_dst =
-                    reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
-                    wave_id * T::SMEM_B_GROUP_BYTES;
-                opus::static_for<T::E_K>([&](auto ek) {
-                    constexpr int stage_offset =
-                        ek.value * mfma_stage_bytes;
-                    opus::static_for<b_loads_per_wave>([&](auto load) {
-                        constexpr int load_byte_offset =
-                            load.value * opus::get_warp_size() * T::VEC_B *
-                            sizeof(D_B);
-                        const int b_local_k =
-                            wave_id +
-                            ((lane_id / n_vectors) +
-                             load.value * source_rows_per_issue) *
-                                T::T_N;
+                if constexpr(split_b_n64)
+                {
+                    const int loader_tid = tid ^ ((tid >> 4) & 7);
+                    const int local_k = loader_tid / 8;
+                    const int local_n = (loader_tid % 8) * T::VEC_B;
+                    opus::static_for<4>([&](auto slab) {
+                        OPUS_LDS_ADDR D_B* b_slab_dst =
+                            b_lds + slab.value * 64 * BK +
+                            wave_id * opus::get_warp_size() * T::VEC_B;
                         const int b_global_offset =
-                            (tile_k * BK + b_local_k +
-                             ek.value * mfma_stage_rows) *
-                                stride_w2_d +
-                            col_base + b_local_n;
+                            (tile_k * BK + local_k) * stride_w2_d +
+                            col_base + slab.value * 64 + local_n;
                         g_b.template _async_load<T::VEC_B>(
-                            reinterpret_cast<OPUS_LDS_ADDR void*>(
-                                b_wave_dst + stage_offset + load_byte_offset),
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(b_slab_dst),
                             b_global_offset * sizeof(D_B),
                             0,
                             opus::number<0>{},
                             opus::number<T::CACHECTL_B>{});
                     });
-                });
+                }
+                else
+                {
+                    constexpr int vectors_per_group =
+                        T::SMEM_B_GROUP_DATA_BYTES /
+                        (T::VEC_B * sizeof(D_B));
+                    static_assert(vectors_per_group % opus::get_warp_size() ==
+                                  0);
+                    constexpr int b_loads_per_wave =
+                        vectors_per_group / opus::get_warp_size();
+                    constexpr int n_vectors = BN / T::VEC_B;
+                    static_assert(opus::get_warp_size() % n_vectors == 0);
+                    constexpr int source_rows_per_issue =
+                        opus::get_warp_size() / n_vectors;
+                    static_assert(source_rows_per_issue * b_loads_per_wave ==
+                                  T::SMEM_B_GROUP_ROWS);
+                    static_assert(T::SMEM_B_GROUPS == 4 * T::E_K);
+                    constexpr int mfma_stage_groups =
+                        T::W_K / T::SMEM_B_GROUP_ROWS;
+                    constexpr int mfma_stage_bytes =
+                        mfma_stage_groups * T::SMEM_B_GROUP_BYTES;
+                    constexpr int mfma_stage_rows = T::W_K;
+                    const int b_local_n =
+                        (lane_id % n_vectors) * T::VEC_B;
+                    OPUS_LDS_ADDR char* b_wave_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR char*>(b_lds) +
+                        wave_id * T::SMEM_B_GROUP_BYTES;
+                    opus::static_for<T::E_K>([&](auto ek) {
+                        constexpr int stage_offset =
+                            ek.value * mfma_stage_bytes;
+                        opus::static_for<b_loads_per_wave>([&](auto load) {
+                            constexpr int load_byte_offset =
+                                load.value * opus::get_warp_size() * T::VEC_B *
+                                sizeof(D_B);
+                            const int b_local_k =
+                                wave_id +
+                                ((lane_id / n_vectors) +
+                                 load.value * source_rows_per_issue) *
+                                    T::T_N;
+                            const int b_global_offset =
+                                (tile_k * BK + b_local_k +
+                                 ek.value * mfma_stage_rows) *
+                                    stride_w2_d +
+                                col_base + b_local_n;
+                            g_b.template _async_load<T::VEC_B>(
+                                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                    b_wave_dst + stage_offset +
+                                    load_byte_offset),
+                                b_global_offset * sizeof(D_B),
+                                0,
+                                opus::number<0>{},
+                                opus::number<T::CACHECTL_B>{});
+                        });
+                    });
+                }
             };
             if constexpr(issue_b_first)
                 issue_b();
@@ -586,8 +662,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 
             auto s_b_current = make_smem(reinterpret_cast<D_B*>(
                 tile_storage + buffer * gemm_buffer_bytes + smem_a_bytes));
-            auto v_b = down_bwd_load_rb_tr<T, decltype(mma)>(
-                s_b_current, lane_id, wave_id_n);
+            auto v_b = [&]() {
+                if constexpr(split_b_n64)
+                    return down_bwd_load_rb_tr_split_n64<T, decltype(mma)>(
+                        s_b_current, lane_id, wave_id_n);
+                else
+                    return down_bwd_load_rb_tr<T, decltype(mma)>(
+                        s_b_current, lane_id, wave_id_n);
+            }();
 
             auto load_route_a = [&](auto route_group) {
                 auto s_a = make_smem(reinterpret_cast<D_A*>(
