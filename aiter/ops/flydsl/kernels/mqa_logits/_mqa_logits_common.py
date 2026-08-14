@@ -73,6 +73,19 @@ def i32_add(a, b):
     return fx.Int32(arith.addi(_to_raw(a), _to_raw(b)))
 
 
+# `//` and `%` on a signed Int32 lower to floordivsi/remsi, which expand to
+# several instructions to get negative-operand rounding right. Every quantity
+# divided here (lane ids, block ids, byte offsets) is non-negative, so route
+# through Uint32 to keep the single-instruction divui/remui the hand-written
+# arith calls used to emit.
+def udiv(a, b):
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
+
+
+def umod(a, b):
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(b))
+
+
 @lru_cache(maxsize=8)
 def device_cu_count(device_index: int) -> int:
     """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
@@ -109,10 +122,7 @@ def load_pack_v8i32(i32_view, byte_off_i32, lane8):
     """
 
     def _load_i64(off):
-        dw = fx.Int32(
-            arith.divui(_to_raw(byte_off_i32 + lane8 + off), _to_raw(fx.Int32(4)))
-        )
-        v2 = i32_view.vec_load((dw,), vec_size=2)
+        v2 = i32_view.vec_load((udiv(byte_off_i32 + lane8 + off, 4),), vec_size=2)
         return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
     i64_0 = _load_i64(0)  # K-group 0: k = lane_div_N*8 + 0..7
@@ -151,13 +161,12 @@ def load_pack_v8i32_preshuffle(
     D = head_size
     # Token super-row (16-token blocks) + intra-super-row column; loop-invariant
     # across the four hidden groups, so hoist out of the per-group load.
-    c_hi = fx.Int32(arith.divui(_to_raw(tok_in_block), _to_raw(fx.Int32(16))))
-    c_lo = fx.Int32(arith.remui(_to_raw(tok_in_block), _to_raw(fx.Int32(16))))
+    c_hi = udiv(tok_in_block, 16)
+    c_lo = umod(tok_in_block, 16)
     base = block_byte_base + c_hi * (D * 16) + c_lo * 16 + lane8
 
     def _load_i64(g):
-        dw = fx.Int32(arith.divui(_to_raw(base + g * 256), _to_raw(fx.Int32(4))))
-        v2 = i32_view.vec_load((dw,), vec_size=2)
+        v2 = i32_view.vec_load((udiv(base + g * 256, 4),), vec_size=2)
         return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
     g0 = kk_step * 4  # first hidden-16 group of this MFMA K-step

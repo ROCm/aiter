@@ -64,6 +64,8 @@ from ._mqa_logits_common import (
     load_pack_v8i32_preshuffle,
     make_out_row_view,
     mfma_head_reduce,
+    udiv,
+    umod,
 )
 
 
@@ -196,15 +198,15 @@ def _build_paged_kernel(
 
         # ChunkQ==H  =>  grid = split_kv * batch * next_n (split outermost),
         # mirroring the Triton _deepgemm_fp8_paged_mqa_logits pid decomposition.
-        pid_next_n = fx.Int32(arith.remui(_to_raw(bid), _to_raw(next_n)))
-        _rem = fx.Int32(arith.divui(_to_raw(bid), _to_raw(next_n)))
-        pid_batch = fx.Int32(arith.remui(_to_raw(_rem), _to_raw(batch_size)))
-        pid_split_kv = fx.Int32(arith.divui(_to_raw(_rem), _to_raw(batch_size)))
+        pid_next_n = umod(bid, next_n)
+        _rem = udiv(bid, next_n)
+        pid_batch = umod(_rem, batch_size)
+        pid_split_kv = udiv(_rem, batch_size)
 
-        wave = fx.Int32(arith.divui(_to_raw(tid), _to_raw(fx.Int32(64))))
-        lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
-        lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
-        lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
+        wave = udiv(tid, 64)
+        lane = umod(tid, 64)
+        lane_div_N = udiv(lane, MFMA_N)
+        lane_mod_N = umod(lane, MFMA_N)
         lane8 = lane_div_N * 8
 
         # fp8 operands loaded as vector<8xi32> per K-step (32 bytes = 4 i64s)
@@ -294,12 +296,8 @@ def _build_paged_kernel(
                 # away (block_idx==col_c, tok_in_block==0) -- no Python `if` here
                 # because the FlyDSL AST rewriter would turn it into a runtime
                 # scf.if and drop the branch-local addresses.
-                block_idx = fx.Int32(
-                    arith.divui(_to_raw(col_c), _to_raw(fx.Int32(KVB)))
-                )
-                tok_in_block = fx.Int32(
-                    arith.remui(_to_raw(col_c), _to_raw(fx.Int32(KVB)))
-                )
+                block_idx = udiv(col_c, KVB)
+                tok_in_block = umod(col_c, KVB)
                 ind_off = pid_batch * max_block_len + block_idx
                 physical = fx.Int32(ind_t[ind_off])
                 block_byte_base = physical * block_byte_stride
@@ -324,10 +322,7 @@ def _build_paged_kernel(
 
                 # Co-packed per-token f32 scale (block-flat: after the KVB keys).
                 scale_byte = block_byte_base + (KVB * D) + tok_in_block * 4
-                scale_dword = fx.Int32(
-                    arith.divui(_to_raw(scale_byte), _to_raw(fx.Int32(4)))
-                )
-                kv_scale = _to_raw(fx.Float32(kv_f32[scale_dword]))
+                kv_scale = _to_raw(fx.Float32(kv_f32[udiv(scale_byte, 4)]))
                 if scale_mul != 1.0:
                     kv_scale = arith.MulFOp(
                         kv_scale, scale_mul_c, fastmath=fm_fast
@@ -349,22 +344,7 @@ def _build_paged_kernel(
                 # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                 # Write only in-causal columns; masked positions keep the
                 # caller's -inf prefill (matches clean_logits semantics).
-                is_writer = arith.andi(
-                    _to_raw(
-                        arith.cmpi(
-                            arith.CmpIPredicate.eq,
-                            _to_raw(lane_div_N),
-                            _to_raw(fx.Int32(0)),
-                        )
-                    ),
-                    _to_raw(
-                        arith.cmpi(
-                            arith.CmpIPredicate.sle,
-                            _to_raw(col),
-                            _to_raw(q_limit),
-                        )
-                    ),
-                )
+                is_writer = _to_raw((lane_div_N == 0) & (col <= q_limit))
                 with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
                     out_row_t[col] = fx.Float32(col_sum)
                     scf.YieldOp([])
