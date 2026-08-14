@@ -435,7 +435,10 @@ __global__ void opus_moe_wgrad_tn_lds_tr_kernel(const __bf16* __restrict__ dy,
 // 4x2 independent m32n32k16 MFMAs.  This deliberately reuses the exact
 // transpose-read/MFMA mapping of the verified 128x128 kernel above while
 // halving operand traffic per output element.
-template<int FIXED_P = 0, int FIXED_Q = 0, int FIXED_ROUTES = 0>
+template<int FIXED_P = 0,
+         int FIXED_Q = 0,
+         int FIXED_ROUTES = 0,
+         bool INTERLEAVE_EXPERTS = false>
 __global__ __launch_bounds__(512, 1)
 __attribute__((amdgpu_num_vgpr(128)))
 void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
@@ -482,18 +485,35 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     const int scalar_warp = __builtin_amdgcn_readfirstlane(warp);
     const int wm = warp / 4;
     const int wn = warp % 4;
-    const int e = blockIdx.z;
+    int e = blockIdx.z;
     int tile_m = blockIdx.y;
     int tile_n = blockIdx.x;
     if constexpr(FIXED_P > 0 && FIXED_Q > 0)
     {
-        // Keep two B panels shared while advancing all eight M tiles.  This
-        // ordering improves L2 reuse for both exact balanced Sonic wgrads;
-        // the general ragged path below retains its original mapping.
+        // Keep two B panels shared while advancing all eight M tiles. For the
+        // target ragged dW1, interleave four experts inside this tile order so
+        // route-count variation does not leave a long final CTA wave. Other
+        // exact paths retain the original expert-major 3-D mapping.
         constexpr int GROUP_M = 8;
         constexpr int GROUP_N = 2;
         const int tiles_n = FIXED_Q / BN;
-        const int linear = blockIdx.y * tiles_n + blockIdx.x;
+        int linear;
+        if constexpr(INTERLEAVE_EXPERTS)
+        {
+            static_assert(FIXED_Q == 2048 && FIXED_ROUTES == 0);
+            constexpr int TILES_M = FIXED_P / BM;
+            constexpr int TILES_PER_EXPERT = TILES_M * (FIXED_Q / BN);
+            constexpr int EXPERT_GROUP = 4;
+            const int schedule = blockIdx.x;
+            const int expert_group =
+                schedule / (TILES_PER_EXPERT * EXPERT_GROUP);
+            const int group_work =
+                schedule % (TILES_PER_EXPERT * EXPERT_GROUP);
+            e = expert_group * EXPERT_GROUP + group_work % EXPERT_GROUP;
+            linear = group_work / EXPERT_GROUP;
+        }
+        else
+            linear = blockIdx.y * tiles_n + blockIdx.x;
         const int group_id = linear / (GROUP_M * GROUP_N);
         const int in_group = linear % (GROUP_M * GROUP_N);
         const int groups_n = tiles_n / GROUP_N;
@@ -1062,7 +1082,11 @@ inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
                                             hipStream_t stream) {
     if(P % 256 == 0 && Q % 256 == 0)
     {
-        dim3 grid(Q / 256, P / 256, E);
+        const bool interleave_experts =
+            E == 64 && P == 2048 && Q == 2048 && uniform_m != 4096;
+        dim3 grid = interleave_experts
+            ? dim3(E * (P / 256) * (Q / 256), 1, 1)
+            : dim3(Q / 256, P / 256, E);
         if(uniform_m == 4096 && P == 2048 && Q == 1024)
             opus_moe_wgrad_tn_8wave_kernel<2048, 1024, 4096>
                 <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
@@ -1073,8 +1097,14 @@ inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
             opus_moe_wgrad_tn_8wave_kernel<2048, 1024, 0>
                 <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
         else if(P == 2048 && Q == 2048)
-            opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 0>
-                <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        {
+            if(interleave_experts)
+                opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 0, true>
+                    <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+            else
+                opus_moe_wgrad_tn_8wave_kernel<2048, 2048, 0>
+                    <<<grid, 512, 0, stream>>>(dy, a, offs, dW, P, Q);
+        }
         else
             opus_moe_wgrad_tn_8wave_kernel<><<<grid, 512, 0, stream>>>(
                 dy, a, offs, dW, P, Q);
