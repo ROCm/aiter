@@ -478,7 +478,10 @@ def _mla_gluon(
     for i in range(num_iter - 2):
         async_idx = (buf_idx + 1) % 2
 
-        gl.amd.cdna4.async_copy.wait_group(0)
+        # Retire just the oldest group, the previous trip's page copy, which is all
+        # the local load below reads. That trip's kv0 / kpe / kv1 stay in flight for
+        # the loads further down, so two KV blocks are resident at no extra LDS.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         #### global load page number
         offs_n_page = start_n + BLOCK_N + offs_page_raw
         offs_page = batch_page_start + offs_n_page // PAGE_SIZE
@@ -522,6 +525,10 @@ def _mla_gluon(
             gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
+        # Retire the previous trip's kv0 / kpe / kv1, which these local loads read.
+        # Leaving three pending (two without PE) keeps this trip's own page and KV
+        # prefetches in flight through the MFMA and softmax block.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
