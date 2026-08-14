@@ -26,6 +26,8 @@
 #include <hipcub/block/block_reduce.hpp>
 #include <hipcub/block/block_scan.hpp>
 #include <hipcub/block/block_store.hpp>
+#include <hipcub/thread/thread_operators.hpp>
+#include <hipcub/util_type.hpp>
 #include <limits>
 #include <numeric>
 #include <tuple>
