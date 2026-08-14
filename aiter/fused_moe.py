@@ -1380,14 +1380,33 @@ def _normalize_bias_for_kernel(
     return bias
 
 
+_PREPARED_STAGE1_SCALE_LAYOUT = "mx_e8m0_route_sbm32_preshuffled_v1"
+
+
 def _is_prepared_stage1_input(
     metadata: MOEMetadata,
     hidden_states: torch.Tensor,
     q_dtype_a: torch.dtype | None,
     a1_scale: torch.Tensor | None,
+    sorted_ids: torch.Tensor,
+    a1_scale_layout: str | None,
 ) -> bool:
+    """Recognize the sorted, 32-row-swizzled E8M0 stage-1 scale contract."""
+    if sorted_ids.ndim != 1:
+        return False
+    required_scale_rows = (sorted_ids.shape[0] + 31) // 32 * 32
+    for sorted_blocks in (
+        metadata.expected_sorted_blocks,
+        metadata.min_sorted_blocks,
+    ):
+        if sorted_blocks is not None:
+            required_scale_rows = max(
+                required_scale_rows,
+                sorted_blocks * metadata.block_m,
+            )
     return (
         metadata.prequant
+        and a1_scale_layout == _PREPARED_STAGE1_SCALE_LAYOUT
         and q_dtype_a == dtypes.fp8
         and hidden_states.dtype == dtypes.fp8
         and hidden_states.ndim == 2
@@ -1397,6 +1416,7 @@ def _is_prepared_stage1_input(
         and a1_scale.dtype == dtypes.fp8_e8m0
         and a1_scale.device == hidden_states.device
         and a1_scale.ndim == 2
+        and a1_scale.shape[0] >= required_scale_rows
         and a1_scale.shape[1] == hidden_states.shape[1] // 32
         and a1_scale.is_contiguous()
     )
@@ -2998,6 +3018,7 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _a1_scale_layout: str | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3033,7 +3054,14 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
-    if _is_prepared_stage1_input(metadata, hidden_states, q_dtype_a, a1_scale):
+    if _is_prepared_stage1_input(
+        metadata,
+        hidden_states,
+        q_dtype_a,
+        a1_scale,
+        sorted_ids,
+        _a1_scale_layout,
+    ):
         # The caller already prepared the stage-1 activation and its sorted
         # scale layout; consuming it directly avoids quantizing the same input
         # a second time.
