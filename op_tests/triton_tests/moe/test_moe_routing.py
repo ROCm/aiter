@@ -10,7 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_from_hash,
     routing_torch,
 )
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -106,6 +106,49 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
 
 
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
+@pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
+def test_topk_in_range(n_tokens: int, n_expts_tot: int):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    # A CUDA graph replay pads the batch to the captured size, so rows
+    # [n_tokens_unpadded, n_tokens) hold whatever the router produced for
+    # uninitialised hidden states.
+    n_tokens_unpadded = n_tokens - 1
+    torch.manual_seed(0)
+    logits = torch.randn(
+        (n_tokens, n_expts_tot), dtype=torch.bfloat16, device="cuda"
+    ).detach()
+
+    # streaming_topk masks columns [n_expts_tot, N_EXPTS_PAD) with -inf, which
+    # is not strictly below every real logit: a real -inf ties with it and a
+    # negative NaN sorts under it, and ties break towards the larger column
+    # index. Once fewer than n_expts_act real columns outrank the placeholder,
+    # top-k elects padded columns and returns expert ids >= n_expts_tot.
+    logits[n_tokens_unpadded:, :] = -float("inf")
+    logits[n_tokens_unpadded:, 0] = float("inf")
+    logits[n_tokens_unpadded:, 1] = float("nan")
+    logits[n_tokens_unpadded:, 2] = -float("nan")
+
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        HIST_BLOCK_M=hist_block_m,
+    )
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert bitmatrix.shape[0] == n_tokens
+
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
