@@ -54,8 +54,10 @@ from ._mqa_logits_common import (
     DEFAULT_COMPILE_HINTS,
     Vec,
     device_cu_count,
+    load_pack_kv,
     load_pack_v8i32,
-    load_pack_v8i32_preshuffle,
+    make_kv_key_view,
+    make_kv_scale_view,
     make_out_row_view,
     mfma_head_reduce,
     udiv,
@@ -197,8 +199,8 @@ def _build_paged_kernel(
         # offset, not the buffer base, since a per-lane base cannot ride a
         # scalar buffer descriptor. That offset stays i32, hence the host's
         # pool-size assert.
-        kv_i32 = GTensor(KV_cache, dtype=T.i32, shape=(-1,))
-        kv_f32 = GTensor(KV_cache, dtype=T.f32, shape=(-1,))
+        kv_key = make_kv_key_view(KV_cache, D, KVB, index_dim, preshuffle)
+        kv_scale_v = make_kv_scale_view(KV_cache, D, KVB, index_dim)
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cl_t = GTensor(context_lens, dtype=T.i32, shape=(-1,))
         ind_t = GTensor(kv_indices, dtype=T.i32, shape=(-1,))
@@ -249,9 +251,6 @@ def _build_paged_kernel(
         tile_lo_col = pid_split_kv * split_cols
         tile_hi_col = arith.minsi(_to_raw(tile_lo_col + split_cols), _to_raw(full_end))
         ctx_m1 = context_length - 1
-        # Block-flat block byte-stride (KVB tokens per physical block);
-        # loop-invariant, so hoist it out of the per-column gather below.
-        block_byte_stride = fx.Int32(KVB) * index_dim
 
         for iv in scf.for_(
             _to_raw(fx.Index(tile_lo_col)),
@@ -269,29 +268,15 @@ def _build_paged_kernel(
                 # fold away on their own. Deliberately no Python `if` for that
                 # case: the FlyDSL AST rewriter would turn it into a runtime
                 # scf.if and drop the branch-local addresses.
-                block_idx = udiv(col_c, KVB)
                 tok_in_block = umod(col_c, KVB)
-                ind_off = pid_batch * max_block_len + block_idx
+                ind_off = pid_batch * max_block_len + udiv(col_c, KVB)
                 physical = fx.Int32(ind_t[ind_off])
-                block_byte_base = physical * block_byte_stride
 
-                # Compile-time branch: preshuffle only swaps the intra-block
-                # key-byte offset, leaving the scale gather below unchanged.
-                b_col = [None] * K_STEPS
-                if preshuffle:
-                    for kk in range_constexpr(K_STEPS):
-                        b_col[kk] = load_pack_v8i32_preshuffle(
-                            kv_i32, block_byte_base, tok_in_block, D, kk, lane8
-                        )
-                else:
-                    key_byte = block_byte_base + tok_in_block * D
-                    for kk in range_constexpr(K_STEPS):
-                        byte_base_b = key_byte + kk * MFMA_K
-                        b_col[kk] = load_pack_v8i32(kv_i32, byte_base_b, lane8)
-
-                # Co-packed per-token f32 scale (block-flat: after the KVB keys).
-                scale_byte = block_byte_base + (KVB * D) + tok_in_block * 4
-                kv_scale = _to_raw(fx.Float32(kv_f32[udiv(scale_byte, 4)]))
+                b_col = [
+                    load_pack_kv(kv_key, physical, tok_in_block, kk, lane_div_N)
+                    for kk in range_constexpr(K_STEPS)
+                ]
+                kv_scale = _to_raw(fx.Float32(kv_scale_v[physical, tok_in_block]))
                 if scale_mul != 1.0:
                     kv_scale = arith.MulFOp(
                         kv_scale, scale_mul_c, fastmath=fm_fast

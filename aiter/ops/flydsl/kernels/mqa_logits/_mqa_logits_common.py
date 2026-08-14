@@ -94,31 +94,52 @@ def load_pack_v8i32(i32_view, byte_off_i32, lane8):
     return Vec.from_elements([i64_0, i64_1, i64_2, i64_3], fx.Int64).bitcast(fx.Int32)
 
 
-def load_pack_v8i32_preshuffle(
-    i32_view, block_byte_base, tok_in_block, head_size, kk_step, lane8
-):
-    """Same operand as ``load_pack_v8i32``, from the ``shuffle_weight(16,16)``
-    layout the production path stores. Element (token c, hidden h) of a block
-    sits at ``(c//16)*(D*16) + (h//16)*256 + (c%16)*16 + (h%16)``, the inverse
-    of the host permute. Only the ``KVB*D`` data section is shuffled; the f32
-    scale tail stays token-ordered, so the scale gather is unchanged.
+def make_kv_key_view(kv_cache, head_size, kv_block_size, index_dim, preshuffle):
+    """Dword view of the co-packed KV keys over the gather's own axes:
+    ``(block, token//16, token%16, K-step, sub-group, lane half)``.
+
+    The two data layouts differ only in this stride vector -- block-flat puts
+    token c at ``c*D``, shuffle_weight(16,16) at ``(c//16)*16D + (c%16)*16``
+    with hidden groups every 256B -- so Preshuffle is a layout, not a second
+    gather path. index_dim is a multiple of 4, so the block stride divides.
     """
     D = head_size
-    # Loop-invariant across the four hidden groups, so hoisted out of the load.
-    c_hi = udiv(tok_in_block, 16)
-    c_lo = umod(tok_in_block, 16)
-    base = block_byte_base + c_hi * (D * 16) + c_lo * 16 + lane8
+    blk = udiv(fx.Int32(kv_block_size) * index_dim, 4)
+    stride = (
+        (blk, D * 4, 4, 256, 64, 2) if preshuffle else (blk, D * 4, D // 4, 16, 4, 2)
+    )
+    return GTensor(kv_cache, dtype=T.i32, shape=(-1,) * 6, stride=stride)
 
-    def _load_i64(g):
-        v2 = i32_view.vec_load((udiv(base + g * 256, 4),), vec_size=2)
+
+def make_kv_scale_view(kv_cache, head_size, kv_block_size, index_dim):
+    """f32 ``(block, token)`` view of the co-packed scales. The tail follows the
+    KVB*D key bytes and is token-ordered in both layouts, so it folds into base.
+    """
+    return GTensor(
+        kv_cache,
+        dtype=T.f32,
+        shape=(-1, kv_block_size),
+        stride=(udiv(fx.Int32(kv_block_size) * index_dim, 4), 1),
+        base_offset=kv_block_size * head_size // 4,
+    )
+
+
+def load_pack_kv(key_view, physical, tok_in_block, kk_step, lane_div_N):
+    """vector<8xi32> B operand for one KV token and K-step. Layout-agnostic:
+    the view's strides carry the block-flat/preshuffle difference.
+    """
+    c_hi, c_lo = udiv(tok_in_block, 16), umod(tok_in_block, 16)
+    # Slice everything but `sub` first: that fixes the token's base offset once
+    # instead of re-deriving it inside each of the four loads.
+    sub_view = key_view[physical, c_hi, c_lo, kk_step, None, lane_div_N]
+
+    def _load_i64(sub):
+        v2 = sub_view.vec_load((sub,), vec_size=2)
         return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
-    g0 = kk_step * 4  # first hidden-16 group of this MFMA K-step
-    i64_0 = _load_i64(g0 + 0)
-    i64_1 = _load_i64(g0 + 1)
-    i64_2 = _load_i64(g0 + 2)
-    i64_3 = _load_i64(g0 + 3)
-    return Vec.from_elements([i64_0, i64_1, i64_2, i64_3], fx.Int64).bitcast(fx.Int32)
+    return Vec.from_elements(
+        [_load_i64(sub) for sub in range_constexpr(4)], fx.Int64
+    ).bitcast(fx.Int32)
 
 
 def make_out_row_view(logits, stride_i64, row_i32):
