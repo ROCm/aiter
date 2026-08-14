@@ -89,11 +89,13 @@ the FlyDSL cold harness.
 - [x] Provenance line goes to **stderr** (commit `62e30c9098`, cold/iters/rotate, `format`,
       mechanism), keeping stdout a clean parseable CSV. Smoke-tested both modes.
 
-#### A3 — expand the CK B-set to cover FlyDSL's  [ ]
-- [ ] Run CK with `CK_WD_BATCHES="1,2,4,8,32"` (env already supported; no cpp change) so
-      B=32 has a peer for the join.
-- [ ] Confirm each B passes CK's `IsSupportedArgument` for all shapes/kernels (skip-print if
-      not) and that B=32 doesn't OOM once the A1 cold flush/rotate buffers are added.
+#### A3 — expand the CK B-set to cover FlyDSL's  [x] DONE (2026-08-14)
+- [x] `CK_WD_BATCHES="1,2,4,8,32"` (env-only, no cpp change) — B=32 now has a peer.
+- [x] Confirmed **every** `shape × B × kernel` cell prints for B∈{1,2,4,8,32}: 75/75 rows
+      (15 per B) in both the warm and cold sweeps *and* in CSV mode, so no
+      `IsSupportedArgument` skips. B=32 is OOM-free with the A1 rotation (rotation only adds
+      a KB router buffer; verified DeepSeek B=32 earlier).
+- [ ] (C1) Ensure `compare.py` joins on the full B set so every FlyDSL row has a CK peer.
 
 #### A4 — extend the CK cpp with a gate_up FP4 bench  [ ]
 - [ ] Add `GUProbFP4 = WarpDecodeGateUpProblem<bf16_t, pk_fp4_t, ...>` + kernel alias and a
@@ -274,3 +276,6 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   µs, provenance on stderr) alongside the default pretty table; smoke-tested both.
 - 2026-08-14 — **D1 refined.** Adopted flat `iters=1000` (cold≥15) for of-record numbers
   (full sweep ~11 s; clears the fastest cell within ~1.3%), smaller default for dev runs.
+- 2026-08-14 — **A3 done.** Confirmed B∈{1,2,4,8,32} fully covered (75/75 cells, table +
+  CSV), env-only, no `IsSupportedArgument` skips, no OOM at B=32. Remaining sub-item is the
+  `compare.py` full-B join (belongs to C1).
