@@ -101,6 +101,23 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     // cost. Going higher needs the panel refilled in K chunks, not a bigger
     // buffer. Both the device guard and the launcher check against this, so an
     // unsupported K raises instead of running a kernel that writes nothing.
+    //
+    // That arithmetic is this traits' -- the 151,680 is kid158/196, and the
+    // 2*(B_M+B_N)*B_K staging it turns on is this pipeline's double buffer. The
+    // two traits below copy the constant, and for them it is loose rather than
+    // tight: their staging is different and the panel scales with B_M, so a
+    // B_M=128 wave8 kid measures ~59,000 bytes at K=8192 and has room for
+    // ~111,000 of per-split K. Measured per kid by reading
+    // .group_segment_fixed_size out of the built code objects. Raising it there is
+    // what would let a panel kid run at split_k=1 on large-K machine-filling
+    // shapes, worth 17-25% over the shuffle_scale kid that owns that column
+    // today -- but the panel array is sized from this constant and not from the
+    // runtime K, so a raise costs LDS at every K.
+    // It is free only where the CU was not going to give the kernel a second
+    // workgroup anyway -- WG_PER_CU==1 is the declaration, not the answer, and a
+    // 256-thread workgroup that fits twice loses a fifth of its throughput at
+    // machine-filling M when the panel pushes it past half the CU's LDS. The
+    // wave8 traits below budgets against that residency for exactly this reason.
     static constexpr int SF_PRELOAD_K_MAX = 8192;
 
     // B source layout: row-major [N, K] (false) vs shuffle_weight(w, (16,16))
@@ -324,6 +341,13 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // caller cannot distinguish from a GEMM that produced zeros, so launchers
     // check the same bound and raise instead. Split-K raises the reach: the
     // panel only has to cover one split's iterations.
+    //
+    // Inherited, not derived from this traits' own budget, and loose for most of
+    // it: prefetch_k_iter below already spends max_lds_size_per_wg on staging,
+    // so the panel lives in that floor division's remainder, which varies with
+    // B_M and B_K. Measured, kid324/326 have 1.7-3.5 KiB spare (the bound is
+    // real for them) while kid336/342 have 52-109 KiB (it is 13-27x loose). See
+    // the base traits' SF_PRELOAD_K_MAX note.
     static constexpr int SF_PRELOAD_K_MAX = 8192;
     // B scale groups spanned by one N-wave's columns. The consumer N-waves read
     // blocked column ranges (nbc, and the matching SPLIT_N_STORE), so wave w owns
@@ -628,12 +652,9 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
 
     static constexpr int SCALES_PER_BK = B_K / GROUP_K;
     static constexpr int N_SCALE_GROUPS = (B_N + GROUP_N - 1) / GROUP_N;
-    // Largest per-split K the LDS scale panels cover, mirroring the pipeline's
-    // SFA_K_MAX. Past it the kernel returns without writing anything, which a
-    // caller cannot tell apart from a GEMM that produced zeros, so the launcher
-    // checks the same bound and raises. Split-K extends the reach: a panel only
-    // has to hold one split's iterations.
-    static constexpr int SF_PRELOAD_K_MAX = 8192;
+    // SF_PRELOAD_K_MAX is defined below, once prefetch_k_iter is known -- it is
+    // derived from the LDS the staging leaves over rather than being a constant.
+    //
     // Every wave owns a contiguous COM_REP_N*W_N column range, so it reads only
     // the B scale groups that range spans -- one group when the range is narrower
     // than GROUP_N (T_N=4), several when it is wider.
@@ -665,6 +686,84 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     // the reachable A lead is two tiles whatever the ring holds.
     static constexpr int prefetch_k_iter = prefetch_k_iter_budget > 3 ? 3 : prefetch_k_iter_budget;
     static_assert(prefetch_k_iter >= 3, "the pipeline requires at least 3 LDS prefetch slots");
+
+    // Largest per-split K the LDS scale panels cover. Past it the kernel returns
+    // without writing anything, which a caller cannot tell apart from a GEMM that
+    // produced zeros, so the launcher checks the same bound and raises. Split-K
+    // extends the reach: a panel only has to hold one split's iterations.
+    //
+    // Derived from this traits' own budget instead of the flat 8192 it used to
+    // copy from the base traits. That 8192 is justified by a 151,680-of-163,840
+    // measurement on kid158/196, whose staging is a 2*(B_M+B_N)*B_K double buffer
+    // -- a family this constant does not describe. Here the staging is
+    // prefetch_k_iter A slots, and the panel gets what that leaves: measured,
+    // kid205 sits at 59,012 bytes with room for ~111,000 of per-split K, so the
+    // flat bound was 13x short and kept it out of the split_k=1 column, which at
+    // K=16384 on a machine-filling shape is where the fastest kernel runs (the
+    // panel kids beat the shuffle_scale kid that owns that column today by
+    // 17-25% at every split_k they share).
+    //
+    // Rows are the worst case over the kernel's template parameters, which the
+    // traits cannot see: SHUFFLE_SCALE stages no panel at all and SFA_MPACK_GLOBAL
+    // stages only the SFB rows, so both get a bound computed for more than they
+    // use, which is safe in the direction that matters. The panel is
+    // SF_PANEL_ROWS * K / GROUP_K bytes, linear in K, hence the plain division.
+    //
+    // Capped, because the array is sized from this constant and not from the
+    // runtime K: without a cap a kid with a small panel would spend every spare
+    // byte of LDS on reach it will never be asked for. 32768 covers the largest K
+    // in the tuned table with room to spare.
+    // Reserve, because this arithmetic is not the allocator's. The panel array is
+    // alignas(16) after the staging array, and comparing this model against
+    // .group_segment_fixed_size in the built objects leaves it a few bytes short
+    // (58,960 modelled against 58,948 real on kid338). Without a reserve B_M=256
+    // lands at 163,812 of 163,840 and a byte of padding would overflow it.
+    //
+    // Budgeted against the residency the kernel already had rather than against
+    // max_lds_size_per_wg, because WG_PER_CU_ is a declared attribute and not
+    // what the CU schedules. kid203/kid205 are 256-thread workgroups at 246 VGPR,
+    // so two of them fit a CU on waves (2*246 <= 512) and LDS was the binding
+    // term: at the flat panel they sat at 59,012 bytes and got two, and spending
+    // the spare half on reach took them to 83,972, where 2*83,972 > 163,840 and
+    // only one is resident. Measured A/B over the 133-cell table, that costs
+    // 1.19x on kid203 and 1.20x on kid205 at m>=1536 -- and nothing at small M,
+    // where there are too few workgroups for the second slot to matter. The
+    // 512-thread kids are unaffected either way (kid168/kid202 1.011x, kid194 and
+    // kid175 1.000x): their footprint was already over half the CU, so the panel
+    // spends LDS no second workgroup was going to use.
+    //
+    // Preserving that residency still leaves most of the reach the derivation is
+    // for: kid205 lands at 30,464 of per-split K instead of 32,768, kid194 keeps
+    // its 30,848 because it was single-resident to begin with.
+    static constexpr int SF_PANEL_LDS_RESERVE = 256;
+    static constexpr int SF_PANEL_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
+    static constexpr int SF_PANEL_STAGING_LDS =
+        prefetch_k_iter * per_block_iter_lds_size;
+    static constexpr int SF_PANEL_FLAT_LDS =
+        SF_PANEL_STAGING_LDS + SF_PANEL_ROWS * (8192 / GROUP_K);
+    static constexpr int SF_PANEL_RESIDENT_WGS =
+        LDS_SIZE_TOTAL / SF_PANEL_FLAT_LDS < 1 ? 1 : LDS_SIZE_TOTAL / SF_PANEL_FLAT_LDS;
+    static constexpr int SF_PANEL_LDS_SHARE = LDS_SIZE_TOTAL / SF_PANEL_RESIDENT_WGS;
+    static constexpr int SF_PANEL_LDS_CEILING =
+        SF_PANEL_LDS_SHARE < max_lds_size_per_wg ? SF_PANEL_LDS_SHARE
+                                                 : max_lds_size_per_wg;
+    static constexpr int SF_PANEL_LDS_BUDGET =
+        SF_PANEL_LDS_CEILING - SF_PANEL_STAGING_LDS - SF_PANEL_LDS_RESERVE;
+    static constexpr int SF_PRELOAD_K_FIT =
+        (SF_PANEL_LDS_BUDGET / SF_PANEL_ROWS) * GROUP_K;
+    static constexpr int SF_PRELOAD_K_CAP = 32768;
+    static constexpr int SF_PRELOAD_K_MAX =
+        ((SF_PRELOAD_K_FIT < SF_PRELOAD_K_CAP ? SF_PRELOAD_K_FIT : SF_PRELOAD_K_CAP)
+         / B_K) * B_K;
+    // Never below what the flat constant already promised, so no kid loses reach.
+    static_assert(SF_PRELOAD_K_MAX >= 8192,
+                  "the scale panel no longer reaches the 8192 of per-split K the "
+                  "flat SF_PRELOAD_K_MAX promised; the staging above grew");
+    static_assert(SF_PANEL_STAGING_LDS
+                      + (long)SF_PANEL_ROWS * SF_PRELOAD_K_MAX / GROUP_K
+                  <= SF_PANEL_LDS_CEILING,
+                  "A staging plus the scale panel overflow the LDS share that "
+                  "keeps this kernel's workgroups resident");
 
     // All eight waves stage, but a group only has `slots` pieces to hand out, so
     // the waves that do not fit inside one group take a different group instead:
