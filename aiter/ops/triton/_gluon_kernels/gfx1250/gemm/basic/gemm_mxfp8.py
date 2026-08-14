@@ -206,6 +206,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     loop runs NUM_K_ITER - (NUM_BUFFERS - 1) times, then the epilogue drains.
     Requires NUM_K_ITER >= NUM_BUFFERS - 1 (the wrapper clamps NUM_BUFFERS).
 
+    Each stage reads its own operand tile out of LDS at the top of the stage,
+    rather than the previous stage prefetching it into a loop-carried value. The
+    carried form gave the ds_loads a stage of slack but kept a BLOCK_SIZE_M x
+    BLOCK_SIZE_K and a BLOCK_SIZE_K x BLOCK_SIZE_N fp8 tile live across the
+    whole body -- ~131 VGPRs at BLOCK 128x128x256, enough to push the allocator
+    to 1017 of 1024 and spill. Reading in place costs a few more s_wait_dscnt
+    and is worth it: measured 58.9 us vs 60.7 us at M512/N7168/K16384, with the
+    spill gone and no scratch allocated at all. Only that shape was measured.
+
     waves_per_eu is deliberately unread in the body. It is a HIPOptions field,
     so triton forwards it to the AMD backend, which emits it as the
     amdgpu-waves-per-eu LLVM function attribute (an occupancy hint); 0 means no
@@ -217,12 +226,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     B_SCALE_N_GROUP: gl.constexpr = 128
     B_SCALE_K_GROUP: gl.constexpr = 128
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_SIZE
-    # cdiv, not //: BLOCK_SIZE_N is only constrained to a multiple of 16, so
-    # 16/32/64 all share a single scale row and must land on 1, not 0.
-    N_SCALE_GROUP: gl.constexpr = (
-        BLOCK_SIZE_N + B_SCALE_N_GROUP - 1
-    ) // B_SCALE_N_GROUP
-
     # ---- A-scale staging in LDS ----
     # The scale bytes a CTA needs for a whole K span are tiny next to the operand
     # tiles (K bytes at BLOCK_SIZE_M == A_SCALE_K_GROUP == 128, so 16 KiB at
@@ -430,16 +433,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    slot_c = num_computes % NUM_BUFFERS
-    cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
-    cur_b = depreshuffle_b(
-        tdm_smem_b.index(slot_c),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-    ).load(layout=dot_b_layout)
-
     # ---------------- Main loop ----------------
     for _ in range(NUM_K_ITER - (NUM_BUFFERS - 1)):
+        slot_c = num_computes % NUM_BUFFERS
+        cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
+        cur_b = depreshuffle_b(
+            tdm_smem_b.index(slot_c),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+        ).load(layout=dot_b_layout)
         if A_SCALE_IN_LDS:
             cur_as = _gather_scale_tile(
                 as_slab.permute((1, 0)),
@@ -495,18 +497,17 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
-
-        next_slot = (num_computes + 1) % NUM_BUFFERS
-        cur_a = tdm_smem_a.index(next_slot).load(layout=dot_a_layout)
-        cur_b = depreshuffle_b(
-            tdm_smem_b.index(next_slot),
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-        ).load(layout=dot_b_layout)
         num_computes += 1
 
     # ---------------- Epilogue ----------------
     for i in gl.static_range(NUM_BUFFERS - 2):
+        slot_c = num_computes % NUM_BUFFERS
+        cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
+        cur_b = depreshuffle_b(
+            tdm_smem_b.index(slot_c),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+        ).load(layout=dot_b_layout)
         if A_SCALE_IN_LDS:
             cur_as = _gather_scale_tile(
                 as_slab.permute((1, 0)),
@@ -548,16 +549,16 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
 
-        next_slot = (num_computes + 1) % NUM_BUFFERS
-        cur_a = tdm_smem_a.index(next_slot).load(layout=dot_a_layout)
-        cur_b = depreshuffle_b(
-            tdm_smem_b.index(next_slot),
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-        ).load(layout=dot_b_layout)
         num_computes += 1
 
     # ---------------- Final WMMA ----------------
+    slot_c = num_computes % NUM_BUFFERS
+    cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
+    cur_b = depreshuffle_b(
+        tdm_smem_b.index(slot_c),
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    ).load(layout=dot_b_layout)
     if A_SCALE_IN_LDS:
         cur_as = _gather_scale_tile(
             as_slab.permute((1, 0)),
