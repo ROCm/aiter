@@ -104,12 +104,13 @@ Host and shared code:
   metadata helpers.
 - `include/opus_moe_arch.cuh`: runtime architecture probe wrapper.
 - `include/opus_moe_host_impl.cuh`: host validation and launch selection.
-- `opus_moe.cu`: pybind-facing translation unit.
+- `opus_moe.cu`: pybind-facing host-only translation unit. It deliberately
+  does not include any device pipeline in its device pass.
 
 gfx950 code:
 
-- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers and BF16
-  generated manifest dispatch.
+- `include/gfx950/opus_moe_arch_gfx950.cuh`: lightweight gfx950 BF16 host
+  launch and dispatch.
 - `include/gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh`: shared
   token/topk route-output reduction.
 - `include/gfx950/opus_moe_stage2_utils_gfx950.cuh`: small gfx950 device
@@ -133,7 +134,7 @@ Python/JIT code:
   reduce wrapper.
 - `aiter/ops/opus/moe_stage2_a8w4_fused_adapter.py`: fused MoE CSV parsing and
   stage2 wrapper glue for A8W4.
-- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest generator.
+- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest/TU generator.
 - `opus_moe_common.py`: private BF16 metadata plus the A8W4 metadata bridge for
   manifest codegen.
 
@@ -143,7 +144,15 @@ Python/JIT code:
 `opus_moe_stage2_a8w4_manifest.h` into the JIT build blob. The first generated
 header is consumed by private BF16 dispatch source; the second is consumed by
 the A8W4 dispatch wrapper for
-`kid -> OpusMoeStage2A8W4DecodeShape -> launcher` cases.
+`kid -> effective_inter_dim -> launch specialization` cases.
+
+Host launch templates stay in their C++ dispatch headers and see only kernel
+forward declarations. The generator emits device-only shards: one A8W4 stage2
+shard per effective inter dim, one Stage1 shard per pipeline family, one
+route-reduce shard per specialized topk, and one private BF16 shard. Each shard
+uses explicit kernel instantiation. This keeps the exact specialization set and
+GPU ISA while allowing Ninja to compile the otherwise independent device work
+in parallel; do not include device pipelines from `opus_moe.cu`.
 
 A8W4 production selection should be done through the fused MoE tuned
 configuration by adding `opus_...` stage2 kernel names only for measured cases

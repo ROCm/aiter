@@ -2055,7 +2055,9 @@ namespace py = pybind11;
           py::arg("q_descale"),                                        \
           py::arg("k_descale"),                                        \
           py::arg("q_unquantized"),                                    \
-          py::arg("k_unquantized"));                                   \
+          py::arg("k_unquantized"),                                    \
+          py::arg("q_partial_amax"),                                   \
+          py::arg("k_partial_amax"));                                  \
     m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                 \
           &aiter::fused_qk_norm_rope_2way_fp8_perhead_quant,           \
           py::arg("q0"),                                               \
@@ -2081,18 +2083,22 @@ namespace py = pybind11;
           py::arg("q_descale"),                                        \
           py::arg("k_descale"),                                        \
           py::arg("q_unquantized"),                                    \
-          py::arg("k_unquantized"));                                   \
+          py::arg("k_unquantized"),                                    \
+          py::arg("q_partial_amax"),                                   \
+          py::arg("k_partial_amax"));                                  \
     m.def("v_2way_per_head_fp8_quant",                                 \
           &aiter::v_2way_per_head_fp8_quant,                           \
           py::arg("v0"),                                               \
           py::arg("v1"),                                               \
           py::arg("v_fp8"),                                            \
-          py::arg("v_descale"));                                       \
+          py::arg("v_descale"),                                        \
+          py::arg("v_amax"));                                          \
     m.def("v_1way_per_head_fp8_quant",                                 \
           &aiter::v_1way_per_head_fp8_quant,                           \
           py::arg("v"),                                                \
           py::arg("v_fp8"),                                            \
-          py::arg("v_descale"));
+          py::arg("v_descale"),                                        \
+          py::arg("v_amax"));
 
 #define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
     m.def("inverse_rope_group_quant",                  \
