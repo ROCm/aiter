@@ -3,12 +3,6 @@
 
 """Host dispatcher for the FlyDSL MXFP4/MXFP6/MXFP8 preshuffle GEMM (gfx950 MFMA).
 
-Wraps the self-contained ``@flyc.jit launch_gemm`` in
-``aiter/ops/flydsl/kernels/mxscale_preshuffle.py``. ``launch_gemm`` already caches
-and dispatches per distinct Constexpr config (N, K, tile_*, a_dtype, b_dtype,
-out_dtype, batch, strides, waves_per_eu), so this layer only marshals torch
-tensors to raw pointers via ``tensor_shim.ptr_arg`` and forwards the config.
-
 Operand convention (matches the kernel's host preshuffle):
     A       : [M, K]   row-major, NOT preshuffled  (fp8/fp6 = 1 byte/code, fp4 = 2 codes/byte)
     B       : preshuffled via aiter.ops.shuffle.shuffle_weight(., (16, 16))  (fp4 or fp8 weight)
@@ -21,11 +15,31 @@ Operand convention (matches the kernel's host preshuffle):
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
+
+@functools.cache
+def _gemm_exe(_cfg):
+    import flydsl.compiler as flyc
+
+    from .kernels.mxscale_preshuffle import launch_gemm
+
+    return flyc.jit(launch_gemm.func)
+
+
+@functools.cache
+def _reduce_exe(_cfg):
+    import flydsl.compiler as flyc
+
+    from .kernels.mxscale_preshuffle import launch_splitk_reduce
+
+    return flyc.jit(launch_splitk_reduce.func)
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -75,8 +89,7 @@ def flydsl_mxscale_preshuffle_gemm(
             "flydsl is not available; cannot run mxscale_preshuffle GEMM"
         )
 
-    from .kernels.mxscale_preshuffle import launch_gemm
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
     if a_dtype not in ("fp4", "fp6", "fp8"):
@@ -129,51 +142,9 @@ def flydsl_mxscale_preshuffle_gemm(
                 f"K/split_k ({k_per_split}) must be a multiple of tile_k and 256"
             )
 
-    if split_k == 1:
-        launch_gemm(
-            ptr_arg(Out),
-            ptr_arg(A),
-            ptr_arg(B),
-            ptr_arg(a_scale),
-            ptr_arg(b_scale),
-            M,
-            N,
-            st,
-            N,
-            K,
-            int(tile_m),
-            int(tile_n),
-            int(tile_k),
-            a_dtype,
-            out_dtype,
-            b_dtype,
-            1,  # batch
-            -1,  # a_row_stride
-            -1,  # a_batch_stride
-            -1,  # sca_row_stride
-            -1,  # sca_batch_stride
-            -1,  # c_row_stride
-            -1,  # c_batch_stride
-            int(waves_per_eu),
-            int(xcd_swizzle),
-            1,  # k_batch
-            bs_mode,  # blockscale
-        )
-        return Out
-
-    # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
-    from .kernels.mxscale_preshuffle import launch_splitk_reduce
-
-    tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
-    launch_gemm(
-        ptr_arg(tmp),
-        ptr_arg(A),
-        ptr_arg(B),
-        ptr_arg(a_scale),
-        ptr_arg(b_scale),
-        M,
-        N,
-        st,
+    # Constexpr tail of launch_gemm -- the same for the direct and the split-K launch
+    # apart from k_batch, and it doubles as the per-config compiled-kernel cache key.
+    cfg = (
         N,
         K,
         int(tile_m),
@@ -183,10 +154,10 @@ def flydsl_mxscale_preshuffle_gemm(
         out_dtype,
         b_dtype,
         1,  # batch
-        -1,  # a_row_stride
-        -1,  # a_batch_stride
-        -1,  # sca_row_stride
-        -1,  # sca_batch_stride
+        -1,  # a_row_stride     ) each <0 keeps the contiguous
+        -1,  # a_batch_stride   ) [B,M,*] default; this op never
+        -1,  # sca_row_stride   ) overrides them, the batched
+        -1,  # sca_batch_stride ) callers do
         -1,  # c_row_stride
         -1,  # c_batch_stride
         int(waves_per_eu),
@@ -194,7 +165,39 @@ def flydsl_mxscale_preshuffle_gemm(
         split_k,  # k_batch
         bs_mode,  # blockscale
     )
-    launch_splitk_reduce(
+    gemm_exe = _gemm_exe(cfg)
+
+    if split_k == 1:
+        _run_compiled(
+            gemm_exe,
+            ptr_arg(Out),
+            ptr_arg(A),
+            ptr_arg(B),
+            ptr_arg(a_scale),
+            ptr_arg(b_scale),
+            M,
+            N,
+            st,
+            *cfg,
+        )
+        return Out
+
+    # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
+    tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    _run_compiled(
+        gemm_exe,
+        ptr_arg(tmp),
+        ptr_arg(A),
+        ptr_arg(B),
+        ptr_arg(a_scale),
+        ptr_arg(b_scale),
+        M,
+        N,
+        st,
+        *cfg,
+    )
+    _run_compiled(
+        _reduce_exe((split_k, out_dtype)),
         ptr_arg(tmp),
         ptr_arg(Out),
         (M * N) // 2,  # n_out_dw (2 out elems per dword)

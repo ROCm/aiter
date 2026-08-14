@@ -8,11 +8,8 @@ matches the host preshuffle (shuffle_weight_w4(.,16) + shuffle_scale_w4).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl._mlir.dialects import fly
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
     Constexpr,
@@ -31,8 +28,6 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
     make_kernel_name,
 )
-from aiter.ops.flydsl.kernels import buffer_ops, vector
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 _B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
@@ -676,16 +671,7 @@ def launch_gemm(
 # fused pass (load slabs -> fp32 add -> cast -> store).
 
 _REDUCE_BLOCK = 256
-
-
-def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype, *, i32):
-    """Truncate two f32 accumulators to bf16/f16 and pack into one dword."""
-    odt = T.bf16 if out_dtype == "bf16" else T.f16
-    lo_i16 = arith.bitcast(T.i16, arith.trunc_f(odt, acc_lo))
-    hi_i16 = arith.bitcast(T.i16, arith.trunc_f(odt, acc_hi))
-    lo_i32 = arith.extui(i32, lo_i16)
-    hi_i32 = arith.extui(i32, hi_i16)
-    return lo_i32 | (hi_i32 << arith.constant(16, type=i32))
+_REDUCE_VEC = 2  # out elems per thread == one dword (2 fp32 in per slab)
 
 
 @flyc.jit
@@ -703,6 +689,10 @@ def launch_splitk_reduce(
     arg_tmp: (split_k, M, N) fp32 contiguous. arg_out: (M, N) out_dtype. One output
     dword (= 2 out elems = 2 fp32 inputs per slab) per thread; grid.x covers all.
     """
+    if const_expr(out_dtype == "bf16"):
+        out_elem = BFloat16
+    else:
+        out_elem = Float16
 
     # Same reason as the GEMM kernel: keep the split-K reduce distinguishable per
     # config in a profile instead of a bare "reduce_kernel_<id>".
@@ -715,41 +705,50 @@ def launch_splitk_reduce(
         n_out_dw_i: fx.Int32,
         slab_dw_i: fx.Int32,
     ):
-        f32 = T.f32
-        i32 = T.i32
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
-        in_rsrc = ptr_rsrc(tmp)
-        out_rsrc = ptr_rsrc(out)
-        n_out_dw_v = ArithValue(n_out_dw_i)
-        slab_dw_v = ArithValue(slab_dw_i)
-        dw = ArithValue(bid) * arith.constant(_REDUCE_BLOCK, type=i32) + ArithValue(tid)
-        dw_valid = arith.cmpi(CmpIPredicate.ult, dw, n_out_dw_v)
-        _if = scf.IfOp(dw_valid)
-        with ir.InsertionPoint(_if.then_block):
-            e0 = dw * arith.constant(2, type=i32)  # first input element (fp32) index
-            acc_lo = ArithValue(arith.constant(0.0, type=f32))
-            acc_hi = ArithValue(arith.constant(0.0, type=f32))
-            for sk in range_constexpr(split_k):
-                sk_off = arith.constant(sk, type=i32) * slab_dw_v
-                raw = buffer_ops.buffer_load(
-                    in_rsrc, e0 + sk_off, vec_width=2, dtype=f32
-                )
-                lo = ArithValue(
-                    vector.extract(raw, static_position=[0], dynamic_position=[])
-                )
-                hi = ArithValue(
-                    vector.extract(raw, static_position=[1], dynamic_position=[])
-                )
-                acc_lo = acc_lo + lo
-                acc_hi = acc_hi + hi
-            packed = _pack_pair_from_f32(acc_lo, acc_hi, out_dtype, i32=i32)
-            buffer_ops.buffer_store(packed, out_rsrc, dw)
-            scf.YieldOp([])
+        frag_layout = fx.make_layout(_REDUCE_VEC, 1)
+        vt = fx.Int32(fx.block_idx.x) * fx.Int32(_REDUCE_BLOCK) + fx.Int32(
+            fx.thread_idx.x
+        )
+        slab_frags = slab_dw_i // fx.Int32(_REDUCE_VEC)
 
-    ctx = CompilationContext.get_current()
-    with ir.InsertionPoint(ctx.gpu_module_body):
-        pass
+        def _tiled(ptr, elem, num_records_bytes):
+            typed = fx.PointerType.get(
+                elem.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=_REDUCE_VEC * elem.width // 8,
+            )
+            buf = fx.rocdl.make_buffer_tensor(
+                fx.Tensor(
+                    fx.make_view(
+                        fx.inttoptr(typed, fx.Int64(fx.ptrtoint(ptr))),
+                        fx.make_layout(1 << 30, 1),
+                    )
+                ),
+                max_size=False,
+                num_records_bytes=num_records_bytes,
+            )
+            return fx.logical_divide(buf, frag_layout)
+
+        in_t = _tiled(
+            tmp, Float32, fx.Int64(slab_dw_i) * fx.Int64(split_k) * fx.Int64(4)
+        )
+        out_t = _tiled(out, out_elem, fx.Int64(n_out_dw_i) * fx.Int64(4))
+        in_copy = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), Float32)  # 2 x f32
+        out_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), out_elem)  # 2 x 16b
+
+        if vt < n_out_dw_i:
+            acc = Vec.filled(_REDUCE_VEC, 0.0, Float32)
+            for sk in range_constexpr(split_k):
+                frag = fx.make_rmem_tensor(frag_layout, Float32)
+                fx.copy_atom_call(
+                    in_copy,
+                    fx.slice(in_t, (None, vt + fx.Int32(sk) * slab_frags)),
+                    frag,
+                )
+                acc = acc + frag.load()
+            out_frag = fx.make_rmem_tensor(frag_layout, out_elem)
+            out_frag.store(acc.to(out_elem))
+            fx.copy_atom_call(out_copy, out_frag, fx.slice(out_t, (None, vt)))
 
     gx = (n_out_dw + (_REDUCE_BLOCK - 1)) // _REDUCE_BLOCK
     reduce_kernel(arg_tmp, arg_out, n_out_dw, slab_stride_dw).launch(
