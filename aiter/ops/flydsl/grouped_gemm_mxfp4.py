@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 
 import torch
@@ -15,15 +14,15 @@ from .kernels.tensor_shim import ptr_arg
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
 
-@functools.cache
-def _next_stage_prefetch() -> int:
-    """Returns whether cross-tile B/scale prefetch is enabled."""
-    return (
-        0
-        if os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH", "1").strip().lower()
-        in ("0", "off", "false", "no")
-        else 1
-    )
+def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
+    """Selects the environment override or the CSV setting."""
+    value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
+    if value is None:
+        return int(bool(csv_next_stage_prefetch))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_TDM_NEXT_STAGE_PREFETCH must be 0 or 1")
+    return int(value)
 
 
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
@@ -92,6 +91,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_wmma_rep=1,
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
+    next_stage_prefetch=0,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -145,7 +145,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
-        _next_stage_prefetch(),
+        _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
         float(situ_beta),
         float(situ_linear_beta),

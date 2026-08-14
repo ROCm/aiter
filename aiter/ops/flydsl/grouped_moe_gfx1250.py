@@ -438,6 +438,7 @@ def _grouped_a8w4_tdm_moe(
     num_buffers2=None,
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
+    next_stage_prefetch=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -623,6 +624,7 @@ def _grouped_a8w4_tdm_moe(
             quant_wmma_rep=wmma_rep2,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
             **_situ_kw,
         )
     else:
@@ -652,6 +654,7 @@ def _grouped_a8w4_tdm_moe(
             num_buffers=num_buffers,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -690,6 +693,7 @@ def _grouped_a8w4_tdm_moe(
         num_buffers=num_buffers2,
         cluster_n=cluster_n,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
+        next_stage_prefetch=next_stage_prefetch,
     )
 
     if kernel_bench_callable is not None:
@@ -725,6 +729,7 @@ def _grouped_a8w4_tdm_moe(
                         quant_wmma_rep=wmma_rep2,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
+                        next_stage_prefetch=next_stage_prefetch,
                         **_situ_kw,
                     ),
                 )
@@ -758,6 +763,7 @@ def _grouped_a8w4_tdm_moe(
                         num_buffers=num_buffers,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
+                        next_stage_prefetch=next_stage_prefetch,
                         **_situ_kw,
                     ),
                 )
@@ -789,6 +795,7 @@ def _grouped_a8w4_tdm_moe(
                     num_buffers=num_buffers2,
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
+                    next_stage_prefetch=next_stage_prefetch,
                 ),
             )
         )
@@ -1030,6 +1037,9 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["next_stage_prefetch"] = _as_int(
+                cfg_row.get("next_stage_prefetch"), 0
             )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
