@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
+  DOCKER_IMAGE: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 
 jobs:
   check-signal:
