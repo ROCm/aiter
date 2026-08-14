@@ -171,7 +171,21 @@ the FlyDSL cold harness.
 ### Group D — methodology, rigor, reproducibility
 
 #### D1 — align timing methodology  [ ]
-- [ ] Match warmup/iter budgets both sides (e.g. cold/warmup ≥15, timed ≥60–100).
+- [ ] **Use a flat `iters=1000` for the of-record numbers on both sides (measured 2026-08-14).**
+      Small-shape × low-B × FP4 cells are so fast (~10 µs) that fixed per-launch/event
+      overhead dominates and a flat `iters=30–100` gives noisy, *pessimistic* numbers, e.g.
+      Qwen `down_fp4_h2` B=1 read 1917 GB/s (original) / 2334 (iters=100) but converges to
+      ~2731 GB/s by iters≥1000; the big cells are already flat at iters=100. A per-cell
+      auto-scaling scheme is unnecessary at this scale: a full flat-1000 sweep (75 cells,
+      B∈{1,2,4,8,32}, cold=20) is only **~11 s** (a warm+cold pair ~23 s), because the few
+      slow cells (DeepSeek B=32 gate ~1.3 ms) dominate and 1000 iters on the fast cells costs
+      almost nothing. `iters=1000` clears the fastest cell we have (Qwen B=1 FP4 = 2696 GB/s
+      @1000, within ~1.3% of the 3000-iter asymptote). Keep warmup `cold≥15` (e.g. 20).
+      - Keep a smaller default (e.g. `CK_WD_ITERS=100`) for quick smoke/dev runs; pin
+        `iters=1000` in the one-command driver (D6) for the recorded table. Same on FlyDSL.
+      - Corollary: a low-iter run can invert fast pairs (it spuriously showed Qwen B=1 FP4
+        down *slower* than FP8; converged, FP4 is marginally faster in time). Do not trust
+        ratios from under-converged fast cells — treat unconverged cells as noisy in D5.
 - [ ] Document the residual stat difference (FlyDSL IQR-trimmed median vs CK mean); pick one
       to report or report both.
 - [ ] **Lock GPU clocks** (`rocm-smi` fixed SCLK, disable boost) for both runs; record the
