@@ -31,13 +31,13 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.vector import ReductionOp
 from flydsl.runtime.device import get_rocm_arch
 
-from . import dpp_utils
+from . import buffer_ops, dpp_utils
 from .utils import cdiv, exp2_amdgcn_scalar, exp2_f32_fast, rcp_f32
 
 MFMA_MNK = (
