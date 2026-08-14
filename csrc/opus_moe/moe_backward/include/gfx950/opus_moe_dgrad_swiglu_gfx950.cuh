@@ -421,21 +421,59 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         vector_t<D_C, T::VEC_C> dgate;
         vector_t<D_C, T::VEC_C> dup;
         float vec_dot = 0.0f;
+        auto pk_mul = [](opus::fp32x2_t a, opus::fp32x2_t b) {
+            opus::fp32x2_t out;
+            asm volatile(
+                "v_pk_mul_f32 %0, %1, %2"
+                : "=v"(out)
+                : "v"(a), "v"(b));
+            return out;
+        };
+        auto pk_fma = [](opus::fp32x2_t a,
+                         opus::fp32x2_t b,
+                         opus::fp32x2_t c) {
+            opus::fp32x2_t out;
+            asm volatile(
+                "v_pk_fma_f32 %0, %1, %2, %3"
+                : "=v"(out)
+                : "v"(a), "v"(b), "v"(c));
+            return out;
+        };
+        static_assert((T::VEC_C % 2) == 0);
 #pragma unroll
-        for(index_t j = 0; j < T::VEC_C; ++j)
+        for(index_t j = 0; j < T::VEC_C; j += 2)
         {
-            const float dh =
-                static_cast<float>(v_dh[i.value * T::VEC_C + j]);
-            const float g = static_cast<float>(gate[j]);
-            const float u = static_cast<float>(up[j]);
+            const opus::fp32x2_t dh = {
+                static_cast<float>(v_dh[i.value * T::VEC_C + j]),
+                static_cast<float>(v_dh[i.value * T::VEC_C + j + 1])};
+            const opus::fp32x2_t g = {
+                static_cast<float>(gate[j]),
+                static_cast<float>(gate[j + 1])};
+            const opus::fp32x2_t u = {
+                static_cast<float>(up[j]),
+                static_cast<float>(up[j + 1])};
             constexpr float log2e = 1.4426950408889634f;
-            const float exp_neg_g = __builtin_amdgcn_exp2f(-g * log2e);
-            const float sig = __builtin_amdgcn_rcpf(1.0f + exp_neg_g);
-            const float silu = g * sig;
-            dgate[j] = static_cast<D_C>(dh * u * (sig + silu * (1.0f - sig)));
-            dup[j] = static_cast<D_C>(dh * silu);
+            const opus::fp32x2_t sig = {
+                __builtin_amdgcn_rcpf(
+                    1.0f + __builtin_amdgcn_exp2f(-g[0] * log2e)),
+                __builtin_amdgcn_rcpf(
+                    1.0f + __builtin_amdgcn_exp2f(-g[1] * log2e))};
+            // Pair the algebraically shared terms for dSwiGLU and dscore:
+            // dup=dh*g*sig, dot=dup*u, dgate=dh*sig*u+dot*(1-sig).
+            const opus::fp32x2_t base = pk_mul(dh, sig);
+            const opus::fp32x2_t dup_f = pk_mul(base, g);
+            const opus::fp32x2_t dot = pk_mul(dup_f, u);
+            const opus::fp32x2_t base_u = pk_mul(base, u);
+            const opus::fp32x2_t one_minus_sig = {
+                1.0f - sig[0], 1.0f - sig[1]};
+            const opus::fp32x2_t dgate_f =
+                pk_fma(dot, one_minus_sig, base_u);
+            dgate[j] = static_cast<D_C>(dgate_f[0]);
+            dgate[j + 1] = static_cast<D_C>(dgate_f[1]);
+            dup[j] = static_cast<D_C>(dup_f[0]);
+            dup[j + 1] = static_cast<D_C>(dup_f[1]);
             if constexpr(WRITE_DSCORE)
-                vec_dot = fmaf(dh, silu * u, vec_dot);
+                vec_dot += dot[0] + dot[1];
         }
         g_dact.template store<T::VEC_C>(
             dgate, offsets[i.value], output_offset);
