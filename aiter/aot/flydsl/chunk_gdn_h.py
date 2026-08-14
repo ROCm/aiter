@@ -782,7 +782,7 @@ _KERNEL_SPECS: dict[str, _KernelSpec] = {
 }
 
 
-def main(argv: list[str] | None = None, *, default_kernel: str = "all"):
+def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile FlyDSL chunk-gated-delta-h kernels "
         "from the offline-tuned csv tables",
@@ -791,7 +791,7 @@ def main(argv: list[str] | None = None, *, default_kernel: str = "all"):
     parser.add_argument(
         "--kernel",
         choices=(*_KERNEL_SPECS, "all"),
-        default=default_kernel,
+        default="all",
         help="Which K5 compiled product to build (default: %(default)s).",
     )
     parser.add_argument(
@@ -815,7 +815,7 @@ def main(argv: list[str] | None = None, *, default_kernel: str = "all"):
         action="store_true",
         help="Print the expanded job list without compiling anything.",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     kernels = tuple(_KERNEL_SPECS) if args.kernel == "all" else (args.kernel,)
     if args.csv and len(kernels) > 1:
@@ -894,11 +894,6 @@ def main(argv: list[str] | None = None, *, default_kernel: str = "all"):
         print("All compilations succeeded. Cache is ready.")
 
     sys.exit(exit_code)
-
-
-def main_mfma16_hip(argv: list[str] | None = None):
-    """Entry point kept for ``python -m aiter.aot.flydsl.chunk_gdn_h_mfma16_hip``."""
-    main(argv, default_kernel="mfma16_hip")
 
 
 if __name__ == "__main__":
