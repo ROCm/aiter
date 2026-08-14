@@ -3,17 +3,15 @@
 
 """Correctness sweep for the FlyDSL paged FP8 MQA-logits (decode) kernel.
 
-Mirrors the aiter-op-test standard used by ``test_flydsl_fp8_mqa_logits.py`` and
-the paged benchmark ``op_tests/op_benchmarks/triton/bench_deepgemm_attention.py``.
-The correctness reference is a torch port of vLLM's ``fp8_paged_mqa_logits_torch``
-(dequantizes the co-packed fp8 cache and applies the causal mask); it is copied
-here so the test does not depend on vLLM. Correctness gate: exact ``-inf``-mask
-match + ``calc_diff < 1e-3`` (tolerances are NOT widened).
+The reference is a torch port of vLLM's ``fp8_paged_mqa_logits_torch``, copied
+here so the test does not depend on vLLM. Gate: exact ``-inf``-mask match plus
+``calc_diff < 1e-3``, tolerances NOT widened.
 """
 
 import argparse
 import itertools
 import random
+from typing import NamedTuple
 
 import aiter
 import pandas as pd
@@ -46,11 +44,8 @@ def calc_diff(x, y):
 
 
 def kv_cache_cast_to_fp8(x, fp8_dtype):
-    """Co-pack a bf16 KV cache into the fp8+scale byte layout (KVBlockSize>=1).
-
-    Layout per block-row: KVBlockSize*head_dim fp8 bytes, then KVBlockSize f32
-    (4-byte) per-token scales. No 16B padding (Phase 1). Mirrors the paged
-    benchmark's builder.
+    """Co-pack a bf16 KV cache into the fp8+scale byte layout: per block-row,
+    KVBlockSize*head_dim fp8 bytes then KVBlockSize f32 scales, no padding.
     """
     num_blocks, block_size, num_heads, head_dim = x.shape
     assert num_heads == 1
@@ -72,14 +67,10 @@ def kv_cache_cast_to_fp8(x, fp8_dtype):
 
 
 def preshuffle_kv_data(kv_cache_fp8, head_dim):
-    """Reorder the fp8 data section into the production ``Preshuffle`` layout.
-
-    Applies ``shuffle_weight(layout=(16,16))`` to the per-block ``KVB*head_dim``
-    fp8 key bytes (reshaped ``[num_blocks, KVBlockSize, head_dim]``) and leaves
-    the co-packed f32 scale tail untouched -- exactly what the production
-    ``deepgemm_fp8_paged_mqa_logits`` benchmark builds for ``Preshuffle=True``.
-    The torch oracle still reads the *unshuffled* cache (the reference is
-    layout-agnostic), so this shuffled copy is fed only to the kernel.
+    """Apply ``shuffle_weight(layout=(16,16))`` to the per-block fp8 key bytes,
+    leaving the co-packed f32 scale tail alone -- the production Preshuffle
+    layout. Only the kernel gets this copy; the oracle reads the unshuffled
+    cache, since the reference is layout-agnostic.
     """
     from aiter.ops.shuffle import shuffle_weight
 
@@ -108,14 +99,12 @@ def ref_fp8_paged_mqa_logits(
     fp8_dtype,
     block_size=1,
 ):
-    """Torch reference (vectorized port of vLLM ``fp8_paged_mqa_logits_torch``).
+    """Torch reference, vectorized port of vLLM ``fp8_paged_mqa_logits_torch``::
 
-    Dequantizes the **block-flat** co-packed fp8 cache and computes:
         logits[b*next_n+n, p] = sum_h ReLU(<q[b,n,h,:], K_deq(p)>) * weights[.., h]
-    with the causal mask ``p <= context_len - next_n + n``. Logical position ``p``
-    resolves to physical ``(block, tok) = (block_tables[b, p//KVB], p%KVB)`` and
-    the block-flat block groups all ``KVB`` fp8 key rows first, then all ``KVB``
-    f32 scales. ``block_size == 1`` degenerates to the per-token page table.
+
+    masked by ``p <= context_len - next_n + n``. Position ``p`` resolves to
+    ``(block_tables[b, p//KVB], p%KVB)`` in the block-flat co-packed cache.
     """
     batch_size, next_n, heads, dim = q.size()
     num_blocks = kv_cache_fp8.shape[0]
@@ -165,6 +154,17 @@ def ref_fp8_paged_mqa_logits(
     return logits
 
 
+class Inputs(NamedTuple):
+    q: torch.Tensor  # bf16, for the oracle
+    q_fp8: torch.Tensor  # quantized, for the kernel
+    kv_cache_fp8: torch.Tensor  # co-packed, unshuffled
+    weights: torch.Tensor
+    context_lens: torch.Tensor
+    block_tables: torch.Tensor
+    max_model_len: int
+    fp8_dtype: torch.dtype
+
+
 def _build_inputs(
     batch_size, next_n, heads, head_dim, avg_kv_length, q_dtype, block_size=1, seed=0
 ):
@@ -185,23 +185,27 @@ def _build_inputs(
     kv_cache = torch.randn((num_blocks, block_size, 1, head_dim), dtype=torch.bfloat16)
     weights = torch.randn((batch_size * next_n, heads), dtype=torch.float32)
 
-    # block table: one entry per KVBlockSize-token block, ceil(ctx / block_size).
-    max_block_len = (int(context_lens.max().item()) + block_size - 1) // block_size
-    block_tables = torch.zeros(
-        (batch_size, max_block_len), device="cuda", dtype=torch.int32
-    )
+    # Block table: one entry per KVBlockSize-token block, handed out of a
+    # shuffled pool in sequence order. The pool is sized from max_model_len, so
+    # sequences share blocks once the batch needs more than it holds -- harmless
+    # here (and extra coverage of block reuse), unlike in the benchmarks where
+    # it would shrink the measured working set into cache.
+    blocks_per_seq = (context_lens.to(torch.int64) + block_size - 1) // block_size
+    max_block_len = int(blocks_per_seq.max().item())
     pool = list(range(num_blocks))
     random.shuffle(pool)
-    counter = 0
-    for i in range(batch_size):
-        n_blk = (int(context_lens[i].item()) + block_size - 1) // block_size
-        for j in range(n_blk):
-            block_tables[i][j] = pool[counter % num_blocks]
-            counter += 1
+    pool_t = torch.tensor(pool, device="cuda", dtype=torch.int32)
+    col = torch.arange(max_block_len, device="cuda", dtype=torch.int64)
+    starts = torch.cumsum(blocks_per_seq, 0) - blocks_per_seq
+    block_tables = torch.where(
+        col[None, :] < blocks_per_seq[:, None],
+        pool_t[(starts[:, None] + col[None, :]) % num_blocks],
+        torch.zeros((), device="cuda", dtype=torch.int32),
+    ).to(torch.int32)
 
     q_fp8 = q.to(q_dtype)
     kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache, fp8_dtype)
-    return (
+    return Inputs(
         q,
         q_fp8,
         kv_cache_fp8,
@@ -227,19 +231,10 @@ def test_fp8_paged_mqa_logits(
     variant=None,
     chunk_k=128,
 ):
-    # split_kv == 0 -> auto (production host formula); else an explicit override
-    # (1 disables splitting). Both must be correctness-identical.
+    # split_kv == 0 -> auto; else an explicit override (1 disables splitting).
+    # Both must be correctness-identical.
     _split_kv = None if split_kv == 0 else split_kv
-    (
-        q,
-        q_fp8,
-        kv_cache_fp8,
-        weights,
-        context_lens,
-        block_tables,
-        max_model_len,
-        fp8_dtype,
-    ) = _build_inputs(
+    inp = _build_inputs(
         batch_size,
         next_n,
         heads,
@@ -251,39 +246,40 @@ def test_fp8_paged_mqa_logits(
 
     with torch.inference_mode():
         ref = ref_fp8_paged_mqa_logits(
-            q,
-            kv_cache_fp8,
-            weights,
-            context_lens,
-            block_tables,
-            max_model_len,
-            fp8_dtype,
+            inp.q,
+            inp.kv_cache_fp8,
+            inp.weights,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            inp.fp8_dtype,
             block_size=block_size,
         )
     ref_mask = ref == float("-inf")
 
     out = torch.full(
-        (batch_size * next_n, max_model_len),
+        (batch_size * next_n, inp.max_model_len),
         float("-inf"),
         device="cuda",
         dtype=torch.float32,
     )
 
-    # Oracle reads the unshuffled cache above; the kernel gets the preshuffled
-    # copy (same numbers, production shuffle_weight(16x16) data layout).
+    # Same numbers as the oracle's cache, in the production data layout.
     kv_cache_kernel = (
-        preshuffle_kv_data(kv_cache_fp8, head_dim) if preshuffle else kv_cache_fp8
+        preshuffle_kv_data(inp.kv_cache_fp8, head_dim)
+        if preshuffle
+        else inp.kv_cache_fp8
     )
 
     with torch.inference_mode():
         got = flydsl_fp8_paged_mqa_logits(
-            q_fp8,
+            inp.q_fp8,
             kv_cache_kernel,
-            weights,
+            inp.weights,
             out,
-            context_lens,
-            block_tables,
-            max_model_len,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
             Preshuffle=preshuffle,
             KVBlockSize=block_size,
             SplitKV=_split_kv,
@@ -339,56 +335,59 @@ _BASE = {
 _SHAPES = [(64, 64), (64, 128), (128, 64), (128, 128)]
 
 
+_AXES = (
+    "batch_size",
+    "next_n",
+    "heads",
+    "head_dim",
+    "avg_kv_length",
+    "q_dtype",
+    "split_kv",
+    "block_size",
+)
+
+
+def _c(**kw):
+    """A case: the base config with KVBlockSize=64, plus the overrides given."""
+    return {**_BASE, "block_size": 64, **kw}
+
+
 def default_cases():
-    """Curated case list; each entry is a kwargs dict for the test body."""
     cases = []
-    # Compile-time cross: one entry per distinct compiled kernel.
+    # Compile-time cross: one case per distinct compiled kernel. Preshuffle
+    # needs KVBlockSize % 16 == 0.
     for heads, head_dim in _SHAPES:
         for kvb in (1, 64):
-            cases.append({**_BASE, "heads": heads, "head_dim": head_dim, "block_size": kvb})
-        for kvb in (16, 64):  # Preshuffle needs KVBlockSize % 16 == 0
+            cases.append(_c(heads=heads, head_dim=head_dim, block_size=kvb))
+        for kvb in (16, 64):
             cases.append(
-                {
-                    **_BASE,
-                    "heads": heads,
-                    "head_dim": head_dim,
-                    "block_size": kvb,
-                    "preshuffle": True,
-                }
+                _c(heads=heads, head_dim=head_dim, block_size=kvb, preshuffle=True)
             )
     # Runtime axes, one at a time off the base.
-    for bs, nn in ((1, 1), (1, 2), (4, 2), (8, 1)):
-        cases.append({**_BASE, "batch_size": bs, "next_n": nn, "block_size": 64})
-    for kv in (128, 8192):  # 128 is shorter than one ChunkK tile
-        cases.append({**_BASE, "avg_kv_length": kv, "block_size": 64})
-    for sk in (1, 4):  # 1 disables splitting; base uses the auto formula
-        cases.append({**_BASE, "split_kv": sk, "block_size": 64})
-    cases.append({**_BASE, "q_dtype": "fn", "block_size": 64})  # FN->FNUZ Q patch
+    cases += [_c(batch_size=b, next_n=n) for b, n in ((1, 1), (1, 2), (4, 2), (8, 1))]
+    cases += [_c(avg_kv_length=kv) for kv in (128, 8192)]  # 128 < one ChunkK tile
+    cases += [_c(split_kv=sk) for sk in (1, 4)]  # 1 disables splitting
+    cases.append(_c(q_dtype="fn"))  # gfx942 FN->FNUZ Q patch
     # Interactions: SplitKV against the context length it partitions, and
-    # against the preshuffled layout (which the old matrix never crossed).
-    cases.append({**_BASE, "avg_kv_length": 128, "split_kv": 4, "block_size": 64})
-    cases.append({**_BASE, "avg_kv_length": 8192, "split_kv": 1, "block_size": 64})
-    cases.append({**_BASE, "split_kv": 4, "block_size": 64, "preshuffle": True})
-    cases.append({**_BASE, "split_kv": 1, "block_size": 16, "preshuffle": True})
-    # Wave split and KV tile width. Neither was covered before -- every case ran
-    # the default variant at ChunkK=128 -- so a bug in the wave-to-column-tile
-    # assignment was invisible, being correct by construction at one wave per
+    # against the preshuffled layout, which the old matrix never crossed.
+    cases.append(_c(avg_kv_length=128, split_kv=4))
+    cases.append(_c(avg_kv_length=8192, split_kv=1))
+    cases.append(_c(split_kv=4, preshuffle=True))
+    cases.append(_c(split_kv=1, block_size=16, preshuffle=True))
+    # Wave split and KV tile width, neither covered before: a bug in the
+    # wave-to-column-tile assignment is correct by construction at one wave per
     # CTA. ChunkK/32 must be divisible by the variant's wave count.
-    for variant in ("paged_w2", "paged_w4"):
-        cases.append({**_BASE, "block_size": 64, "variant": variant})
-    cases.append({**_BASE, "block_size": 64, "chunk_k": 64, "variant": "paged_w2"})
-    cases.append({**_BASE, "block_size": 64, "chunk_k": 256, "variant": "paged_w4"})
-    cases.append({**_BASE, "block_size": 64, "chunk_k": 256})
-    cases.append(
-        {**_BASE, "block_size": 64, "preshuffle": True, "variant": "paged_w4"}
-    )
+    cases += [_c(variant=v) for v in ("paged_w2", "paged_w4")]
+    cases.append(_c(chunk_k=64, variant="paged_w2"))
+    cases.append(_c(chunk_k=256, variant="paged_w4"))
+    cases.append(_c(chunk_k=256))
+    cases.append(_c(preshuffle=True, variant="paged_w4"))
     return cases
 
 
 def exhaustive_cases():
-    """The original 7-way cartesian product, for release validation."""
-    cases = []
-    for (bs, nn), nh, hd, kv, qd, sk, kvb in itertools.product(
+    """The original 7-way cartesian product (870 cases), for release validation."""
+    prod = itertools.product(
         [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (8, 1)],
         [64, 128],
         [64, 128],
@@ -396,40 +395,23 @@ def exhaustive_cases():
         ["fnuz", "fn"],
         [0, 1, 4],
         [1, 64],
-    ):
-        cases.append(
-            {
-                "batch_size": bs,
-                "next_n": nn,
-                "heads": nh,
-                "head_dim": hd,
-                "avg_kv_length": kv,
-                "q_dtype": qd,
-                "split_kv": sk,
-                "block_size": kvb,
-            }
-        )
-    for bs, nn, nh, hd, kv, qd, kvb in [
-        (1, 1, 64, 128, 1024, "fnuz", 16),
-        (1, 2, 64, 128, 1024, "fnuz", 64),
-        (2, 1, 128, 128, 8192, "fnuz", 64),
-        (1, 1, 64, 64, 1024, "fnuz", 16),
-        (1, 1, 64, 128, 1024, "fn", 64),
-        (4, 2, 64, 128, 8192, "fnuz", 64),
-    ]:
-        cases.append(
-            {
-                "batch_size": bs,
-                "next_n": nn,
-                "heads": nh,
-                "head_dim": hd,
-                "avg_kv_length": kv,
-                "q_dtype": qd,
-                "block_size": kvb,
-                "preshuffle": True,
-            }
-        )
-    return cases
+    )
+    cases = [
+        dict(zip(_AXES, (bs, nn, nh, hd, kv, qd, sk, kvb)))
+        for (bs, nn), nh, hd, kv, qd, sk, kvb in prod
+    ]
+    # Preshuffle was covered by a hand-picked set rather than a full cross.
+    return cases + [
+        {**dict(zip(_AXES, (bs, nn, nh, hd, kv, qd, 0, kvb))), "preshuffle": True}
+        for bs, nn, nh, hd, kv, qd, kvb in [
+            (1, 1, 64, 128, 1024, "fnuz", 16),
+            (1, 2, 64, 128, 1024, "fnuz", 64),
+            (2, 1, 128, 128, 8192, "fnuz", 64),
+            (1, 1, 64, 64, 1024, "fnuz", 16),
+            (1, 1, 64, 128, 1024, "fn", 64),
+            (4, 2, 64, 128, 8192, "fnuz", 64),
+        ]
+    ]
 
 
 def main():
