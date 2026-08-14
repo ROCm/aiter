@@ -22,7 +22,6 @@ from flydsl.expr.typing import T, Vector as Vec
 from ..tensor_shim import _run_compiled
 
 from .fmha_utils import *  # constants, classes, prologue helpers
-from .fmha_utils import _ep_finish  # underscore name, not covered by star import
 
 
 def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
@@ -78,54 +77,44 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         actual_q_len = q_end_tok - q_start_tok
         actual_kv_len = k_end_tok - k_start_tok
 
-        _sk_elems = stride_k_seq >> 1
-        _sv_elems = stride_v_seq >> 1
-        _K_CFG = (1 << 16) | K_TDM_CONFIG
-        _V_CFG = (1 << 16) | V_TDM_CONFIG
+        # ── OOB descriptors for TDM K/V loads and D store ──
+        _sk_elems, _sv_elems = stride_k_seq >> 1, stride_v_seq >> 1
+        _K_CFG, _V_CFG = (1 << 16) | K_TDM_CONFIG, (1 << 16) | V_TDM_CONFIG
         k_oob_dg1 = TDM.build_oob_dg1_list(_K_CFG, QK_HDIM, _sk_elems, actual_kv_len, wave_id, dim0_stride=200)
         v_oob_dg1 = TDM.build_oob_dg1_list(_V_CFG, 128, _sv_elems, actual_kv_len, wave_id)
         q_remain_o = arith.maxsi(actual_q_len - m_start, arith.constant(0, type=T.i32))
         o_oob_dim1 = TDM.per_warp_oob_dim1(q_remain_o, wave_id, 32)
-        # ── Zero-fill guard (seqlen_k == 0) ──
+
+        # ── Zero-fill output when KV is empty (seqlen_k == 0) ──
         wg_valid = m_start < actual_q_len
-        need_zero = wg_valid & (actual_kv_len == 0)
-        if need_zero:
-            glbpz = glb_ptr_ty()
-            o_base_z = ptr_base_i64(ptr_O)
+        if wg_valid & (actual_kv_len == 0):
             tid_z = wave_id * WAVE_SIZE + lane_id
-            zero_v4 = fx.constant_vector(0, T.vec(4, T.i32))
             q_tok_z = q_start_tok + m_start + tid_z
-            valid_z = tid_z < q_remain_o
-            if valid_z:
-                o_addr_z = o_base_z + fx.Int64((by * stride_o_head + q_tok_z * stride_o_seq) * 2)
+            if tid_z < q_remain_o:
+                o_addr_z = ptr_base_i64(ptr_O) + fx.Int64((by * stride_o_head + q_tok_z * stride_o_seq) * 2)
                 for chunk_z in fx.range_constexpr(V_HDIM // 8):
-                    llvm_dialect.store(zero_v4, llvm_dialect.inttoptr(glbpz, o_addr_z + fx.Int64(chunk_z * 16)))
+                    llvm_dialect.store(fx.constant_vector(0, T.vec(4, T.i32)),
+                                      llvm_dialect.inttoptr(glb_ptr_ty(), o_addr_z + fx.Int64(chunk_z * 16)))
                 if const_expr(RETURN_LSE):
                     lse_addr_z = ptr_base_i64(ptr_LSE) + fx.Int64((q_tok_z * gdz + by) * 4)
-                    llvm_dialect.store(arith.constant(float("-inf"), type=T.f32), llvm_dialect.inttoptr(glbpz, lse_addr_z))
+                    llvm_dialect.store(arith.constant(float("-inf"), type=T.f32),
+                                      llvm_dialect.inttoptr(glb_ptr_ty(), lse_addr_z))
 
         if wg_valid & (actual_kv_len > 0):
-            # ── Prologue: Q load ──
-            q_tok = q_start_tok + bx * 128
-            q_offset = q_tok * stride_q_seq + by * stride_q_head
-            q_rsrc = buffer_ops.create_buffer_resource(ptr_Q, num_records_bytes=q_end_tok * stride_q_seq)
-            q_frags_raw = phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=q_offset)
-            rocdl.sched_barrier(0)
-            fpb = len(q_frags_raw[0])
-            pad = [None] * (Q_WMMA_PER_MSB - 2 * fpb)
-            q_frags = [[None] * Q_WMMA_PER_MSB for _ in range(NUM_MSB)]
-            q_frags[0] = q_frags_raw[0] + q_frags_raw[1] + pad
-            q_frags[2] = q_frags_raw[2] + q_frags_raw[3] + pad
+            # ── Prologue: Q load + address setup ──
+            q_frags = prologue_q_load_and_rearrange(
+                lane_id, wave_id, ptr_Q, stride_q_seq, by, stride_q_head,
+                q_start_tok, q_end_tok, bx)
             head_index = head_index_div(by, gqa)
             k_offset = k_start_tok * stride_k_seq + head_index * stride_k_head
             v_offset = k_start_tok * stride_v_seq + head_index * stride_v_head
-            k_a_base_i32 = extract_lds_base_i32(lds_alloc_k_a.get_base())
-            k_b_base_i32 = extract_lds_base_i32(lds_alloc_k_b.get_base())
-            v_a_base_i32 = extract_lds_base_i32(lds_alloc_v_a.get_base())
-            v_b_base_i32 = extract_lds_base_i32(lds_alloc_v_b.get_base())
+            k_a = extract_lds_base_i32(lds_alloc_k_a.get_base())
+            k_b = extract_lds_base_i32(lds_alloc_k_b.get_base())
+            v_a = extract_lds_base_i32(lds_alloc_v_a.get_base())
+            v_b = extract_lds_base_i32(lds_alloc_v_b.get_base())
             rocdl.sched_barrier(0)
-            kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_a_base_i32, v_a_base_i32)
-            kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_b_base_i32, v_b_base_i32)
+            kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_a, v_a)
+            kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_b, v_b)
             stride_k_32, stride_v_32 = stride_k_seq * 32, stride_v_seq * 32
             scale = arith.constant(1.4426950408889634, type=T.f32) * scalar_f
             sgpr_state = {"s_log2e_scl": scale, "s_log2e_scl_pair": fx.vector.broadcast(T.vec(2, T.f32), scale)}
@@ -141,7 +130,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                    "q_frags": q_frags, "sgpr_state": sgpr_state, "RETURN_LSE": RETURN_LSE}
             # ── Prologue: Tile 0 QK + softmax ──
             softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles, causal_offset, zero_v8f32 = prologue_tile0(
-                ctx, ty, q_frags, kv_lds_addrs_a, k_a_base_i32, v_a_base_i32,
+                ctx, ty, q_frags, kv_lds_addrs_a, k_a, v_a,
                 k_oob_dg1, v_oob_dg1, IS_CAUSAL, sgpr_state)
             tile_n_const = TILE_N
             ctx["tile_n_const"] = tile_n_const
@@ -156,13 +145,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             k_tile1_stride = tile_n_const * stride_k_seq
             k_tile1_offset = k_offset + k_tile1_stride
             k_tile1_oob_dg1 = TDM.build_oob_dg1_list(_K_CFG, QK_HDIM, _sk_elems, actual_kv_len - TILE_N, wave_id, dim0_stride=200)
-            TDM.load_k_only(ptr_K, k_tile1_offset, stride_k_seq, stride_k_32, wave_id, k_b_base_i32, oob_dg1_list=k_tile1_oob_dg1)
+            TDM.load_k_only(ptr_K, k_tile1_offset, stride_k_seq, stride_k_32, wave_id, k_b, oob_dg1_list=k_tile1_oob_dg1)
             rocdl.sched_barrier(0)
             kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
             init_args = build_init_args(
                 zero_v8f32, softmax_state_pro, sp_pairs_all_pro,
                 kv_tiles_init, all_su_sp_tiles,
-                k_b_base_i32, v_a_base_i32, k_a_base_i32, v_b_base_i32)
+                k_b, v_a, k_a, v_b)
 
             # ── Main KV Loop: non-causal tiles ──
             for tile_idx, iter_args, loop1_results in scf.for_(
@@ -184,18 +173,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 causal_n = tile_idx_i32 * tile_n_const - causal_offset
                 yield tile_iteration(ctx, tile_idx, iter_args, causal_n_start=causal_n)
 
-            # ── Epilogue: endtile + rescale + store ──
+            # ── Epilogue ──
             ep = unpack_loop_results(loop_results, lane_id)
             emit_void("s_wait_idle")
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
             if num_tiles >= 2:
-                endtile_pipeline(ctx, ty, ep, q_frags, sgpr_state, num_tiles, num_tiles_idx,
+                epilogue_endtile(ctx, ty, ep, q_frags, sgpr_state, num_tiles, num_tiles_idx,
                                  tile_n_const, causal_offset, IS_CAUSAL, _V_CFG, zero_v8f32)
             else:
-                _ep_finish(ctx, [[ep["o_tiles"][d][n] for n in range(N_PV_WMMA_N)] for d in range(NUM_MSB)],
-                           ep["partial_sp_pairs"], ep["exp_delta"],
-                           ep["v_cur_base"], list(ep["old_max"]), list(ep["local_max"]), list(ep["delta"]), list(ep["row_sums"]), ep["k_cur_base"])
+                epilogue_single_tile(ctx, ep)
 
     return fmha_fwd_kernel
 

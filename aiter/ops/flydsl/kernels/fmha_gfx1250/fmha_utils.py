@@ -1266,6 +1266,21 @@ _PSP_SIZE = NUM_MSB * N_SP_PAIRS
 _OFF_PSP_HI = _OFF_PSP + _PSP_SIZE
 _OFF_PED = _OFF_PSP_HI + _PSP_SIZE
 
+def prologue_q_load_and_rearrange(lane_id, wave_id, ptr_Q, stride_q_seq, by, stride_q_head,
+                                  q_start_tok, q_end_tok, bx):
+    """Load Q tile via buffer_load and rearrange fragments into WMMA layout."""
+    from aiter.ops.flydsl.kernels import buffer_ops
+    q_tok = q_start_tok + bx * 128
+    q_offset = q_tok * stride_q_seq + by * stride_q_head
+    q_rsrc = buffer_ops.create_buffer_resource(ptr_Q, num_records_bytes=q_end_tok * stride_q_seq)
+    q_frags_raw = phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=q_offset)
+    rocdl.sched_barrier(0)
+    fpb = len(q_frags_raw[0])
+    pad = [None] * (Q_WMMA_PER_MSB - 2 * fpb)
+    q_frags = [[None] * Q_WMMA_PER_MSB for _ in range(NUM_MSB)]
+    q_frags[0] = q_frags_raw[0] + q_frags_raw[1] + pad
+    q_frags[2] = q_frags_raw[2] + q_frags_raw[3] + pad
+    return q_frags
 def xcd_remap(raw_bx, raw_by, raw_bz, gdx, gdy, gdz):
     """Software XCD remap: flat wgid -> chunked assignment for K/V cache locality."""
     _NUM_XCDS = 8
@@ -1407,13 +1422,16 @@ def compute_num_tiles(actual_kv_len, actual_q_len, bx, tile_n_const, causal_offs
     return num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx
 
 
-def endtile_pipeline(ctx, ty, ep, q_frags, sgpr_state, num_tiles, num_tiles_idx,
+def epilogue_single_tile(ctx, ep):
+    """Epilogue for num_tiles == 1: call ep_finish directly (no endtile pipeline)."""
+    _ep_finish(ctx, ep["o_tiles"], ep["partial_sp_pairs"], ep["exp_delta"],
+               ep["v_cur_base"], list(ep["old_max"]), list(ep["local_max"]),
+               list(ep["delta"]), list(ep["row_sums"]), ep["k_cur_base"])
+def epilogue_endtile(ctx, ty, ep, q_frags, sgpr_state, num_tiles, num_tiles_idx,
                      tile_n_const, causal_offset, IS_CAUSAL, _V_CFG, zero_v8f32):
-    """Endtile: run fmha_pipeline on last tile + ep_finish (for num_tiles >= 2)."""
-    v_offset = ctx["v_offset"]
-    stride_v_seq = ctx["stride_v_seq"]
-    wave_id = ctx["wave_id"]
-    actual_kv_len = ctx["actual_kv_len"]
+    """Epilogue for num_tiles >= 2: run endtile pipeline + ep_finish."""
+    v_offset, stride_v_seq = ctx["v_offset"], ctx["stride_v_seq"]
+    wave_id, actual_kv_len = ctx["wave_id"], ctx["actual_kv_len"]
     et_sp_t = [[set_vgpr_bank(zero_v8f32, m)] for m in fx.range_constexpr(NUM_MSB)]
     et_sfx = make_softmax_state(ep["old_max"], ep["local_max"], ep["delta"], ep["row_sums"],
         sp_pairs_prev=[[ep["partial_sp_pairs"][m][i] for i in fx.range_constexpr(N_SP_PAIRS)]
