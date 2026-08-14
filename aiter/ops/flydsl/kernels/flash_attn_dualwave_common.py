@@ -746,12 +746,11 @@ class DualwaveSwpFp8Traits:
     LDS_SCOPE_NAMES: tuple[str, str, str, str]
     NEG_INF_F32_BITS: int
     LGKMCNT_0_ONLY: int
-    # Shuffled 5D KV-cache support (port-scope stage 4). KV_VECTORIZED selects
-    # the 5D shuffled K/V layout over the linear 4D one; KV_VEC_SIZE is the
-    # vectorization width (16 fp8 elements = one dwordx4). Both K and V
-    # loaders branch on KV_VECTORIZED as of Stage 3; both fields still key the
-    # cache (below) so a vectorized module can never alias a linear one under
-    # the same JIT key.
+    # Shuffled 5D KV-cache support. KV_VECTORIZED selects the 5D shuffled K/V
+    # layout over the linear 4D one; KV_VEC_SIZE is the vectorization width
+    # (16 fp8 elements = one dwordx4). Both K and V loaders branch on
+    # KV_VECTORIZED; both fields still key the cache (below) so a vectorized
+    # module can never alias a linear one under the same JIT key.
     KV_VECTORIZED: bool = False
     KV_VEC_SIZE: int = 16
 
@@ -799,9 +798,8 @@ class DualwaveSwpFp8Traits:
             self.BLOCK_Q,
             self.QREG,
             self.VDMA,
-            # Shuffled 5D KV-cache (stage 4): a vectorized module must never
-            # alias a linear one under the same JIT key, even though the
-            # vectorized loaders are not implemented yet (Stage 2/3).
+            # Shuffled 5D KV-cache: a vectorized module must never alias a
+            # linear one under the same JIT key.
             self.KV_VECTORIZED,
             self.KV_VEC_SIZE,
         )
@@ -837,15 +835,14 @@ def _make_dualwave_swp_fp8_traits(
     ``paged`` addresses KV through a block table instead of contiguously. Page
     size is not a parameter: it is structurally ``BLOCK_N`` (64), which is why
     the host pins ``_PAGED_PAGE_SIZE = 64``. ``kv_vectorized``/``kv_vec_size``
-    set the ``KV_VECTORIZED``/``KV_VEC_SIZE`` traits (and the cache tag); as of
-    Stage 3 of the shuffled-cache port the K and V loaders both branch on
-    ``KV_VECTORIZED`` and read the 5D-shuffled layout (``load_k`` address-only,
-    ``_stage_v_fp8_vectorized`` for all three V staging paths).
+    set the ``KV_VECTORIZED``/``KV_VEC_SIZE`` traits (and the cache tag); the K
+    and V loaders both branch on ``KV_VECTORIZED`` and read the 5D-shuffled
+    layout (``load_k`` address-only, ``_stage_v_fp8_coalesced`` for V staging).
 
     CTA width is fixed at 8 waves (``block_m = 256``): the fp8 V staging path
     distributes BLOCK_N rows over waves with a hardcoded literal 8
-    (``_stage_v_fp8_block`` / ``_stage_v_fp8_block_dma``), so anything else
-    would stage a partial V tile. Ring depth is fixed at 6 buffers: the BN128
+    (``_stage_v_fp8_block_dma``), so anything else would stage a partial V
+    tile. Ring depth is fixed at 6 buffers: the BN128
     body's prefetch distance is hardcoded to reach 4/5 buffers ahead
     (``_ring_wrap(a_buf + 4/5)`` in ``flash_attn_fp8_gfx950.py``), so fewer
     than 6 live buffers alias a buffer still being read (wrong output at 4,
@@ -1994,19 +1991,6 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
         return [fx.Index(fx.Int32(rocdl.readfirstlane(T.i32, h))) for h in handles]
 
 
-# Stage 5b: shuffled 5D fp8 V staging strategy.
-#   True  -> coalesced token-contiguous store (buffer_load_lds, no VGPR
-#            round-trip, no ds_write) into L_tok[d*BLOCK_N + token], with the
-#            token<->head_dim transpose moved entirely into the plain LDS read
-#            (_stage_v_fp8_coalesced + _load_v_fp8_coalesced).
-#   False -> the correctness-first byte-scatter (_stage_v_fp8_scatter +
-#            the ds_read_b64_tr_b8 reader in _load_v_fp8_block), kept for A/B
-#            and as a recoverable fallback until the coalesced path is proven.
-# Store and read MUST agree: this one flag drives both. Compile-time constant,
-# so `~/.flydsl/cache` must be cleared after flipping it.
-_V_LDS_COALESCED = True
-
-
 class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -2052,8 +2036,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             n_in_tile = self.n_in_warp * traits.NUM_WAVES + self.wave_id
             global_d = self.d_bucket * traits.VEC_KV + (d * traits.D_128B_SIZE)
             if const_expr(traits.KV_VECTORIZED):
-                # Shuffled 5D K cache (shuffled-cache-support-investigation,
-                # Stage 2, address-only): the linear path above fetches the
+                # Shuffled 5D K cache: the linear path above fetches the
                 # 16-element head-dim chunk at `global_d` for token
                 # `n_in_tile` from the row-major [.., block_size, head_dim]
                 # layout. Under the vectorized 5D layout the SAME chunk lives
@@ -2065,8 +2048,8 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 # baked into kv_gmem_elem_offset -- do not reuse that field
                 # here, it would double-apply the head term the wrong way and
                 # it is still needed unmodified by V's linear loaders. LDS
-                # write and MFMA read are untouched (Stage 0: byte-identical
-                # chunk, only the fetch address differs).
+                # write and MFMA read are untouched (byte-identical chunk,
+                # only the fetch address differs).
                 vec = traits.KV_VEC_SIZE
                 head_region_base = self.kv_head_idx * fx.Index(
                     traits.HEAD_DIM * traits.BLOCK_N
@@ -2085,7 +2068,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
 
     def load_v(self, tile_start, buf_id, page_id=None):
         if const_expr(self.traits.FP8_PV):
-            self._stage_v_fp8_block(tile_start, buf_id, page_id)
+            self._stage_v_fp8_block_dma(tile_start, buf_id, page_id)
         else:
             self._stage_vt_dequant_fp8(tile_start, buf_id)
 
@@ -2103,63 +2086,6 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             p = buffer_ops.create_llvm_ptr(off, address_space=3)
             llvm.StoreOp(as_mlir_value(zero), p, alignment=16)
 
-    def _stage_v_fp8_block(self, tile_start, buf_id, page_id=None):
-        traits = self.traits
-        if const_expr(traits.VDMA):
-            return self._stage_v_fp8_block_dma(tile_start, buf_id, page_id)
-        v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
-        buf_off = buf_id * v_tile_bytes
-        if const_expr(traits.KV_VECTORIZED):
-            # Non-DMA fp8 V staging feeds the same reader (_load_v_fp8_block) as
-            # the DMA path, so the vectorized token-major scatter targets the
-            # identical L_lin LDS layout. Dead under the shipped config (VDMA is
-            # always True, so the early return above fires); kept correct for
-            # parity with _stage_v_fp8_block_dma.
-            aligned_base = (
-                (self.lds_vt_base_idx + fx.Index(127)) // fx.Index(128)
-            ) * fx.Index(128)
-            self._stage_v_fp8_vectorized(
-                tile_start, buf_id, page_id, aligned_base, buf_off
-            )
-            return
-        n = self.wave_id * fx.Index(8) + self.lane // fx.Index(8)
-        d_block = self.lane % fx.Index(8)
-        v_div, _ = self._kv_src("v", tile_start, page_id)
-        src_elem = (
-            self.kv_gmem_elem_offset
-            + n * self.stride_kv_n_v
-            + d_block * fx.Index(16)
-            + self.tile_voffset(tile_start)
-        )
-        v16 = fly.copy_atom_call_ssa(
-            [Vec.make_type(4, fx.Int32)],
-            self.load_atom_128,
-            fx.slice(v_div, (None, fx.Int32(src_elem))),
-        )
-        n_i = fx.Int32(n)
-        w16 = n_i % fx.Int32(16)
-        c_add = (w16 >= fx.Int32(4)) & (w16 < fx.Int32(8))
-        c_sub = (w16 >= fx.Int32(8)) & (w16 < fx.Int32(12))
-        dest_n = (
-            n_i
-            + c_add.select(fx.Int32(4), fx.Int32(0))
-            - c_sub.select(fx.Int32(4), fx.Int32(0))
-        )
-        dest_wave = fx.Index(dest_n // fx.Int32(8))
-        dest_m = fx.Index(dest_n % fx.Int32(8))
-        block = dest_wave * fx.Index(8) + self.lane % fx.Index(8)
-        aligned_base = (
-            (self.lds_vt_base_idx + fx.Index(127)) // fx.Index(128)
-        ) * fx.Index(128)
-        byte_off = (
-            aligned_base
-            + fx.Index(buf_off)
-            + block * fx.Index(128)
-            + fx.Index(16) * dest_m
-        )
-        lds_ptr = buffer_ops.create_llvm_ptr(byte_off, address_space=3)
-        llvm.StoreOp(as_mlir_value(Vec(v16)), lds_ptr, alignment=16)
-
     def _stage_v_fp8_block_dma(self, tile_start, buf_id, page_id=None):
         traits = self.traits
         v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
@@ -2168,7 +2094,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             (self.lds_vt_base_idx + fx.Index(127)) // fx.Index(128)
         ) * fx.Index(128)
         if const_expr(traits.KV_VECTORIZED):
-            self._stage_v_fp8_vectorized(
+            self._stage_v_fp8_coalesced(
                 tile_start, buf_id, page_id, aligned_base, buf_off
             )
             return
@@ -2191,23 +2117,6 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         )
         self.buffer_load_lds_128(v_div, lds_addr, src_elem, v_soffset)
 
-    # Involutive swap of a token's low 4 bits (token % 16 -> dest_n % 16),
-    # reproducing the linear DMA's quad-1<->quad-2 swap (c_add/c_sub above) so
-    # the vectorized staging lands bytes in the identical L_lin LDS positions.
-    _V_LDS_TOKEN_SWAP = (0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15)
-
-    def _stage_v_fp8_vectorized(
-        self, tile_start, buf_id, page_id, aligned_base, buf_off
-    ):
-        if const_expr(_V_LDS_COALESCED):
-            self._stage_v_fp8_coalesced(
-                tile_start, buf_id, page_id, aligned_base, buf_off
-            )
-        else:
-            self._stage_v_fp8_scatter(
-                tile_start, buf_id, page_id, aligned_base, buf_off
-            )
-
     def _stage_v_fp8_coalesced(
         self, tile_start, buf_id, page_id, aligned_base, buf_off
     ):
@@ -2216,8 +2125,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         V's innermost x=16 axis holds 16 TOKENS at one head-dim, so a single
         coalesced 128-bit load fetches 16 tokens (4 quads) of one head-dim.
         Those go straight into a token-contiguous LDS layout with four
-        dword (ds_write_b32) stores -- replacing the 16 bank-conflicting
-        byte-scatters of ``_stage_v_fp8_scatter``.
+        dword (ds_write_b32) stores.
 
         Layout ``L_tok``: row = ``d*BLOCK_N`` (one 64-byte row per head-dim),
         and within a row the quad index is rotated by ``d % 16``:
@@ -2257,68 +2165,6 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             col = ((qglobal + dmask) % fx.Index(nquads)) * fx.Index(4)
             p = buffer_ops.create_llvm_ptr(row + col, address_space=3)
             llvm.StoreOp(as_mlir_value(fx.Int32(v4[qi])), p, alignment=4)
-
-    def _stage_v_fp8_scatter(self, tile_start, buf_id, page_id, aligned_base, buf_off):
-        """Token-major vectorized V staging for the shuffled 5D fp8 KV cache.
-
-        V's innermost x=16 axis holds 16 TOKENS at one head-dim (the PV MFMA
-        contracts over tokens), so a contiguous 128-bit load fetches 16 tokens
-        of a single head-dim -- orthogonal to the linear path's 16-head-dim
-        chunk for one token. We read those token-contiguous 16-groups and
-        SCATTER each token's fp8 byte into the exact LDS position the linear
-        ``buffer_load_lds`` would have written, reproducing the linear V LDS
-        content (L_lin) byte-for-byte so the downstream transpose read
-        (``_load_v_fp8_block``, ``ds_read_tr8``) and the PV MFMA operand are
-        reused unchanged.
-
-        Lane ``l`` covers one ``(head_dim d, token-group tc)``:
-        ``d = l // NGROUPS``, ``tc = l % NGROUPS`` with
-        ``NGROUPS = BLOCK_N // KV_VEC_SIZE``. BLOCK_SIZE (512) equals
-        ``HEAD_DIM * NGROUPS``, so every ``(d, tc)`` is covered exactly once.
-
-        L_lin position for logical ``(token = tc*16 + t_local, head_dim = d)``
-        (rel. ``aligned_base + buf_off``): ``dest_n = tc*16 + swap(t_local)``,
-        ``W = dest_n // 8``, ``lo = dest_n % 8`` gives
-        ``off = W*1024 + (d//16)*128 + lo*16 + d%16``. Since ``tc*16`` is a
-        multiple of 8, ``W = tc*2 + swap(t_local)//8`` and
-        ``lo = swap(t_local)%8``, so the ``tc``/``d`` terms are lane-uniform and
-        only the per-token add varies.
-        """
-        traits = self.traits
-        HD = traits.HEAD_DIM
-        vec = traits.KV_VEC_SIZE
-        ngroups = traits.BLOCK_N // vec
-        v_div, _ = self._kv_src("v", tile_start, page_id)
-        d = self.tid // fx.Index(ngroups)
-        tc = self.tid % fx.Index(ngroups)
-        head_region_base = self.kv_head_idx * fx.Index(HD * traits.BLOCK_N)
-        src_elem = head_region_base + tc * fx.Index(HD * vec) + d * fx.Index(vec)
-        v16 = fly.copy_atom_call_ssa(
-            [Vec.make_type(4, fx.Int32)],
-            self.load_atom_128,
-            fx.slice(v_div, (None, fx.Int32(src_elem))),
-        )
-        v_i8 = Vec(
-            vector.BitCastOp(
-                Vec.make_type(vec, fx.Int8), as_mlir_value(Vec(v16))
-            ).result,
-            (vec,),
-            fx.Int8,
-        )
-        d_block = d // fx.Index(16)
-        bb = d % fx.Index(16)
-        base_off = (
-            aligned_base
-            + fx.Index(buf_off)
-            + tc * fx.Index(2 * 1024)
-            + d_block * fx.Index(128)
-            + bb
-        )
-        for t_local in range_constexpr(vec):
-            s = self._V_LDS_TOKEN_SWAP[t_local]
-            off = base_off + fx.Index((s // 8) * 1024 + (s % 8) * 16)
-            lds_ptr = buffer_ops.create_llvm_ptr(off, address_space=3)
-            llvm.StoreOp(as_mlir_value(fx.Int8(v_i8[t_local])), lds_ptr, alignment=1)
 
     def _stage_vt_dequant_fp8(self, tile_start, buf_id):
         # Dequantize fp8 V into the exact bf16 V staging positions. The two d-iters
@@ -2443,7 +2289,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
 
     def _load_v_fp8_block(self, buf_id):
         traits = self.traits
-        if const_expr(_V_LDS_COALESCED and traits.KV_VECTORIZED):
+        if const_expr(traits.KV_VECTORIZED):
             return self._load_v_fp8_coalesced(buf_id)
         v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
         buf_off = buf_id * v_tile_bytes

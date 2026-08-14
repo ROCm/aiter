@@ -51,10 +51,9 @@ _PAGE_SIZE = 64
 # Head dim is fixed by the kernel (it raises on anything else).
 _HEAD_DIM = 128
 
-# Vectorization width of the shuffled 5D KV cache (stage 4 of the shuffled-
-# cache-support-investigation port): 16 fp8 elements = one 128-bit dwordx4.
-# Backs the _strides_ok 5D validation branch and _get_kernel's layout
-# selection; _dispatch_mode_ok accepts shuffled_kv_cache as of Stage 3.
+# Vectorization width of the shuffled 5D KV cache: 16 fp8 elements = one
+# 128-bit dwordx4. Backs the _strides_ok 5D validation branch and
+# _get_kernel's layout selection; _dispatch_mode_ok accepts shuffled_kv_cache.
 _KV_VEC_SIZE = 16
 
 
@@ -243,15 +242,14 @@ def _split_count(num_2d_prgms: int, target_num_prgms: int) -> int:
 
 
 def _kv_strides_ok_5d(k, v, num_kv_heads, head_size) -> bool:
-    """Validate the shuffled 5D KV-cache shape/strides (stage 4 gate scaffolding).
+    """Validate the shuffled 5D KV-cache shape/strides.
 
-    Layout spec (shuffled-cache-support-investigation, "the layout spec"):
-    K = ``[num_blocks, kv_heads, head_size//x, block_size, x]``, V =
+    Layout: K = ``[num_blocks, kv_heads, head_size//x, block_size, x]``, V =
     ``[num_blocks, kv_heads, block_size//x, head_size, x]``, x = _KV_VEC_SIZE.
     Requires the trailing (vectorized) dim to be exactly ``x`` elements,
     contiguous, and the whole tensor row-major in that 5D shape -- the
-    vectorized loaders (Stage 2/3) assume the fixed byte-offset formula that
-    only holds under that layout.
+    vectorized loaders assume the fixed byte-offset formula that only holds
+    under that layout.
     """
     if k.dim() != 5 or v.dim() != 5:
         return False
@@ -307,12 +305,12 @@ def _strides_ok(
         return False
     if out.stride(0) != num_query_heads * head_size:
         return False
-    # Shuffled 5D KV cache (stage 4): the production gate (_dispatch_mode_ok)
-    # accepts shuffled_kv_cache as of the end of Stage 3, so this branch is
-    # live on the real dispatch path. The flag and the tensor layout MUST agree:
-    # a shuffled flag on a 4D linear tensor (or vice versa) would run the
-    # vectorized loader's byte-offset formula against the wrong memory, so
-    # decline the mismatch rather than mis-address it. shuffled -> require 5D.
+    # Shuffled 5D KV cache: the production gate (_dispatch_mode_ok) accepts
+    # shuffled_kv_cache, so this branch is live on the real dispatch path. The
+    # flag and the tensor layout MUST agree: a shuffled flag on a 4D linear
+    # tensor (or vice versa) would run the vectorized loader's byte-offset
+    # formula against the wrong memory, so decline the mismatch rather than
+    # mis-address it. shuffled -> require 5D.
     if shuffled_kv_cache:
         if k.dim() != 5 or v.dim() != 5:
             return False
@@ -336,11 +334,10 @@ def _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce) 
     layout this kernel does not read; the paged path is the only one wired
     here. (Causal and non-causal are both built.)
 
-    ``shuffled_kv_cache`` is accepted as of the end of Stage 3
-    (shuffled-cache-support-investigation): the vectorized K and V loaders
-    are both correctness-validated against a torch reference (Stage 2 K,
-    Stage 3 V), and ``_get_kernel``/``_strides_ok`` route a shuffled call to
-    the vectorized builder and validate its 5D K/V shape.
+    ``shuffled_kv_cache`` is accepted: the vectorized K and V loaders are both
+    correctness-validated against a torch reference, and
+    ``_get_kernel``/``_strides_ok`` route a shuffled call to the vectorized
+    builder and validate its 5D K/V shape.
     """
     return window_size[0] < 0 and block_table is not None and not skip_reduce
 
@@ -707,7 +704,7 @@ def flydsl_unified_attention(
             def _sub(rows, seqs, n_sub, max_q_sub):
                 r0, r1 = rows
                 s0, s1 = seqs
-                flydsl_unified_attention(
+                return flydsl_unified_attention(
                     q[r0:r1],
                     k,
                     v,
@@ -737,7 +734,15 @@ def flydsl_unified_attention(
                     skip_reduce=skip_reduce,
                 )
 
-            _sub(pre_rows, pre_seqs, n_pre, pre_max_q)  # prefill -> single-pass 2d
+            # Prefill first. A small multi-chunk prefill half can underfill and
+            # decline (return None from the tier-selection guard below); the split
+            # has no Triton fall-through, only the external caller does, so cede the
+            # whole batch to Triton rather than leaving its rows unwritten. The decode
+            # half has max_q == 1 and never declines.
+            if (
+                _sub(pre_rows, pre_seqs, n_pre, pre_max_q) is None
+            ):  # prefill -> single-pass 2d
+                return None
             _sub(dec_rows, dec_seqs, n_dec, 1)  # decode -> split-K 3d
             return out
 
@@ -854,7 +859,7 @@ def flydsl_unified_attention(
             int(max_seqlen_q),
             # The KV stride is the within-page row stride, not the page stride.
             #
-            # Shuffled 5D KV cache (stage 4): `k.stride(1)` is always the true
+            # Shuffled 5D KV cache: `k.stride(1)` is always the true
             # stride_kv_n = per-token element count across ALL kv_heads
             # (num_kv_heads * head_dim). This arg sizes the paged
             # buffer-descriptor: `page_elems = BLOCK_N * stride_kv_n_v *
