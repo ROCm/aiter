@@ -1562,7 +1562,7 @@ a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list = {
 #
 # Read those columns down, never across runs: this harness has a ~11% clock ramp
 # that penalizes whichever kid is measured first in a process (BMM_KIDS=205,194,205
-# gives the same kid 273.1 us then 244.7 us). _bp_kids.py and the flydsl harness
+# gives the same kid 273.1 us then 244.7 us). The kid harness and the flydsl one
 # both prewarm for 3s before timing now; without that the two are not comparable.
 #
 # The mechanism is visible at m32768 and absent at m8192, which is also why the
@@ -1737,7 +1737,7 @@ a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list.update({
 # prologue that removing it saves does not come back as steady state.
 #
 # Where it is kept is the other end of M at K=1024, which it takes off kid208 --
-# the corner kid208 itself was kept for. _bp_kids.py; the kid208/kid210 columns
+# the corner kid208 itself was kept for. The kid208/kid210 columns below
 # are the mean of both running orders, each taken from its warm repeat, because a
 # percent at these sizes is position (us, N=1024, K=1024):
 #
