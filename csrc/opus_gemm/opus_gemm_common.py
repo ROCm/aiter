@@ -1410,11 +1410,91 @@ _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES = {
     # row-major kid326 (20.45 vs 21.13), the cell that was preshuffle's worst
     # mid-M loss -- and it is the fastest kid here at m<=256 (g8/m256 19.3us).
     175: (128, 64,  256, 1),
+    # kid348/kid349: the 128x128 tile at eight waves, which this family has had at
+    # 64 columns and at 256 but never between. They earn 4 cells of the m=128..512
+    # band by 1.025-1.057x -- kid349 at g8/m512 both K and g16/m256/k4096, kid348 at
+    # g16/m256/k1024 -- and below g8 they are far off the pace (g2/m128/k1024 is
+    # 9.1us against 4.9), which is what a 128-row eight-wave tile should do on a
+    # grid of 16 workgroups. Both clear the wave-grid constraints with only
+    # COM_REP_N moved off kid175 (1 -> 2, against kid194's shipped 4), SF_PANEL_ROWS
+    # unchanged at 129, and no spill.
+    #
+    # They were added to test an explanation, and the measurement refuted it. Keep
+    # the refutation: aiter's Triton batched_gemm_a8w8, swept over its own config
+    # grid, runs g16/m256/k4096 in 31.1us against 40.3us for the best of the 43
+    # preshuffle kids the tuner sweeps (8/8 paired draws, output checked against a
+    # float reference). Its winning config is a 128x128 tile, K 256 deep, eight
+    # warps, and the same tile at four warps measures 40.34us -- kid229's number to
+    # three digits. That read as the wave count at a grid of exactly one workgroup
+    # per CU (16*2*8 = 256 tiles on 256 CUs), where a 256-thread kid puts one wave
+    # on each SIMD with nothing to overlap its global latency against.
+    #
+    # It is not the wave count. kid349 is that tile at eight waves -- same 128x128,
+    # same grid, same two waves per SIMD as the Triton config -- and lands at
+    # 39.4us, 1.27x behind it, having taken only 1.025x off kid229. And the K depth
+    # ordering inverts: Triton wants 256 over 128 by 32.80 to 37.72, while kid348
+    # loses to kid349 by 42.8 to 39.4, so the two are not responding to the same
+    # thing.
+    #
+    # What that leaves is the inner loop, and the scale path is the term with a
+    # measured size at this cell: the same 128x128 tile with the scale panel
+    # preloaded (kid229) is 40.3us and without it (kid231/kid232) is 51.7-52.3us.
+    # Triton is doing none of that work -- int8 with one scalar per row and one per
+    # column against e8m0 every 128 elements of K -- so a 1.27x gap at equal
+    # geometry is the price of microscaling here rather than a tile this family is
+    # missing. Anyone reopening this should start there and not at the tile table.
+    348: (128, 128, 256, 1),
+    349: (128, 128, 128, 1),
 }
 a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list = {
     kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES.items()
 }
+
+# kid194 + the L2 rasterization that so far only wavetm1 has had. The reason it
+# is worth trying on this family now is the per-traits SF_PRELOAD_K_MAX: the
+# swizzle is only live at split_k == 1 (the kernel falls back to the linear map
+# when the K range is split, since the reduction's workgroups no longer tile the
+# output), and before the derived bound kid194 could not reach K=16384 on that
+# column at all -- every large-K cell it won, it won at split_k >= 2, where the
+# parameter is dead code. Raising its bound to 30848 moved it onto the one column
+# where the map matters, and against kid213 there it wins by 3-4%.
+#
+# It works, and what gates it is the width of the tile grid rather than anything
+# about this family. Band 4 against kid194 at k16384, g16/m4096 (6 draws, order
+# rotated, bit-exact at every point since the map only moves which workgroup owns
+# which tile):
+#
+#   n     N tiles   band 4    draws won
+#   1024      4     +0.4%       4/6      <- the shipped envelope: noise
+#   2048      8     +1.0%       6/6
+#   4096     16     +2.2%       6/6
+#   8192     32     +2.2%       6/6
+#
+# The reason it needs N is that the reordering's whole effect is the aspect ratio
+# of the tile run an XCD walks. At n=1024 there are 4 N tiles and 8 tiles per XCD,
+# so the run is 2 columns of A-rows either way and there is nothing to re-shape.
+# At n=4096 a 32-tile run is 2x16 under the linear map and 4x8 under band 4, and
+# at K=16384 a row block and a column block are 4 MB each: 64+8 MB of operand
+# footprint against 16+32, which is the L2's problem stated as a number.
+#
+# So it changes no shipped cell -- the tuned envelope is n=1024 -- and is kept for
+# the wider-N rows this bound now makes reachable at split_k=1.
+#
+# Band 2 was measured alongside (kid347) and is noise at every width above:
+# +0.1% to +0.9%, never separable. Halving the band halves the A footprint but
+# doubles the B one, and at these K the two are the same size, so it trades one
+# for one. Uncomment to reopen.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM)     twin of
+    346: (256, 256, 128, 1, 4),               # kid194 + FlyDSL's band height
+    # 347: (256, 256, 128, 1, 2),             # kid194 + half of it; noise, see above
+}
+a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES.items()
+})
 
 # The three tiles above again on the shuffle_scale scale layout, one twin each, so that the
 # only difference inside a pair is where the A scale comes from: the LDS panel

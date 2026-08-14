@@ -170,6 +170,22 @@ _TUNE_POLICY = {
     168: [1],
     175: [1],
     194: [1],
+    # kid194 plus the banded tile map, the wave8n4 answer to what kid205 is for
+    # wavetm1. Worth the sweep on that precedent alone: kid203 and kid205 are the
+    # same tile differing only in the map, and the shipped table gives kid205 22
+    # rows against kid203's 6. kid194 holds 16, all of them m>=2048 shapes that
+    # fill the machine, which is the regime a tile map acts on at all.
+    346: [1],
+    # The 128x128 tile this family never had, at both K depths. Swept because they
+    # win 4 cells of the m=128..512 band by 1.025-1.057x; they do not do what they
+    # were added to do, which was to close a 1.27x gap to Triton's swept kernel at
+    # g16/m256/k4096 at equal geometry. The kid348 note in opus_gemm_common.py has
+    # the numbers and where that gap actually lives.
+    #
+    # Worth sweeping only from g8 up: at g2/m128 they are 1.8x off the incumbent,
+    # since a 128-row eight-wave tile on a 16-workgroup grid is mostly idle machine.
+    348: [1],
+    349: [1],
     # wavetm1, the 1x8 / 1x4 grids. kid205 is kid203 plus the banded tile map.
     202: [1],
     203: [1],
