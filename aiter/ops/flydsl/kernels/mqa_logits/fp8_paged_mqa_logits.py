@@ -14,25 +14,19 @@ the query token and ``p >= context_lens[b]`` stay ``-inf``). ``K_phys(p)`` /
 maps through the block table (``kv_indices``) to a physical block, and each
 token's fp8 K bytes and its f32 dequant scale are **co-packed** in that block.
 
-Supported scope (this file): ``KVBlockSize >= 1`` (block-flat co-packed layout)
-with SplitKV KV-column parallelism. The public ``flydsl_fp8_paged_mqa_logits``
-mirrors the tensor contract of the Triton
-``aiter.ops.triton.attention.pa_mqa_logits.deepgemm_fp8_paged_mqa_logits`` so the
-two are interchangeable in tests/benchmarks. ``Preshuffle=True`` consumes the
-production ``shuffle_weight(layout=(16,16))`` KV data layout (requires
-``KVBlockSize % 16 == 0``).
+Supports ``KVBlockSize >= 1`` with SplitKV KV-column parallelism, and mirrors
+the tensor contract of the Triton ``deepgemm_fp8_paged_mqa_logits`` so the two
+are interchangeable. ``Preshuffle=True`` consumes the production
+``shuffle_weight(layout=(16,16))`` KV layout (needs ``KVBlockSize % 16 == 0``).
 
-Cache layout (per physical block of ``KVBlockSize`` tokens): all ``KVBlockSize``
-fp8 key rows (``D`` bytes each) grouped first, then all ``KVBlockSize`` f32
-dequant scales (block-flat). The per-lane gather resolves each logical KV column
-independently through the block table (``kv_indices[b, p // KVBlockSize]``) so a
-column tile may straddle block boundaries; ``KVBlockSize == 1`` degenerates to
-the per-token ``[D fp8 | 4 scale]`` slot layout.
+Cache layout, per physical block of ``KVBlockSize`` tokens: the fp8 key rows
+(``D`` bytes each) grouped first, then the f32 dequant scales. Each lane
+resolves its own column through ``kv_indices[b, p // KVBlockSize]``, so a column
+tile may straddle blocks; ``KVBlockSize == 1`` degenerates to per-token
+``[D fp8 | 4 scale]`` slots.
 
-The fp8 32x32x64 scaled MFMA compute, ReLU*weight head-sum + kv-scale hoist,
-in-wave ``shuffle_xor`` head reduce, the fp8 dword-pack load, and the i64
-byte-base per-row output view are all shared with the dense kernel via
-``._mqa_logits_common`` (no duplication).
+The MFMA compute, ReLU*weight head-sum, head reduce, dword-pack load and output
+view are shared with the dense kernel via ``._mqa_logits_common``.
 """
 
 # No `from __future__ import annotations`: FlyDSL arg typing needs real
@@ -115,28 +109,17 @@ def _build_paged_kernel(
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
 ):
-    """Paged MQA-logits kernel (KVBlockSize>=1) with SplitKV column parallelism.
+    """Paged MQA-logits kernel with SplitKV column parallelism.
 
-    One thread block owns one ``(batch, next_n)`` query row and walks the whole
-    ``[0, context_length)`` KV window in ``BKV``-wide tiles. ``waves_per_block``
-    waves each own a disjoint slice of the ``BKV/MFMA_N`` column tiles (no
-    cross-wave sharing / barrier), mirroring the dense kernel's wave split.
+    One thread block owns one ``(batch, next_n)`` query row and walks its KV
+    window in ``BKV``-wide tiles; the ``waves_per_block`` waves each take a
+    disjoint slice of the ``BKV/MFMA_N`` column tiles, with no barrier between
+    them.
 
-    ``kv_block_size`` (KVBlockSize) is the number of tokens co-packed in one
-    physical block; each lane gathers its own logical KV column independently
-    (``kv_indices[b, col // KVBlockSize]`` -> physical block, ``col %
-    KVBlockSize`` -> token within the block-flat block), so a column tile may
-    straddle block boundaries. ``KVBlockSize == 1`` degenerates to the per-token
-    ``[D fp8 | 4 scale]`` slot layout.
-
-    ``preshuffle`` selects the production ``shuffle_weight(layout=(16,16))`` KV
-    data layout (each block's ``KVB*D`` fp8 bytes reordered into 16-token x
-    16-hidden tiles; the co-packed f32 scale tail stays token-ordered). Only the
-    intra-block key-byte offset changes -- the block-table gather, scale gather,
-    MFMA, and mask are identical. Requires ``KVBlockSize % 16 == 0``.
-
-    ``scale_mul`` folds the FN->FNUZ 2x-per-converted-operand compensation into
-    the (co-packed) per-token scale at compile time (ReLU positive-homogeneity).
+    ``preshuffle`` only changes the intra-block key-byte offset -- the
+    block-table gather, scale gather, MFMA and mask are identical either way.
+    ``scale_mul`` folds the FN->FNUZ 2x compensation into the per-token scale at
+    compile time, which is exact by ReLU positive-homogeneity.
     """
     H = num_heads
     D = head_size
@@ -209,14 +192,11 @@ def _build_paged_kernel(
         lane_mod_N = umod(lane, MFMA_N)
         lane8 = lane_div_N * 8
 
-        # fp8 operands loaded as vector<8xi32> per K-step (32 bytes = 4 i64s)
-        # for the 32x32x64 scaled MFMA. One vec_load_dwordx2 per i64 sub-step.
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
-        # Uniform-base views over the co-packed cache: per-token gather is done
-        # via the (per-lane) byte offset, NOT the buffer base -- a per-lane base
-        # can't ride a scalar buffer descriptor. The byte offset stays i32
-        # (assumes num_blocks*index_dim < 2^31; see host assert); a shared cache
-        # pool large enough to exceed that would need an i64/global-load gather.
+        # Uniform-base views: the per-token gather rides the per-lane byte
+        # offset, not the buffer base, since a per-lane base cannot ride a
+        # scalar buffer descriptor. That offset stays i32, hence the host's
+        # pool-size assert.
         kv_i32 = GTensor(KV_cache, dtype=T.i32, shape=(-1,))
         kv_f32 = GTensor(KV_cache, dtype=T.f32, shape=(-1,))
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
@@ -232,10 +212,9 @@ def _build_paged_kernel(
         out_row_t = make_out_row_view(out_logits, stride_out_i64, out_row)
 
         # ---- Preload Q frags + weights for the single query row ----
-        # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
-        # With MFMA_K=64, each K-step loads a vector<8xi32> (4 packed i64s covering
-        # k = lane8 + [0,16,32,48]). fn_to_fnuz not supported for v8i32 operands;
-        # gfx950 uses native fp8 so convert_q_fn is always False on this arch.
+        # The A-operand layout is per in-wave lane, so `lane` indexes Q, not
+        # `tid`. convert_q_fn is always False here: the v8i32 operand has no
+        # fn_to_fnuz path, and gfx950 is native fp8 anyway.
         q_row_base = pid_batch * stride_q_batch + pid_next_n * stride_q_next_n
         a_pack = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
@@ -257,13 +236,10 @@ def _build_paged_kernel(
                 h_w = mi * MFMA_M + h_off
                 w_frag[mi][ii] = _to_raw(fx.Float32(w_t[out_row, h_w]))
 
-        # ---- SplitKV: this CTA owns a disjoint, BKV-aligned slice of the KV
-        # window. total_tiles = ceil(ctx/BKV); each split owns
-        # ceil(total_tiles/split_kv) contiguous tiles => slices are gap-free and
-        # disjoint, so every logits column has exactly one writer (pure
-        # parallelism across n, no cross-CTA reduction). split_kv==1 collapses to
-        # the full [0, ceil(ctx/BKV)*BKV) window. Splits past ctx early-exit
-        # (tile_lo_col >= tile_hi_col => the loop runs 0 iterations). ----
+        # ---- SplitKV: each split owns ceil(total_tiles/split_kv) contiguous
+        # BKV-aligned tiles, so the slices are gap-free and disjoint and every
+        # logits column has exactly one writer -- no cross-CTA reduction. A
+        # split past ctx runs zero iterations. ----
         context_chunk_num = arith.ceildivui(
             _to_raw(context_length), _to_raw(fx.Int32(BKV))
         )
@@ -289,12 +265,9 @@ def _build_paged_kernel(
                 col = col0 + abs_ni * MFMA_N + lane_mod_N
                 # Clamp the gather index to a valid token (mask handles the rest).
                 col_c = fx.Int32(arith.minsi(_to_raw(col), _to_raw(ctx_m1)))
-                # Block table maps a logical column to a physical block. The
-                # block-flat block byte-stride is KVB*index_dim, keys grouped
-                # first (tok*D) then all scales (KVB*D + tok*4). KVB is a
-                # compile-time constant, so for KVB==1 divui/remui/mul-by-1 fold
-                # away (block_idx==col_c, tok_in_block==0) -- no Python `if` here
-                # because the FlyDSL AST rewriter would turn it into a runtime
+                # KVB is a compile-time constant, so at KVB==1 the div/mod/mul
+                # fold away on their own. Deliberately no Python `if` for that
+                # case: the FlyDSL AST rewriter would turn it into a runtime
                 # scf.if and drop the branch-local addresses.
                 block_idx = udiv(col_c, KVB)
                 tok_in_block = umod(col_c, KVB)
@@ -302,12 +275,8 @@ def _build_paged_kernel(
                 physical = fx.Int32(ind_t[ind_off])
                 block_byte_base = physical * block_byte_stride
 
-                # B operands: vector<8xi32> per K-step (MFMA_K=64).
-                # convert_kv_fn is always False (gfx950 native fp8). The
-                # preshuffle branch is compile-time (Python if): it only swaps
-                # the intra-block key-byte offset for the shuffle_weight(16x16)
-                # layout; the scale gather below is unchanged (scales stay
-                # co-packed and token-ordered).
+                # Compile-time branch: preshuffle only swaps the intra-block
+                # key-byte offset, leaving the scale gather below unchanged.
                 b_col = [None] * K_STEPS
                 if preshuffle:
                     for kk in range_constexpr(K_STEPS):
@@ -342,8 +311,7 @@ def _build_paged_kernel(
                 )
 
                 # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
-                # Write only in-causal columns; masked positions keep the
-                # caller's -inf prefill (matches clean_logits semantics).
+                # Masked positions keep the caller's -inf prefill.
                 is_writer = _to_raw((lane_div_N == 0) & (col <= q_limit))
                 with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
                     out_row_t[col] = fx.Float32(col_sum)
@@ -484,35 +452,26 @@ def flydsl_fp8_paged_mqa_logits(
 
     Drop-in for the Triton ``deepgemm_fp8_paged_mqa_logits`` tensor contract.
 
-    q_fp8:        [batch, next_n, heads, hidden_dim], dtype float8 (e4m3 fn/fnuz)
-    kv_cache:     [num_blocks, KVBlockSize, 1, index_dim], dtype uint8, block-flat
-                  co-packed: per physical block, KVBlockSize*hidden_dim fp8 K
-                  bytes (all key rows grouped) then KVBlockSize f32 dequant scales;
-                  index_dim == hidden_dim + 4 (+ optional 16B padding). When
-                  ``Preshuffle=True`` the fp8 data section is reordered by the
-                  production ``shuffle_weight(layout=(16,16))`` (16-token x
-                  16-hidden tiles); the f32 scale tail stays token-ordered.
-    Preshuffle:   consume the shuffle_weight(16x16) KV data layout. Requires
-                  ``KVBlockSize % 16 == 0``. Default False (block-flat gather).
-    weights:      [batch*next_n, heads], dtype float32
-    out_logits:   [batch*next_n, max_model_len], dtype float32. MUST be prefilled
-                  with -inf by the caller; the kernel writes only in-window
-                  (causal) positions and leaves masked positions untouched.
-    context_lens: [batch], dtype int32
-    kv_indices:   [batch, max_block_len], dtype int32 block table (physical block
-                  per logical block ``p // KVBlockSize``; KVBlockSize==1 => a
-                  per-token page table).
-    max_model_len: int, out_logits column count.
+    q_fp8:        [batch, next_n, heads, hidden_dim], float8 e4m3 (fn or fnuz)
+    kv_cache:     [num_blocks, KVBlockSize, 1, index_dim] uint8, co-packed per
+                  block as KVBlockSize*hidden_dim fp8 K bytes then KVBlockSize
+                  f32 scales; index_dim == hidden_dim + 4 (+ optional padding).
+    Preshuffle:   consume the shuffle_weight(16x16) layout for the fp8 data
+                  section (the scale tail stays token-ordered). Requires
+                  ``KVBlockSize % 16 == 0``.
+    weights:      [batch*next_n, heads], float32
+    out_logits:   [batch*next_n, max_model_len], float32. MUST be prefilled with
+                  -inf: the kernel writes only in-window positions.
+    context_lens: [batch], int32
+    kv_indices:   [batch, max_block_len], int32 block table indexed by
+                  ``p // KVBlockSize``.
+    max_model_len: out_logits column count.
     SplitKV:      KV-column split count (grid = split_kv*batch*next_n). None =>
-                  sized so the dispatch lands WavePerEU waves on every SIMD;
-                  pass an int to override, 1 disables splitting. Splits own
-                  disjoint, gap-free BKV-aligned column ranges (one writer per
-                  column, no cross-CTA reduction).
-    WavePerEU:    target resident waves per SIMD for the auto-SplitKV formula
-                  (default 2, which is where the measured curve bottoms out).
+                  sized for WavePerEU waves per SIMD; 1 disables splitting.
+    WavePerEU:    target resident waves per SIMD (default 2, where the measured
+                  curve bottoms out).
     TotalCuCount: CU count for that formula; None => query the device.
-    ChunkK:       KV tile width (must be a multiple of MFMA_N=32). Mirrors
-                  the Triton ChunkK parameter. Defaults to 128.
+    ChunkK:       KV tile width, a multiple of MFMA_N=32. Defaults to 128.
 
     Returns the same ``out_logits`` tensor (written in place).
     """
