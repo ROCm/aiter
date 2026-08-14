@@ -104,11 +104,8 @@ def launch_gemm_a8w4_tdm(
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
-    # Env knob AND a spare buffer AND an even KWS (an odd one would carry into
-    # the slot it computes from -- see k_step). Folded into the cache tag below.
-    next_stage_on = (
-        1 if (next_stage_prefetch and num_buffers >= 3 and KWS % 2 == 0) else 0
-    )
+    # A spare LDS buffer is required while the next tile's first k128 is carried.
+    next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 3) else 0
     cache_tag = (
         K,
         tile_m,
@@ -705,18 +702,19 @@ def launch_gemm_a8w4_tdm(
             issue_fn=None,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
-            if load_nxt_fn is not None and next_rmem is cur_rmem:
-                raise ValueError("k_step cannot load into its current compute slot")
+            reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
             if const_expr(num_outstanding_tdm is not None):
                 pipeline_fence(outstanding=num_outstanding_tdm)
             if const_expr(issue_fn is not None):
                 issue_fn()
-            if const_expr(load_nxt_fn is not None):
+            if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
             mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+            if const_expr(reuse_cur_rmem):
+                load_nxt_fn()
 
         def compute_ktile(
             buf,
