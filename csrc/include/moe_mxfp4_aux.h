@@ -8,6 +8,7 @@
 // fails on `at::Tensor`.
 #include <torch/extension.h>
 
+#include <optional>
 #include <string>
 
 void mxfp4_moe_sort_quant_kernel(
@@ -26,7 +27,8 @@ void mxfp4_moe_sort_quant_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t MB);
+    int64_t MB,
+    std::optional<torch::Tensor> bf16_out_init = std::nullopt);
 
 void mxfp4_moe_sort_kernel(
     torch::Tensor& topk_ids,
@@ -45,7 +47,8 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue);  // 0 = inline_quant, 1 = threestage
+    int64_t prologue,  // 0 = inline_quant, 1 = threestage
+    std::optional<torch::Tensor> bf16_out_init = std::nullopt);
 
 void mxfp4_moe_quant_kernel(
     torch::Tensor& a_input,
@@ -55,7 +58,8 @@ void mxfp4_moe_quant_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t MB);
+    int64_t MB,
+    std::optional<torch::Tensor> bf16_out_init = std::nullopt);
 
 void mxfp4_moe_sort_scales_kernel(
     torch::Tensor& a_scale,

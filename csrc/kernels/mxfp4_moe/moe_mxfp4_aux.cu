@@ -14,6 +14,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -94,13 +95,16 @@ void mxfp4_moe_sort_quant_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t MB)
+    int64_t MB,
+    std::optional<torch::Tensor> bf16_out_init)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const int M = static_cast<int>(a_input.size(0));
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
+    const void* bf16_out_init_ptr =
+        (bf16_out_init.has_value() && bf16_out_init->numel() > 0) ? bf16_out_init->data_ptr() : nullptr;
 
     const std::string key = "aux_sort_quant_NE" + std::to_string(NE)
         + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -114,7 +118,7 @@ void mxfp4_moe_sort_quant_kernel(
         sorted_weights.data_ptr<float>(),
         a_quant.data_ptr(), a_scale.data_ptr(),
         m_indices.data_ptr<int32_t>(),
-        bf16_zero_ptr);
+        bf16_zero_ptr, bf16_out_init_ptr);
 }
 
 
@@ -135,7 +139,8 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue)
+    int64_t prologue,
+    std::optional<torch::Tensor> bf16_out_init)
 {
     (void)D_INTER;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(topk_ids));
@@ -143,6 +148,11 @@ void mxfp4_moe_sort_kernel(
     const int M = static_cast<int>(M_logical);
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
+    // Optional shared-expert init value for the inline-quant (BM=16) zero-init path. nullptr -> plain zero. The threestage path (prologue==1)
+    // does not zero here, so it ignores out_init (the separate quant kernel
+    // initialises the atomic target in that case).
+    const void* bf16_out_init_ptr =
+        (bf16_out_init.has_value() && bf16_out_init->numel() > 0) ? bf16_out_init->data_ptr() : nullptr;
     void* bf16_zero_ws_ptr = nullptr;
     long long workspace_bytes = 0;
     if (bf16_zero_workspace.numel() > 0) {
@@ -183,7 +193,7 @@ void mxfp4_moe_sort_kernel(
             cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
             sorted_weights.data_ptr<float>(),
             m_indices.data_ptr<int32_t>(),
-            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
+            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes, bf16_out_init_ptr);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
             + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -207,13 +217,17 @@ void mxfp4_moe_quant_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t MB)
+    int64_t MB,
+    std::optional<torch::Tensor> bf16_out_init)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const int M = static_cast<int>(a_input.size(0));
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
+    // Optional shared-expert init value for the atomic-accumulate target (folds the shared add into the zero-init). nullptr -> plain zero.
+    const void* bf16_out_init_ptr =
+        (bf16_out_init.has_value() && bf16_out_init->numel() > 0) ? bf16_out_init->data_ptr() : nullptr;
 
     const std::string key = "aux_quant_NE" + std::to_string(NE)
         + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -221,7 +235,7 @@ void mxfp4_moe_quant_kernel(
     aux_find(quant_lookup(), key, "mxfp4_moe_quant")(
         stream, M,
         a_input.data_ptr(), a_quant.data_ptr(), a_scale.data_ptr(),
-        bf16_zero_ptr);
+        bf16_zero_ptr, bf16_out_init_ptr);
 }
 
 
