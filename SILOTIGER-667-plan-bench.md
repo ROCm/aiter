@@ -117,9 +117,10 @@ the FlyDSL cold harness.
 - [ ] FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
       (1,32); keep FlyDSL's e8m0 and document as perf-negligible (scale bytes ≪ FP4 stream).
 
-#### B2 — add TOPK to the FlyDSL cold-bench return dicts  [ ]
-- [ ] Add `"TOPK": TOPK` to `bench_down_cold` / `bench_gate_up_cold` returns (they already
-      carry B/HIDDEN/INTER/E) so `compare.py` has the full `(H,I,E,K,B)` join key.
+#### B2 — add TOPK to the FlyDSL cold-bench return dicts  [x] DONE (2026-08-14)
+- [x] Added `"TOPK": TOPK` (after `"E"`) to both `bench_down_cold` and `bench_gate_up_cold`
+      return dicts, so `compare.py` has the full `(H,I,E,K=TOPK,B)` join key. `_fmt_table`
+      is DataFrame-based, so it just gains a TOPK column; py_compile clean, no new lints.
 
 #### B3 — pluggable `compute_metrics(...)` helper  [ ]
 - [ ] Add `compute_metrics(B,H,I,K,dtype,us,method="weight_stream") -> {TFLOPS, TB/s, %peak}`;
@@ -279,3 +280,5 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 - 2026-08-14 — **A3 done.** Confirmed B∈{1,2,4,8,32} fully covered (75/75 cells, table +
   CSV), env-only, no `IsSupportedArgument` skips, no OOM at B=32. Remaining sub-item is the
   `compare.py` full-B join (belongs to C1).
+- 2026-08-14 — **B2 done.** Added `"TOPK"` to both FlyDSL cold-bench return dicts (completes
+  the `(H,I,E,K,B)` join key); py_compile clean.
