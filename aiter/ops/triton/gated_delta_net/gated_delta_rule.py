@@ -465,6 +465,7 @@ def chunk_gated_delta_rule_opt_vk(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -518,6 +519,8 @@ def chunk_gated_delta_rule_opt_vk(
             This is unsupported with ``use_chunk_flydsl=True``.
         inplace_final_state: Controls K5 in-place state write-back. It defaults
             to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
+            (`fp32` or `bf16`). Defaults to `k.dtype`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -574,6 +577,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,
         o=o,
         num_decodes=num_decodes,
