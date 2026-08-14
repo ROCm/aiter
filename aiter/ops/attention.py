@@ -3,8 +3,6 @@
 
 import math
 
-from aiter.ops.enum import QuantType, Enum, MlaVersion
-from aiter.ops._det_split import resolve_det_split_cap as _resolve_det_split_cap
 import torch
 import triton
 import triton.language as tl
@@ -1410,8 +1408,10 @@ def get_mla_metadata_v1(
             dtype_kv_rope = dtype_kv
 
     # Deterministic-serving workaround (issue #4364): optionally clamp the
-    # per-batch KV-split cap from the environment. See _resolve_det_split_cap.
-    max_split_per_batch = _resolve_det_split_cap(max_split_per_batch)
+    # per-batch KV-split cap from the environment. See resolve_det_split_cap.
+    from aiter.ops._det_split import resolve_det_split_cap
+
+    max_split_per_batch = resolve_det_split_cap(max_split_per_batch)
 
     return _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,

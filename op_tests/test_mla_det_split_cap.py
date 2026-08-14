@@ -6,6 +6,7 @@
 Loads aiter/ops/_det_split.py directly by path so it needs no GPU and does not
 trigger the aiter JIT build.
 """
+
 import importlib.util
 import os
 import warnings
@@ -14,9 +15,13 @@ import pytest
 
 _MODULE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "aiter", "ops", "_det_split.py",
+    "aiter",
+    "ops",
+    "_det_split.py",
 )
-_spec = importlib.util.spec_from_file_location("aiter_det_split_standalone", _MODULE_PATH)
+_spec = importlib.util.spec_from_file_location(
+    "aiter_det_split_standalone", _MODULE_PATH
+)
 _det_split = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_det_split)
 resolve = _det_split.resolve_det_split_cap
@@ -43,13 +48,13 @@ def test_unset_returns_input(budget):
 @pytest.mark.parametrize(
     "cap, budget, expected",
     [
-        ("1", 8, 1),      # single-split (reproducible)
-        ("4", 8, 4),      # clamp down
-        ("32", 8, 8),     # cap above budget -> budget unchanged (min)
-        ("4", 0, 4),      # budget<=0 sentinel -> take the cap
-        ("4", -1, 4),     # budget<=0 sentinel -> take the cap
-        (" 1 ", 8, 1),    # whitespace tolerated by int()
-        ("01", 8, 1),     # leading zero tolerated by int()
+        ("1", 8, 1),  # single-split (reproducible)
+        ("4", 8, 4),  # clamp down
+        ("32", 8, 8),  # cap above budget -> budget unchanged (min)
+        ("4", 0, 4),  # budget<=0 sentinel -> take the cap
+        ("4", -1, 4),  # budget<=0 sentinel -> take the cap
+        (" 1 ", 8, 1),  # whitespace tolerated by int()
+        ("01", 8, 1),  # leading zero tolerated by int()
     ],
 )
 def test_valid_cap(monkeypatch, cap, budget, expected):
@@ -80,7 +85,9 @@ def test_deterministic_flag_off(monkeypatch, val):
 @pytest.mark.parametrize("cap", ["abc", "1.5", "", "  "])
 def test_invalid_value_warns_and_ignored(monkeypatch, cap):
     monkeypatch.setenv(_MSPB, cap)
-    with pytest.warns(UserWarning, match="invalid AITER_MLA_DECODE_MAX_SPLIT_PER_BATCH"):
+    with pytest.warns(
+        UserWarning, match="invalid AITER_MLA_DECODE_MAX_SPLIT_PER_BATCH"
+    ):
         assert resolve(8) == 8
 
 

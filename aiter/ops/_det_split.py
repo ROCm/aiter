@@ -5,6 +5,7 @@
 Kept dependency-free (only ``os`` + ``warnings``) so the env-parsing logic can be
 unit-tested on CPU without importing the full ``aiter`` package / JIT build.
 """
+
 import os
 import warnings
 
