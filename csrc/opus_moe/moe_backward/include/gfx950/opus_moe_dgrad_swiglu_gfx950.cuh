@@ -504,7 +504,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                 const int local_row =
                     wave_id_m * (T::B_M / T::T_M) +
                     r.value * T::W_M + lane_id;
-                score_smem[local_row * T::T_N + wave_id_n] = route_dot;
+                score_smem[wave_id_n * T::B_M + local_row] = route_dot;
             }
         });
         __syncthreads();
@@ -522,7 +522,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
                 float partial = 0.0f;
 #pragma unroll
                 for(int wn = 0; wn < T::T_N; ++wn)
-                    partial += score_smem[local_row * T::T_N + wn];
+                    partial += score_smem[wn * T::B_M + local_row];
                 const int n_tile = col / T::B_N;
                 const int compact_row = RAGGED
                     ? batch_row_start + route_row
