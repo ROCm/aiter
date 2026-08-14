@@ -110,10 +110,17 @@ the FlyDSL cold harness.
 
 ### Group B — FlyDSL-side changes
 
-#### B1 — match scale layout for the comparison  [ ]
-- [ ] Run the FlyDSL FP8 legs (`bench_gate_up_cold` / `bench_down_cold`) with
+#### B1 — match scale layout for the comparison  [x] DONE (2026-08-14)
+- [x] Run the FlyDSL FP8 legs (`bench_gate_up_cold` / `bench_down_cold`) with
       `w_scale_mode="block2d", scale_block=(128,128)` to mirror CK's `Block2D<128,128>`
-      weight scales (so weight-scale byte traffic is apples-to-apples).
+      weight scales. Both FP8 pool generators now emit a flat Block2D scale
+      (`_FP8_SCALE_BLOCK=(128,128)`), the refs apply it via `_block2d_scale_matrix`, and the
+      timed kernel now does the same **per-block scale load+multiply** as CK (not just a byte
+      match — the fairness win is in the timed work). Verified `fp8_cos=1.0000` for down &
+      gate_up on the FP8-running shapes (minimax, qwen3next; DeepSeek FP8 still gated on B5).
+      Note the Block2D<128,128> scale-byte traffic is genuinely tiny for FP8 (≪ FP4 e8m0
+      (1,32)), so `compute_metrics(weight_stream)` FP8 byte accounting is left unchanged
+      (preserves the B3 byte-for-byte invariant); only the FP4 e8m0 term is carried there.
 - [ ] FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
       (1,32). **Not perf-negligible (corrected 2026-08-14):** FlyDSL's e8m0 stream is
       `TOPK·H·(I/32)` ≈ 0.33 MB vs the `TOPK·H·I/2` ≈ 5.24 MB FP4 weight stream at Qwen
@@ -336,6 +343,12 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   benches, joins on dims, emits a ratio table (markdown + CSV) via the shared metrics helper;
   smoke-tested on GPU 6. Added `fp8_cos` to the cold dicts for the sanity column. n/a cells
   (gate_up FP4 CK → A4; DeepSeek FP8 → B5) render correctly.
+- 2026-08-14 — **B1 done.** Switched the FlyDSL FP8 cold legs (down + gate_up) to
+  `w_scale_mode="block2d", scale_block=(128,128)` to mirror CK's `Block2D<128,128>` (pools +
+  refs + kernel calls). The timed kernel now does the same per-block scale work as CK;
+  `fp8_cos=1.0000` on minimax & qwen3next (DeepSeek FP8 still gated on B5). ruff/py_compile
+  clean. `compute_metrics` FP8 byte accounting unchanged (Block2D<128,128> scale bytes are
+  negligible; keeps the B3 invariant).
 - 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
   measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
   entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in

@@ -1291,6 +1291,9 @@ _COLD_MODELS = [
     ("qwen3next_tp1", 2048, 512, 512, 10),
 ]
 _COLD_BATCHES = [1, 2, 4, 8, 32]
+# B1: FP8 cold legs stream a Block2D<128,128> weight scale to mirror CK's
+# `Block2D<128,128>` layout (same scale-byte traffic + per-block scale work).
+_FP8_SCALE_BLOCK = (128, 128)
 COLD_DOWN_SHAPES = [
     (B, INTER, HIDDEN, E, TOPK)
     for (_name, HIDDEN, INTER, E, TOPK) in _COLD_MODELS
@@ -1461,9 +1464,14 @@ def _ref_down_fp4_pool(inter, w_down, w_scale, rid, rwt, HIDDEN):
     return y.to(torch.bfloat16)
 
 
-def _gen_down_fp8_pool(B, INTER, HIDDEN, E, TOPK, n_route):
-    """Full E-expert FP8 (e4m3) down pool + PerTensor scale + rotating router
-    list, matching :func:`_gen_down_fp4_pool` (same inter/rwt RNG stream)."""
+def _gen_down_fp8_pool(
+    B, INTER, HIDDEN, E, TOPK, n_route, scale_block=_FP8_SCALE_BLOCK
+):
+    """Full E-expert FP8 (e4m3) down pool + Block2D weight scale + rotating router
+    list, matching :func:`_gen_down_fp4_pool` (same inter/rwt RNG stream).
+
+    B1: the scale layout mirrors CK's ``Block2D<128,128>`` so the FP8 leg streams
+    the same weight-scale bytes and does the same per-block scale work as CK."""
     device = torch.device("cuda")
     gen = torch.Generator(device="cuda").manual_seed(20260811)
     w_down = (
@@ -1471,7 +1479,9 @@ def _gen_down_fp8_pool(B, INTER, HIDDEN, E, TOPK, n_route):
         .to(torch.float8_e4m3fn)
         .contiguous()
     )
-    w_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+    bn, bk = scale_block
+    n_scale = _n_block2d_scales(E * HIDDEN, INTER, bn, bk)
+    w_scale = (torch.rand(n_scale, generator=gen, device=device) * 1.5 + 0.5).float()
     inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
         torch.bfloat16
     )
@@ -1481,15 +1491,21 @@ def _gen_down_fp8_pool(B, INTER, HIDDEN, E, TOPK, n_route):
     return inter, w_down, w_scale, rid_list, rwt
 
 
-def _ref_down_fp8_pool(inter, w_down, w_scale, rid, rwt, HIDDEN):
-    B, TOPK, _ = inter.shape
+def _ref_down_fp8_pool(
+    inter, w_down, w_scale, rid, rwt, HIDDEN, scale_block=_FP8_SCALE_BLOCK
+):
+    B, TOPK, INTER = inter.shape
+    bn, bk = scale_block
     interf = inter.float()
-    scale = float(w_scale[0])
     y = torch.zeros(B, HIDDEN, device=inter.device)
+    cache = {}
     for b in range(B):
         for k in range(TOPK):
             e = int(rid[b, k])
-            y[b] += float(rwt[b, k]) * (interf[b, k] @ w_down[e].float().T) * scale
+            if e not in cache:
+                sd = _block2d_scale_matrix(w_scale, e, HIDDEN, INTER, bn, bk)
+                cache[e] = w_down[e].float() * sd
+            y[b] += float(rwt[b, k]) * (interf[b, k] @ cache[e].T)
     return y.to(torch.bfloat16)
 
 
@@ -1552,7 +1568,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     del inter, w_down, w_scale, out
     torch.cuda.empty_cache()
 
-    # ---- FP8 (PerTensor) -- only when the i32 byte offset fits (E*H*I < 2^31) ----
+    # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*H*I < 2^31) ----
     if run_fp8:
         inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
             B, INTER, HIDDEN, E, TOPK, n_route
@@ -1560,7 +1576,14 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
         ref8 = _ref_down_fp8_pool(inter8, w_down8, w_scale8, rid_list8[0], rwt8, HIDDEN)
         entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
-            inter8, w_down8, rid, rwt8, w_scale8, w_scale_mode="pertensor", out=out8
+            inter8,
+            w_down8,
+            rid,
+            rwt8,
+            w_scale8,
+            w_scale_mode="block2d",
+            scale_block=_FP8_SCALE_BLOCK,
+            out=out8,
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
@@ -1683,8 +1706,11 @@ def _ref_gate_up_fp4_pool(x, wg, wgs, wu, wus, rid, INTER, HIDDEN):
     return out.to(torch.bfloat16)
 
 
-def _gen_gate_up_fp8_pool(B, HIDDEN, INTER, E, TOPK, n_route):
-    """Full E-expert FP8 gate_up pool + PerTensor scales + rotating router list."""
+def _gen_gate_up_fp8_pool(
+    B, HIDDEN, INTER, E, TOPK, n_route, scale_block=_FP8_SCALE_BLOCK
+):
+    """Full E-expert FP8 gate_up pool + Block2D<128,128> weight scales + rotating
+    router list.  B1: mirrors CK's ``Block2D<128,128>`` scale layout."""
     device = torch.device("cuda")
     gen = torch.Generator(device="cuda").manual_seed(20260811)
 
@@ -1698,26 +1724,42 @@ def _gen_gate_up_fp8_pool(B, HIDDEN, INTER, E, TOPK, n_route):
             .contiguous()
         )
 
+    bn, bk = scale_block
+    n_scale = _n_block2d_scales(E * INTER, HIDDEN, bn, bk)
+
+    def _scale():
+        return (torch.rand(n_scale, generator=gen, device=device) * 1.5 + 0.5).float()
+
     wg = _one()
     wu = _one()
-    ones = torch.tensor([1.0], dtype=torch.float32, device=device)
+    wgs = _scale()
+    wus = _scale()
     x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
         torch.bfloat16
     )
     rid_list = _router_group_list(B, E, TOPK, device, n_route)
-    return x, wg, ones, wu, ones, rid_list
+    return x, wg, wgs, wu, wus, rid_list
 
 
-def _ref_gate_up_fp8_pool(x, wg, wu, rid, INTER):
+def _ref_gate_up_fp8_pool(
+    x, wg, wgs, wu, wus, rid, INTER, HIDDEN, scale_block=_FP8_SCALE_BLOCK
+):
     B, _ = x.shape
     TOPK = rid.shape[1]
+    bn, bk = scale_block
     xf = x.float()
     out = torch.zeros(B, TOPK, INTER, device=x.device)
+    cache = {}
     for b in range(B):
         for k in range(TOPK):
             e = int(rid[b, k])
-            gate = xf[b] @ wg[e].float().T
-            up = xf[b] @ wu[e].float().T
+            if e not in cache:
+                sg = _block2d_scale_matrix(wgs, e, INTER, HIDDEN, bn, bk)
+                su = _block2d_scale_matrix(wus, e, INTER, HIDDEN, bn, bk)
+                cache[e] = (wg[e].float() * sg, wu[e].float() * su)
+            gate_e, up_e = cache[e]
+            gate = xf[b] @ gate_e.T
+            up = xf[b] @ up_e.T
             out[b, k] = (gate * torch.sigmoid(gate)) * up
     return out.to(torch.bfloat16)
 
@@ -1757,15 +1799,25 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     del x, wg, wgs, wu, wus, out
     torch.cuda.empty_cache()
 
-    # ---- FP8 (PerTensor) -- only when the i32 byte offset fits (E*I*H < 2^31) ----
+    # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*I*H < 2^31) ----
     if run_fp8:
-        x8, wg8, s8, wu8, _, rid_list8 = _gen_gate_up_fp8_pool(
+        x8, wg8, wgs8, wu8, wus8, rid_list8 = _gen_gate_up_fp8_pool(
             B, HIDDEN, INTER, E, TOPK, n_route
         )
         out8 = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
-        ref8 = _ref_gate_up_fp8_pool(x8, wg8, wu8, rid_list8[0], INTER)
-        entry8 = lambda rid, x8=x8, wg8=wg8, wu8=wu8, s8=s8, out8=out8: flydsl_warp_decode_gate_up(  # noqa: E731
-            x8, wg8, wu8, rid, s8, s8, w_scale_mode="pertensor", out=out8
+        ref8 = _ref_gate_up_fp8_pool(
+            x8, wg8, wgs8, wu8, wus8, rid_list8[0], INTER, HIDDEN
+        )
+        entry8 = lambda rid, x8=x8, wg8=wg8, wu8=wu8, wgs8=wgs8, wus8=wus8, out8=out8: flydsl_warp_decode_gate_up(  # noqa: E731
+            x8,
+            wg8,
+            wu8,
+            rid,
+            wgs8,
+            wus8,
+            w_scale_mode="block2d",
+            scale_block=_FP8_SCALE_BLOCK,
+            out=out8,
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
