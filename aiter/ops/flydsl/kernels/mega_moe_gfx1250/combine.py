@@ -33,8 +33,8 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from flydsl.expr import arith, const_expr, range_constexpr, T
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.typing import Int32, Int64, T
 
 from . import primitives as P
 from .config import (
