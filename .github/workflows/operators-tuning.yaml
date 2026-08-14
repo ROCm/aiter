@@ -52,7 +52,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name operators_tuning_test \
-          rocm/pytorch:latest
+          rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
 
       - name: Setup Aiter and Triton
         run: |
