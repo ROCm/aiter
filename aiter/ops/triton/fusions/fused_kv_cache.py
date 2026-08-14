@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+
 import torch
 import triton
 
@@ -35,7 +36,7 @@ _LOGGER = AiterTritonLogger()
 
 DEVICE_ARCH = arch_info.get_arch()
 
-_BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", 128))
+_BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(

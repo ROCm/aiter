@@ -45,9 +45,9 @@ CACHE_LAYOUTS = ("flash", "nonflash", "nonflash_v_shuffle")
 
 SLOT_PATTERNS = ("blocked", "random")
 
-DEFAULT_M = [15360] # test prefill
+DEFAULT_M = [15360]  # test prefill
 DEFAULT_QH = 64
-DEFAULT_KH = 8 # 64 / TP8
+DEFAULT_KH = 8  # 64 / TP8
 DEFAULT_D = 64
 # gpt-oss-120b, TP1, bf16 cache, block 16.
 DEFAULT_NUM_BLOCKS = 169788
@@ -81,7 +81,9 @@ def bench_qk_rope_fn(
     # max position ~= max(ISL) + OSL.
     max_pos = args.isl + args.osl
 
-    assert args.isl > 0 and args.osl > 0, f"ISL > 0 and OSL > 0, got: {args.isl=} {args.osl=}"
+    assert (
+        args.isl > 0 and args.osl > 0
+    ), f"ISL > 0 and OSL > 0, got: {args.isl=} {args.osl=}"
     # powers of 2 for triton
     assert D == triton.next_power_of_2(D), f"D must be a power of 2, got {D=}"
     assert block_size == triton.next_power_of_2(
@@ -106,7 +108,7 @@ def bench_qk_rope_fn(
 
     torch.cuda.empty_cache()
 
-    dtype = torch.bfloat16 # qkv dtype
+    dtype = torch.bfloat16  # qkv dtype
 
     # assumed contiguous, split into 3
     qkv = torch.randn((M, (QH + 2 * KH) * D), dtype=dtype, device="cuda")
@@ -194,7 +196,7 @@ def bench_qk_rope_fn(
         return_mode="median",
     )
 
-    flops = M * QH * D * 3 + M * KH * D * 3 # rope
+    flops = M * QH * D * 3 + M * KH * D * 3  # rope
 
     elem = q.element_size()
 
