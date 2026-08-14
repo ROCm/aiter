@@ -99,6 +99,42 @@ SPLITK_REDUCE_ABI_MAP = {
 SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
 LEGACY_OPUS_ARCH = "gfx950"
 
+
+def _kid_name_arch(kid_name):
+    """Resolve a kid's arch from its symbol name.
+
+    Classified by the `opus_gemm_<arch>_*` prefix; legacy names carry no arch
+    token (a16w16 flatmm / persistent / mono_tile, and the opus_bmm_* family)
+    and are gfx950, matching kid_arch's default.
+    """
+    for ap in SPLITK_REDUCE_ARCHES:
+        if kid_name.startswith(f"opus_gemm_{ap}_"):
+            return ap
+    return LEGACY_OPUS_ARCH
+
+
+def _own_arch_device_pass_guard(arch):
+    """Open/close guard admitting only `arch`'s device pass, plus the host pass.
+
+    In a mixed build (GPU_ARCHS=gfx950;gfx1250) hipcc runs every TU through
+    one device pass per offload arch, so without a guard gfx950 kid instances
+    get instantiated for gfx1250 as well: the gfx950 traits then compute their
+    layouts off a 32-wide wave and trip `BLOCK_SIZE == 4 * get_warp_size()`,
+    and the reverse direction hits gfx1250-only kernel attributes. A kid is
+    only ever launched on the arch it was generated for, so the foreign device
+    pass has nothing to contribute -- guarding out the #include as well leaves
+    it an empty TU that never parses another arch's headers.
+
+    The host pass stays inside the guard: it is what emits the __device_stub__
+    symbols the fused host TU's <<<>>> calls link against, and it is arch
+    independent.
+    """
+    return (
+        f"#if !defined(__HIP_DEVICE_COMPILE__) || defined(__{arch}__)\n",
+        f"#endif // host pass or {arch} device pass\n",
+    )
+
+
 # Arches that own an opus_gemm_arch_*.cuh dispatch header, i.e. one set of
 # lookup tables each. Every generated lookup macro is emitted once per arch and
 # expanded by that arch's header only: the arches disagree on the a16w16
@@ -353,7 +389,8 @@ class opus_gemm_codegen:
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
-        # Compile-time split: Build layout: * One fused HOST TU (instances/all_instances_host.cu)
+        # Compile-time split: Build layout: * One fused HOST TU per arch
+        # (instances/all_instances_host_<arch>.cu)
         # instantiates every launcher's `template...
         self._host_instantiations = []
         self._device_instantiations = []
@@ -900,17 +937,10 @@ void
         only #includes gfx950 kid impl .cuh, etc. ODR clashes between
         same-named layout helpers in different pipeline headers are
         naturally avoided.
+
+        This TU needs no arch guard: it is host-pass only, so a mixed
+        build's device passes already see nothing here.
         """
-
-        # Bucket host/device instantiations by arch. We classify by the
-        # kid_name prefix `opus_gemm_<arch>_*`; legacy kid names without
-        # explicit arch prefix default to gfx950 (matches kid_arch).
-        def _kid_name_arch(kid_name):
-            for ap in SPLITK_REDUCE_ARCHES:
-                if kid_name.startswith(f"opus_gemm_{ap}_"):
-                    return ap
-            return LEGACY_OPUS_ARCH
-
         host_by_arch = {}
         for row in self._host_instantiations:
             arch = _kid_name_arch(row["kid_name"])
@@ -968,10 +998,15 @@ void
         which doesn't depend on any libtorch type. Skipping the torch
         parse on host pass drops each device TU's compile to ~1.5s
         (down from ~13s when torch was forced in).
+
+        Both the #include and the instantiations sit behind the kid's own
+        arch guard, so a mixed build's other device passes see an empty TU
+        (see _own_arch_device_pass_guard).
         """
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
+            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
             # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
             # OPUS_FUSED_HOST_TU is NOT defined here) an...
             contents = (
@@ -986,7 +1021,10 @@ void
                 "#ifndef __HIPCC_RTC__\n"
                 "#define __HIPCC_RTC__ 1\n"
                 "#endif\n"
-                f'#include "impl/{name}.cuh"\n' + row["device_decl"]
+                + guard_open
+                + f'#include "impl/{name}.cuh"\n'
+                + row["device_decl"]
+                + guard_close
             )
             Path(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
@@ -1054,6 +1092,7 @@ void
                 reduce_vec, reduce_block = 16, 64
                 reduce_split_ks = (None,)
                 reduce_d_ws = None
+            guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
@@ -1062,7 +1101,8 @@ void
                 "#ifndef __HIPCC_RTC__\n"
                 "#define __HIPCC_RTC__ 1\n"
                 "#endif\n"
-                f'#include "{reduce_header}"\n'
+                + guard_open
+                + f'#include "{reduce_header}"\n'
                 + "".join(
                     _splitk_reduce_baseline_instantiations(
                         reduce_kernel,
@@ -1078,6 +1118,7 @@ void
             )
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
             contents += extra_reduce.get("device_instantiations", lambda: "")()
+            contents += guard_close
             Path(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
