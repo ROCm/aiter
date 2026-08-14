@@ -115,7 +115,19 @@ the FlyDSL cold harness.
       `w_scale_mode="block2d", scale_block=(128,128)` to mirror CK's `Block2D<128,128>`
       weight scales (so weight-scale byte traffic is apples-to-apples).
 - [ ] FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
-      (1,32); keep FlyDSL's e8m0 and document as perf-negligible (scale bytes ≪ FP4 stream).
+      (1,32). **Not perf-negligible (corrected 2026-08-14):** FlyDSL's e8m0 stream is
+      `TOPK·H·(I/32)` ≈ 0.33 MB vs the `TOPK·H·I/2` ≈ 5.24 MB FP4 weight stream at Qwen
+      down B=1 — **~6%** of the weight bytes. CK's PerTensor streams ~0 scale bytes, so CK
+      does ~6% less real traffic ⇒ its time is slightly lower and the FlyDSL/CK ratio is
+      modestly **CK-favored** on FP4 cells. (Also note `compute_metrics(weight_stream)`
+      includes the e8m0 term for *both* sides, so it over-attributes bytes to CK — only the
+      **time** ratio is ground truth there.) Keep FlyDSL's e8m0 and treat this as a
+      documented ~6% CK-favored caveat next to the FP4 rows.
+- [ ] Exact match would require CK to stream an e8m0 `(1,32)` MXFP4 scale. The down kernel
+      supports `Block2D` (`ScaleLayoutTraits::is_block2d`) but only the generic
+      `Block2D<128,128>` granularity — no `(1,32)` e8m0 path is visible — so an exact match
+      likely needs **kernel work** (see D7 for the steps). Until then, document the caveat.
+- **See also D7** for the CK-real-weights/validation path (real values + e8m0 scale support).
 
 #### B2 — add TOPK to the FlyDSL cold-bench return dicts  [x] DONE (2026-08-14)
 - [x] Added `"TOPK": TOPK` (after `"E"`) to both `bench_down_cold` and `bench_gate_up_cold`
@@ -239,9 +251,25 @@ the FlyDSL cold harness.
 - [ ] Reference the generated artifact from the plan doc.
 
 #### D7 — (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs  [ ]
-- [ ] Add a CK mode that accepts/initializes real inputs and dumps the output tensor; feed
-      identical inputs to both and compare (cos / `checkAllclose`). Heavier — explicitly
-      optional / stretch (both harnesses are currently perf-only).
+Both harnesses are currently **perf-only** (CK runs uninitialized weights + dummy scales;
+timing is data-independent so this doesn't affect perf). This item = "convert CK to real
+weights" and validate. Est **~2–3 days**, dominated by FP4 pack/scale convention-matching.
+Steps:
+- [ ] **Init real inputs per shape** on-device (small fill / hiprand) rather than multi-GB
+      H2D — the pools are ~3.75 GB each (DeepSeek gate/up). Behind a `CK_WD_VALIDATE` flag so
+      perf mode stays the default (real init adds startup cost). (~0.5 d)
+- [ ] **FP8 quant:** produce FP8 weights + real `Block2D<128,128>` scales from a bf16
+      reference (host or device quantizer). (~0.5 d)
+- [ ] **FP4 pack + e8m0 scales (the hard part):** nibble-pack to `pk_fp4_t` and compute e8m0
+      `(1,32)` block scales matching FlyDSL's exact packing/scale convention. **Needs kernel
+      work** — the down kernel's `Block2D` path only supports the generic `Block2D<128,128>`
+      granularity, not an e8m0 `(1,32)` MXFP4 scale (this is also what B1 needs for an exact
+      FP4 scale-traffic match). (~0.5–1 d)
+- [ ] **Dump + compare:** emit the CK output tensor and compare (cos / `checkAllclose`)
+      against FlyDSL/torch on identical inputs. (~0.5 d)
+- [ ] Wire the `CK_WD_VALIDATE` flag + a compare.py hook; keep perf runs unaffected. (~0.25 d)
+- **Cross-ref:** landing the e8m0 `(1,32)` scale support here also closes B1's exact FP4
+      scale-traffic match (else B1 stays a documented ~6% CK-favored caveat).
 
 ---
 
@@ -279,6 +307,10 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   aiter; the CK side is a standalone binary so it's driven via subprocess.
 - **Regime honesty:** ratios are only "apples-to-apples" once cold + scale + timing + config
   are aligned; report the config/regime next to every table.
+- **FP4 scale-traffic bias (~6%, CK-favored):** CK FP4 uses a dummy PerTensor scale while
+  FlyDSL streams a real e8m0 `(1,32)` scale (~6% of the FP4 weight bytes); CK reads ~0 scale
+  bytes, so FP4-cell ratios are modestly CK-favored. Exact match needs e8m0 `(1,32)` kernel
+  support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
 - 2026-08-14 — plan drafted from `SILOTIGER-667-bench-TODO.txt`; per-stage G9 items folded
@@ -304,3 +336,7 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   benches, joins on dims, emits a ratio table (markdown + CSV) via the shared metrics helper;
   smoke-tested on GPU 6. Added `fp8_cos` to the cold dicts for the sanity column. n/a cells
   (gate_up FP4 CK → A4; DeepSeek FP8 → B5) render correctly.
+- 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
+  measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
+  entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in
+  D7 (init/quant/FP4-pack+e8m0/dump-compare, ~2–3 d) and cross-linked B1↔D7.
