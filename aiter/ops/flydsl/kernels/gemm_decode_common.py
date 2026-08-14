@@ -629,7 +629,7 @@ def iter_gemm_decode_configs(
 
 
 _NAME_RE = re.compile(
-    r"^flydsl_decode_v1_a(?P<arch>gfx\d+)_m(?P<m>\d+)_n(?P<n>\d+)_k(?P<k>\d+)_"
+    r"^flydsl_decode_a(?P<arch>gfx\d+)_m(?P<m>\d+)_n(?P<n>\d+)_k(?P<k>\d+)_"
     r"(?P<body>.+)$"
 )
 
@@ -644,7 +644,7 @@ def gemm_decode_kernel_name(
     has_bias: bool = False,
 ) -> str:
     config.validate(m=m, n=n, k=k, arch=arch)
-    prefix = f"flydsl_decode_v1_a{arch}_m{m}_n{n}_k{k}_"
+    prefix = f"flydsl_decode_a{arch}_m{m}_n{n}_k{k}_"
     if isinstance(config, WaveDecodeConfig):
         name = prefix + (
             f"pwave_mp{config.m_per_wave}_np{config.n_per_wave}_kv{config.kvec}_"
@@ -654,7 +654,7 @@ def gemm_decode_kernel_name(
         )
     else:
         name = prefix + (
-            f"pblock2_ww{config.waves_per_workgroup}_cw{config.columns_per_wave}_"
+            f"pblock_ww{config.waves_per_workgroup}_cw{config.columns_per_wave}_"
             f"as{config.activation_source.value}_bl{config.b_load_width}_"
             f"ku{config.k_unroll}_pf{config.prefetch_stages}_"
             f"pn{int(config.persistent_n)}_g{config.workgroups_per_cu}_"
@@ -697,7 +697,7 @@ def parse_gemm_decode_kernel_name(
         )
     else:
         block = re.fullmatch(
-            r"pblock2_ww(\d+)_cw(\d+)_as([a-z]+)_bl(\d+)_ku(\d+)_"
+            r"pblock_ww(\d+)_cw(\d+)_as([a-z]+)_bl(\d+)_ku(\d+)_"
             r"pf(\d+)_pn([01])_g(\d+)_we(\d+)_cp(\d+)_or([a-z]+)",
             body,
         )

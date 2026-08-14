@@ -400,7 +400,7 @@ def mp_tuner(
         fast_mode: Skip result comparison if True
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
-        timeout: Timeout in seconds for each task group (None = no timeout)
+        timeout: Timeout in seconds for each isolated candidate (None = no timeout)
 
     Returns:
         List of (info, latency, error_ratio) tuples
@@ -412,7 +412,13 @@ def mp_tuner(
     start_idx = 0
     if not tasks:
         return []
-    if mp_num == 1 and fast_mode == 0:
+    if shape_grouped and timeout is not None:
+        print(
+            "[Task Grouping] Disabling shape grouping because candidate "
+            "timeouts must not discard completed winners."
+        )
+        shape_grouped = False
+    elif mp_num == 1 and fast_mode == 0:
         shape_grouped = True
     # time.sleep(2)
     task_group = []
@@ -562,7 +568,10 @@ def mp_tuner(
                     if elapsed is not None and elapsed > timeout:
                         consecutive_timeouts += 1
 
-                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                        error_msg = (
+                            f"[!] Candidate {k} exceeded its {timeout}s execution "
+                            f"budget after {elapsed:.1f}s"
+                        )
                         print(error_msg)
                         failed_tasks.append((k, "timeout"))
 
@@ -574,13 +583,16 @@ def mp_tuner(
                         )
                         completed_this_round.append((k, async_result))
 
-                        # Trigger pool restart for timeout (similar to crash)
+                        # Isolate the timed-out worker and preserve all completed
+                        # candidate results before resubmitting unfinished work.
                         pool_restart_needed = True
 
-                        # If half the GPUs worth of consecutive timeouts, pool is in bad shape
+                        # Restart promptly when several workers exceed their
+                        # independent candidate budgets.
                         if consecutive_timeouts >= half_gpu:
                             print(
-                                f"\n[!] {consecutive_timeouts} consecutive tasks timed out (>= {half_gpu}/{mp_num} GPUs likely stuck)"
+                                f"\n[!] {consecutive_timeouts} candidate budgets "
+                                f"expired (>= {half_gpu}/{mp_num} workers)"
                             )
                             print("[!] Triggering immediate pool restart...\n")
                             break
@@ -713,7 +725,7 @@ def mp_tuner(
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
-            f"    - Timeouts (GPU hang): {timeout_count}\n"
+            f"    - Candidate timeouts: {timeout_count}\n"
             f"    - Crashes (memory fault): {crash_count}\n"
             f"{'=' * 60}"
         )

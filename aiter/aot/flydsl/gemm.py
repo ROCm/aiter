@@ -16,7 +16,7 @@ Supported kernel families:
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
-  - ``flydsl_decode_v1_*``                    exact-M BF16 decode GEMM kernels
+  - ``flydsl_decode_*``                       exact-shape BF16 decode GEMM kernels
   - ``smallm_hgemm_*``                        gfx942/gfx950 small-M BF16 GEMM kernels
 
 Usage:
@@ -272,6 +272,10 @@ def parse_csv(csv_path: str):
                     raise ValueError(
                         "FlyDSL small-M CSV bias metadata does not match kernel name"
                     )
+                if (params["n"], params["k"]) != (n, k):
+                    raise ValueError(
+                        "FlyDSL small-M CSV N/K does not match kernel name"
+                    )
                 if params["split_k"] != int(row.get("splitK", "0")):
                     raise ValueError(
                         "FlyDSL small-M CSV splitK does not match kernel name"
@@ -348,6 +352,11 @@ def parse_csv(csv_path: str):
                 raise ValueError(
                     "FlyDSL HGEMM CSV architecture does not match kernel name"
                 )
+            if params.get("kind") == "hgemm" and (
+                params.get("n"),
+                params.get("k"),
+            ) != (n, k):
+                raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
 
             job = {
                 "kernel_name": kernel_name,

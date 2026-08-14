@@ -42,7 +42,9 @@ FLYDSL_SMALL_M_SUPPORTED_ARCHS = frozenset()
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
+            BlockMfmaDecodeConfig,
             SPLIT_K_SEMAPHORE_MAX_LEN,
+            WaveDecodeConfig,
             flydsl_hgemm,
             flydsl_small_m_hgemm,
             gemm_decode_bf16,
@@ -54,7 +56,7 @@ try:
         )
         from aiter.ops.flydsl.kernels.small_m_hgemm import (
             SMALL_M_SUPPORTED_ARCHS,
-            iter_small_m_registry_configs,
+            iter_small_m_tuning_configs,
             small_m_kernel_name,
         )
 
@@ -62,6 +64,8 @@ try:
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
+    BlockMfmaDecodeConfig = None
+    WaveDecodeConfig = None
     flydsl_hgemm = None
     flydsl_small_m_hgemm = None
     SPLIT_K_SEMAPHORE_MAX_LEN = 256
@@ -69,7 +73,7 @@ except ImportError as exc:
     gemm_decode_bf16 = None
     gemm_decode_kernel_name = None
     iter_gemm_decode_configs = None
-    iter_small_m_registry_configs = None
+    iter_small_m_tuning_configs = None
     small_m_kernel_name = None
     FLYDSL_TUNE_ERROR = str(exc)
 
@@ -711,6 +715,71 @@ def libtype_list(string):
     return values
 
 
+def _round_robin_representatives(items, *, limit, bucket_key, priority_key):
+    buckets = {}
+    for item in items:
+        buckets.setdefault(bucket_key(item), []).append(item)
+    for bucket in buckets.values():
+        bucket.sort(key=priority_key)
+
+    keys = sorted(buckets, key=str)
+    offsets = {key: 0 for key in keys}
+    selected = []
+    while keys and len(selected) < limit:
+        next_keys = []
+        for key in keys:
+            offset = offsets[key]
+            bucket = buckets[key]
+            if offset >= len(bucket):
+                continue
+            selected.append(bucket[offset])
+            offsets[key] = offset + 1
+            if offsets[key] < len(bucket):
+                next_keys.append(key)
+            if len(selected) >= limit:
+                break
+        keys = next_keys
+    return selected
+
+
+def _bounded_decode_configs(configs):
+    def bucket(config):
+        if isinstance(config, WaveDecodeConfig):
+            return ("wave", config.contraction.value)
+        return (
+            "block",
+            config.activation_source.value,
+            bool(config.persistent_n),
+        )
+
+    def priority(config):
+        if isinstance(config, WaveDecodeConfig):
+            return (
+                -config.m_per_wave,
+                config.n_per_wave != 1,
+                config.kvec != 8,
+                config.prefetch_depth != 1,
+                config.waves_per_eu != 2,
+                config.b_cache_modifier != 0,
+                config.reduction.value != "dpp",
+                repr(config),
+            )
+        return (
+            config.waves_per_workgroup != 8,
+            config.columns_per_wave != 1,
+            config.b_load_width != 8,
+            config.k_unroll != 2,
+            config.waves_per_eu != 2,
+            config.workgroups_per_cu != 1,
+            config.b_cache_modifier != 0,
+            repr(config),
+        )
+
+    return _round_robin_representatives(
+        configs, limit=12, bucket_key=bucket, priority_key=priority
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tuner
 # ---------------------------------------------------------------------------
@@ -780,6 +849,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="with_hipblaslt",
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+        )
+        self.parser.add_argument(
+            "--candidate-policy",
+            choices=("bounded", "deep"),
+            default="bounded",
+            help="Candidate breadth policy. 'bounded' is the normal deterministic "
+            "representative search; 'deep' enables the exhaustive Cartesian search.",
         )
         self.parser.add_argument(
             "--with-vllm-wvsplitk",
@@ -1002,6 +1078,17 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         ("out_asm",),
                     )
                 )
+        if getattr(self, "candidate_policy", "bounded") == "bounded":
+            tasks = _round_robin_representatives(
+                tasks,
+                limit=4,
+                bucket_key=lambda task: min(int(task[0][2]), 4),
+                priority_key=lambda task: (
+                    int(task[0][2]) not in (1, 2, 4),
+                    int(task[0][1]),
+                    str(task[0][3]),
+                ),
+            )
         return tasks
 
     def _get_opus_tasks(
@@ -1118,6 +1205,25 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 )
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
+        if getattr(self, "candidate_policy", "bounded") == "bounded":
+            tasks = [
+                task for task in tasks if int(task[4][2]["split_k"]) in (1, 2, 4)
+            ]
+            tasks = _round_robin_representatives(
+                tasks,
+                limit=8,
+                bucket_key=lambda task: int(task[4][2]["split_k"]),
+                priority_key=lambda task: (
+                    int(task[4][2]["stages"]) != 2,
+                    int(task[4][2]["tile_m"]) not in (16, 32, 64),
+                    int(task[4][2]["tile_n"]) != 128,
+                    int(task[4][2]["tile_k"]) != 64,
+                    int(task[4][2]["block_m_warps"])
+                    * int(task[4][2]["block_n_warps"])
+                    * int(task[4][2]["block_k_warps"]),
+                    str(task[0][3]),
+                ),
+            )
         return tasks
 
     def _get_flydsl_decode_tasks(
@@ -1158,9 +1264,12 @@ class GemmA16W16Tuner(GemmCommonTuner):
         decode_run_kwargs["num_iters"] = 3
         # Decode has a deliberately stricter absolute/relative correctness gate
         # than the general GEMM catalog. Every candidate is rejected independently.
-        for solidx, config in enumerate(
+        configs = list(
             iter_gemm_decode_configs(M, N, K, arch, num_cus=int(info_keys[1]))
-        ):
+        )
+        if getattr(self, "candidate_policy", "bounded") == "bounded":
+            configs = _bounded_decode_configs(configs)
+        for solidx, config in enumerate(configs):
             kernel_name = gemm_decode_kernel_name(
                 arch,
                 M,
@@ -1217,7 +1326,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     ):
         if (
             flydsl_hgemm is None
-            or iter_small_m_registry_configs is None
+            or iter_small_m_tuning_configs is None
             or small_m_kernel_name is None
         ):
             logger.warning(f"FlyDSL small-M unavailable: {FLYDSL_TUNE_ERROR}")
@@ -1246,8 +1355,42 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 f"but the runtime device is {runtime_arch}"
             )
         configs = list(
-            iter_small_m_registry_configs("bf16", "bf16", m=M, n=N, k=K)
+            iter_small_m_tuning_configs(
+                "bf16",
+                "bf16",
+                m=M,
+                n=N,
+                k=K,
+                max_configs=256,
+            )
         )
+        if getattr(self, "candidate_policy", "bounded") == "bounded":
+            configs = [config for config in configs if config["split_k"] <= 2]
+
+            def small_m_bucket(config):
+                if config["persistent_n_tiles"] > 1:
+                    path = "persistent"
+                elif config["n_tile_repeat"] > 1:
+                    path = "repeat"
+                elif config["b_to_lds"]:
+                    path = "b_to_lds"
+                else:
+                    path = "direct"
+                return path, config["lds_staging"], config["split_k"]
+
+            configs = _round_robin_representatives(
+                configs,
+                limit=16,
+                bucket_key=small_m_bucket,
+                priority_key=lambda config: (
+                    config["tile_n"] != 128,
+                    config["tile_k"] != 64,
+                    config["block_n_warps"] != 2,
+                    config["waves_per_eu"] != 2,
+                    config["b_to_lds_unroll"] not in (0, 8),
+                    tuple(sorted(config.items())),
+                ),
+            )
         tasks = []
         small_m_run_kwargs = dict(run_kwargs)
         small_m_run_kwargs["use_cuda_event"] = True
@@ -1256,6 +1399,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             config["block_k_warps"] = 1
             kernel_name = small_m_kernel_name(
                 "bf16",
+                N,
+                K,
                 target_gfx=config["target_gfx"],
                 tile_n=config["tile_n"],
                 tile_k=config["tile_k"],
@@ -1501,6 +1646,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         with_vllm_wvsplitk = getattr(args, "with_vllm_wvsplitk", False)
+        self.candidate_policy = getattr(args, "candidate_policy", "bounded")
         _VLLM_WVSPLITK_FINITE_CHECKED.clear()
         if "vllm_wvsplitk" in libtype and not with_vllm_wvsplitk:
             logger.warning(
@@ -1522,7 +1668,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
             _VLLM_WVSPLITK_METADATA = None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        run_kwargs = {"num_warmup": 10, "num_iters": 101}
+        # Direct HIP launches and several eager providers are not reliably
+        # visible to the PyTorch profiler on this stack. A zero-duration sample
+        # can otherwise beat every real candidate and poison the tuned CSV.
+        # Use one CUDA/HIP-event backend for all providers in this tuner.
+        run_kwargs = {
+            "num_warmup": 10,
+            "num_iters": 101,
+            "use_cuda_event": True,
+        }
 
         task = []
         tasks_data = []
@@ -1578,7 +1732,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_torch_tasks(*common))
             if "all" in libtype or "triton" in libtype:
                 task.extend(self._get_triton_tasks(*common))
-            if "all" in libtype or "opus" in libtype:
+            if (
+                "all" in libtype or "opus" in libtype
+            ) and self.candidate_policy == "deep":
                 opus_tasks = self._get_opus_tasks(*common)
                 if opus_tasks and _opus_ensure_kids_compiled is not None:
                     opus_kids = {t[0][1] for t in opus_tasks}

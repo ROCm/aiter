@@ -210,6 +210,8 @@ def _small_m_split_k_options(k: int, tile_k: int) -> tuple[int, ...]:
 
 def small_m_kernel_name(
     dtype: str,
+    n: int,
+    k: int,
     *,
     target_gfx: str,
     tile_n: int,
@@ -230,7 +232,8 @@ def small_m_kernel_name(
     if target_gfx != "gfx942" and lds_staging != LDS_STAGING_DIRECT:
         raise ValueError(f"LDS staging {lds_staging!r} is not supported for {target_gfx}")
     name = (
-        f"smallm_hgemm_{dtype}_{target_gfx}_{TILE_M}x{tile_n}x{tile_k}_S{STAGES}TN_AS"
+        f"smallm_hgemm_{dtype}_{target_gfx}_n{n}_k{k}_"
+        f"{TILE_M}x{tile_n}x{tile_k}_S{STAGES}TN_AS"
         f"_BNW{block_n_warps}"
     )
     if n_tile_repeat > 1:
@@ -254,6 +257,7 @@ def small_m_kernel_name(
 
 _SMALL_M_KERNEL_NAME_RE = re.compile(
     r"^smallm_hgemm_(?P<dtype>bf16)_(?P<target_gfx>gfx\d+)_"
+    r"n(?P<n>[1-9]\d*)_k(?P<k>[1-9]\d*)_"
     r"16x(?P<tile_n>[1-9]\d*)x"
     r"(?P<tile_k>[1-9]\d*)_S2TN_AS_BNW(?P<block_n_warps>[1-9]\d*)"
     r"(?:_NR(?P<n_tile_repeat>(?:[2-9]|[1-9]\d+)))?"
@@ -277,6 +281,8 @@ def parse_small_m_kernel_name(kernel_name: str) -> dict:
     config = {
         "kernel_family": "small_m",
         "target_gfx": groups["target_gfx"],
+        "n": int(groups["n"]),
+        "k": int(groups["k"]),
         "stage": STAGES,
         "tile_m": TILE_M,
         "tile_n": int(groups["tile_n"]),
@@ -312,15 +318,11 @@ def parse_small_m_kernel_name(kernel_name: str) -> dict:
             "wide-N small-M B-to-LDS kernel name must encode effective waves-per-EU"
         )
 
-    validation_n = config["tile_n"] * max(
-        config["n_tile_repeat"], config["persistent_n_tiles"]
-    )
-    validation_k = config["tile_k"] * config["split_k"]
     try:
         _validate_small_m_registry_config(
             1,
-            validation_n,
-            validation_k,
+            config["n"],
+            config["k"],
             tile_n=config["tile_n"],
             tile_k=config["tile_k"],
             split_k=config["split_k"],
@@ -340,6 +342,8 @@ def parse_small_m_kernel_name(kernel_name: str) -> dict:
 
     canonical_name = small_m_kernel_name(
         config["dtype"],
+        config["n"],
+        config["k"],
         target_gfx=config["target_gfx"],
         tile_n=config["tile_n"],
         tile_k=config["tile_k"],
@@ -448,6 +452,11 @@ def validate_small_m_kernel_config(
         raise ValueError(
             "FlyDSL small-M config architecture mismatch: "
             f"name={config.get('target_gfx')!r}, runtime={arch!r}"
+        )
+    if (config.get("n"), config.get("k")) != (n, k):
+        raise ValueError(
+            "FlyDSL small-M config shape mismatch: "
+            f"name={(config.get('n'), config.get('k'))}, runtime={(n, k)}"
         )
     try:
         _validate_small_m_registry_config(
@@ -824,6 +833,8 @@ def compile_small_m_hgemm_kernel(
 
     KERNEL_NAME = small_m_kernel_name(
         dtype,
+        n,
+        k,
         target_gfx=GPU_ARCH,
         tile_n=TILE_N,
         tile_k=TILE_K,

@@ -246,6 +246,8 @@ def get_GEMM_A16W16_config(
                     if (
                         flydsl_config is None
                         or flydsl_config.get("target_gfx") != gfx
+                        or flydsl_config.get("n") != N
+                        or flydsl_config.get("k") != K
                         or int(config["splitK"]) != flydsl_config.get("split_k")
                     ):
                         logger.warning(
@@ -307,6 +309,8 @@ def get_GEMM_A16W16_config(
                         )
                         if (
                             name_config["target_gfx"] != gfx
+                            or name_config["n"] != N
+                            or name_config["k"] != K
                             or name_config["has_bias"] != bias
                             or int(config["splitK"]) != name_config["split_k"]
                         ):
@@ -625,6 +629,17 @@ def flydsl_gemm(
     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
         config["kernelName"]
     )
+    runtime_shape = (int(weights.shape[0]), int(inp.shape[1]))
+    kernel_shape = (
+        None
+        if flydsl_config is None
+        else (flydsl_config.get("n"), flydsl_config.get("k"))
+    )
+    if kernel_shape != runtime_shape:
+        raise ValueError(
+            "FlyDSL HGEMM kernel N/K identity does not match launch: "
+            f"kernel={kernel_shape}, runtime={runtime_shape}"
+        )
     stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
@@ -675,7 +690,7 @@ def flydsl_decode_gemm(
     bpreshuffle=False,
     config: Optional[dict] = None,
 ):
-    """Launch an exact-shape unified decode kernel selected by the BF16 CSV."""
+    """Launch an exact-M/N/K decode kernel selected by the BF16 CSV."""
     del solidx
     if config is None or not config.get("kernelName"):
         raise ValueError("FlyDSL decode dispatch requires kernelName")
@@ -702,7 +717,7 @@ def flydsl_decode_gemm(
     if (arch, m, n, k) != expected:
         raise ValueError(
             "FlyDSL decode tuned kernel does not match the runtime "
-            f"architecture/exact shape: kernel={(arch, m, n, k)}, runtime={expected}"
+            f"exact identity: kernel={(arch, m, n, k)}, runtime={expected}"
         )
     if has_bias != (bias is not None):
         raise ValueError("FlyDSL decode kernel bias identity does not match launch")
@@ -732,7 +747,7 @@ def flydsl_small_m_gemm(
     bpreshuffle=False,
     config: Optional[dict] = None,
 ):
-    """Launch an exact-shape small-M kernel selected by the BF16 CSV."""
+    """Launch an exact-N/K, runtime-M small-M kernel selected by the BF16 CSV."""
     del solidx
     if config is None or not config.get("kernelName"):
         raise ValueError("FlyDSL small-M dispatch requires kernelName")

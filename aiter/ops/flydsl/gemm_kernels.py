@@ -73,6 +73,7 @@ KERNEL_FAMILY_SMALL_M = "small_m"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
+    r"n(?P<n>[1-9]\d*)_k(?P<k>[1-9]\d*)_"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"split_k(?P<split_k>\d+)_"
     r"block_m_warp(?P<block_m_warps>\d+)_"
@@ -113,9 +114,6 @@ KERNEL_CONFIG_VARIANTS = [
     for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
 ]
 
-_SPLITK_HGEMM_KERNELS: dict[str, dict] = {}
-
-
 def _normalize_supported_kernel_metadata(
     *,
     async_copy: bool,
@@ -140,6 +138,8 @@ def flydsl_kernel_name(
     stages: int,
     dtype: str,
     out_dtype: str,
+    n: int,
+    k: int,
     tile_m: int,
     tile_n: int,
     tile_k: int,
@@ -163,7 +163,8 @@ def flydsl_kernel_name(
     if b_preshuffle:
         raise ValueError("Current generic kernel only supports `b_preshuffle=False`")
     name = (
-        f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
+        f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_n{n}_k{k}_"
+        f"t{tile_m}x{tile_n}x{tile_k}"
     )
     name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}_block_k_warp{block_k_warp}"
     name += (
@@ -575,15 +576,14 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
         "c_to_lds": m.group("c_to_lds") == "True",
         "dtype": m.group("a_dtype"),
         "out_dtype": m.group("out_dtype"),
+        "n": int(m.group("n")),
+        "k": int(m.group("k")),
         "target_gfx": m.group("target_gfx"),
     }
     return config
 
 
 def get_flydsl_splitk_hgemm_kernel_params(name: str) -> dict | None:
-    config = _SPLITK_HGEMM_KERNELS.get(name)
-    if config is not None:
-        return dict(config)
     config = _parse_hgemm_kernel_params(name)
     if config is not None:
         return dict(config)
@@ -599,11 +599,9 @@ def get_flydsl_splitk_hgemm_kernels(
     k: int | None = None,
 ) -> dict[str, dict]:
     kernels = {}
-    if any(dim is None for dim in (m, n, k)) and any(
-        dim is not None for dim in (m, n, k)
-    ):
+    if any(dim is None for dim in (m, n, k)):
         raise ValueError(
-            "m, n, k must be provided together when requesting shape-aware kernels"
+            "m, n, k are required to generate exact-shape HGEMM candidates"
         )
     tile_ms = _hgemm_tile_m_options(m)
     for tile_m, tile_n, tile_k, stages, variant in product(
@@ -636,30 +634,33 @@ def get_flydsl_splitk_hgemm_kernels(
             config["dtype"] = dtype
             config["out_dtype"] = out_dtype
             config["target_gfx"] = get_gfx()
-            if m is not None:
-                try:
-                    _validate_hgemm_tiling(
-                        m,
-                        n,
-                        k,
-                        dtype=dtype,
-                        tile_m=config["tile_m"],
-                        tile_n=config["tile_n"],
-                        tile_k=config["tile_k"],
-                        pack_n=1,
-                        split_k=config["split_k"],
-                        stages=config["stages"],
-                        block_m_warps=config["block_m_warps"],
-                        block_n_warps=config["block_n_warps"],
-                        block_k_warps=config["block_k_warps"],
-                        b_to_lds=config["b_to_lds"],
-                    )
-                except ValueError:
-                    continue
+            config["n"] = n
+            config["k"] = k
+            try:
+                _validate_hgemm_tiling(
+                    m,
+                    n,
+                    k,
+                    dtype=dtype,
+                    tile_m=config["tile_m"],
+                    tile_n=config["tile_n"],
+                    tile_k=config["tile_k"],
+                    pack_n=1,
+                    split_k=config["split_k"],
+                    stages=config["stages"],
+                    block_m_warps=config["block_m_warps"],
+                    block_n_warps=config["block_n_warps"],
+                    block_k_warps=config["block_k_warps"],
+                    b_to_lds=config["b_to_lds"],
+                )
+            except ValueError:
+                continue
             name = flydsl_kernel_name(
                 config["stages"],
                 dtype,
                 out_dtype,
+                n,
+                k,
                 config["tile_m"],
                 config["tile_n"],
                 config["tile_k"],
@@ -674,17 +675,6 @@ def get_flydsl_splitk_hgemm_kernels(
             )
             kernels[name] = config
     return kernels
-
-
-def _register_all_configs():
-    for dtype in ("bf16", "f16"):
-        for out_dtype in ("f16", "bf16"):
-            _SPLITK_HGEMM_KERNELS.update(
-                get_flydsl_splitk_hgemm_kernels(dtype, out_dtype)
-            )
-
-
-_register_all_configs()
 
 
 @functools.lru_cache(maxsize=128)
