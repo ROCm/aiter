@@ -53,8 +53,18 @@ def ref_attention(q, k_cache, v_cache, cu_q, kv_indptr, kv_pages, sm_scale):
     return out
 
 
-def make_inputs(bs, q_len, kv_len, H, D, Hkv=1, seed=0, device="cuda",
-                dtype=torch.bfloat16, dist="normal"):
+def make_inputs(
+    bs,
+    q_len,
+    kv_len,
+    H,
+    D,
+    Hkv=1,
+    seed=0,
+    device="cuda",
+    dtype=torch.bfloat16,
+    dist="normal",
+):
     """Shared-prefix page layout: every request shares the first (kv_len - q_len)
     pages and owns a unique tail, which is what prefix caching produces."""
     g = torch.Generator(device="cpu").manual_seed(seed)

@@ -19,7 +19,7 @@ import os
 import pytest
 import torch
 
-import aiter.ops.mha as mha
+from aiter.ops import mha
 from aiter.ops.triton.attention import fused_paged_prefill as fpp
 
 POOL_PAGES = 20000
@@ -36,8 +36,17 @@ def _restore_env():
         os.environ[ENV] = old
 
 
-def make(bs=2, q_len=256, kv_len=1024, H=8, Hkv=1, D=256, dtype=torch.bfloat16,
-         seed=0, device="cuda"):
+def make(
+    bs=2,
+    q_len=256,
+    kv_len=1024,
+    H=8,
+    Hkv=1,
+    D=256,
+    dtype=torch.bfloat16,
+    seed=0,
+    device="cuda",
+):
     g = torch.Generator(device="cpu").manual_seed(seed)
     prefix = kv_len - q_len
     perm = torch.randperm(POOL_PAGES, generator=g)
@@ -45,17 +54,20 @@ def make(bs=2, q_len=256, kv_len=1024, H=8, Hkv=1, D=256, dtype=torch.bfloat16,
     pages = torch.cat(
         [torch.cat([shared, tails[i * q_len : (i + 1) * q_len]]) for i in range(bs)]
     )
-    mk = lambda *sh: (torch.randn(*sh, generator=g) * 0.5).to(dtype).to(device)
-    return dict(
-        q=mk(bs * q_len, H, D),
-        k=mk(POOL_PAGES, Hkv, D),
-        v=mk(POOL_PAGES, Hkv, D),
-        cu_seqlens_q=(torch.arange(bs + 1, dtype=torch.int32) * q_len).to(device),
-        kv_indptr=(torch.arange(bs + 1, dtype=torch.int32) * kv_len).to(device),
-        kv_page_indices=pages.to(torch.int32).to(device),
-        max_seqlen_q=q_len,
-        max_seqlen_k=kv_len,
-    )
+
+    def mk(*sh):
+        return (torch.randn(*sh, generator=g) * 0.5).to(dtype).to(device)
+
+    return {
+        "q": mk(bs * q_len, H, D),
+        "k": mk(POOL_PAGES, Hkv, D),
+        "v": mk(POOL_PAGES, Hkv, D),
+        "cu_seqlens_q": (torch.arange(bs + 1, dtype=torch.int32) * q_len).to(device),
+        "kv_indptr": (torch.arange(bs + 1, dtype=torch.int32) * kv_len).to(device),
+        "kv_page_indices": pages.to(torch.int32).to(device),
+        "max_seqlen_q": q_len,
+        "max_seqlen_k": kv_len,
+    }
 
 
 def run(inp, **kwargs):
@@ -63,8 +75,15 @@ def run(inp, **kwargs):
     kwargs.setdefault("causal", True)
     try:
         out = mha.mha_batch_prefill_func(
-            inp["q"], inp["k"], inp["v"], inp["cu_seqlens_q"], inp["kv_indptr"],
-            inp["kv_page_indices"], inp["max_seqlen_q"], inp["max_seqlen_k"], **kwargs
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["cu_seqlens_q"],
+            inp["kv_indptr"],
+            inp["kv_page_indices"],
+            inp["max_seqlen_q"],
+            inp["max_seqlen_k"],
+            **kwargs,
         )
         torch.cuda.synchronize()
     except Exception as e:  # noqa: BLE001 - the exception IS the observable behaviour
@@ -114,11 +133,13 @@ def assert_no_interference(on, off1, off2, what):
     is not, the most that can be asserted is that the on-leg sits inside CK-tile's
     own run-to-run spread, and the case says so rather than quietly weakening.
     """
-    assert on[0] == off1[0], (
-        f"{what}: outcome differs, on={on[0]} off={off1[0]}\n  on: {on[1]}\n off: {off1[1]}"
-    )
+    assert (
+        on[0] == off1[0]
+    ), f"{what}: outcome differs, on={on[0]} off={off1[0]}\n  on: {on[1]}\n off: {off1[1]}"
     if on[0] == "raised":
-        assert on[1] == off1[1], f"{what}: different exception\n  on: {on[1]}\n off: {off1[1]}"
+        assert (
+            on[1] == off1[1]
+        ), f"{what}: different exception\n  on: {on[1]}\n off: {off1[1]}"
         return "raised identically"
 
     a, b, c = on[1], off1[1], off2[1]
@@ -127,7 +148,9 @@ def assert_no_interference(on, off1, off2, what):
     for i, (x, y, z) in enumerate(zip(a, b, c)):
         if x is None and y is None:
             continue
-        assert x.shape == y.shape and x.dtype == y.dtype, f"{what}[{i}]: shape/dtype differ"
+        assert (
+            x.shape == y.shape and x.dtype == y.dtype
+        ), f"{what}[{i}]: shape/dtype differ"
         ck_reproducible = torch.equal(y, z)
         if ck_reproducible:
             assert torch.equal(x, y), (
@@ -155,6 +178,7 @@ def assert_no_interference(on, off1, off2, what):
 # path on and off, and must not enter the Triton kernel.
 # --------------------------------------------------------------------------------
 
+
 def _alibi(H=8):
     return torch.zeros(H, device="cuda", dtype=torch.float32)
 
@@ -164,27 +188,27 @@ def _scale():
 
 
 REJECTED = {
-    "non_causal":            (dict(), dict(causal=False)),
-    "logits_soft_cap":       (dict(), dict(logits_soft_cap=30.0)),
-    "sliding_window":        (dict(), dict(window_size=(1024, 0))),
-    "return_lse":            (dict(), dict(return_lse=True)),
-    "return_attn_probs":     (dict(), dict(return_attn_probs=True)),
-    "alibi_slopes":          (dict(), dict(alibi_slopes=_alibi)),
-    "sink_size":             (dict(), dict(sink_size=4)),
-    "q_descale":             (dict(), dict(q_descale=_scale)),
-    "k_descale":             (dict(), dict(k_descale=_scale)),
-    "v_descale":             (dict(), dict(v_descale=_scale)),
-    "dropout":               (dict(), dict(dropout_p=0.1)),
-    "seqlen_k":              (dict(), dict(seqlen_k=1024)),
-    # tensor-shape rejections, the ones that would be silent
-    "two_kv_heads":          (dict(Hkv=2), dict()),
-    "four_kv_heads":         (dict(Hkv=4), dict()),
-    "head_dim_128":          (dict(D=128), dict()),
-    "head_dim_64_ok":        (dict(D=64), None),   # sanity: this one IS taken
+    # name: (kwargs for make(), kwargs for the op call)
+    "non_causal": ({}, {"causal": False}),
+    "logits_soft_cap": ({}, {"logits_soft_cap": 30.0}),
+    "sliding_window": ({}, {"window_size": (1024, 0)}),
+    "return_lse": ({}, {"return_lse": True}),
+    "return_attn_probs": ({}, {"return_attn_probs": True}),
+    "alibi_slopes": ({}, {"alibi_slopes": _alibi}),
+    "sink_size": ({}, {"sink_size": 4}),
+    "q_descale": ({}, {"q_descale": _scale}),
+    "k_descale": ({}, {"k_descale": _scale}),
+    "v_descale": ({}, {"v_descale": _scale}),
+    "dropout": ({}, {"dropout_p": 0.1}),
+    "seqlen_k": ({}, {"seqlen_k": 1024}),
+    # tensor-shape rejections: the ones that would otherwise be silent
+    "two_kv_heads": ({"Hkv": 2}, {}),
+    "four_kv_heads": ({"Hkv": 4}, {}),
+    "head_dim_128": ({"D": 128}, {}),
 }
 
 
-@pytest.mark.parametrize("name", [k for k, v in REJECTED.items() if v[1] is not None])
+@pytest.mark.parametrize("name", list(REJECTED))
 def test_rejected_calls_are_untouched(name):
     mk_kwargs, call_kwargs = REJECTED[name]
     inp = make(**mk_kwargs)
@@ -218,7 +242,9 @@ def test_float32_falls_back():
 def test_kv_block_descale_falls_back():
     inp = make()
     ok, why = fpp.is_supported(
-        inp["q"], inp["k"], inp["v"],
+        inp["q"],
+        inp["k"],
+        inp["v"],
         kv_block_descale=torch.ones(POOL_PAGES, 1, 2, device="cuda"),
     )
     assert not ok and "kv_block_descale" in why
@@ -227,6 +253,7 @@ def test_kv_block_descale_falls_back():
 # --------------------------------------------------------------------------------
 # Calls the predicate accepts
 # --------------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("D", fpp.SUPPORTED_HEAD_DIMS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -249,9 +276,16 @@ def test_out_is_written_not_ignored():
     buf = torch.full_like(inp["q"], float("nan"))
     os.environ[ENV] = "1"
     ret = mha.mha_batch_prefill_func(
-        inp["q"], inp["k"], inp["v"], inp["cu_seqlens_q"], inp["kv_indptr"],
-        inp["kv_page_indices"], inp["max_seqlen_q"], inp["max_seqlen_k"],
-        causal=True, out=buf,
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["cu_seqlens_q"],
+        inp["kv_indptr"],
+        inp["kv_page_indices"],
+        inp["max_seqlen_q"],
+        inp["max_seqlen_k"],
+        causal=True,
+        out=buf,
     )
     torch.cuda.synchronize()
     assert torch.isfinite(buf).all(), "out buffer was left untouched by the fast path"
@@ -260,9 +294,16 @@ def test_out_is_written_not_ignored():
     os.environ[ENV] = "0"
     ref = torch.empty_like(inp["q"])
     mha.mha_batch_prefill_func(
-        inp["q"], inp["k"], inp["v"], inp["cu_seqlens_q"], inp["kv_indptr"],
-        inp["kv_page_indices"], inp["max_seqlen_q"], inp["max_seqlen_k"],
-        causal=True, out=ref,
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["cu_seqlens_q"],
+        inp["kv_indptr"],
+        inp["kv_page_indices"],
+        inp["max_seqlen_q"],
+        inp["max_seqlen_k"],
+        causal=True,
+        out=ref,
     )
     torch.cuda.synchronize()
     rel = _rms_rel(buf, ref)
@@ -271,7 +312,11 @@ def test_out_is_written_not_ignored():
 
 def _fp32_reference(inp, sm_scale):
     q, k, v = inp["q"], inp["k"], inp["v"]
-    cu_q, kv_indptr, pages = inp["cu_seqlens_q"], inp["kv_indptr"], inp["kv_page_indices"]
+    cu_q, kv_indptr, pages = (
+        inp["cu_seqlens_q"],
+        inp["kv_indptr"],
+        inp["kv_page_indices"],
+    )
     out = torch.empty_like(q)
     for b in range(cu_q.shape[0] - 1):
         qs, qe = int(cu_q[b]), int(cu_q[b + 1])
@@ -311,15 +356,17 @@ def test_accuracy_is_no_worse_than_ck(dist):
     assert got[0] == "ok" and ck[0] == "ok"
 
     e_triton, e_ck = _rms_rel(got[1][0], ref), _rms_rel(ck[1][0], ref)
-    print(f"\n  {dist}: triton {e_triton:.3e} vs ck-tile {e_ck:.3e} "
-          f"(ratio {e_triton / e_ck:.3f})")
+    print(
+        f"\n  {dist}: triton {e_triton:.3e} vs ck-tile {e_ck:.3e} "
+        f"(ratio {e_triton / e_ck:.3f})"
+    )
     assert e_triton < 2e-2, f"triton rms vs fp32 = {e_triton:.3e}"
     # The default scaling mode is exact in bf16, so the error should track CK-tile's
     # rather than merely stay inside a loose budget. This pins that: an earlier default
     # passed a 2e-2 budget while carrying 7x CK-tile's error on the spiked case.
-    assert e_triton <= e_ck * 1.25, (
-        f"{dist}: triton error {e_triton:.3e} is more than 1.25x CK-tile's {e_ck:.3e}"
-    )
+    assert (
+        e_triton <= e_ck * 1.25
+    ), f"{dist}: triton error {e_triton:.3e} is more than 1.25x CK-tile's {e_ck:.3e}"
 
 
 def test_kill_switch_prevents_dispatch():
@@ -359,8 +406,14 @@ def test_default_causal_false_is_not_dispatched():
     try:
         os.environ[ENV] = "1"
         mha.mha_batch_prefill_func(
-            inp["q"], inp["k"], inp["v"], inp["cu_seqlens_q"], inp["kv_indptr"],
-            inp["kv_page_indices"], inp["max_seqlen_q"], inp["max_seqlen_k"],
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["cu_seqlens_q"],
+            inp["kv_indptr"],
+            inp["kv_page_indices"],
+            inp["max_seqlen_q"],
+            inp["max_seqlen_k"],
         )
         torch.cuda.synchronize()
     finally:
