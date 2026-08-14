@@ -1302,6 +1302,94 @@ COLD_DOWN_SHAPES = [
 _COLD_FP4_LIMIT = 2**32
 _COLD_FP8_LIMIT = 2**31
 
+# Weight element bytes by weight dtype (FP4 is packed 2/byte -> 0.5).
+_WBYTES = {"fp4": 0.5, "fp8": 1.0, "bf16": 2.0}
+# Activation element bytes by activation dtype (gate_up: bf16 act by default;
+# the FP8-activation variant (B4/gate_fp8_d2 peer) uses 1).
+_XBYTES = {"fp4": 0.5, "fp8": 1.0, "bf16": 2.0}
+
+
+def compute_metrics(
+    op, B, HIDDEN, INTER, TOPK, w_dtype, us, method="weight_stream", act_dtype="bf16"
+):
+    """Derived perf metrics from raw time -- the single source of truth for both
+    the FlyDSL and CK harnesses (compare.py imports this and feeds CK's raw
+    us+dims through it too, so one formula covers both sides).
+
+    Time is the only method-independent quantity; bytes/FLOPs are pure functions
+    of (op, dims, dtype, method).  Two named methods:
+
+      "weight_stream" (DEFAULT) -- FlyDSL's weight-bandwidth-bound decode metric:
+        only the weight bytes a launch streams for its TOPK experts (+ e8m0 scale
+        bytes for FP4) and the core MAC FLOPs.  Reproduces the cold benches'
+        recorded wbytes/TB-s exactly.
+
+      "total_traffic" -- mirrors CK commit 62e30c9098: every operand touched per
+        launch (activation + both weights + intermediate + router + output) for
+        bytes, and the full epilogue (silu/scale + router mul) for FLOPs.  MUST be
+        revisited if CK's gu_bytes/dn_bytes/gu_flops/dn_flops change.
+
+    op: "down" | "gate_up"; w_dtype/act_dtype in {"fp4","fp8","bf16"}.
+    Returns {"TFLOPS", "TB/s", "%peak"} (%peak is bandwidth vs _HBM_PEAK_TBS).
+    """
+    if not (us and us > 0) or us != us:  # None / 0 / NaN
+        return {"TFLOPS": float("nan"), "TB/s": float("nan"), "%peak": float("nan")}
+    we = _WBYTES[w_dtype]
+    xe = _XBYTES[act_dtype]
+
+    if method == "weight_stream":
+        if op == "down":
+            outputs = B * HIDDEN
+            flops = 2 * INTER * TOPK * outputs
+            wbytes = outputs * TOPK * INTER * we
+            if w_dtype == "fp4":  # + e8m0 block-scale bytes (1 B / 32-elt block)
+                wbytes += outputs * TOPK * (INTER / _MXFP4_BK)
+        elif op == "gate_up":
+            out_elems = B * TOPK * INTER
+            flops = 2 * 2 * HIDDEN * out_elems  # gate+up matmuls
+            wbytes = out_elems * HIDDEN * 2 * we  # two weight streams (gate + up)
+            if w_dtype == "fp4":
+                wbytes += B * TOPK * 2 * INTER * (HIDDEN / _MXFP4_BK)
+        else:
+            raise ValueError(f"unknown op {op!r}")
+        bytes_ = wbytes
+    elif method == "total_traffic":
+        if op == "down":
+            flops = 3 * B * HIDDEN * TOPK * INTER
+            bytes_ = (
+                B
+                * HIDDEN
+                * (
+                    TOPK * INTER * 2  # intermediate (bf16)
+                    + TOPK * INTER * we  # down weight
+                    + 2 * TOPK * 4  # router ids + wts (i32/f32)
+                    + 2  # y (bf16)
+                )
+            )
+        elif op == "gate_up":
+            flops = B * TOPK * INTER * (4 * HIDDEN + 5)
+            bytes_ = (
+                B
+                * TOPK
+                * INTER
+                * (
+                    HIDDEN * xe  # activation
+                    + 2 * HIDDEN * we  # gate + up weights
+                    + 2  # intermediate (bf16)
+                )
+            )
+        else:
+            raise ValueError(f"unknown op {op!r}")
+    else:
+        raise ValueError(f"unknown method {method!r}")
+
+    tbs = bytes_ / us / 1e6
+    return {
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": tbs,
+        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+    }
+
 
 def _router_group_list(B, E, TOPK, device, n_route):
     """`n_route` router-id sets, each selecting a *disjoint* contiguous block of
@@ -1430,14 +1518,13 @@ def _time_rotating(entry_fn, rid_list, num_iters, num_warmup, timing):
 def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     """Cold-HBM A/B: FP4 vs FP8 `down` at real E, router rotated over the pool.
 
-    Returns one merged row (FP4 + FP8 side by side).  ``wbytes`` counts only the
-    weights a single launch reads (TOPK experts' rows) -- the effective cold read
-    per launch -- so TB/s reflects real HBM bandwidth, not the whole pool.
+    Returns one merged row (FP4 + FP8 side by side).  Metrics come from
+    ``compute_metrics(method="weight_stream")``, which counts only the weights a
+    single launch reads (TOPK experts' rows) -- the effective cold read per launch
+    -- so TB/s reflects real HBM bandwidth, not the whole pool.
     """
     device = torch.device("cuda")
     n_route = max(1, E // TOPK)
-    outputs = B * HIDDEN
-    flops = 2 * INTER * TOPK * outputs
     ehi = E * HIDDEN * INTER
     # K3 i32 addressing limits (see scope): FP4 byte offset = w_row*INTER/2, FP8 =
     # w_row*INTER; the FP8 leg is skipped above 2^31 (needs the Tier-2 i64 base).
@@ -1460,8 +1547,8 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     cos4 = _cosine(ref4, got4)
     assert cos4 >= 0.99, f"down fp4 cold: correctness regression (cos={cos4:.4f})"
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
-    wbytes4 = outputs * TOPK * INTER // 2 + outputs * TOPK * (INTER // _MXFP4_BK)
-    tbs4 = wbytes4 / us4 / 1e6 if us4 > 0 else 0.0
+    m4 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp4", us4)
+    tbs4 = m4["TB/s"]
     del inter, w_down, w_scale, out
     torch.cuda.empty_cache()
 
@@ -1480,8 +1567,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         cos8 = _cosine(ref8, got8)
         assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
         _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
-        wbytes8 = outputs * TOPK * INTER  # 1 B/elt FP8 weights
-        tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
+        tbs8 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp8", us8)["TB/s"]
         del inter8, w_down8, w_scale8, out8
         torch.cuda.empty_cache()
     else:
@@ -1500,7 +1586,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
         "fp4_cos": cos4,
-        "TFLOPS_fp4": flops / us4 / 1e6 if us4 > 0 else 0.0,
+        "TFLOPS_fp4": m4["TFLOPS"],
     }
 
 
@@ -1637,13 +1723,12 @@ def _ref_gate_up_fp8_pool(x, wg, wu, rid, INTER):
 def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup):
     """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
 
-    ``wbytes`` counts the two weight streams (gate + up) a single launch reads for
-    its TOPK experts, so TB/s reflects real HBM bandwidth.
+    Metrics come from ``compute_metrics(method="weight_stream")``, which counts the
+    two weight streams (gate + up) a single launch reads for its TOPK experts, so
+    TB/s reflects real HBM bandwidth.
     """
     device = torch.device("cuda")
     n_route = max(1, E // TOPK)
-    out_elems = B * TOPK * INTER
-    flops = 2 * 2 * HIDDEN * out_elems  # gate+up matmuls, mul+add
     ehi = E * INTER * HIDDEN
     assert (
         ehi < _COLD_FP4_LIMIT
@@ -1664,8 +1749,8 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     cos4 = _cosine(ref4, got4)
     assert cos4 >= 0.99, f"gate_up fp4 cold: correctness regression (cos={cos4:.4f})"
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
-    wbytes4 = out_elems * HIDDEN + B * TOPK * 2 * INTER * (HIDDEN // _MXFP4_BK)
-    tbs4 = wbytes4 / us4 / 1e6 if us4 > 0 else 0.0
+    m4 = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp4", us4)
+    tbs4 = m4["TB/s"]
     del x, wg, wgs, wu, wus, out
     torch.cuda.empty_cache()
 
@@ -1686,8 +1771,7 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
             cos8 >= 0.99
         ), f"gate_up fp8 cold: correctness regression (cos={cos8:.4f})"
         _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
-        wbytes8 = out_elems * HIDDEN * 2  # gate+up, 1 B/elt FP8
-        tbs8 = wbytes8 / us8 / 1e6 if us8 > 0 else 0.0
+        tbs8 = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp8", us8)["TB/s"]
         del x8, wg8, wu8, out8
         torch.cuda.empty_cache()
     else:
@@ -1706,7 +1790,7 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
         "fp4_cos": cos4,
-        "TFLOPS_fp4": flops / us4 / 1e6 if us4 > 0 else 0.0,
+        "TFLOPS_fp4": m4["TFLOPS"],
     }
 
 

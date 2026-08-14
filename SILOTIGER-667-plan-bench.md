@@ -122,15 +122,25 @@ the FlyDSL cold harness.
       return dicts, so `compare.py` has the full `(H,I,E,K=TOPK,B)` join key. `_fmt_table`
       is DataFrame-based, so it just gains a TOPK column; py_compile clean, no new lints.
 
-#### B3 — pluggable `compute_metrics(...)` helper  [ ]
-- [ ] Add `compute_metrics(B,H,I,K,dtype,us,method="weight_stream") -> {TFLOPS, TB/s, %peak}`;
-      keep raw µs + dims + dtype as source of truth (do **not** bake a mode into timing).
-- [ ] Two methods only: **`weight_stream`** (default; weight bytes streamed + core MACs) and
-      **`total_traffic`** (mirrors CK `62e30c9098`: all operands for bytes, full epilogue for
-      FLOPs — `gu_bytes=B*K*I*(H*xe+2*H*we+2)`, `dn_bytes=B*H*(K*I*2+K*I*we+2*K*4+2)`,
-      `gu_flops=B*K*I*(4H+5)`, `dn_flops=3*B*H*K*I`).
-- [ ] Route the existing bench columns through it with the default ⇒ recorded numbers
-      unchanged. Comment-pin `total_traffic` to CK commit `62e30c9098`.
+#### B3 — pluggable `compute_metrics(...)` helper  [x] DONE (2026-08-14)
+- [x] Added `compute_metrics(op, B, HIDDEN, INTER, TOPK, w_dtype, us, method="weight_stream",
+      act_dtype="bf16") -> {TFLOPS, TB/s, %peak}` in the op_test module. Raw µs + dims + dtype
+      stay the source of truth (no mode baked into timing). `op∈{down,gate_up}`,
+      `w_dtype/act_dtype∈{fp4,fp8,bf16}`; `%peak` = TB/s vs `_HBM_PEAK_TBS`; NaN-guarded for
+      us≤0/NaN. `act_dtype` param is ready for the B4 FP8-activation (`gate_fp8_d2`) peer.
+- [x] Two methods only: **`weight_stream`** (default) and **`total_traffic`** (CK-style, all
+      operands + full epilogue — the `gu_bytes/dn_bytes/gu_flops/dn_flops` formulas).
+- [x] Routed both cold benches (`bench_down_cold`, `bench_gate_up_cold`) through it. Verified
+      by a standalone numeric check that `weight_stream` **reproduces the old wbytes/TB-s and
+      TFLOPS exactly** across sampled DeepSeek/MiniMax/Qwen shapes (recorded numbers
+      unchanged); `total_traffic` ≈2× bytes as expected.
+- [x] `total_traffic` docstring **pinned to CK commit `62e30c9098`** with a "revisit if CK's
+      byte/FLOP formulas change" note.
+- [ ] **Follow-up (optional, non-blocking):** migrate the *warm* benches `bench_gate_up` /
+      `bench_down` / `bench_down_fp4` to `compute_metrics` for a single source of truth (they
+      still carry inline byte/FLOP accounting, off the `compare.py` path). Use the same
+      exact-equivalence check so their recorded numbers stay unchanged. Deferred from B3 to
+      keep that change tight; tracked here as low-priority tech-debt cleanup.
 
 #### B4 — FlyDSL counterpart to CK's `gate_fp8_d2` (FP8-activation gate_up)  [ ]
 - [ ] Add an FP8-activation gate_up entry: quantize `x` BF16→FP8 (activation scale contract),
@@ -282,3 +292,6 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   `compare.py` full-B join (belongs to C1).
 - 2026-08-14 — **B2 done.** Added `"TOPK"` to both FlyDSL cold-bench return dicts (completes
   the `(H,I,E,K,B)` join key); py_compile clean.
+- 2026-08-14 — **B3 done.** Added the shared `compute_metrics(method=weight_stream|
+  total_traffic)` helper; routed both cold benches through it and verified `weight_stream`
+  reproduces the prior TB/s & TFLOPS exactly. `total_traffic` pinned to CK `62e30c9098`.
