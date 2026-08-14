@@ -53,7 +53,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # fmt: off
 @gluon.jit
@@ -761,10 +761,13 @@ def _mla_softmax_reducev_kernel(
     USE_2D_VIEW: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    D_SPLIT: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    q_pos = tl.program_id(2)
+    # Grid axis 2 packs (q_pos, head-dim slice).
+    q_pos = tl.program_id(2) // D_SPLIT
+    cur_d = tl.program_id(2) % D_SPLIT
 
     # Recompute this batch's seq len exactly as the decode kernel did, so we can
     # rederive which splits are empty. Stage-1 early-returns on empty splits
@@ -783,14 +786,18 @@ def _mla_softmax_reducev_kernel(
         tl.cdiv(cur_batch_seq_len, kv_len_per_split), NUM_KV_SPLITS
     )
 
-    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    # Each program owns a disjoint BLOCK_D slice of the head dim and re-derives the
+    # same scalar lse statistics from the same Mid_lse vector, so slices never
+    # communicate. D_SPLIT=1 is the full-width kernel.
+    BLOCK_D: tl.constexpr = HEAD_DIM_CKV // D_SPLIT
+    offs_d_ckv = cur_d * BLOCK_D + tl.arange(0, BLOCK_D)
     offs_s = tl.arange(0, BLOCK_S)
     base_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h
     base_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
 
     e_sum = 0.0
     e_max = -float("inf")
-    acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     # The split-KV LSE merge is associative, so instead of a serial dependent loop
     # over NUM_KV_SPLITS (latency-bound on ~batch*nhead workgroups), reduce BLOCK_S
@@ -809,7 +816,7 @@ def _mla_softmax_reducev_kernel(
             Logits + base_l + s_ids[:, None] * stride_l_s + offs_d_ckv[None, :],
             mask=s_mask[:, None],
             other=0.0,
-        )  # [BLOCK_S, HEAD_DIM_CKV]
+        )  # [BLOCK_S, BLOCK_D]
 
         tile_max = tl.max(lse, axis=0)  # scalar; masked/empty splits are -inf
         n_e_max = tl.maximum(e_max, tile_max)
@@ -820,12 +827,13 @@ def _mla_softmax_reducev_kernel(
         e_sum = e_sum * old_scale + tl.sum(w, axis=0)
         e_max = n_e_max
 
-    out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    out = acc / e_sum if e_sum > 0.0 else tl.zeros([BLOCK_D], dtype=tl.float32)
     tl.store(
         O + cur_batch * stride_o_b + q_pos * stride_o_qs + cur_head * stride_o_h + offs_d_ckv,
         out,
     )
-    if HAS_FINAL_LSE:
+    # Every head-dim slice derived the same lse; slice 0 owns the single store.
+    if HAS_FINAL_LSE and cur_d == 0:
         tl.store(
             Final_lse + cur_batch * stride_fl_b + q_pos * stride_fl_qs + cur_head * stride_fl_h,
             e_max + tl.log(e_sum),
@@ -1132,8 +1140,22 @@ def mla_gluon(
         return o, final_lse
 
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
-    # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
-    grid_reduce = (batch_size, nhead, qlen)
+    #
+    # The reduce grid is otherwise batch*nhead*qlen, which for plain decode at batch
+    # 1 is 12 workgroups on a 256-CU part, so tile the head dim across D_SPLIT
+    # programs while that grid is narrower than the machine. Every slice repeats the
+    # same lse derivation, so grid width is what pays: +8.6% of the decode op at
+    # batch 1, +3.0% at batch 2, +0.6% at batch 4. Back off when the head dim does
+    # not divide evenly or the slice would fall under 16 elements.
+    RED_D_SPLIT = 1
+    while RED_D_SPLIT < 8 and batch_size * nhead * qlen * RED_D_SPLIT < get_num_sms():
+        RED_D_SPLIT *= 2
+    while RED_D_SPLIT > 1 and (
+        head_dim_ckv % RED_D_SPLIT or head_dim_ckv // RED_D_SPLIT < 16
+    ):
+        RED_D_SPLIT //= 2
+    # grid axis 2 packs (q_pos, head-dim slice). o keeps the caller's layout.
+    grid_reduce = (batch_size, nhead, qlen * RED_D_SPLIT)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
@@ -1161,7 +1183,8 @@ def mla_gluon(
         USE_2D_VIEW=use_2d_view,
         BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
         BLOCK_N=BLOCK_N,
-        num_warps=8,
+        D_SPLIT=RED_D_SPLIT,
+        num_warps=8 if RED_D_SPLIT == 1 else 4,
     )
 
     return o, final_lse
