@@ -572,6 +572,7 @@ def build_moe_fused_route_quant_scatter_module(
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
         n_buckets: Int32,  # sentinel value (== dropped) / local expert count
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
@@ -867,6 +868,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         expert_row_base: fx.Pointer,  # (E,) int32
         numel: Int32,  # == topk for this specialization
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1113,6 +1115,7 @@ def build_moe_fused_quant_preshuffle_module(
         n_rows: Int32,
         max_m: Int32,
     ):
+        """Write scales as ``(E, M//(wmma_rep*16), K//128, wmma_rep, 16, 4)``."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1324,6 +1327,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         numel: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1623,6 +1627,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         tile_m: Int32,
         num_workers: Int32,
     ):
+        """Write ``(contiguous_m//(wmma_rep*16), K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 

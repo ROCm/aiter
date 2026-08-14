@@ -142,6 +142,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         rows_to_tokens: fx.Pointer,  # (E*max_m,) int32  -- -1 = skip (gather only)
         max_m: Int32,
     ):
+        """Write scales as ``(E, M//(wmma_rep*16), K//128, wmma_rep, 16, 4)``."""
         i32 = T.i32
         tile = ArithValue(fx.block_idx.x)
         e = ArithValue(fx.block_idx.y)
