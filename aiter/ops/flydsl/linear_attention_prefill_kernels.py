@@ -269,16 +269,10 @@ _HOST_CHUNK_META_ATTR = "_flydsl_host_chunk_meta"
 def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
     """Total and maximum per-sequence chunk counts, cached on the tensor.
 
-    ``chunk_offsets`` comes from the ``@tensor_cache``-decorated prologue (or
-    from prebuilt metadata), so its identity is stable across forwards and these
-    counts cannot change underneath the cache -- the same reasoning as
-    ``_as_int32``.
-
-    Caching matters beyond the copy itself. The ``tolist`` lands between the
-    K1..K4 launches and K5's, so an uncached forward blocks the host until the
-    whole front end has retired, and the GPU then idles through the remaining
-    host work for K5 and K6 instead of the host running ahead. On a T=8k
-    varlen GQA prefill that bubble was 66us of a 738us block.
+    Safe because ``chunk_offsets`` identity is stable across forwards (same
+    reasoning as ``_as_int32``); worth doing because the ``tolist`` sits between
+    the K1..K4 launches and K5's and stalls the host until the front end
+    retires: 66us of a 738us T=8k varlen block.
     """
     cached = getattr(chunk_offsets, _HOST_CHUNK_META_ATTR, None)
     if cached is not None:
@@ -581,11 +575,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
     # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
-    # int32. The narrowing is a device-to-device cast (no host sync) cached on
-    # the source tensor, which comes from one of the @tensor_cache-decorated
-    # prologue helpers or from prebuilt metadata, so a steady-state forward
-    # launches no copy for it. The placeholder is allocated rather than cast
-    # off ``dummy`` because the kernel reads only a disabled slot's pointer.
+    # int32. The narrowing is cached on the source tensor, whose identity is
+    # stable across forwards, so a steady-state forward launches no copy for it.
     cu_arg = (
         _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
@@ -682,8 +673,8 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
-# Offline-measured BV table for the mfma16_hip fork, consulted before the
-# CU/LDS rule below. See the csv header for the schema and how to extend it.
+# Offline-measured BV table, consulted before the CU/LDS rule below. See the
+# csv header for the schema and how to extend it.
 _BV_TUNED_CSV = os.path.join(
     os.path.dirname(__file__), "chunk_gdn_h_mfma16_hip_tuned.csv"
 )
@@ -692,10 +683,9 @@ _BV_TUNED_CSV = os.path.join(
 def _load_tuned_bv_table() -> dict[tuple, int]:
     """Load the tuned BV table at import time.
 
-    Deliberately eager and stdlib-only: a lazy first-call load would put the
-    file read (0.15ms here, ~3.6ms via pandas) inside the first prefill of a
-    live server. A missing or malformed table is not fatal -- every lookup then
-    misses and the CU/LDS rule answers, which is the pre-table behaviour.
+    Eager and stdlib-only so the read (0.15ms, ~3.6ms via pandas) cannot land in
+    a live server's first prefill. A missing or malformed table is not fatal:
+    every lookup misses and the rule answers, as before the table.
     """
     table: dict[tuple, int] = {}
     try:
@@ -721,11 +711,8 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                     int(row["max_seq_chunks"]),
                 )
                 bv_int = int(bv)
-                # Two rows can describe the same physical batch shape under
-                # different model names (a 4x8192 varlen batch is the same work
-                # whichever sweep produced it). Identical values are fine; a
-                # disagreement means the table contradicts itself, and silently
-                # keeping the last row read would hide that.
+                # One physical shape can appear under two model names, so a
+                # duplicate key is fine; a disagreeing one must not pass quietly.
                 if table.get(key, bv_int) != bv_int:
                     warnings.warn(
                         f"chunk_gdn_h_mfma16_hip tuned table disagrees on "
@@ -758,10 +745,9 @@ def _tuned_bv(
 ) -> int | None:
     """Measured BV for this exact batch shape, or None to use the rule.
 
-    Matching is exact rather than nearest-neighbour: every key component is
-    already on the host (no D2H), so this is a single dict probe (~0.09us,
-    against ~46us of wrapper host time per call), and an unmeasured shape falls
-    through to the rule instead of inheriting a neighbour's tile.
+    Exact rather than nearest-neighbour: the key is all host-side, so this is
+    one dict probe (~0.09us against ~46us of wrapper host time), and an
+    unmeasured shape takes the rule instead of a neighbour's tile.
     """
     if not _BV_TUNED_TABLE:
         return None
@@ -884,9 +870,8 @@ def _resolve_state_dtype(initial_state, state_dtype):
 
 
 def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
-    """Resolve/validate the per-chunk snapshot dtype, matching the HIP policy in
-    ``aiter.ops.chunk_gated_delta_rule_fwd_h``: it defaults to ``k.dtype`` and is
-    independent of the persistent state dtype."""
+    """Per-chunk snapshot dtype: defaults to ``k.dtype`` and is independent of
+    the state dtype, matching ``aiter.ops.chunk_gated_delta_rule_fwd_h``."""
     resolved = input_dtype if snapshot_dtype is None else snapshot_dtype
     if resolved not in (torch.float32, torch.bfloat16):
         raise ValueError(f"`snapshot_dtype` must be fp32 or bf16, got {resolved}.")
@@ -1140,9 +1125,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     if V != 128:
         raise ValueError(f"FlyDSL K5 mfma16_hip: only V=128 is supported, got V={V}.")
 
-    # Host-side (total_chunks, max_seq_chunks) for the BV selector, when the
-    # caller's metadata already carries them; None means read them off
-    # ``chunk_offsets``.
+    # BV selector counts from the caller's metadata; None = read off chunk_offsets.
     host_chunk_meta = None
     if cu_seqlens is None:
         N = B
@@ -1279,8 +1262,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # selector (``_hipeq_select_bv`` above) so this fork picks the same BV as
     # the hand-tuned HIP kernel today, without importing its private API.
     # dense: total_chunks = B*NT, max_seq_chunks = NT (NT = cdiv(T, BT));
-    # varlen: prebuilt metadata carries both on the host, otherwise they are
-    # read off chunk_offsets once and cached on it.
+    # varlen: prebuilt metadata, else off chunk_offsets once (cached there).
     if is_varlen:
         _total_chunks, _max_seq_chunks = (
             host_chunk_meta
@@ -1289,9 +1271,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
-    # Offline-measured value first; the rule answers every shape the table does
-    # not cover (which is the common case -- the table only holds shapes that
-    # were actually benchmarked).
+    # Measured value first, rule for everything the table does not cover.
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
@@ -1351,10 +1331,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     )
 
     # Null-arg placeholders for the @flyc.jit slots ignored on this path. Sized
-    # 1 (not 0) so their ``data_ptr()`` is always a valid non-null device
-    # address. Allocated rather than cast off ``dummy``: the kernel reads only
-    # the base pointer of a disabled slot, and a cast would launch a kernel to
-    # copy the one element it does not read.
+    # 1 (not 0) for a non-null ``data_ptr()``; allocated, not cast, to avoid a copy.
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
     int32_dummy = torch.empty(1, device=k.device, dtype=torch.int32)
     cu_arg = (
