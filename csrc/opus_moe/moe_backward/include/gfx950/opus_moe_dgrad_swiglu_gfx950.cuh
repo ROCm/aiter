@@ -162,8 +162,43 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
     }
     int tile_m;
     int tile_n;
-    opus_moe_dgrad_tile_map(
-        local_wgid, num_tiles_m, num_tiles_n, tile_m, tile_n);
+    if constexpr(TARGET_EXACT)
+    {
+        // Natural and balanced target routing has 20--23 M tiles per
+        // expert, hence exactly five complete four-M groups.  Specialize the
+        // hot grouped region so division/modulo by dynamic groups_m becomes
+        // compile-time division by five; unusual skew keeps the generic map.
+        if(num_tiles_m >= 20 && num_tiles_m < 24)
+        {
+            constexpr int GROUP_M = 4;
+            constexpr int GROUP_N = 2;
+            constexpr int GROUPS_M = 5;
+            constexpr int GROUPED_TILES_M = GROUP_M * GROUPS_M;
+            const int grouped_blocks = GROUPED_TILES_M * num_tiles_n;
+            if(local_wgid < grouped_blocks)
+            {
+                const int group_id = local_wgid / (GROUP_M * GROUP_N);
+                const int in_group = local_wgid % (GROUP_M * GROUP_N);
+                tile_m = (group_id % GROUPS_M) * GROUP_M +
+                    in_group % GROUP_M;
+                tile_n = (group_id / GROUPS_M) * GROUP_N +
+                    in_group / GROUP_M;
+            }
+            else
+            {
+                const int remainder_m = num_tiles_m - GROUPED_TILES_M;
+                const int remainder_wgid = local_wgid - grouped_blocks;
+                tile_m = GROUPED_TILES_M + remainder_wgid % remainder_m;
+                tile_n = remainder_wgid / remainder_m;
+            }
+        }
+        else
+            opus_moe_dgrad_tile_map(
+                local_wgid, num_tiles_m, num_tiles_n, tile_m, tile_n);
+    }
+    else
+        opus_moe_dgrad_tile_map(
+            local_wgid, num_tiles_m, num_tiles_n, tile_m, tile_n);
     const int row = tile_m * T::B_M;
     const int col = tile_n * T::B_N;
 
