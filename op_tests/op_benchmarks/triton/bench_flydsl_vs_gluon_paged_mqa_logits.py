@@ -38,7 +38,6 @@ from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 # same fp8 co-pack builder the production paged benchmark uses
 from op_tests.op_benchmarks.triton.bench_deepgemm_attention import (
     kv_cache_cast_to_fp8,
-    cdiv,
 )
 
 torch.set_default_device("cuda")
@@ -103,13 +102,31 @@ def parity_mask(context_lens, batch_size, next_n, max_model_len):
 
 
 def build_inputs(
-    batch_size, next_n, heads, index_dim, kv_length, seed=0, var_ratio=0.0
+    batch_size,
+    next_n,
+    heads,
+    index_dim,
+    kv_length,
+    seed=0,
+    var_ratio=0.0,
+    pool_blocks=0,
 ):
     """Paged input builder (blocksize==1).
 
     ``var_ratio`` controls the per-sequence context-length spread around
     ``kv_length``: 0.0 gives an exact length (every sequence == kv_length), and
     v>0 draws lengths uniformly from [(1-v)*kv_length, (1+v)*kv_length].
+
+    The pool holds one distinct block per block the batch needs, so the KV
+    footprint both kernels read is ``sum(ctx)*(index_dim+4)`` -- what a real
+    decode touches. Sizing it from ``max_model_len`` instead (as an earlier
+    version did) makes the block table wrap: at blocksize=1 the pool is
+    2*kv_length blocks while the batch needs batch_size*kv_length, so from
+    batch_size=4 up the sequences share blocks and the working set collapses
+    into cache. At B=16, kv_length=32768 that is 8.65 MB standing in for 69 MB,
+    which flatters both kernels and, because the two spend their time
+    differently, does not flatter them equally. ``pool_blocks`` overrides the
+    size to study cache residency deliberately.
     """
     torch.manual_seed(seed)
     random.seed(seed)
@@ -117,7 +134,6 @@ def build_inputs(
 
     max_model_len = 2 * kv_length
     blocksize = 1
-    num_blocks = (max_model_len + blocksize - 1) // blocksize
 
     if var_ratio == 0.0:
         context_lens = torch.full(
@@ -136,6 +152,21 @@ def build_inputs(
     # decode with MTP needs at least next_n tokens of context.
     context_lens = torch.clamp(context_lens, min=next_n)
 
+    blocks_per_seq = (context_lens.to(torch.int64) + blocksize - 1) // blocksize
+    max_block_len = int(blocks_per_seq.max().item())
+    needed_blocks = int(blocks_per_seq.sum().item())
+    num_blocks = needed_blocks if pool_blocks <= 0 else max(pool_blocks, max_block_len)
+
+    # The kernels ride the per-token byte offset on a 32-bit buffer voffset, so
+    # the whole pool must be addressable in i32 bytes.
+    pool_bytes = num_blocks * blocksize * (index_dim + 4)
+    if pool_bytes >= 2**31:
+        raise SystemExit(
+            f"pool of {num_blocks} blocks = {pool_bytes / 1e9:.2f} GB exceeds the "
+            f"i32 gather-offset limit (2.15 GB). Shrink the shape or cap the pool "
+            f"with --pool-blocks (which re-introduces block sharing)."
+        )
+
     q = torch.randn(
         (batch_size, next_n, heads, index_dim), device="cuda", dtype=torch.bfloat16
     )
@@ -146,20 +177,18 @@ def build_inputs(
         (batch_size * next_n, heads), device="cuda", dtype=torch.float32
     )
 
-    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
-    block_tables = torch.zeros(
-        (batch_size, max_block_len), device="cuda", dtype=torch.int32
-    )
+    # Hand blocks out of a shuffled pool in sequence order (scattered across the
+    # pool, as they are after real paged allocation); pad each row's tail with 0.
     pool = list(range(num_blocks))
     random.shuffle(pool)
     pool_t = torch.tensor(pool, device="cuda", dtype=torch.int32)
-    counter = 0
-    for i in range(batch_size):
-        ctx_len = int(context_lens[i].item())
-        n = cdiv(ctx_len, blocksize)
-        idx = (counter + torch.arange(n, device="cuda")) % num_blocks
-        block_tables[i, :n] = pool_t[idx]
-        counter += n
+    starts = torch.cumsum(blocks_per_seq, 0) - blocks_per_seq
+    col = torch.arange(max_block_len, device="cuda", dtype=torch.int64)
+    in_row = col[None, :] < blocks_per_seq[:, None]
+    draw = (starts[:, None] + col[None, :]) % num_blocks
+    block_tables = torch.where(
+        in_row, pool_t[draw], torch.zeros((), device="cuda", dtype=torch.int32)
+    ).to(torch.int32)
 
     q_fp8 = q.to(fp8_dtype)
     kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache, padding=False, fp8_dtype=fp8_dtype)
@@ -172,6 +201,7 @@ def build_inputs(
         block_tables,
         max_model_len,
         fp8_dtype,
+        min(needed_blocks, num_blocks) * blocksize * (index_dim + 4),
     )
 
 
@@ -184,7 +214,15 @@ def time_kernel(fn, repeats, num_iters):
 
 
 def run_shape(
-    batch_size, next_n, heads, index_dim, kv_length, repeats, num_iters, var_ratio=0.0
+    batch_size,
+    next_n,
+    heads,
+    index_dim,
+    kv_length,
+    repeats,
+    num_iters,
+    var_ratio=0.0,
+    pool_blocks=0,
 ):
     (
         q,
@@ -195,8 +233,15 @@ def run_shape(
         block_tables,
         max_model_len,
         fp8_dtype,
+        touched_bytes,
     ) = build_inputs(
-        batch_size, next_n, heads, index_dim, kv_length, var_ratio=var_ratio
+        batch_size,
+        next_n,
+        heads,
+        index_dim,
+        kv_length,
+        var_ratio=var_ratio,
+        pool_blocks=pool_blocks,
     )
 
     ref = ref_fp8_paged_mqa_logits(
@@ -275,6 +320,7 @@ def run_shape(
         "H": heads,
         "D": index_dim,
         "avg_kv": kv_length,
+        "kv_mb": touched_bytes / 1e6,
         "ref_ms": ref_med / 1e3,
         "ref_min_ms": ref_min / 1e3,
         "ref_max_ms": ref_max / 1e3,
@@ -318,6 +364,14 @@ def main():
         help="Per-sequence context-length spread around kv_len. 0.0 = exact "
         "(every sequence == kv_len); e.g. 0.5 draws lengths in [0.5, 1.5]*kv_len.",
     )
+    parser.add_argument(
+        "--pool-blocks",
+        type=int,
+        default=0,
+        help="physical blocks in the cache pool; 0 == one per block the batch "
+        "needs (no sharing). Smaller values make sequences share blocks, "
+        "shrinking the KV footprint into cache",
+    )
     args = parser.parse_args()
 
     if get_gfx() not in ("gfx942", "gfx950"):
@@ -329,21 +383,35 @@ def main():
         f"# arch={get_gfx()} fp8={get_fp8_e4m3_dtype()} "
         f"repeats={args.repeats} num_iters={args.num_iters} "
         f"ref_chunk_k={REF_CHUNK_K} ref_wave_per_eu={REF_WAVE_PER_EU} "
-        f"ctx_len={len_mode} max_model_len=2*kv_len blocksize=1"
+        f"ctx_len={len_mode} max_model_len=2*kv_len blocksize=1 "
+        f"pool={'one block per block needed' if args.pool_blocks <= 0 else args.pool_blocks}"
+    )
+    print(
+        "# kv_mb = distinct KV bytes the batch touches "
+        "(both kernels read it once per query row)"
     )
     header = (
-        "B nn grid H D kv_len | ref_ms[min-max] fly_ms[min-max] fly/ref | "
+        "B nn grid H D kv_len kv_mb | ref_ms[min-max] fly_ms[min-max] fly/ref | "
         "ref_diff fly_diff ref_mask fly_mask ref_pass fly_pass"
     )
     print(header)
     rows = []
     for B, nn, H, D, kv_len in default_shapes():
         r = run_shape(
-            B, nn, H, D, kv_len, args.repeats, args.num_iters, var_ratio=args.var_ratio
+            B,
+            nn,
+            H,
+            D,
+            kv_len,
+            args.repeats,
+            args.num_iters,
+            var_ratio=args.var_ratio,
+            pool_blocks=args.pool_blocks,
         )
         rows.append(r)
         print(
-            f"{r['B']} {r['nn']} {r['grid']} {r['H']} {r['D']} {r['avg_kv']} | "
+            f"{r['B']} {r['nn']} {r['grid']} {r['H']} {r['D']} {r['avg_kv']} "
+            f"{r['kv_mb']:.0f} | "
             f"{r['ref_ms']:.4f}[{r['ref_min_ms']:.4f}-{r['ref_max_ms']:.4f}] "
             f"{r['fly_ms']:.4f}[{r['fly_min_ms']:.4f}-{r['fly_max_ms']:.4f}] "
             f"{r['fly/ref']:.2f}x | "
