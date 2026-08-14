@@ -355,6 +355,9 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p3 _p39;
     unsigned int s_descale_v_Hs;
     p3 _p40;
+    // Global Q-tile index of this launch's blockIdx.z=0 (host gdz chunk for group mode).
+    unsigned int s_q_tile_base;
+    p3 _p41;
 };
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
