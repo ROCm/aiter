@@ -66,8 +66,10 @@ __all__ = [
     "LDS_STAGING_VGPR",
     "SMALL_M_KERNEL_MAX",
     "SMALL_M_SUPPORTED_ARCHS",
+    "SMALL_M_TUNING_MAX_CONFIGS",
     "compile_small_m_hgemm_kernel",
     "iter_small_m_registry_configs",
+    "iter_small_m_tuning_configs",
     "parse_small_m_kernel_name",
     "small_m_arch_params",
     "small_m_kernel_name",
@@ -120,6 +122,8 @@ SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 3, 4)
 SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
 SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
 SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
+SMALL_M_TUNING_MAX_CONFIGS = 256
+SMALL_M_TUNING_SPLIT_K_OPTIONS = frozenset((1, 2, 4))
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -645,6 +649,81 @@ def iter_small_m_registry_configs(
                         continue
                     seen_configs.add(config_key)
                     yield config
+
+
+def _small_m_tuning_bucket(config: dict) -> tuple:
+    if config["persistent_n_tiles"] > 1:
+        path = "persistent"
+    elif config["n_tile_repeat"] > 1:
+        path = "repeat"
+    elif config["b_to_lds"]:
+        path = "b_to_lds"
+    else:
+        path = "direct"
+    return path, config["lds_staging"], config["split_k"]
+
+
+def _small_m_tuning_priority(config: dict) -> tuple:
+    def rank(value: int, preferred: tuple[int, ...]) -> int:
+        try:
+            return preferred.index(value)
+        except ValueError:
+            return len(preferred)
+
+    return (
+        rank(config["tile_n"], (128, 256, 64, 192, 384, 512, 32, 16, 768, 1024)),
+        rank(config["tile_k"], (64, 128, 32, 256)),
+        rank(config["block_n_warps"], (2, 4, 1, 3)),
+        rank(config["waves_per_eu"], (2, 0, 4)),
+        rank(config["b_to_lds_unroll"], (8, 16, 0)),
+        rank(config["persistent_n_tiles"], (2, 4, 1, 8)),
+        rank(config["n_tile_repeat"], (2, 1, 4)),
+        tuple(sorted(config.items())),
+    )
+
+
+def iter_small_m_tuning_configs(
+    dtype: str,
+    out_dtype: str,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    max_configs: int = SMALL_M_TUNING_MAX_CONFIGS,
+):
+    """Yield a bounded, policy-diverse normal-tuner candidate set."""
+    if max_configs < 1:
+        return
+
+    buckets: dict[tuple, list[dict]] = {}
+    for config in iter_small_m_registry_configs(
+        dtype, out_dtype, m=m, n=n, k=k
+    ):
+        if config["split_k"] not in SMALL_M_TUNING_SPLIT_K_OPTIONS:
+            continue
+        buckets.setdefault(_small_m_tuning_bucket(config), []).append(config)
+
+    for configs in buckets.values():
+        configs.sort(key=_small_m_tuning_priority)
+
+    bucket_keys = sorted(buckets)
+    offsets = {key: 0 for key in bucket_keys}
+    emitted = 0
+    while bucket_keys and emitted < max_configs:
+        next_keys = []
+        for key in bucket_keys:
+            offset = offsets[key]
+            configs = buckets[key]
+            if offset >= len(configs):
+                continue
+            yield configs[offset]
+            emitted += 1
+            offsets[key] = offset + 1
+            if offsets[key] < len(configs):
+                next_keys.append(key)
+            if emitted >= max_configs:
+                break
+        bucket_keys = next_keys
 
 
 @functools.lru_cache(maxsize=1024)
