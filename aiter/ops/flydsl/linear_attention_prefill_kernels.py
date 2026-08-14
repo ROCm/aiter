@@ -792,6 +792,66 @@ def _as_int32(t: torch.Tensor) -> torch.Tensor:
     return cached
 
 
+_STATE_INDICES_ATTR = "_flydsl_state_indices_check"
+
+
+def _checked_state_indices(
+    indices: torch.Tensor, pool_size: int, inplace: bool
+) -> torch.Tensor:
+    """Range/duplicate-check the pool indices, returning the int32 narrowing.
+
+    The checks are three device reductions plus the blocking readback that
+    reads them back (~80us of device time and a sync point even for a handful
+    of indices, since ``torch.unique`` sorts). A serving step hands the same
+    index array to every layer, so cache the verdict on the tensor.
+
+    ``_version`` keys the cache because a serving loop usually rewrites the
+    slot mapping in place: the counter bumps on every in-place op (under
+    ``no_grad`` too) and a view shares it with its base, so a rewritten
+    mapping re-validates. ``data_ptr`` covers the rarer ``set_``-style
+    restorage, which leaves the counter alone.
+    """
+    key = (pool_size, inplace, indices.data_ptr(), indices._version)
+    cached = getattr(indices, _STATE_INDICES_ATTR, None)
+    if cached is not None and cached[0] == key:
+        # None means the narrowing was a no-op; storing ``indices`` itself
+        # would make the tensor hold a reference to itself.
+        return indices if cached[1] is None else cached[1]
+
+    if indices.numel():
+        # Validate in the ORIGINAL integer dtype. Narrowing first would let
+        # int64 values such as 2**32 wrap to a valid-looking int32 zero.
+        idx_min = int(indices.min())
+        idx_max = int(indices.max())
+        if idx_min < 0 or idx_max >= pool_size:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices out of range for a state pool "
+                f"of size {pool_size}; got [{idx_min}, {idx_max}], expected "
+                f"values in [0, {pool_size})."
+            )
+        if idx_max > torch.iinfo(torch.int32).max:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices values must fit in int32; "
+                f"got maximum {idx_max}."
+            )
+        if inplace and torch.unique(indices).numel() != indices.numel():
+            raise ValueError(
+                "FlyDSL K5: duplicate initial_state_indices with in-place "
+                "final-state write-back race on the shared pool slot; indices "
+                "must be unique."
+            )
+
+    # The kernel ABI is int32; narrow only after all checks pass.
+    si_i32 = indices.to(torch.int32).contiguous()
+    try:
+        object.__setattr__(
+            indices, _STATE_INDICES_ATTR, (key, None if si_i32 is indices else si_i32)
+        )
+    except (AttributeError, TypeError):
+        pass
+    return si_i32
+
+
 def _resolve_prologue(
     cu_seqlens: torch.Tensor,
     BT: int,
@@ -1230,31 +1290,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
                 "FlyDSL K5: initial_state_indices length "
                 f"({indices.numel()}) must equal the number of sequences N={N}."
             )
-        pool_size = initial_state.shape[0]
-        if indices.numel():
-            # Validate in the ORIGINAL integer dtype. Narrowing first would let
-            # int64 values such as 2**32 wrap to a valid-looking int32 zero.
-            idx_min = int(indices.min())
-            idx_max = int(indices.max())
-            if idx_min < 0 or idx_max >= pool_size:
-                raise ValueError(
-                    "FlyDSL K5: initial_state_indices out of range for a state pool "
-                    f"of size {pool_size}; got [{idx_min}, {idx_max}], expected "
-                    f"values in [0, {pool_size})."
-                )
-            if idx_max > torch.iinfo(torch.int32).max:
-                raise ValueError(
-                    "FlyDSL K5: initial_state_indices values must fit in int32; "
-                    f"got maximum {idx_max}."
-                )
-            if inplace and torch.unique(indices).numel() != indices.numel():
-                raise ValueError(
-                    "FlyDSL K5: duplicate initial_state_indices with in-place "
-                    "final-state write-back race on the shared pool slot; indices "
-                    "must be unique."
-                )
-        # The kernel ABI is int32; narrow only after all checks pass.
-        si_i32 = indices.to(torch.int32).contiguous()
+        si_i32 = _checked_state_indices(indices, initial_state.shape[0], inplace)
     else:
         si_i32 = None
 
