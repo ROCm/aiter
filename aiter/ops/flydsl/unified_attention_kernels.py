@@ -792,6 +792,22 @@ def flydsl_unified_attention(
                 )
         num_2d_prgms = num_kv_heads * num_q_blocks
         if num_2d_prgms < target_num_prgms:
+            # Underfilled. For a MIXED single-call batch (some prefill, >1 seq)
+            # this is a loss regime, so cede it to Triton (return None). FlyDSL
+            # builds one BLOCK_M=256 tile and launches a dense grid, so a
+            # small-chunk mix leaves the machine starved (real WGs < CU count)
+            # and loses 0.4-0.6x to Triton, which tiles finer (BLOCK_M 128/16) to
+            # fill it. Neither split-K on the single call (measured 0.88-0.91x
+            # split/single) nor a finer FlyDSL tile recovers it -- num_waves=4
+            # halves per-CU SIMD use for the WGs it gains, a wash (see
+            # finer-tile-feasibility). The signal separates losses (num_2d
+            # 60-156) from fills (>=284) cleanly at the CU boundary.
+            # Excluded, and left on FlyDSL because they win despite underfilling:
+            # all-decode (max_seqlen_q == 1, won via split-K below) and
+            # single-seq prefill (num_seqs == 1). Deep-decode mixed already took
+            # the dispatch split above and never reaches here.
+            if max_seqlen_q > 1 and num_seqs > 1:
+                return None
             num_kv_splits = _split_count(num_2d_prgms, target_num_prgms)
 
     kernel = _get_kernel(
