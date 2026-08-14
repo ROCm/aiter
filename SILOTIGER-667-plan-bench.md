@@ -78,14 +78,16 @@ the FlyDSL cold harness.
 - Context: CK previously measured **warm** (fixed seed-42 router ⇒ the same TOPK experts
   stay MALL-resident where they fit).
 
-#### A2 — machine-readable, FlyDSL-compatible CK output  [ ]
-- [ ] Add a machine-readable output mode behind `CK_WD_FORMAT=csv`: stable schema
-      `shape,H,I,K,E,B,kernel,us`. Keep the pretty table as default.
-- [ ] Emit **microseconds** (`ms*1000`) to match FlyDSL units.
-- [ ] Emit the shape dims `H,I,K,E` as columns (CK has them) so the join key is
-      dimension-based `(H,I,E,K,B,op)`, not coupled to the `"deepseek-v3"` name strings.
-- [ ] Emit a **provenance line**: CK commit (`62e30c9098`), arch, timing config
-      (cold/iters/flush/rotate).
+#### A2 — machine-readable, FlyDSL-compatible CK output  [x] DONE (2026-08-14)
+- [x] Added `CK_WD_FORMAT=csv` mode (global `g_csv`): stable stdout schema
+      `shape,H,I,K,E,B,kernel,us`. Pretty table remains the default.
+- [x] Emits **microseconds** (`ms*1e3`, `setprecision(4)`) to match FlyDSL units. Only raw
+      `us` is emitted (no TFLOP/s or GB/s) since derived metrics are recomputed downstream by
+      the shared `compute_metrics` helper (B3) applied identically to both harnesses.
+- [x] Emits shape dims `H,I,K,E` as columns so the join key is dimension-based
+      `(H,I,E,K,B,op)`, not coupled to the `"deepseek-v3"` name strings.
+- [x] Provenance line goes to **stderr** (commit `62e30c9098`, cold/iters/rotate, `format`,
+      mechanism), keeping stdout a clean parseable CSV. Smoke-tested both modes.
 
 #### A3 — expand the CK B-set to cover FlyDSL's  [ ]
 - [ ] Run CK with `CK_WD_BATCHES="1,2,4,8,32"` (env already supported; no cpp change) so
@@ -268,3 +270,7 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   bench via a manual hipEvent loop + disjoint-expert router rotation (`CK_WD_ROTATE`).
   Verified cold numbers drop vs warm on the small Qwen shapes; no OOM on DeepSeek B=1/32.
   `tickets/667/harness/ck_bench_warp_decode.cpp` updated + rebuilt.
+- 2026-08-14 — **A2 done.** Added `CK_WD_FORMAT=csv` (schema `shape,H,I,K,E,B,kernel,us`,
+  µs, provenance on stderr) alongside the default pretty table; smoke-tested both.
+- 2026-08-14 — **D1 refined.** Adopted flat `iters=1000` (cold≥15) for of-record numbers
+  (full sweep ~11 s; clears the fastest cell within ~1.3%), smaller default for dev runs.

@@ -36,6 +36,10 @@
 
 using namespace ck_tile;
 
+// Output format: pretty human table (default) or machine-readable CSV
+// (CK_WD_FORMAT=csv) with schema "shape,H,I,K,E,B,kernel,us" for compare.py.
+static bool g_csv = false;
+
 // ---------------------------------------------------------------------------
 // Kernel type aliases (mirrors bench_warp_decode.cpp, non-persistent only)
 // ---------------------------------------------------------------------------
@@ -195,16 +199,22 @@ static float bench_cold(
     return (iters > 0) ? ms / iters : 0.f;
 }
 
-static void print_row(const std::string& shape,
-                      index_t B,
-                      const std::string& kernel,
-                      float ms,
-                      double flops,
-                      double bytes)
+static void print_row(
+    const Shape& sh, index_t B, const std::string& kernel, float ms, double flops, double bytes)
 {
+    if(g_csv)
+    {
+        // Dimension-based join key + raw time in microseconds. Derived metrics
+        // (TB/s, TFLOPs) are recomputed downstream by the shared compute_metrics
+        // helper (B3) applied identically to both harnesses, so only us is emitted.
+        std::cout << sh.name << ',' << sh.H << ',' << sh.I << ',' << sh.K << ',' << sh.E << ',' << B
+                  << ',' << kernel << ',' << std::fixed << std::setprecision(4) << (ms * 1e3)
+                  << "\n";
+        return;
+    }
     double tflops = (ms > 0) ? flops / (ms * 1e9) : 0.0;
     double gbs    = (ms > 0) ? bytes / (ms * 1e6) : 0.0;
-    std::cout << std::left << std::setw(16) << shape << std::right << std::setw(4) << B
+    std::cout << std::left << std::setw(16) << sh.name << std::right << std::setw(4) << B
               << std::setw(18) << kernel << std::setw(10) << std::fixed << std::setprecision(4)
               << ms << std::setw(10) << std::fixed << std::setprecision(2) << tflops
               << std::setw(10) << std::fixed << std::setprecision(1) << gbs << "\n";
@@ -311,7 +321,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
         if(GUKernBF16::IsSupportedArgument(a))
         {
             float ms = bench_cold<GUKernBF16>(a, rids_ptr, rotate, bk, cold, iters);
-            print_row(sh.name,
+            print_row(sh,
                       B,
                       "gate_up_bf16",
                       ms,
@@ -341,7 +351,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
         if(GUKernBF16D2::IsSupportedArgument(a))
         {
             float ms = bench_cold<GUKernBF16D2>(a, rids_ptr, rotate, bk, cold, iters);
-            print_row(sh.name,
+            print_row(sh,
                       B,
                       "gate_bf16_d2",
                       ms,
@@ -371,7 +381,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
         if(GUKernFP8D2::IsSupportedArgument(a))
         {
             float ms = bench_cold<GUKernFP8D2>(a, rids_ptr, rotate, bk, cold, iters);
-            print_row(sh.name,
+            print_row(sh,
                       B,
                       "gate_fp8_d2",
                       ms,
@@ -406,7 +416,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
         if(DnKernFP8H2D2::IsSupportedArgument(a))
         {
             float ms = bench_cold<DnKernFP8H2D2>(a, rids_ptr, rotate, bk, cold, iters);
-            print_row(sh.name,
+            print_row(sh,
                       B,
                       "down_h2_d2",
                       ms,
@@ -440,7 +450,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
         if(DnKernFP4H2::IsSupportedArgument(a))
         {
             float ms = bench_cold<DnKernFP4H2>(a, rids_ptr, rotate, bk, cold, iters);
-            print_row(sh.name,
+            print_row(sh,
                       B,
                       "down_fp4_h2",
                       ms,
@@ -479,6 +489,9 @@ int main()
     // Cold-HBM router rotation: <=0 => auto (tile the whole E pool per shape),
     // 1 => warm baseline (single fixed expert group), >1 => that many groups.
     int rotate_env = std::getenv("CK_WD_ROTATE") ? std::stoi(std::getenv("CK_WD_ROTATE")) : 0;
+    // Output format: CK_WD_FORMAT=csv -> machine-readable; anything else -> pretty table.
+    if(const char* fmt = std::getenv("CK_WD_FORMAT"))
+        g_csv = (std::string(fmt) == "csv");
 
     std::set<std::string> shape_filter(shape_env.begin(), shape_env.end());
     std::vector<index_t> batches;
@@ -491,12 +504,20 @@ int main()
     std::cerr << "# ck_bench_warp_decode  commit=62e30c9098" << "  cold=" << cold
               << "  iters=" << iters << "  rotate="
               << (rotate_env > 0 ? std::to_string(rotate_env) : std::string("auto(ceil(E/BK))"))
+              << "  format=" << (g_csv ? "csv" : "table")
               << "  mechanism=manual-hipEvent+disjoint-router-rotation\n";
 
-    std::cout << std::left << std::setw(16) << "shape" << std::right << std::setw(4) << "B"
-              << std::setw(18) << "kernel" << std::setw(10) << "ms" << std::setw(10) << "TFLOP/s"
-              << std::setw(10) << "GB/s" << "\n"
-              << std::string(68, '-') << "\n";
+    if(g_csv)
+    {
+        std::cout << "shape,H,I,K,E,B,kernel,us\n";
+    }
+    else
+    {
+        std::cout << std::left << std::setw(16) << "shape" << std::right << std::setw(4) << "B"
+                  << std::setw(18) << "kernel" << std::setw(10) << "ms" << std::setw(10)
+                  << "TFLOP/s" << std::setw(10) << "GB/s" << "\n"
+                  << std::string(68, '-') << "\n";
+    }
 
     for(const auto& sh : ALL_SHAPES)
     {
