@@ -70,10 +70,19 @@ __host__ __device__ constexpr inline int opus_ctdmcl_max_i(int a, int b) {
 // Cluster geometry comes from the traits (T::kClusterWgM x T::kClusterWgN x 1);
 // default (4,4,1). The __cluster_dims__ attribute reads it off the traits directly
 // (it precedes the body where `T` is aliased), resolved at instantiation.
+//
+// Guarded like the body below, and for the same reason: SPG clusters exist only
+// on gfx1250, so a mixed-arch build's gfx950/gfx942 device pass rejects the
+// attribute outright ("'cluster_dims' is not supported for this GPU
+// architecture") even though it compiles the body away to an empty stub. The
+// host pass keeps the attribute -- that is where the launch reads the cluster
+// geometry from.
 template <typename UserTraits>
 __global__ __launch_bounds__(128, 1)
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
 __cluster_dims__(opus::remove_cvref_t<UserTraits>::kClusterWgM,
                  opus::remove_cvref_t<UserTraits>::kClusterWgN, 1)
+#endif
 void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_kargs_gfx1250 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx1250__)

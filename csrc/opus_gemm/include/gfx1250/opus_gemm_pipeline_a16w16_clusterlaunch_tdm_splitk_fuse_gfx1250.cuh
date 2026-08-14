@@ -52,9 +52,16 @@ static constexpr int kFuseReduceRing = 3;
 
 // D_OUT = C output element type (bf16_t or fp32_t). DataWs = partial workspace
 // storage (bf16_t default; fp32_t for higher reduce precision).
+// __cluster_dims__ is guarded like the body below: SPG clusters exist only on
+// gfx1250, so a mixed-arch build's gfx950/gfx942 device pass rejects the
+// attribute outright. The host pass keeps it -- that is where the launch reads
+// the cluster geometry from.
 template <typename UserTraits, int SplitK, typename DataWs, int MClusterWg, typename D_OUT>
 __global__ __launch_bounds__(128, 1)
-    __cluster_dims__(SplitK, MClusterWg, 1) void gemm_a16w16_splitk_fuse_kernel_gfx1250(
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+    __cluster_dims__(SplitK, MClusterWg, 1)
+#endif
+    void gemm_a16w16_splitk_fuse_kernel_gfx1250(
         opus_gemm_splitk_fuse_kargs_gfx1250 kargs)
 {
     static_assert(SplitK * MClusterWg <= 16, "cluster WG count (SplitK*MClusterWg) must be <= 16");
