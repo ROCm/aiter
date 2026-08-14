@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
+    pack_fp6_v_data_scale_views,
     reorder_fp6_k_lds_order_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -27,6 +28,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_raw_buffer_size,
     pack_v_mxfp4_colmajor_raw,
 )
+from aiter.ops.quant import rotate_activation
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
@@ -137,12 +139,15 @@ def _validate_format_contract(
         raise ValueError("MHA v4 currently requires matching Q and K formats")
     if q_format not in _PACKED_QK_WIDTH:
         raise ValueError(f"unsupported Q/K format: {q_format!r}")
-    if v_format not in (*_FP8_FORMATS, AttentionFormat.FP4_E2M1):
+    if v_format not in (*_FP8_FORMATS, AttentionFormat.FP6_E2M3, AttentionFormat.FP4_E2M1):
         raise ValueError(f"unsupported V format: {v_format!r}")
     if q_format == AttentionFormat.INT8 and v_format not in _FP8_FORMATS:
         raise ValueError("INT8 Q/K currently requires FP8 V")
-    if q_format in _FP8_FORMATS and v_format != q_format:
-        raise ValueError("FP8 Q/K currently requires the same FP8 encoding for V")
+    if q_format in _FP8_FORMATS and v_format not in (
+        q_format,
+        AttentionFormat.MXFP6,
+    ):
+        raise ValueError("FP8 Q/K requires matching FP8 or MXFP6 V")
 
 
 def scale_modes_for_formats(
@@ -152,10 +157,15 @@ def scale_modes_for_formats(
 ) -> tuple[AttentionScaleMode, AttentionScaleMode, AttentionScaleMode]:
     _validate_format_contract(q_format, k_format, v_format)
     if q_format == AttentionFormat.INT8 or q_format in _FP8_FORMATS:
+        v_scale_mode = (
+            AttentionScaleMode.F32_PER_TENSOR
+            if _is_fp8_format(v_format)
+            else AttentionScaleMode.E8M0_PER_1X32
+        )
         return (
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
-            AttentionScaleMode.F32_PER_TENSOR,
+            v_scale_mode,
         )
     if q_format in _MX_FORMATS:
         v_scale_mode = (
@@ -448,6 +458,15 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
+def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Apply normalized hd128 Walsh-Hadamard rotation, then per-tensor FP8 quantize."""
+    if input.shape[-1] != 128 or not input.is_contiguous():
+        raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
+    rotated = torch.empty_like(input)
+    rotate_activation(rotated, input)
+    return quantize_fp8(rotated)
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
 def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
@@ -654,6 +673,22 @@ def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     ), input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
 
 
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
+def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
+    if input.shape[-1] != 128 or not input.is_contiguous():
+        raise ValueError("MXFP6 V quantization requires contiguous hd128 BSHD input")
+    return pack_fp6_v_data_scale_views(input)
+
+
+@quantize_v_mxfp6.register_fake
+def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, head_dim = input.shape
+    tiles = (sequence + 127) // 128
+    return input.new_empty(
+        (batch, sequence, heads, head_dim), dtype=torch.uint8
+    ), input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
+
+
 _quantize_mxfp4 = quantize_mxfp4_q
 _quantize_v_mxfp4_raw = quantize_v_mxfp4
 _quantize_mxfp6_q = quantize_mxfp6_q
@@ -829,10 +864,17 @@ def mha_v4(
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)
         v_quantized, v_descale = quantize_fp8(v)
-    elif q_format in _FP8_FORMATS and v_format == q_format:
-        q_quantized, q_descale = quantize_fp8(q)
-        k_quantized, k_descale = quantize_fp8(k)
-        v_quantized, v_descale = quantize_fp8(v)
+    elif q_format in _FP8_FORMATS and v_format in (
+        q_format,
+        AttentionFormat.MXFP6,
+    ):
+        quantize_qk = quantize_fp8 if _is_fp8_format(v_format) else quantize_fp8_rotated
+        q_quantized, q_descale = quantize_qk(q)
+        k_quantized, k_descale = quantize_qk(k)
+        if _is_fp8_format(v_format):
+            v_quantized, v_descale = quantize_fp8(v)
+        else:
+            v_quantized, v_descale = quantize_v_mxfp6(v)
     elif q_format == AttentionFormat.MXFP4 and v_format in (
         *_FP8_FORMATS,
         AttentionFormat.MXFP4,

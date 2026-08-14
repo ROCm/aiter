@@ -16,13 +16,19 @@ from aiter.ops.mha_v4 import (
     mxfp4_v_view,
     mxfp6_k_view,
     quantize_fp8,
+    quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_v_mxfp6,
     quantize_v_mxfp4,
+    scale_modes_for_formats,
 )
-from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
+from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    _v_direct_kvtab,
+    fp6_k_raw_buffer_sizes,
+)
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
@@ -126,6 +132,59 @@ def test_mha_v4_q_multiplier_recipe():
     assert mha_v4_q_multiplier(softmax_scale) == softmax_scale * MHA_V4_LOG2E
 
 
+def test_mha_v4_f8f6_scale_recipe():
+    assert scale_modes_for_formats(
+        AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.MXFP6
+    ) == (
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.E8M0_PER_1X32,
+    )
+
+
+def test_mha_v4_rejects_f8f4_format_pair():
+    with pytest.raises(ValueError, match="matching FP8 or MXFP6 V"):
+        scale_modes_for_formats(
+            AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.MXFP4
+        )
+
+
+def test_mha_v4_f8f6_v_kv_table_matches_live_p_pack():
+    expected = []
+    for lane in range(64):
+        row = []
+        for field in range(32):
+            physical = 32 * (lane // 32) + field
+            paired = (
+                (physical & 0x0F)
+                | ((physical & 0x10) << 1)
+                | ((physical & 0x20) >> 1)
+            )
+            group, byte = divmod(paired, 32)
+            row.append(
+                32 * (byte // 16)
+                + 8 * ((byte % 16) // 4)
+                + byte % 4
+                + 4 * group
+            )
+        expected.append(row)
+
+    assert _v_direct_kvtab().tolist() == expected
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+def test_mha_v4_mxfp6_v_layout_contract():
+    value = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+
+    packed, scale = quantize_v_mxfp6(value)
+
+    assert packed.shape == value.shape
+    assert packed.dtype == torch.uint8
+    assert packed.stride() == (2 * 2 * 12288, 96, 2 * 12288, 1)
+    assert scale.shape == (1, 2, 2 * 512)
+    assert scale.dtype == torch.uint8
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
 @pytest.mark.parametrize("clip", [1.0, 0.9])
 def test_mha_v4_int8_quantization_matches_torch(clip):
@@ -155,8 +214,26 @@ def test_mha_v4_fp8_quantization_matches_torch():
     assert torch.equal(scale, expected_scale.reshape(1))
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rotated FP8 quantization")
+def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
+    from aiter.ops.quant import rotate_activation
+
+    torch.manual_seed(23)
+    value = torch.randn((1, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
+    rotated = torch.empty_like(value)
+    rotate_activation(rotated, value)
+    expected, expected_scale = quantize_fp8(rotated)
+
+    actual, scale = quantize_fp8_rotated(value)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(scale, expected_scale)
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
-@pytest.mark.parametrize("quantize", [quantize_int8, quantize_fp8])
+@pytest.mark.parametrize(
+    "quantize", [quantize_int8, quantize_fp8, quantize_fp8_rotated]
+)
 def test_mha_v4_per_tensor_quantization_handles_zero(quantize):
     value = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
 
@@ -480,6 +557,7 @@ def test_mha_v4_native_schema_mutates_only_out():
     [
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6),
         (AttentionFormat.MXFP4, AttentionFormat.FP8),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8),

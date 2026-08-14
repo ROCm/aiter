@@ -257,38 +257,8 @@ def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
 # (fp8 K-distribution + cvt interleave); without it the layout caps at cos 0.59.
 _TR8_SIGMA32 = np.array(
     [
-        0,
-        1,
-        2,
-        3,
-        16,
-        17,
-        18,
-        19,
-        4,
-        5,
-        6,
-        7,
-        20,
-        21,
-        22,
-        23,
-        8,
-        9,
-        10,
-        11,
-        24,
-        25,
-        26,
-        27,
-        12,
-        13,
-        14,
-        15,
-        28,
-        29,
-        30,
-        31,
+        0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23,
+        8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31,
     ],
     dtype=np.int64,
 )
@@ -382,7 +352,9 @@ def _v_field_perm() -> np.ndarray:
     return inv32[c].astype(np.int32)  # fieldperm[f] = inv32[c(f)]
 
 
-def quantize_fp6_v_clean_triton(v_fp8: "torch.Tensor", tile: int = 128):
+def quantize_fp6_v_clean_triton(
+    v_fp8: "torch.Tensor", tile: int = 128, direct_p: bool = False
+):
     """GPU (Triton) equivalent of quantize_fp6_v_clean (byte-identical).
 
     v_fp8 : torch fp8 tensor [b, sk, h_kv, d=128] (RAW fp8 V magnitudes; the kernel
@@ -396,7 +368,8 @@ def quantize_fp6_v_clean_triton(v_fp8: "torch.Tensor", tile: int = 128):
     nT = sk // tile
     n_blocks = b * h_kv * nT * 128 * 4
     out = torch.empty(b * h_kv * nT * 12800, dtype=torch.uint8, device=v_fp8.device)
-    kvtab = torch.from_numpy(_v_noswap_kvtab().reshape(-1)).to(v_fp8.device)
+    kvtab_np = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
+    kvtab = torch.from_numpy(kvtab_np.reshape(-1)).to(v_fp8.device)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
     _pack_v_fp6_kernel[grid](
@@ -448,6 +421,32 @@ def _v_noswap_kvtab() -> np.ndarray:
     return _NOSWAP_KVTAB_CACHE
 
 
+def _v_direct_kvtab() -> np.ndarray:
+    """Scaled FP6-src0 field to logical KV for the direct FP8 P operand.
+
+    A gfx950 one-hot probe shows FP6 physical contraction index ``a`` pairs with
+    FP8 index ``swap_bits_4_5(a)`` for all 64 indices. The live P pack maps its
+    physical byte ``s`` and lane group ``g`` to logical KV as
+    ``32*(s//16) + 8*((s%16)//4) + s%4 + 4*g``.
+    """
+    lane = np.arange(64)[:, None]
+    field = np.arange(32)[None, :]
+    physical = 32 * (lane // 32) + field
+    paired = (
+        (physical & 0x0F)
+        | ((physical & 0x10) << 1)
+        | ((physical & 0x20) >> 1)
+    )
+    group = paired // 32
+    byte = paired % 32
+    return (
+        32 * (byte // 16)
+        + 8 * ((byte % 16) // 4)
+        + byte % 4
+        + 4 * group
+    ).astype(np.int32)
+
+
 if _HAVE_TRITON:
 
     @triton.jit
@@ -470,15 +469,16 @@ if _HAVE_TRITON:
         m = blk < n_blocks
         # decode block id: blk = ((bh*nT + t)*128 + d_row)*4 + kvblk
         kvblk = blk % 4
-        d_row = (blk // 4) % 128
+        physical_d = (blk // 4) % 128
+        d_row = physical_d
         t = (blk // 512) % nT
         bh = blk // (512 * nT)
         bb = bh // h_kv
         hh = bh % h_kv
-        n = d_row // 32
+        n = physical_d // 32
         k = kvblk // 2
         bn = n * 2 + k
-        L = (kvblk % 2) * 32 + (d_row % 32)
+        L = (kvblk % 2) * 32 + (physical_d % 32)
 
         f = tl.arange(0, 32)
         kt = tl.load(kvtab_ptr + L[:, None] * 32 + f[None, :])  # [BN,32]
@@ -534,8 +534,7 @@ if _HAVE_TRITON:
         tl.store(out_ptr + off0 + 0, b0, mask=m[:, None])
         tl.store(out_ptr + off0 + 1, b1, mask=m[:, None])
         tl.store(out_ptr + off0 + 2, b2, mask=m[:, None])
-        # scale byte (d-major: 12288 + d_row*4 + kvblk)
-        scale_off = base + 12288 + d_row * 4 + kvblk
+        scale_off = base + 12288 + physical_d * 4 + kvblk
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(out_ptr + scale_off, sb, mask=m)
 
@@ -1302,3 +1301,39 @@ def pack_fp6_v_kernel_view(
     if out_device is not None:
         buf = buf.to(out_device)
     return buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
+
+
+def pack_fp6_v_data_scale_views(v: "torch.Tensor", tile: int = 128):
+    """Pack V into separate F8F6 data and E8M0 scale images."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h_kv, d = v.shape
+    n_tiles = (sk + tile - 1) // tile
+    sk_pad = n_tiles * tile
+    if sk_pad != sk:
+        tail = v[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
+        v = torch.cat([v, tail], dim=1)
+
+    packed = quantize_fp6_v_clean_triton(v, tile=tile, direct_p=True).view(
+        b, h_kv, n_tiles, 12800
+    )
+    data = packed[..., :12288].contiguous()
+    scale_tail = packed[..., 12288:].view(b, h_kv, n_tiles, 128, 4)
+    lane = torch.arange(64, device=v.device)
+    physical_channel = (
+        lane[:, None] % 32 + 32 * torch.arange(4, device=v.device)[None, :]
+    )
+    channel = physical_channel
+    scale = (
+        torch.stack(
+            [scale_tail[..., channel, 2 * k + lane[:, None] // 32] for k in range(2)],
+            dim=-3,
+        )
+        .contiguous()
+        .view(b, h_kv, n_tiles * 512)
+    )
+
+    v_hs = n_tiles * 12288
+    v_bs = h_kv * v_hs
+    data_flat = torch.cat([data.reshape(-1), data.new_zeros(256)])
+    view = data_flat.as_strided((b, sk, h_kv, d), (v_bs, 96, v_hs, 1))
+    return view, scale
