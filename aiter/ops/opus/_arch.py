@@ -37,7 +37,11 @@ import logging
 import os
 from collections.abc import Iterable
 
+import torch
+
 logger = logging.getLogger("aiter.ops.opus._arch")
+
+_DEVICE_INFO_CACHE: dict[torch.device, tuple[str, int]] = {}
 
 
 def _detect_arch(
@@ -134,3 +138,50 @@ def _check_arch(
     if hint:
         msg = f"{msg} {hint}"
     raise ImportError(msg)
+
+
+def _normalize_device(device: torch.device | str | int) -> torch.device:
+    """Return an explicit device so cache entries never follow current_device."""
+    if isinstance(device, int):
+        device = torch.device("cuda", device)
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def _read_device_arch_and_cu(device: torch.device) -> tuple[str, int]:
+    """Read immutable architecture properties for one explicit GPU."""
+    if device.type != "cuda":
+        raise RuntimeError(f"OPUS GEMM requires a GPU tensor; got device {device}")
+    props = torch.cuda.get_device_properties(device)
+    raw_arch = str(getattr(props, "gcnArchName", "")).strip()
+    arch = raw_arch.split(":", 1)[0].lower()
+    if not arch.startswith("gfx"):
+        try:
+            from ...jit.utils.chip_info import get_gfx_runtime
+
+            arch = get_gfx_runtime().lower()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"cannot determine the AMD gfx architecture for device {device}"
+            ) from exc
+    return arch, int(props.multi_processor_count)
+
+
+def _device_arch_and_cu(
+    device: torch.device | str | int,
+) -> tuple[str, int]:
+    """Return cached arch/CU metadata scoped to an explicit device."""
+    explicit = _normalize_device(device)
+    info = _DEVICE_INFO_CACHE.get(explicit)
+    if info is None:
+        info = _read_device_arch_and_cu(explicit)
+        _DEVICE_INFO_CACHE[explicit] = info
+    return info
+
+
+def _device_arch(device: torch.device | str | int) -> str:
+    """Return the runtime gfx architecture for one tensor device."""
+    return _device_arch_and_cu(device)[0]

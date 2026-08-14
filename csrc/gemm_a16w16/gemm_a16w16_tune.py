@@ -75,13 +75,11 @@ try:
         kid_rejects_shape as _opus_kid_rejects_shape,
     )
 
-    from aiter.ops.opus.gemm_op_a16w16 import (
-        opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
-    )
+    from aiter.ops.opus import opus_gemm as _opus_gemm
 
     _opus_all_kernels = dict(_opus_kernels_list)
 except Exception as _opus_exc:  # noqa: BLE001
-    _opus_gemm_a16w16_tune = None
+    _opus_gemm = None
     _opus_all_kernels = None
     _opus_splitk_kids = frozenset()
     _opus_candidate_kids_for_shape = None
@@ -211,16 +209,17 @@ _opus_max_delta_checked = set()
 
 
 def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
+    """Launch one OPUS kid and run the existing maximum-error check."""
     inp3 = inp.unsqueeze(0)
     weight3 = weight.unsqueeze(0)
     out3 = out.unsqueeze(0)
-    _opus_gemm_a16w16_tune(
+    _opus_gemm(
         inp3,
         weight3,
         out3,
         bias=bias,
-        kernelId=kid,
-        splitK=splitK,
+        kid=kid,
+        split_k=splitK,
     )
     if torch.cuda.is_current_stream_capturing():
         return out
@@ -670,7 +669,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_opus_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if _opus_gemm_a16w16_tune is None:
+        if _opus_gemm is None:
             logger.warning(f"opus not available, skip. reason: {OPUS_TUNE_ERROR}")
             return []
         if scaleAB or indtype != dtypes.bf16:

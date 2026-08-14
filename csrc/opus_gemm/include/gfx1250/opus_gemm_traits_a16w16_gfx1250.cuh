@@ -2,9 +2,9 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Traits + kargs for the gfx1250 a16w16 cluster/TDM split-K pipeline that
-// reduces via an fp32 WORKSPACE + a separate REDUCE kernel (no atomic_add,
-// no self-clear, no semaphore). The workspace buffer is allocated externally
-// (torch.empty on the Python side) and passed as a direct pointer in kargs.
+// reduces via a per-kid bf16/fp32 WORKSPACE + a separate REDUCE kernel (no
+// atomic_add, no self-clear, no semaphore). Uses a caller-owned direct
+// workspace pointer.
 //
 // This header is the SINGLE source of truth for every compile-time constant
 // the pipeline needs: the pipeline file
@@ -32,30 +32,22 @@ constexpr int kCtdmLayoutTileN = 0;
 constexpr int kCtdmLayoutTileM = 1;
 }  // namespace opus_gfx1250
 
-#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-// Indirection slot for the split-K fp32 workspace pointer. Captured HIP
-// graphs hold the slot address (stable), not the workspace ptr, so a
-// post-capture grow + hipFree of the old buffer doesn't dangle the graph.
-struct opus_splitk_ws_handle {
-    void*         ptr;    // current backing workspace; null until first grow
-    unsigned long bytes;  // current capacity in bytes
-};
-#endif
+// log2 of a power-of-2 (B_K is always a power of 2 here).
+__host__ __device__ constexpr inline int opus_ctdm_log2_i(int x) {
+    int r = 0; while (x > 1) { x >>= 1; ++r; } return r;
+}
 
 #ifndef OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 // Kernel arguments for the gfx1250 a16w16 cluster/TDM split-K (workspace)
-// pipeline. The main kernel writes partial sums (bf16 by default) into
-// ptr_ws laid out as [split_k, padded_M, padded_N] (per host launch;
-// batch handled by a per-batch host launch with pointer offsets). The reduce
-// kernel consumes it, folds bias once, casts to Y dtype, writes C[M, N].
-// The workspace buffer is allocated externally (torch.empty on the Python
-// side) and passed in directly -- no indirection through a handle struct.
+// pipeline. The main kernel writes D_WS partial sums into
+// ptr_ws laid out as [split_k, padded_M, padded_N]. The reduce kernel consumes
+// them, re-accumulates in fp32, folds bias once, casts to Y dtype, and writes
+// C[M, N].
 struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
     const void* __restrict__ ptr_a;          // bf16 [M, K]
     const void* __restrict__ ptr_b;          // bf16 [N, K] (A @ B^T)
-    void*       __restrict__ ptr_ws;         // workspace [split_k, padded_M, padded_N]
+    void*       __restrict__ ptr_ws;         // D_WS [split_k, padded_M, padded_N]
     void*       __restrict__ ptr_c;          // bf16/fp32 [M, N] (filled by reduce kernel)
     const void* __restrict__ ptr_bias;       // consumed by reduce kernel only
     int m;
@@ -77,43 +69,42 @@ struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
 
 #ifndef OPUS_GEMM_SPLITK_FUSE_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_SPLITK_FUSE_KARGS_GFX1250_DEFINED
-// Kernel args for the FUSED single-kernel in-cluster split-K reduce pipeline
-// (a16w16_clusterlaunch_tdm_splitk_fuse). No separate reduce kernel: the last
-// split WG folds bias + reduces the DataWs partials in-kernel (cluster-barrier
-// sync) and writes C. The DataWs partial workspace is allocated externally
-// (torch.empty) and passed via ptr_ws; there is no semaphore buffer (the
-// cluster barrier replaces it).
+// Arguments for #4246's fused in-cluster split-K pipeline. The first SplitK-1
+// WGs publish typed partial tiles through ptr_ws; the last WG reduces those
+// tiles after the cluster barrier and writes C directly. There is no separate
+// reduce launch. SplitK and the N-peer cluster count are compile-time per kid.
 struct opus_gemm_splitk_fuse_kargs_gfx1250
 {
-    const void* __restrict__ ptr_a;                      // bf16 [M, K]
-    const void* __restrict__ ptr_b;                      // bf16 [N, K] (A @ B^T)
-    void* __restrict__ ptr_ws;                           // DataWs partial workspace
-    void* __restrict__ ptr_c;          // bf16/fp32 [M, N] (written by last split WG)
-    const void* __restrict__ ptr_bias; // bf16 [N] or null (folded once by last WG)
+    const void* __restrict__ ptr_a;          // bf16 [M, K]
+    const void* __restrict__ ptr_b;          // bf16 [N, K] (A @ B^T)
+    void* __restrict__ ptr_ws;               // D_WS tile-major partial workspace
+    void* __restrict__ ptr_c;                // bf16/fp32 [M, N]
+    const void* __restrict__ ptr_bias;       // bf16 [N] or null
     int m;
     int n;
     int k;
-    int batch;             // = 1 per launch
-    int split_k;           // == compile-time SplitK
-    int stride_a;          // A row pitch (>= K)
-    int stride_b;          // B row pitch (>= K)
-    int stride_c;          // = N
-    int stride_a_batch;    // = M * stride_a
-    int stride_b_batch;    // = N * stride_b
-    int stride_c_batch;    // = M * N
-    int stride_bias_batch; // 0 (broadcast [N]) or N
-    int num_tiles_m;       // ceil(M / B_M)
-    int num_tiles_n;       // ceil(N / B_N)
+    int batch;                               // fused family requires 1
+    int split_k;                             // equals compile-time SplitK
+    int stride_a;
+    int stride_b;
+    int stride_c;
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
+    int stride_bias_batch;
+    int num_tiles_m;
+    int num_tiles_n;
 };
 #endif
 
 // ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
-//   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_C MUST be float (main kernel
-//   writes the fp32 workspace; the reduce kernel casts to the final Y dtype).
+//   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_WS is either bf16 or fp32.
+//   The main kernel casts the fp32 accumulator to D_WS; the reduce kernel reads
+//   the same D_WS and always re-accumulates in fp32.
 template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
          int LAYOUT_,
-         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         typename D_A_, typename D_B_, typename D_WS_, typename D_ACC_,
          bool ENABLE_BIAS_ = false,
          int NUM_SLOTS_ = 3,
          int WG_PER_CU_ = 2,
@@ -128,16 +119,18 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
 
     using D_A   = D_A_;
     using D_B   = D_B_;
-    using D_C   = D_C_;                                // workspace dtype
+    using D_WS  = D_WS_;
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
-    static_assert(std::is_same<D_C, float>::value,
-                  "cluster_tdm_splitk_ws main kernel writes an fp32 workspace; D_C must be float");
+    static_assert(std::is_same<D_WS, D_A>::value ||
+                      std::is_same<D_WS, D_ACC>::value,
+                  "cluster_tdm_splitk_ws D_WS must be bf16 input storage or "
+                  "fp32 accumulator storage");
 
     // Aliases used by the pipeline / layout helpers.
     using DataA   = D_A;
     using DataB   = D_B;
-    using DataC   = D_C;
+    using DataWS  = D_WS;
     using DataAcc = D_ACC;
 
     static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16
@@ -255,8 +248,10 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     // gfx1250 LDS max ~320KB.
     static_assert(kLdsTotalBytes <= 320 * 1024, "LDS exceeds 320KB");
 
-    // Workspace plain store: fp32 dwordx4.
-    static constexpr int kCVec = 16 / (int)sizeof(DataAcc);      // 4 (fp32)
+    // Four workspace elements per issue: 16B for fp32, 8B for bf16. This is
+    // the layout used by the #4246 bf16 store path and preserves the register
+    // partition for both storage types.
+    static constexpr int kCVec = 4;
 
     // ── Warp-derived WMMA register-decomposition constants ───────────────────
     // (computed from kWarpRt so device/host passes match)

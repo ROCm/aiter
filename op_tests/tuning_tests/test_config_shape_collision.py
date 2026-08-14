@@ -62,10 +62,6 @@ FAMILIES = [
     ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
-    (
-        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
-        "batched_gemm_a8w8_blockscale_mxscale_tuned",
-    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -208,10 +204,15 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm")
 
     def test_batched_gemm_a8w8_blockscale_mxscale(self):
-        self._check_family(
-            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
-            "batched_gemm_a8w8_blockscale_mxscale_tuned",
-        )
+        # This family deliberately resolves in the existing A8W8 module so
+        # adding PR #4320 does not modify generic jit/core.py.
+        from aiter.ops import batched_gemm_op_a8w8 as bmm
+
+        bmm._load_mxscale_bmm_tuned.cache_clear()
+        rows = bmm._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        bmm._load_mxscale_bmm_tuned.cache_clear()
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")

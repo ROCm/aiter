@@ -41,22 +41,9 @@ from torch import Tensor
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+    from aiter.ops.opus import opus_gemm as _opus_launch
 except Exception:  # noqa: BLE001  blanket catch is intentional here
-    _opus_tune = None
-
-# NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
-# torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
-# passed explicitly to the launcher. torch's caching allocator is HIP graph-
-# capture aware, so that single torch.empty path serves both eager and capture
-# (a buffer first touched inside capture comes from the graph mempool with a
-# replay-stable address) and no eager pre-warm of the shape is required. (The
-# old per-stream hipMalloc registry -- opus_gemm_workspace_init /
-# opus_splitk_ws_get -- used by the gfx942/gfx950 a16w16 split-K path still needs
-# an eager warm before capture; if that path is ever exercised under cudagraphs,
-# warm it via aiter.opus_gemm_workspace_init() on the capture stream. It fails
-# loudly ("splitk workspace not initialized") rather than silently corrupting,
-# so its absence here is safe to detect.)
+    _opus_launch = None
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +113,41 @@ def is_skinny_default_shape(
     )
 
 
+def _resolve_opus_a16w16_caller_candidate(
+    *,
+    gfx: str,
+    cu_num: int,
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype,
+    otype,
+    requested_kid=None,
+    requested_split_k=0,
+):
+    """Resolve tuned/heuristic policy before the exact public OPUS call."""
+    if _opus_launch is None:
+        return None
+    from aiter.ops.opus.gemm_op_a16w16 import (
+        _resolve_a16w16_caller_candidate,
+    )
+
+    return _resolve_a16w16_caller_candidate(
+        arch=gfx,
+        M=M,
+        N=N,
+        K=K,
+        batch=1,
+        cu_num=cu_num,
+        has_bias=bias,
+        input_dtype=dtype,
+        output_dtype=otype,
+        requested_kid=requested_kid,
+        requested_split_k=requested_split_k,
+    )
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -175,6 +197,26 @@ def get_GEMM_A16W16_config(
                     config = None
             if config is None:
                 continue
+            if config["libtype"] == "opus":
+                resolved = _resolve_opus_a16w16_caller_candidate(
+                    gfx=gfx,
+                    cu_num=cu_num,
+                    M=M,
+                    N=N,
+                    K=K,
+                    bias=bias,
+                    dtype=eval(dtype),
+                    otype=eval(otype),
+                    requested_kid=config.get("solidx"),
+                    requested_split_k=config.get("splitK"),
+                )
+                if resolved is None:
+                    # Discard the whole stale (kid, split-K) pair before
+                    # trying another padded row or the architecture heuristic.
+                    config = None
+                    continue
+                config = dict(config)
+                config["solidx"] = int(resolved.actual_kid)
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""
@@ -186,6 +228,32 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
+        opus_plain = (
+            not bpreshuffle
+            and not scaleAB
+            and eval(dtype) == dtypes.bf16
+            and eval(otype) in (dtypes.bf16, dtypes.fp32)
+        )
+        if opus_plain:
+            resolved = _resolve_opus_a16w16_caller_candidate(
+                gfx=gfx,
+                cu_num=cu_num,
+                M=M,
+                N=N,
+                K=K,
+                bias=bias,
+                dtype=eval(dtype),
+                otype=eval(otype),
+                requested_kid=None,
+                requested_split_k=0,
+            )
+            if resolved is not None:
+                default_config.update(
+                    libtype="opus",
+                    solidx=int(resolved.actual_kid),
+                    splitK=0,
+                    kernelName="",
+                )
         if bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
@@ -206,9 +274,8 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif gfx in ("gfx90a", "gfx942", "gfx950") and is_skinny_default_shape(
-            M, N, K, dtype, cu_num
-        ):
+        elif not opus_plain and is_skinny_default_shape(M, N, K, dtype, cu_num):
+            # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
@@ -539,7 +606,8 @@ def opus_gemm(
     bpreshuffle: bool | None = False,
     config: dict | None = None,
 ):
-    if _opus_tune is None:
+    """Run one tuned OPUS A16W16 row through the exact-kid interface."""
+    if _opus_launch is None:
         logger.warning(
             "opus tuned config found but opus is not available; falling back to torch"
         )
@@ -562,22 +630,16 @@ def opus_gemm(
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     m, _k = inp.shape
     n = weights.shape[0]
-    # The split-K workspace (if any) is allocated capture-safely inside
-    # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-    _opus_tune(
+    _opus_launch(
         inp.unsqueeze(0),
         weights.unsqueeze(0),
         Y.unsqueeze(0),
+        kid=int(solidx),
         bias=bias,
-        kernelId=int(solidx),
-        splitK=splitK,
+        split_k=splitK,
     )
-    # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
-    # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
-    # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
-    # 2*bias), causing ~54% miscompare (maxabs ~= bias range) for every bias!=None
-    # opus shape under tgemm (e.g. ATOM's bf16 linear).
+    # The OPUS launcher already applies bias, including split-K reduction.
     return Y
 
 

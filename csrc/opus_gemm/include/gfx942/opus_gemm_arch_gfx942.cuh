@@ -1,181 +1,174 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// opus_gemm_arch_gfx942.cuh -- gfx942-specific dispatch implementations.
+// Exact-kid launcher tables for gfx942.
 #pragma once
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
-#include "opus_gemm_heuristic_dispatch_gfx942.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_dispatch_gfx942<>
-#include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_{BF16,FP32}_GFX942
-#include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_{BF16,FP32}_GFX942
-#include "opus_gemm_a8w8_tune_lookup.h"             // GENERATE_A8W8_TUNE_LOOKUP_BF16
-#include "opus_gemm_manifest.h"                     // launcher symbols referenced by the lookup macros
-#include "../opus_gemm_utils.cuh"                   // bf16_t / fp32_t
+#include "../opus_gemm_utils.cuh"
+#include "opus_gemm_a16w16_kid_dispatch.h"
+#include "opus_gemm_a8w8_kid_dispatch.h"
+#include "opus_gemm_manifest.h"
 
-#include <algorithm>  // std::lower_bound
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <optional>
 
+#ifndef OPUS_A16W16_DISPATCH_KERNEL_TYPES_DEFINED
+#define OPUS_A16W16_DISPATCH_KERNEL_TYPES_DEFINED
+using OpusA16W16Kernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    std::optional<aiter_tensor_t>, int);
+using OpusA16W16WorkspaceKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, std::optional<aiter_tensor_t>, int);
+#endif
+
+#ifndef OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
+#define OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
+using OpusA8W8Kernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&);
+using OpusA8W8BlockscaleKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&);
+using OpusA8W8BlockscaleBpreshuffleKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&);
+#endif
+
 namespace opus_gfx942_detail
 {
-struct OpusA16W16Shape
-{
-    int M;
-    int N;
-    int K;
-};
-
-struct OpusA16W16RuntimeEntry
-{
-    OpusA16W16Shape key;
-    OpusA16W16NoscaleKernel func;
-};
-
-constexpr bool entry_less(const OpusA16W16RuntimeEntry& a,
-                          const OpusA16W16RuntimeEntry& b) noexcept
-{
-    if (a.key.M != b.key.M) return a.key.M < b.key.M;
-    if (a.key.N != b.key.N) return a.key.N < b.key.N;
-    return a.key.K < b.key.K;
-}
-
-constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
-                        const OpusA16W16RuntimeEntry& b) noexcept
-{
-    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
-}
-
-struct OpusA16W16TuneEntry
+struct OpusA16W16KidEntry
 {
     int kid;
-    OpusA16W16NoscaleKernel func;
+    OpusA16W16Kernel func;
 };
 
-constexpr bool tune_entry_less(const OpusA16W16TuneEntry& a,
-                               const OpusA16W16TuneEntry& b) noexcept
-{
-    return a.kid < b.kid;
-}
-
-using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
-
-using OpusA8W8BlockscaleBPreshuffleKernel = void (*)(
-    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
-    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
-
-struct OpusA8W8TuneEntry
+struct OpusA16W16WorkspaceKidEntry
 {
     int kid;
-    OpusA8W8BlockscaleBPreshuffleKernel func;
+    OpusA16W16WorkspaceKernel func;
 };
 
-constexpr bool a8w8_tune_entry_less(const OpusA8W8TuneEntry& a,
-                                    const OpusA8W8TuneEntry& b) noexcept
+template <typename Kernel>
+struct OpusA8W8KidEntry
 {
-    return a.kid < b.kid;
-}
-}  // namespace opus_gfx942_detail
+    int kid;
+    Kernel func;
+};
 
-// -- a16w16 runtime dispatch (tuned lookup -> heuristic fallback) -------------
+template <typename Entry, size_t Size>
+inline const Entry* find_kid(const std::array<Entry, Size>& entries, int kid)
+{
+    const auto it = std::lower_bound(
+        entries.begin(), entries.end(), kid,
+        [](const Entry& entry, int value) { return entry.kid < value; });
+    return it != entries.end() && it->kid == kid ? &*it : nullptr;
+}
+
+inline const OpusA16W16WorkspaceKidEntry* workspace_entry(int kid)
+{
+    static constexpr std::array<
+        OpusA16W16WorkspaceKidEntry,
+        GENERATE_A16W16_WORKSPACE_KID_DISPATCH_GFX942_SIZE>
+        kWorkspace = {{GENERATE_A16W16_WORKSPACE_KID_DISPATCH_GFX942}};
+    return find_kid(kWorkspace, kid);
+}
+
+} // namespace opus_gfx942_detail
 
 template <typename CDataType>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx942(int M, int N, int K, int batch, bool has_bias = false);
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx942(int kid);
 
 template <>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx942<bf16_t>(int M, int N, int K, int batch, bool has_bias)
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx942<bf16_t>(int kid)
 {
     using namespace opus_gfx942_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX942(bf16_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
-    {
-        return it->func;
-    }
-    return opus_a16w16_heuristic_dispatch_gfx942<bf16_t>(M, N, K, batch, has_bias);
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX942_BF16_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX942_BF16(bf16_t)}};
+    const auto* entry = find_kid(kKids, kid);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", kid,
+                " for OPUS a16w16 on gfx942 with bf16 Y in the "
+                "non-workspace launch table");
+    return entry->func;
 }
 
 template <>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx942<fp32_t>(int M, int N, int K, int batch, bool has_bias)
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx942<fp32_t>(int kid)
 {
     using namespace opus_gfx942_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX942(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
-    {
-        return it->func;
-    }
-    return opus_a16w16_heuristic_dispatch_gfx942<fp32_t>(M, N, K, batch, has_bias);
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX942_FP32_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX942_FP32(fp32_t)}};
+    const auto* entry = find_kid(kKids, kid);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", kid,
+                " for OPUS a16w16 on gfx942 with fp32 Y in the "
+                "non-workspace launch table");
+    return entry->func;
 }
 
-// -- a16w16 tune dispatch (id-based, two specializations) --------------------
+inline bool opus_a16w16_has_workspace_kernel_gfx942(int id)
+{
+    return opus_gfx942_detail::workspace_entry(id) != nullptr;
+}
+
+inline OpusA16W16WorkspaceKernel
+opus_a16w16_workspace_dispatch_gfx942(int id)
+{
+    const auto* entry = opus_gfx942_detail::workspace_entry(id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id,
+                " for OPUS a16w16 on gfx942 in the workspace launch table");
+    return entry->func;
+}
 
 template <typename CDataType>
-inline opus_gfx942_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx942(int id);
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx942(int id);
 
 template <>
-inline opus_gfx942_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx942<bf16_t>(int id)
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx942<bf16_t>(int id)
 {
-    using namespace opus_gfx942_detail;
-    static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_BF16_GFX942(bf16_t)
-    };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 bf16 tune lookup table (gfx942)");
-    return it->func;
+    using Entry = opus_gfx942_detail::OpusA8W8KidEntry<
+        OpusA8W8BlockscaleBpreshuffleKernel>;
+    static constexpr std::array<
+        Entry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_BF16_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_BF16}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx942 with bf16 Y");
+    const auto* entry = opus_gfx942_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id, " for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx942 with bf16 Y");
+    return entry->func;
 }
 
 template <>
-inline opus_gfx942_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx942<fp32_t>(int id)
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx942<fp32_t>(int id)
 {
-    using namespace opus_gfx942_detail;
-    static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX942(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table (gfx942)");
-    return it->func;
-}
-
-// -- a8w8 tune dispatch (id-based, bf16-output explicit tune API only) --------
-
-inline opus_gfx942_detail::OpusA8W8BlockscaleBPreshuffleKernel
-opus_a8w8_tune_dispatch_gfx942(int id);
-
-inline opus_gfx942_detail::OpusA8W8BlockscaleBPreshuffleKernel
-opus_a8w8_tune_dispatch_gfx942(int id)
-{
-    using namespace opus_gfx942_detail;
-    static constexpr OpusA8W8TuneEntry kTune[] = {
-        GENERATE_A8W8_TUNE_LOOKUP_BF16(bf16_t)
-    };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA8W8TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, a8w8_tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a8w8 bf16 tune lookup table (gfx942)");
-    return it->func;
+    using Entry = opus_gfx942_detail::OpusA8W8KidEntry<
+        OpusA8W8BlockscaleBpreshuffleKernel>;
+    static constexpr std::array<
+        Entry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_FP32_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_FP32}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx942 with fp32 Y");
+    const auto* entry = opus_gfx942_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id, " for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx942 with fp32 Y");
+    return entry->func;
 }

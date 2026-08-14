@@ -17,7 +17,8 @@ Runtime schema (what the tuner emits, and what the runtime reads back):
     gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 ``aiter/ops/batched_gemm_op_a8w8.py:lookup_mxscale_bmm_config`` indexes on
 ``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
-``libtype``, and ``bmm_op.py`` reads ``kernelId`` / ``splitK`` off that row, so
+``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
+the unified ``opus_gemm`` entry, so
 those columns must match exactly.
 
 Verification (the part that catches column-transpose / scale defects):
@@ -55,7 +56,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.opus import opus_gemm
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -100,58 +101,58 @@ _SK = [1, 2, 4, 8]
 # Tuning policy: kid -> splitK list. The ONLY hand-maintained per-kid metadata --
 # it decides which kids to sweep and with which split-K factors, not their
 # geometry and not their M alignment. Tile shape, kernelName and m_align all come
-# from the codegen instance, so this cannot drift from what compiles. kid 0 (the
+# from the codegen instance, so this cannot drift from what compiles. kid 8000 (the
 # heuristic default) is intentionally not tuned.
 _TUNE_POLICY = {
     # flatmm_splitk family: the M=16/32 last-mile tiles, the mid-M SFA/SFB-preload
     # tiles and the 64x* tiles. All are split-K capable via the fused reduce tail,
     # except kid646 whose persistent DIRECT_ONLY schedule requires splitK == 1.
-    32: _SK,
-    64: _SK,
-    138: _SK,
-    139: _SK,
-    256: _SK,
-    311: _SK,
-    312: _SK,
-    313: _SK,
-    314: _SK,
-    316: _SK,
-    317: _SK,
-    318: _SK,
-    319: _SK,
-    320: _SK,
-    321: _SK,
-    322: _SK,
-    323: _SK,
-    324: _SK,
-    326: _SK,
-    327: _SK,
-    640: _SK,
-    642: _SK,
-    646: [1],
-    650: _SK,
-    653: _SK,
+    8032: _SK,
+    8064: _SK,
+    8138: _SK,
+    8139: _SK,
+    8256: _SK,
+    8311: _SK,
+    8312: _SK,
+    8313: _SK,
+    8314: _SK,
+    8316: _SK,
+    8317: _SK,
+    8318: _SK,
+    8319: _SK,
+    8320: _SK,
+    8321: _SK,
+    8322: _SK,
+    8323: _SK,
+    8324: _SK,
+    8326: _SK,
+    8327: _SK,
+    8640: _SK,
+    8642: _SK,
+    8646: [1],
+    8650: _SK,
+    8653: _SK,
     # fused single-tile launcher.
-    100: [1],
+    8100: [1],
     # pipeline family; kid158 preloads both the per-token SFA and the block SFB
     # panel into LDS.
-    149: [1],
-    150: [1],
-    151: [1],
-    152: [1],
-    158: [1],
+    8149: [1],
+    8150: [1],
+    8151: [1],
+    8152: [1],
+    8158: [1],
     # monolithic mouter / wave pipelines.
-    131: [1],
-    132: [1],
-    134: [1],
-    142: [1],
-    144: [1],
-    148: [1],
-    160: [1],
-    161: [1],
+    8131: [1],
+    8132: [1],
+    8134: [1],
+    8142: [1],
+    8144: [1],
+    8148: [1],
+    8160: [1],
+    8161: [1],
     # minterleave only exists in split-K form.
-    162: [2, 4, 8],
-    163: [2, 4, 8],
+    8162: [1],
+    8163: [1],
     # 128x128x128 tiles, splitK=1 only and deliberately so. They are the largest
     # BMM tile (COM_REP_M=4 x COM_REP_N=8 -> 32 C fragments, 128 fp32 C values per
     # lane) at 512 VGPRs / occupancy 1. At splitK=1 they run the Cbf16
@@ -160,12 +161,12 @@ _TUNE_POLICY = {
     # never won (g2/m256: best kid325 split-K is 23.6us against the 14.5us winner),
     # and which is also where the clang-22 gfx950 greedy-VGPR miscompile lives (one
     # C-fragment dword left unmaterialized under --amdgpu-mfma-vgpr-form).
-    128: [1],
-    137: [1],
-    325: [1],
+    8128: [1],
+    8137: [1],
+    8325: [1],
 }
 
-# Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
+# Only non-direct flatmm split-K launchers are swept with splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
@@ -173,7 +174,7 @@ for _kid, _sks in _TUNE_POLICY.items():
         assert (
             _tag == "a8w8_mxscale_bmm_flatmm_splitk"
             and not getattr(_CODEGEN_BMM[_kid], "direct_only", False)
-        ) or _tag == "a8w8_mxscale_bmm_minterleave", (
+        ), (
             f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
         )
 
@@ -206,15 +207,42 @@ def _gen_varied(shape, k, device):
     return (x * amp.repeat_interleave(GROUP)).to(dtypes.bf16)
 
 
-def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
-    """Return the 6-tuple mp_tuner indexes into:
+def _workspace_numel(kernel_id, split_k, batch, m, n):
+    instance = _CODEGEN_BMM[int(kernel_id)]
+    if split_k <= 1 or instance.kernel_tag not in {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+    }:
+        return 0
+    tiles_m = (m + instance.B_M - 1) // instance.B_M
+    tiles_n = (n + instance.B_N - 1) // instance.B_N
+    partial_numel = (
+        split_k
+        * batch
+        * tiles_m
+        * instance.B_M
+        * tiles_n
+        * instance.B_N
+    )
+    if instance.kernel_tag != "a8w8_mxscale_bmm_fused":
+        return partial_numel
+    counter_offset = (partial_numel * 4 + 255) & ~255
+    counter_bytes = batch * tiles_m * tiles_n * 4
+    return (counter_offset + counter_bytes + 3) // 4
+
+
+def gen_bmm_mxscale_data(
+    batch, m, n, k, seed, out_dtype, kernel_id, split_k, device="cuda"
+):
+    """Return the 7-tuple mp_tuner indexes into:
 
     0 O_in   [m,g,k]     fp8 (mmajor transposed view, K contiguous)
     1 W_mx   [g,n,k]     fp8 (batch-major)
     2 Y       [m,g,n]     out_dtype output buffer
     3 xs_in  [m,g,k/128] uint8 e8m0 per-token scale (mmajor view)
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
-    5 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
+    5 workspace optional caller-owned FP32 split-K buffer
+    6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
     """
     torch.manual_seed(seed)
     O_bf16 = _gen_varied((batch, m, k), k, device)
@@ -224,14 +252,31 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     O_in = O_mx.transpose(0, 1)  # [m,g,k]
     xs_in = xs_mx.transpose(0, 1)  # [m,g,k/128]
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
+    workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
+    workspace = (
+        torch.empty(workspace_numel, dtype=torch.float32, device=device)
+        if workspace_numel
+        else None
+    )
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
-    return (O_in, W_mx, Y, xs_in, ws_mx, ref)
+    return (O_in, W_mx, Y, xs_in, ws_mx, workspace, ref)
 
 
-def run_bmm_mxscale_bench(O_in, W_mx, Y, xs_in, ws_mx, kernelId, splitK):
+def run_bmm_mxscale_bench(
+    O_in, W_mx, Y, xs_in, ws_mx, workspace, kernelId, splitK
+):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
-    _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, splitK, kernelId)
-    return Y
+    return opus_gemm(
+        O_in,
+        W_mx,
+        Y,
+        kid=int(kernelId),
+        layout="mxscale_bmm",
+        x_scale=xs_in,
+        w_scale=ws_mx,
+        split_k=int(splitK),
+        workspace=workspace,
+    )
 
 
 def _bmm_ref_passthrough(ref):
@@ -445,12 +490,12 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                         (
                             info,
                             gen_bmm_mxscale_data,
-                            (b, m, n, k, seed, out_dtype),
+                            (b, m, n, k, seed, out_dtype, kid, sk),
                             run_bmm_mxscale_bench,
-                            ([0, 1, 2, 3, 4], kid, sk),
+                            ([0, 1, 2, 3, 4, 5], kid, sk),
                             perf_kwargs,
                             _bmm_ref_passthrough,
-                            ([5],),
+                            ([6],),
                             {},
                             None,
                             1e-2,  # rtol

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""End-to-end regression of gemm_a16w16_opus vs torch.bmm; prints TFLOPs.
+"""End-to-end regression of exact-kid ``opus_gemm`` vs torch.bmm.
 
 Usage:
-    python3 op_tests/test_opus_a16w16_gemm.py [-m M -n N -k K -b B]
+    python3 op_tests/test_opus_a16w16_gemm.py --kid KID [-m M -n N -k K -b B]
     python3 op_tests/test_opus_a16w16_gemm.py --csv_file <shape_csv>
 
     # opus-only sweep in CUDA-graph mode, golden-checked (default entry):
@@ -14,19 +14,15 @@ import argparse
 import os
 import sys
 
+import pytest
 import torch
 
 # Skip on unsupported arch via the same probe opus uses at import time.
 from aiter.ops.opus._arch import _detect_arch
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
-if not _arch_ok:
-    print(
-        f"[skip] test_opus_a16w16_gemm requires gfx950/gfx942/gfx1250 (detected {_detected_gfx!r})"
-    )
-    sys.exit(0)
 
-from aiter.ops.opus import gemm_a16w16_opus
+from aiter.ops.opus import opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
 
 try:
@@ -80,36 +76,34 @@ def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
 
 
 def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
-    """Build a B that gemm_a16w16_opus accepts for both batch=1 and batch>1.
-
-    The wrapper rejects 2D B + batch>1 because the opus launcher hardcodes
-    stride_b_batch == N*K (a broadcast view would silently fault). For the
-    common "shared weight across batch" case, materialize an explicit
-    `[batch, N, K]` tensor via the contiguous broadcast pattern.
-    """
+    """Build the physical dense ``[batch, N, K]`` weight contract."""
     B2D = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
-    if batch == 1:
-        return B2D
     return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
 
-def test_a16w16(
-    batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16, use_graph=False
+def run_a16w16_case(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    *,
+    kid: int,
+    split_k: int = 0,
+    out_dtype=torch.bfloat16,
 ):
-    # gemm_a16w16_opus accepts either 2D or 3D A; test 3D to exercise the
-    # batched reshape path. B is 2D when batch==1, 3D contiguous otherwise.
     A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
     B = _make_b(batch, N, K)
+    Y = torch.empty((batch, M, N), device="cuda", dtype=out_dtype)
 
     ref = _torch_ref(A, B, out_dtype)
 
     Y, us = run_perftest(
-        gemm_a16w16_opus,
+        opus_gemm,
         A,
         B,
-        None,
-        out_dtype,
-        testGraph=use_graph,
+        Y,
+        kid=kid,
+        split_k=split_k,
     )
 
     err = checkAllclose(
@@ -128,152 +122,63 @@ def test_a16w16(
     return err
 
 
-def load_shapes_from_csv(csv_path):
+def load_shapes_from_csv(csv_path, *, default_kid=None, default_split_k=0):
     import pandas as pd
 
     df = pd.read_csv(csv_path)
-    shapes = list(zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int)))
-    return list(dict.fromkeys(shapes))
-
-
-def _default_tuned_csv():
-    """Locate the shipped dsv4 tuned GEMM CSV inside the aiter package."""
-    import aiter
-
-    return os.path.join(
-        os.path.dirname(aiter.__file__),
-        "configs",
-        "model_configs",
-        "dsv4_bf16_tuned_gemm.csv",
-    )
-
-
-def load_opus_shapes(csv_path, gfx, N=None, K=None):
-    """Return the opus_gemm rows (with their tuned reference timing).
-
-    Filters the tuned CSV to rows matching the current arch (``gfx``) and,
-    optionally, a fixed ``N``/``K``, keeping only rows where ``libtype ==
-    'opus'`` (i.e. the shapes for which opus_gemm was selected). Returns a
-    list of dicts sorted by M, each with keys: ``M``, ``csv_us`` (the tuned
-    latency recorded in the CSV) and ``kernelName``.
-    """
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    mask = (df["gfx"] == gfx) & (df["libtype"] == "opus")
-    if N is not None:
-        mask &= df["N"].astype(int) == N
-    if K is not None:
-        mask &= df["K"].astype(int) == K
-    sub = df.loc[mask].copy()
-    sub["M"] = sub["M"].astype(int)
-    # Keep the first row per M (CSV holds one tuned winner per shape).
-    sub = sub.sort_values("M").drop_duplicates(subset="M", keep="first")
-    rows = []
-    for _, r in sub.iterrows():
-        rows.append(
-            {
-                "M": int(r["M"]),
-                "csv_us": float(r["us"]),
-                "kernelName": str(r.get("kernelName", "")),
-            }
+    kid_column = next((name for name in ("kernelId", "solidx", "kid") if name in df), None)
+    split_column = next((name for name in ("splitK", "split_k") if name in df), None)
+    if kid_column is None and default_kid is None:
+        raise ValueError(
+            "exact-kid CSV sweep needs a kernelId/solidx/kid column or --kid"
         )
-    return rows
+    rows = []
+    for row in df.to_dict("records"):
+        rows.append(
+            (
+                int(row["M"]),
+                int(row["N"]),
+                int(row["K"]),
+                int(default_kid if default_kid is not None else row[kid_column]),
+                int(row[split_column]) if split_column is not None else int(default_split_k),
+            )
+        )
+    return list(dict.fromkeys(rows))
 
 
-def test_opus_shapes_graph(
-    csv_path,
-    gfx,
-    N=2048,
-    K=7168,
-    batch=1,
-    out_dtype=torch.bfloat16,
+def run_a16w16_csv_sweep(
+    csv_path: str,
+    batch: int = 1,
+    *,
+    kid: int | None = None,
+    split_k: int = 0,
 ):
-    """CUDA-graph-mode opus_gemm sweep with golden check.
-
-    Selects the M values from the tuned CSV where opus_gemm is the winner
-    (for the given arch / N / K), then times each in CUDA-graph mode and
-    validates against the torch fp32 reference.
-    """
-    rows = load_opus_shapes(csv_path, gfx, N=N, K=K)
-    ms = [r["M"] for r in rows]
-    print(f"\n{'=' * 80}")
-    print(
-        f"opus graph-mode sweep [{gfx}] N={N} K={K} batch={batch}: "
-        f"{len(rows)} opus shapes -> M={ms}"
+    shapes = load_shapes_from_csv(
+        csv_path, default_kid=kid, default_split_k=split_k
     )
-    print("=" * 80)
-    if not rows:
-        print(f"[skip] no opus_gemm rows in {csv_path} for gfx={gfx} N={N} K={K}")
-        return True
-
-    passed = failed = 0
-    perf_rows = []
-    for r in rows:
-        M = r["M"]
-        csv_us = r["csv_us"]
-        tag = f"a16w16-graph b={batch} M={M} N={N} K={K}"
-        try:
-            A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = _make_b(batch, N, K)
-            ref = _torch_ref(A, B, out_dtype)
-            # opus split-K workspace must be grown on the capture stream before
-            # run_perftest's graph mode captures this shape.
-            _prewarm_opus_graph_workspace(A, B, out_dtype)
-            Y, us = run_perftest(
-                gemm_a16w16_opus,
-                A,
-                B,
-                None,
-                out_dtype,
-                testGraph=True,
-            )
-            err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
-            tflops = 2.0 * batch * M * N * K / us / 1e6
-            # Ratio of measured graph latency to the tuned CSV reference.
-            ratio = (us / csv_us) if csv_us else float("nan")
-            print(
-                f"[PASS] {tag} | {us:.1f}us (csv {csv_us:.1f}us, "
-                f"{ratio:.2f}x) | {tflops:.2f} TFLOPs | err={err}"
-            )
-            perf_rows.append((M, us, csv_us, ratio))
-            passed += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
-            failed += 1
-
-    if perf_rows:
-        print(f"\n{'-' * 64}")
-        print(f"latency vs tuned CSV [{gfx}] N={N} K={K} batch={batch}")
-        print(f"{'-' * 64}")
-        print(f"{'M':>6} | {'graph us':>10} | {'csv us':>10} | {'ratio':>7} | note")
-        for M, us, csv_us, ratio in perf_rows:
-            # >20% slower than the tuned reference is flagged for a closer look.
-            note = "" if ratio <= 1.20 else "SLOW >1.20x"
-            print(f"{M:>6} | {us:>10.2f} | {csv_us:>10.2f} | {ratio:>6.2f}x | {note}")
-
-    print(f"\nSummary: {passed} passed, {failed} failed out of {len(rows)}")
-    return failed == 0
-
-
-def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
-    shapes = load_shapes_from_csv(csv_path)
     print(f"\n{'=' * 80}")
     print(f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}")
     print("=" * 80)
     passed = failed = 0
-    for M, N, K in shapes:
-        tag = f"a16w16 b={batch} M={M} N={N} K={K}"
+    for M, N, K, row_kid, row_split_k in shapes:
+        tag = (
+            f"a16w16 b={batch} M={M} N={N} K={K} "
+            f"kid={row_kid} split_k={row_split_k}"
+        )
         try:
             A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
             B = _make_b(batch, N, K)
+            Y = torch.empty(
+                (batch, M, N), device="cuda", dtype=torch.bfloat16
+            )
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
-                gemm_a16w16_opus,
+                opus_gemm,
                 A,
                 B,
-                None,
-                torch.bfloat16,
+                Y,
+                kid=row_kid,
+                split_k=row_split_k,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
             tflops = 2.0 * batch * M * N * K / us / 1e6
@@ -286,35 +191,161 @@ def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
     return failed == 0
 
 
+def _runtime_arch() -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return str(getattr(props, "gcnArchName", "")).split(":", 1)[0].lower()
+
+
+def _assert_matches_golden(actual, A, B, bias=None):
+    golden = A.float() @ B.float().transpose(-1, -2)
+    if bias is not None:
+        golden = golden + bias.float()
+    # BF16 output has one final rounding; fp32 output is normally much tighter.
+    atol = 0.5 if actual.dtype == torch.bfloat16 else 0.05
+    rtol = 0.03 if actual.dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(actual.float(), golden, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("arch", "kid", "M", "N", "K", "split_k", "out_dtype"),
+    [
+        ("gfx950", 200, 64, 64, 512, 2, torch.bfloat16),
+        ("gfx950", 200, 64, 64, 512, 2, torch.float32),
+        ("gfx942", 10200, 128, 128, 512, 2, torch.float32),
+        ("gfx942", 10210, 128, 128, 512, 2, torch.bfloat16),
+        ("gfx1250", 20000, 16, 32, 512, 2, torch.bfloat16),
+        ("gfx1250", 20000, 16, 32, 512, 2, torch.float32),
+    ],
+)
+def test_split_k_matches_torch_golden(arch, kid, M, N, K, split_k, out_dtype):
+    if _runtime_arch() != arch:
+        pytest.skip(f"requires {arch} hardware")
+    torch.manual_seed(8192 + kid)
+    A = torch.randn((1, M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, N, K), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, M, N), device="cuda", dtype=out_dtype)
+    actual = opus_gemm(
+        A,
+        B,
+        Y,
+        kid=kid,
+        split_k=split_k,
+    )
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B)
+
+
+@pytest.mark.parametrize("kid", (1400, 6400))
+def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
+    """Regress the ordinary and 4G-safe mono FP32 physical-store paths."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+
+    torch.manual_seed(0x950000 + kid)
+    A = torch.randn((1, 192, 128), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    out = torch.full(
+        (1, 192, 256), 12345.0, device="cuda", dtype=torch.float32
+    )
+
+    actual = opus_gemm(
+        A,
+        B,
+        out,
+        kid=kid,
+    )
+    torch.cuda.synchronize()
+
+    assert actual is out
+    assert int((actual != 12345.0).sum().item()) == actual.numel()
+    _assert_matches_golden(actual, A, B)
+
+
+def test_gfx950_bias_dtype_rules_and_numerics():
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    A = torch.randn((1, 64, 512), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, 64, 512), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((64,), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, 64, 64), device="cuda", dtype=torch.bfloat16)
+    actual = opus_gemm(
+        A,
+        B,
+        Y,
+        kid=200,
+        bias=bias,
+        split_k=2,
+    )
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B, bias)
+
+    with pytest.raises(RuntimeError, match="bias dtype must match Y dtype"):
+        opus_gemm(
+            A,
+            B,
+            Y,
+            kid=200,
+            bias=bias.float(),
+            split_k=2,
+        )
+
+
+def test_gfx942_workspace_kid_rejects_bias_without_framework_fallback():
+    if _runtime_arch() != "gfx942":
+        pytest.skip("requires gfx942 hardware")
+    A = torch.randn((1, 128, 4096), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, 256, 4096), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, 128, 256), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((256,), device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="rejects bias on split-K kernels"):
+        opus_gemm(
+            A,
+            B,
+            Y,
+            kid=10201,
+            bias=bias,
+            split_k=2,
+        )
+
+
+def test_gfx1250_bf16_output_accepts_fp32_bias():
+    if _runtime_arch() != "gfx1250":
+        pytest.skip("requires gfx1250 hardware")
+    A = torch.randn((1, 16, 512), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, 32, 512), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, 16, 32), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((32,), device="cuda", dtype=torch.float32)
+    actual = opus_gemm(
+        A,
+        B,
+        Y,
+        kid=20000,
+        bias=bias,
+        split_k=2,
+    )
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B, bias)
+
+
 if __name__ == "__main__":
+    if not _arch_ok:
+        print(
+            "[skip] test_opus_a16w16_gemm requires "
+            f"gfx950/gfx942/gfx1250 (detected {_detected_gfx!r})"
+        )
+        sys.exit(0)
     parser = argparse.ArgumentParser(
-        description="End-to-end test for aiter.ops.opus.gemm_a16w16_opus"
+        description="End-to-end exact-kid test for aiter.ops.opus.opus_gemm"
     )
-    parser.add_argument(
-        "-m",
-        type=int,
-        default=None,
-        help="Single-shape M. Passing -m forces the single-shape test.",
-    )
-    parser.add_argument(
-        "-n",
-        type=int,
-        default=None,
-        help="N (default: 2048 for the opus sweep, 512 for single-shape).",
-    )
-    parser.add_argument(
-        "-k",
-        type=int,
-        default=None,
-        help="K (default: 7168 for the opus sweep, 256 for single-shape).",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch",
-        type=int,
-        default=None,
-        help="Batch size. Defaults to 1 for --opus_sweep, else 8.",
-    )
+    parser.add_argument("-m", type=int, default=256)
+    parser.add_argument("-n", type=int, default=512)
+    parser.add_argument("-k", type=int, default=256)
+    parser.add_argument("-b", "--batch", type=int, default=8)
+    parser.add_argument("--kid", type=int, default=None)
+    parser.add_argument("--split-k", type=int, default=0)
     parser.add_argument(
         "-d",
         "--dtype",
@@ -362,33 +393,23 @@ if __name__ == "__main__":
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
-    # Default action (no -m and no --csv_file): auto-sweep the opus shapes in
-    # CUDA-graph mode and print the vs-CSV latency table. So a bare
-    # `python3 op_tests/test_opus_a16w16_gemm.py` reproduces the table.
-    run_opus_sweep = args.opus_sweep or (args.m is None and args.csv_file is None)
-
-    if run_opus_sweep:
-        tuned_csv = args.tuned_csv or _default_tuned_csv()
-        batch = args.batch if args.batch is not None else 1
-        ok = test_opus_shapes_graph(
-            tuned_csv,
-            _detected_gfx,
-            N=args.n if args.n is not None else 2048,
-            K=args.k if args.k is not None else 7168,
-            batch=batch,
-            out_dtype=out_dtype,
+    if args.csv_file is not None:
+        run_a16w16_csv_sweep(
+            args.csv_file,
+            batch=args.batch,
+            kid=args.kid,
+            split_k=args.split_k,
         )
-        sys.exit(0 if ok else 1)
-    elif args.csv_file is not None:
-        test_a16w16_csv_sweep(args.csv_file, batch=(args.batch or 8))
     else:
-        # Clamp K>=128 so every kid the heuristic picks has K>=B_K (smallest is 128).
-        k_eff = max(args.k if args.k is not None else 256, 128)
-        test_a16w16(
-            args.batch or 8,
+        if args.kid is None:
+            parser.error("--kid is required when --csv_file is not supplied")
+        k_eff = max(args.k, 128)
+        run_a16w16_case(
+            args.batch,
             args.m,
-            args.n if args.n is not None else 512,
+            args.n,
             k_eff,
+            kid=args.kid,
+            split_k=args.split_k,
             out_dtype=out_dtype,
-            use_graph=args.graph,
         )

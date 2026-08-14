@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx942 codegen -- emit launchers for gfx942-targeted kid families."""
+"""Generate gfx942 OPUS launchers."""
 
 import os
 from pathlib import Path
 
-from opus_gemm_common import OpusGemmInstance
+from opus_gemm_common import GFX942_BF16WS_EXACT_N, OpusGemmInstance
 
 from codegen.common import (
     _GFX942_A16W16_TAGS,
@@ -15,6 +15,7 @@ from codegen.common import (
     WARP_SIZE,
     register_arch_map,
     register_emit,
+    splitk_workspace_type,
 )
 
 
@@ -57,17 +58,6 @@ def _splitk_traits_geometry(k):
         return k.B_M, k.B_N, 2
     trait_bm, trait_bn = override["block"]
     return trait_bm, trait_bn, override["lds_depth"]
-
-
-def _splitk_workspace_types(k):
-    dtype = getattr(k, "splitk_workspace_dtype", "fp32_t")
-    if dtype == "bf16_t":
-        return "bf16_t", "__bf16"
-    return "fp32_t", "float"
-
-
-def _uses_bf16_workspace(k):
-    return getattr(k, "splitk_workspace_dtype", "fp32_t") == "bf16_t"
 
 
 PIPELINE_HEADER_MAP = {
@@ -136,20 +126,24 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
     (8, 256, 1),  # N=2048, 1 row/wg
 )
 
+assert frozenset(
+    vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
+) == GFX942_BF16WS_EXACT_N
+
 
 def splitk_reduce_extra_forward_decls():
     return (
         "template<int VEC_, int BLOCK_, typename D_OUT,\n"
         "         bool HAS_BIAS_, typename D_BIAS_, bool HAS_OOB_>\n"
         "__global__ void splitk_reduce_kernel_bf16ws_fallback(\n"
-        "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
+        "    const void* ws_ptr, D_OUT* c_out,\n"
         "    int split_k, int M, int N, int batch,\n"
         "    int padded_M, int padded_N,\n"
         "    const D_BIAS_* bias, int stride_bias_batch);\n"
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
         "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
-        "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
+        "    const void* ws_ptr, D_OUT* c_out,\n"
         "    int M, int N, int batch,\n"
         "    int padded_M, int padded_N,\n"
         "    const D_BIAS_* bias, int stride_bias_batch);\n"
@@ -161,10 +155,10 @@ def splitk_reduce_extra_device_instantiations():
     for out_type in ("__bf16", "float"):
         contents += (
             f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, true,  {out_type}, true>(\n"
-            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const void*, {out_type}*, int, int, int, int, int, int,\n"
             f"    const {out_type}*, int);\n"
             f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, false, {out_type}, true>(\n"
-            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const void*, {out_type}*, int, int, int, int, int, int,\n"
             f"    const {out_type}*, int);\n"
         )
     for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
@@ -172,7 +166,7 @@ def splitk_reduce_extra_device_instantiations():
             for ws_type in ("float", "__bf16"):
                 contents += (
                     f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, false, __bf16>(\n"
-                    "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int,\n"
+                    "    const void*, __bf16*, int, int, int, int, int,\n"
                     "    const __bf16*, int);\n"
                 )
     return contents
@@ -203,7 +197,7 @@ def gen_splitk_gfx942_instance(
     kargs_name,
     kargs_template_vars,
     BIAS_HOST_VALIDATE,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
     make_host_decl,
     make_device_decl,
     record_one_instantiation,
@@ -218,8 +212,10 @@ def gen_splitk_gfx942_instance(
         kargs_explicit_param = f", {k.GROUP_M}, opus_gemm_splitk_kargs"
         fwd_decl_kargs_tpl = ", int COL_MAJOR_GROUP_M, typename Kargs"
         fwd_decl_kargs_fnarg = "Kargs"
-    bf16ws = _uses_bf16_workspace(k)
-    workspace_dtype, workspace_ptr_type = _splitk_workspace_types(k)
+    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = (
+        splitk_workspace_type(k)
+    )
+    bf16ws = workspace_dtype == "bf16_t"
     # gfx942 a16w16_traits: 7 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, LDS_DEPTH=2>.
     trait_bm, trait_bn, lds_depth = _splitk_traits_geometry(k)
     traits_aliases = f"""
@@ -281,7 +277,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
             dim3 block_rowblock({block_size});
             splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {workspace_ptr_type}, __bf16, {{hb}}, __bf16>
                 <<<grid_rowblock, block_rowblock, 0, stream>>>(
-                    ws_handle_device_,
+                    workspace_ptr_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     M, N, batch, padded_M, padded_N,
                     {{bias_arg}});
@@ -307,7 +303,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         return (
             f"{indent}{reduce_kernel}<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
             f"{indent}    <<<grid_reduce, block_reduce, 0, stream>>>(\n"
-            f"{indent}        ws_handle_device_,\n"
+            f"{indent}        workspace_ptr_,\n"
             f"{indent}        reinterpret_cast<{dtype}*>(Y.data_ptr()),\n"
             f"{indent}        split_k, M, N, batch, padded_M, padded_N,"
             f"{bias_args}"
@@ -318,43 +314,17 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     fp32_t = _baseline_call("float", True, "            ")
     fp32_f = _baseline_call("float", False, "            ")
     bf16_y_check = ""
-    bf16ws_fallback_decl = ""
-    bf16ws_host_redirect = ""
+    bf16ws_host_guard = ""
     if bf16ws:
-        fp32ws_name = k.name.replace("_bf16ws", "")
         exact_reduce_shape_conditions = " ||\n        ".join(
-            f"(N == {n_exact})"
-            for n_exact in sorted(
-                {vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS}
-            )
+            f"(N == {n_exact})" for n_exact in sorted(GFX942_BF16WS_EXACT_N)
         )
-        if is_quad_mfma32_splitk:
-            bf16ws_host_redirect = f"""
+        bf16ws_host_guard = f"""
     const bool bf16ws_exact_reduce_shape =
         {exact_reduce_shape_conditions};
     AITER_CHECK(bf16ws_exact_reduce_shape,
         "{err_label} bf16 workspace currently supports only exact-N rowblock "
         "reduce shapes");
-"""
-        else:
-            bf16ws_fallback_decl = f"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void {fp32ws_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-#endif
-"""
-            bf16ws_host_redirect = f"""
-    const bool bf16ws_exact_reduce_shape =
-        {exact_reduce_shape_conditions};
-    if (!bf16ws_exact_reduce_shape) {{
-        {fp32ws_name}<D_C>(XQ, WQ, Y, bias, splitK);
-        return;
-    }}
 """
         bf16_y_check = (
             "    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,\n"
@@ -392,6 +362,7 @@ void {fp32ws_name}(
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
+#include "opus_gemm_common.cuh"
 #include <optional>
 #include <type_traits>
 #endif
@@ -401,7 +372,6 @@ void {fp32ws_name}(
 #else
 #include "{pipeline_header}"
 #endif
-{bf16ws_fallback_decl}
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
@@ -410,18 +380,19 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
-    "{err_label} splitK launcher uses the fp32 tune-dispatch table");
+    "{err_label} split_k launcher uses the fp32 launch-dispatch table");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-{bf16ws_host_redirect}
+{bf16ws_host_guard}
 {bf16_y_check}
     AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
             || Y.dtype() == AITER_DTYPE_fp32,
@@ -467,12 +438,15 @@ void
         }}}}
         if (cu_cached <= 0) cu_cached = 64;  // safe gfx942 lower bound
     }}}}
-    int tiles_mn = ((M + {k.B_M} - 1) / {k.B_M})
-                 * ((N + {k.B_N} - 1) / {k.B_N}) * batch;
-    if (tiles_mn <= 0) tiles_mn = 1;
+    const size_t tiles_mn = opus_checked_extent_product(
+        {{static_cast<size_t>(1 + (M - 1) / {k.B_M}),
+          static_cast<size_t>(1 + (N - 1) / {k.B_N}),
+          static_cast<size_t>(batch)}},
+        "{k.name} launch grid");
     // P1 variant wants 2 wg/CU co-residency for TLP -> aim for 2x cu_num grid.
     int target_wg_dbuf2 = {"2 * cu_cached" if k.kernel_tag.endswith("_p1") else "cu_cached"};
-    split_k = (target_wg_dbuf2 + tiles_mn - 1) / tiles_mn;
+    split_k = static_cast<int>(
+        1 + (static_cast<size_t>(target_wg_dbuf2) - 1) / tiles_mn);
     if (split_k < 1)  split_k = 1;
     if (split_k > 16) split_k = 16;  // matches tuner enumeration ceiling
     }}}}
@@ -503,49 +477,35 @@ void
         " split_k=", split_k, " gives loops=(", iters_full, ",", last_loops, ")");
     }}}}
 
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    int padded_M    = num_tiles_m * {k.B_M};
-    int padded_N    = num_tiles_n * {k.B_N};
+    int num_tiles_m = 1 + (M - 1) / {k.B_M};
+    int num_tiles_n = 1 + (N - 1) / {k.B_N};
+    const size_t padded_M_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_m), static_cast<size_t>({k.B_M})}},
+        "{k.name}");
+    const size_t padded_N_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_n), static_cast<size_t>({k.B_N})}},
+        "{k.name}");
+    const size_t workspace_slice_numel = opus_checked_extent_product(
+        {{padded_M_size, padded_N_size}}, "{k.name}");
+    AITER_CHECK(padded_M_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && padded_N_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && workspace_slice_numel <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "{k.name}: padded workspace extents exceed 32-bit kernel stride limits");
+    int padded_M = static_cast<int>(padded_M_size);
+    int padded_N = static_cast<int>(padded_N_size);
 
+    const size_t required_numel = opus_checked_extent_product(
+        {{static_cast<size_t>(split_k), static_cast<size_t>(batch),
+          workspace_slice_numel}},
+        "{k.name}");
+    void* workspace_ptr_ = opus_validate_workspace(
+        workspace, XQ, {workspace_aiter_dtype}, required_numel, 16, "{k.name}");
     auto stream = aiter::getCurrentHIPStream();
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
-    extern void opus_splitk_ws_sync_to_device(hipStream_t);
-    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    size_t ws_bytes = (size_t)split_k * (size_t)batch
-                * (size_t)padded_M * (size_t)padded_N * sizeof(typename Traits::D_C);
-    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
-    {{
-    AITER_CHECK(!capturing,
-        "{err_label} workspace grow inside HIP graph capture is not "
-        "supported. Call aiter.opus_gemm_workspace_init() on the capture "
-        "stream and warm with the largest expected GEMM before capturing.");
-
-    if (ws_handle_->ptr != nullptr)
-    {{
-        HIP_CALL(hipDeviceSynchronize());
-        HIP_CALL(hipFree(ws_handle_->ptr));
-    }}
-    const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-    size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-    void* new_ptr = nullptr;
-    HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-    ws_handle_->ptr = new_ptr;
-    ws_handle_->bytes = grow_bytes;
-    opus_splitk_ws_sync_to_device(stream);
-    }}
-    const auto* ws_handle_device_ =
-        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ws_handle     = ws_handle_device_;
+    kargs.ptr_ws        = workspace_ptr_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -556,7 +516,7 @@ void
     kargs.stride_c        = N;
     kargs.stride_a_batch  = XQ.stride(0);
     kargs.stride_b_batch  = WQ.stride(0);
-    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;
     dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
@@ -573,7 +533,7 @@ void
         k,
         kernel_func,
         kargs_name,
-        A16W16_TUNE_HOST_EXTRA,
+        A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
         kargs_explicit_param,
     )
 
@@ -590,7 +550,7 @@ def _emit_a16w16_nosplit_launcher(
     kargs_name,
     instance_impl_preamble,
     instance_impl_host_tu_split,
-    A16W16_TUNE_TAGS,
+    A16W16_KID_DISPATCH_TAGS,
     fwd_decl_kargs_tpl,
     fwd_decl_kargs_fnarg,
     traits_extra,
@@ -600,15 +560,15 @@ def _emit_a16w16_nosplit_launcher(
     device_decl_for_dtype,
 ):
     extra_param = (
-        ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
-        if k.kernel_tag in A16W16_TUNE_TAGS
+            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*split_k*/"
+        if k.kernel_tag in A16W16_KID_DISPATCH_TAGS
         else ""
     )
 
     bias_kargs_block = (
         "    AITER_CHECK(!bias.has_value(),\n"
         '        "bias not supported on this a16w16 kid");\n'
-        if k.kernel_tag in A16W16_TUNE_TAGS
+        if k.kernel_tag in A16W16_KID_DISPATCH_TAGS
         else ""
     )
 
@@ -672,7 +632,7 @@ void
 
     inst_extra_param = (
         ",\n    std::optional<aiter_tensor_t>,\n    int"
-        if k.kernel_tag in A16W16_TUNE_TAGS
+        if k.kernel_tag in A16W16_KID_DISPATCH_TAGS
         else ""
     )
     for CDtype in k.output_dtypes:
@@ -709,8 +669,8 @@ def gen_a16w16_quad_mfma32_gfx942_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
-    A16W16_TUNE_TAGS,
+    A16W16_LAUNCH_HOST_EXTRA,
+    A16W16_KID_DISPATCH_TAGS,
     **_unused,
 ):
     """gfx942 quad MFMA32 launcher emit."""
@@ -766,7 +726,7 @@ def gen_a16w16_quad_mfma32_gfx942_instance(
         kargs_name,
         instance_impl_preamble,
         instance_impl_host_tu_split,
-        A16W16_TUNE_TAGS,
+        A16W16_KID_DISPATCH_TAGS,
         fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg,
         traits_extra,
@@ -791,8 +751,8 @@ def gen_a16w16_nosplit_gfx942_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
-    A16W16_TUNE_TAGS,
+    A16W16_LAUNCH_HOST_EXTRA,
+    A16W16_KID_DISPATCH_TAGS,
     **_unused,
 ):
     """gfx942 a16w16 non-splitK launcher emit (kbuf2v / kbuf2v_bk128 /
@@ -831,7 +791,17 @@ def gen_a16w16_nosplit_gfx942_instance(
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
 
-    launch_block = f"""
+    if is_wkc_accum:
+        launch_block = f"""
+    auto stream = aiter::getCurrentHIPStream();
+    auto memset_status = hipMemsetAsync(
+        Y.data_ptr(), 0, static_cast<size_t>(batch) * M * N * sizeof(D_C), stream);
+    AITER_CHECK(memset_status == hipSuccess,
+        "hipMemsetAsync failed before gfx942 wave-K accumulate launch: ",
+        hipGetErrorString(memset_status));
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
+    else:
+        launch_block = f"""
     auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
     if is_wkc_accum:
@@ -859,7 +829,7 @@ def gen_a16w16_nosplit_gfx942_instance(
         kargs_name,
         instance_impl_preamble,
         instance_impl_host_tu_split,
-        A16W16_TUNE_TAGS,
+        A16W16_KID_DISPATCH_TAGS,
         fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg,
         traits_extra,
@@ -884,15 +854,11 @@ def gen_a8w8_blockscale_bpreshuffle_gfx942_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A8W8_SCALE_HOST_EXTRA,
+    A8W8_BLOCKSCALE_HOST_EXTRA,
+    make_a8w8_bpreshuffle_host_decl,
     **_unused,
 ):
-    """gfx942 A8W8 blockscale bpreshuffle launcher emit.
-
-    This is an explicit tune path. The public C++ wrapper dispatches by
-    integer kid through opus_gemm_a8w8_tune_lookup.h; production opus_gemm()
-    fp8 dispatch remains gfx950-only.
-    """
+    """Emit the checked gfx942 A8W8 bpreshuffle launcher."""
     info = _validate_a8w8_blockscale_bpreshuffle_gfx942(k)
     print(
         f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
@@ -937,32 +903,48 @@ void
 {k.name}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y)
 {{{{
     AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3),
-        "gfx942 a8w8 expects XQ [M,K] or [B,M,K]");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: XQ must be "
+        "[M,K] or [B,M,K]");
     AITER_CHECK((WQ.dim() == 2 || WQ.dim() == 3),
-        "gfx942 a8w8 expects WQ [N,K] or [B,N,K]");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ must be "
+        "[N,K] or [B,N,K]");
     AITER_CHECK((Y.dim() == 2 || Y.dim() == 3),
-        "gfx942 a8w8 expects Y [M,N] or [B,M,N]");
-    AITER_CHECK(x_scale.has_value() && w_scale.has_value(),
-        "gfx942 a8w8 blockscale requires x_scale and w_scale");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y must be "
+        "[M,N] or [B,M,N]");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected fp8 XQ/WQ");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected bf16 Y");
+    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
+        "XQ/WQ/Y");
 
     int batch = XQ.dim() == 3 ? XQ.size(0) : 1;
     int M = XQ.dim() == 3 ? XQ.size(1) : XQ.size(0);
     int K = XQ.dim() == 3 ? XQ.size(2) : XQ.size(1);
     int N = WQ.dim() == 3 ? WQ.size(1) : WQ.size(0);
     AITER_CHECK(batch == 1,
-        "gfx942 a8w8 tune path currently supports batch=1 only");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 currently "
+        "supports batch=1 only");
+    AITER_CHECK((WQ.dim() == 2 || WQ.size(0) == batch) &&
+                    (Y.dim() == 2 || Y.size(0) == batch),
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: batch dimensions "
+        "must match");
     AITER_CHECK(WQ.size(WQ.dim() - 1) == K,
-        "WQ K dim must match XQ K dim");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ K dim must "
+        "match XQ K dim");
     AITER_CHECK((Y.dim() == 3 ? Y.size(1) : Y.size(0)) == M &&
                 (Y.dim() == 3 ? Y.size(2) : Y.size(1)) == N,
-        "Y shape must be [M,N] or [B,M,N]");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y shape must be "
+        "[M,N] or [B,M,N]");
     AITER_CHECK(N % {k.B_N} == 0 && K % {k.B_K} == 0,
-        "gfx942 a8w8 tune path requires exact N/K tiles: N%",
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 requires "
+        "exact N/K tiles: N%",
         {k.B_N}, "=0 K%", {k.B_K}, "=0");
 
     int GROUP_N = {k.GROUP_N};
@@ -970,14 +952,22 @@ void
     int num_groups_n = N / GROUP_N;
     int num_groups_k = K / GROUP_K;
 
-    const auto& xs = x_scale.value();
-    const auto& ws = w_scale.value();
+    const auto& xs = x_scale;
+    const auto& ws = w_scale;
     AITER_CHECK(xs.dtype() == AITER_DTYPE_fp32 && ws.dtype() == AITER_DTYPE_fp32,
-        "gfx942 a8w8 blockscale expects fp32 scales");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects fp32 scales");
+    AITER_CHECK(xs.is_contiguous() && ws.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
+        "scales");
+    AITER_CHECK(xs.device_id == XQ.device_id && ws.device_id == XQ.device_id,
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: scales must be on "
+        "the XQ device");
     AITER_CHECK(xs.dim() == 2 && xs.size(0) == M && xs.size(1) == num_groups_k,
-        "x_scale must use CK bpreshuffle layout [K/128,M] flattened as [M,K/128]");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: x_scale must use "
+        "the transposed storage contract with shape [M,K/128]");
     AITER_CHECK(ws.dim() == 2 && ws.size(0) == num_groups_n && ws.size(1) == num_groups_k,
-        "w_scale must be row-major [N/128,K/128]");
+        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: w_scale must be "
+        "row-major [N/128,K/128]");
 
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     int num_tiles_n = N / {k.B_N};
@@ -1008,8 +998,9 @@ void
         k,
         kernel_func,
         kargs_name,
-        A8W8_SCALE_HOST_EXTRA,
+        A8W8_BLOCKSCALE_HOST_EXTRA,
         kargs_explicit_param,
+        make_a8w8_bpreshuffle_host_decl,
     )
 
 
@@ -1047,7 +1038,7 @@ _GFX942_LDS_PER_WG_BYTES = 64 * 1024
 
 
 def _validate_a8w8_blockscale_bpreshuffle_gfx942(k: OpusGemmInstance):
-    """Validate gfx942 A8W8 blockscale bpreshuffle tune instances."""
+    """Validate one gfx942 A8W8 bpreshuffle kernel entry."""
     errors = []
     sizeof_da = 1  # fp8
     if k.BLOCK_SIZE != k.T_M * k.T_N * WARP_SIZE:

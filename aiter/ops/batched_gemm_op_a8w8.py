@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -88,7 +90,7 @@ def get_CKBatchedGEMM_config(
             get_CKBatchedGEMM_config.has_gfx = True
         else:
             logger.warning(
-                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column -- "
+                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column — "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
             get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
@@ -150,31 +152,65 @@ def batched_gemm_a8w8_CK(
 
 
 # ---------------------------------------------------------------------------
-# Shared tuned-CSV lookup for the mxscale batched GEMM.
-#
-# Shaped like tuned_gemm.py's multi-backend lookup: this layer locates the row
-# and never interprets the kernel identifier, since that differs per backend
-# (opus names kernels with an integer kernelId, flydsl with a kernelName). The
-# row comes back whole, libtype included, so a caller can dispatch on it;
-# libtype also filters up front for CSVs that carry one row per (shape, backend)
-# rather than a single cross-backend winner per shape.
+# gfx950 MXFP8 BMM tuned caller. The final global kid is passed verbatim to the
+# one OPUS public entry; the private family launcher performs no selection.
 
-# Tuner bookkeeping rather than selection inputs, so the lookup log drops them
-# and stays readable.
+_MXSCALE_BMM_CONFIG_ENV = "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE"
+_MXSCALE_BMM_CONFIG_STEM = "batched_gemm_a8w8_blockscale_mxscale_tuned"
+_MXSCALE_BMM_KID_OFFSET = 8000
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
+
+
+def _mxscale_bmm_config_paths() -> tuple[Path, ...]:
+    configured = os.getenv(_MXSCALE_BMM_CONFIG_ENV)
+    if configured:
+        return tuple(
+            Path(token).expanduser()
+            for token in configured.split(os.pathsep)
+            if token.strip()
+        )
+
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+    candidates = [config_dir / f"{_MXSCALE_BMM_CONFIG_STEM}.csv"]
+    candidates.extend(
+        sorted(
+            (config_dir / "model_configs").glob(
+                f"*_{_MXSCALE_BMM_CONFIG_STEM}.csv"
+            )
+        )
+    )
+    return tuple(path for path in candidates if path.is_file())
 
 
 @functools.cache
 def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
-    """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-    try:
-        df = pd.read_csv(path).drop_duplicates()
-    except FileNotFoundError:
-        logger.warning("mxscale BMM tuned CSV not found at %s", path)
+    paths = _mxscale_bmm_config_paths()
+    if not paths:
+        logger.warning("no MXFP8 BMM tuned CSV was found")
         return {}
+
+    frames = [pd.read_csv(path) for path in paths]
+    df = pd.concat(frames, ignore_index=True).drop_duplicates()
+    required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}"
+        )
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype]
+    if not df.empty and int(df["kernelId"].min()) < _MXSCALE_BMM_KID_OFFSET:
+        raise ValueError(
+            "MXFP8 BMM tuned CSV must contain global OPUS kids in the "
+            "8000-8653 range"
+        )
+    shape_keys = ["gfx", "b", "m", "n", "k"]
+    duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
+    if duplicate_shapes.any():
+        rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
+        raise RuntimeError(
+            f"duplicate shapes across MXFP8 BMM tuned CSV files: {rows}"
+        )
     return df.set_index(["gfx", "b", "m", "n", "k"]).to_dict("index")
 
 
@@ -182,29 +218,9 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
 def lookup_mxscale_bmm_config(
     b: int, m: int, n: int, k: int, *, libtype: str | None = None
 ):
-    """Exact tuned row for this shape, else one at a padded M.
-
-    Same exact-then-two-granularities walk over the shared C++ getPaddedM that
-    the CK / asm / a16w16 lookups use. A bucket table built from the CSV's own M
-    values was the alternative and bought nothing: over every M up to the
-    largest tuned one, both cover the same shapes and reach the same kernel on
-    131070 of 131072 M, so this keeps the one rounding rule the repo already has.
-
-    Cached per shape like get_CKGEMM_config, and for the same reason: getPaddedM
-    is a ctypes hop into C++ at ~10us, and the padded levels run on every call
-    whose M is not itself a tuned row. DPA+MTP decode is exactly that case (M is
-    the ragged token count a rank happened to get), and paying it once per layer
-    per step cost ~1% end-to-end before this. The row is shared, so callers must
-    treat it as read-only.
-
-    Returns the row, or None when no level hits. The log prints the row whole
-    instead of named fields, so a backend gets its own kernel identifier
-    reported without this layer knowing which column holds it.
-    """
+    """Return the exact or existing padded-M tuned row for one shape."""
     gfx = get_gfx()
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
     tuned = _load_mxscale_bmm_tuned(libtype)
-
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
@@ -214,44 +230,60 @@ def lookup_mxscale_bmm_config(
 
     if row is None:
         logger.info(
-            f"shape is B:{b}, M:{m}, N:{n}, K:{k}, not found tuned/padded config "
-            f"in {path}, the caller will fall back!"
+            "shape B:%s M:%s N:%s K:%s has no MXFP8 BMM tuned row",
+            b,
+            m,
+            n,
+            k,
         )
         return None
-
     if AITER_LOG_TUNED_CONFIG:
-        cfg = {c: v for c, v in row.items() if c not in _TUNED_PERF_COLUMNS}
-        if padded_m == m:
-            logger.info(
-                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx} "
-                f"in {path}, config is {cfg}!"
-            )
-        else:
-            logger.info(
-                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, exact miss on gfx = {gfx}; "
-                f"using padded_M: {padded_m} config {cfg} from {path}!"
-            )
+        cfg = {key: value for key, value in row.items() if key not in _TUNED_PERF_COLUMNS}
+        logger.info(
+            "shape B:%s M:%s N:%s K:%s uses padded_M:%s MXFP8 config %s",
+            b,
+            m,
+            n,
+            k,
+            padded_m,
+            cfg,
+        )
     return row
 
 
-# ---------------------------------------------------------------------------
-# fp8 e8m0 mxscale (block-scale) batched GEMM -- public entry for the family.
-#
-# This file is the per-family (a8w8 batched) public surface, not a CK-only
-# file: like aiter/ops/gemm_op_a8w8.py hosts gemm_a8w8 (CK rowwise) +
-# gemm_a8w8_blockscale (ck/cktile/triton/asm) side by side and lazy-imports
-# backend impls, we host the mxscale batched entry here too. The concrete
-# kernels stay in their backend dirs (opus -> aiter.ops.opus.bmm_op).
-#
-# Dispatch follows tuned_gemm.mm: look the shape up once here, then let the
-# winning row's libtype pick the backend, which is why the lookup runs
-# unfiltered -- the tuner writes one winning row per shape and its libtype says
-# who won. A second backend then only has to add rows and a branch below; it
-# does not repeat the lookup.
+@functools.cache
+def _mxscale_bmm_kid_m_align() -> dict[int, int]:
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
 
-# Untuned shapes go to opus: it is the backend carrying a shape heuristic for
-# rows the CSV does not have.
-_MXSCALE_BMM_DEFAULT_LIBTYPE = "opus"
+    return {
+        int(kid): int(instance.m_align)
+        for family in a8w8_mxscale_bmm_kernel_lists
+        for kid, instance in family.items()
+    }
+
+
+def _mxscale_bmm_kid_runs_m(kid: int, m: int) -> bool:
+    align = _mxscale_bmm_kid_m_align().get(int(kid))
+    return align is not None and m % align == 0
+
+
+def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
+    """Choose a final global kid only when the tuned table has no usable row."""
+
+    def divisible(value: int, divisor: int) -> bool:
+        return value % divisor == 0
+
+    if divisible(n, 256) and divisible(k, 128) and (
+        m >= 2048 or (m >= 1024 and g >= 8)
+    ):
+        return 8158 if 4096 <= k <= 8192 else 8150
+    if m < 64:
+        return 8640 if divisible(n, 64) and divisible(k, 256) else 8653
+    if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
+        return 8320
+    if divisible(n, 64) and divisible(k, 128):
+        return 8653
+    return 8000
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -261,39 +293,33 @@ def _batched_gemm_a8w8_mxscale_impl(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
+    from .opus import opus_gemm
 
-    Kept unwrapped (plain Python) so tests can introspect the real dispatch
-    (which kernelId a shape resolves to) on meta tensors. The public
-    ``batched_gemm_a8w8_mxscale`` is the torch.compile-guarded custom op over
-    this; a caller that must write into its own (e.g. batch-major) output buffer
-    calls the opus backend (``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus``)
-    directly, which keeps the ``out=`` argument.
-    """
-    from .opus.bmm_op import bmm_a8w8_mxscale_opus
-
-    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    m, g, k = map(int, x.shape)
     n = int(wo_a.shape[1])
-
-    cfg = lookup_mxscale_bmm_config(g, m, n, k)
-    libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
+    config = lookup_mxscale_bmm_config(g, m, n, k)
+    libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
-            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which has no batched mxscale backend here yet"
+            f"MXFP8 BMM tuned row requests unsupported backend {libtype!r}"
         )
 
-    # Reading opus columns is this branch's job; whether that kernel can run
-    # this M, and what to do when it cannot, is the backend's.
-    return bmm_a8w8_mxscale_opus(
+    kid = int(config["kernelId"]) if config is not None else None
+    split_k = int(config["splitK"]) if config is not None else 1
+    if kid is None or not _mxscale_bmm_kid_runs_m(kid, m):
+        kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
+        split_k = 1
+
+    Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
+    return opus_gemm(
         x,
         wo_a,
-        x_scale,
-        w_scale,
-        None,
-        dtype=dtype,
-        kernelId=int(cfg["kernelId"]) if cfg is not None else None,
-        splitK=int(cfg["splitK"]) if cfg is not None else None,
+        Y,
+        kid=kid,
+        layout="mxscale_bmm",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        split_k=split_k,
     )
 
 
@@ -304,7 +330,6 @@ def _batched_gemm_a8w8_mxscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    # token-major [M, G, N]; mirrors the eager allocation in bmm_a8w8_mxscale_opus.
     return torch.empty(
         (x.shape[0], x.shape[1], wo_a.shape[1]),
         dtype=dtype,
@@ -320,32 +345,10 @@ def batched_gemm_a8w8_mxscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
-
-    mmajor DSV4 wo_a layout (matches the opus kernels + op test):
-
-    * ``x``       : [M, G, K] fp8 activation (per-token e8m0; transposed view
-                    of batch-major [G, M, K]).
-    * ``wo_a``    : [G, N, K] fp8 weight (batch-major).
-    * ``x_scale`` : [M, G, K/128] uint8 e8m0 activation scale.
-    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0 weight scale.
-
-    Returns a fresh **token-major** [M, G, N] output. This entry is
-    torch.compile-guarded (registered as an ``aiter::`` custom op with a meta
-    kernel), so a framework can call it inside a compiled graph without the
-    tuned-CSV lookup / heuristic being traced. A caller that must write into its
-    own preallocated (e.g. batch-major) buffer uses
-    ``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus`` directly (it keeps ``out=``).
-
-    Note this is *microscaling* (e8m0) block scale -- distinct from
-    ``gemm_a8w8_blockscale`` which uses fp32 block scale. Scale type is baked
-    into the name so a future fp32-block batched variant stays separate.
-
-    The shape is looked up in the tuned CSV and the winning row's libtype picks
-    the backend. No kernel override lives on this entry: how a kernel is named is
-    backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
-    """
-    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
+    return _batched_gemm_a8w8_mxscale_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype
+    )
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(

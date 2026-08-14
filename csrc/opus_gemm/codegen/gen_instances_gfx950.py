@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx950 codegen -- emit launchers for gfx950-targeted kid families.
-
-Free functions taking the parent opus_gemm_codegen instance as first arg.
-Self-registers each emit into codegen.common.EMIT_REGISTRY at import time.
-"""
+"""Generate gfx950 OPUS launchers."""
 
 import os
 from pathlib import Path
@@ -15,6 +11,7 @@ from codegen.common import (
     WARP_SIZE,
     register_arch_map,
     register_emit,
+    splitk_workspace_type,
 )
 
 # ---------------- gfx950 arch-override maps ----------------
@@ -142,10 +139,10 @@ def splitk_reduce_extra_device_instantiations():
     return (
         "// mmajor BMM reduce (a8w8_mxscale split-K launchers)\n"
         "template __global__ void opus_bmm_splitk_reduce_kernel<__bf16, 8, 128>(\n"
-        "    const opus_splitk_ws_handle*, __bf16*,\n"
+        "    const void*, __bf16*,\n"
         "    int, int, int, int, int, int, int, int);\n"
         "template __global__ void opus_bmm_splitk_reduce_kernel<float, 8, 128>(\n"
-        "    const opus_splitk_ws_handle*, float*,\n"
+        "    const void*, float*,\n"
         "    int, int, int, int, int, int, int, int);\n"
     )
 
@@ -633,7 +630,7 @@ def gen_persistent_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_LAUNCH_HOST_EXTRA,
     **_unused,
 ):
     """gfx950 a16w16_persistent launcher emit. See gen_instances.opus_gemm_codegen._gen_persistent_instance."""
@@ -720,7 +717,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> bias,
-    int /*splitK*/)   // persistent ignores splitK; shares tune-lookup slot signature
+    int /*splitK*/)   // persistent ignores splitK; shares launch-table signature
 {{{{
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -753,7 +750,7 @@ void
 #endif // launcher only on regular host pass
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
 def gen_scale_instance(
@@ -770,10 +767,10 @@ def gen_scale_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A8W8_SCALE_HOST_EXTRA,
+    A8W8_BLOCKSCALE_HOST_EXTRA,
     **_unused,
 ):
-    """gfx950 a8w8_scale launcher emit."""
+    """Emit the checked gfx950 A8W8 blockscale launcher."""
     _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -804,13 +801,48 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale)
 {{{{
+    AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+        "opus_gemm_a8w8_blockscale_launch: XQ/WQ/Y must be 3D");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+        "opus_gemm_a8w8_blockscale_launch: expected fp8 XQ/WQ");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_blockscale_launch: expected fp32 Y");
+    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_launch: XQ/WQ must be K-contiguous "
+        "and Y must be contiguous");
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
+    AITER_CHECK(batch >= 1 && WQ.size(0) == batch && Y.size(0) == batch,
+        "opus_gemm_a8w8_blockscale_launch: batch dimensions must match");
+    AITER_CHECK(WQ.size(2) == K && Y.size(1) == M && Y.size(2) == N,
+        "opus_gemm_a8w8_blockscale_launch: tensor shapes must be "
+        "[B,M,K], [B,N,K], [B,M,N]");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= {k.B_K},
+        "opus_gemm_a8w8_blockscale_launch: requires positive M/N and "
+        "K >= {k.B_K}");
+    AITER_CHECK(M % {k.GROUP_M} == 0 && N % {k.GROUP_N} == 0 &&
+                    K % {k.GROUP_K} == 0,
+        "opus_gemm_a8w8_blockscale_launch: M/N/K must be divisible by "
+        "scale groups ",
+        {k.GROUP_M}, "/", {k.GROUP_N}, "/", {k.GROUP_K});
+
+    // The pipeline primes two K tiles, then advances in pairs. Rejecting a
+    // one-tile or odd-tile launch here prevents a negative final tile and an
+    // out-of-range prefetch in device code.
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "opus_gemm_a8w8_blockscale_launch: ceil_div(K, B_K)=", loops_,
+        " must be >= 2 (K=", K, ", B_K=", {k.B_K}, ")");
+    AITER_CHECK(loops_ % 2 == 0,
+        "opus_gemm_a8w8_blockscale_launch: ceil_div(K, B_K)=", loops_,
+        " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "opus_gemm_a8w8_blockscale_launch: K must be even; got K=", K);
 
     using Traits = {k.name}_Traits<D_C>;
 
@@ -820,6 +852,31 @@ void
     int num_groups_m = M / GROUP_M;
     int num_groups_n = N / GROUP_N;
     int num_groups_k = K / GROUP_K;
+
+    AITER_CHECK(x_scale.dtype() == AITER_DTYPE_fp32 &&
+                    w_scale.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_blockscale_launch: expects fp32 scales");
+    AITER_CHECK(x_scale.is_contiguous() && w_scale.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_launch: expects contiguous scales");
+    AITER_CHECK(x_scale.device_id == XQ.device_id &&
+                    w_scale.device_id == XQ.device_id,
+        "opus_gemm_a8w8_blockscale_launch: scales must be on the XQ device");
+    const bool x_scale_2d = x_scale.dim() == 2 && batch == 1 &&
+        x_scale.size(0) == M && x_scale.size(1) == num_groups_k;
+    const bool x_scale_3d = x_scale.dim() == 3 &&
+        x_scale.size(0) == batch && x_scale.size(1) == M &&
+        x_scale.size(2) == num_groups_k;
+    const bool w_scale_2d = w_scale.dim() == 2 && batch == 1 &&
+        w_scale.size(0) == num_groups_n && w_scale.size(1) == num_groups_k;
+    const bool w_scale_3d = w_scale.dim() == 3 &&
+        w_scale.size(0) == batch && w_scale.size(1) == num_groups_n &&
+        w_scale.size(2) == num_groups_k;
+    AITER_CHECK(x_scale_2d || x_scale_3d,
+        "opus_gemm_a8w8_blockscale_launch: x_scale must be "
+        "[B,M,K/128], or [M,K/128] when B=1");
+    AITER_CHECK(w_scale_2d || w_scale_3d,
+        "opus_gemm_a8w8_blockscale_launch: w_scale must be "
+        "[B,N/128,K/128], or [N/128,K/128] when B=1");
 
     {kargs_name} kargs{{}};
     kargs.ptr_a = XQ.data_ptr();
@@ -836,8 +893,8 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
+    kargs.ptr_sfa = x_scale.data_ptr();
+    kargs.ptr_sfb = w_scale.data_ptr();
     kargs.stride_sfa = num_groups_k;
     kargs.stride_sfb = num_groups_k;
     kargs.stride_sfa_batch = num_groups_m * num_groups_k;
@@ -855,85 +912,9 @@ void
 #endif // launcher only on regular host pass
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_SCALE_HOST_EXTRA)
-
-    # "_mmajor" sibling: A(XQ)/Y are [M, batch, *] (dim0=M, dim1=batch) and
-    # x_scale is [M, batch, K/GROUP_K] (per-token M) so the DSV4 wo_a activation
-    # o=[num_tokens, n_groups, K] feeds in with NO caller-side transpose. Weight
-    # (WQ) and its scale (w_scale) stay batch-major [batch, N, K] /
-    # [batch, N/GROUP_N, K/GROUP_K]. Same kernel/traits; the launcher just reads
-    # A/Y/sfa strides from the tensors instead of hardcoding batch-major.
-    INSTANCE_IMPL_MMAJOR = f"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}_mmajor(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
-{{{{
-    int M = XQ.size(0);
-    int batch = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    // mmajor A/Y (dim0=M, dim1=batch); weight WQ stays batch-major.
-    kargs.stride_a = (int)XQ.stride(0);
-    kargs.stride_b = (int)WQ.stride(1);
-    kargs.stride_c = (int)Y.stride(0);
-    kargs.stride_a_batch = (int)XQ.stride(1);
-    kargs.stride_b_batch = (int)WQ.stride(0);
-    kargs.stride_c_batch = (int)Y.stride(1);
-
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
-    // x_scale mmajor [M, batch, num_groups_k]; w_scale batch-major.
-    kargs.stride_sfa = (int)x_scale.value().stride(0);
-    kargs.stride_sfa_batch = (int)x_scale.value().stride(1);
-    kargs.stride_sfb = num_groups_k;
-    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
-    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
-        _f.write(INSTANCE_IMPL_MMAJOR)
-
-    for CDtype in k.output_dtypes:
-        host_decl_mmajor = (
-            f"template void\n"
-            f"{k.name}_mmajor<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y{A8W8_SCALE_HOST_EXTRA});\n"
-        )
-        cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
-        )
-
+    record_one_instantiation(
+        cg, k, kernel_func, kargs_name, A8W8_BLOCKSCALE_HOST_EXTRA
+    )
 
 def gen_noscale_instance_gfx950(
     cg,
@@ -949,11 +930,10 @@ def gen_noscale_instance_gfx950(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     BIAS_HOST_VALIDATE,
-    A16W16_TUNE_TAGS,
+    A16W16_KID_DISPATCH_TAGS,
     **_unused,
 ):
-    """gfx950 noscale launcher emit: a16w16 split-barrier (bias-aware double-traits)
-    and a8w8 noscale (single traits). a8w8 falls through the else branch."""
+    """Emit a gfx950 A16W16 or A8W8 no-scale launcher."""
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -969,7 +949,9 @@ def gen_noscale_instance_gfx950(
         )
 
     min_k = 2 * k.B_K
-    k_check = f"""
+    shape_preamble = ""
+    if is_a16w16_split_barrier:
+        k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
     AITER_CHECK(loops_ >= 2,
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
@@ -980,10 +962,37 @@ def gen_noscale_instance_gfx950(
         "latent K-tail accumulation bug; pass an even K)");
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
+    else:
+        shape_preamble = """
+    AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+        "opus_gemm_a8w8_launch: XQ/WQ/Y must be 3D");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+        "opus_gemm_a8w8_launch: expected fp8 XQ/WQ");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_launch: expected fp32 Y");
+    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
+        "opus_gemm_a8w8_launch: XQ/WQ must be K-contiguous and Y must be "
+        "contiguous");
+"""
+        k_check = f"""
+    AITER_CHECK(batch >= 1 && WQ.size(0) == batch && Y.size(0) == batch,
+        "opus_gemm_a8w8_launch: batch dimensions must match");
+    AITER_CHECK(WQ.size(2) == K && Y.size(1) == M && Y.size(2) == N,
+        "opus_gemm_a8w8_launch: tensor shapes must be "
+        "[B,M,K], [B,N,K], [B,M,N]");
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "opus_gemm_a8w8_launch: K must be even; got K=", K);
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+"""
 
-    if k.kernel_tag in A16W16_TUNE_TAGS:
+    if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         extra_param = (
-            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
+            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*split_k*/"
         )
     else:
         extra_param = ""
@@ -996,7 +1005,7 @@ def gen_noscale_instance_gfx950(
             + "    kargs.ptr_bias = ptr_bias_;\n"
             + "    kargs.stride_bias_batch = stride_bias_batch_;\n"
         )
-    elif k.kernel_tag in A16W16_TUNE_TAGS:
+    elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         bias_kargs_block = (
             "    AITER_CHECK(!bias.has_value(),\n"
             '        "bias not supported on this a16w16 kid");\n'
@@ -1068,6 +1077,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y{extra_param})
 {{{{
+{shape_preamble}
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
@@ -1099,7 +1109,7 @@ void
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-    if k.kernel_tag in A16W16_TUNE_TAGS:
+    if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         inst_extra_param = ",\n    std::optional<aiter_tensor_t>,\n    int"
     else:
         inst_extra_param = ""
@@ -1272,7 +1282,7 @@ def gen_flatmm_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_LAUNCH_HOST_EXTRA,
     **_unused,
 ):
     """gfx950 a16w16_flatmm launcher emit."""
@@ -1364,7 +1374,7 @@ void
 #endif // launcher only on regular host pass
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
 def gen_flatmm_splitk_instance(
@@ -1381,11 +1391,19 @@ def gen_flatmm_splitk_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
     BIAS_HOST_VALIDATE,
     **_unused,
 ):
-    """gfx950 a16w16_flatmm_splitk launcher emit (uses ws_handle + reduce kernel call)."""
+    """Emit a gfx950 split-K launcher using a caller-owned typed workspace."""
+    workspace_dtype, _workspace_ptr_type, workspace_aiter_dtype = (
+        splitk_workspace_type(k)
+    )
+    if workspace_dtype != "fp32_t":
+        raise ValueError(
+            f"gfx950 kid {k.name} declares {workspace_dtype} workspace, but "
+            "the current gfx950 main/reduce kernels support fp32_t only"
+        )
     _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -1394,7 +1412,7 @@ def gen_flatmm_splitk_instance(
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,
+    opus::tuple<{da}, {db}, {workspace_dtype}, fp32_t, {da}>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
     {k.WG_PER_CU},
@@ -1402,7 +1420,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {has_oob_str}>;
 """
 
-    preamble = instance_impl_preamble()
+    preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
     host_tu_split = instance_impl_host_tu_split(
         traits_header,
         pipeline_header,
@@ -1420,12 +1438,12 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
-        "splitk main kernel uses fp32 workspace; D_C template param must be fp32_t "
-        "(Y can be bf16 or fp32; reduce kernel handles the cast / passthrough)");
+        "split_k launcher uses the fp32 launch specialization");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -1459,55 +1477,35 @@ void
         "need total_iters >= pfk*B_K = ", pfk * {k.B_K},
         " (pfk=", pfk, ")");
 
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    int padded_M    = num_tiles_m * {k.B_M};
-    int padded_N    = num_tiles_n * {k.B_N};
+    int num_tiles_m = 1 + (M - 1) / {k.B_M};
+    int num_tiles_n = 1 + (N - 1) / {k.B_N};
+    const size_t padded_M_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_m), static_cast<size_t>({k.B_M})}},
+        "{k.name}");
+    const size_t padded_N_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_n), static_cast<size_t>({k.B_N})}},
+        "{k.name}");
+    const size_t workspace_slice_numel = opus_checked_extent_product(
+        {{padded_M_size, padded_N_size}}, "{k.name}");
+    AITER_CHECK(padded_M_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && padded_N_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && workspace_slice_numel <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "{k.name}: padded workspace extents exceed 32-bit kernel stride limits");
+    int padded_M = static_cast<int>(padded_M_size);
+    int padded_N = static_cast<int>(padded_N_size);
 
-    // Per-stream workspace handle (process-global registry, mutex-protected
-    // in opus_gemm.cu). Replaces the prior `static thread_local` cache --
-    // under TBO two CPU threads drive two streams concurrently, and each
-    // captured graph must bake in its own buffer pointer. Eager: lazy-
-    // create. Capture: must be pre-warmed via
-    // aiter.opus_gemm_workspace_init() on the capture stream.
-    // (opus_splitk_ws_handle is already a complete type at this point via
-    // the traits header included at the top of this launcher .cuh.)
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-
+    const size_t required_numel = opus_checked_extent_product(
+        {{static_cast<size_t>(split_k), static_cast<size_t>(batch),
+          workspace_slice_numel}},
+        "{k.name}");
+    void* workspace_ptr_ = opus_validate_workspace(
+        workspace, XQ, {workspace_aiter_dtype}, required_numel, 16, "{k.name}");
     auto stream = aiter::getCurrentHIPStream();
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    size_t ws_bytes = (size_t)split_k * (size_t)batch
-                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
-    {{
-        AITER_CHECK(!capturing,
-            "splitk workspace grow inside HIP graph capture is not "
-            "supported (hipMalloc / hipFree are stream-capture-illegal). "
-            "Warm the cache once eagerly with the largest workspace before "
-            "capturing. Call aiter.opus_gemm_workspace_init() on the capture "
-            "stream first.");
-
-        void* new_ptr = nullptr;
-        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-        if (ws_handle_->ptr != nullptr)
-        {{
-            HIP_CALL(hipDeviceSynchronize());
-            HIP_CALL(hipFree(ws_handle_->ptr));
-        }}
-        ws_handle_->ptr = new_ptr;
-        ws_handle_->bytes = grow_bytes;
-    }}
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ws_handle     = ws_handle_;
+    kargs.ptr_ws        = workspace_ptr_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -1518,7 +1516,7 @@ void
     kargs.stride_c        = N;
     kargs.stride_a_batch  = XQ.stride(0);
     kargs.stride_b_batch  = WQ.stride(0);
-    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;
 
@@ -1536,7 +1534,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_),
@@ -1544,7 +1542,7 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
@@ -1553,7 +1551,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_),
@@ -1561,7 +1559,7 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
@@ -1572,7 +1570,13 @@ void
 #endif // launcher only on regular host pass
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    record_one_instantiation(
+        cg,
+        k,
+        kernel_func,
+        kargs_name,
+        A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
+    )
 
 
 def _assert_m_align(k, tile_mult):
@@ -1615,6 +1619,7 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int splitK)
 {
   using Traits = @@NAME@@_Traits;
@@ -1654,15 +1659,15 @@ void
   const int num_tiles_n = (N + Traits::B_N - 1) / Traits::B_N;
   const int padded_M = num_tiles_m * Traits::B_M;
   const int padded_N = num_tiles_n * Traits::B_N;
-  const size_t partial_bytes = (size_t)split_k * (size_t)batch
-                             * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+  const size_t required_numel = (size_t)split_k * (size_t)batch
+                              * (size_t)padded_M * (size_t)padded_N;
 
   auto stream = aiter::getCurrentHIPStream();
 
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.split_k = split_k;
   kargs.stride_a = (int)O.stride(0);
@@ -1681,6 +1686,8 @@ void
   dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
   dim3 block_main(Traits::BLOCK_SIZE);
   if (no_split_k) {
+    AITER_CHECK(!workspace.has_value(),
+                "@@NAME@@ splitK == 1 does not use workspace");
     kargs.ptr_c = Y.data_ptr();
     kargs.stride_c = (int)Y.stride(0);
     kargs.stride_c_batch = (int)Y.stride(1);
@@ -1695,28 +1702,11 @@ void
   }
 
   if constexpr (!DIRECT_ONLY) {
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    const size_t ws_bytes = partial_bytes;
-    if (ws_handle->ptr == nullptr || ws_bytes > ws_handle->bytes) {
-      AITER_CHECK(!capturing,
-                  "splitk workspace grow inside HIP graph capture is not supported");
-      void* new_ptr = nullptr;
-      const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-      size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-      HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-      if (ws_handle->ptr != nullptr) {
-        HIP_CALL(hipDeviceSynchronize());
-        HIP_CALL(hipFree(ws_handle->ptr));
-      }
-      ws_handle->ptr = new_ptr;
-      ws_handle->bytes = grow_bytes;
-    }
-    kargs.ws_handle = ws_handle;
+    AITER_CHECK(workspace.has_value(),
+                "@@NAME@@ splitK > 1 requires workspace");
+    void* workspace_ptr = opus_validate_workspace(
+        workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
+    kargs.ptr_ws = workspace_ptr;
 
     // Pass all 4 template args explicitly (D_OUT=void: the split-K main kernel
     // writes an fp32 workspace, so its output dtype is irrelevant; the reduce
@@ -1736,13 +1726,13 @@ void
     if (Y.dtype() == AITER_DTYPE_bf16) {
       opus_bmm_splitk_reduce_kernel<__bf16, REDUCE_VEC, REDUCE_BS>
           <<<grid_reduce, block_reduce, 0, stream>>>(
-              ws_handle, reinterpret_cast<__bf16*>(Y.data_ptr()),
+              workspace_ptr, reinterpret_cast<__bf16*>(Y.data_ptr()),
               split_k, M, N, batch, padded_M, padded_N,
               y_stride_c, y_stride_c_batch);
     } else {
       opus_bmm_splitk_reduce_kernel<float, REDUCE_VEC, REDUCE_BS>
           <<<grid_reduce, block_reduce, 0, stream>>>(
-              ws_handle, reinterpret_cast<float*>(Y.data_ptr()),
+              workspace_ptr, reinterpret_cast<float*>(Y.data_ptr()),
               split_k, M, N, batch, padded_M, padded_N,
               y_stride_c, y_stride_c_batch);
     }
@@ -1797,7 +1787,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {k.WG_PER_CU}>;
 """
 
-    preamble = instance_impl_preamble()
+    preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
     host_tu_split = instance_impl_host_tu_split(
         traits_header,
         pipeline_header,
@@ -1811,12 +1801,11 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     # header that defines this kernel -- so the launcher body's <<<...>>> call
     # needs a visible declaration. On the non-fused device pass the pipeline
     # header (via splitk_reduce_gfx950.cuh) provides a compatible definition, so
-    # this is just a harmless redeclaration there. opus_splitk_ws_handle is a
-    # complete type in both passes via the included traits/pipeline header.
+    # this is just a harmless redeclaration there.
     reduce_fwd_decl = """
 template <typename D_OUT, int VEC, int BLOCK>
 __global__ void opus_bmm_splitk_reduce_kernel(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ workspace,
     D_OUT* __restrict__ out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -1841,6 +1830,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -1896,11 +1886,14 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    int /*splitK*/)
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
 {
   using Traits = @@NAME@@_Traits;
   constexpr bool SKIP_SCALE_WAIT = @@SKIP@@;
   constexpr int MI = 2;
+  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
 
   const int M = O.size(0);
   const int batch = O.size(1);
@@ -1922,7 +1915,7 @@ void
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   const int num_tiles_m = M / Traits::B_M;
   const int num_tiles_n = N / Traits::B_N;
@@ -2022,6 +2015,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2100,6 +2094,7 @@ def _emit_bmm_specialized(
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2139,9 +2134,11 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int @@SPLITK_ARG@@)
 {
   using Traits = @@NAME@@_Traits;
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
 """
 
 _BMM_SPEC_KARGS = r"""
@@ -2150,7 +2147,7 @@ _BMM_SPEC_KARGS = r"""
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.stride_a = (int)O.stride(0);
   kargs.stride_b = (int)wo_a.stride(1);
@@ -2171,8 +2168,9 @@ _BMM_SPEC_KARGS = r"""
 
 # ---- wave8n2 (kid 132) ----
 _BMM_WAVE8N2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
-    + r"""  const int M = O.size(0);
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  const int M = O.size(0);
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
@@ -2249,8 +2247,9 @@ def _cppbool(v):
 
 # ---- wave4m2_selfload (kids 134/142/148) ----
 _BMM_WAVE4M2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
-    + r"""  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
   constexpr bool PACK_SCALE_ON_DEMAND = @@PSOD@@;
   const int M = O.size(0);
   const int batch = O.size(1);
@@ -2355,7 +2354,7 @@ _BMM_MOUTER_KARGS = r"""
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   const int num_tiles_m = M / Traits::B_M;
   const int num_tiles_n = N / Traits::B_N;
@@ -2397,7 +2396,8 @@ _BMM_MOUTER_TAIL = r"""  kargs.split_k = m_per_wg;
 """
 
 _BMM_MOUTER_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + "  AITER_CHECK(splitK == 1, \"@@NAME@@ requires splitK == 1\");\n"
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  const int m_per_wg = (num_tiles_m >= 16) ? 2 : 1;\n"
@@ -2408,6 +2408,7 @@ _BMM_MOUTER_LAUNCHER_BODY = (
 # num_tiles_m]); reuses the same mouter kernel.
 _BMM_MOUTER_TUNABLE_LAUNCHER_BODY = (
     _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + "  AITER_CHECK(splitK >= 1, \"@@NAME@@ requires splitK >= 1\");\n"
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  int m_per_wg = splitK;\n"
@@ -2511,10 +2512,13 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    int /*splitK*/)
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
 {
   using Bf16Traits = @@NAME@@_Bf16Traits;
   using Fp32Traits = @@NAME@@_Fp32Traits;
+  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
   const int M = O.size(0);
   const int batch = O.size(1);
   const int N = wo_a.size(1);
@@ -2624,6 +2628,7 @@ def gen_bmm_mxscale_pipeline_instance(
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2663,6 +2668,7 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int splitK)
 {
   using Traits = @@NAME@@_Traits;
@@ -2704,7 +2710,7 @@ void
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.split_k = split_k;
   kargs.stride_a = (int)O.stride(0);
@@ -2723,6 +2729,8 @@ void
   dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
   dim3 block_main(Traits::BLOCK_SIZE);
   if (no_split_k) {
+    AITER_CHECK(!workspace.has_value(),
+                "@@NAME@@ splitK == 1 does not use workspace");
     kargs.ptr_c = Y.data_ptr();
     kargs.stride_c = (int)Y.stride(0);
     kargs.stride_c_batch = (int)Y.stride(1);
@@ -2736,34 +2744,19 @@ void
     return;
   }
 
-  extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-  hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-  HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-  const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-  auto* ws_handle = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
   const size_t ws_bytes = counter_offset + counter_bytes;
-  if (ws_handle->ptr == nullptr || ws_bytes > ws_handle->bytes) {
-    AITER_CHECK(!capturing,
-                "splitk workspace grow inside HIP graph capture is not supported");
-    void* new_ptr = nullptr;
-    const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-    size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-    HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-    if (ws_handle->ptr != nullptr) {
-      HIP_CALL(hipDeviceSynchronize());
-      HIP_CALL(hipFree(ws_handle->ptr));
-    }
-    ws_handle->ptr = new_ptr;
-    ws_handle->bytes = grow_bytes;
-  }
-  kargs.ws_handle = ws_handle;
+  const size_t required_numel = (ws_bytes + sizeof(float) - 1) / sizeof(float);
+  AITER_CHECK(workspace.has_value(),
+              "@@NAME@@ splitK > 1 requires workspace");
+  void* workspace_ptr = opus_validate_workspace(
+      workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
+  kargs.ptr_ws = workspace_ptr;
 
   kargs.ptr_c = Y.data_ptr();
   kargs.stride_c = (int)Y.stride(0);
   kargs.stride_c_batch = (int)Y.stride(1);
   kargs.counter_offset_bytes = counter_offset;
-  HIP_CALL(hipMemsetAsync(static_cast<char*>(ws_handle->ptr) + counter_offset,
+  HIP_CALL(hipMemsetAsync(static_cast<char*>(workspace_ptr) + counter_offset,
                           0, counter_bytes, stream));
   if (Y.dtype() == AITER_DTYPE_bf16) {
     @@KERNEL@@<Traits, __bf16, false, false, false>
@@ -2807,7 +2800,7 @@ def gen_bmm_mxscale_fused_instance(
         kargs_name,
         da,
         db,
-        instance_impl_preamble(),
+        instance_impl_preamble('\n#include "opus_gemm_common.cuh"'),
         instance_impl_host_tu_split(
             traits_header, pipeline_header, tpl, kernel_func, fn
         ),

@@ -5,7 +5,7 @@
 Covers the mmajor DeepSeek-V4 wo_a path: O/Y are [M, G, *] (transposed views of
 batch-major [G, M, *]); wo_a + w_scale stay batch-major. Activation scale is
 per-token e8m0 (GROUP_M=1), weight scale is 128x128-block e8m0. Candidates are
-kid 0 (always-runnable baseline) and the public dispatch path; the reference is
+kid 8000 (always-runnable baseline) and the public dispatch path; the reference is
 a dequantized fp32 einsum. Per-kid perf comparison / winner selection lives in
 ``csrc/opus_gemm/opus_bmm_mxscale_tune.py``.
 
@@ -31,7 +31,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw, bmm_a8w8_mxscale_opus
+from aiter.ops.opus import opus_gemm
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -39,6 +39,29 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
 GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
 _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
+
+
+def _run_opus(
+    x,
+    weight,
+    out,
+    x_scale,
+    w_scale,
+    kid,
+    split_k=1,
+    workspace=None,
+):
+    return opus_gemm(
+        x,
+        weight,
+        out,
+        kid=int(kid),
+        layout="mxscale_bmm",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        split_k=int(split_k),
+        workspace=workspace,
+    )
 
 
 def _to_e8m0_scale(scale):
@@ -88,7 +111,8 @@ def _block_varied(shape, k):
     """Signed random tensor whose per-128-K-block magnitude spans several powers
     of two, so the e8m0 128-block scales cover many exponents.
 
-    ``rand()/10`` (non-negative, near-uniform) is what let the shipped kid312/313
+    ``rand()/10`` (non-negative, near-uniform) is what let the shipped
+    global kids 8312/8313
     tileN COM_REP_N>1 kernels pass this test at ~0.007 rel while silently
     transposing output column groups: a pure column permutation over symmetric
     positive columns barely moves any element, and the collapsed single block
@@ -118,19 +142,19 @@ def test_mxscale_bmm(g, m, n, k, dtype):
 
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        _run_opus(O_in, W_mx, Y, xs_in, ws_mx, kid)
         return Y
 
-    # Correctness-focused: kid 0 (k32 fused) is a fixed baseline with no
+    # Correctness-focused: global kid 8000 is a fixed baseline with no
     # tile-alignment requirement (always runnable), plus the public dispatch path
     # end to end. Per-kid perf comparison / winner selection lives in
     # csrc/opus_gemm/opus_bmm_mxscale_tune.py, not here.
-    candidates = {"kid0_k32_fused": (lambda: _call(0), ref)}
+    candidates = {"kid8000_k32_fused": (lambda: _call(8000), ref)}
 
-    # Public backend-neutral entry: no kernelId -> per-(g,m,n,k) tuned-CSV
-    # lookup + heuristic fallback + libtype backend routing. Exercises the
-    # whole aiter.batched_gemm_a8w8_mxscale -> bmm_a8w8_mxscale_opus path end
-    # to end (not the raw binding).
+    # Public backend-neutral entry: per-(g,m,n,k) tuned-CSV lookup + heuristic
+    # final-kid resolution + libtype backend routing. Exercises the whole
+    # aiter.batched_gemm_a8w8_mxscale -> unified opus_gemm path end to end
+    # (not the raw binding).
     candidates["auto (batched_gemm_a8w8_mxscale)"] = (
         lambda: aiter.batched_gemm_a8w8_mxscale(O_in, W_mx, xs_in, ws_mx, dtype=ydt),
         ref,
@@ -193,33 +217,30 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         # Batch-major output buffer; hand the kernel its [m, g, n] view so the
         # store lands at Y.stride(1) (batch) = m*n (outermost), N contiguous.
         Yb = torch.empty((g, m, n), dtype=ydt)
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, 1, kid)
+        _run_opus(O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, kid)
         return Yb  # [g, m, n]
 
     def _call_auto():
-        # Same tuned-CSV lookup the public entry does, but writing into a
-        # caller-owned batch-major buffer -- which the guarded public entry no
-        # longer exposes (it returns fresh token-major), so drive the opus
-        # backend directly with the looked-up kid + the batch-major out= view.
+        # Resolve the final global kid here, then use the same unified OPUS
+        # entry with a caller-owned batch-major output view.
         Yb = torch.empty((g, m, n), dtype=ydt)
         cfg = lookup_mxscale_bmm_config(g, m, n, k)
-        bmm_a8w8_mxscale_opus(
+        _run_opus(
             O_in,
             W_mx,
+            Yb.transpose(0, 1),
             xs_in,
             ws_mx,
-            out=Yb.transpose(0, 1),
-            dtype=ydt,
-            kernelId=int(cfg["kernelId"]) if cfg is not None else None,
-            splitK=int(cfg["splitK"]) if cfg is not None else None,
+            int(cfg["kernelId"]) if cfg is not None else 8000,
+            int(cfg["splitK"]) if cfg is not None else 1,
         )
         return Yb
 
-    # Correctness-focused: kid 0 (always runnable) as the batch-major baseline,
+    # Correctness-focused: kid 8000 as the batch-major baseline,
     # plus the backend dispatch path writing into the batch-major buffer via
     # out=. Per-kid perf sweep lives in csrc/opus_gemm/opus_bmm_mxscale_tune.py.
-    candidates = {"kid0_k32_fused": (lambda: _call_raw(0), ref)}
-    candidates["auto (bmm_a8w8_mxscale_opus)"] = (_call_auto, ref)
+    candidates = {"kid8000_k32_fused": (lambda: _call_raw(8000), ref)}
+    candidates["auto (unified opus_gemm)"] = (_call_auto, ref)
 
     flops = 2.0 * g * m * n * k
     # fp8 A + fp8 W + e8m0 scales (uint8) + output.
@@ -248,17 +269,24 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     return ret
 
 
+# These two functions are CLI benchmarks whose required arguments come from
+# ``main()`` rather than pytest fixtures.  Keep their historical names for the
+# benchmark report while preventing pytest from invoking them with no shape.
+test_mxscale_bmm.__test__ = False
+test_mxscale_bmm_batch_first.__test__ = False
+
+
 # --- tileN column-map regression guard ------------------------------------
 # These COM_REP_N>1 kernels previously transposed output column groups. Keep
 # them out of the narrow perf table, but always exercise both output layouts
 # with signed, varied-block-scale data so the bug cannot silently return.
-_TILEN_REGRESSION_KIDS = (312, 313)
+_TILEN_REGRESSION_KIDS = (8312, 8313)
 _TILEN_REGRESSION_SHAPE = (2, 16, 128, 1024)  # G, M, N, K; accepts both kids
 _TILEN_REGRESSION_ERR_TOL = 0.003
 
 
 def check_tilen_column_map():
-    """Check kid312/313 column mapping for token- and batch-major output."""
+    """Check global kids 8312/8313 for both output memory layouts."""
     g, m, n, k = _TILEN_REGRESSION_SHAPE
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
@@ -275,7 +303,7 @@ def check_tilen_column_map():
                 out = torch.full((g, m, n), float("nan"), dtype=dtypes.bf16).transpose(
                     0, 1
                 )
-            _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, out, xs_in, ws_mx, 1, kid)
+            _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
             torch.cuda.synchronize()
             delta = (out.to(dtypes.fp32) - ref).abs()
             rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
@@ -288,6 +316,113 @@ def check_tilen_column_map():
 
     assert not failures, "tileN column-map regression:\n  " + "\n  ".join(failures)
     return len(_TILEN_REGRESSION_KIDS) * 2
+
+
+def check_workspace_and_graph():
+    """Exercise auto/caller workspace, validation and graph replay."""
+    g, m, n, k = 2, 32, 128, 2048
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+    O_in = O_mx.transpose(0, 1)
+    xs_in = xs_mx.transpose(0, 1)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+    required_numel = 2 * g * m * n
+
+    auto_out = torch.empty((m, g, n), dtype=dtypes.bf16)
+    _run_opus(O_in, W_mx, auto_out, xs_in, ws_mx, 8000, split_k=2)
+
+    workspace = torch.empty(required_numel, dtype=torch.float32)
+    caller_out = torch.empty_like(auto_out)
+    _run_opus(
+        O_in,
+        W_mx,
+        caller_out,
+        xs_in,
+        ws_mx,
+        8000,
+        split_k=2,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    for label, out in (("auto", auto_out), ("caller", caller_out)):
+        checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"MXFP8 BMM {label} workspace",
+        )
+
+    for bad_workspace in (
+        torch.empty(required_numel - 1, dtype=torch.float32),
+        torch.empty(required_numel, dtype=torch.bfloat16),
+    ):
+        try:
+            _run_opus(
+                O_in,
+                W_mx,
+                caller_out,
+                xs_in,
+                ws_mx,
+                8000,
+                split_k=2,
+                workspace=bad_workspace,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid MXFP8 BMM workspace was accepted")
+
+    try:
+        _run_opus(
+            O_in,
+            W_mx,
+            caller_out,
+            xs_in,
+            ws_mx,
+            8000,
+            split_k=1,
+            workspace=workspace,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("split_k=1 unexpectedly accepted workspace")
+
+    graph_out = torch.empty_like(auto_out)
+    _run_opus(
+        O_in,
+        W_mx,
+        graph_out,
+        xs_in,
+        ws_mx,
+        8000,
+        split_k=2,
+        workspace=workspace,
+    )
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        _run_opus(
+            O_in,
+            W_mx,
+            graph_out,
+            xs_in,
+            ws_mx,
+            8000,
+            split_k=2,
+            workspace=workspace,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    checkAllclose(
+        ref,
+        graph_out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="MXFP8 BMM graph workspace",
+    )
+    return 3
 
 
 # --- m_align guard ---------------------------------------------------------
@@ -340,9 +475,9 @@ def _align_run(kid, m, n, k):
     # plausible value that a mean error would dilute.
     Y = torch.full((m, _ALIGN_G, n), float("nan"), dtype=dtypes.bf16)
     try:
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        _run_opus(O_in, W_mx, Y, xs_in, ws_mx, kid)
         torch.cuda.synchronize()
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         # The launcher's AITER_CHECK on M surfaces here. Deliberately not a
         # blanket except: a harness bug must fail loudly, not read as a refusal.
         return False, 0.0
@@ -366,7 +501,7 @@ def check_m_align():
     """Assert OpusGemmInstance.m_align matches what each mxscale BMM kid does.
 
     m_align says which M values a kid's launcher accepts (1 == it masks a partial
-    M tile). Both the runtime's padded-M lookup (aiter/ops/opus/bmm_op.py) and a
+    M tile). Both the tuned caller's padded-M lookup and a
     tuner's candidate filter act on it, so a wrong value is not merely cosmetic:
     too strict hides the fastest kernel from tuning (kid326 lost ~9% at the DSV4
     wo_a decode shapes that way, while the runtime dispatched it at those very
@@ -467,6 +602,10 @@ def main():
     n_tilen_checks = check_tilen_column_map()
     aiter.logger.info(
         "tileN column mapping passed for %d kid/layout combinations", n_tilen_checks
+    )
+    n_workspace_checks = check_workspace_and_graph()
+    aiter.logger.info(
+        "MXFP8 BMM workspace/graph checks passed (%d paths)", n_workspace_checks
     )
 
     if args.check_m_align:

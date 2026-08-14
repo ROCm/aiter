@@ -914,6 +914,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Dispatch blockscale bpreshuffle GEMM through its tuned backend."""
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -1023,7 +1024,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
+    if (config is not None and config["libtype"] == "triton") or (
+        get_gfx() == "gfx1250"
+        and not (config is not None and config["libtype"] == "opus")
+    ):
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -1066,13 +1070,18 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
         elif libtype == "opus":
-            kernelId = int(config["kernelId"])
-            from aiter.ops.opus.gemm_op_a8w8 import (
-                opus_gemm_a8w8_blockscale_bpreshuffle_tune,
-            )
+            # Only an OPUS-tuned row enters the OPUS exact-kid interface.
+            kid = int(config["kernelId"])
+            from aiter.ops.opus import opus_gemm
 
-            return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
-                XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
+            return opus_gemm(
+                XQ,
+                WQ,
+                Y,
+                kid=kid,
+                layout="bpreshuffle",
+                x_scale=x_scale,
+                w_scale=w_scale,
             )
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(

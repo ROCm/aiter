@@ -36,12 +36,12 @@ _A16W16_TAGS = (
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
     "a16w16_mono_tile",
-    # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).
+    # gfx1250 cluster/TDM split-K (exact-kid typed workspace + reduce kernel).
     "a16w16_cluster_tdm_splitk_ws",
-    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
+    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (typed workspace + reduce).
     "a16w16_clusterlaunch_tdm_splitk_ws",
-    # gfx1250 FUSED single-kernel in-cluster split-K reduce (no reduce kernel);
-    # B multicast + GL2-resident partial workspace + cluster-barrier sync.
+    # gfx1250 fused in-cluster reduction. It still consumes a caller-owned
+    # exact-kid typed workspace, but does not launch a second reduce kernel.
     "a16w16_clusterlaunch_tdm_splitk_fuse",
 ) + _GFX942_A16W16_TAGS
 
@@ -51,6 +51,23 @@ EMIT_REGISTRY = {}
 # its overrides at import time; gen_instances merges them into the cross-arch
 # default maps.
 ARCH_MAP_REGISTRY = {}
+
+_SPLITK_WORKSPACE_TYPES = {
+    "bf16_t": ("bf16_t", "__bf16", "AITER_DTYPE_bf16"),
+    "fp32_t": ("fp32_t", "float", "AITER_DTYPE_fp32"),
+}
+
+
+def splitk_workspace_type(k):
+    """Return C++ storage, pointer, and Aiter dtype tokens declared by a kid."""
+    dtype = getattr(k, "splitk_workspace_dtype", None)
+    try:
+        return _SPLITK_WORKSPACE_TYPES[dtype]
+    except KeyError as exc:
+        raise ValueError(
+            f"workspace instance {getattr(k, 'name', '<unknown>')} must declare "
+            f"splitk_workspace_dtype as bf16_t or fp32_t, got {dtype!r}"
+        ) from exc
 
 
 def register_arch_map(arch, map_name, mapping):
