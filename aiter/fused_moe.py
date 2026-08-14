@@ -1132,7 +1132,6 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
-                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -1944,6 +1943,10 @@ def _mxfp4_scale_u8(scale):
     return scale
 
 
+def _flydsl_stage2_fp8_enabled():
+    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -1966,6 +1969,7 @@ def _flydsl_v2_stage2_wrapper(
     block_m=None,
     expert_mask=None,
     topk_ids=None,
+    topk_weights=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
@@ -1984,17 +1988,39 @@ def _flydsl_v2_stage2_wrapper(
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
     target = out
-    _s2_fp8_inter = (
-        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    )
+    _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
+    if _s2_fp8_inter and _kstatic:
+        _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
+    _defer_w = _s2_fp8_inter and _kstatic
+    _fp8_scale_blk = None
+    _fp8_pitch_align = None
     if epilog == "reduce":
         if _s2_fp8_inter:
-            if model_dim_runtime % 8 != 0:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+                FP8OUT_PITCH_ALIGN,
+                FP8OUT_SCALE_BLK_MIN,
+                fp8out_row_bytes,
+                fp8out_scale_blk,
+            )
+
+            if model_dim_runtime % FP8OUT_SCALE_BLK_MIN != 0:
                 raise ValueError(
-                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
+                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
+                    f"by {FP8OUT_SCALE_BLK_MIN}"
                 )
+            _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime) if _kstatic else 8
+            _fp8_pitch_align = FP8OUT_PITCH_ALIGN if _kstatic else 0
+
             target = torch.empty(
-                (token_num * topk, model_dim_runtime + model_dim_runtime // 8),
+                (
+                    token_num * topk,
+                    fp8out_row_bytes(
+                        model_dim_runtime,
+                        scale_blk=_fp8_scale_blk,
+                        pitch_align=_fp8_pitch_align,
+                    ),
+                ),
                 dtype=torch.uint8,
                 device=out.device,
             )
@@ -2035,6 +2061,8 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
+        g2_bf16_lds=cfg["bf16_lds"],
+        g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if epilog == "reduce":
@@ -2049,6 +2077,9 @@ def _flydsl_v2_stage2_wrapper(
             expert_mask=expert_mask,
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
+            topk_weights=topk_weights if _defer_w else None,
+            fp8_scale_blk=_fp8_scale_blk,
+            fp8_pitch_align=_fp8_pitch_align,
         )
     return out
 
@@ -2566,24 +2597,23 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.i4x2
         and is_flydsl_available()
     ):
-        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
+        # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
+        # the port has no grid split-K (it uses intra-block k_wave); asking for it
+        # would set up partials the kernel never writes. block_m MUST equal tile_m --
+        # it sizes both moe_sorting and the gemm tile.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+        _tile_n = _tile_k = 128
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
-        if _ksplit > 1:
-            kn1 += f"_kb{_ksplit}"
         kn2 = flydsl_kernel_name(
             2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using untuned a16wi4 fallback ({kn1=}, {kn2=})"
         )
         return MOEMetadata(
             functools.partial(
@@ -2600,7 +2630,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            _ksplit,
+            0,
             False,
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
@@ -3118,6 +3148,12 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if (
+        stage2_func is _flydsl_v2_stage2_wrapper
+        and not doweight_stage1
+        and _flydsl_stage2_fp8_enabled()
+    ):
+        extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
@@ -3675,7 +3711,12 @@ def torch_moe_stage2(
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
     if doweight:
-        out = out * topk_weights.view(token_num, -1, 1)
+        # In-place: out and topk_weights are both fp32 (ctype), so this is
+        # numerically identical to `out = out * ...` but avoids allocating a
+        # second full (token_num, topk, model_dim) fp32 tensor. That transient
+        # is the largest single allocation in the stage-2 reference (tens of GiB
+        # for large-token FP4 shapes) and was the site of the CI OOM.
+        out.mul_(topk_weights.view(token_num, -1, 1))
     return out.sum(1).to(dtype)
 
 
