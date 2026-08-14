@@ -29,6 +29,11 @@ layer stack. Pass ``--without-metadata`` to also time the metadata=None path,
 where each wrapper recovers the chunk counts with a blocking device-to-host
 copy that shows up as host gap rather than device time.
 
+States are per-sequence and dense by default. Pass ``--with-state-pool`` to
+also time the indexed path a serving stack uses, where ``initial_state`` is a
+pool wider than the batch and K5 gathers each sequence's slot from an index
+array, writing the final state back into that same slot.
+
 Usage examples
 --------------
 # Default: the varlen-qwen-ali-tp1 T=8192 single-sequence case, bf16 vs fp32
@@ -47,6 +52,9 @@ python bench_gated_delta_rule_block.py --summary-only \
 
 # Quantify what skipping the prebuilt chunk schedule costs
 python bench_gated_delta_rule_block.py --without-metadata
+
+# Quantify what the indexed state pool costs against the dense states
+python bench_gated_delta_rule_block.py --with-state-pool
 
 # Per-kernel breakdown behind the stage buckets
 python bench_gated_delta_rule_block.py --show-kernels
@@ -132,13 +140,16 @@ def _stage_of(kernel_name: str) -> str:
     return "other"
 
 
-def _build_inputs(case, seed):
+def _build_inputs(case, seed, with_state_pool=False):
     """Materialize the block-level tensors a ``PrefillArgs`` case describes.
 
     The K5 suite builds K5's own operands (k / w / u); the block entry takes the
     layer inputs instead, so q / v / beta are built here from the same shape
     fields. q and k are L2-normalized and v is scaled down to keep the
     recurrence in the numeric range the suite uses.
+
+    ``with_state_pool`` additionally builds the operands of the indexed path:
+    a state pool wider than the batch plus the slot indices into it.
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -180,12 +191,26 @@ def _build_inputs(case, seed):
     g = F.logsigmoid(
         torch.randn(batch, total_tokens, num_heads, device=device, dtype=torch.float32)
     )
-    initial_state = (
-        torch.randn(
-            num_states, num_heads, case.V, case.K, device=device, dtype=torch.float32
-        )
-        * 0.01
-    ).to(case.ssm_state_dtype)
+
+    def make_states(count):
+        return (
+            torch.randn(
+                count, num_heads, case.V, case.K, device=device, dtype=torch.float32
+            )
+            * 0.01
+        ).to(case.ssm_state_dtype)
+
+    initial_state = make_states(num_states)
+
+    # A serving stack holds the states in a pool wider than the running batch
+    # and hands K5 the slots this batch owns, so oversize the pool and scatter
+    # the slots rather than passing an identity mapping the gather sees through.
+    state_pool = make_states(2 * num_states) if with_state_pool else None
+    state_indices = (
+        torch.randperm(2 * num_states)[:num_states].to(device=device, dtype=torch.int32)
+        if with_state_pool
+        else None
+    )
 
     return {
         "q": q,
@@ -194,6 +219,8 @@ def _build_inputs(case, seed):
         "g": g,
         "beta": beta,
         "initial_state": initial_state,
+        "state_pool": state_pool,
+        "state_indices": state_indices,
         "cu_seqlens": cu_seqlens,
         "metadata": metadata,
         "total_tokens": total_tokens,
@@ -201,7 +228,16 @@ def _build_inputs(case, seed):
     }
 
 
-def _make_callable(tensors, case, backend, snapshot_dtype, prefill_metadata):
+def _make_callable(
+    tensors, case, backend, snapshot_dtype, prefill_metadata, state_indices=None
+):
+    # The indexed path reads and writes the pool, so the states it walks are
+    # the ones the previous iteration wrote back. The gates decay, so the
+    # recurrence stays in range across a benchmark loop.
+    initial_state = (
+        tensors["state_pool"] if state_indices is not None else tensors["initial_state"]
+    )
+
     def run():
         return chunk_gated_delta_rule_opt_vk(
             q=tensors["q"],
@@ -209,7 +245,8 @@ def _make_callable(tensors, case, backend, snapshot_dtype, prefill_metadata):
             v=tensors["v"],
             g=tensors["g"],
             beta=tensors["beta"],
-            initial_state=tensors["initial_state"],
+            initial_state=initial_state,
+            initial_state_indices=state_indices,
             output_final_state=case.output_final_state,
             cu_seqlens=tensors["cu_seqlens"],
             use_chunk_flydsl=backend == "flydsl",
@@ -381,10 +418,18 @@ def _run_case(case_id, case, args):
         print(f"\n== {case_id}\nskipped: the block entry requires g")
         return []
 
-    tensors = _build_inputs(case, args.seed)
+    # The indexed path writes the final state back into its pool slot, so it
+    # only applies to cases that ask for a final state at all.
+    with_pool = args.with_state_pool and case.output_final_state
+    tensors = _build_inputs(case, args.seed, with_state_pool=with_pool)
     metadata_variants = [("meta", tensors["metadata"])]
     if args.without_metadata and tensors["metadata"] is not None:
         metadata_variants.append(("no-meta", None))
+    # The dense variant carries no suffix, keeping the labels of a run that
+    # does not ask for the pool unchanged.
+    state_variants = [("", None)]
+    if with_pool:
+        state_variants.append(("pool", tensors["state_indices"]))
 
     records = []
     labels, rows, per_kernel_rows = [], {}, {}
@@ -397,28 +442,45 @@ def _run_case(case_id, case, args):
                 "fp32" if snapshot_dtype == torch.float32 else "bf16"
             )  # None resolves to k.dtype, i.e. bf16 here
             for meta_name, metadata in metadata_variants:
-                run = _make_callable(
-                    tensors, case, backend, snapshot_dtype, prefill_metadata=metadata
-                )
-                label = f"{backend} {snapshot_name} {meta_name}"
-                labels.append(label)
-                rows[label], per_kernel_rows[label] = _measure(run, args)
-                records.append(
-                    {
-                        "case": case_id,
-                        "snap": snapshot_name,
-                        "column": f"{backend} {meta_name}",
-                        "row": rows[label],
-                    }
-                )
+                for state_name, state_indices in state_variants:
+                    run = _make_callable(
+                        tensors,
+                        case,
+                        backend,
+                        snapshot_dtype,
+                        prefill_metadata=metadata,
+                        state_indices=state_indices,
+                    )
+                    parts = (backend, snapshot_name, meta_name, state_name)
+                    label = " ".join(part for part in parts if part)
+                    labels.append(label)
+                    rows[label], per_kernel_rows[label] = _measure(run, args)
+                    records.append(
+                        {
+                            "case": case_id,
+                            "snap": snapshot_name,
+                            "column": " ".join(
+                                part
+                                for part in (backend, meta_name, state_name)
+                                if part
+                            ),
+                            "row": rows[label],
+                        }
+                    )
 
     if not args.summary_only:
+        if with_pool:
+            pool_note = f", pool={2 * tensors['num_seqs']} slots"
+        elif args.with_state_pool:
+            pool_note = ", pool skipped (needs final_state=on)"
+        else:
+            pool_note = ""
         print(f"\n== {case_id}")
         print(
             f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} "
             f"{'varlen' if case.is_varlen else f'dense B={case.dense_batch}'}, "
             f"T={tensors['total_tokens']} ({tensors['num_seqs']} seqs), "
-            f"final_state={'on' if case.output_final_state else 'off'}"
+            f"final_state={'on' if case.output_final_state else 'off'}{pool_note}"
         )
         _print_table(labels, rows)
 
@@ -465,6 +527,14 @@ def main() -> None:
         action="store_true",
         help="Also time each config with prefill_metadata=None, exposing the "
         "chunk-schedule device-to-host copy as host gap.",
+    )
+    parser.add_argument(
+        "--with-state-pool",
+        action="store_true",
+        help="Also time each config against an indexed state pool, where K5 "
+        "gathers each sequence's slot from an index array and writes the "
+        "final state back in place. Cases without a final state keep the "
+        "dense states only.",
     )
     parser.add_argument(
         "--show-kernels",
