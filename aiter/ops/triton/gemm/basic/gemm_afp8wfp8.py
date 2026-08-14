@@ -356,6 +356,10 @@ def gemm_afp8wfp8_preshuffle(
             BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
             GROUP_SIZE_M=config["GROUP_SIZE_M"],
             A_SCALE_K_GROUP=x_scale_group_size,
+            # Not foldable into strides like the rest of the layout: staging the
+            # scales in LDS needs a TDM descriptor whose innermost stride is 1,
+            # so the kernel has to know which axis is contiguous.
+            A_SCALE_TRANSPOSED=is_x_scale_transposed,
             NUM_KSPLIT=config["NUM_KSPLIT"],
             SPLITK_BLOCK_SIZE=config["SPLITK_BLOCK_SIZE"],
             num_warps=config["num_warps"],

@@ -21,6 +21,7 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "BLOCK_SIZE_K",
     "GROUP_SIZE_M",
     "A_SCALE_K_GROUP",
+    "A_SCALE_TRANSPOSED",
     "NUM_KSPLIT",
     "SPLITK_BLOCK_SIZE",
     "EVEN_K",
@@ -103,6 +104,44 @@ def _load_scale_tile(
     return gl.load(ptrs, cache_modifier=cache_modifier)
 
 
+@gluon.jit
+def _gather_scale_tile(
+    slab,
+    tile_idx,
+    zeros_row,
+    offs_kg,
+    BLOCK_SIZE_K: gl.constexpr,
+    SCALE_K_GROUP: gl.constexpr,
+    SLAB_COLS: gl.constexpr,
+):
+    """Read a (BLOCK, BLOCK_SIZE_K // 32) e8m0 scale tile out of an LDS slab.
+
+    ``slab`` is a (BLOCK, SLAB_COLS) shared-memory view holding every scale byte
+    this CTA needs for the whole K span, TDM'd in once by the prologue.
+    ``memdesc.gather`` returns a tensor whose layout is the *index* layout, so
+    passing indices built on slices of the wmma scale layout lands the result
+    directly in that layout -- the coarse-to-32 replication falls out of the
+    same index arithmetic the global path used, with no broadcast and no
+    convert_layout.
+
+    Index arithmetic mirrors _load_scale_tile but is slab-relative: there is no
+    k_split_offset (the descriptor base already carries it) and the clamp is
+    against the slab width rather than the global group count.
+
+    TDM zero-fills the slab past the real M / K extent. An e8m0 byte of 0 is
+    2^-127, not zero, but those lanes only ever scale operand data that TDM also
+    zero-filled, so the product is zero either way.
+    """
+    SCALE_GROUP_SIZE: gl.constexpr = 32
+
+    kg_idx = (tile_idx * BLOCK_SIZE_K + offs_kg * SCALE_GROUP_SIZE) // SCALE_K_GROUP
+    kg_idx = gl.minimum(kg_idx, SLAB_COLS - 1)
+
+    # gather's indices must carry the full result shape, so broadcast the K-group
+    # vector across rows with a zero column built on the matching layout slice.
+    return slab.gather(kg_idx[None, :] + zeros_row[:, None], 1)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -137,6 +176,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     A_SCALE_K_GROUP: gl.constexpr,
+    A_SCALE_TRANSPOSED: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
@@ -177,6 +217,57 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     B_SCALE_N_GROUP: gl.constexpr = 128
     B_SCALE_K_GROUP: gl.constexpr = 128
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_SIZE
+    # cdiv, not //: BLOCK_SIZE_N is only constrained to a multiple of 16, so
+    # 16/32/64 all share a single scale row and must land on 1, not 0.
+    N_SCALE_GROUP: gl.constexpr = (
+        BLOCK_SIZE_N + B_SCALE_N_GROUP - 1
+    ) // B_SCALE_N_GROUP
+
+    # ---- A-scale staging in LDS ----
+    # The scale bytes a CTA needs for a whole K span are tiny next to the operand
+    # tiles (K bytes at BLOCK_SIZE_M == A_SCALE_K_GROUP == 128, so 16 KiB at
+    # K = 16384), so they are TDM'd into LDS once by the prologue and read back
+    # with _gather_scale_tile instead of re-fetched from global every K tile.
+    #
+    # gfx1250 has 320 KiB of LDS and the operand buffers already take 260 KiB at
+    # BLOCK 128x128x256 / NUM_BUFFERS 4, which rounds up to the full 5 x 64 KiB
+    # partitions -- so a 16 KiB slab is free in occupancy terms.
+    A_SCALE_SLAB_BYTES: gl.constexpr = 16384
+    A_SCALE_CHUNK_K: gl.constexpr = (
+        (A_SCALE_SLAB_BYTES * A_SCALE_K_GROUP // BLOCK_SIZE_M) // BLOCK_SIZE_K
+    ) * BLOCK_SIZE_K
+    NUM_SCALE_CHUNKS: gl.constexpr = (
+        SPLITK_BLOCK_SIZE + A_SCALE_CHUNK_K - 1
+    ) // A_SCALE_CHUNK_K
+    # A_SCALE_CHUNK_K is the LDS *capacity*; the slab only has to span the K this
+    # split actually walks, rounded up to whole K tiles. Without the min, a small
+    # K (SPLITK_BLOCK_SIZE 384) would still book a full 16 KiB slab for 3 columns
+    # of real data and cost occupancy for nothing.
+    A_SCALE_SPAN_K: gl.constexpr = min(
+        A_SCALE_CHUNK_K,
+        ((SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K) * BLOCK_SIZE_K,
+    )
+    # Rounded up: a TDM block_shape dim must be a power of 2. The capacity above
+    # is already one, so this never rounds past it. The extra columns are only
+    # ever addressed if the loop walks past the real K, which it does not -- the
+    # gather clamp keeps every index inside the span.
+    A_SCALE_COLS: gl.constexpr = triton.next_power_of_2(
+        A_SCALE_SPAN_K // A_SCALE_K_GROUP
+    )
+
+    # Three fallbacks to the in-loop global path, none of them silent:
+    #  - MX activations (A_SCALE_K_GROUP == 32) need 4x the bytes, overflowing
+    #    the 60 KiB of LDS headroom.
+    #  - A K span wider than one slab needs an outer chunk loop (not yet here).
+    #  - Row-major scales would need the slab in the other orientation, since a
+    #    TDM dest memdesc must match block_shape and the innermost descriptor
+    #    stride must be 1. Transposed is what per_group_quant_hip emits for
+    #    1x128, so that is the path staged for now.
+    A_SCALE_IN_LDS: gl.constexpr = (
+        A_SCALE_TRANSPOSED
+        and A_SCALE_K_GROUP == B_SCALE_K_GROUP
+        and NUM_SCALE_CHUNKS == 1
+    )
 
     # The wmma instruction shape is [16, 16, 128], so a K tile must be a whole
     # number of k-steps; 128 also keeps K_GROUPS aligned to the 32-element MX
@@ -251,6 +342,11 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     ) % M
     offs_as_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
     as_row_off = offs_as_m * stride_asm
+    # Zero column used only to broadcast the K-group vector to the full tile
+    # shape for memdesc.gather; costs nothing once folded into the index add.
+    as_zeros_m = gl.zeros(
+        [BLOCK_SIZE_M], dtype=gl.int32, layout=gl.SliceLayout(1, a_scale_layout)
+    )
 
     offs_bs_n = (
         pid_n * BLOCK_SIZE_N
@@ -289,12 +385,39 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         layout=tdm_shared_b,
     )
 
+    # A-scale slab. The transposed source is physically (K // A_SCALE_K_GROUP, M)
+    # and contiguous, so the descriptor is built in that orientation to keep the
+    # innermost stride at 1; the loop reads it back through a permuted view.
+    # Lane n reads slab[kg, n] -> consecutive bytes across lanes, so an unpadded
+    # swizzled layout is already bank-conflict free.
+    as_shared: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+    if A_SCALE_IN_LDS:
+        as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_scale_ptr + (k_split_offset // A_SCALE_K_GROUP) * stride_ask,
+            shape=(gl.cdiv(K_local, A_SCALE_K_GROUP), M),
+            strides=(stride_ask, stride_asm),
+            block_shape=(A_SCALE_COLS, BLOCK_SIZE_M),
+            layout=as_shared,
+        )
+        as_slab = gl.allocate_shared_memory(
+            as_desc.dtype, shape=[A_SCALE_COLS, BLOCK_SIZE_M], layout=as_shared
+        )
+
     num_loads = 0
     num_computes = 0
 
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
 
     # ---------------- Prologue ----------------
+    # The scale slab is issued first and never waited on directly: tensorcnt is a
+    # single in-order counter, so the async_wait below -- which already drains
+    # down to the operand pipeline depth -- retires the slab as the oldest op.
+    # Prepending it therefore needs no change to any existing wait count.
+    if A_SCALE_IN_LDS:
+        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_am_tdm], as_slab)
+
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = num_loads % NUM_BUFFERS
         gl.amd.gfx1250.tdm.async_load(
@@ -317,18 +440,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     # ---------------- Main loop ----------------
     for _ in range(NUM_K_ITER - (NUM_BUFFERS - 1)):
-        cur_as = _load_scale_tile(
-            a_scale_ptr,
-            num_computes,
-            k_split_offset,
-            K,
-            as_row_off,
-            offs_as_kg,
-            stride_ask,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=A_SCALE_K_GROUP,
-            cache_modifier=cache_modifier,
-        )
+        if A_SCALE_IN_LDS:
+            cur_as = _gather_scale_tile(
+                as_slab.permute((1, 0)),
+                num_computes,
+                as_zeros_m,
+                offs_as_kg,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=A_SCALE_K_GROUP,
+                SLAB_COLS=A_SCALE_COLS,
+            )
+        else:
+            cur_as = _load_scale_tile(
+                a_scale_ptr,
+                num_computes,
+                k_split_offset,
+                K,
+                as_row_off,
+                offs_as_kg,
+                stride_ask,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=A_SCALE_K_GROUP,
+                cache_modifier=cache_modifier,
+            )
         cur_bs = _load_scale_tile(
             b_scale_ptr,
             num_computes,
@@ -373,18 +507,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     # ---------------- Epilogue ----------------
     for i in gl.static_range(NUM_BUFFERS - 2):
-        cur_as = _load_scale_tile(
-            a_scale_ptr,
-            num_computes,
-            k_split_offset,
-            K,
-            as_row_off,
-            offs_as_kg,
-            stride_ask,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=A_SCALE_K_GROUP,
-            cache_modifier=cache_modifier,
-        )
+        if A_SCALE_IN_LDS:
+            cur_as = _gather_scale_tile(
+                as_slab.permute((1, 0)),
+                num_computes,
+                as_zeros_m,
+                offs_as_kg,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=A_SCALE_K_GROUP,
+                SLAB_COLS=A_SCALE_COLS,
+            )
+        else:
+            cur_as = _load_scale_tile(
+                a_scale_ptr,
+                num_computes,
+                k_split_offset,
+                K,
+                as_row_off,
+                offs_as_kg,
+                stride_ask,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=A_SCALE_K_GROUP,
+                cache_modifier=cache_modifier,
+            )
         cur_bs = _load_scale_tile(
             b_scale_ptr,
             num_computes,
@@ -413,18 +558,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         num_computes += 1
 
     # ---------------- Final WMMA ----------------
-    cur_as = _load_scale_tile(
-        a_scale_ptr,
-        num_computes,
-        k_split_offset,
-        K,
-        as_row_off,
-        offs_as_kg,
-        stride_ask,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        SCALE_K_GROUP=A_SCALE_K_GROUP,
-        cache_modifier=cache_modifier,
-    )
+    if A_SCALE_IN_LDS:
+        cur_as = _gather_scale_tile(
+            as_slab.permute((1, 0)),
+            num_computes,
+            as_zeros_m,
+            offs_as_kg,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=A_SCALE_K_GROUP,
+            SLAB_COLS=A_SCALE_COLS,
+        )
+    else:
+        cur_as = _load_scale_tile(
+            a_scale_ptr,
+            num_computes,
+            k_split_offset,
+            K,
+            as_row_off,
+            offs_as_kg,
+            stride_ask,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=A_SCALE_K_GROUP,
+            cache_modifier=cache_modifier,
+        )
     cur_bs = _load_scale_tile(
         b_scale_ptr,
         num_computes,
