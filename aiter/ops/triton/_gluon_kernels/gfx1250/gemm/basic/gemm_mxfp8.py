@@ -73,10 +73,13 @@ def _load_scale_tile(
     stride_k,
     BLOCK_SIZE_K: gl.constexpr,
     SCALE_K_GROUP: gl.constexpr,
-    out_layout: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
     """Load a (BLOCK, BLOCK_SIZE_K // 32) e8m0 scale tile in the wmma scale layout.
+
+    ``row_off`` / ``offs_kg`` are already built on slices of the wmma scale
+    layout, so the load lands in that layout directly and needs no
+    ``convert_layout`` afterwards.
 
     ``SCALE_K_GROUP`` is how many K elements share one scale byte in the source
     tensor (32 for MX scales, 128 for blockscale). When it exceeds 32 the same
@@ -97,7 +100,7 @@ def _load_scale_tile(
     kg_idx = gl.minimum(kg_idx, kg_max)
 
     ptrs = scale_ptr + row_off[:, None] + kg_idx[None, :] * stride_k
-    return gl.convert_layout(gl.load(ptrs, cache_modifier=cache_modifier), out_layout)
+    return gl.load(ptrs, cache_modifier=cache_modifier)
 
 
 @triton.heuristics(
@@ -231,26 +234,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     )
 
     # ---- scale addressing (see _load_scale_tile) ----
-    as_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, K_GROUPS], [32, 1], [num_warps, 1], [1, 0]
-    )
-    bs_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, K_GROUPS], [32, 1], [num_warps, 1], [1, 0]
-    )
+    # Indices are built on slices of the wmma scale layouts themselves, so the
+    # global loads land directly in the layout wmma_scaled wants -- no
+    # convert_layout (and no LDS round trip) after the load.
+    # as_load_layout: gl.constexpr = gl.BlockedLayout(
+    #     [1, K_GROUPS], [32, 1], [num_warps, 1], [1, 0]
+    # )
+    # bs_load_layout: gl.constexpr = gl.BlockedLayout(
+    #     [1, K_GROUPS], [32, 1], [num_warps, 1], [1, 0]
+    # )
     # `% M` rather than a mask: TDM zero-fills the A tile past M, so a wrapped
     # scale row multiplies zero data.
     offs_as_m = (
         pid_m * BLOCK_SIZE_M
-        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, as_load_layout))
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, a_scale_layout))
     ) % M
-    offs_as_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, as_load_layout))
+    offs_as_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
     as_row_off = offs_as_m * stride_asm
 
     offs_bs_n = (
         pid_n * BLOCK_SIZE_N
-        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, bs_load_layout))
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, b_scale_layout))
     ) % N
-    offs_bs_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, bs_load_layout))
+    offs_bs_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
     bs_row_off = (offs_bs_n // B_SCALE_N_GROUP) * stride_bsn
 
     # ---- TDM descriptors ----
@@ -321,7 +327,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             stride_ask,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             SCALE_K_GROUP=A_SCALE_K_GROUP,
-            out_layout=a_scale_layout,
             cache_modifier=cache_modifier,
         )
         cur_bs = _load_scale_tile(
@@ -334,7 +339,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             stride_bsk,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             SCALE_K_GROUP=B_SCALE_K_GROUP,
-            out_layout=b_scale_layout,
             cache_modifier=cache_modifier,
         )
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -379,7 +383,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             stride_ask,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             SCALE_K_GROUP=A_SCALE_K_GROUP,
-            out_layout=a_scale_layout,
             cache_modifier=cache_modifier,
         )
         cur_bs = _load_scale_tile(
@@ -392,7 +395,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             stride_bsk,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             SCALE_K_GROUP=B_SCALE_K_GROUP,
-            out_layout=b_scale_layout,
             cache_modifier=cache_modifier,
         )
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -421,7 +423,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         stride_ask,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SCALE_K_GROUP=A_SCALE_K_GROUP,
-        out_layout=a_scale_layout,
         cache_modifier=cache_modifier,
     )
     cur_bs = _load_scale_tile(
@@ -434,7 +435,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         stride_bsk,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SCALE_K_GROUP=B_SCALE_K_GROUP,
-        out_layout=b_scale_layout,
         cache_modifier=cache_modifier,
     )
     acc = gl.amd.gfx1250.wmma_scaled(cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc)
