@@ -1110,6 +1110,11 @@ _USE_FLAT_DSCORE_LAYOUT = False
 _USE_CACHED_TAIL_METADATA = True
 _USE_EARLY_TAIL = True
 _USE_TUNED_ROUTER_WGRAD = True
+# Limit the auxiliary dW2 stream to 8 experts (256 CTAs) per dispatch.  A full
+# 64-expert grid competes for every CU with stage2 and erases the intended
+# overlap; eight ordered dispatches leave a small CU budget for the main stream
+# while dW2 continues through the later stage1/tail work.
+_EXACT_DW2_EXPERT_CHUNK = 8
 _ROUTER_WGRAD_HIPB_SOLUTION = 436589
 _ROUTER_HIPB_READY = False
 
@@ -1546,13 +1551,31 @@ class OpusMoERefFunc(torch.autograd.Function):
             )
             ctx.wgrad_stream.wait_stream(current)
             with torch.cuda.stream(ctx.wgrad_stream):
-                _opus_moe_wgrad_tn_bf16_raw(
-                    dy_op,
-                    a_op,
-                    offs,
-                    out,
-                    ctx.uniform_m or 0,
+                expert_count = offs.numel() - 1
+                expert_chunk = (
+                    _EXACT_DW2_EXPERT_CHUNK
+                    if ctx.dims == (32768, 2048, 64, 1024, 8)
+                    else expert_count
                 )
+                chunk_uniform_m = (
+                    ctx.uniform_m or 0
+                    if expert_chunk == expert_count
+                    else 0
+                )
+                for expert_start in range(
+                    0, expert_count, expert_chunk
+                ):
+                    expert_end = min(
+                        expert_start + expert_chunk,
+                        expert_count,
+                    )
+                    _opus_moe_wgrad_tn_bf16_raw(
+                        dy_op,
+                        a_op,
+                        offs[expert_start : expert_end + 1],
+                        out[expert_start:expert_end],
+                        chunk_uniform_m,
+                    )
             return out
 
         def stage2_wgrad_finish(out):
