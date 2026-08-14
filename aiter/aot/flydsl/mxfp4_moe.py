@@ -240,7 +240,10 @@ def parse_csv(csv_path: str):
                         "use_nt": p1["use_nt"],
                         "inline_quant": p1["inline_quant"],
                         "D_HIDDEN": model_dim,
-                        "D_INTER": v2_d_inter,
+                        # GEMM1 specializes on the logical output width. GEMM2
+                        # padding is backend-specific and must not change its
+                        # AOT cache key (for example, inter_dim=384 vs 512).
+                        "D_INTER": inter_dim,
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
