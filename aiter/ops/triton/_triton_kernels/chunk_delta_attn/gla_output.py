@@ -15,14 +15,24 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
     chunk_delta_attn_autotune_configs,
+    chunk_delta_attn_tuned_config,
     exp,
     exp2,
     input_guard,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+
+# The BV=128 / num_stages=3 tile this kernel came with wants up to 123KB of LDS,
+# which a 64KB device (gfx942, gfx90a) cannot launch at all. Unpipelined, this one
+# compiles to 16KB for every shape measured, so it runs anywhere, at 3% on long
+# prefills and 9% at low occupancy. Devices with the budget for a wider tile keep
+# it by pinning one in configs/<arch>/triton/attention/chunk_delta_attn/DEFAULT.json.
+_FALLBACK_O_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=1)
 
 
 @triton.heuristics(
@@ -39,9 +49,13 @@ from .utils import (
             for nw in [2, 4, 8]
             for ns in [2, 3, 4]
         ],
-        default_config=triton.Config({"BK": 64, "BV": 128}, num_warps=8, num_stages=3),
+        default_config=chunk_delta_attn_tuned_config(
+            "chunk_gla_fwd_kernel_o", _FALLBACK_O_CONFIG
+        ),
     ),
-    key=["BT", "HV", "TRANSPOSE_STATE"],
+    # K and V belong in the key alongside BT: they set how much LDS a tile needs,
+    # so a choice made for one head dim can be unlaunchable at the next one.
+    key=["BT", "HV", "K", "V", "TRANSPOSE_STATE"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
