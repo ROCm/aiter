@@ -171,7 +171,7 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
         if(num_tiles_m >= 20 && num_tiles_m < 24)
         {
             constexpr int GROUP_M = 4;
-            constexpr int GROUP_N = 2;
+            constexpr int GROUP_N = APPLY_SWIGLU ? 2 : 4;
             constexpr int GROUPS_M = 5;
             constexpr int GROUPED_TILES_M = GROUP_M * GROUPS_M;
             const int grouped_blocks = GROUPED_TILES_M * num_tiles_n;
