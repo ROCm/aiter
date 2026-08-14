@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...jit.core import compile_ops
+from ..gradlib import hipb_create_extension, hipb_mm
 
 
 @compile_ops("module_moe_opus_bwd", fc_name="opus_moe_wgrad_bf16", develop=True)
@@ -1108,6 +1109,17 @@ _USE_GPU_DGRAD_METADATA = True
 _USE_FLAT_DSCORE_LAYOUT = False
 _USE_CACHED_TAIL_METADATA = True
 _USE_EARLY_TAIL = True
+_USE_TUNED_ROUTER_WGRAD = True
+_ROUTER_WGRAD_HIPB_SOLUTION = 436589
+_ROUTER_HIPB_READY = False
+
+
+def _ensure_router_hipb() -> None:
+    """Initialize hipBLASLt before the timed exact-shape backward."""
+    global _ROUTER_HIPB_READY
+    if not _ROUTER_HIPB_READY:
+        hipb_create_extension()
+        _ROUTER_HIPB_READY = True
 
 
 def _get_wgrad_stream(device: torch.device) -> torch.cuda.Stream:
@@ -1566,6 +1578,8 @@ class OpusMoEFullFunc(torch.autograd.Function):
         ctx.use_sparse_router_dx = True
         ctx.full_x = x
         ctx.full_router_w = router_w
+        if _USE_TUNED_ROUTER_WGRAD:
+            _ensure_router_hipb()
         router_logits = F.linear(x, router_w)
         return OpusMoERefFunc.forward(
             ctx, x, w1, w2, router_logits, topk, act_type
@@ -1579,7 +1593,15 @@ class OpusMoEFullFunc(torch.autograd.Function):
         if not ctx.fused_sparse_router_dx:
             dx_router = torch.mm(dlogits, ctx.full_router_w)
             dx = (dx.float() + dx_router.float()).to(dx.dtype)
-        drouter_w = torch.mm(dlogits.t(), ctx.full_x)
+        if _USE_TUNED_ROUTER_WGRAD:
+            drouter_w = hipb_mm(
+                dlogits.t(),
+                ctx.full_x,
+                _ROUTER_WGRAD_HIPB_SOLUTION,
+                out_dtype=torch.bfloat16,
+            )
+        else:
+            drouter_w = torch.mm(dlogits.t(), ctx.full_x)
         return dx, dw1, dw2, drouter_w, None, None
 
 
