@@ -67,18 +67,33 @@ from ._mqa_logits_common import (
 )
 
 
-def _auto_split_kv(batch_size, next_n, wave_per_eu, device_index, total_cu=None):
-    """Production host SplitKV formula (mirrors deepgemm_fp8_paged_mqa_logits):
+_SIMDS_PER_CU = 4
 
-        SplitKV = ((max(1, TotalCuCount // (batch*next_n)) + 4) // 5 * 5) * WavePerEU
 
-    Fills the device for small decode grids where the batch*next_n row grid alone
-    leaves most CUs idle. Returns >= 1.
+def _auto_split_kv(
+    batch_size, next_n, wave_per_eu, device_index, total_cu=None, waves_per_block=1
+):
+    """Pick SplitKV so the dispatch lands ``wave_per_eu`` waves on every SIMD:
+
+        SplitKV = round(WavePerEU * 4 * TotalCuCount / (batch*next_n*WavePerBlock))
+
+    Resident wave count is the lever that matters here -- the kernel is bound by
+    memory throughput, not per-wave latency, so too few waves leaves the memory
+    system idle and too many just queue. Measured on gfx950/256 CU across six
+    shapes (batch 4..128, kv_len 4k..128k), the curve is flat between 2.0 and 2.5
+    waves/SIMD and rises steeply either side: at the reference shape 1.0/SIMD
+    costs 33.9 us and 4.0/SIMD costs 29.4 us against 27.6 us at 2.0.
+
+    The earlier formula, ``((TotalCuCount // (batch*next_n) + 4) // 5 * 5) *
+    WavePerEU``, ignored the CTA's wave count, so it drifted with shape --
+    2.5 waves/SIMD at the reference shape but 10 at batch=128 -- and left 4-14%
+    on the table. Returns >= 1.
     """
     tile_q_count = max(1, batch_size * next_n)
     if total_cu is None:
         total_cu = device_cu_count(device_index)
-    split_kv = ((max(1, total_cu // tile_q_count) + 4) // 5 * 5) * wave_per_eu
+    target_waves = max(1, wave_per_eu) * _SIMDS_PER_CU * total_cu
+    split_kv = round(target_waves / (tile_q_count * max(1, waves_per_block)))
     return max(1, int(split_kv))
 
 
@@ -401,8 +416,14 @@ def _build_paged_kernel(
 
 # Kernel variants: single-token-per-block, wave-split only ("paged_w<WPB>").
 # WPB must divide the column-tile count BKV/16 (=8 at the default BKV=128).
+#
+# WPB=1 (one wave per CTA) is the default: with SplitKV set to hit the same
+# resident wave count, splitting a CTA across 2 or 4 waves is 4-14% slower on
+# every shape measured -- a 1-wave CTA schedules more freely and pays no
+# whole-CTA granularity cost, and the waves have no work to share anyway (each
+# owns a disjoint set of KV columns, with no barrier or LDS between them).
 KERNEL_VARIANTS = tuple(f"paged_w{w}" for w in (1, 2, 4))
-DEFAULT_VARIANT = "paged_w4"
+DEFAULT_VARIANT = "paged_w1"
 
 
 def _variant_wpb(variant):
@@ -503,11 +524,13 @@ def flydsl_fp8_paged_mqa_logits(
                   per-token page table).
     max_model_len: int, out_logits column count.
     SplitKV:      KV-column split count (grid = split_kv*batch*next_n). None =>
-                  the production host formula (fills the device on small decode
-                  grids); pass an int to override, 1 disables splitting. Splits
-                  own disjoint, gap-free BKV-aligned column ranges (one writer
-                  per column, no cross-CTA reduction).
-    WavePerEU/TotalCuCount: inputs to the auto-SplitKV formula.
+                  sized so the dispatch lands WavePerEU waves on every SIMD;
+                  pass an int to override, 1 disables splitting. Splits own
+                  disjoint, gap-free BKV-aligned column ranges (one writer per
+                  column, no cross-CTA reduction).
+    WavePerEU:    target resident waves per SIMD for the auto-SplitKV formula
+                  (default 2, which is where the measured curve bottoms out).
+    TotalCuCount: CU count for that formula; None => query the device.
     ChunkK:       KV tile width (must be a multiple of MFMA_N=32). Mirrors
                   the Triton ChunkK parameter. Defaults to 128.
 
@@ -591,10 +614,15 @@ def flydsl_fp8_paged_mqa_logits(
     kv_bytes = kv_cache.reshape(-1)
 
     # KV-column splits (one lever): fill the device when the batch*next_n row
-    # grid is small. Auto == production host formula; overridable.
+    # grid is small. Auto targets WavePerEU waves per SIMD; overridable.
     if SplitKV is None:
         split_kv = _auto_split_kv(
-            batch_size, next_n, WavePerEU, q_fp8.device.index, TotalCuCount
+            batch_size,
+            next_n,
+            WavePerEU,
+            q_fp8.device.index,
+            TotalCuCount,
+            waves_per_block=_variant_wpb(variant),
         )
     else:
         split_kv = max(1, int(SplitKV))
