@@ -32,8 +32,10 @@
 #   BV                measured best value tile; empty = AOT-only row
 #   us                K5 device time at that BV, for regression tracking
 #
-# Measured with op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py on
-# MI300X (gfx942). The two families mirror the varlen-qwen3.5-397b-ptpc-ali
+# Each row is measured by running the shape at every legal BV and keeping the
+# median K5 device time of the winner, on MI300X (gfx942). Differences can be
+# as small as ~2%, so a sweep needs a few hundred iterations to resolve them.
+# The two families mirror the varlen-qwen3.5-397b-ptpc-ali
 # (TP8) and varlen-qwen-ali-tp1 PrefillGroups in
 # op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py: 8192-token
 # segments, batched-token budget swept 8192..65536.

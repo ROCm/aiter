@@ -73,8 +73,8 @@ python -m aiter.aot.flydsl.chunk_gdn_h_mfma16_hip --target-arch gfx942
 > snapshot/state dtypes, both `g_head_major` layouts, and — where the row allows
 > a state pool — both `use_state_indices` values — batch
 > shapes absent from the table fall back to the runtime BV rule, which can pick
-> any tile, and none of them may hit the JIT. Rows are produced by
-> `op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`. A row with an
+> any tile, and none of them may hit the JIT. Each row is measured by running
+> its shape at every legal BV and keeping the fastest. A row with an
 > empty `BV` is AOT-only: the shape gets pre-compiled while the runtime keeps
 > using the rule, which is how to cover a new model before tuning it.
 
