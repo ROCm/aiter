@@ -4,7 +4,7 @@
 ## Build a container with Aiter installed and add a non-root user using the Dockerfile provided below:
 
 ```
-ARG BASE_DOCKER="rocm/pytorch:latest"
+ARG BASE_DOCKER="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 FROM $BASE_DOCKER
 RUN pip install pandas zmq einops && \
     pip install numpy==1.26.2
