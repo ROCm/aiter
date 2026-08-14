@@ -181,6 +181,18 @@ _TUNE_POLICY = {
     173: [1],
     179: [1],
     184: [1],
+    # The plain-scale halves of the kid334/335 ablation pairs (see the term table
+    # in opus_gemm_common.py). Built to attribute a layout ratio rather than to
+    # ship, but they are ordinary preload_sf kids at tiles the pool otherwise has
+    # only at a different B_K or WG_PER_CU, so a table sweep is the cheapest way
+    # to find out whether one of them owns a cell.
+    #
+    # kid344 stays out on purpose. Its B_N=128 geometry runs 105,000-133,000us
+    # against 19us for the same family's baseline tile, so sweeping it would cost
+    # more than the rest of the pool put together and it cannot win a cell.
+    336: [1],
+    338: [1],
+    342: [1],
     # kid158's pipeline with only B's layout flipped -- the direct A/B comparison
     # for what preshuffling B is worth at the tile the shipped table leans on.
     196: [1],
@@ -233,7 +245,99 @@ _TUNE_POLICY.update(
 # (shuffle_scale) need A's scale panel, and for the shuffle_scale kids B's too, relaid out by
 # whatever produces them. That layout is fixed once per model, so a table meant
 # for a model whose quantiser emits plain scales cannot dispatch to them at all --
-# see the shuffle_scale notes in opus_gemm_common.py for what the switch would be worth.
+# see the shuffle_scale notes in opus_gemm_common.py for what the layout is.
+#
+# Priced, in case a quantiser can emit it, and the answer is no. The axis measures on
+# its own because every shuffle_scale kid has a plain-scale twin at the same tile/wg/xcd:
+# over the 133-cell preshuffle envelope the seven wave8 pairs come out at 1.004x median
+# and 496/931 cells won, i.e. a wash, and strongly per-tile (kid216/172 1.063x and
+# kid214/168 1.023x against kid217/184 0.860x). kid208's A-only mpack layout is a
+# separate decision and a clear no at 0.903x.
+#
+# The pool-level number to trust is best-shuffle_scale against best-plain-scale, both
+# sides drawing the whole pool. Comparing against the *table's* pick instead prices the
+# table's sub-optimality along with the layout, which is what made an earlier pass read
+# 25 of 133 cells better by >1%. Full pool both sides, 12 shapes x 3 K, order rotated:
+# median -0.80% at K=1024, -4.25% at K=4096, -5.74% at K=8192, 4 of 36 cells better by
+# >1% and none at K=8192.
+#
+# Two things that number is not. It is not a property of the layout uniformly: measured
+# twin against twin, the shuffled read beats the LDS panel at every K on kid334's
+# 64x32x256 (1.108x/1.041x/1.038x against kid172) and loses a fifth on kid335's
+# 128x128x128 (0.984x/0.805x/0.793x against kid184), so the pool reads negative because
+# the pool's top is the tiles where it loses. Which tile property that is remains open --
+# those two kids differ in four parameters, and kid215 rules out the obvious answer by
+# being B_K=256/COM_REP_K=2 and losing anyway; see opus_gemm_common.py's kid334/335
+# entry. And it is not measured with the scale prefetch missing any more: kid334/335 are
+# kid216/217 with PREFETCH_SCALE on, worth only 1-2% here against flatmm's 1.139x, but
+# their absence was half the apparent decay with K (the same sweep without them reads
+# -0.43% / -5.97% / -10.82%). The wave8n4/wavetm1 kids cannot be measured with it at
+# all -- that pipeline static_asserts !PREFETCH_SCALE.
+#
+# Past K=8192 the panel does not fit and 21 of 99 kids stop dispatching at splitK=1,
+# which looks like the layout's opening: at splitK=1 the fastest kid at K=16384/32768 is
+# a shuffle_scale kid in all 10 cells measured. But the bound is per split -- the
+# launcher checks ceil(total_iters/split_k) <= SF_PRELOAD_K_MAX/B_K -- so a plain-scale
+# preload kid reaches K=32768 at split_k>=4 today. Swept over split_k in {1,2,4,8} the
+# advantage is gone: median -3.1%, 0 of 10 cells better by >1%, kid194 taking 6 of 10.
+#
+# That held only because every shape in the sweep leaves the machine half empty -- the
+# largest, g2/m4096, is 128 workgroups at B_M=256 against 256 CUs, so split-K was partly
+# buying parallelism the shape lacked. On shapes that fill it (g16/m4096 is 2048 WGs) at
+# K=16384/32768, split_k=1 takes 6 of 6 cells and no panel kid dispatches there at all,
+# so kid213 (shuffle_scale) wins every cell with the best panel kid 1.068-1.144x behind.
+# The full kid x split_k grid says that win is split_k=1's and not the layout's: at every
+# split_k both families reach, the panel kid is 0.75-0.83x the shuffle_scale kid. So the
+# 7-14% is the K bound charging rent, collectable either by emitting shuffle_scale (worth
+# it only in this regime) or by letting the faster family into the split_k=1 column.
+#
+# Which is worth doing, because the bound is not each kid's. The panel is
+# (SFA rows + SFB rows) * K/GROUP_K bytes with SFA rows == B_M, and reading
+# .group_segment_fixed_size out of the built code objects puts 19 of 25
+# panel kids at 3-884x of unused headroom: kid208 (mpack_sfa, SFA from global, 2 SFB rows)
+# could take K=7.2M per split, kid205 111,360, kid194 30,976. Only 158/196/228/230/324/326
+# are genuinely full, and 151,680 -- the figure the traits comment justifies 8192 with --
+# is kid158/196's, a pipeline whose staging is the 2*(B_M+B_N)*B_K double buffer and not
+# the flatmm/wave8 families the constant also governs. Chunked refills are forced only for
+# those 6.
+#
+# So the wave8 traits now derives SF_PRELOAD_K_MAX from the LDS its staging leaves over
+# (capped at 32768, with a 256-byte reserve for allocator padding), which gives kid194
+# 30,848 and the B_M=128 kids 30,464 -- the latter is not the cap because the budget is
+# the LDS share that keeps the kernel's workgroups resident, not the whole CU. Spending
+# the whole CU is what the first cut did, and it cost kid203/kid205 1.19-1.20x at m>=1536:
+# they are 256-thread workgroups that fit a CU twice at 59,012 bytes and once at 83,972.
+# See the SF_PANEL_LDS_CEILING note in the traits. At split_k=1 and K=16384 on machine-filling shapes
+# that is worth 3.0-4.0% over kid213, 8/8 paired draws in each of three shapes, bit-exact.
+# Less than the 17-25% the shared-split_k columns suggest, because the panel's edge falls
+# from 0.79x at sk2/sk4 to 0.97x at sk1 -- kid213 gains more from that column than the
+# panel kids do. K=32768 stays kid213's: a 256x256 tile needs a 66,048-byte panel against
+# 62,208 of headroom, the one cell where a chunked refill is the only lever left (it would
+# have to find 5.3%). No shipped row moves -- this table is K in {1024, 4096} at splitK=1
+# -- so the gain is available to whoever tunes large-K rows, and re-running all 133 rows
+# shows no drift beyond the machine's own (1.011x affected over control).
+#
+# split_k 2-8 being free is measured, not assumed: the reduce sums an fp32 workspace in an
+# fp32 accumulator and casts once, so splitting K is blocked summation. Against an fp64
+# reference at K=32768 with positive operands the max relative error falls monotonically,
+# 6.18e-06 at sk1 to 4.75e-06 at sk8; with bf16 output every split_k reads 1.327e-03 and
+# the difference is invisible. The ceiling on split_k is the ">= 3 K-tiles per split"
+# launcher check, not precision.
+#
+# One follow-on still declined: a deeper register prefetch cannot replace the panel. The
+# shared BMM pipeline already stages scales in v_sfa[2][2] one to two K tiles ahead with
+# SFA_VM in every vmcnt immediate, so latency is covered, and what the panel buys is
+# SFA_VM==0 -- the scale load leaving every vmcnt wait, vmcnt being one in-order counter.
+# More stages attack latency, not ordering.
+# See the kid328-333 block in opus_gemm_common.py.
+#
+# One methodology note from that work, for anyone re-running a pool sweep here:
+# stepping the candidate pool in kid order every draw is worth several percent to
+# whoever runs first. Rescanning the 39-kid preshuffle pool that way produced three
+# mis-ranks that all evaporated under a small pool with the order rotated and 12
+# draws (kid196 at g4/m3072/k4096 read 64.09us in kid order and 73.35us rotated).
+# Rank on a handful of candidates with rotated order and per-draw values, not on a
+# median over a full-pool pass.
 _RELAYOUT_KIDS = sorted(
     kid
     for kid, inst in _CODEGEN_BMM.items()

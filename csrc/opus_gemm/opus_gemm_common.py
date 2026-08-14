@@ -629,6 +629,115 @@ a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
 
+# --- shuffle_scale on this family: a retired measurement, kept for its verdict ----
+#
+# The flatmm split-K kernel has implemented SHUFFLE_SCALE all along and the codegen
+# spells it on every kid of this kernel, but no instance had ever set the flag, and
+# _name had no suffix for it -- so one would have deduplicated onto its plain
+# sibling and been emitted as the plain kid, measuring as "the layout changes
+# nothing" with nothing raised. That is fixed (see the sfshuf note in _name).
+#
+# Six instances then priced the layout here and are retired now that it has come out
+# no; the numbers are below because the axis reversed twice under better measurement, and
+# the two mis-framed comparisons that caused it are the reusable part. 328/329/330 are
+# the three tiles as first measured, bit-exact against their plain twins; twin vs twin
+# over the 77 cells of the plain tuned table, 3 draws:
+#
+#   kid328 vs kid320 (same tile, no panel)   1.099x  76/77 won
+#   kid328 vs kid324 (same tile + preload)   0.893x   9/77 won
+#   kid329 vs kid325 (same tile + preload)   0.705x   0/77 won
+#   kid330 vs kid326 (same tile + preload)   0.748x   0/77 won
+#
+# -- but that first pass forgot PREFETCH_SCALE, which is the axis the two mechanisms
+# are actually competing on: it moves load_scale_regs ahead of the lgkmcnt wait, and it
+# carries no static_assert against SHUFFLE_SCALE, so the combination was instantiable
+# all along. kid331/332/333 are the same three tiles with it on, and it is worth 1.139x
+# to the layout, which changes the verdict at these tiles from a loss to a tie:
+#
+#   kid331 vs kid328 (the prefetch axis alone)  1.139x  69/77 won
+#   kid331 vs kid324 (prefetched vs the panel)  1.013x  66/77 won
+#   kid331 vs kid320 (vs the naive load)        1.268x  74/77 won
+#   kid332 vs kid325                            0.714x   0/77 won
+#   kid333 vs kid326                            0.913x   0/77 won
+#
+# kid332 is the informative failure: prefetch moved it 0.705 -> 0.714, i.e. not a
+# latency problem. It is the only one with COM_REP_K==1, where load_scale_regs issues
+# load<1>(g_sfa_shuf_h, 2*w + kp) every K tile against the two halves of one dword --
+# two loads where one would do. Loading the dword once per two tiles needs the K parity
+# in op_sel, which is an instruction immediate, so it has to be compile-time; today it
+# rides in the address instead. The main K loop's parity is static (it steps by 2 from
+# a compile-time start), the tail and epilogue are where it is not. Not implemented.
+#
+# So at the tables' K the layout is a wash on its best tile rather than a loss, and the
+# pool-level answer is that it buys nothing: best shuffle_scale kid against best
+# plain-scale kid, both sides drawing the whole pool, is -0.80% at K=1024, -4.25% at
+# K=4096 and -5.74% at K=8192, 4 of 36 cells better by >1% and none at K=8192. (Read
+# with kid334/335 in the pool; without the prefetch axis the same sweep reads -0.43% /
+# -5.97% / -10.82%, so half the apparent decay with K was the missing prefetch on the
+# bdirect twins rather than the layout.) Three of the 36 cells -- g2/m16, at -18% to
+# -56% -- are not measuring the layout at all: no shuffle_scale kid has a 16-row tile,
+# so they go to kid179/kid243/kid236 and record a coverage gap. The medians are robust
+# to them either way.
+#
+# What decay is left is the panel amortizing: PRELOAD_SF_LDS pays a fixed one-shot fill
+# and then reads from LDS, so more K tiles amortize it better, while the shuffled
+# layout's cost is per tile and flat.
+#
+# Past K=8192 the panel does not fit, 21 of 99 kids stop dispatching, and at splitK=1
+# the fastest kid at K=16384/32768 is a shuffle_scale kid in all 10 cells -- which is
+# an artefact of pinning splitK=1. The bound is per split (the launcher checks
+# ceil(total_iters/split_k) <= SF_PRELOAD_K_MAX/B_K), so a plain-scale preload kid
+# reaches K=32768 at split_k>=4 today. Swept over split_k in {1,2,4,8}: median -3.1%,
+# 0 of 10 cells better by >1%, kid194 taking 6 of 10. g2/m256/K16384 alone moves from
+# "kid331 at 36.0us is fastest" to kid326 at sk4 in 26.6us.
+#
+# That verdict does not extend past these shapes, and the paragraph that used to stand
+# here wrongly closed the K-bound question with it. Every shape above leaves the machine
+# half empty -- g2/m4096, the largest, is 128 workgroups at B_M=256 against 256 CUs -- so
+# split-K was partly buying parallelism the shape lacked. On shapes that fill it
+# (g16/m4096 = 2048 WGs) at K=16384/32768, split_k=1 wins 6 of 6 cells and no panel kid
+# dispatches at split_k=1, so kid213 takes every cell with the best panel kid 1.068-1.144x
+# back. The kid x split_k grid attributes that to the column, not the layout: wherever both
+# families reach the same split_k, the panel kid is 0.75-0.83x the shuffle_scale kid.
+#
+# And the bound is one constant set by the worst tile rather than each kid's own. The panel
+# is (SFA rows + SFB rows) * K/GROUP_K with SFA rows == B_M, so it varies 8x across kids at
+# equal K; .group_segment_fixed_size from the built code objects puts 19
+# of 25 panel kids at 3-884x spare -- kid205 could hold 111,360 of per-split K, kid194
+# 30,976, kid208 (mpack_sfa, so only 2 SFB rows in LDS) 7.2M. The 151,680 figure the traits
+# comment cites is kid158/196's, whose staging is the 2*(B_M+B_N)*B_K double buffer, not the
+# flatmm/wave8 families the constant also governs; only 158/196/228/230/324/326 are really
+# full. So chunked refills are forced for 6 kids, and the wave8 traits now derives its bound
+# from the LDS its staging leaves over instead of copying the flat 8192 -- 32768 for the
+# B_M=128 kids, 30,848 for kid194. That is worth 3.0-4.0% at K=16384 and split_k=1 on
+# machine-filling shapes (8/8 paired draws, bit-exact), and changes no shipped row, since
+# this table is K in {1024, 4096} at splitK=1. K=32768 still wants a chunked refill: a
+# 256x256 tile needs 66,048 panel bytes against 62,208 of headroom.
+#
+# kid331 is also not the answer at large K: it ranks 14th-21st of 76 there, 64x32x256
+# being too small a tile at large M, and the four-kid sweep that first suggested it
+# (1.3-1.7x over kid320) only looked convincing because all four were small or mediocre
+# tiles.
+#
+# The one lever left unpulled is the COM_REP_K==1 amortization above, and its value is
+# unmeasured rather than small: the ~2% estimate here counted u16 loads against the tile's
+# ~86 buffer_loads, and the bdirect twins show a 25% spread between tiles, but kid215
+# (B_K=256, COM_REP_K=2, still losing 7-13%) shows COM_REP_K is not what that spread
+# tracks. See the kid334/335 entry for the pairs that would separate the terms.
+#
+# The flatmm half of the axis is therefore closed. To reopen it, restore the dict below
+# and _BLDS_NO_TWIN's reference to it; the factory keeps its shuffle_scale kwarg for
+# that and asserts the kernel's static_asserts on the Python side.
+#
+# _BMM_MXSCALE_SPLITK_SHUFSCALE_TILES = {   # (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)
+#     328: (64,  32,  256, 2, False),   # = kid320/324 tile, kid216's geometry
+#     329: (128, 128, 128, 1, False),   # = kid325 tile, the plain table's workhorse
+#     330: (128, 64,  256, 1, False),   # = kid326 tile
+#     331: (64,  32,  256, 2, True),    # the same three, scale load hoisted ahead
+#     332: (128, 128, 128, 1, True),    # of the LDS wait
+#     333: (128, 64,  256, 1, True),
+# }
+
 
 # --- Removed bpreshuffle experiments -------------------------------------------
 #
@@ -986,6 +1095,13 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list = {
 # kid646 is the DIRECT_ONLY persistent schedule, which carries its own B staging
 # and rejects the flags this family sets. kid0 is the heuristic default and an
 # alias of kid32's geometry, so kid224 already covers its tile.
+#
+# A shuffle_scale flatmm kid would be exempt for a third reason: it wants a host-side
+# scale relayout, so it is not dispatchable under the layout the tables ship and cannot
+# win a shipped cell either way. None exist right now (the kid328-333 block above is
+# retired), but restoring that dict means adding its ids here too, since promoting one
+# into a table would need a preshuffled-B twin, i.e. a blds kid carrying shuffle_scale,
+# which does not exist.
 _BLDS_NO_TWIN = {0, 646}
 _blds_untwinned = sorted(
     kid
@@ -1071,8 +1187,8 @@ assert not _blds_untwinned, (
 # The kid is kept on the same terms as kid213/214/215: measurement, not a tuner
 # candidate, until a producer emits the layout.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES = {
-    #   (B_M, B_N, B_K, WG_PER_CU)     twin of
-    216: (64, 32, 256, 2),           # kid171 / kid172
+    #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)     twin of
+    216: (64, 32, 256, 2, False),    # kid171 / kid172
     # kid217: kid184's tile, built to close the one cell where the shuffle_scale envelope
     # gave anything up -- g8/m512/K4096, which kid184 owns -- and it does not
     # close it. COM_REP_K=1 here, so a tile owns one of the dword's two K blocks
@@ -1098,13 +1214,120 @@ _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES = {
     # to make the layout free here is not another twin but a panel fill that reads
     # the shuffle_scale bytes -- which would decouple what the producer emits from whether a
     # kid stages its scales, and is what to build if the producer switch is real.
-    217: (128, 128, 128, 1),         # kid184
+    217: (128, 128, 128, 1, False),  # kid184
+    # kid216/217 with the scale load hoisted ahead of the LDS wait. Both entries
+    # above were measured with PREFETCH_SCALE off, which is not the fair setting for
+    # this layout: the shuffled read is a per-K-tile global load sitting in the
+    # critical path, where the panel it replaces is a ds_read already hoisted, and on
+    # the flatmm family turning it on was worth 1.139x to the layout. It is only
+    # testable here -- the wave8n4/wavetm1 pipeline static_asserts !PREFETCH_SCALE,
+    # so kid210/213/214/215 cannot have it -- and bdirect + shuffle_scale + prefetch
+    # is the one combination of the three that had never been instantiated.
+    #
+    # It is not what was wrong here. The axis alone is worth 1-2% on both tiles
+    # (kid334/kid216 1.008x/1.012x/1.018x and kid335/kid217 1.017x/1.016x/1.012x at
+    # K=1024/4096/8192, 6 shapes), nowhere near flatmm's 1.139x. What the pair does
+    # show, once the layout is measured at its best, is that the verdict is per tile
+    # rather than global -- against the LDS panel each replaces:
+    #
+    #     K=            1024    4096    8192
+    #     kid334/kid172  1.108x  1.041x  1.038x   64x32x256,  wg2, cRepM=2, cRepK=2
+    #     kid335/kid184  0.984x  0.805x  0.793x   128x128x128, wg1, cRepM=4, cRepK=1
+    #
+    # so the layout beats the panel outright on one tile and loses a fifth on the other.
+    # Those two kids differ in four terms at once (B_M, B_N, B_K, WG_PER_CU), so the pair
+    # attributes nothing on its own; kids 336-345 below walk the path one term at a time
+    # and find B_K carrying the largest attributable share (0.907x at K=8192), B_M little
+    # (0.979x), WG_PER_CU exactly nothing (1.000x), and a 0.86x residual that B_N cannot
+    # be separated from. kid215 is not the counterexample it looks like: 128x64x256 in
+    # another family differs in B_M, B_N, family and the prefetch it cannot have, so it
+    # was never a B_K-only comparison.
+    334: (64, 32, 256, 2, True),     # kid216 + prefetch
+    335: (128, 128, 128, 1, True),   # kid217 + prefetch
 }
 a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
-    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, shuffle_scale=True)
-    for kid, (bm, bn, bk, wg)
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
+                                               shuffle_scale=True)
+    for kid, (bm, bn, bk, wg, pf)
     in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES.items()
 })
+
+# --- what the 25% spread between kid334/kid172 and kid335/kid184 is caused by -------
+#
+# Those are the only two geometries this family has a shuffle_scale/panel pair at, and
+# they differ in four terms at once: B_M 64->128, B_N 32->128, B_K 256->128 and
+# WG_PER_CU 2->1. The instruction-count reading blamed B_K, and kid215 refutes it by
+# being B_K=256 with COM_REP_K=2 and losing anyway. So walk the path one term at a time,
+# holding the family fixed: each row below is kid334's geometry with exactly one term
+# moved toward kid335's, and each needs BOTH sides of the pair -- plain + preload_sf for
+# the panel, shuffle_scale + prefetch_scale for the layout at its best -- because a ratio
+# is only readable against a twin that moved the same term.
+#
+# Measured (shuf/plain per pair, then each term against its own reference, K=1024/4096/8192):
+#
+#     baseline  334/172   64x32x256  wg2   1.105x 1.045x 1.037x
+#     B_K->128  337/336   64x32x128  wg2   1.035x 0.982x 0.941x   term: 0.937 0.940 0.907
+#     B_M->128  339/338  128x32x128  wg2   1.051x 0.936x 0.921x   term: 1.016 0.953 0.979
+#     wg->1     343/342   64x32x256  wg1   1.102x 1.049x 1.037x   term: 0.997 1.005 1.000
+#     endpoint  335/184  128x128x128 wg1   0.997x 0.807x 0.792x
+#
+#     product of the three   0.949 0.900 0.888
+#     endpoint / baseline    0.902 0.773 0.763
+#     residual (B_N + int.)  0.951 0.859 0.860
+#
+# So B_K carries the largest attributable term and the instruction-count reading holds
+# for it: COM_REP_K=1 takes a u16 half of a dword per K tile while tiles are twice as
+# dense, 4 loads per 256 of K against 1 for the same bytes, worth 6-9%. WG_PER_CU is
+# exactly neutral, which is worth keeping as a negative. The residual is the largest
+# piece at K>=4096 and stays unattributed because B_N cannot be stepped alone.
+#     kid334/kid172   64x32x256  wg2   COM_REP (M,N,K) = (2,2,2), 8 MFMA
+#     kid335/kid184  128x128x128 wg1   COM_REP (M,N,K) = (4,8,1), 32 MFMA
+#
+# so the path between them is exactly four steps, one per row here.
+#
+# 128x32x256 at WG_PER_CU=2 would have been the cleaner B_M step and is not legal:
+# prefetch_k_iter divides the per-WG LDS budget by the A staging, which scales with B_M
+# (B contributes nothing under B_DIRECT_REG, so B_N is free -- 64x128x256 has the same
+# per-iteration LDS as 64x32x256), and 128 rows at B_K=256 halves the budget below the
+# `prefetch_k_iter >= 3` floor. So B_M is stepped at B_K=128 instead, against the B_K
+# row rather than against the baseline. Instantiating the traits alone against a
+# candidate geometry checks it in a second, worth doing before a 21-minute build.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
+    #    (B_M, B_N, B_K, WG_PER_CU)   term moved, and what it moves
+    (336, 337): (64,  32,  128, 2),   # B_K  256->128: COM_REP_K 2->1
+    (338, 339): (128, 32,  128, 2),   # B_M   64->128: COM_REP_M 2->4, vs (336,337)
+    (342, 343): (64,  32,  256, 1),   # WG_PER_CU 2->1: occupancy only, geometry fixed
+    (344, 345): (64,  128, 256, 1),   # B_N   32->128: COM_REP_N 2->8, vs (342,343)
+}
+# B_N has no row because it cannot be stepped alone, which took three attempts to
+# establish. 64x128x256 passes the traits at both occupancies -- LDS is fine, since
+# B_DIRECT_REG keeps B out of it and 64x128x256 has the same per-iteration LDS as
+# 64x32x256 -- and runs at 332,000us at wg2 (kid340/341) and 105,000-133,000us at wg1
+# (kid344/345), against 19us for the baseline geometry, both sides of each pair alike.
+# That is the VGPR spill the family's own notes predict ("occupancy here is VGPR-bound at
+# 2 waves/SIMD, not LDS-bound"): COM_REP_N=8 with COM_REP_K=2 is 32 MFMA and 16 B
+# fragments per tile. B_N=128 is only viable at B_K=128, which is what every B_N=128 kid
+# in this family is. So B_N cannot move without B_K moving, and the two measured corners
+# differ in four terms because the geometry space forbids the orthogonal walk -- not
+# because the pair was picked carelessly.
+#
+# Two traps worth keeping. Instantiating the traits alone against a candidate geometry
+# takes a second and catches the compile-time gate, worth doing before a 21-minute
+# build; it does NOT catch the spill, a register allocator outcome rather than a
+# static_assert, so a new geometry wants a timing smoke check too. And a 300,000us kid
+# inside a sweep is indistinguishable from a hang -- that is what it was first taken for.
+# So kid340/341 are not wired at all. 344/345 are, and only as the recorded evidence
+# that wg1 does not rescue B_N=128; nothing should sweep or ship them.
+for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
+    _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE.items()
+):
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list[_plain_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, preload_sf=True)
+    )
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list[_shuf_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, prefetch_scale=True,
+                                              shuffle_scale=True)
+    )
 
 
 
