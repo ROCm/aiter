@@ -224,6 +224,8 @@ def test_fp8_paged_mqa_logits(
     split_kv=0,
     block_size=1,
     preshuffle=False,
+    variant=None,
+    chunk_k=128,
 ):
     # split_kv == 0 -> auto (production host formula); else an explicit override
     # (1 disables splitting). Both must be correctness-identical.
@@ -285,6 +287,8 @@ def test_fp8_paged_mqa_logits(
             Preshuffle=preshuffle,
             KVBlockSize=block_size,
             SplitKV=_split_kv,
+            ChunkK=chunk_k,
+            variant=variant,
         )
 
     got_mask = got == float("-inf")
@@ -309,6 +313,8 @@ def test_fp8_paged_mqa_logits(
         "kvb": block_size,
         "preshuffle": preshuffle,
         "split_kv": "auto" if split_kv == 0 else split_kv,
+        "variant": variant or "default",
+        "chunk_k": chunk_k,
         "flydsl err": err,
     }
 
@@ -364,6 +370,18 @@ def default_cases():
     cases.append({**_BASE, "avg_kv_length": 8192, "split_kv": 1, "block_size": 64})
     cases.append({**_BASE, "split_kv": 4, "block_size": 64, "preshuffle": True})
     cases.append({**_BASE, "split_kv": 1, "block_size": 16, "preshuffle": True})
+    # Wave split and KV tile width. Neither was covered before -- every case ran
+    # the default variant at ChunkK=128 -- so a bug in the wave-to-column-tile
+    # assignment was invisible, being correct by construction at one wave per
+    # CTA. ChunkK/32 must be divisible by the variant's wave count.
+    for variant in ("paged_w2", "paged_w4"):
+        cases.append({**_BASE, "block_size": 64, "variant": variant})
+    cases.append({**_BASE, "block_size": 64, "chunk_k": 64, "variant": "paged_w2"})
+    cases.append({**_BASE, "block_size": 64, "chunk_k": 256, "variant": "paged_w4"})
+    cases.append({**_BASE, "block_size": 64, "chunk_k": 256})
+    cases.append(
+        {**_BASE, "block_size": 64, "preshuffle": True, "variant": "paged_w4"}
+    )
     return cases
 
 
