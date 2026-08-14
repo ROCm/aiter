@@ -279,7 +279,7 @@ def launch_gemm_a8w4_tdm(
         # Per-expert A-data OOB: bound to the owning expert's valid-row
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
-        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
+        base_ptr = fx.SharedAllocator().allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
