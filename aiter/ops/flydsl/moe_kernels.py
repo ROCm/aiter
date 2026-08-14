@@ -1302,14 +1302,8 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel.
-
-    situ_beta/situ_linear_beta are compile-time constants for the SiTUv2 split-K
-    post-activation (mirrors the main gemm1 kernel); they are part of the cache
-    key so distinct betas compile distinct modules and never alias on disk."""
+    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1319,8 +1313,6 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -1394,6 +1386,10 @@ def flydsl_silu_and_mul_interleaved(
             ptr_arg(empty_f32),
             token_num,
             num_sorted_rows,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
             float("inf"),
             torch.cuda.current_stream(),
         ),
@@ -1744,8 +1740,6 @@ def _flydsl_moe_stage1_impl(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1759,6 +1753,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
@@ -1771,8 +1769,6 @@ def _flydsl_moe_stage1_impl(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1786,6 +1782,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
@@ -1796,8 +1796,6 @@ def _flydsl_moe_stage1_impl(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1811,6 +1809,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
