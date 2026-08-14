@@ -30,9 +30,7 @@ def _situv2_ref(
 
 
 @pytest.mark.parametrize("beta, linear_beta", [(1.0, 1.0), (4.0, 25.0)])
-def test_flydsl_situv2_fused_uses_runtime_betas(
-    beta: float, linear_beta: float
-):
+def test_flydsl_situv2_fused_uses_runtime_betas(beta: float, linear_beta: float):
     if not is_flydsl_available():
         pytest.skip("FlyDSL is not available")
 
