@@ -26,6 +26,7 @@ def reduce_grouped(
     reduction_n=1,
     out_dtype=None,
     swiglu_add_residual: bool = True,
+    swiglu_separated_layout: bool = False,
     residual: torch.Tensor | None = None,
 ):
     """
@@ -141,6 +142,7 @@ def reduce_grouped(
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
         K=K,
         SWIGLU_ADD_RESIDUAL=swiglu_add_residual,
+        SWIGLU_SEPARATED=swiglu_separated_layout,
         USE_TDM=is_tdm_avail(),
         Residual=residual,
         stride_extres_m=res_stride_m,
