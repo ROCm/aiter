@@ -46,7 +46,12 @@ plain ``arange(batch)`` would make sequence 0 a null block and silently skip it.
 
 When the ``sglang`` package is importable, the SGLang-interface cases pick up an
 extra bit-exact cross-check against its live Triton kernel; without it the torch
-spec above is the ground truth and the cross-check is skipped.
+spec above is the ground truth and the cross-check is skipped. vLLM's own kernel
+is picked up the same way for the varlen cases, where it is the only oracle for
+the handful whose per-sequence window upstream narrows below ``width - 1`` -- the
+dense entry point cannot express that, so those rest on it rather than on
+something weaker. The rest of the packed cases are pinned bit for bit against the
+dense path, which the spec already covers.
 
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/test_flydsl_causal_conv1d_update.py
@@ -111,7 +116,25 @@ def _load_live_sglang():
     return None
 
 
+def _load_live_vllm():
+    """vLLM's own Triton kernel, when the package happens to be importable.
+
+    The counterpart of :func:`_load_live_sglang`. It is the only oracle for the
+    varlen combinations, whose per-sequence ``state_len`` revision the dense path
+    cannot express, so those cases skip without it rather than assert something
+    weaker.
+    """
+    try:
+        module = importlib.import_module(
+            "vllm.model_executor.layers.mamba.ops.causal_conv1d"
+        )
+    except Exception:  # noqa: BLE001 - absent, or unimportable standalone
+        return None
+    return getattr(module, "causal_conv1d_update", None)
+
+
 causal_conv1d_update_sglang_live = _load_live_sglang()
+causal_conv1d_update_vllm_live = _load_live_vllm()
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -288,9 +311,16 @@ def _reference_update(
                     for k in range(width - 1):
                         new_window[win_line, token, :, k] = win_raw[k]
 
-        # STEP 2: slide the stored window and blend in the new tokens.
+        # STEP 2: slide the stored window and blend in the new tokens. The slide
+        # is one column when a speculative rollback point is in play and the
+        # whole chunk otherwise, which only differ once 1 < seqlen < width - 1.
+        shift = 1 if is_spec else seqlen
         rolled = [
-            (raw[:, offset + 1 + t] if (t + seqlen) < state_len else x[i, :, t - val])
+            (
+                raw[:, offset + shift + t]
+                if (t + seqlen) < state_len
+                else x[i, :, t - val]
+            )
             for t in range(state_len)
         ]
         new_state[line, :, :state_len] = torch.stack(rolled, dim=1)
@@ -352,6 +382,13 @@ _VLLM_CASES = [
     (4, 256, 4, 1, False),
     (64, 512, 4, 1, False),
     (2, 256, 3, 1, False),
+    # Multi-token without a rollback point, in the one band where the slide
+    # length is observable: 1 < seqlen < width - 1 keeps part of the rolled
+    # window coming from conv_state, and it then slides by the chunk length
+    # rather than by one column. At seqlen >= width - 1 every slot comes from x
+    # and the distinction vanishes, which is why width 4 / seqlen 2 is the only
+    # cell of this kind the Triton oracle (widths 2-4) can witness.
+    (4, 128, 4, 2, False),
     (8, 256, 4, 2, True),
     (32, 384, 4, 4, True),
     (16, 256, 4, 8, True),
@@ -446,6 +483,26 @@ def test_vllm_channels_per_thread_agree(channels_per_thread):
     )
 
 
+def test_cpt_policy_backs_off_for_long_speculative_windows():
+    """The channels-per-thread default has to track S, not just the batch.
+
+    Paired A/B measured +4.1% at S=4 but -2.4% at S=8, and the EAGLE tree path
+    runs at S=8, so a policy that only looked at the batch would hand the tree a
+    knob setting known to cost it time. Pinned here because the reversal is not
+    something the code can derive.
+    """
+    from aiter.ops.flydsl.causal_conv1d_update_kernels import _CPT_MAX, _pick_cpt
+
+    device = torch.device(DEVICE)
+    big_enough = 256  # batch past the occupancy target at dim=4096
+
+    assert _pick_cpt(big_enough, 4096, device, seqlen=4) == _CPT_MAX
+    assert _pick_cpt(big_enough, 4096, device, seqlen=5) == 1
+    assert _pick_cpt(big_enough, 4096, device, seqlen=8) == 1
+    # A small batch stays at 1 whatever the window: it is occupancy-bound first.
+    assert _pick_cpt(1, 256, device, seqlen=1) == 1
+
+
 def test_vllm_skips_the_null_block():
     """A sequence pointing at the null block keeps its output and cache line.
 
@@ -512,6 +569,14 @@ _SGLANG_CASES = [
     (4, 128, 4, 4, True, True, True),
     (4, 128, 2, 4, True, True, True),
     (4, 128, 3, 4, True, True, True),
+    # Tree links with `num_accept_tokens` left out. This is the shape SGLang's
+    # own target-verify sites send (gdn / kda / mamba2 all pass the tree and the
+    # snapshot but no accept count), and it is a distinct path: the accept count
+    # is what turns on the rollback and the wider state, so upstream and this
+    # port both fall to `offset = 0` and `state_len = width - 1` here and let the
+    # parent links carry the chain instead.
+    (8, 256, 4, 8, False, True, True),
+    (4, 128, 3, 4, False, False, True),
 ]
 
 
@@ -815,24 +880,418 @@ def test_predicates_accept_the_supported_slice():
     )
 
 
-def test_vllm_predicate_refuses_varlen_and_apc():
-    """The vLLM kernel implements neither varlen packing nor APC copy-on-write."""
+def test_vllm_predicate_accepts_varlen_and_apc():
+    """Both of vLLM's optional modes are in scope now, so neither may be refused."""
     t = _make_inputs(4, 256, 4, 1, spec=False, seed=19)
     marker = torch.zeros(4, dtype=torch.int32, device=DEVICE)
+    packed = t["x"].squeeze(-1) if t["x"].dim() == 3 else t["x"]
 
-    assert not _causal_conv1d_update_flydsl_supported(
-        t["x"], t["conv_state"], t["weight"], query_start_loc=marker
+    assert _causal_conv1d_update_flydsl_supported(
+        t["x"],
+        t["conv_state"],
+        t["weight"],
+        block_idx_last_scheduled_token=marker,
+        initial_state_idx=marker,
     )
-    assert not _causal_conv1d_update_flydsl_supported(
-        t["x"], t["conv_state"], t["weight"], block_idx_last_scheduled_token=marker
+    assert _causal_conv1d_update_flydsl_supported(
+        packed,
+        t["conv_state"],
+        t["weight"],
+        query_start_loc=torch.zeros(5, dtype=torch.int32, device=DEVICE),
+        max_query_len=1,
     )
+    # Packing without the token budget cannot be sized, so it stays out of scope.
     assert not _causal_conv1d_update_flydsl_supported(
-        t["x"], t["conv_state"], t["weight"], initial_state_idx=marker
+        packed,
+        t["conv_state"],
+        t["weight"],
+        query_start_loc=torch.zeros(5, dtype=torch.int32, device=DEVICE),
     )
-    with pytest.raises(NotImplementedError):
+
+
+def test_vllm_varlen_needs_indices_and_a_token_budget():
+    """Packed x hides the batch and the per-sequence budget; both must be given."""
+    t = _make_inputs(4, 256, 4, 1, spec=False, seed=31)
+    packed = t["x"].squeeze(-1)
+    qsl = torch.arange(5, dtype=torch.int32, device=DEVICE)
+
+    with pytest.raises(ValueError):
         causal_conv1d_update_flydsl(
-            t["x"], t["conv_state"], t["weight"], query_start_loc=marker
+            packed, t["conv_state"], t["weight"], query_start_loc=qsl, max_query_len=1
         )
+    with pytest.raises(ValueError):
+        causal_conv1d_update_flydsl(
+            packed,
+            t["conv_state"],
+            t["weight"],
+            conv_state_indices=torch.arange(4, dtype=torch.int32, device=DEVICE),
+            query_start_loc=qsl,
+        )
+
+
+def test_vllm_apc_needs_both_index_tensors():
+    """Upstream keys APC off one tensor then dereferences the other regardless."""
+    t = _make_inputs(4, 256, 4, 1, spec=False, seed=29)
+    marker = torch.zeros(4, dtype=torch.int32, device=DEVICE)
+
+    indices = torch.arange(4, dtype=torch.int32, device=DEVICE).unsqueeze(1)
+    with pytest.raises(ValueError):
+        causal_conv1d_update_flydsl(
+            t["x"],
+            t["conv_state"],
+            t["weight"],
+            conv_state_indices=indices,
+            block_idx_last_scheduled_token=marker,
+        )
+
+
+#: (width, max_query_len, spec, per-sequence token counts).
+_VARLEN_CASES = [
+    (4, 1, False, (1, 1, 1, 1)),
+    (4, 3, True, (3, 1, 2, 3)),
+    (4, 4, True, (4, 2, 1, 4, 3)),
+    (3, 2, True, (2, 1)),
+    # 1 < seqlen < width - 1 again, this time reached through the packed layout.
+    (4, 2, False, (2, 1, 2)),
+    # A slot with no tokens at all: upstream returns before writing anything, so
+    # its cache line has to come back untouched.
+    (4, 3, True, (3, 0, 2, 1)),
+    (4, 4, True, (0, 4)),
+]
+
+
+#: How far the output may sit from vLLM's Triton, in bf16 steps of its own
+#: magnitude. Not a rounding tie: the two kernels lower silu differently (see
+#: :func:`test_vllm_varlen_matches_live_vllm`), which costs a few steps on the
+#: dense path too, so this is sized to that and not to varlen.
+_VLLM_SILU_STEPS = 8
+
+#: The subset whose sequences are each equivalent to a dense problem. With a
+#: rollback point the window is history + accepted drafts, whose length tracks the
+#: sequence, and at max_query_len == 1 there is no padding to revise away. Without
+#: either, upstream narrows a short sequence's window below width - 1, which the
+#: dense entry point cannot express, so those cases rest on the live oracle below.
+_VARLEN_DENSE_EQUIVALENT = [c for c in _VARLEN_CASES if c[2] or c[1] == 1]
+
+
+def _pack(x_dense, lens):
+    """Dense ``(batch, dim, seqlen)`` -> vLLM's packed ``(cu_tokens, dim)``."""
+    rows = [x_dense[i, :, : lens[i]].T for i in range(len(lens))]
+    return torch.cat(rows, dim=0).contiguous()
+
+
+def _varlen_problem(width, seqlen, spec, lens):
+    batch, dim = len(lens), 128
+    gen = torch.Generator(device=DEVICE).manual_seed(sum(lens) * 17 + width * 7 + batch)
+    state_len = (width - 1 + (seqlen - 1)) if spec else (width - 1)
+    qsl = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    qsl[1:] = torch.tensor(lens, dtype=torch.int32, device=DEVICE).cumsum(0)
+    return {
+        "x_dense": torch.randn(
+            (batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE
+        ),
+        "conv_state": torch.randn(
+            (batch + 1, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+        ),
+        "weight": torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE),
+        "bias": torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE),
+        "indices": torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE),
+        # An empty slot never reaches the accept count upstream, so any value in
+        # it is legal; 1 keeps it inside the tensor's own range.
+        "nacc": (
+            torch.tensor([max(1, n) for n in lens], dtype=torch.int32, device=DEVICE)
+            if spec
+            else None
+        ),
+        "qsl": qsl,
+        "lens": lens,
+    }
+
+
+def _run_varlen(fn, t, seqlen, **extra):
+    state = t["conv_state"].clone()
+    out = fn(
+        _pack(t["x_dense"], t["lens"]),
+        state,
+        t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=t["indices"],
+        num_accepted_tokens=t["nacc"],
+        query_start_loc=t["qsl"],
+        max_query_len=seqlen,
+        **extra,
+    )
+    return out, state
+
+
+@pytest.mark.parametrize("width,seqlen,spec,lens", _VARLEN_DENSE_EQUIVALENT)
+def test_vllm_varlen_matches_the_dense_path(width, seqlen, spec, lens):
+    """Packing is a layout change, not a different computation.
+
+    For these cases each packed sequence is the dense problem at its own length,
+    so run every sequence on its own through the dense path -- already pinned
+    against Triton and the fp64 spec -- and require the packed batch to reproduce
+    it bit for bit. An empty slot must come back untouched, which is what upstream
+    does by returning before any store.
+    """
+    t = _varlen_problem(width, seqlen, spec, lens)
+    label = f"varlen w{width} s{seqlen} spec={spec} lens={lens}"
+    packed_out, packed_state = _run_varlen(causal_conv1d_update_flydsl, t, seqlen)
+
+    for i, n in enumerate(lens):
+        line = int(t["indices"][i])
+        if n == 0:
+            _assert_bit_exact(
+                label,
+                f"seq {i} empty slot untouched",
+                packed_state[line],
+                t["conv_state"][line],
+            )
+            continue
+        one_state = t["conv_state"][
+            line : line + 1, :, : (width - 1 + (n - 1)) if spec else (width - 1)
+        ].clone()
+        one_out = causal_conv1d_update_flydsl(
+            t["x_dense"][i : i + 1, :, :n].clone(),
+            one_state,
+            t["weight"],
+            bias=t["bias"],
+            activation="silu",
+            conv_state_indices=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+            num_accepted_tokens=None if t["nacc"] is None else t["nacc"][i : i + 1],
+            null_block_id=None,
+        )
+        got = packed_out[int(t["qsl"][i]) : int(t["qsl"][i]) + n].T.unsqueeze(0)
+        _assert_bit_exact(label, f"seq {i} output", got.contiguous(), one_out)
+        _assert_bit_exact(
+            label,
+            f"seq {i} rolled window",
+            packed_state[line, :, : one_state.shape[2]],
+            one_state[0],
+        )
+
+
+@pytest.mark.skipif(
+    causal_conv1d_update_vllm_live is None,
+    reason="the vllm package is not importable here",
+)
+@pytest.mark.parametrize("width,seqlen,spec,lens", _VARLEN_CASES)
+def test_vllm_varlen_matches_live_vllm(width, seqlen, spec, lens):
+    """The packed layout, against vLLM's own kernel on the same inputs.
+
+    ``conv_state`` carries the whole point of the mode -- which slots of which
+    cache line each sequence owns once its window has been narrowed, and that an
+    empty slot is left alone -- and it is assembled from copies, so it must agree
+    bit for bit. The output only has to stay close: this kernel emits the same
+    bare ``v_exp_f32`` / ``v_rcp_f32`` pair SGLang's Triton lowers silu to, while
+    vLLM's spells it ``acc / (1 + exp(-acc))``, and the two round apart by a few
+    bf16 steps on the dense path already (measured up to 3.5).
+    """
+    t = _varlen_problem(width, seqlen, spec, lens)
+    label = f"varlen-live w{width} s{seqlen} spec={spec} lens={lens}"
+
+    got, got_state = _run_varlen(causal_conv1d_update_flydsl, t, seqlen)
+    want, want_state = _run_varlen(causal_conv1d_update_vllm_live, t, seqlen)
+
+    _assert_bit_exact(label, "conv_state", got_state, want_state)
+    delta = (got.float() - want.float()).abs()
+    steps = delta / (_BF16_EPS * want.float().abs().clamp_min(1.0))
+    assert (steps <= _VLLM_SILU_STEPS).all(), (
+        f"{label}: output is {steps.max().item():.1f} bf16 steps from vLLM's, past "
+        f"the {_VLLM_SILU_STEPS} the two silu lowerings account for"
+    )
+
+
+def _with_apc_blocks(t):
+    """Give a varlen problem two disjoint cache blocks per sequence."""
+    batch = len(t["lens"])
+    gen = torch.Generator(device=DEVICE).manual_seed(batch * 13 + 5)
+    state_len = t["conv_state"].shape[-1]
+    dim = t["conv_state"].shape[1]
+    t["conv_state"] = torch.randn(
+        (2 * batch + 1, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+    blocks = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+    t["read_blocks"] = 1 + 2 * blocks
+    t["write_blocks"] = 2 + 2 * blocks
+    t["indices"] = torch.stack((t["read_blocks"], t["write_blocks"]), dim=1)
+    t["init_col"] = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+    t["last_col"] = torch.ones(batch, dtype=torch.int32, device=DEVICE)
+    return t
+
+
+@pytest.mark.parametrize("width,seqlen,spec,lens", _VARLEN_CASES)
+def test_vllm_varlen_with_apc_copies_instead_of_clobbering(width, seqlen, spec, lens):
+    """The two optional modes compose, which is how vLLM's MTP sites call this.
+
+    Packing decides which tokens a sequence owns and APC decides which cache
+    block its window lands on; neither should disturb the other, so the packed run
+    with APC must reproduce the packed run reading the same blocks without it, and
+    the block the history came from must survive. Only the slots a sequence
+    actually owns are compared: packing narrows a short sequence's window, and
+    whatever the destination block held beyond it is left in place -- which the
+    last assertion pins.
+    """
+    t = _with_apc_blocks(_varlen_problem(width, seqlen, spec, lens))
+    label = f"varlen+apc w{width} s{seqlen} spec={spec} lens={lens}"
+    original = t["conv_state"].clone()
+    val = original.shape[-1] - seqlen  # slots still fed by conv_state
+
+    plain_out, plain_state = _run_varlen(
+        causal_conv1d_update_flydsl, {**t, "indices": t["read_blocks"]}, seqlen
+    )
+    apc_out, apc_state = _run_varlen(
+        causal_conv1d_update_flydsl,
+        t,
+        seqlen,
+        block_idx_last_scheduled_token=t["last_col"],
+        initial_state_idx=t["init_col"],
+    )
+
+    _assert_bit_exact(label, "output", apc_out, plain_out)
+    for i, n in enumerate(lens):
+        read, write = int(t["read_blocks"][i]), int(t["write_blocks"][i])
+        owned = val + n if n else 0
+        _assert_bit_exact(
+            label,
+            f"seq {i} rolled window on the scheduled block",
+            apc_state[write, :, :owned],
+            plain_state[read, :, :owned],
+        )
+        _assert_bit_exact(
+            label,
+            f"seq {i} slots beyond the narrowed window",
+            apc_state[write, :, owned:],
+            original[write, :, owned:],
+        )
+        _assert_bit_exact(
+            label, f"seq {i} source block left alone", apc_state[read], original[read]
+        )
+
+
+#: (batch, dim, width, seqlen, spec). The first is vLLM's decode + APC call
+#: (``mamba_mixer``), the second its speculative one (``mamba_mixer2``) minus the
+#: varlen packing that site also uses.
+_APC_CASES = [
+    (4, 256, 4, 1, False),
+    (8, 256, 4, 4, True),
+    (4, 128, 3, 1, False),
+    (2, 128, 2, 2, True),
+]
+
+
+def _apc_problem(batch, dim, width, seqlen, spec, seed):
+    """An APC problem whose read and write blocks are disjoint.
+
+    Two cache lines per sequence, laid out so nothing aliases, and line 0 left
+    unused because the default ``null_block_id`` is the valid index ``0``.
+    ``conv_state_indices`` becomes ``(batch, 2)``: column 0 is the block the
+    state was last computed into, column 1 the block scheduled for this step.
+    """
+    t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=seed)
+    gen = torch.Generator(device=DEVICE).manual_seed(seed + 1)
+    state_len = t["conv_state"].shape[-1]
+    t["conv_state"] = torch.randn(
+        (2 * batch + 1, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+    blocks = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+    t["read_blocks"] = 1 + 2 * blocks
+    t["write_blocks"] = 2 + 2 * blocks
+    t["indices2d"] = torch.stack((t["read_blocks"], t["write_blocks"]), dim=1)
+    t["init_col"] = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+    t["last_col"] = torch.ones(batch, dtype=torch.int32, device=DEVICE)
+    return t
+
+
+@pytest.mark.parametrize("batch,dim,width,seqlen,spec", _APC_CASES)
+def test_vllm_apc_copies_instead_of_clobbering(batch, dim, width, seqlen, spec):
+    """APC only moves where the state is read from and written to.
+
+    So the output must be bit-identical to the plain path reading the same block,
+    the rolled window must land on the scheduled block, and the block it was read
+    from must come back untouched -- that last part is the whole point of the
+    mode, and the one a wrong write address would break silently.
+    """
+    t = _apc_problem(batch, dim, width, seqlen, spec, seed=batch * 41 + seqlen)
+    label = f"apc b{batch} d{dim} w{width} s{seqlen} spec={spec}"
+
+    plain_state = t["conv_state"].clone()
+    plain_out = causal_conv1d_update_flydsl(
+        t["x"].clone(),
+        plain_state,
+        t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=t["read_blocks"],
+        num_accepted_tokens=t["num_accepted"],
+    )
+
+    apc_state = t["conv_state"].clone()
+    apc_out = causal_conv1d_update_flydsl(
+        t["x"].clone(),
+        apc_state,
+        t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=t["indices2d"],
+        num_accepted_tokens=t["num_accepted"],
+        block_idx_last_scheduled_token=t["last_col"],
+        initial_state_idx=t["init_col"],
+    )
+
+    _assert_bit_exact(label, "output", apc_out, plain_out)
+    _assert_bit_exact(
+        label,
+        "rolled window on the scheduled block",
+        apc_state[t["write_blocks"]],
+        plain_state[t["read_blocks"]],
+    )
+    _assert_bit_exact(
+        label,
+        "source block left alone",
+        apc_state[t["read_blocks"]],
+        t["conv_state"][t["read_blocks"]],
+    )
+
+
+def test_vllm_apc_reads_the_selected_column():
+    """The read column is ``initial_state_idx``, not just "the first one".
+
+    Pointing both columns at the same block turns APC into an in-place update, so
+    the result has to match the plain path exactly. Getting the column arithmetic
+    wrong (say ignoring the index, or swapping the two) shows up here.
+    """
+    t = _apc_problem(4, 256, 4, 4, True, seed=97)
+    # Swap the columns and the index tensors with them: same read/write blocks.
+    swapped = torch.stack((t["write_blocks"], t["read_blocks"]), dim=1)
+
+    want_state = t["conv_state"].clone()
+    want = causal_conv1d_update_flydsl(
+        t["x"].clone(),
+        want_state,
+        t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=t["indices2d"],
+        num_accepted_tokens=t["num_accepted"],
+        block_idx_last_scheduled_token=t["last_col"],
+        initial_state_idx=t["init_col"],
+    )
+    got_state = t["conv_state"].clone()
+    got = causal_conv1d_update_flydsl(
+        t["x"].clone(),
+        got_state,
+        t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=swapped,
+        num_accepted_tokens=t["num_accepted"],
+        block_idx_last_scheduled_token=t["init_col"],
+        initial_state_idx=t["last_col"],
+    )
+    _assert_bit_exact("apc swapped columns", "output", got, want)
+    _assert_bit_exact("apc swapped columns", "conv_state", got_state, want_state)
 
 
 def test_sglang_predicate_refuses_circular_buffer():
@@ -884,6 +1343,7 @@ def main():
     cases = [
         (test_vllm_against_spec_and_aiter_triton, _VLLM_CASES),
         (test_vllm_channels_per_thread_agree, [(1,), (2,)]),
+        (test_cpt_policy_backs_off_for_long_speculative_windows, [()]),
         (test_vllm_skips_the_null_block, [()]),
         (test_vllm_out_parameter_leaves_x_untouched, [()]),
         (test_sglang_against_spec, _SGLANG_CASES),
@@ -893,7 +1353,14 @@ def main():
         (test_dispatch_seam_preserves_2d_decode_shape, [()]),
         (test_dispatch_seam_is_off_by_default, [()]),
         (test_predicates_accept_the_supported_slice, [()]),
-        (test_vllm_predicate_refuses_varlen_and_apc, [()]),
+        (test_vllm_predicate_accepts_varlen_and_apc, [()]),
+        (test_vllm_varlen_needs_indices_and_a_token_budget, [()]),
+        (test_vllm_varlen_matches_the_dense_path, _VARLEN_DENSE_EQUIVALENT),
+        (test_vllm_varlen_matches_live_vllm, _VARLEN_CASES),
+        (test_vllm_varlen_with_apc_copies_instead_of_clobbering, _VARLEN_CASES),
+        (test_vllm_apc_needs_both_index_tensors, [()]),
+        (test_vllm_apc_copies_instead_of_clobbering, _APC_CASES),
+        (test_vllm_apc_reads_the_selected_column, [()]),
         (test_sglang_predicate_refuses_circular_buffer, [()]),
         (test_predicates_refuse_unsupported_shapes, [()]),
     ]

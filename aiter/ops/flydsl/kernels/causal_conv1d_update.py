@@ -44,6 +44,14 @@ Design (shared by both)
 * Work that does not depend on the channel -- the cache-line index, the rollback
   offset and the whole tree parent chain -- is computed once and shared by the
   ``C`` channels.
+* Addressing splits the way vLLM's does. A buffer access takes a 64-bit base and
+  a 32-bit offset, so the terms that scale with the batch or the cache size --
+  exactly the ones vLLM casts to ``tl.int64`` -- are folded into the descriptor
+  base and computed in 64 bits, while the per-channel and per-token remainder,
+  bounded by ``dim`` and ``state_len``, stays in the 32-bit offset. Without the
+  split a conv_state or packed ``x`` above 4 GiB wraps and reads the wrong lines
+  with no fault. The indices feeding a base are loaded into SGPRs, since a
+  descriptor base must be uniform (see ``_cache_line``).
 
 Faithful mapping to the upstream STEP 1-5
 -----------------------------------------
@@ -58,12 +66,22 @@ Faithful mapping to the upstream STEP 1-5
 
 Scope
 -----
-Both cover the core decode (no accepted-token tensor) and the speculative verify
-paths. Neither implements vLLM's varlen packing (``query_start_loc``) or its
-Automatic-Prefix-Caching copy-on-write (``block_idx_last_scheduled_token`` /
-``initial_state_idx``); the SGLang one additionally leaves ``cache_seqlens``
-(circular buffer) unimplemented, matching SGLang's own Triton kernel, which
-ignores it and asserts it is ``None``.
+Each builder covers every mode of the kernel it ports. Beyond the shared decode
+and speculative-verify paths that means:
+
+* vLLM: varlen packing (``query_start_loc``, ``IS_VARLEN``) and
+  Automatic-Prefix-Caching copy-on-write (``block_idx_last_scheduled_token`` /
+  ``initial_state_idx``, ``IS_APC_ENABLED``), including both at once, which is how
+  its speculative sites call it.
+* SGLang: ``SAVE_INTERMEDIATE`` snapshots and the EAGLE tree. ``cache_seqlens``
+  (circular buffer) is left unimplemented, matching SGLang's own Triton kernel,
+  which ignores it and asserts it is ``None``.
+
+Upstream's remaining two flags have no counterpart here by construction:
+``NP2_STATELEN`` / ``NP2_SEQLEN`` are padding for Triton's power-of-two tiles,
+which fully unrolled loops do not need, and ``USE_GDC`` / ``launch_pdl`` gate
+NVIDIA's programmatic dependent launch, which both upstreams pass only when the
+architecture supports it and so never on ROCm.
 """
 
 from __future__ import annotations
@@ -92,12 +110,25 @@ def build_causal_conv1d_update_module(
     cs_vec: bool = False,
     o_vec: bool = False,
     channels_per_thread: int = 1,
+    is_apc_enabled: bool = False,
+    is_varlen: bool = False,
 ):
     """Build a FlyDSL decode/verify conv1d-update kernel for a fixed config.
 
     ``seqlen`` is the number of tokens processed per sequence (``1`` for plain
     decode, ``1 + K`` for chain verify) and is baked in as a compile-time
     constant, exactly like vLLM's ``seqlen: tl.constexpr``.
+
+    ``is_apc_enabled`` is vLLM's ``IS_APC_ENABLED``: it splits the cache line the
+    history is read from off the one the rolled window is written to, so a
+    prefix-cached block is copied rather than clobbered.
+
+    ``is_varlen`` is vLLM's ``IS_VARLEN``: ``x`` arrives packed as
+    ``(cu_tokens, dim)`` and each sequence's token count comes from
+    ``query_start_loc``, so ``seqlen`` becomes the *maximum* over the batch and
+    the per-sequence count is a runtime bound. ``state_len`` shrinks with it by
+    the same amount upstream does, which leaves ``VAL`` -- the number of window
+    slots still fed by ``conv_state`` -- a compile-time constant either way.
 
     ``channels_per_thread`` (CPT) makes one thread own that many feature
     channels, trading workgroup count for more independent loads in flight per
@@ -115,12 +146,24 @@ def build_causal_conv1d_update_module(
     SILU = bool(silu)
     IS_SPEC = bool(is_spec_decoding)
     HAS_NULL_BLOCK = bool(has_null_block)
+    IS_APC = bool(is_apc_enabled)
+    IS_VARLEN = bool(is_varlen)
+    ELEM_BYTES = 2  # bf16 / fp16 are the only element types this kernel takes
 
     # Effective conv_state window length (matches vLLM wrapper):
     #   spec  -> width - 1 + (seqlen - 1)   (history + K candidate slots)
     #   decode-> width - 1
     ST = (W - 1 + (S - 1)) if IS_SPEC else (W - 1)
     VAL = ST - S  # tokens before the first x column enters the rolled window
+    SHIFT = 1 if IS_SPEC else S  # conv_state slide, per vLLM's STEP 2
+
+    # Upstream rewrites `seqlen` to the per-sequence token count before it slides
+    # the window, so without a rollback point a packed batch slides by a runtime
+    # amount and the source column is no longer a compile-time index into the
+    # history taps. Only this combination needs its own loads, and only while VAL
+    # is positive -- at seqlen >= width - 1 no slot comes from conv_state at all,
+    # and with a rollback point the slide is 1 either way.
+    RUNTIME_SHIFT = IS_VARLEN and not IS_SPEC and VAL > 0
 
     # Opt A: the W weight taps of one channel are contiguous (weight.stride(1)==1)
     # so load them in a single vec load instead of W scalar loads. vec_width
@@ -156,6 +199,9 @@ def build_causal_conv1d_update_module(
         cs_ptr: fx.Tensor,
         csi_ptr: fx.Tensor,
         nacc_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        blst_ptr: fx.Tensor,
+        isi_ptr: fx.Tensor,
         o_ptr: fx.Tensor,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
@@ -178,16 +224,37 @@ def build_causal_conv1d_update_module(
         def _rsrc(ptr):
             return buffer_ops.create_buffer_resource(ptr, max_size=True)
 
+        def _rsrc_at(ptr, index, stride):
+            """Descriptor whose base already includes ``index * stride`` elements.
+
+            The buffer offset operand is 32 bits wide in hardware, so a term that
+            scales with the batch or the cache size cannot live there. Folding it
+            into the descriptor base instead is the same split vLLM makes when it
+            promotes exactly these quantities to ``tl.int64`` and leaves the
+            per-channel arithmetic in 32 bits. The two factors are widened
+            separately: their product is what overflows.
+            """
+            byte_offset = (
+                index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+            )
+            return buffer_ops.create_buffer_resource(
+                ptr, max_size=True, base_byte_offset=byte_offset.ir_value()
+            )
+
         # Opt D: only build the buffer descriptors actually used. bias_ptr /
-        # nacc_ptr are dummy (x) when unused; skipping their resource creation
-        # drops the corresponding kernarg s_loads from the prologue.
-        x_r = _rsrc(x_ptr)
+        # nacc_ptr / qsl_ptr / blst_ptr / isi_ptr are dummy (x) when unused;
+        # skipping their resource creation drops the corresponding kernarg
+        # s_loads from the prologue.
         w_r = _rsrc(w_ptr)
         b_r = _rsrc(bias_ptr) if fx.const_expr(HAS_BIAS) else None
-        cs_r = _rsrc(cs_ptr)
         csi_r = _rsrc(csi_ptr)
         nacc_r = _rsrc(nacc_ptr) if fx.const_expr(IS_SPEC) else None
-        o_r = _rsrc(o_ptr)
+        qsl_r = _rsrc(qsl_ptr) if fx.const_expr(IS_VARLEN) else None
+        blst_r = _rsrc(blst_ptr) if fx.const_expr(IS_APC) else None
+        isi_r = _rsrc(isi_ptr) if fx.const_expr(IS_APC) else None
+        # x / out / conv_state are the ones whose offsets scale with the batch and
+        # the cache size, so their descriptors are built further down, once the
+        # sequence-level part of their address is known.
 
         tid = fx.Int32(fx.thread_idx.x)
         idx_seq = fx.Int32(fx.block_idx.x)
@@ -197,21 +264,95 @@ def build_causal_conv1d_update_module(
         # Everything here depends only on block_idx.x, so with CPT > 1 it is
         # computed once instead of once per channel.
 
-        # cache line selected for this sequence (APC disabled -> init index 0).
-        # Opt B (mode-specialized): the address is workgroup-uniform. In DECODE a
-        # scalar buffer load (result in an SGPR, shared by all 256 lanes) avoids
-        # 256 identical VMEM loads and is a net win. In VERIFY the scalar path
-        # measured net-negative (its s_load drain serializes worse than per-lane
-        # VMEM inside the longer verify pipeline), so keep the VMEM load there.
-        in_coord = fx.Int32(
-            buffer_ops.buffer_load(
-                csi_r,
-                idx_seq * scsi,
-                vec_width=1,
-                dtype=fx.Int32,
-                is_scalar=not IS_SPEC,
+        # Cache line(s) selected for this sequence. Without APC a single index is
+        # read from conv_state_indices and serves both the history load and the
+        # write-back. With APC conv_state_indices is 2D (batch, num_blocks) and
+        # the two ends differ: the history comes from the block the state was
+        # last computed into (``initial_state_idx``) while the rolled window goes
+        # to the block scheduled for this step
+        # (``block_idx_last_scheduled_token``), which is what makes a
+        # prefix-cached block copy-on-write instead of clobbered.
+        #
+        # Opt B (mode-specialized): the address is workgroup-uniform, so a scalar
+        # buffer load (result in an SGPR, shared by all 256 lanes) replaces 256
+        # identical VMEM loads. That was a win in DECODE but measured net-negative
+        # in VERIFY on its own -- the s_load drain serializes worse than per-lane
+        # VMEM inside the longer verify pipeline -- so VERIFY kept the VMEM load.
+        #
+        # Since the 64-bit terms went in the choice is forced and the sign flips:
+        # these indices reach a descriptor base, which has to be uniform, and a
+        # per-lane load does not tell the compiler that. It answers with a
+        # readfirstlane waterfall around every access built on the result -- +131
+        # instructions on varlen, more than the whole point of the exercise.
+        # Loading into an SGPR removes both the waterfall and the redundant VMEM,
+        # and verify came out 7-9% faster than 32-bit addressing rather than slower.
+        def _cache_line(block_offset):
+            return fx.Int32(
+                buffer_ops.buffer_load(
+                    csi_r, block_offset, vec_width=1, dtype=fx.Int32, is_scalar=True
+                )
             )
-        )
+
+        # Spelled as a branch rather than adding an index that is zero when APC
+        # is off, so the offset expression stays byte-identical in that case.
+        if fx.const_expr(IS_APC):
+            init_i = fx.Int32(
+                buffer_ops.buffer_load(
+                    isi_r, idx_seq, vec_width=1, dtype=fx.Int32, is_scalar=True
+                )
+            )
+            last_i = fx.Int32(
+                buffer_ops.buffer_load(
+                    blst_r, idx_seq, vec_width=1, dtype=fx.Int32, is_scalar=True
+                )
+            )
+            in_coord = _cache_line(idx_seq * scsi + init_i)
+            out_coord = _cache_line(idx_seq * scsi + last_i)
+        else:
+            in_coord = _cache_line(idx_seq * scsi)
+            out_coord = in_coord
+
+        # Packed layout: this sequence owns x[qs:qe], so its token count is a
+        # runtime value bounded by the compile-time S (= max_query_len). Upstream
+        # shrinks state_len by the same slack, which is why VAL stays constant and
+        # only the tail of the window and the output need runtime bounds.
+        if fx.const_expr(IS_VARLEN):
+            qs = fx.Int32(
+                buffer_ops.buffer_load(
+                    qsl_r, idx_seq, vec_width=1, dtype=fx.Int32, is_scalar=True
+                )
+            )
+            qe = fx.Int32(
+                buffer_ops.buffer_load(
+                    qsl_r,
+                    idx_seq + fx.Int32(1),
+                    vec_width=1,
+                    dtype=fx.Int32,
+                    is_scalar=True,
+                )
+            )
+            s_len = qe - qs
+            # An empty slot stores nothing, but its loads still issue, so point
+            # them at the start of the packed tensor: its own qs can sit one past
+            # the last token when it trails the batch.
+            nonempty = s_len > fx.Int32(0)
+            qs_eff = nonempty.select(qs, fx.Int32(0))
+            tok_hi = nonempty.select(s_len - fx.Int32(1), fx.Int32(0))
+            x_seq_idx, x_seq_stride = qs_eff, sx_tok
+            o_seq_idx, o_seq_stride = qs_eff, so_tok
+        else:
+            s_len = fx.Int32(S)
+            x_seq_idx, x_seq_stride = idx_seq, sx_seq
+            o_seq_idx, o_seq_stride = idx_seq, so_seq
+
+        # The sequence-level part of every large address goes into the descriptor
+        # base, computed in 64 bits, leaving the per-channel and per-token part --
+        # which is bounded by dim and state_len -- in the 32-bit buffer offset. The
+        # conv_state read and write bases differ only under APC.
+        x_r = _rsrc_at(x_ptr, x_seq_idx, x_seq_stride)
+        o_r = _rsrc_at(o_ptr, o_seq_idx, o_seq_stride)
+        cs_r = _rsrc_at(cs_ptr, in_coord, scs_seq)
+        cs_out_r = _rsrc_at(cs_ptr, out_coord, scs_seq) if IS_APC else cs_r
 
         # rollback point: spec -> num_accepted - 1, decode -> 0.
         # Opt B (verify): num_accepted_tokens is verify-only; keep it on VMEM
@@ -222,6 +363,13 @@ def build_causal_conv1d_update_module(
                 buffer_ops.buffer_load(nacc_r, idx_seq, vec_width=1, dtype=fx.Int32)
             )
             offset_dyn = nacc - fx.Int32(1)
+            if fx.const_expr(IS_VARLEN):
+                # Upstream returns on an empty slot before it ever reads the accept
+                # count, so nothing constrains that entry. This kernel issues its
+                # loads unconditionally and only guards the stores, so pin the
+                # offset for empty slots rather than address conv_state with
+                # whatever the padding happens to hold.
+                offset_dyn = (s_len > fx.Int32(0)).select(offset_dyn, fx.Int32(0))
         else:
             offset_dyn = fx.Int32(0)
 
@@ -251,11 +399,19 @@ def build_causal_conv1d_update_module(
             active = feat_ok & (in_coord < num_cache_lines)
             if fx.const_expr(HAS_NULL_BLOCK):
                 active = active & (in_coord != null_block_id)
+            if fx.const_expr(IS_VARLEN):
+                # An empty slot in the packed batch is skipped whole, as upstream
+                # returns before it writes anything.
+                active = active & (s_len > fx.Int32(0))
 
-            # per-(seq, channel) base offsets
-            cs_base = in_coord * scs_seq + gfeat * scs_dim
-            x_base = idx_seq * sx_seq + gfeat * sx_dim
-            o_base = idx_seq * so_seq + gfeat * so_dim
+            # per-(seq, channel) base offsets. Both cache coordinates already sit in
+            # their descriptor bases -- under APC the write-back lands on a
+            # different cache line than the history was read from, which is why
+            # there are two descriptors -- so what is left here is the per-channel
+            # term alone, shared by the read and the write.
+            cs_base = gfeat * scs_dim
+            x_base = gfeat * sx_dim
+            o_base = gfeat * so_dim
 
             # ============ PHASE 1: issue ALL loads up front ==================
             # Opt C: batch every VMEM load before any convert/compute so the
@@ -274,7 +430,16 @@ def build_causal_conv1d_update_module(
             # rolled conv_state slots and for the convolution.
             x_raw = []
             for tok in fx.range_constexpr(S):
-                off = x_base + fx.Int32(tok) * sx_tok
+                if fx.const_expr(IS_VARLEN and tok > 0):
+                    # Past this sequence's tokens the value is unused (every
+                    # consumer is store-guarded below), but the address must stay
+                    # inside the packed tensor, so clamp instead of masking: the
+                    # last sequence in the batch ends at the allocation. Token 0
+                    # needs no clamp, tok_hi being 0 when the slot is empty.
+                    tok_idx = (fx.Int32(tok) < s_len).select(fx.Int32(tok), tok_hi)
+                else:
+                    tok_idx = fx.Int32(tok)
+                off = x_base + tok_idx * sx_tok
                 x_raw.append(
                     elem_dtype(
                         buffer_ops.buffer_load(x_r, off, vec_width=1, dtype=elem_dtype)
@@ -316,16 +481,27 @@ def build_causal_conv1d_update_module(
                     )
                 )
 
+            if fx.const_expr(RUNTIME_SHIFT):
+                roll_raw = []
+                for t in fx.range_constexpr(VAL):
+                    off = cs_base + (offset_dyn + s_len + fx.Int32(t)) * scs_tok
+                    roll_raw.append(
+                        elem_dtype(
+                            buffer_ops.buffer_load(
+                                cs_r, off, vec_width=1, dtype=elem_dtype
+                            )
+                        )
+                    )
+
             # STEP 2 rolled window slots that come FROM conv_state:
-            #   new_state[t] = conv_state[offset + shift + t] if (t + S) < ST
-            #                  (shift = 1 in spec, S in decode)
+            #   new_state[t] = conv_state[offset + SHIFT + t] if (t + S) < ST
             #                = x[t - VAL]                     otherwise
             # Opt (dedup): the conv_state source column of every rolled slot is
-            # offset + (shift + t); the roll condition (t + S) < ST bounds it to
+            # offset + (SHIFT + t); the roll condition (t + S) < ST bounds it to
             # <= offset + (W-2), which is exactly the range already loaded into
             # col_raw above (col_raw[k] = conv_state[offset + k]). So the rolled
             # conv_state slots are re-reads of col_raw -- reuse them at store
-            # time (col_raw[shift + t]) instead of issuing W-2 duplicate loads.
+            # time (col_raw[SHIFT + t]) instead of issuing W-2 duplicate loads.
 
             # ============ PHASE 2: convert + convolution =====================
             cols = [c.to(fx.Float32) for c in col_raw]
@@ -361,15 +537,46 @@ def build_causal_conv1d_update_module(
 
             # ============ PHASE 3: guarded stores ============================
             # rolled conv_state window values (per token slot t in [0, ST)):
-            #   t <  VAL -> conv_state[offset + 1 + t] == col_raw[1 + t] (dedup)
+            #   t <  VAL -> conv_state[offset + SHIFT + t] == col_raw[SHIFT + t]
+            #               (or roll_raw[t] when the slide is only known at runtime)
             #   t >= VAL -> new x token  x_raw[t - VAL]
-            cs_vals = [
-                col_raw[1 + t] if fx.const_expr((t + S) < ST) else x_raw[t - VAL]
-                for t in fx.range_constexpr(ST)
-            ]
+            cs_vals = []
+            for t in fx.range_constexpr(ST):
+                if fx.const_expr((t + S) >= ST):
+                    cs_vals.append(x_raw[t - VAL])
+                elif fx.const_expr(RUNTIME_SHIFT):
+                    cs_vals.append(roll_raw[t])
+                else:
+                    cs_vals.append(col_raw[SHIFT + t])
 
-            if active:
-                _store_run(cs_vals, cs_r, cs_base, scs_tok, ST, CS_VEC)
+            if fx.const_expr(IS_VARLEN):
+                # Only VAL + s_len window slots and s_len outputs belong to this
+                # sequence; the rest of the compile-time run must keep whatever
+                # was there, so the stores are predicated one slot at a time and
+                # the vectorized runs above do not apply. The first VAL slots come
+                # from history and are always in range (s_len >= 1 here).
+                for t in fx.range_constexpr(ST):
+                    keep = (
+                        active
+                        if fx.const_expr(t < VAL)
+                        else active & (fx.Int32(t - VAL) < s_len)
+                    )
+                    if keep:
+                        buffer_ops.buffer_store(
+                            cs_vals[t], cs_out_r, cs_base + fx.Int32(t) * scs_tok
+                        )
+                for t in fx.range_constexpr(S):
+                    keep = (
+                        active
+                        if fx.const_expr(t == 0)
+                        else active & (fx.Int32(t) < s_len)
+                    )
+                    if keep:
+                        buffer_ops.buffer_store(
+                            o_vals[t], o_r, o_base + fx.Int32(t) * so_tok
+                        )
+            elif active:
+                _store_run(cs_vals, cs_out_r, cs_base, scs_tok, ST, CS_VEC)
                 _store_run(o_vals, o_r, o_base, so_tok, S, O_VEC)
 
         # Mapping mirrors SGLang's: channel c of this thread is
@@ -386,6 +593,9 @@ def build_causal_conv1d_update_module(
         cs_ptr: fx.Tensor,
         csi_ptr: fx.Tensor,
         nacc_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        blst_ptr: fx.Tensor,
+        isi_ptr: fx.Tensor,
         o_ptr: fx.Tensor,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
@@ -413,6 +623,9 @@ def build_causal_conv1d_update_module(
             cs_ptr,
             csi_ptr,
             nacc_ptr,
+            qsl_ptr,
+            blst_ptr,
+            isi_ptr,
             o_ptr,
             dim,
             num_cache_lines,
@@ -452,6 +665,8 @@ def compile_causal_conv1d_update(
     cs_vec: bool,
     o_vec: bool,
     channels_per_thread: int,
+    is_apc_enabled: bool = False,
+    is_varlen: bool = False,
 ):
     """Memoized :func:`build_causal_conv1d_update_module`.
 
@@ -471,6 +686,8 @@ def compile_causal_conv1d_update(
         cs_vec,
         o_vec,
         channels_per_thread,
+        is_apc_enabled,
+        is_varlen,
     )
 
 

@@ -8,8 +8,8 @@ kernels. They are the same algorithm behind two upstream interfaces, and both
 are maintained -- neither supersedes the other:
 
 * ``causal_conv1d_update_flydsl`` -- vLLM's interface, a drop-in for
-  ``aiter.ops.triton.conv.causal_conv1d.causal_conv1d_update`` on the decode /
-  chain-verify paths.
+  ``aiter.ops.triton.conv.causal_conv1d.causal_conv1d_update``, covering that
+  kernel's decode, chain-verify, varlen-packing and prefix-caching modes.
 * ``causal_conv1d_update_sglang_flydsl`` -- SGLang's interface, which adds
   per-step ``intermediate_conv_window`` snapshots and an EAGLE tree traversal.
 
@@ -108,6 +108,10 @@ _BLOCK_N_CANDIDATES = (256, 128, _WAVEFRONT)
 #: Largest channels-per-thread the kernels implement.
 _CPT_MAX = 2
 
+#: Longest speculative window that still measured a gain from ``_CPT_MAX``. Past
+#: it the knob reverses sign, and the EAGLE tree path runs at S=8 by default.
+_CPT_MAX_SEQLEN = 4
+
 #: Workgroups per CU the launch aims for. Two gives the scheduler something to
 #: swap in while a workgroup is stalled on memory without over-subscribing.
 #: A ratio, not a count, so it carries across parts unchanged.
@@ -185,7 +189,12 @@ def _target_wg(device: torch.device) -> int | None:
 
 
 def _pick_cpt(
-    batch: int, dim: int, device: torch.device, *, env: str | None = None
+    batch: int,
+    dim: int,
+    device: torch.device,
+    *,
+    seqlen: int = 1,
+    env: str | None = None,
 ) -> int:
     """Pick channels-per-thread.
 
@@ -200,10 +209,23 @@ def _pick_cpt(
 
     Occupancy is estimated at the widest span the tile search could pick, so this
     stays consistent with :func:`_pick_block_n`.
+
+    ``seqlen`` gates the whole thing, because the knob's sign turns over with the
+    speculative window rather than with the batch: paired A/B measured +4.1% at
+    S=4 but -2.4% at S=8, and the same reversal at S=8 on the vLLM-shaped sibling.
+    The plausible reading is that a longer window already keeps more live
+    registers per thread, so doubling the channels costs occupancy that the extra
+    memory-level parallelism no longer repays -- plausible but unverified, it
+    needs a VGPR count to confirm. Windows of 5 to 7 were never measured, so they
+    take the conservative side of the reversal: giving up an unmeasured gain is
+    preferable to a default that may carry an unmeasured regression. The
+    ``AITER_FLYDSL_CONV1D_CPT`` override stays the way to re-tune any of this.
     """
     override = _env_int(env)
     if override is not None:
         return override
+    if seqlen > _CPT_MAX_SEQLEN:
+        return 1
     target = _target_wg(device)
     if target is None:
         return 1
@@ -250,9 +272,13 @@ def _shapes_supported(
     weight: torch.Tensor,
     widths: range,
     is_spec: bool,
+    is_varlen: bool = False,
+    max_query_len: int = -1,
 ) -> bool:
     """Shape / dtype / placement checks shared by both interfaces."""
     if x.dim() not in (2, 3) or conv_state.dim() != 3 or weight.dim() != 2:
+        return False
+    if is_varlen and (x.dim() != 2 or max_query_len <= 0):
         return False
     if conv_state.dtype not in _SUPPORTED_DTYPES or x.dtype not in _SUPPORTED_DTYPES:
         return False
@@ -262,7 +288,8 @@ def _shapes_supported(
         return False
 
     dim = x.size(1)
-    seqlen = x.size(2) if x.dim() == 3 else 1
+    # Packed x carries no sequence axis, so the token budget comes from the caller.
+    seqlen = max_query_len if is_varlen else (x.size(2) if x.dim() == 3 else 1)
     width = weight.size(1)
     if width not in widths:
         return False
@@ -280,22 +307,25 @@ def _causal_conv1d_update_flydsl_supported(
     *,
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    max_query_len: int = -1,
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
 ) -> bool:
     """Whether ``causal_conv1d_update_flydsl`` can serve this problem.
 
-    The kernel covers the decode and chain speculative-verify paths of vLLM's
-    Triton ``causal_conv1d_update``, but not its varlen packing or its
-    Automatic-Prefix-Caching copy-on-write, so callers gate on this and fall
-    back to Triton for the rest.
+    The kernel covers every mode of vLLM's Triton ``causal_conv1d_update`` --
+    decode, chain speculative-verify, varlen packing and Automatic-Prefix-Caching
+    copy-on-write -- so this only screens the shapes and dtypes.
     """
-    if query_start_loc is not None:
-        return False
-    if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
-        return False
+    del block_idx_last_scheduled_token, initial_state_idx  # supported
     return _shapes_supported(
-        x, conv_state, weight, _VLLM_WIDTHS, num_accepted_tokens is not None
+        x,
+        conv_state,
+        weight,
+        _VLLM_WIDTHS,
+        num_accepted_tokens is not None,
+        is_varlen=query_start_loc is not None,
+        max_query_len=max_query_len,
     )
 
 
@@ -354,40 +384,65 @@ def causal_conv1d_update_flydsl(
     ``block_n`` narrows the tile at small batch so more workgroups launch and
     hide memory latency; auto ``channels_per_thread`` is 1, since measurement
     did not support spending it (see the call site). Pass a positive value to
-    force either. Implements the core (non-varlen, non-APC) decode + chain
-    speculative-verify path:
+    force either. Covers every mode of the upstream kernel -- decode, chain
+    speculative-verify, varlen packing and Automatic-Prefix-Caching
+    copy-on-write:
 
-    - ``x``:                ``(batch, dim)`` (single-token decode) or
-                            ``(batch, dim, seqlen)`` (multi-token / verify).
+    - ``x``:                ``(batch, dim)`` (single-token decode),
+                            ``(batch, dim, seqlen)`` (multi-token / verify) or
+                            ``(cu_tokens, dim)`` (varlen packing).
     - ``conv_state``:       ``(num_cache_lines, dim, state_len)``,
                             ``state_len >= width - 1 + (seqlen - 1)`` for verify.
                             Updated **in place** (matches vLLM).
     - ``weight``:           ``(dim, width)``.
     - ``bias``:             ``(dim,)`` or ``None``.
     - ``conv_state_indices``: ``(batch,)`` int32; selects the cache line per
-                            sequence. Defaults to ``arange(batch)``.
+                            sequence. ``(batch, num_blocks)`` under APC. Defaults
+                            to ``arange(batch)``.
     - ``num_accepted_tokens``: ``(batch,)`` int32. If given, enables the chain
                             speculative rollback (``offset = num_accepted-1``).
     - ``null_block_id``:    sequences whose cache line equals this id are skipped
                             (null/padding block, **0** upstream, not ``-1``);
                             pass ``None`` to disable the check.
+    - ``query_start_loc`` / ``max_query_len``: ``(batch + 1,)`` int32 cumulative
+                            token counts, turning on the packed ``(cu_tokens,
+                            dim)`` layout. ``max_query_len`` is the compile-time
+                            token budget; each sequence's real count is
+                            ``query_start_loc[i+1] - query_start_loc[i]`` and may
+                            be anything from ``0`` to it.
+    - ``block_idx_last_scheduled_token`` / ``initial_state_idx``: ``(batch,)``
+                            int32 Automatic-Prefix-Caching copy-on-write. Giving
+                            the former turns it on: the history is read from
+                            ``conv_state_indices[i, initial_state_idx[i]]`` and
+                            the rolled window written to
+                            ``conv_state_indices[i, block_idx_last_scheduled_token[i]]``,
+                            so a shared prefix block is copied, not clobbered.
     - ``out``:              optional output tensor shaped like ``x``. When
                             omitted the input is overwritten, as upstream does.
 
-    Not supported (raise ``NotImplementedError`` if used): ``query_start_loc``
-    / ``max_query_len`` (varlen packing) and ``block_idx_last_scheduled_token``
-    / ``initial_state_idx`` (Automatic Prefix Caching copy-on-write).
-
     Returns an output tensor with the same shape as ``x``.
     """
-    if query_start_loc is not None:
-        raise NotImplementedError(
-            "causal_conv1d_update_flydsl: varlen (query_start_loc) not supported"
-        )
-    if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
-        raise NotImplementedError(
-            "causal_conv1d_update_flydsl: APC (block_idx_last_scheduled_token / "
-            "initial_state_idx) not supported"
+    is_varlen = query_start_loc is not None
+    if is_varlen:
+        if conv_state_indices is None:
+            # batch is only recoverable from the index tensor here: x is packed
+            # and query_start_loc may be padded longer than the batch.
+            raise ValueError(
+                "`conv_state_indices` is required when `query_start_loc` is given."
+            )
+        if max_query_len <= 0:
+            raise ValueError(
+                "`max_query_len` must be positive when `query_start_loc` is given,"
+                f" got {max_query_len}."
+            )
+    is_apc = block_idx_last_scheduled_token is not None
+    if is_apc and initial_state_idx is None:
+        # Upstream keys the mode off block_idx_last_scheduled_token alone and then
+        # dereferences initial_state_idx unconditionally, so this combination is a
+        # null deref there; say so instead.
+        raise ValueError(
+            "`initial_state_idx` is required when `block_idx_last_scheduled_token`"
+            " is given."
         )
     silu = _resolve_activation(activation)
 
@@ -404,11 +459,23 @@ def causal_conv1d_update_flydsl(
         if out.dtype != original_dtype or out.device != x.device:
             raise ValueError("`out` must have the same dtype and device as `x`.")
 
-    unsqueeze = x.dim() == 2
+    unsqueeze = not is_varlen and x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)  # (batch, dim, 1)
         out = out.unsqueeze(-1)
-    batch, dim, seqlen = x.shape
+    if is_varlen:
+        # x is (cu_tokens, dim): the sequence axis is gone and the token axis is
+        # the outer one, so there is no per-sequence stride to walk.
+        batch = conv_state_indices.shape[0]
+        seqlen = int(max_query_len)
+        stride_x_tok, stride_x_dim = x.stride()
+        stride_o_tok, stride_o_dim = out.stride()
+        stride_x_seq = stride_o_seq = 0
+        dim = x.shape[1]
+    else:
+        batch, dim, seqlen = x.shape
+        stride_x_seq, stride_x_dim, stride_x_tok = x.stride()
+        stride_o_seq, stride_o_dim, stride_o_tok = out.stride()
     _, width = weight.shape
     num_cache_lines, cs_dim, state_len_phys = conv_state.shape
 
@@ -449,7 +516,10 @@ def causal_conv1d_update_flydsl(
     # (state_len=5, odd) sped up ~7-9% at batch >= 32 and decode (state_len=3)
     # ~7% at batch 128. So an even channel stride is not required.
     cs_vec = bool(conv_state.stride(2) == 1)
-    o_vec = bool(out.stride(2) == 1)
+    # Under varlen the packed layout puts the channel axis innermost, so one
+    # channel's tokens are dim apart and there is no run to vectorize; the
+    # per-slot store predication that path needs would rule it out anyway.
+    o_vec = bool(stride_o_tok == 1)
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
     launcher = compile_causal_conv1d_update(
@@ -465,18 +535,22 @@ def causal_conv1d_update_flydsl(
         cs_vec,
         o_vec,
         int(channels_per_thread),
+        bool(is_apc),
+        bool(is_varlen),
     )
     span = launcher._bn * launcher._cpt
     grid_y_dim = (dim + span - 1) // span
 
-    stride_x_seq, stride_x_dim, stride_x_tok = x.stride()
     stride_w_dim, stride_w_width = weight.stride()
     stride_cs_seq, stride_cs_dim, stride_cs_tok = conv_state.stride()
-    stride_o_seq, stride_o_dim, stride_o_tok = out.stride()
     stride_csi = conv_state_indices.stride(0)
 
     bias_arg = bias if bias is not None else x  # dummy ptr when HAS_BIAS=False
     nacc_arg = num_accepted_tokens if is_spec else x  # dummy ptr when not spec
+    # dummy ptrs when the mode is off; the kernel builds no descriptor for them
+    qsl_arg = query_start_loc if is_varlen else x
+    blst_arg = block_idx_last_scheduled_token if is_apc else x
+    isi_arg = initial_state_idx if is_apc else x
 
     _run_compiled(
         launcher,
@@ -486,6 +560,9 @@ def causal_conv1d_update_flydsl(
         conv_state,
         conv_state_indices,
         nacc_arg,
+        qsl_arg,
+        blst_arg,
+        isi_arg,
         out,
         int(dim),
         int(num_cache_lines),
@@ -610,14 +687,22 @@ def causal_conv1d_update_sglang_flydsl(
         )
 
     if out is None:
-        out = torch.empty_like(x)
+        out = torch.empty_like(x)  # SGLang allocates rather than overwriting x
     else:
+        # SGLang has no `out` parameter, so hold this extension to the contract
+        # vLLM defines for its own: same shape, dtype and device as the input.
         # x has already been cast to the conv_state dtype, which is what the
-        # kernel writes; a caller-supplied buffer has to match it.
-        if out.dtype != x.dtype:
-            raise NotImplementedError(
-                "causal_conv1d_update_sglang_flydsl: out must have the "
-                f"conv_state dtype {x.dtype}, got {out.dtype}"
+        # kernel writes, so that is what the buffer has to be.
+        # x is already unsqueezed here, so compare against the caller's shape.
+        want_shape = x.shape[:-1] if unsqueeze else x.shape
+        if out.shape != want_shape:
+            raise ValueError(
+                f"`out` shape {tuple(out.shape)} must match `x` shape "
+                f"{tuple(want_shape)}."
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError(
+                "`out` must have the conv_state dtype and the device of `x`."
             )
         if unsqueeze:
             out = out.unsqueeze(-1)
@@ -627,7 +712,7 @@ def causal_conv1d_update_sglang_flydsl(
 
     if channels_per_thread <= 0:
         channels_per_thread = _pick_cpt(
-            batch, dim, x.device, env="AITER_FLYDSL_CONV1D_CPT"
+            batch, dim, x.device, seqlen=seqlen, env="AITER_FLYDSL_CONV1D_CPT"
         )
     if block_n <= 0:
         block_n = _pick_block_n(
