@@ -26,21 +26,19 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
 
 
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
-    """Selects a CSV-authorized cluster degree; 1 means no clustering."""
-    if csv_cluster_n not in _SUPPORTED_CLUSTER_N:
-        return 1
-
+    """Selects the environment override or CSV cluster degree."""
+    env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
-        requested_cluster_n = int(
-            os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N", csv_cluster_n)
+        requested_cluster_n = (
+            int(env_cluster_n) if env_cluster_n is not None else int(csv_cluster_n)
         )
-    except ValueError:
-        return 1
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_N must be an integer") from exc
     if requested_cluster_n <= 1:
         return 1
-    if requested_cluster_n == csv_cluster_n and n_tiles % requested_cluster_n == 0:
-        return requested_cluster_n
-    return 1
+    if requested_cluster_n not in _SUPPORTED_CLUSTER_N:
+        return 1
+    return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
 
 
 def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
