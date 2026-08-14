@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -154,6 +155,52 @@ def test_ctypes_raw_fake_registration_is_torch_compile_visible():
         assert result.fake_mode is mode
 
 
+def test_ctypes_first_launch_primes_on_input_device(monkeypatch):
+    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    launch = inspect.unwrap(gemm._opus_gemm_a16w16_launch_ctypes_raw)
+    target = torch.device("cuda", 1)
+    events = []
+
+    class DeviceGuard:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            events.append(("enter", self.device))
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("exit", self.device))
+
+    monkeypatch.setattr(torch.cuda, "device", DeviceGuard)
+    monkeypatch.setattr(
+        gemm,
+        "_opus_gemm_a16w16_launch_raw",
+        lambda *args: events.append("launch"),
+    )
+    monkeypatch.setattr(
+        gemm, "_load_opus_a16w16_cabi", lambda: events.append("load")
+    )
+    monkeypatch.setattr(gemm, "_opus_a16w16_cabi_primed", False)
+
+    launch(
+        SimpleNamespace(device=target),
+        object(),
+        object(),
+        None,
+        object(),
+        200,
+        2,
+    )
+
+    assert events == [
+        ("enter", target),
+        "launch",
+        "load",
+        ("exit", target),
+    ]
+    assert gemm._opus_a16w16_cabi_primed is True
+
+
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 def test_gfx950_ctypes_matches_pybind_and_golden(output_dtype):
     gemm, config, XQ, WQ, Y_ctypes, workspace = _gfx950_case(
@@ -290,7 +337,8 @@ def test_gfx950_ctypes_two_streams_keep_workspace_ownership_external():
     torch.cuda.device_count() < 2,
     reason="requires two gfx950 devices for the C ABI device guard",
 )
-def test_gfx950_ctypes_switches_and_restores_current_device():
+@pytest.mark.parametrize("workspace_mode", ["automatic", "caller"])
+def test_gfx950_ctypes_switches_and_restores_current_device(workspace_mode):
     initial = torch.cuda.current_device()
     target = (initial + 1) % torch.cuda.device_count()
     target_arch = str(
@@ -303,17 +351,27 @@ def test_gfx950_ctypes_switches_and_restores_current_device():
     XQ = torch.randn((1, 64, 512), device=device, dtype=torch.bfloat16)
     WQ = torch.randn((1, 64, 512), device=device, dtype=torch.bfloat16)
     Y = torch.empty((1, 64, 64), device=device, dtype=torch.bfloat16)
-    workspace = torch.empty(
-        (2, 1, 64, 64), device=device, dtype=torch.float32
+    workspace = (
+        None
+        if workspace_mode == "automatic"
+        else torch.empty((2, 1, 64, 64), device=device, dtype=torch.float32)
     )
 
     opus = importlib.import_module("aiter.ops.opus")
-    opus.opus_gemm(
-        XQ, WQ, Y, kid=200, split_k=2, workspace=workspace
-    )
-    assert torch.cuda.current_device() == initial
-    torch.cuda.synchronize(device)
-    torch.testing.assert_close(Y.float(), _golden(XQ, WQ), rtol=0.03, atol=0.5)
+    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    # Make this deterministic in the full suite: the first iteration covers
+    # the guarded pybind priming launch and the second covers the C ABI guard.
+    gemm._opus_a16w16_cabi_primed = False
+    for _ in range(2):
+        Y.fill_(float("nan"))
+        opus.opus_gemm(
+            XQ, WQ, Y, kid=200, split_k=2, workspace=workspace
+        )
+        assert torch.cuda.current_device() == initial
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            Y.float(), _golden(XQ, WQ), rtol=0.03, atol=0.5
+        )
 
 
 @pytest.mark.skipif(

@@ -752,21 +752,28 @@ def _opus_gemm_a16w16_launch_ctypes_raw(
     """Launch through the private C ABI without modifying generic JIT code.
 
     The first call uses the existing pybind wrapper so its normal lazy-build,
-    rebuild and architecture checks remain authoritative.  It then loads the
-    C ABI from that same module; subsequent calls use the lower-overhead path.
+    rebuild and architecture checks remain authoritative.  Run that priming
+    launch on the input tensor's device: unlike the C ABI below, the pybind
+    entry does not install its own device guard.  It then loads the C ABI from
+    that same module; subsequent calls use the lower-overhead path.
     """
     global _opus_a16w16_cabi_primed
     if not _opus_a16w16_cabi_primed:
-        _opus_gemm_a16w16_launch_raw(
-            XQ,
-            WQ,
-            Y,
-            bias,
-            workspace,
-            kid,
-            split_k,
-        )
-        _load_opus_a16w16_cabi()
+        # torch.cuda.device restores the caller's current device on both the
+        # success and exception paths.  This is required when XQ lives on a
+        # non-current device, because the generated pybind launcher obtains
+        # its launch stream from the current device's TLS state.
+        with torch.cuda.device(XQ.device):
+            _opus_gemm_a16w16_launch_raw(
+                XQ,
+                WQ,
+                Y,
+                bias,
+                workspace,
+                kid,
+                split_k,
+            )
+            _load_opus_a16w16_cabi()
         _opus_a16w16_cabi_primed = True
         return None
     _invoke_opus_a16w16_cabi(XQ, WQ, Y, bias, workspace, kid, split_k)
