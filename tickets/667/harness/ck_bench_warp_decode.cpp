@@ -147,14 +147,52 @@ static const std::vector<Shape> ALL_SHAPES = {
     {"qwen3next", 2048, 512, 10, 512},
 };
 
-static stream_config make_cfg(int cold, int iters)
+// ---------------------------------------------------------------------------
+// Cold-HBM timing loop with disjoint-expert router rotation.
+//
+// WHY NOT stream_config flush/rotate: launch_warp_decode_* -> launch_kernel()
+// only ever calls timing_loop_impl(); it never reads s.flush_cache_ /
+// s.rotating_count_ (those are consumed by launch_kernel_time_mask_flush_cache
+// and the gemm-universal profiler, not this path). And ck_tile's "flush_cache"
+// is s_icache_inv -- it evicts the *instruction* cache, not the L2/MALL data
+// cache that holds the weights. So neither flag would make weight reads cold.
+//
+// Instead we mirror the FlyDSL cold harness: keep the full E-expert weight pool
+// resident, precompute `rotate` disjoint router-id groups that tile the pool
+// (group g -> experts [g*BK, g*BK+BK) mod E), and march a *continuous* launch
+// counter across warmup+timed so every launch reads a different expert group.
+// Any repeat is `rotate` launches apart == a full-pool sweep of HBM traffic
+// between reuses, so each timed launch reads its weights cold from HBM.
+template <typename Kern>
+static float bench_cold(
+    typename Kern::Kargs a, const int32_t* rids_base, int rotate, int bk, int cold, int iters)
 {
-    stream_config s{};
-    s.time_kernel_  = true;
-    s.cold_niters_  = cold;
-    s.nrepeat_      = iters;
-    s.is_gpu_timer_ = true;
-    return s;
+    stream_config s{}; // default stream (stream_id_ == 0)
+    int idx        = 0;
+    auto do_launch = [&]() {
+        a.p_router_ids = rids_base + static_cast<std::size_t>(idx % rotate) * bk;
+        ++idx;
+        make_kernel(Kern{}, Kern::GridSize(a), Kern::BlockSize(), 0, a)(s);
+    };
+
+    for(int i = 0; i < cold; ++i)
+        do_launch();
+    HIP_CHECK_ERROR(hipDeviceSynchronize());
+
+    hipEvent_t start, stop;
+    HIP_CHECK_ERROR(hipEventCreate(&start));
+    HIP_CHECK_ERROR(hipEventCreate(&stop));
+    HIP_CHECK_ERROR(hipEventRecord(start, s.stream_id_));
+    for(int i = 0; i < iters; ++i)
+        do_launch();
+    HIP_CHECK_ERROR(hipEventRecord(stop, s.stream_id_));
+    HIP_CHECK_ERROR(hipEventSynchronize(stop));
+
+    float ms = 0.f;
+    HIP_CHECK_ERROR(hipEventElapsedTime(&ms, start, stop));
+    HIP_CHECK_ERROR(hipEventDestroy(start));
+    HIP_CHECK_ERROR(hipEventDestroy(stop));
+    return (iters > 0) ? ms / iters : 0.f;
 }
 
 static void print_row(const std::string& shape,
@@ -200,14 +238,22 @@ static double dn_bytes(index_t B, index_t H, index_t I, index_t K, double we)
 // Bench one shape x batch
 // ---------------------------------------------------------------------------
 
-static void bench(const Shape& sh, index_t B, int cold, int iters)
+static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_env)
 {
     const index_t H = sh.H, I = sh.I, K = sh.K, E = sh.E;
+
+    // Cold rotation: `rotate` disjoint router-id groups that tile the E-expert
+    // pool (BK = B*K experts per group). Default (rotate_env <= 0) covers the
+    // whole pool -> ceil(E / BK); env CK_WD_ROTATE overrides (use 1 for the
+    // warm baseline). Any value >= 1 is valid; groups wrap over E when
+    // rotate*BK > E, and a wrap is still a full-pool traffic apart == cold.
+    const int bk     = static_cast<int>(B) * static_cast<int>(K);
+    const int rotate = (rotate_env > 0) ? rotate_env : std::max(1, (E + bk - 1) / bk);
 
     DeviceMem x_bf16_dev(B * H * sizeof(bf16_t));
     DeviceMem x_fp8_dev(B * H * sizeof(fp8_t));
     DeviceMem x_scale_fp8_dev(B * (H / 128) * sizeof(float));
-    DeviceMem router_ids_dev(B * K * sizeof(int32_t));
+    DeviceMem router_ids_dev(static_cast<std::size_t>(rotate) * bk * sizeof(int32_t));
     DeviceMem router_wts_dev(B * K * sizeof(float));
     DeviceMem inter_dev(B * K * I * sizeof(bf16_t));
     DeviceMem y_dev(B * H * sizeof(bf16_t));
@@ -220,13 +266,13 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
     DeviceMem w_up_dev(static_cast<std::size_t>(E) * I * H * sizeof(fp8_t));
     DeviceMem w_up_scale_dev(static_cast<std::size_t>(E) * I * (H / 128) * sizeof(float));
 
-    // Fill small tensors
+    // Fill small tensors. router_ids: `rotate` disjoint groups tiling the pool
+    // (rids[i] = i % E) so consecutive launches march sequentially through the
+    // experts and each group reads a fresh slice of the weight pool from HBM.
     {
-        std::vector<int32_t> rids(B * K);
-        std::mt19937 gen(42);
-        std::uniform_int_distribution<int32_t> dist(0, E - 1);
-        for(auto& r : rids)
-            r = dist(gen);
+        std::vector<int32_t> rids(static_cast<std::size_t>(rotate) * bk);
+        for(std::size_t i = 0; i < rids.size(); ++i)
+            rids[i] = static_cast<int32_t>(i % static_cast<std::size_t>(E));
         router_ids_dev.ToDevice(rids.data(), rids.size() * sizeof(int32_t));
     }
     {
@@ -241,8 +287,6 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
     auto x_sc_ptr  = static_cast<const float*>(x_scale_fp8_dev.GetDeviceBuffer());
     auto wg_sc_ptr = static_cast<const float*>(w_gate_scale_dev.GetDeviceBuffer());
     auto wu_sc_ptr = static_cast<const float*>(w_up_scale_dev.GetDeviceBuffer());
-
-    const auto cfg = make_cfg(cold, iters);
 
     // -- gate_up kernels (gate/up weights live here, freed before down) -------
     {
@@ -266,7 +310,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
         a.stride_intermediate = I;
         if(GUKernBF16::IsSupportedArgument(a))
         {
-            float ms = launch_warp_decode_gate_up<GUKernBF16>(a, cfg);
+            float ms = bench_cold<GUKernBF16>(a, rids_ptr, rotate, bk, cold, iters);
             print_row(sh.name,
                       B,
                       "gate_up_bf16",
@@ -296,7 +340,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
         a.stride_intermediate = I;
         if(GUKernBF16D2::IsSupportedArgument(a))
         {
-            float ms = launch_warp_decode_gate_up<GUKernBF16D2>(a, cfg);
+            float ms = bench_cold<GUKernBF16D2>(a, rids_ptr, rotate, bk, cold, iters);
             print_row(sh.name,
                       B,
                       "gate_bf16_d2",
@@ -326,7 +370,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
         a.stride_intermediate = I;
         if(GUKernFP8D2::IsSupportedArgument(a))
         {
-            float ms = launch_warp_decode_gate_up<GUKernFP8D2>(a, cfg);
+            float ms = bench_cold<GUKernFP8D2>(a, rids_ptr, rotate, bk, cold, iters);
             print_row(sh.name,
                       B,
                       "gate_fp8_d2",
@@ -361,7 +405,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
         a.stride_y            = H;
         if(DnKernFP8H2D2::IsSupportedArgument(a))
         {
-            float ms = launch_warp_decode_down_reduce<DnKernFP8H2D2>(a, cfg);
+            float ms = bench_cold<DnKernFP8H2D2>(a, rids_ptr, rotate, bk, cold, iters);
             print_row(sh.name,
                       B,
                       "down_h2_d2",
@@ -395,7 +439,7 @@ static void bench(const Shape& sh, index_t B, int cold, int iters)
         a.stride_y            = H;
         if(DnKernFP4H2::IsSupportedArgument(a))
         {
-            float ms = launch_warp_decode_down_reduce<DnKernFP4H2>(a, cfg);
+            float ms = bench_cold<DnKernFP4H2>(a, rids_ptr, rotate, bk, cold, iters);
             print_row(sh.name,
                       B,
                       "down_fp4_h2",
@@ -432,6 +476,9 @@ int main()
     auto batch_env = split_csv(std::getenv("CK_WD_BATCHES"));
     int cold       = std::getenv("CK_WD_COLD") ? std::stoi(std::getenv("CK_WD_COLD")) : 5;
     int iters      = std::getenv("CK_WD_ITERS") ? std::stoi(std::getenv("CK_WD_ITERS")) : 30;
+    // Cold-HBM router rotation: <=0 => auto (tile the whole E pool per shape),
+    // 1 => warm baseline (single fixed expert group), >1 => that many groups.
+    int rotate_env = std::getenv("CK_WD_ROTATE") ? std::stoi(std::getenv("CK_WD_ROTATE")) : 0;
 
     std::set<std::string> shape_filter(shape_env.begin(), shape_env.end());
     std::vector<index_t> batches;
@@ -439,6 +486,12 @@ int main()
         batches.push_back(std::stoi(b));
     if(batches.empty())
         batches = {1, 2, 4, 8};
+
+    // Config/provenance to stderr (keeps stdout table clean for parsing).
+    std::cerr << "# ck_bench_warp_decode  commit=62e30c9098" << "  cold=" << cold
+              << "  iters=" << iters << "  rotate="
+              << (rotate_env > 0 ? std::to_string(rotate_env) : std::string("auto(ceil(E/BK))"))
+              << "  mechanism=manual-hipEvent+disjoint-router-rotation\n";
 
     std::cout << std::left << std::setw(16) << "shape" << std::right << std::setw(4) << "B"
               << std::setw(18) << "kernel" << std::setw(10) << "ms" << std::setw(10) << "TFLOP/s"
@@ -450,6 +503,6 @@ int main()
         if(!shape_filter.empty() && shape_filter.find(sh.name) == shape_filter.end())
             continue;
         for(index_t B : batches)
-            bench(sh, B, cold, iters);
+            bench(sh, B, cold, iters, rotate_env);
     }
 }
