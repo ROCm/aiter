@@ -3913,6 +3913,7 @@ def mha_batch_prefill_func(
         _ok, _ = _fpp.is_supported(
             q,
             k,
+            v,
             causal=causal,
             logits_soft_cap=logits_soft_cap,
             alibi_slopes=alibi_slopes,
@@ -3920,12 +3921,18 @@ def mha_batch_prefill_func(
             return_attn_probs=return_attn_probs,
             window_size=window_size,
             sink_ptr=sink_ptr,
+            sink_size=sink_size,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            kv_block_descale=kv_block_descale,
+            dropout_p=dropout_p,
+            kv_last_page_lens=kv_last_page_lens,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
         )
-        # dropout and the block_table/vectorized layouts are CK-only entry points
-        if _ok and not dropout_p and block_table is None and kv_last_page_lens is None:
+        if _ok:
+            # every other argument is at its default here, guaranteed by is_supported
             return _fpp.mha_batch_prefill_func(
                 q,
                 k,
@@ -3935,16 +3942,7 @@ def mha_batch_prefill_func(
                 kv_page_indices,
                 max_seqlen_q,
                 max_seqlen_k,
-                causal=causal,
-                logits_soft_cap=logits_soft_cap,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-                window_size=window_size,
-                sink_ptr=sink_ptr,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
+                causal=True,
                 out=out,
                 softmax_scale=softmax_scale,
             )

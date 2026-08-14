@@ -40,7 +40,14 @@ _DEFAULT_CFG = {
     "waves_per_eu": 2,
     "kpack": 2,
     "matrix_instr_nonkdim": 16,
-    "PRESCALE_Q": 1,  # fold sm_scale*log2e into q (measured margin 0.28 of the 2e-2 budget)
+    # How the softmax scale reaches the QK product. 2 folds only the power-of-two part
+    # of sm_scale*log2e into q, which is exact in bf16, and applies the small remainder
+    # to the product. Mode 1 folds the whole thing and is 3.4% faster, but its rounding
+    # error is data-dependent: on a distribution with large late kv values it measured
+    # 7.0x the CK-tile path's error against an fp32 reference (6.8e-3 vs 9.7e-4), where
+    # mode 2 matches CK-tile to 1.00x. Not worth 3.4% on a path that silently replaces
+    # a more accurate kernel.
+    "PRESCALE_Q": 2,
     "DOT_ACC": 0,
     "SWAP_GRID": 1,  # head-major grid: 8 GQA heads of one (req, m-tile) dispatch together
     "CONTIG": 0,  # contiguous-page fast path measured SLOWER (11.6 vs 10.5 ms) -> off
@@ -226,6 +233,7 @@ Restricted rather than "any power of two" on purpose:
 def is_supported(
     q,
     k_cache,
+    v_cache=None,
     *,
     causal=True,
     logits_soft_cap=0.0,
@@ -234,26 +242,40 @@ def is_supported(
     return_attn_probs=False,
     window_size=(-1, -1),
     sink_ptr=None,
+    sink_size=0,
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    kv_block_descale=None,
+    dropout_p=0.0,
+    kv_last_page_lens=None,
+    block_table=None,
+    seqlen_k=None,
 ):
     """Return (supported, reason). Callers MUST gate on this before dispatching.
 
-    The two tensor-shape conditions are the dangerous ones, because unlike the
-    feature flags they do not fail loudly:
+    This is deliberately exhaustive over every argument of
+    `aiter.ops.mha.mha_batch_prefill_func` that changes what the op computes, so that
+    adding an argument there and forgetting it here fails closed rather than open.
+    Arguments the CK-tile path itself ignores (`deterministic`) are not listed.
 
-    * ``k_cache`` must present exactly ONE kv head. The kernel addresses K/V as
-      ``base + page * stride(0) + offs_d`` with no kv-head term, so with more than
-      one kv head every query head would silently read kv head 0 and return a
-      plausible-looking wrong answer (measured rms error ~1.0 vs a reference at
-      num_kv_heads=2). This is not a limitation that can be detected downstream.
-    * ``head_dim`` must be in :data:`SUPPORTED_HEAD_DIMS`.
+    Most conditions describe a feature this kernel does not implement, and getting
+    one wrong would be loud. The four that would be SILENT are:
+
+    * ``k_cache``/``v_cache`` must present exactly ONE kv head. K/V are addressed as
+      ``base + page * stride(0) + offs_d`` with no kv-head term, so with more than one
+      kv head every query head reads kv head 0 and the kernel returns a
+      plausible-looking wrong answer (measured rms error ~1.0 at num_kv_heads=2).
+    * ``kv_block_descale`` is a per-page K/V scale the kernel never applies.
+    * the head dim of V must equal that of Q, since one ``HEAD_DIM`` serves both.
+    * the last dim of q/k/v must be unit-stride, because ``offs_d`` is added to the
+      base pointer directly rather than multiplied by a stride.
 
     One kv head is the normal case for a GQA model whose kv heads are replicated
-    across tensor-parallel ranks (e.g. 4 kv heads at TP8 gives 1 per rank), which is
-    the configuration this was developed and measured against.
+    across tensor-parallel ranks (4 kv heads at TP8 gives 1 per rank), which is the
+    configuration this was developed and measured against.
     """
+    # --- features not implemented (all would be loud, but must not dispatch) ---
     if not causal:
         return False, "non-causal not implemented"
     if logits_soft_cap:
@@ -264,22 +286,48 @@ def is_supported(
         return False, "return_lse / return_attn_probs not implemented"
     if tuple(window_size) != (-1, -1):
         return False, "sliding window not implemented"
-    if sink_ptr is not None:
+    if sink_ptr is not None or sink_size:
         return False, "attention sinks not implemented"
     if q_descale is not None or k_descale is not None or v_descale is not None:
         return False, "fp8 descales not implemented"
+    if dropout_p:
+        return False, "dropout not implemented"
+    # block_table / kv_last_page_lens / seqlen_k select CK-only paged layouts
+    if block_table is not None:
+        return False, "block_table layout not implemented"
+    if kv_last_page_lens is not None:
+        return False, "kv_last_page_lens not implemented"
+    if seqlen_k is not None:
+        return False, "seqlen_k not implemented"
+
+    # --- conditions that would be SILENT if they were not checked here ---
+    if kv_block_descale is not None:
+        return False, "kv_block_descale (per-page K/V scale) not applied by this kernel"
     if q.dim() != 3:
         return False, f"expected q of rank 3 (tokens, heads, dim), got {q.dim()}"
-    if k_cache.dim() != 3 or k_cache.shape[1] != 1:
+    for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if t is None:
+            continue
         # rank 3 == the page_size=1 linear layout; shape[1] is the kv-head count
-        return (
-            False,
-            f"requires page_size=1 with a single kv head, got k_cache {tuple(k_cache.shape)}",
+        if t.dim() != 3 or t.shape[1] != 1:
+            return False, (
+                f"requires page_size=1 with a single kv head, got "
+                f"{name} {tuple(t.shape)}"
+            )
+    if v_cache is not None and v_cache.shape[-1] != q.shape[-1]:
+        return False, (
+            f"head dim of V ({v_cache.shape[-1]}) must equal that of Q "
+            f"({q.shape[-1]})"
         )
+    for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t is not None and t.stride(-1) != 1:
+            return False, f"{name} must be unit-stride in its last dim"
     if q.shape[-1] not in SUPPORTED_HEAD_DIMS:
         return False, f"head_dim {q.shape[-1]} not in {SUPPORTED_HEAD_DIMS}"
     if q.dtype not in (torch.bfloat16, torch.float16):
         return False, f"dtype {q.dtype} not supported"
+    if k_cache.dtype != q.dtype or (v_cache is not None and v_cache.dtype != q.dtype):
+        return False, "q/k/v dtypes must match"
     return True, ""
 
 
@@ -311,6 +359,7 @@ def mha_batch_prefill_func(
     ok, why = is_supported(
         q,
         k_cache,
+        v_cache,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
         alibi_slopes=alibi_slopes,
@@ -347,7 +396,12 @@ def mha_batch_prefill_func(
     else:
         _q_pre, _qk_scale = 1.0, _full
 
-    o = torch.empty_like(q)
+    if out is None:
+        o = torch.empty_like(q)
+    else:
+        if out.shape != q.shape or out.dtype != q.dtype or out.stride(-1) != 1:
+            raise ValueError("out must match q in shape/dtype and be unit-stride")
+        o = out
     bs = cu_seqlens_q.shape[0] - 1
     num_m = triton.cdiv(int(max_seqlen_q), BLOCK_M)
 

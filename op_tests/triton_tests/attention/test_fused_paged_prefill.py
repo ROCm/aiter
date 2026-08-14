@@ -53,7 +53,8 @@ def ref_attention(q, k_cache, v_cache, cu_q, kv_indptr, kv_pages, sm_scale):
     return out
 
 
-def make_inputs(bs, q_len, kv_len, H, D, Hkv=1, seed=0, device="cuda"):
+def make_inputs(bs, q_len, kv_len, H, D, Hkv=1, seed=0, device="cuda",
+                dtype=torch.bfloat16, dist="normal"):
     """Shared-prefix page layout: every request shares the first (kv_len - q_len)
     pages and owns a unique tail, which is what prefix caching produces."""
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -64,10 +65,19 @@ def make_inputs(bs, q_len, kv_len, H, D, Hkv=1, seed=0, device="cuda"):
     idx = [torch.cat([shared, tails[i * q_len : (i + 1) * q_len]]) for i in range(bs)]
     cu_q = torch.arange(bs + 1, dtype=torch.int32) * q_len
     kv_indptr = torch.arange(bs + 1, dtype=torch.int32) * kv_len
+
+    def mk(*sh):
+        t = torch.randn(*sh, generator=g) * 0.5
+        if dist == "spikes":
+            # large-magnitude values in the LAST tenth of the pool, so the running
+            # softmax max is revised late and the rescale path is exercised hard
+            t[int(t.shape[0] * 0.9) :] *= 12.0
+        return t.to(dtype).to(device)
+
     return (
-        (torch.randn(bs * q_len, H, D, generator=g) * 0.5).bfloat16().to(device),
-        (torch.randn(POOL_PAGES, Hkv, D, generator=g) * 0.5).bfloat16().to(device),
-        (torch.randn(POOL_PAGES, Hkv, D, generator=g) * 0.5).bfloat16().to(device),
+        mk(bs * q_len, H, D),
+        mk(POOL_PAGES, Hkv, D),
+        mk(POOL_PAGES, Hkv, D),
         cu_q.to(device),
         kv_indptr.to(device),
         torch.cat(idx).to(torch.int32).to(device),
@@ -81,9 +91,10 @@ def rms_rel(got, ref):
 
 @pytest.mark.parametrize("bs,q_len,kv_len", SHAPES)
 @pytest.mark.parametrize("D", SUPPORTED_HEAD_DIMS)
-def test_correctness(bs, q_len, kv_len, D):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_correctness(bs, q_len, kv_len, D, dtype):
     H = 8
-    q, k, v, cu_q, kv_indptr, pages = make_inputs(bs, q_len, kv_len, H, D)
+    q, k, v, cu_q, kv_indptr, pages = make_inputs(bs, q_len, kv_len, H, D, dtype=dtype)
     sm_scale = D**-0.5
     got = mha_batch_prefill_func(
         q, k, v, cu_q, kv_indptr, pages, q_len, kv_len, softmax_scale=sm_scale
@@ -125,6 +136,41 @@ def test_prescale_modes_agree(prescale, monkeypatch):
     assert rms_rel(got, ref) < 2e-2
 
 
+def test_default_scaling_mode_is_exact():
+    """The default must stay on a bf16-exact scaling mode.
+
+    Mode 1 is 3.4% faster but its rounding error is data-dependent: on a distribution
+    with large late kv values it measured 7.0x the CK-tile path's error against fp32
+    while still passing the 2e-2 budget above, so that budget alone does not protect
+    this choice.
+    """
+    from aiter.ops.triton.attention.fused_paged_prefill import _DEFAULT_CFG
+
+    assert _DEFAULT_CFG["PRESCALE_Q"] in (0, 2)
+
+
+@pytest.mark.parametrize("prescale", [1, 2])
+def test_exact_mode_is_robust_to_late_kv_spikes(prescale, monkeypatch):
+    """Pins the measurement behind the default: on the spiked distribution the exact
+    mode holds near the bf16 floor while the folded mode degrades by ~7x."""
+    import json
+
+    monkeypatch.setenv("AITER_FPP_CFG", json.dumps({"PRESCALE_Q": prescale}))
+    q_len, kv_len, D, H = 512, 8192, 256, 8
+    q, k, v, cu_q, kv_indptr, pages = make_inputs(2, q_len, kv_len, H, D, dist="spikes")
+    sm_scale = D**-0.5
+    got = mha_batch_prefill_func(
+        q, k, v, cu_q, kv_indptr, pages, q_len, kv_len, softmax_scale=sm_scale
+    )
+    ref = ref_attention(q, k, v, cu_q, kv_indptr, pages, sm_scale)
+    err = rms_rel(got, ref)
+    assert torch.isfinite(got).all()
+    if prescale == 2:
+        assert err < 2e-3, f"exact mode degraded on spiked kv: {err:.3e}"
+    else:
+        assert err < 2e-2
+
+
 def test_unsupported_calls_are_rejected():
     """Every condition in is_supported() must actually be reported, in particular the
     two that would otherwise be SILENT: >1 kv head and an unsupported head dim."""
@@ -153,3 +199,33 @@ def test_unsupported_calls_are_rejected():
     ]:
         ok, why = is_supported(q, k, **kwargs)
         assert not ok and expect in why, f"{kwargs} -> ({ok}, {why!r})"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_adversarial_distribution(dtype):
+    """Large-magnitude values late in the kv range force the online-softmax running
+    max to be revised on a late tile, which is where a rescale bug would show."""
+    bs, q_len, kv_len, H, D = 2, 512, 8192, 8, 256
+    q, k, v, cu_q, kv_indptr, pages = make_inputs(
+        bs, q_len, kv_len, H, D, dtype=dtype, dist="spikes"
+    )
+    sm_scale = D**-0.5
+    got = mha_batch_prefill_func(
+        q, k, v, cu_q, kv_indptr, pages, q_len, kv_len, softmax_scale=sm_scale
+    )
+    assert torch.isfinite(got).all(), "non-finite output on the spiked distribution"
+    ref = ref_attention(q, k, v, cu_q, kv_indptr, pages, sm_scale)
+    assert rms_rel(got, ref) < 2e-2
+
+
+def test_large_shape():
+    """One shape at the scale this kernel is actually for: a long shared prefix."""
+    bs, q_len, kv_len, H, D = 2, 2048, 40960, 8, 256
+    q, k, v, cu_q, kv_indptr, pages = make_inputs(bs, q_len, kv_len, H, D)
+    sm_scale = D**-0.5
+    got = mha_batch_prefill_func(
+        q, k, v, cu_q, kv_indptr, pages, q_len, kv_len, softmax_scale=sm_scale
+    )
+    assert torch.isfinite(got).all()
+    ref = ref_attention(q, k, v, cu_q, kv_indptr, pages, sm_scale)
+    assert rms_rel(got, ref) < 2e-2
