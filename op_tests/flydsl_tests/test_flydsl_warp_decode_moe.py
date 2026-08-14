@@ -1571,7 +1571,9 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         del inter8, w_down8, w_scale8, out8
         torch.cuda.empty_cache()
     else:
-        us8 = tbs8 = float("nan")  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
+        us8 = tbs8 = cos8 = float(
+            "nan"
+        )  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
 
     return {
         "gfx": get_gfx(),
@@ -1586,6 +1588,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
         "fp4_cos": cos4,
+        "fp8_cos": cos8,
         "TFLOPS_fp4": m4["TFLOPS"],
     }
 
@@ -1775,7 +1778,9 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
         del x8, wg8, wu8, out8
         torch.cuda.empty_cache()
     else:
-        us8 = tbs8 = float("nan")  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
+        us8 = tbs8 = cos8 = float(
+            "nan"
+        )  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
 
     return {
         "gfx": get_gfx(),
@@ -1790,6 +1795,7 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
         "fp4_cos": cos4,
+        "fp8_cos": cos8,
         "TFLOPS_fp4": m4["TFLOPS"],
     }
 

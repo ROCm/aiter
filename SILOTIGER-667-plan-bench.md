@@ -166,22 +166,27 @@ the FlyDSL cold harness.
 
 ### Group C — the comparison script
 
-#### C1 — write `compare.py` (generate both, then join/compare)  [ ]
-- [ ] Drive CK: subprocess the binary (path via `CK_BENCH`, exported by `build_ck_bench.sh`)
-      with `CK_WD_SHAPES/BATCHES/ITERS/COLD/FORMAT`; parse CSV into records keyed by
-      `(H,I,E,K,B,kernel)`.
-- [ ] Drive FlyDSL: import the op_test module (under `flydsl_venv`, GPU 6), call
-      `bench_down_cold` / `bench_gate_up_cold` over the same shapes/B/iters; **melt** the
-      two-op rows (`fp4_us` + `fp8_us` in one row) into per-op records.
-- [ ] Canonical op mapping: CK `gate_bf16_d2 → gate_up FP8`; `down_h2_d2 → down FP8`;
-      `down_fp4_h2 → down FP4`; `gate_up_fp4 → gate_up FP4`; `gate_fp8_d2 → gate_up FP8-act`.
-- [ ] Join on `(H,I,E,K,B,op)`; emit `ck_us`, `flydsl_us`, `ratio`, and TB/s recomputed via
-      the shared `compute_metrics` (default `weight_stream`; `total_traffic` optional) applied
-      to both sides. Carry FlyDSL `cos` as a sanity column; mark CK perf-only/unverified
-      (uninitialized weights). Handle n/a cells (DeepSeek FP8 until B5).
-- [ ] Output: markdown ratio table (for the plan) + optional CSV; print the provenance header.
-- **Depends on:** A1 (cold), A2 (machine-readable), B2 (TOPK), B3 (compute_metrics).
-  Fairness/completeness also depends on B1 (scale), A3 (B=32), A4/B4 (extra peers), B5 (Tier-2).
+#### C1 — write `compare.py` (generate both, then join/compare)  [x] DONE (2026-08-14)
+`tickets/667/harness/compare.py`; smoke-tested end-to-end on GPU 6 (qwen3next B=1).
+- [x] Drives CK via subprocess (path from `CK_BENCH`/`--ck-bench`) with
+      `CK_WD_SHAPES/BATCHES/ITERS/COLD` + `CK_WD_FORMAT=csv`; parses the CSV into records
+      keyed by dims, taking the **recommended** kernel per cell (stderr provenance captured).
+- [x] Drives FlyDSL by importing the op_test module and calling `bench_down_cold` /
+      `bench_gate_up_cold` over the same shapes/B/iters; **melts** the merged fp4+fp8 rows
+      into per-`(op,dtype,act)` records (with `cos`). Added `fp8_cos` to both cold dicts so
+      the FP8 sanity column populates.
+- [x] Canonical map `CK_MAP` (kernel → op/w_dtype/act_dtype/recommended): `gate_bf16_d2 →
+      gate_up fp8/bf16-act`; `down_h2_d2 → down fp8`; `down_fp4_h2 → down fp4`; `gate_up_fp4
+      → gate_up fp4` (CK pending A4); `gate_fp8_d2 → gate_up fp8/fp8-act` (FlyDSL pending B4).
+- [x] Joins on `(H,I,E,K,B,op,w_dtype,act_dtype)`; emits `flydsl_us`, `ck_us`, `ratio=f/c`,
+      and TB/s + %peak recomputed via the shared `compute_metrics` (`--method
+      weight_stream|total_traffic`) applied to both sides. Carries FlyDSL `cos`; CK marked
+      perf-only/uninitialized. n/a cells noted (DeepSeek FP8 → B5; gate_up FP4 CK → A4).
+- [x] Output: markdown ratio table (HTML-comment provenance header: gfx, aiter+CK commits,
+      iters/cold/timing/method, CK provenance line, config-policy note) + optional `--csv-out`.
+- **Depends on:** A1 (cold) ✅, A2 (CSV) ✅, B2 (TOPK) ✅, B3 (compute_metrics) ✅.
+  Fairness/completeness still depends on B1 (scale), A4/B4 (extra peers), B5 (Tier-2); those
+  cells show as n/a until landed.
 
 ### Group D — methodology, rigor, reproducibility
 
@@ -295,3 +300,7 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 - 2026-08-14 — **B3 done.** Added the shared `compute_metrics(method=weight_stream|
   total_traffic)` helper; routed both cold benches through it and verified `weight_stream`
   reproduces the prior TB/s & TFLOPS exactly. `total_traffic` pinned to CK `62e30c9098`.
+- 2026-08-14 — **C1 done.** `tickets/667/harness/compare.py` drives CK (CSV) + FlyDSL cold
+  benches, joins on dims, emits a ratio table (markdown + CSV) via the shared metrics helper;
+  smoke-tested on GPU 6. Added `fp8_cos` to the cold dicts for the sanity column. n/a cells
+  (gate_up FP4 CK → A4; DeepSeek FP8 → B5) render correctly.
