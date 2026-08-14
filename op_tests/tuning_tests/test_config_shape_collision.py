@@ -212,7 +212,42 @@ class TestConfigShapeCollision(unittest.TestCase):
         rows = bmm._load_mxscale_bmm_tuned("opus")
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"],
+            8311,
+            "legacy local OPUS kid 311 must become public global kid 8311",
+        )
+        self.assertEqual(
+            rows[("gfx950", 8, 128, 1024, 4096)]["kernelId"],
+            8653,
+            "legacy local OPUS kid 653 must become public global kid 8653",
+        )
         bmm._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_mxscale_kid_translation_does_not_touch_other_backends(self):
+        from aiter.ops import batched_gemm_op_a8w8 as bmm
+
+        env_name = bmm._MXSCALE_BMM_CONFIG_ENV
+        old_value = os.environ.get(env_name)
+        with tempfile.TemporaryDirectory(prefix="aiter_mxscale_kid_") as tmp:
+            config_path = os.path.join(tmp, "mixed.csv")
+            with open(config_path, "w") as f:
+                f.write("gfx,b,m,n,k,libtype,kernelId,splitK\n")
+                f.write("gfx950,2,1,1024,4096,opus,311,1\n")
+                f.write("gfx950,3,1,1024,4096,other,42,1\n")
+
+            try:
+                os.environ[env_name] = config_path
+                bmm._load_mxscale_bmm_tuned.cache_clear()
+                rows = bmm._load_mxscale_bmm_tuned()
+                self.assertEqual(rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"], 8311)
+                self.assertEqual(rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"], 42)
+            finally:
+                if old_value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = old_value
+                bmm._load_mxscale_bmm_tuned.cache_clear()
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")

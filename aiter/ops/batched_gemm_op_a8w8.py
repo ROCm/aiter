@@ -158,6 +158,8 @@ def batched_gemm_a8w8_CK(
 _MXSCALE_BMM_CONFIG_ENV = "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE"
 _MXSCALE_BMM_CONFIG_STEM = "batched_gemm_a8w8_blockscale_mxscale_tuned"
 _MXSCALE_BMM_KID_OFFSET = 8000
+_MXSCALE_BMM_LOCAL_KID_MAX = 653
+_MXSCALE_BMM_GLOBAL_KID_MAX = _MXSCALE_BMM_KID_OFFSET + _MXSCALE_BMM_LOCAL_KID_MAX
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
@@ -197,12 +199,38 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         raise ValueError(
             f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}"
         )
+
+    # PR #4320's checked-in tuned data uses the original private/local OPUS
+    # ids (0..653), while the unified public dispatcher owns the 8000 band.
+    # Keep the source CSV unchanged for upstream compatibility and translate
+    # only OPUS rows in memory.  Other backends may use their own id namespace.
+    opus_rows = (
+        df["libtype"].eq("opus")
+        if "libtype" in df.columns
+        else pd.Series(True, index=df.index, dtype=bool)
+    )
+    legacy_opus_rows = opus_rows & df["kernelId"].between(
+        0, _MXSCALE_BMM_LOCAL_KID_MAX
+    )
+    df.loc[legacy_opus_rows, "kernelId"] += _MXSCALE_BMM_KID_OFFSET
+
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype]
-    if not df.empty and int(df["kernelId"].min()) < _MXSCALE_BMM_KID_OFFSET:
+
+    selected_opus_rows = (
+        df["libtype"].eq("opus")
+        if "libtype" in df.columns
+        else pd.Series(True, index=df.index, dtype=bool)
+    )
+    invalid_opus_kids = selected_opus_rows & ~df["kernelId"].between(
+        _MXSCALE_BMM_KID_OFFSET, _MXSCALE_BMM_GLOBAL_KID_MAX
+    )
+    if invalid_opus_kids.any():
         raise ValueError(
             "MXFP8 BMM tuned CSV must contain global OPUS kids in the "
-            "8000-8653 range"
+            f"{_MXSCALE_BMM_KID_OFFSET}-{_MXSCALE_BMM_GLOBAL_KID_MAX} range "
+            "or legacy local OPUS kids in the "
+            f"0-{_MXSCALE_BMM_LOCAL_KID_MAX} range"
         )
     shape_keys = ["gfx", "b", "m", "n", "k"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
