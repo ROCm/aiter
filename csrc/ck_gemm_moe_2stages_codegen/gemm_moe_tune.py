@@ -3,6 +3,7 @@
 
 import functools
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -139,6 +140,33 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
     return cos_diff
+
+
+def _candidate_dump_tag(
+    gfx,
+    cu_num,
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    act_type,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+):
+    return re.sub(
+        r"[^0-9A-Za-z_.-]+",
+        "_",
+        (
+            f"{gfx}_cu{cu_num}_t{token}_h{model_dim}_i{inter_dim}_e{expert}_k{topk}"
+            f"_act{act_type}_dtype{dtype}_qa{q_dtype_a}_qw{q_dtype_w}_qt{q_type}"
+            f"_g1u1{int(use_g1u1)}_dw{int(doweight_stage1)}"
+        ),
+    )
 
 
 def _dump_prefilter_candidates(profile_df, args, stage_tag):
@@ -5161,10 +5189,21 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
-            dump_tag = re.sub(
-                r"[^0-9A-Za-z_.-]+",
-                "_",
-                f"{gfx}_cu{cu_num}_t{token}_h{model_dim}_i{inter_dim}_e{expert}_k{topk}_{q_dtype_a}_{q_dtype_w}",
+            dump_tag = _candidate_dump_tag(
+                gfx,
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
             )
             _dump_prefilter_candidates(profileDF, args, dump_tag)
             if args.verbose:
