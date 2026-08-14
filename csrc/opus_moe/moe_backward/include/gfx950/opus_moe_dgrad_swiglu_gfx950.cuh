@@ -508,9 +508,14 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             }
         });
         __syncthreads();
-        if(thread_id_x() < T::B_M)
+        constexpr int SCORE_REDUCE_WAVES = 4;
+        constexpr int SCORE_ROWS_PER_WAVE =
+            T::B_M / SCORE_REDUCE_WAVES;
+        if(wave_id < SCORE_REDUCE_WAVES &&
+           lane_id < SCORE_ROWS_PER_WAVE)
         {
-            const int local_row = thread_id_x();
+            const int local_row =
+                wave_id * SCORE_ROWS_PER_WAVE + lane_id;
             const int route_row = row + local_row;
             if(route_row < batch_m)
             {
