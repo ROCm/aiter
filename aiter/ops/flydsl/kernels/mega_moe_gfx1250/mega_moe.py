@@ -21,9 +21,50 @@ from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
+_DISPATCH_BACKENDS = ("flydsl", "mori")
+
+# mori's C++ EpArgs offset stems -> this package's arena region names. mori binds
+# all eight when a plan is built, though its dispatch dereferences only the first
+# six, so `outTok` -- combine staging this package does not have -- is aimed at a
+# region the dispatch never touches.
+_MORI_REGION_NAMES = {
+    "tokOff": "tok_off",
+    "recvNum": "recv_num",
+    "recvToSrc": "recv_to_src_token",
+    "outIdx": "out_idx",
+    "outWts": "out_wts",
+    "dispOut": "disp_out",
+    "outTok": "comb_inp",
+    "xdb": "cross_device_barrier",
+}
+
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _mori_dispatch_schedule(config) -> tuple:
+    """mori's own tuned buckets, as this package's (bound, block, warp) triples.
+
+    Not `_select_dispatch_config`'s: that table asks for 32 warps above 256
+    tokens, and mori's gfx1250 dispatch stages a hidden-dim tile per warp in
+    dynamic LDS -- 32 * 7168 * 2 = 458 KB, past the 320 KB the combine path
+    budgets against. EpCfgIsValid does not check LDS, so that would not be
+    rejected when the plan is built; it would fail at launch.
+    """
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
+
+    tuned = lookup(
+        config.world_size,
+        config.hidden_dim,
+        config.topk,
+        dtype="bf16",
+        experts_per_rank=config.experts_per_rank,
+    )
+    schedule = tuned["schedule"]
+    if schedule:
+        return tuple((bound, block, warp) for bound, block, warp, _, _ in schedule)
+    return ((None, tuned["dispatch_block_num"], tuned["warp_num_per_block"]),)
 
 
 class SymmetricArena:
@@ -77,8 +118,14 @@ class MegaMoEStage2Config:
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
+    dispatch_backend: str = "flydsl"
 
     def __post_init__(self):
+        if self.dispatch_backend not in _DISPATCH_BACKENDS:
+            raise ValueError(
+                f"dispatch_backend must be one of {_DISPATCH_BACKENDS}, "
+                f"got {self.dispatch_backend!r}"
+            )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > 64:
@@ -148,6 +195,7 @@ class MegaMoEGfx1250:
         w2_scale: torch.Tensor,
         max_tokens_per_rank: int,
         swiglu_limit: float = 0.0,
+        dispatch_backend: str | None = None,
     ):
         gfx = get_gfx()
         if gfx != "gfx1250":
@@ -212,6 +260,11 @@ class MegaMoEGfx1250:
                 max_tokens_per_rank=self.max_tokens_per_rank,
                 experts_per_rank=self.experts_per_rank,
                 topk=self.topk,
+                dispatch_backend=(
+                    dispatch_backend
+                    if dispatch_backend is not None
+                    else os.environ.get("MEGA_DISPATCH", "flydsl")
+                ),
             ),
             communicator,
         )
@@ -322,6 +375,11 @@ class MegaMoEGfx1250:
             device=device,
         )
 
+        if config.dispatch_backend == "mori":
+            # mori's dispatch is tuned on its own kernel, and its geometry is a
+            # compile-time Cfg field, so it brings its own buckets.
+            config.schedule = _mori_dispatch_schedule(config)
+
         if config.schedule:
             dispatch_specs = sorted(
                 {(block, warp) for _, block, warp in config.schedule}
@@ -334,26 +392,29 @@ class MegaMoEGfx1250:
                 )
             ]
         self._dispatch_specs = dispatch_specs
-        self._dispatch_variants = {
-            spec: _make_dispatch(
-                rank=config.rank,
-                npes=config.world_size,
-                experts_per_rank=config.experts_per_rank,
-                experts_per_token=config.topk,
-                hidden_dim=config.hidden_dim,
-                max_tok_per_rank=config.max_tokens_per_rank,
-                max_recv=config.max_recv,
-                off_tok_off=self._arena.offset("tok_off"),
-                off_recv_num=self._arena.offset("recv_num"),
-                off_tis=self._arena.offset("recv_to_src_token"),
-                off_out_idx=self._arena.offset("out_idx"),
-                off_out_wts=self._arena.offset("out_wts"),
-                off_out_tok=self._arena.offset("disp_out"),
-                block_num=spec[0],
-                warp_num_per_block=spec[1],
-            )
-            for spec in dispatch_specs
-        }
+        if config.dispatch_backend == "mori":
+            self._dispatch_variants = self._build_mori_dispatch(config)
+        else:
+            self._dispatch_variants = {
+                spec: _make_dispatch(
+                    rank=config.rank,
+                    npes=config.world_size,
+                    experts_per_rank=config.experts_per_rank,
+                    experts_per_token=config.topk,
+                    hidden_dim=config.hidden_dim,
+                    max_tok_per_rank=config.max_tokens_per_rank,
+                    max_recv=config.max_recv,
+                    off_tok_off=self._arena.offset("tok_off"),
+                    off_recv_num=self._arena.offset("recv_num"),
+                    off_tis=self._arena.offset("recv_to_src_token"),
+                    off_out_idx=self._arena.offset("out_idx"),
+                    off_out_wts=self._arena.offset("out_wts"),
+                    off_out_tok=self._arena.offset("disp_out"),
+                    block_num=spec[0],
+                    warp_num_per_block=spec[1],
+                )
+                for spec in dispatch_specs
+            }
 
         combine_override = os.environ.get("SCATTER_COMB_BW")
         if combine_override:
@@ -377,6 +438,91 @@ class MegaMoEGfx1250:
             )
             for spec in combine_specs
         }
+
+    def _build_mori_dispatch(self, config: MegaMoEStage2Config) -> dict:
+        """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
+
+        Only the kernel changes. mori leaves the same arena state this package's
+        own dispatch does -- disp_out rows at slot*hidden, out_idx/out_wts at
+        slot*topk+k, and recv_to_src_token as src_pe*max_tok+src_tok, which is
+        what the GEMM host pass decodes to build ep_rowmap -- so gemm1, the
+        gemm2 P2P scatter and the fused combine are untouched. It also never
+        touches cross_device_barrier (its cross-rank rendezvous is the same
+        recv_num signal/ack handshake), so the combine's epoch is undisturbed.
+
+        The recv SLOT a token lands in does change: mori's gfx1250 dispatch
+        reserves a block's slots with one atomic and hands them out block-local.
+        Nothing indexes by slot order -- routing goes through the reverse map --
+        but a test comparing arena contents slot-by-slot against the FlyDSL
+        dispatch will differ.
+        """
+        try:
+            from mori.ops.dispatch_combine_v2.ep_plans import EpDispatchPlan
+        except ImportError as error:
+            raise RuntimeError(
+                "dispatch_backend='mori' needs a mori with ops/dispatch_combine_v2 "
+                "(JIT v2, PR #548 or later)"
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                "dispatch_backend='mori' needs mori's libmori_ops_v2.so; it is "
+                "built by mori's CMake and is not shipped by every install"
+            ) from error
+
+        plans = {}
+        for spec in self._dispatch_specs:
+            plan = EpDispatchPlan(
+                world_size=config.world_size,
+                hidden_dim=config.hidden_dim,
+                max_tok_per_rank=config.max_tokens_per_rank,
+                num_expert_per_rank=config.experts_per_rank,
+                num_expert_per_token=config.topk,
+                max_recv=config.max_recv,
+                dtype=torch.bfloat16,
+                use_weights=True,
+                block_num=spec[0],
+                warp_per_block=spec[1],
+                arena=self._arena,
+                region_names=_MORI_REGION_NAMES,
+            )
+            plan.bind(rank=config.rank)
+            plans[spec] = plan
+        # The kernels dereference the window, so the plans have to outlive them.
+        self._mori_plans = plans
+
+        def make_variant(plan):
+            def launch(
+                arena_handle,
+                addr_inp_tok,
+                addr_inp_idx,
+                addr_inp_wts,
+                addr_tok_map,
+                addr_dest_ctr,
+                addr_disp_bar,
+                addr_total_recv,
+                my_lsa_rank,
+                inp_cur_tok,
+                stream,
+            ):
+                # This package's dispatch zeroes total_recv in its own Phase 2;
+                # mori's only accumulates into it, and the fused combine never
+                # resets it, so without this it grows every forward.
+                self._total_recv.zero_()
+                plan.launch(
+                    stream=torch.cuda.current_stream().cuda_stream,
+                    token_indices=addr_inp_idx,
+                    inp_token_buf=addr_inp_tok,
+                    weights_buf=addr_inp_wts,
+                    disp_dest_tok_id_map=addr_tok_map,
+                    dest_pe_token_counter=addr_dest_ctr,
+                    total_recv_token_num=addr_total_recv,
+                    grid_barrier=addr_disp_bar,
+                    num_tokens=inp_cur_tok,
+                )
+
+            return launch
+
+        return {spec: make_variant(plan) for spec, plan in plans.items()}
 
     def _select_dispatch(self, token_count: int) -> tuple[int, int]:
         if not self._config.schedule:
