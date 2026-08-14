@@ -91,8 +91,8 @@ Current gfx950 long-sequence dense ASM kernel throughput, excluding Q/K/V prepro
 |---|---|---:|
 | INT8 | FP8 | 2315 |
 | FP8 | FP8 | 3118 |
-| MXFP6 | FP8 | 3430 |
-| MXFP6 | MXFP4 | 3544 |
+| MXFP6 | FP8 | 3450 |
+| MXFP6 | MXFP4 | 3610 |
 | MXFP4 | FP8 | 3650 |
 | MXFP4 | MXFP4 | 4000 |
 
