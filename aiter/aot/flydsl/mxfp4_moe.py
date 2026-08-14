@@ -82,6 +82,8 @@ def _job_key(job: dict) -> tuple:
             job["enable_bias"],
             job["interleave"],
             job["native_scale_layout"],
+            job["num_waves"],
+            job["k_wave"],
         )
     return (
         2,
@@ -257,6 +259,8 @@ def parse_csv(csv_path: str):
                         "interleave": p1["interleave"],
                         "native_scale_layout": p1["BM"] == 16
                         and kn2.startswith("flydsl_mxmoe_g2_"),
+                        "num_waves": p1.get("num_waves", 4),
+                        "k_wave": p1.get("k_wave", 1),
                     }
                 )
 
@@ -366,6 +370,8 @@ def _compile_stage1(job):
         bias=d if job["enable_bias"] else None,
         interleave=job["interleave"],
         native_scale_layout=job["native_scale_layout"],
+        num_waves=job["num_waves"],
+        k_wave=job["k_wave"],
         stream=0,
     )
 

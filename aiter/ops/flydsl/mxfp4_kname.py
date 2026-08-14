@@ -10,7 +10,11 @@
 
 import re
 
-_MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
+_MXMOE_NUMERIC_TOKENS = {
+    "SK": "kSplitK",
+    "KW": "k_wave",
+    "XCD": "xcd_swizzle",
+}
 _MXMOE_G1_FLAG_TOKENS = {
     "NT",
     "F16IN",
@@ -60,6 +64,7 @@ def _make_mxfp4_g1_kname(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     num_waves: int = 4,
+    k_wave: int = 1,
 ) -> str:
     """Build a cache-safe GEMM1 name; legacy a4w4 names remain byte-for-byte."""
     a_dtype = str(a_dtype).lower()
@@ -73,6 +78,8 @@ def _make_mxfp4_g1_kname(
         raise ValueError(f"unsupported mxmoe GEMM1 activation: {act!r}")
     if num_waves not in (2, 4):
         raise ValueError(f"unsupported mxmoe GEMM1 num_waves: {num_waves!r}")
+    if k_wave not in (1, 2, 4):
+        raise ValueError(f"unsupported mxmoe GEMM1 k_wave: {k_wave!r}")
     family = "a8w4" if a_dtype == "fp8" else "a4w4"
     name = f"flydsl_mxmoe_g1_{family}_{int(BM)}x{int(BN)}x{int(BK)}"
     if inline_quant:
@@ -91,6 +98,8 @@ def _make_mxfp4_g1_kname(
         name += "_bias"
     if kSplitK:
         name += f"_sk{int(kSplitK)}"
+    if k_wave > 1:
+        name += f"_kw{int(k_wave)}"
     if xcd_swizzle:
         name += f"_xcd{int(xcd_swizzle)}"
     if num_waves == 2:
@@ -112,6 +121,7 @@ def _select_mxfp4_g1_kernel(
     interleave: bool = False,
     enable_bias: bool = False,
     num_waves: int = 4,
+    k_wave: int = 1,
 ) -> dict:
     """Select an MXMOE GEMM1 while retaining a tuned block_m when supplied."""
     routed_rows = int(token) * int(topk)
@@ -142,6 +152,7 @@ def _select_mxfp4_g1_kernel(
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
             num_waves=num_waves,
+            k_wave=k_wave,
         ),
     }
 
@@ -220,6 +231,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "act": act,
         "enable_bias": "BIAS" in flags,
         "num_waves": 2 if "W2" in flags else 4,
+        "k_wave": nums.get("k_wave", 1),
     }
 
 

@@ -63,6 +63,7 @@ def _get_compiled_mxfp4_gemm1_port(
     wide_mfma=False,
     wide_accumulators=1,
     num_waves=4,
+    k_wave=1,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -90,6 +91,7 @@ def _get_compiled_mxfp4_gemm1_port(
         wide_mfma=wide_mfma,
         wide_accumulators=wide_accumulators,
         num_waves=num_waves,
+        k_wave=k_wave,
     )
 
 
@@ -113,6 +115,7 @@ def _assert_supported(
     interleave=False,
     num_waves=4,
     native_scale_layout=False,
+    k_wave=1,
 ):
     if a_dtype not in _SUPPORTED_BY_DTYPE:
         raise NotImplementedError(
@@ -179,6 +182,30 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 native scale layout requires BM16 FP4 output"
         )
+    if k_wave not in (1, 2, 4):
+        raise NotImplementedError(
+            f"flydsl mxfp4 GEMM1 requires k_wave in (1, 2, 4), got {k_wave}"
+        )
+    if k_wave > 1:
+        if BM != 32:
+            raise NotImplementedError("k_wave > 1 is currently restricted to BM32")
+        if inline_quant:
+            raise NotImplementedError("k_wave > 1 does not support inline quantization")
+        if interleave:
+            raise NotImplementedError("k_wave > 1 requires separated gate/up layout")
+        if num_waves * k_wave > 8:
+            raise NotImplementedError(
+                f"k_wave creates too many waves: {num_waves} * {k_wave} > 8"
+            )
+        k_tiles = D_HIDDEN // BK
+        if k_tiles % k_wave != 0:
+            raise NotImplementedError(
+                f"D_HIDDEN/BK={k_tiles} must be divisible by k_wave={k_wave}"
+            )
+        if k_tiles // k_wave < 2:
+            raise NotImplementedError(
+                f"k_wave leaves fewer than 2 K tiles per wave: {k_tiles // k_wave}"
+            )
     if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
@@ -225,6 +252,7 @@ def flydsl_mxfp4_gemm1(
     wide_mfma=None,
     wide_accumulators=1,
     num_waves=4,
+    k_wave=1,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
     if wide_mfma is None:
@@ -261,6 +289,7 @@ def flydsl_mxfp4_gemm1(
         interleave=interleave,
         num_waves=num_waves,
         native_scale_layout=native_scale_layout,
+        k_wave=k_wave,
     )
     if not v2_output_layout and sorted_token_ids is None:
         raise ValueError(
@@ -292,6 +321,7 @@ def flydsl_mxfp4_gemm1(
         wide_mfma,
         wide_accumulators,
         num_waves,
+        k_wave,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     if BM == 16:
