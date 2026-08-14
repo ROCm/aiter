@@ -1898,6 +1898,64 @@ def flydsl_moe_stage1(
     )
 
 
+def flydsl_moe_tp_gemm1_all_ready(
+    *,
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    metadata,
+    topk: int,
+    tile_m: int = 32,
+    tile_n: int = 256,
+    tile_k: int = 256,
+    waves_per_eu: int = 3,
+    b_nt: int = 0,
+) -> torch.Tensor:
+    """Run the default-off single-launch TP Stage1 compute prerequisite.
+
+    ``metadata`` retains source-local sorted rows/scales but presents one
+    expert-major work descriptor.  This function intentionally has no ready
+    flags or communication side effects.
+    """
+    from .kernels.moe_tp_ag_gemm1 import (
+        TPStage1AllReadyMetadata,
+        compile_moe_tp_gemm1_all_ready,
+    )
+
+    if not isinstance(metadata, TPStage1AllReadyMetadata):
+        raise TypeError("metadata must be TPStage1AllReadyMetadata")
+    expected_tokens = metadata.source_count * metadata.tokens_per_source
+    if a.ndim != 2 or a.shape[0] != expected_tokens:
+        raise ValueError(
+            f"a must contain {expected_tokens} gathered tokens, got {tuple(a.shape)}"
+        )
+    compile_kernel = functools.partial(
+        compile_moe_tp_gemm1_all_ready, source_count=metadata.source_count
+    )
+    return _flydsl_moe_stage1_impl(
+        a=a,
+        w1=w1,
+        sorted_token_ids=metadata.sorted_token_ids,
+        sorted_expert_ids=metadata.work_descriptors,
+        num_valid_ids=metadata.num_valid_ids,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="silu",
+        w1_scale=w1_scale,
+        a1_scale=metadata.sorted_scales,
+        persist_m=0,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode="separated",
+        _compile_kernel=compile_kernel,
+    )
+
+
 def _flydsl_moe_stage2_impl(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
@@ -2266,6 +2324,20 @@ def flydsl_moe_stage2(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
     )
+
+
+def flydsl_moe_tp_register_peer_workspace(workspace: torch.Tensor) -> int:
+    """IPC-register a workspace and return its device peer-base table."""
+    if workspace.dtype != torch.uint8 or not workspace.is_contiguous():
+        raise ValueError("TP peer workspace must be a contiguous uint8 tensor")
+    from aiter.dist.parallel_state import get_tp_group
+
+    communicator = get_tp_group().device_communicator
+    ca_comm = communicator.ca_comm if communicator is not None else None
+    if ca_comm is None or ca_comm.disabled:
+        raise RuntimeError("TP peer direct-pull requires the custom-AR IPC communicator")
+    ca_comm.register_input_buffer(workspace)
+    return ca_comm.get_registered_input_buffer_rank_data(workspace)
 
 
 # Fused route-map + MX quant + scatter-copy + scale-preshuffle kernels

@@ -19,7 +19,9 @@ from dataclasses import dataclass, field
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
+from flydsl.expr.typing import T
 
 __all__ = [
     "GeometryTuningTable",
@@ -32,9 +34,19 @@ __all__ = [
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "load_i32_system_acquire",
+    "load_i64_agent_acquire",
     "load_i64_global",
+    "load_i64_system_acquire",
+    "store_i64_global_agent",
     "store_i32_system",
     "store_i64_global_system",
+    "wait_i64_agent_until_equals",
+    "wait_i32_system_until_equals",
+    "wait_i32_system_until_at_least",
+    "wait_i64_agent_until_at_least",
+    "wait_i64_system_until_equals",
+    "wait_i64_system_until_at_least",
 ]
 
 
@@ -80,6 +92,18 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
+def store_i64_global_agent(addr_i64, val):
+    """Same-GPU agent-scope release i64 store to ``addr_i64``."""
+    gptr = _to_ptr_global(addr_i64)
+    _llvm_d.StoreOp(
+        arith.unwrap(val),
+        gptr,
+        alignment=8,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    )
+
+
 def fence_acquire(syncscope):
     """Emit an acquire fence for the selected AMDGPU memory scope."""
     _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope=syncscope)
@@ -115,6 +139,121 @@ def load_i64_global(addr_i64):
     ptr = _to_ptr_global(addr_i64)
     _i64 = ir.IntegerType.get_signless(64)
     return _llvm_d.LoadOp(_i64, ptr, alignment=8).result
+
+
+def load_i32_system_acquire(addr_i64):
+    """System-scope acquire i32 load from ``addr_i64``."""
+    ptr = _to_ptr_global(addr_i64)
+    _i32 = ir.IntegerType.get_signless(32)
+    return _llvm_d.LoadOp(
+        _i32,
+        ptr,
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.acquire,
+        syncscope="one-as",
+    ).result
+
+
+def load_i64_system_acquire(addr_i64):
+    """System-scope acquire i64 load from ``addr_i64``."""
+    ptr = _to_ptr_global(addr_i64)
+    _i64 = ir.IntegerType.get_signless(64)
+    return _llvm_d.LoadOp(
+        _i64,
+        ptr,
+        alignment=8,
+        ordering=_llvm_d.AtomicOrdering.acquire,
+        syncscope="one-as",
+    ).result
+
+
+def load_i64_agent_acquire(addr_i64):
+    """Agent-scope acquire i64 load from ``addr_i64``."""
+    ptr = _to_ptr_global(addr_i64)
+    _i64 = ir.IntegerType.get_signless(64)
+    return _llvm_d.LoadOp(
+        _i64,
+        ptr,
+        alignment=8,
+        ordering=_llvm_d.AtomicOrdering.acquire,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    ).result
+
+
+def _wait_system_until_equals(addr_i64, expected, value_type, load):
+    """Emit a device-side acquire poll loop for one scalar generation."""
+    initial = load(addr_i64)
+    loop = scf.WhileOp([value_type], [initial])
+    before = ir.Block.create_at_start(loop.before, [value_type])
+    after = ir.Block.create_at_start(loop.after, [value_type])
+    with ir.InsertionPoint(before):
+        current = before.arguments[0]
+        keep_waiting = arith.CmpIOp(
+            arith.CmpIPredicate.ne, current, arith.unwrap(expected)
+        ).result
+        scf.ConditionOp(keep_waiting, [current])
+    with ir.InsertionPoint(after):
+        scf.YieldOp([load(addr_i64)])
+    return loop.results[0]
+
+
+def _wait_system_until_at_least(addr_i64, expected, value_type, load):
+    """Emit an acquire poll loop until a non-negative counter reaches a target."""
+    initial = load(addr_i64)
+    loop = scf.WhileOp([value_type], [initial])
+    before = ir.Block.create_at_start(loop.before, [value_type])
+    after = ir.Block.create_at_start(loop.after, [value_type])
+    with ir.InsertionPoint(before):
+        current = before.arguments[0]
+        keep_waiting = arith.CmpIOp(
+            arith.CmpIPredicate.slt, current, arith.unwrap(expected)
+        ).result
+        scf.ConditionOp(keep_waiting, [current])
+    with ir.InsertionPoint(after):
+        scf.YieldOp([load(addr_i64)])
+    return loop.results[0]
+
+
+def wait_i32_system_until_equals(addr_i64, expected):
+    """Poll until an i32 generation equals ``expected``, using acquire loads."""
+    return _wait_system_until_equals(
+        addr_i64, expected, T.i32, load_i32_system_acquire
+    )
+
+
+def wait_i32_system_until_at_least(addr_i64, expected):
+    """Poll until a non-negative i32 counter is at least ``expected``."""
+    return _wait_system_until_at_least(
+        addr_i64, expected, T.i32, load_i32_system_acquire
+    )
+
+
+def wait_i64_system_until_equals(addr_i64, expected):
+    """Poll until an i64 generation equals ``expected``, using acquire loads."""
+    return _wait_system_until_equals(
+        addr_i64, expected, T.i64, load_i64_system_acquire
+    )
+
+
+def wait_i64_system_until_at_least(addr_i64, expected):
+    """Poll until a non-negative i64 counter is at least ``expected``."""
+    return _wait_system_until_at_least(
+        addr_i64, expected, T.i64, load_i64_system_acquire
+    )
+
+
+def wait_i64_agent_until_at_least(addr_i64, expected):
+    """Poll a same-GPU i64 counter with agent-scope acquire loads."""
+    return _wait_system_until_at_least(
+        addr_i64, expected, T.i64, load_i64_agent_acquire
+    )
+
+
+def wait_i64_agent_until_equals(addr_i64, expected):
+    """Poll a same-GPU i64 generation with agent-scope acquire loads."""
+    return _wait_system_until_equals(
+        addr_i64, expected, T.i64, load_i64_agent_acquire
+    )
 
 
 def atomic_add_global_at(addr_i64, val, syncscope="one-as"):

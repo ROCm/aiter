@@ -658,6 +658,10 @@ namespace py = pybind11;
           py::arg("self_ptr"),                                                       \
           py::arg("ipc_handle_ptrs"),                                                \
           py::arg("offsets"));                                                       \
+    m.def("get_registered_input_buffer_rank_data",                                  \
+          &aiter::get_registered_input_buffer_rank_data,                             \
+          py::arg("_fa"),                                                            \
+          py::arg("self_ptr"));                                                      \
     m.def("get_graph_buffer_count", &aiter::get_graph_buffer_count, py::arg("_fa")); \
     m.def("get_graph_buffer_ipc_meta",                                               \
           &aiter::get_graph_buffer_ipc_meta,                                         \
@@ -674,7 +678,12 @@ namespace py = pybind11;
     m.def("get_meta_buffer_ipc_handle",                                              \
           &aiter::get_meta_buffer_ipc_handle,                                        \
           py::arg("inp_ptr"),                                                        \
-          py::arg("out_handle_ptr"));
+          py::arg("out_handle_ptr"));                                                \
+    m.def("get_buffer_ipc_meta",                                                     \
+          &aiter::get_buffer_ipc_meta,                                                \
+          py::arg("inp_ptr"),                                                        \
+          py::arg("out_handle_ptr"),                                                 \
+          py::arg("out_offset_ptr"));
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \

@@ -159,6 +159,7 @@ void register_output_buffer(fptr_t _fa,
                             int64_t self_ptr,
                             const std::vector<int64_t>& ipc_handle_ptrs,
                             const std::vector<int64_t>& offsets);
+int64_t get_registered_input_buffer_rank_data(fptr_t _fa, int64_t self_ptr);
 int64_t get_graph_buffer_count(fptr_t _fa);
 void get_graph_buffer_ipc_meta(fptr_t _fa,
                                int64_t handle_out,
@@ -170,6 +171,9 @@ void register_graph_buffers(fptr_t _fa,
 int64_t allocate_meta_buffer(int64_t size);
 void free_meta_buffer(int64_t ptr);
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
+void get_buffer_ipc_meta(int64_t inp_ptr,
+                         int64_t out_handle_ptr,
+                         int64_t out_offset_ptr);
 #endif
 
 } // namespace aiter

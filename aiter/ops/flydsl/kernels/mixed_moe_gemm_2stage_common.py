@@ -155,6 +155,7 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    tp_source_count: int = 1,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -275,6 +276,28 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    tp_multi_source = tp_source_count > 1
+    if tp_source_count <= 0 or tp_source_count > 64:
+        raise ValueError(f"tp_source_count must be in [1, 64], got {tp_source_count}")
+    if tp_multi_source:
+        if heterogeneous_b:
+            raise ValueError("TP multi-source GEMM1 does not support shared experts")
+        if (
+            a_dtype != "fp8"
+            or b_dtype != "fp4"
+            or out_s != "bf16"
+            or tile_m != 32
+            or doweight_stage1
+            or enable_bias
+            or is_splitk
+            or gate_mode is not GateMode.SEPARATED
+            or v2_output_layout
+        ):
+            raise ValueError(
+                "TP multi-source GEMM1 first gate requires "
+                "A=FP8, W=FP4, out=BF16, BM=32, separated gate, "
+                "no route weight/bias/split-K/v2 output"
+            )
 
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
@@ -287,6 +310,9 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
+    # Version the experimental TP-only symbol independently from the historical
+    # single-source kernel.  ``r2`` fixes the per-source A-scale base units.
+    tp_source_tag = f"_tpms{tp_source_count}r2" if tp_multi_source else ""
     # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
     # distinct symbol so they can't alias the silu kernel on disk. beta is
     # compile-time for situv2 (folded via arith.constant), so two different betas
@@ -304,7 +330,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 33 if heterogeneous_b else 32
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{tp_source_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -643,6 +669,26 @@ def compile_mixed_moe_gemm1_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
+            tp_source_count_idx = arith.constant(tp_source_count, index=True)
+            source_tokens = tokens_in
+            source_sorted_stride = sorted_m
+            source_scale_stride = arith.index(0)
+            if const_expr(tp_multi_source):
+                source_tokens = tokens_in // tp_source_count_idx
+                source_sorted_stride = (
+                    source_tokens * arith.constant(topk, index=True)
+                    + arith.constant(experts * sort_block_m - topk, index=True)
+                )
+                source_scale_rows = (
+                    (source_sorted_stride + arith.constant(31, index=True))
+                    // arith.constant(32, index=True)
+                    * arith.constant(32, index=True)
+                )
+                source_scale_cols = arith.constant(
+                    ((model_dim // 32 + 7) // 8) * 8, index=True
+                )
+                source_scale_stride = source_scale_rows * source_scale_cols
+
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             numids_rsrc = ptr_buffer_resource(
@@ -663,6 +709,8 @@ def compile_mixed_moe_gemm1_common(
                     * arith.constant(32, index=True)
                 )
                 sx_nbytes_idx = scale_rows * kblk
+                if const_expr(tp_multi_source):
+                    sx_nbytes_idx = source_scale_stride * tp_source_count_idx
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
@@ -688,6 +736,12 @@ def compile_mixed_moe_gemm1_common(
             sorted_nbytes_idx = size_expert_ids_in * arith.constant(
                 sort_block_m * 4, index=True
             )
+            if const_expr(tp_multi_source):
+                sorted_nbytes_idx = (
+                    source_sorted_stride
+                    * tp_source_count_idx
+                    * arith.constant(4, index=True)
+                )
             sorted_nbytes_i32 = arith.index_cast(T.i32, sorted_nbytes_idx)
             sorted_rsrc = ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
             sorted_w_rsrc = ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
@@ -735,13 +789,57 @@ def compile_mixed_moe_gemm1_common(
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
-            expert_i32 = buffer_ops.buffer_load(
+            work_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
+            expert_i32 = work_i32
+            source_i32 = arith.constant(0, type=T.i32)
+            source_idx = arith.index(0)
+            source_token_base = arith.index(0)
+            metadata_bx_m = bx_m
+            sorted_block_base = bx_m
+            scale_source_base = arith.index(0)
+            if const_expr(tp_multi_source):
+                expert_i32 = arith.andi(
+                    work_i32, arith.constant(0x3FF, type=T.i32)
+                )
+                source_i32 = arith.andi(
+                    arith.shrui(work_i32, arith.constant(10, type=T.i32)),
+                    arith.constant(0x3F, type=T.i32),
+                )
+                local_block_i32 = arith.shrui(
+                    work_i32, arith.constant(16, type=T.i32)
+                )
+                source_idx = arith.index_cast(ir.IndexType.get(), source_i32)
+                local_block_idx = arith.index_cast(
+                    ir.IndexType.get(), local_block_i32
+                )
+                metadata_bx_m = local_block_idx * arith.constant(
+                    sort_block_m, index=True
+                )
+                sorted_block_base = (
+                    source_idx * source_sorted_stride + metadata_bx_m
+                )
+                source_token_base = source_idx * source_tokens
+                # ``source_scale_stride`` is carried in bytes so it can also
+                # size the raw scale resource.  Scale loads below use i32
+                # elements, however, so their base offset must be in dwords.
+                scale_source_base = (
+                    source_idx
+                    * source_scale_stride
+                    // arith.constant(4, index=True)
+                )
             expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            if const_expr(tp_multi_source):
+                source_valid = arith.cmpi(
+                    CmpIPredicate.ult,
+                    source_i32,
+                    arith.constant(tp_source_count, type=T.i32),
+                )
+                exp_valid = arith.andi(exp_valid, source_valid)
             if const_expr(heterogeneous_b):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
@@ -825,6 +923,29 @@ def compile_mixed_moe_gemm1_common(
                 topk_i32 = arith.constant(topk)
                 mask24 = arith.constant(0xFFFFFF)
                 tokens_i32 = arith.index_cast(T.i32, tokens_in)
+                source_tokens_i32 = arith.index_cast(T.i32, source_tokens)
+                source_token_base_i32 = arith.index_cast(
+                    T.i32, source_token_base
+                )
+
+                def globalize_source_fused(fused_i32):
+                    if const_expr(not tp_multi_source):
+                        return fused_i32
+                    local_t = arith.andi(fused_i32, mask24)
+                    local_s = arith.shrui(fused_i32, arith.constant(24))
+                    local_t_valid = arith.cmpi(
+                        CmpIPredicate.ult, local_t, source_tokens_i32
+                    )
+                    local_s_valid = arith.cmpi(
+                        CmpIPredicate.ult, local_s, topk_i32
+                    )
+                    local_valid = arith.andi(local_t_valid, local_s_valid)
+                    global_t = local_t + source_token_base_i32
+                    global_t = arith.select(local_valid, global_t, tokens_i32)
+                    slot_bits = arith.andi(
+                        fused_i32, arith.constant(0xFF000000, type=T.i32)
+                    )
+                    return arith.ori(slot_bits, global_t)
 
                 def x_tile_chunk_coord_i32(i: int):
                     return tile_chunk_coord_i32(
@@ -858,10 +979,11 @@ def compile_mixed_moe_gemm1_common(
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
 
-                    sorted_row_i = bx_m + row_local
+                    sorted_row_i = sorted_block_base + row_local
                     fused_i = buffer_ops.buffer_load(
                         sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
                     )
+                    fused_i = globalize_source_fused(fused_i)
                     t_i32 = arith.andi(fused_i, mask24)
                     s_i32 = arith.shrui(fused_i, arith.constant(24))
                     t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
@@ -1108,9 +1230,11 @@ def compile_mixed_moe_gemm1_common(
                 if const_expr(not a_scale_one):
                     a_scale_bases = []
                     for mi in range_constexpr(m_repeat_packed):
-                        a_mni = mi + bx_m // scale_mn_pack // 16
+                        a_mni = mi + metadata_bx_m // scale_mn_pack // 16
                         a_scale_bases.append(
-                            a_mni * layout_a_scale.stride_n0 + scale_lane_elem
+                            scale_source_base
+                            + a_mni * layout_a_scale.stride_n0
+                            + scale_lane_elem
                         )
 
                 c16_idx = arith.constant(16, index=True)
@@ -1126,7 +1250,7 @@ def compile_mixed_moe_gemm1_common(
                 bscale_shift = arith.constant(0, type=T.i32)
                 bscale_shift_hi = arith.constant(0, type=T.i32)
                 if const_expr(pack_M < scale_mn_pack):
-                    m_half_idx = (bx_m // c16_idx) % c2_idx
+                    m_half_idx = (metadata_bx_m // c16_idx) % c2_idx
                     m_half_i32 = arith.index_cast(T.i32, m_half_idx)
                     scale_shift = m_half_i32 * arith.constant(8, type=T.i32)
                     scale_shift_hi = scale_shift + arith.constant(16, type=T.i32)
@@ -1889,10 +2013,11 @@ def compile_mixed_moe_gemm1_common(
                 tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, c_tile_m_idx)
                 if_tid = scf.IfOp(tid_in_range)
                 with ir.InsertionPoint(if_tid.then_block):
-                    tid_row = bx_m + tx
+                    tid_row = sorted_block_base + tx
                     tid_val = buffer_ops.buffer_load(
                         sorted_rsrc, tid_row, vec_width=1, dtype=T.i32
                     )
+                    tid_val = globalize_source_fused(tid_val)
                     tid_vec1 = vector.from_elements(T.vec(1, T.i32), [tid_val])
                     vector.store(tid_vec1, lds_tid, [tx])
                     scf.YieldOp([])
@@ -3185,6 +3310,7 @@ def compile_mixed_moe_gemm1_common(
         a_scale_one,
         xcd_swizzle,
         v2_output_layout,
+        tp_source_count,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)

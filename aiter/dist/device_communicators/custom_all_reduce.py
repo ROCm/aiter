@@ -535,8 +535,9 @@ class IPCBufferPool:
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
-        self._ipc_handle_fn(data_ptr, handle.data_ptr())
-        return self._gather_ipc_meta((handle, 0))
+        offset = torch.empty(1, dtype=torch.int64)
+        ops.get_buffer_ipc_meta(data_ptr, handle.data_ptr(), offset.data_ptr())
+        return self._gather_ipc_meta((handle, int(offset.item())))
 
     def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
@@ -1025,6 +1026,23 @@ class CustomAllreduce:
             self._ops_register_output_buffer(
                 self._ptr, out.data_ptr(), [h.data_ptr() for h in handles], offsets
             )
+
+    def get_registered_input_buffer_rank_data(self, inp: torch.Tensor) -> int:
+        """Return the device ``RankData*`` for an IPC-registered input.
+
+        ``RankData`` is the existing custom-AR table of peer base addresses.
+        Exposing its address lets experimental FlyDSL communication kernels
+        reuse the registered mapping without introducing a second IPC or MORI
+        allocation path.  The gfx1250 backend has a different table ABI and is
+        intentionally excluded from this gfx950-only prototype.
+        """
+        if self._is_gfx1250:
+            raise NotImplementedError(
+                "registered RankData export is only available on pre-gfx1250 custom AR"
+            )
+        return int(
+            ops.get_registered_input_buffer_rank_data(self._ptr, inp.data_ptr())
+        )
 
     def register_graph_buffers(self):
         """Batch-register graph-captured buffer addresses."""

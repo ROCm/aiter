@@ -339,6 +339,15 @@ void register_output_buffer(fptr_t _fa,
     fa->register_output_buffer(ipc_handles.data(), offsets.data(), (void*)self_ptr);
 }
 
+int64_t get_registered_input_buffer_rank_data(fptr_t _fa, int64_t self_ptr)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto it = fa->input_buffer.find((void*)self_ptr);
+    if(it == fa->input_buffer.end())
+        throw std::runtime_error("input buffer is not registered");
+    return reinterpret_cast<int64_t>(it->second);
+}
+
 int64_t get_graph_buffer_count(fptr_t _fa)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -400,6 +409,21 @@ void free_meta_buffer(int64_t ptr)
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
 {
     HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, (void*)inp_ptr));
+}
+
+void get_buffer_ipc_meta(int64_t inp_ptr,
+                         int64_t out_handle_ptr,
+                         int64_t out_offset_ptr)
+{
+    void* ptr = (void*)inp_ptr;
+    void* base_ptr;
+    if(hipPointerGetAttribute(&base_ptr,
+                              HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                              (hipDeviceptr_t)ptr) != hipSuccess)
+        throw std::runtime_error("failed to get allocation base for IPC buffer");
+    HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, base_ptr));
+    int64_t offset = (char*)ptr - (char*)base_ptr;
+    std::memcpy((void*)out_offset_ptr, &offset, sizeof(offset));
 }
 
 #endif

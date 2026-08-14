@@ -210,6 +210,10 @@ def register_output_buffer(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def get_registered_input_buffer_rank_data(_fa: int, self_ptr: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def get_graph_buffer_count(_fa: int) -> int: ...
 
 
@@ -233,6 +237,12 @@ def free_meta_buffer(ptr: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def get_buffer_ipc_meta(
+    inp_ptr: int, out_handle_ptr: int, out_offset_ptr: int
+) -> None: ...
 
 
 # ---- gfx1250 (MI450) dedicated module ----
