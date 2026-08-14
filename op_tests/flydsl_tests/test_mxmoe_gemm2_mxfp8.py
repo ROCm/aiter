@@ -19,7 +19,7 @@ from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
 from aiter.ops.shuffle import shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from op_tests.mxmoe_v2_test_utils import (
+from op_tests.flydsl_tests.mxmoe_v2_test_utils import (
     logits_diff,
     run_standalone_v2_a8w8,
 )
