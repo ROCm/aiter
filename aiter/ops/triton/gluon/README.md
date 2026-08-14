@@ -57,6 +57,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
   <td>TBD</td><td>TBD</td><td>TBD</td>
 </tr>
+<tr>
+  <td><code>sparse_attention_<br>dsv4_bwd_gluon</code></td><td>DSv4 Sparse<br>MLA Backward</td><td>CDNA4</td>
+  <td nowrap>Q/KV/dO/O: bf16, K == V<br>head_dim = 512 (dense)<br>lse: fp32, sink-inclusive<br>num_kv &ge; T (pool ok)<br>topk % 32 == 0<br>gfx950 only</td>
+  <td>python op_tests/triton_tests/<br>attention/test_sparse_<br>attention_dsv4_bwd.py</td>
+  <td>~407<br>TFLOPS</td><td>—</td><td>—</td>
+</tr>
 </table>
 </small>
 
@@ -246,6 +252,30 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | 100K     | 1     | 256           | 7                | 63.78  | 1.81 |
 | 100K     | 3     | 85            | 19               | 88.77  | 3.89 |
 | 100K     | 4     | 64            | 25               | 106.96 | 4.31 |
+
+### `sparse_attention_dsv4_bwd_gluon.py` — DeepSeek V4 Sparse MLA Backward
+
+**Public entry:** `aiter.ops.triton.attention.sparse_attention_dsv4_bwd.sparse_mla_bwd_dsv4(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUNK=None)` -> `(dq, dkv, d_sink)`
+
+Training backward for the DSv4 sparse prefill attention (the `has_pe=False` form of `mla_gluon`). Same op contract: `K == V == kv` as one dense 512-wide tensor, RoPE applied in place caller-side, scale `1/sqrt(512)`, `attn_sink` in the softmax denominator only, `topk_indices == -1` masked.
+
+`o` and `lse` come from the forward; `mla_gluon(..., has_pe=False, return_lse=True)` produces both, and its `lse` is already sink-inclusive, which is what this backward expects.
+
+Five kernels plus one torch reduction:
+
+| phase | impl | notes |
+|---|---|---|
+| `delta = rowsum(O*dO)` | triton | streams bf16, accumulates fp32 |
+| dQ | **gluon** | one LDS read of the gathered KV feeds both the `S` and `dP` MFMAs; also emits this chunk's `dS`/`P` |
+| dKV-interm | **gluon** | contracts over all heads inside one MFMA pair, Q/dO transposed once into registers, D split across `grid.y` |
+| CSR build | torch | `sort` + `searchsorted` on int16-narrowed keys |
+| dKV gather | triton | atomic-free: the scatter is inverted so each KV row gathers its own contributors |
+| `d_sink` | torch | 26 us |
+
+`R_CHUNK` splits the rank dimension. Leave it `None` (unchunked) unless memory forces otherwise: it exists only to bound the `interm` intermediate (`T*topk*512` bf16, 2.0 GiB at T=4096 topk=512) and costs a dQ read-modify-write between chunks plus one CSR build per chunk.
+
+**Measured** (MI355X, T=4096 H=128 topk=512, SWA(128)+pool top-k): 3.38 ms / 407 TFLOPS as a per-kernel sum, 3.24 ms / 424 TFLOPS end-to-end.
+
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 
