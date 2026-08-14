@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import OrderedDict
 from functools import cache, lru_cache
 
 import torch
@@ -130,6 +131,46 @@ _FP8_DTYPE = torch.float8_e4m3fn
 # (SILOTIGER-877): the crossover is chunk-independent and lands in (5632, 6144];
 # 6144 (96 pages) is the lowest depth where all sampled chunks win noise-robustly.
 _SPLIT_MIN_DECODE_KV = 6144
+
+
+# Bounded memo of mixed-batch signatures whose dispatch-split probe DECLINED.
+# Keyed on host-only quantities (the two device-tensor data_ptrs plus the shape
+# scalars), so a lookup costs no device sync -- the point is to avoid re-paying
+# _partition_mixed's ~29us host sync.
+#
+# The residual it removes: a large-chunk + shallow-decode mixed batch passes the
+# host-scalar pre-check (max_seqlen_k reflects the deep PREFILL KV) but declines
+# on the true, shallow decode depth. That batch recurs identically on every
+# decoder layer of a forward pass, so without a memo each layer probes only to
+# decline again. With it, the first layer probes and records the signature; the
+# rest skip straight to the single call.
+#
+# ONLY declines are memoized, and that asymmetry is a correctness invariant, not
+# an optimization: a decline falls through to the single unified call, which is
+# correct for ANY batch composition, so a stale hit (a reused data_ptr whose
+# contents now differ) costs at most a missed split -- never wrong output. A
+# TAKE slices q/out at the probed split_point, so a stale partition would route
+# the wrong rows to each half; takes therefore always re-probe (see the dispatch
+# site). Bounded LRU because data_ptr keys churn across steps; eviction only ever
+# forces a re-probe, never affects correctness.
+_SPLIT_DECLINE_MEMO: OrderedDict[tuple, bool] = OrderedDict()
+_SPLIT_DECLINE_MEMO_MAX = 128
+
+
+def _split_declined_before(key) -> bool:
+    """True if this batch signature already probed and declined the split."""
+    if key in _SPLIT_DECLINE_MEMO:
+        _SPLIT_DECLINE_MEMO.move_to_end(key)
+        return True
+    return False
+
+
+def _remember_split_decline(key) -> None:
+    """Record that this batch signature's split probe declined."""
+    _SPLIT_DECLINE_MEMO[key] = True
+    _SPLIT_DECLINE_MEMO.move_to_end(key)
+    if len(_SPLIT_DECLINE_MEMO) > _SPLIT_DECLINE_MEMO_MAX:
+        _SPLIT_DECLINE_MEMO.popitem(last=False)
 
 
 @lru_cache(maxsize=64)
@@ -626,8 +667,32 @@ def flydsl_unified_attention(
     # decode can be deeper than the batch max, so a shallow batch skips the
     # device partition entirely. Only when it could contain a deep decode do we
     # pay _partition_mixed's sync and check the decode half's own depth exactly.
+    # The pre-check is host-only; the probe (_partition_mixed) costs a device
+    # sync. A shallow-decode batch whose deep prefill chunk satisfies the
+    # pre-check would probe and decline on every layer, so a decline is memoized
+    # (host-only key) and its later recurrences skip the probe. Takes are never
+    # memoized -- they re-slice on the probed split_point and must re-probe.
     if max_seqlen_q > 1 and num_seqs > 1 and max_seqlen_k >= _SPLIT_MIN_DECODE_KV:
-        part = _partition_mixed(cu_seqlens_q, seqused_k, num_seqs)
+        memo_key = (
+            cu_seqlens_q.data_ptr(),
+            seqused_k.data_ptr(),
+            num_seqs,
+            q.shape[0],
+            max_seqlen_q,
+            max_seqlen_k,
+        )
+        part = None
+        if not _split_declined_before(memo_key):
+            part = _partition_mixed(cu_seqlens_q, seqused_k, num_seqs)
+            if part is not None and part[5] < _SPLIT_MIN_DECODE_KV:
+                # Clean two-block batch whose decode half is too shallow to
+                # amortize the split -- the residual case. Record it so the
+                # recurrence on later layers skips the probe. part is None
+                # (interleaved, or a pure prefill/decode sub-batch of a taken
+                # split) is left unmemoized: its key can be an ephemeral sliced
+                # tensor, and re-probing it is both correct and the pre-existing
+                # behavior.
+                _remember_split_decline(memo_key)
         if part is not None and part[5] >= _SPLIT_MIN_DECODE_KV:
             split_point, prefill_first, n_pre, n_dec, pre_max_q, _dec_max_kv = part
             row_split = int(cu_seqlens_q[split_point])
