@@ -23,10 +23,10 @@ opus_gemm(
 
 `kid` is mandatory. `Y` is also caller-owned and is returned unchanged after
 the launch. The disjoint architecture id bands and the merged `kernels_list`
-already existed in the pre-Task1 baseline. The public entry directly calls
-`kernels_list.get(kid)`; this refactor does not introduce or renumber those
-ids. The returned instance tag plus the dtype/layout arguments determine the
-private family adapter, rather than a second selector or a numeric-range guess.
+form the canonical registry. The public entry directly calls
+`kernels_list.get(kid)`; it does not introduce or renumber ids. The returned
+instance tag plus the dtype/layout arguments determine the private family
+adapter, rather than a second selector or a numeric-range guess.
 
 ## Dispatch model
 
@@ -123,7 +123,7 @@ opus_gemm(
     XQ,                    # [M,G,K], K-contiguous
     WQ,                    # [G,N,K], K-contiguous
     Y,
-    kid=8311,              # exact global id; upstream PR #4320 id 311
+    kid=8311,              # exact global id; family-local id 311
     layout="mxscale_bmm",
     x_scale=x_scale,       # [M,G,K/128], one-byte E8M0
     w_scale=w_scale,       # [G,N/128,K/128], one-byte E8M0
@@ -131,12 +131,12 @@ opus_gemm(
 )
 ```
 
-The 45 PR #4320 kernels use global ids `8000 + upstream_kid`; the low digits
-remain recognizable while the ids share the canonical `kernels_list` without
-colliding with existing GEMM ids. `mxfp8_bmm` and `bmm_mxscale` are accepted
-layout aliases. The high-level tuned caller remains in the existing A8W8
-module as `aiter.batched_gemm_a8w8_mxscale`; it resolves the final id and then
-calls this same public entry.
+The 45 MXFP8 BMM kernels use global ids `8000 + family_local_kid`; the
+family-local ids remain recognizable while sharing the canonical
+`kernels_list` without colliding with existing GEMM ids. `mxfp8_bmm` and
+`bmm_mxscale` are accepted layout aliases. The high-level tuned caller remains
+in the existing A8W8 module as `aiter.batched_gemm_a8w8_mxscale`; it resolves
+the final id and then calls this same public entry.
 
 ### gfx942 blockscale bpreshuffle
 
@@ -210,9 +210,9 @@ Concurrent eager calls own independent workspace Tensors. The private C ABI
 switches to the XQ device and live PyTorch stream for the call, restores the
 previous state, and carries C++ errors through a thread-local status bridge.
 The pybind raw remains available privately for the normal lazy JIT build and
-A/B measurement.  The mixed-module ctypes adapter lives entirely in
-`gemm_op_a16w16.py`; generic `aiter/jit/core.py` is unchanged from the
-Task1 baseline.
+A/B measurement. The mixed-module ctypes adapter lives entirely in
+`gemm_op_a16w16.py`; generic JIT machinery owns module discovery and build,
+but not per-call workspace state.
 
 ## Build-time subset compile
 
@@ -236,6 +236,25 @@ The former shape-driven and family-specific Python APIs were removed. Migrate
 by allocating `Y`, resolving the final id in the caller, and calling the one
 entry above. The private family modules intentionally export an empty
 `__all__`.
+
+## Validation
+
+Run the focused OPUS suite on each target GPU rather than treating
+architecture skips as coverage:
+
+```bash
+pytest -q \
+  op_tests/test_opus_interfaces.py \
+  op_tests/test_opus_dispatch.py \
+  op_tests/test_opus_ctypes.py \
+  op_tests/test_opus_graph.py \
+  op_tests/test_opus_workspace.py \
+  op_tests/test_opus_gfx950_exhaustive.py \
+  op_tests/test_opus_a8w8_bmm.py
+```
+
+In particular, gfx942 and gfx1250 validation must run on matching hardware; a
+skip on another architecture is not a pass for that target.
 
 ## Source map
 

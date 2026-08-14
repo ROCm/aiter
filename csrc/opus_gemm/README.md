@@ -81,9 +81,8 @@ workspace. The caller supplies the live HIP stream. The bridge validates
 integer conversions, switches/restores device and thread-local stream state,
 and reports exceptions through thread-local error text before returning to
 Python. Its small ctypes adapter is local to
-`aiter/ops/opus/gemm_op_a16w16.py`; generic `aiter/jit/core.py` is not
-modified. The pybind A16 entry owns normal lazy JIT build and remains private
-for parity and performance A/B tests.
+`aiter/ops/opus/gemm_op_a16w16.py`. The pybind A16 entry owns normal lazy JIT
+build and remains private for parity and performance A/B tests.
 
 ## Registry and capability
 
@@ -96,11 +95,11 @@ for parity and performance A/B tests.
 | `a8w8_mxscale_bmm` | empty | 45 exact ids in 8000--8653, BF16/FP32 Y | empty |
 
 Empty tables are explicit capability states. The merged registry currently
-contains 2084 final ids. The PR #4320 BMM ids are `8000 + upstream_kid`, which
-places them in an unused global band while preserving upstream tuning/debug
-correlation. Historical child-dictionary collisions are resolved
-by the final merge; runtime routing always follows the resulting
-`kernels_list[kid]` instance and never a numeric interval.
+contains 2084 final ids. The MXFP8 BMM ids are
+`8000 + family_local_kid`, which places them in an unused global band while
+preserving family-local tuning/debug correlation. Historical child-dictionary
+collisions are resolved by the final merge; runtime routing always follows the
+resulting `kernels_list[kid]` instance and never a numeric interval.
 
 ## Generated tables
 
@@ -184,6 +183,6 @@ launcher allocates, frees, registers or retains workspace memory.
 | `opus_gemm_common.py` | canonical registry, unique route map and compile-floor constants |
 | `gen_instances.py` | subset selection, manifests and typed dispatch generation |
 | `codegen/gen_instances_gfx*.py` | exact-instance host launchers and generated input checks |
-| `include/gfx950/opus_bmm_*` | PR #4320 BMM traits, launchers and pipelines |
+| `include/gfx950/opus_bmm_*` | MXFP8 BMM traits, launchers and pipelines |
 | `include/gfx*/opus_gemm_arch_*.cuh` | sorted exact-kid tables |
 | `include/gfx*/**/opus_gemm_traits*.cuh` | kernel arguments and traits |
