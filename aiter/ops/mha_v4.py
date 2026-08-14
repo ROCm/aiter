@@ -9,6 +9,7 @@ import triton
 from torch import Tensor
 
 from aiter import dtypes
+from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -28,7 +29,6 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_raw_buffer_size,
     pack_v_mxfp4_colmajor_raw,
 )
-from aiter.ops.quant import rotate_activation
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
@@ -139,7 +139,11 @@ def _validate_format_contract(
         raise ValueError("MHA v4 currently requires matching Q and K formats")
     if q_format not in _PACKED_QK_WIDTH:
         raise ValueError(f"unsupported Q/K format: {q_format!r}")
-    if v_format not in (*_FP8_FORMATS, AttentionFormat.FP6_E2M3, AttentionFormat.FP4_E2M1):
+    if v_format not in (
+        *_FP8_FORMATS,
+        AttentionFormat.FP6_E2M3,
+        AttentionFormat.FP4_E2M1,
+    ):
         raise ValueError(f"unsupported V format: {v_format!r}")
     if q_format == AttentionFormat.INT8 and v_format not in _FP8_FORMATS:
         raise ValueError("INT8 Q/K currently requires FP8 V")

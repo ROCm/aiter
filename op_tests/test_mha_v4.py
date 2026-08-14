@@ -21,8 +21,8 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
-    quantize_v_mxfp6,
     quantize_v_mxfp4,
+    quantize_v_mxfp6,
     scale_modes_for_formats,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
@@ -156,16 +156,11 @@ def test_mha_v4_f8f6_v_kv_table_matches_live_p_pack():
         for field in range(32):
             physical = 32 * (lane // 32) + field
             paired = (
-                (physical & 0x0F)
-                | ((physical & 0x10) << 1)
-                | ((physical & 0x20) >> 1)
+                (physical & 0x0F) | ((physical & 0x10) << 1) | ((physical & 0x20) >> 1)
             )
             group, byte = divmod(paired, 32)
             row.append(
-                32 * (byte // 16)
-                + 8 * ((byte % 16) // 4)
-                + byte % 4
-                + 4 * group
+                32 * (byte // 16) + 8 * ((byte % 16) // 4) + byte % 4 + 4 * group
             )
         expected.append(row)
 

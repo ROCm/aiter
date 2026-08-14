@@ -257,8 +257,38 @@ def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
 # (fp8 K-distribution + cvt interleave); without it the layout caps at cos 0.59.
 _TR8_SIGMA32 = np.array(
     [
-        0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23,
-        8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31,
+        0,
+        1,
+        2,
+        3,
+        16,
+        17,
+        18,
+        19,
+        4,
+        5,
+        6,
+        7,
+        20,
+        21,
+        22,
+        23,
+        8,
+        9,
+        10,
+        11,
+        24,
+        25,
+        26,
+        27,
+        12,
+        13,
+        14,
+        15,
+        28,
+        29,
+        30,
+        31,
     ],
     dtype=np.int64,
 )
@@ -432,19 +462,12 @@ def _v_direct_kvtab() -> np.ndarray:
     lane = np.arange(64)[:, None]
     field = np.arange(32)[None, :]
     physical = 32 * (lane // 32) + field
-    paired = (
-        (physical & 0x0F)
-        | ((physical & 0x10) << 1)
-        | ((physical & 0x20) >> 1)
-    )
+    paired = (physical & 0x0F) | ((physical & 0x10) << 1) | ((physical & 0x20) >> 1)
     group = paired // 32
     byte = paired % 32
-    return (
-        32 * (byte // 16)
-        + 8 * ((byte % 16) // 4)
-        + byte % 4
-        + 4 * group
-    ).astype(np.int32)
+    return (32 * (byte // 16) + 8 * ((byte % 16) // 4) + byte % 4 + 4 * group).astype(
+        np.int32
+    )
 
 
 if _HAVE_TRITON:

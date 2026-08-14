@@ -17,7 +17,6 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.quant import rotate_activation
 from aiter.ops.mha import (
     flash_attn_func,
 )
@@ -38,10 +37,11 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp6_k,
     quantize_mxfp6_q,
     quantize_v_fp8,
-    quantize_v_mxfp6,
     quantize_v_mxfp4,
+    quantize_v_mxfp6,
     scale_modes_for_formats,
 )
+from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -720,10 +720,12 @@ def rotate_qk_blocks(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[-1]
     if block_r > head_dim or head_dim % block_r != 0:
-        raise ValueError(f"head dim ({head_dim}) must be divisible by block_r ({block_r})")
-    rotation = create_hadamard_matrix(
-        block_r, device=q.device, dtype=q.dtype
-    ) / (block_r**0.5)
+        raise ValueError(
+            f"head dim ({head_dim}) must be divisible by block_r ({block_r})"
+        )
+    rotation = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+        block_r**0.5
+    )
     blocks = head_dim // block_r
     q_rotated = torch.matmul(q.unflatten(-1, (blocks, block_r)), rotation).flatten(-2)
     k_rotated = torch.matmul(k.unflatten(-1, (blocks, block_r)), rotation).flatten(-2)
@@ -1039,6 +1041,7 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
+
         def _run_aiter_fp8():
             packed = fp8_quantize(
                 q_bshd,
@@ -1057,9 +1060,7 @@ def make_kernel_runner(
 
         if args.e2e:
             return _run_aiter_fp8
-        packed = fp8_quantize(
-            q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate
-        )
+        packed = fp8_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
         return lambda: mha_v4_packed(
             *packed,
             fp8_format,
@@ -1104,9 +1105,7 @@ def make_kernel_runner(
 
         if args.e2e:
             return _run_aiter_f8f6
-        packed = f8f6_quantize(
-            q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate
-        )
+        packed = f8f6_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
         return lambda: mha_v4_packed(
             *packed,
             fp8_format,
@@ -1159,9 +1158,7 @@ def make_kernel_runner(
 
         block_r = args.block_r
         if block_r != 128:
-            raise ValueError(
-                f"{args.kernel} requires block_r=128, got {block_r}"
-            )
+            raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
         r = create_hadamard_matrix(
             block_r, device=q_bshd.device, dtype=q_bshd.dtype
         ) / (block_r**0.5)
@@ -1184,7 +1181,9 @@ def make_kernel_runner(
                         "and does not support --qsmooth"
                     )
                 return (
-                    *_production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale),
+                    *_production_quantize_mxfp4(
+                        quant_q, quant_k, v_bshd, softmax_scale
+                    ),
                     None,
                 )
             if not args.qsmooth and block_r == 128:
