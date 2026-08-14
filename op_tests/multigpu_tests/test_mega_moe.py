@@ -65,22 +65,26 @@ _MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
 _FP8_KEYS = ("per_Token", "per_128x128")
 
 
-def _import_mori_v2():
-    """Import Mori's non-fused dispatch/combine v2 path."""
+def _import_mori_comm():
+    """Import Mori's communicator (needed by every combine mode)."""
     from mori.cco import Communicator
+
+    return Communicator
+
+
+def _import_mori_v2():
+    """Import Mori's non-fused dispatch/combine v2 path.
+
+    Deferred: scatter_fused runs entirely on aiter's own mega_moe kernels and
+    only needs the communicator, so importing this eagerly would make the fused
+    path fail whenever Mori's copy lags the installed flydsl API.
+    """
     from mori.ops.dispatch_combine_v2 import (
         EpDispatchCombineConfig,
         EpDispatchCombineOp,
     )
 
-    def set_device(rank: int) -> None:
-        gpu = int(os.environ.get("CCO_GPU", rank % torch.cuda.device_count()))
-        torch.cuda.set_device(gpu)
-
-    def sync() -> None:
-        torch.cuda.synchronize()
-
-    return Communicator, EpDispatchCombineConfig, EpDispatchCombineOp
+    return EpDispatchCombineConfig, EpDispatchCombineOp
 
 
 # --------------------------------------------------------------------------- #
@@ -452,8 +456,7 @@ class DeviceMoEPipeline:
 
     # ---- initialization (grouped together) ---- #
     def setup(self, x0):
-        (Communicator,
-         EpDispatchCombineConfig, EpDispatchCombineOp) = _import_mori_v2()
+        Communicator = _import_mori_comm()
         # torch.cuda.set_device sets the process HIP current device (== driver
         # hipSetDevice) that cco keys off; Dist already set it, repeat for safety.
         torch.cuda.set_device(self.dist_ctx.local_rank)
@@ -500,6 +503,7 @@ class DeviceMoEPipeline:
                 max_tokens_per_rank=self.ct,
             )
         else:
+            EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
             cfg = EpDispatchCombineConfig(
                 rank=r,
                 world_size=self.dist_ctx.world,
