@@ -1,0 +1,134 @@
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#include <cmath>
+#include <cassert>
+#include <iostream>
+#include <cstdio>
+#include <cstdlib>
+
+// pa-256.cpp currently uses macro-driven specialization.
+// Instantiate concrete NHD BF16 shape from compile-time args here.
+#define HQ {{gqa_ratio * num_kv_heads}}
+#define HK {{num_kv_heads}}
+#define S {{head_size}}
+#define BLOCK_SIZE {{block_size}}
+#define KV_PART_SIZE {{partition_size}}
+#define SCALE (1.0f / sqrtf((float)S))
+#define FAKE_Q 0
+#define FAKE_K_IDX 0
+#define OUTPUT_QK 0
+
+#include "pa_ragged_nhd_impl.cpp"
+
+extern "C" {
+void {{func_name}}(void* out_ptr,
+        void* exp_sums_ptr,
+        void* max_logits_ptr,
+        void* tmp_out_ptr,
+        void* query_ptr,
+        void* key_cache_ptr,
+        void* value_cache_ptr,
+        int* kv_indptr_ptr,
+        int* kv_page_indices_ptr,
+        int* kv_last_page_lens_ptr,
+        const float* alibi_slopes_ptr,
+        const float* q_scale_ptr,
+        const float* k_scale_ptr,
+        const float* v_scale_ptr,
+        const float* fp8_out_scale_ptr,
+        float scale,
+        float logits_soft_cap,
+        const int num_seqs,
+        const int num_kv_heads,
+        const int num_heads,
+        const int max_num_partitions,
+        const int q_stride,
+        const int kv_block_stride,
+        const int kv_head_stride,
+        const int kv_seq_stride,
+        void* stream);
+}
+
+void {{func_name}}(void* out_ptr,
+        void* exp_sums_ptr,
+        void* max_logits_ptr,
+        void* tmp_out_ptr,
+        void* query_ptr,
+        void* key_cache_ptr,
+        void* value_cache_ptr,
+        int* kv_indptr_ptr,
+        int* kv_page_indices_ptr,
+        int* kv_last_page_lens_ptr,
+        const float* alibi_slopes_ptr,
+        const float* q_scale_ptr,
+        const float* k_scale_ptr,
+        const float* v_scale_ptr,
+        const float* fp8_out_scale_ptr,
+        float scale,
+        float logits_soft_cap,
+        const int num_seqs,
+        const int num_kv_heads,
+        const int num_heads,
+        const int max_num_partitions,
+        const int q_stride,
+        const int kv_block_stride,
+        const int kv_head_stride,
+        const int kv_seq_stride,
+        void* stream)
+{
+    (void)kv_last_page_lens_ptr;
+    (void)alibi_slopes_ptr;
+    (void)q_scale_ptr;
+    (void)k_scale_ptr;
+    (void)v_scale_ptr;
+    (void)fp8_out_scale_ptr;
+    (void)logits_soft_cap;
+    (void)q_stride;
+    (void)kv_block_stride;
+    (void)kv_head_stride;
+    (void)kv_seq_stride;
+    (void)scale;
+
+    // pa-256 implementation constraints (current port):
+    // BF16 only, head_size=256, BLOCK_SIZE=1.
+    assert(num_kv_heads == HK);
+    assert(num_heads == HQ);
+    static_assert(S == 256, "pa_ragged_nhd(pa-256): only head_size=256 is supported");
+    static_assert(BLOCK_SIZE == 1, "pa_ragged_nhd(pa-256): only block_size=1 is supported");
+   // 不要动 这个是用来debug的~
+    printf("==========================================hit pa nhd========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d PARTITION_SIZE=%d\n",
+           num_seqs,
+           q_stride,
+           kv_block_stride,
+           kv_head_stride,
+           kv_seq_stride,
+           max_num_partitions,
+           KV_PART_SIZE);
+
+    float* exp_sums = reinterpret_cast<float*>(exp_sums_ptr);
+    float* max_logits = reinterpret_cast<float*>(max_logits_ptr);
+    __bf16* tmp_out = reinterpret_cast<__bf16*>(tmp_out_ptr);
+
+    hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream);
+    dim3 pa_grid(num_seqs, num_kv_heads, max_num_partitions);
+    dim3 pa_block(256);
+    pa<<<pa_grid, pa_block, 0, hip_stream>>>(reinterpret_cast<__bf16*>(query_ptr),
+                                             reinterpret_cast<__bf16*>(key_cache_ptr),
+                                             reinterpret_cast<__bf16*>(value_cache_ptr),
+                                             reinterpret_cast<unsigned int*>(kv_indptr_ptr),
+                                             reinterpret_cast<unsigned int*>(kv_page_indices_ptr),
+                                             tmp_out,
+                                             nullptr,
+                                             max_logits,
+                                             exp_sums);
+
+    dim3 reduce_grid(num_seqs, num_heads);
+    dim3 reduce_block(256);
+    pa_reduce<<<reduce_grid, reduce_block, 0, hip_stream>>>(
+        reinterpret_cast<unsigned int*>(kv_indptr_ptr),
+        tmp_out,
+        max_logits,
+        exp_sums,
+        reinterpret_cast<__bf16*>(out_ptr),
+        max_num_partitions);
+}

@@ -22,3 +22,25 @@ void paged_attention_ragged(
     const std::string &kv_cache_dtype, const std::string &kv_cache_layout,
     float logits_soft_cap, torch::Tensor &k_scale, torch::Tensor &v_scale,
     const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);
+
+void paged_attention_ragged_nhd(
+    torch::Tensor &out, // [num_seqs, num_heads, head_size]
+    torch::Tensor &exp_sums,   // float32 workspace for partition sums
+    torch::Tensor &max_logits, // float32 workspace for partition max
+    torch::Tensor &tmp_out,    // bf16 workspace for partial outputs (same layout as CK path)
+    torch::Tensor &query, // [num_seqs, num_heads, head_size]
+    torch::Tensor
+        &key_cache, // [num_blocks, num_heads, block_size, head_size] or
+                    // [num_blocks, block_size, num_heads, head_size]
+    torch::Tensor
+        &value_cache, // [num_blocks, num_heads, block_size, head_size] or
+                      // [num_blocks, block_size, num_heads, head_size]
+    double scale,
+    torch::Tensor &kv_indptr,                        // [num_seqs + 1]
+    torch::Tensor &kv_page_indices,                  // [max_num_blocks]
+    std::optional<torch::Tensor> &kv_last_page_lens, // [num_seqs]
+    int64_t block_size, int64_t max_num_partitions,
+    const std::optional<torch::Tensor> &alibi_slopes,
+    const std::string &kv_cache_dtype, const std::string &kv_cache_layout,
+    float logits_soft_cap, torch::Tensor &k_scale, torch::Tensor &v_scale,
+    const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);

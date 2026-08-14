@@ -162,10 +162,14 @@ __inline__ std::string get_default_func_name(const std::string& md_name, std::li
     std::string args_str = fmt::format("{}", fmt::join(args, "_"));
     std::transform(args_str.begin(), args_str.end(), args_str.begin(),
     [](unsigned char c){ return std::tolower(c); });
-    auto func_name = func_names->get(args_str);
+    // Must include md_name in the cache key. Otherwise two different entrypoints
+    // (e.g. pa_ragged vs pa_ragged_nhd) with the same arg list can alias and
+    // reuse the wrong func_name / lib.so.
+    const std::string cache_key = md_name + "|" + args_str;
+    auto func_name = func_names->get(cache_key);
     if(!func_name){
-        func_names->put(args_str, fmt::format("{}_{}", md_name, hash_signature(args_str)));
-        func_name = func_names->get(args_str);
+        func_names->put(cache_key, fmt::format("{}_{}", md_name, hash_signature(cache_key)));
+        func_name = func_names->get(cache_key);
     }
     return *func_name;
 }
