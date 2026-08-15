@@ -8,7 +8,7 @@ Gluon comparison) so the kernel can be profiled directly. Example rocprofv3 run:
 
     PYTHONPATH=. rocprofv3 --kernel-trace --output-format csv \\
         --output-directory .rocprofv3 -- \\
-        python op_tests/op_benchmarks/triton/bench_flydsl_paged_mqa_logits.py \\
+        python op_tests/op_benchmarks/flydsl/bench_flydsl_paged_mqa_logits.py \\
             --heads 64 --head-dim 128 --kv-len 32768 --batch 16 --next-n 2 \\
             --kv-block-size 64 --preshuffle --iters 200 --no-check
 
