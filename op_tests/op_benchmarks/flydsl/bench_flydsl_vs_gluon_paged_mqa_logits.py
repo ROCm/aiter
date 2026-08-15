@@ -29,11 +29,11 @@ import statistics
 
 import torch
 
-from aiter.test_common import run_perftest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import run_perftest
 
 # same fp8 co-pack builder the production paged benchmark uses
 from op_tests.op_benchmarks.triton.bench_deepgemm_attention import (
@@ -57,7 +57,7 @@ def ref_fp8_paged_mqa_logits(
     q, kv_cache_fp8, weights, context_lens, block_tables, max_model_len, fp8_dtype
 ):
     """Vectorized torch reference (dequantizes the co-packed fp8 cache)."""
-    batch_size, next_n, heads, dim = q.size()
+    batch_size, next_n, _heads, dim = q.size()
     kvv, scale = kv_cache_fp8[..., :dim], kv_cache_fp8[..., dim:]
     scale = scale.contiguous().view(torch.float)
     qf = q.float()
@@ -328,7 +328,9 @@ def run_shape(
         "fly_min_ms": fly_min / 1e3,
         "fly_max_ms": fly_max / 1e3,
         "fly/ref": (
-            (fly_med / ref_med) if ref_med == ref_med and ref_med > 0 else float("nan")
+            (fly_med / ref_med)
+            if ref_med == ref_med and ref_med > 0  # noqa: PLR0124  (NaN check)
+            else float("nan")
         ),
         "ref_diff": ref_diff,
         "fly_diff": fly_diff,

@@ -16,9 +16,8 @@ and in the windowing / output layout. Everything else lives here.
 
 from functools import lru_cache
 
-import torch
-
 import flydsl.expr as fx
+import torch
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
@@ -72,7 +71,7 @@ def device_cu_count(device_index: int) -> int:
     """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
     try:
         return torch.cuda.get_device_properties(device_index).multi_processor_count
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 304
 
 

@@ -30,19 +30,19 @@ import random
 
 import torch
 
-from aiter.test_common import run_perftest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits import DEFAULT_VARIANT
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import run_perftest
 
 # Reuse the correctness test's layout/oracle helpers so the profiled kernel sees
 # exactly the tested co-pack + preshuffle byte layout.
 from op_tests.flydsl_tests.test_flydsl_fp8_paged_mqa_logits import (
-    kv_cache_cast_to_fp8,
-    ref_fp8_paged_mqa_logits,
-    preshuffle_kv_data,
     calc_diff,
+    kv_cache_cast_to_fp8,
+    preshuffle_kv_data,
+    ref_fp8_paged_mqa_logits,
 )
 
 torch.set_default_device("cuda")
@@ -152,11 +152,12 @@ def main():
         action="store_true",
         help="use the shuffle_weight(16x16) KV layout (needs kv-block-size %% 16 == 0)",
     )
+    parser.add_argument("--q-dtype", type=str, default="fnuz", choices=["fnuz", "fn"])
     parser.add_argument(
-        "--q-dtype", type=str, default="fnuz", choices=["fnuz", "fn"]
-    )
-    parser.add_argument(
-        "--split-kv", type=int, default=0, help="0 == auto (host formula); else override"
+        "--split-kv",
+        type=int,
+        default=0,
+        help="0 == auto (host formula); else override",
     )
     parser.add_argument("--wave-per-eu", type=int, default=2)
     parser.add_argument("--chunk-k", type=int, default=128, help="KV tile width")
@@ -183,7 +184,9 @@ def main():
         "--num-iters", type=int, default=101, help="run_perftest iters for --time"
     )
     parser.add_argument(
-        "--time", action="store_true", help="also report device self-time (run_perftest)"
+        "--time",
+        action="store_true",
+        help="also report device self-time (run_perftest)",
     )
     parser.add_argument(
         "--no-check", action="store_true", help="skip the one-shot correctness gate"

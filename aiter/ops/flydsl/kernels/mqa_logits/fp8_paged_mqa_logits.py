@@ -35,23 +35,22 @@ view are shared with the dense kernel via ``._mqa_logits_common``.
 import os
 from functools import lru_cache
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.typing import T
-from flydsl._mlir.dialects import scf
-from flydsl._mlir import ir
-
 from ..tensor_shim import GTensor, _run_compiled, _to_raw
 from ._mqa_logits_common import (
+    DEFAULT_COMPILE_HINTS,
+    MFMA_K,
     MFMA_M,
     MFMA_N,
-    MFMA_K,
-    DEFAULT_COMPILE_HINTS,
     Vec,
     device_cu_count,
     load_pack_kv,
@@ -63,7 +62,6 @@ from ._mqa_logits_common import (
     udiv,
     umod,
 )
-
 
 _SIMDS_PER_CU = 4
 
@@ -313,7 +311,7 @@ def _build_paged_kernel(
         index_dim: fx.Int32,
         max_block_len: fx.Int32,
         stride_out: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx = arith.index_cast(T.index, _to_raw(grid_blocks))
         kernel._func.__name__ = _kname

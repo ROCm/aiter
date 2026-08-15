@@ -13,13 +13,14 @@ import itertools
 import random
 from typing import NamedTuple
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import benchmark, checkAllclose
 
 torch.set_default_device("cuda")
 
@@ -106,7 +107,7 @@ def ref_fp8_paged_mqa_logits(
     masked by ``p <= context_len - next_n + n``. Position ``p`` resolves to
     ``(block_tables[b, p//KVB], p%KVB)`` in the block-flat co-packed cache.
     """
-    batch_size, next_n, heads, dim = q.size()
+    batch_size, next_n, _heads, dim = q.size()
     num_blocks = kv_cache_fp8.shape[0]
     index_dim = kv_cache_fp8.shape[-1]
     # Reconstruct the block-flat block: [KVB keys (dim bytes each)][KVB f32 scales].
