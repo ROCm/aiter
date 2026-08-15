@@ -205,6 +205,9 @@ REJECTED = {
     "two_kv_heads": ({"Hkv": 2}, {}),
     "four_kv_heads": ({"Hkv": 4}, {}),
     "head_dim_128": ({"D": 128}, {}),
+    # non-power-of-two: tl.arange(0, HEAD_DIM) would not compile, so the predicate must
+    # reject it rather than the allowlist being replaced by is_power_of_two()
+    "head_dim_192": ({"D": 192}, {}),
 }
 
 
