@@ -149,10 +149,10 @@ def test_prescale_modes_agree(prescale, monkeypatch):
 def test_default_scaling_mode_is_exact():
     """The default must stay on a bf16-exact scaling mode.
 
-    Mode 1 is 3.4% faster but its rounding error is data-dependent: on a distribution
-    with large late kv values it measured 7.0x the CK-tile path's error against fp32
-    while still passing the 2e-2 budget above, so that budget alone does not protect
-    this choice.
+    Mode 1 buys at most ~2% of kernel time (1.8% and 0.0% in two processes) and its
+    rounding error is data-dependent: on a distribution with large late kv values it
+    measured 8.0x the CK-tile path's error against fp32 while still passing the 2e-2
+    budget above, so that budget alone does not protect this choice.
     """
     from aiter.ops.triton.attention.fused_paged_prefill import _DEFAULT_CFG
 
@@ -162,7 +162,7 @@ def test_default_scaling_mode_is_exact():
 @pytest.mark.parametrize("prescale", [1, 2])
 def test_exact_mode_is_robust_to_late_kv_spikes(prescale, monkeypatch):
     """Pins the measurement behind the default: on the spiked distribution the exact
-    mode holds near the bf16 floor while the folded mode degrades by ~7x."""
+    mode holds at CK-tile's own error (9.7e-4) while the folded mode degrades ~8x."""
     import json
 
     monkeypatch.setenv("AITER_FPP_CFG", json.dumps({"PRESCALE_Q": prescale}))

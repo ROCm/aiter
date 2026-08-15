@@ -42,11 +42,11 @@ _DEFAULT_CFG = {
     "matrix_instr_nonkdim": 16,
     # How the softmax scale reaches the QK product. 2 folds only the power-of-two part
     # of sm_scale*log2e into q, which is exact in bf16, and applies the small remainder
-    # to the product. Mode 1 folds the whole thing and is 3.4% faster, but its rounding
-    # error is data-dependent: on a distribution with large late kv values it measured
-    # 7.0x the CK-tile path's error against an fp32 reference (6.8e-3 vs 9.7e-4), where
-    # mode 2 matches CK-tile to 1.00x. Not worth 3.4% on a path that silently replaces
-    # a more accurate kernel.
+    # to the product. Mode 1 folds the whole thing for at most ~2% of kernel time (1.8%
+    # and 0.0% in two processes), but its rounding error is data-dependent: on a
+    # distribution with large late kv values it measured 8.0x the CK-tile path's error
+    # against an fp32 reference (7.8e-3 vs 9.8e-4), where mode 2 matches CK-tile to
+    # 1.00x. Not worth ~2% on a path that silently replaces a more accurate kernel.
     "PRESCALE_Q": 2,
     "DOT_ACC": 0,
     "SWAP_GRID": 1,  # head-major grid: 8 GQA heads of one (req, m-tile) dispatch together

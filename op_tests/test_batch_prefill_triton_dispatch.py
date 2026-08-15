@@ -363,7 +363,7 @@ def test_accuracy_is_no_worse_than_ck(dist):
     assert e_triton < 2e-2, f"triton rms vs fp32 = {e_triton:.3e}"
     # The default scaling mode is exact in bf16, so the error should track CK-tile's
     # rather than merely stay inside a loose budget. This pins that: an earlier default
-    # passed a 2e-2 budget while carrying 7x CK-tile's error on the spiked case.
+    # passed a 2e-2 budget while carrying 8x CK-tile's error on the spiked case.
     assert (
         e_triton <= e_ck * 1.25
     ), f"{dist}: triton error {e_triton:.3e} is more than 1.25x CK-tile's {e_ck:.3e}"
