@@ -778,10 +778,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
 
     if constexpr(triple_buffer)
     {
-        static_assert(T::DIRECT_GMEM_TO_LDS && split_b_n64 && sorted_b_rows,
-                      "triple-buffered K4 requires the sorted-X direct path");
+        static_assert(T::DIRECT_GMEM_TO_LDS && split_b_n64 &&
+                          (sorted_b_rows || swap_route_sources),
+                      "triple-buffered K32 requires a direct split-B path");
         static_assert(BM == 256 && BN == 128 && T::BLOCK_SIZE == 256,
-                      "triple-buffered K4 requires the wave4 production tile");
+                      "triple-buffered K32 requires the wave4 production tile");
         constexpr int direct_loads_per_tile = a_m_slabs + 2;
         static_assert(direct_loads_per_tile == 6);
 

@@ -1015,6 +1015,15 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4DoubleLds
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
+// A third 24-KiB stage keeps two future reduction tiles in flight.  The
+// accumulator footprint already bounds residency, so this preserves the
+// production output tile and global access geometry.
+struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4TripleLds
+    : Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4DoubleLds
+{
+    static constexpr bool TRIPLE_BUFFER = true;
+};
+
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
     : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {
