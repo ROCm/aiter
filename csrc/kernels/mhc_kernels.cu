@@ -2185,13 +2185,13 @@ namespace aiter {
         static constexpr int x_load_waitcnt = 0;
         auto lds_load_x_tile = [&](int k){
             if (warp_id == 1) {
-                opus::tdm_window<DTYPE_I, tile_k, tile_m> win;   // ndim=2, cpol=default_cpol=16
-                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x))
-                    + static_cast<uint32_t>((k & 1) * tile_mk * sizeof(DTYPE_I));
+                using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m>>;
+                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x));
                 DTYPE_I* g = x_ptr + k_split_offset + k * tile_k;
-                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride)
-                win.desc.make(lds, g, tile_k, m_oob, x_stride);
-                win.load_to_lds();
+                // make(lds_base, global_ptr, shape0, shape1, dim0_stride); the
+                // double-buffer half is the per-issue LDS write offset (elements).
+                auto win = opus::make_tdm<win_t>(lds, g, tile_k, m_oob, x_stride);
+                win.async_load(static_cast<uint32_t>((k & 1) * tile_mk));
             }
         };
 #else
@@ -2251,17 +2251,18 @@ namespace aiter {
             // TDM is a wave-level DMA (not per-lane, not EXEC-gated); a single wave
             // issues one op that fills the whole all-head tile. Only warp 0 issues;
             // the others see the data after the tensorcnt wait + workgroup barrier
-            // in wait_load_cnt(). Build the 3D descriptor by hand (tdm_window::make
-            // is 2D-only) and reuse the vetted load_to_lds() issue path (cpol=16).
+            // in wait_load_cnt(). make() is 2D-only, so the 3D shape/pitch/origin
+            // go in through make_from_layout(), already in D# order (dim0 fastest).
             if (warp_id == 0) {
-                opus::tdm_window<DTYPE_I, tile_k, tile_m, hc_mult> win;  // ndim=3, cpol=default_cpol=16
-                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual))
-                    + static_cast<uint32_t>((k & 1) * (hc_mult * tile_mk) * sizeof(DTYPE_I));
+                using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m, hc_mult>>;
+                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual));
                 DTYPE_I* g = residual_ptr + k_split_offset + k * tile_k;
-                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride,
-                //      tensor_dim1_stride, lds_barrier_addr, tensor_dim2)
-                win.desc.make(lds, g, tile_k, m_oob, residual_stride, hidden_size, 0, hc_mult);
-                win.load_to_lds();
+                const opus::u32_t shape[3] = {tile_k, (opus::u32_t)m_oob, hc_mult};
+                const opus::u64_t pitch[2] = {(opus::u64_t)residual_stride, (opus::u64_t)hidden_size};
+                const opus::u32_t coord[3] = {0, 0, 0};
+                win_t win;
+                win.make_from_layout(lds, g, shape, pitch, coord);
+                win.async_load(static_cast<uint32_t>((k & 1) * (hc_mult * tile_mk)));
             }
         };
 #else
