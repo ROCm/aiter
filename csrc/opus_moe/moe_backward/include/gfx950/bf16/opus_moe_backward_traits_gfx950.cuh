@@ -199,6 +199,9 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
     : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64DeferredZWaitSavedAScaled
 {
     static constexpr bool PIPELINE_Z_ROUTE_GROUPS = true;
+    // The self-inverse vector permutation is shape-generic within this K32
+    // path and wins across token count, D, I, and routing-skew families.
+    static constexpr bool SWIZZLE_A_XOR2 = true;
 };
 
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.

@@ -168,6 +168,40 @@ down_bwd_load_rb_tr_split_n64(opus::smem<typename T::D_B>& s_b,
     return result;
 }
 
+// Locally permute each row's four K vectors with a self-inverse XOR.  Both the
+// direct-to-LDS writer and MFMA reader need only one shift/mask/xor, the tile
+// footprint is unchanged, and source-lane reordering stays within four rows.
+// Keeping the native fragment addressing explicit also gives the compiler a
+// shorter LDS dependency chain than the generic layout expression.
+template<typename T, typename Mma>
+inline __device__ auto
+down_bwd_load_ra_swizzled_xor2(opus::smem<typename T::D_A>& s_a,
+                               int lane_id)
+{
+    static_assert(T::B_K == 32 && T::W_M == 32 && T::W_K == 16);
+    static_assert(T::E_M == 1 && T::E_K == 2 && T::VEC_A == 8);
+
+    constexpr int vectors_per_row = T::B_K / T::VEC_A;
+    const int logical_row = lane_id % T::W_M;
+    const int lane_k_vector = lane_id / T::W_M;
+
+    typename Mma::vtype_a result;
+    opus::static_for<T::E_K>([&](auto ek) {
+        const int logical_k_vector =
+            lane_k_vector + ek.value * (T::W_K / T::VEC_A);
+        const int logical_vector =
+            logical_row * vectors_per_row + logical_k_vector;
+        const int physical_vector =
+            logical_vector ^ ((logical_vector >> 2) & 3);
+        auto values = s_a.template load<T::VEC_A>(
+            physical_vector * T::VEC_A);
+#pragma unroll
+        for(int j = 0; j < T::VEC_A; ++j)
+            result[ek.value * T::VEC_A + j] = values[j];
+    });
+    return result;
+}
+
 __device__ __forceinline__ float down_bwd_sigmoid(float value)
 {
     constexpr float kNegLog2E = -1.4426950408889634f;
@@ -245,9 +279,18 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::SPLIT_B_N64_SWIZZLE;
         return false;
     }();
+    constexpr bool swizzle_a_xor2 = []() constexpr {
+        if constexpr(requires { T::SWIZZLE_A_XOR2; })
+            return T::SWIZZLE_A_XOR2;
+        return false;
+    }();
     static_assert(!split_b_n64 ||
                       (BN == 256 && BK == 32 && T::BLOCK_SIZE == 256),
                   "split-B down backward requires the four-wave BN256 tile");
+    static_assert(!swizzle_a_xor2 ||
+                      (BK == 32 && T::W_M == 32 && T::W_K == 16 &&
+                       T::E_M == 1 && T::E_K == 2 && T::VEC_A == 8),
+                  "A XOR layout requires the native BF16 K32 fragment");
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -602,9 +645,22 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 const int a_vector = load.value * T::BLOCK_SIZE + tid;
                 if(a_vector < a_vectors)
                 {
-                    const int a_element = a_vector * T::VEC_A;
-                    const int local_m = a_element / BK;
-                    const int local_k = a_element % BK;
+                    int local_m;
+                    int local_k;
+                    if constexpr(swizzle_a_xor2)
+                    {
+                        const int logical_vector =
+                            a_vector ^ ((a_vector >> 2) & 3);
+                        local_m = logical_vector >> 2;
+                        local_k =
+                            (logical_vector & 3) * T::VEC_A;
+                    }
+                    else
+                    {
+                        const int a_element = a_vector * T::VEC_A;
+                        local_m = a_element / BK;
+                        local_k = a_element % BK;
+                    }
                     int token;
                     bool valid;
                     if constexpr(T::PREDECODE_ROUTE_METADATA)
@@ -687,7 +743,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 auto s_a = make_smem(reinterpret_cast<D_A*>(
                     tile_storage + buffer * gemm_buffer_bytes +
                     route_group.value * ROUTE_M * BK * sizeof(D_A)));
-                return s_a.template load<T::VEC_A>(u_ra);
+                if constexpr(swizzle_a_xor2)
+                    return down_bwd_load_ra_swizzled_xor2<T, decltype(mma)>(
+                        s_a, lane_id);
+                else
+                    return s_a.template load<T::VEC_A>(u_ra);
             };
             if constexpr(prefetch_a_tiles == 3 && RouteTiles >= 3)
             {
