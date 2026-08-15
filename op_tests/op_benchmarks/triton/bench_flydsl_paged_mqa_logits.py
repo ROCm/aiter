@@ -161,7 +161,10 @@ def main():
     parser.add_argument("--wave-per-eu", type=int, default=2)
     parser.add_argument("--chunk-k", type=int, default=128, help="KV tile width")
     parser.add_argument(
-        "--variant", type=str, default=None, help="paged_w<WPB> tag (default paged_w4)"
+        "--variant",
+        type=str,
+        default=None,
+        help=f"paged_w<WPB> tag; None uses the kernel default ({DEFAULT_VARIANT})",
     )
     parser.add_argument("--var-ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
