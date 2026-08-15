@@ -1263,7 +1263,11 @@ class OpusMoERefFunc(torch.autograd.Function):
         out.index_add_(0, x_gather_idx, (y.float() * p_sorted.float()[:, None]))
         out = out.to(dtype)
 
-        ctx.save_for_backward(x_g, w1, w2, act_input, h, y, p_sorted,
+        # Exact stage2 derives dscore from <dO @ W2, h>; its combine backward
+        # only scales dO and never reads expert-packed Y. Release this 1-GiB
+        # forward temporary instead of pinning it in the autograd context.
+        saved_y = y.new_empty(0) if exact_shape else y
+        ctx.save_for_backward(x_g, w1, w2, act_input, h, saved_y, p_sorted,
                               x_gather_idx, order, lens, topk_ids, topk_w)
         # Exact router tail only needs these tensors as metadata.  Store compact
         # INT32 copies during forward so the bandwidth-critical dx/router
