@@ -117,15 +117,15 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    grid = (batch_size * tp_k_head_num_k,)
+    # Both impls partition (batch, head, KV chunk). Sizing the chunk axis from
+    # the longest sequence rather than from kv_indices keeps preallocated
+    # serving buffers from inflating the grid; programs past their own
+    # sequence's end return immediately.
+    max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
+    grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
     if is_fp4_weight:
-        # Use the actual output token count, not kv_indices capacity. Serving
-        # paths may pass a preallocated kv_indices buffer that is much larger
-        # than the valid range described by kv_indptr/k_prefix.
-        max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
-        fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
-        _triton_gather_kv_b_proj[fp4_grid](
+        _triton_gather_kv_b_proj[grid](
             batch_size,
             k_buffer,
             k_scale,
