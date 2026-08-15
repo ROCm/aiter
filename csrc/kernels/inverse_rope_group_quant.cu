@@ -30,11 +30,28 @@ template <int N>
 using ic = std::integral_constant<int, N>;
 
 // scale_shuffle = false: row-major [S, G, Ks], unit stride on Ks.
-// scale_shuffle = true:  MFMA tile-shuffled for V_MFMA_SCALE_F32_16x16x128_F8.
-//     Storage: [G, S_pad, Ks_pad] with 256-byte tiles of [32_M, 8_K].
-//     Tile-internal byte = lane*4 + iter, where
+//
+// scale_shuffle = true means two different layouts depending on the quant group
+// size, matching dynamic_per_group_scaled_quant's contract:
+//
+//   GROUP_SIZE == 32 -- the MX hardware scale-load swizzle for
+//     V_MFMA_SCALE_F32_16x16x128_F8. Storage [G, S_pad, Ks_pad] with 256-byte
+//     tiles of [32_M, 8_K]; tile-internal byte = lane*4 + iter, where
 //       lane = (k%4)*16 + (m%16)
 //       iter = ((m/16)&1) + ((k/4)&1)*2
+//     The four bytes of a lane's dword are the op_sel iterations, which is what
+//     makes the swizzle worth doing at this group size.
+//
+//   GROUP_SIZE != 32 -- a plain transpose to [G, Ks_pad, S_pad], M contiguous.
+//     There is no tile swizzle here and nothing to op_sel-pack: a 1x128 scale
+//     covers the whole MFMA K step, so the consumer broadcasts the one byte to
+//     all four 32-blocks of the scale operand (opus pack_e8m0x4 = e*0x01010101)
+//     and all four bytes of the dword would be equal. What the transpose buys is
+//     on the consumer's side: its 16 M lanes then read 16 adjacent bytes instead
+//     of bytes Ks apart.
+//
+// Both shuffled layouts occupy the same S_pad*Ks_pad bytes per group, so
+// scale_row_base below is shared.
 
 template <typename scalar_t,
           int HEAD_DIM,
@@ -237,13 +254,27 @@ __global__ void inverse_rope_group_quant_kernel(
         {
             if(scale_shuffle)
             {
-                const int tile_k = k_group >> 3;
-                const int64_t tile_base =
-                    (static_cast<int64_t>(shuf_tile_m) * (Ks_pad >> 3) + tile_k) << 8;
-                const int lane_idx = (k_group & 3) * 16 + shuf_s_mod16;
-                const int iter = shuf_m_half + (((k_group >> 2) & 1) << 1);
-                x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] =
-                    s8.byte;
+                if constexpr(GROUP_SIZE == 32)
+                {
+                    const int tile_k = k_group >> 3;
+                    const int64_t tile_base =
+                        (static_cast<int64_t>(shuf_tile_m) * (Ks_pad >> 3) + tile_k) << 8;
+                    const int lane_idx = (k_group & 3) * 16 + shuf_s_mod16;
+                    const int iter = shuf_m_half + (((k_group >> 2) & 1) << 1);
+                    x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] =
+                        s8.byte;
+                }
+                else
+                {
+                    // [G, Ks_pad, S_pad], M contiguous. Writers in a block hold
+                    // consecutive `row` and row = s*G + g, so they differ in g
+                    // rather than in s and land Ks_pad*S_pad apart -- as scattered
+                    // as the swizzled path above, whose tiles are also per-g. The
+                    // M-adjacency this layout creates pays off on the consumer,
+                    // not here.
+                    x_scale[scale_row_base + static_cast<int64_t>(k_group) * S_pad + s] =
+                        s8.byte;
+                }
             }
             else
             {
@@ -337,14 +368,33 @@ void inverse_rope_group_quant(
                 "template path supports HEAD_DIM=512, RD=64; got ",
                 head_dim, ",", rd);
     const int scale_n = D / static_cast<int>(quant_group_size);
+    // At group_size 32 scale_shuffle is the MX hardware swizzle; at any other
+    // group size it is the plain transpose. The two put a different axis in dim1,
+    // so the shape check has to follow the group size or a caller that allocated
+    // for one layout would silently be filled in the other.
+    const bool scale_transposed = scale_shuffle && quant_group_size != 32;
     if(scale_shuffle)
     {
         CHECK_CONTIGUOUS(x_scale);
         AITER_CHECK(x_scale.size(0) == G, "scale_shuffle: x_scale dim0 must be G");
-        AITER_CHECK(x_scale.size(1) >= S && x_scale.size(1) % 32 == 0,
-                    "scale_shuffle: x_scale dim1 (S_pad) must be >= S and %32==0");
-        AITER_CHECK(x_scale.size(2) >= scale_n && x_scale.size(2) % 8 == 0,
-                    "scale_shuffle: x_scale dim2 (Ks_pad) must be >= Ks and %8==0");
+        if(scale_transposed)
+        {
+            AITER_CHECK(x_scale.size(1) >= scale_n,
+                        "scale_shuffle at group_size ", quant_group_size,
+                        " is the transpose [G, Ks_pad, S_pad]: x_scale dim1 (Ks_pad)"
+                        " must be >= ", scale_n);
+            AITER_CHECK(x_scale.size(2) >= S,
+                        "scale_shuffle at group_size ", quant_group_size,
+                        " is the transpose [G, Ks_pad, S_pad]: x_scale dim2 (S_pad)"
+                        " must be >= S");
+        }
+        else
+        {
+            AITER_CHECK(x_scale.size(1) >= S && x_scale.size(1) % 32 == 0,
+                        "scale_shuffle: x_scale dim1 (S_pad) must be >= S and %32==0");
+            AITER_CHECK(x_scale.size(2) >= scale_n && x_scale.size(2) % 8 == 0,
+                        "scale_shuffle: x_scale dim2 (Ks_pad) must be >= Ks and %8==0");
+        }
     }
     else
     {
@@ -360,8 +410,15 @@ void inverse_rope_group_quant(
 
     constexpr int BLOCK_M = 16;
 
-    const int Ks_pad = scale_shuffle ? ((scale_n + 7) / 8) * 8 : scale_n;
-    const int S_pad = scale_shuffle ? ((S + 31) / 32) * 32 : S;
+    // The transposed layout has no MFMA tile to pad to, so its two pitches come
+    // straight from the buffer -- that also lets a caller over-allocate S_pad to
+    // whatever M alignment its GEMM tile wants.
+    const int Ks_pad = !scale_shuffle     ? scale_n
+                       : scale_transposed ? static_cast<int>(x_scale.size(1))
+                                          : ((scale_n + 7) / 8) * 8;
+    const int S_pad = !scale_shuffle     ? S
+                      : scale_transposed ? static_cast<int>(x_scale.size(2))
+                                         : ((S + 31) / 32) * 32;
 
     auto launch = [&](auto group_tag, auto tds_tag, auto kpb_tag)
     {

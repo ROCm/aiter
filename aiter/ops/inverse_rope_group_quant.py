@@ -52,8 +52,14 @@ def inverse_rope_group_quant(
         cos_cache/sin_cache: ``[max_pos, rd//2]``.
         num_groups: output-LoRA local groups ``G``.
         quant_group_size: quant block along ``D``; V4 wo_a path uses 128.
-        scale_shuffle: when True, emit scale in MFMA tile-shuffled layout
-            ``[G, S_pad, Ks_pad]`` for ``V_MFMA_SCALE_F32_16x16x128_F8``.
+        scale_shuffle: when True, the layout follows the quant group size, the
+            same split ``dynamic_per_group_scaled_quant`` makes:
+            ``quant_group_size == 32`` emits the MFMA tile-shuffled
+            ``[G, S_pad, Ks_pad]`` for ``V_MFMA_SCALE_F32_16x16x128_F8``, and any
+            other group size emits the transpose ``[G, Ks, S]`` (M contiguous).
+            A 1x128 scale spans the whole MFMA K step, so its consumer broadcasts
+            the byte rather than selecting it with op_sel -- there is no tile to
+            swizzle, only the axis order to pick.
             When False, emit row-major ``[S, G, Ks]``.
 
     Returns:
@@ -84,10 +90,20 @@ def inverse_rope_group_quant(
     scale_groups = D // quant_group_size
     if x_scale is None:
         if scale_shuffle:
-            S_pad = ((S + 31) // 32) * 32
-            Ks_pad = ((scale_groups + 7) // 8) * 8
+            if quant_group_size == 32:
+                shape = (
+                    num_groups,
+                    ((S + 31) // 32) * 32,
+                    ((scale_groups + 7) // 8) * 8,
+                )
+            else:
+                shape = (num_groups, scale_groups, S)
+            # 0x7F is E8M0 1.0: rows the kernel never writes (an S_pad tail a
+            # caller allocated for its GEMM's M tile) are read unconditionally by
+            # the consumer's scale path, so they have to dequantize harmlessly
+            # rather than hold whatever was in the allocation.
             x_scale = torch.full(
-                (num_groups, S_pad, Ks_pad),
+                shape,
                 0x7F,
                 dtype=dtypes.fp8_e8m0,
                 device=o.device,

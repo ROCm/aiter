@@ -32,6 +32,12 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw, bmm_a8w8_mxscale_opus
+from aiter.ops.shuffle import (
+    shuffle_scale_a,
+    shuffle_scale_b,
+    shuffle_scale_mxsk_mpack,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -39,6 +45,105 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
 GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
 _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
+
+
+def _preshuffled_kids():
+    """Kids whose B must be shuffle_weight(w, layout=(16, 16)).
+
+    Imported lazily for the same reason as _align_kids: the helpers here are
+    reused by scripts that must not need the codegen package on sys.path.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid)
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+        if inst.needs_preshuffled_b
+    }
+
+
+_SCALE_LAYOUT_KIDS = {}
+
+
+def _scale_layout_kids():
+    """kid -> (shuffle_scale ``sub``, mpacked-SFA args) for kids wanting either.
+
+    Imported lazily for the same reason as _preshuffled_kids.
+    """
+    if not _SCALE_LAYOUT_KIDS:
+        from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+        _SCALE_LAYOUT_KIDS.update(
+            {
+                int(kid): (inst.needs_shuffle_scale, inst.needs_mpacked_sfa)
+                for fam in a8w8_mxscale_bmm_kernel_lists
+                for kid, inst in fam.items()
+                if inst.needs_shuffle_scale or inst.needs_mpacked_sfa
+            }
+        )
+    return _SCALE_LAYOUT_KIDS
+
+
+def _scale_picker(xs_mx, ws_mx, n, k):
+    """Return kid -> the (A, B) scale buffers that kid reads, relaying out once.
+
+    Same hazard as the weight, one step worse: a shuffle_scale kid handed the
+    plain arrays reads the wrong elements, and an mpacked-SFA kid reads past the
+    end of them, which arrives as a GPU memory fault rather than as a bad number.
+    Either layout is fixed once per model, so it follows the kid.
+    """
+    cache = {}
+
+    def pick(kid):
+        key = _scale_layout_kids().get(int(kid), (None, None))
+        if key not in cache:
+            sub, mpack = key
+            g, _, sk = xs_mx.shape
+            if sub:
+                # stride(0) zeroed: the shuffle_scale layout folds the row into
+                # its own addressing, so the kernel takes only the per-batch slab
+                # from stride(1) and would otherwise add a bogus row offset.
+                slab = shuffle_scale_a(xs_mx, k, sub)
+                sfa = slab.as_strided(
+                    (xs_mx.shape[1], g, slab.shape[1]), (0, slab.shape[1], 1)
+                )
+                # Kept 3-D with the N-block axis in the middle so stride(0) is the
+                # per-batch slab, the only term the shuffle_scale path reads.
+                sfb = shuffle_scale_b(ws_mx, n, k).view(g, n // 128, -1)
+            elif mpack:
+                sfa = (
+                    shuffle_scale_mxsk_mpack(xs_mx, *mpack)
+                    .view(g, -1, sk)
+                    .transpose(0, 1)
+                )
+                sfb = ws_mx
+            else:
+                sfa, sfb = xs_mx.transpose(0, 1), ws_mx
+            cache[key] = (sfa, sfb)
+        return cache[key]
+
+    return pick
+
+
+def _weight_picker(W_mx):
+    """Return kid -> the B buffer that kid reads, shuffling at most once.
+
+    A preshuffled kid handed the row-major buffer does not raise, it just
+    computes the wrong answer against the same reference, so the choice cannot
+    be left to the caller.
+    """
+    preshuffled = _preshuffled_kids()
+    cache = {}
+
+    def pick(kid):
+        if kid not in preshuffled:
+            return W_mx
+        if "sh" not in cache:
+            cache["sh"] = shuffle_weight(W_mx, layout=(16, 16))
+        return cache["sh"]
+
+    return pick
 
 
 def _to_e8m0_scale(scale):
@@ -116,9 +221,11 @@ def test_mxscale_bmm(g, m, n, k, dtype):
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)  # [m,g,n]
     y_shape = (m, g, n)
 
+    weight_for = _weight_picker(W_mx)
+
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        _opus_bmm_a8w8_mxscale_raw(O_in, weight_for(kid), Y, xs_in, ws_mx, 1, kid)
         return Y
 
     # Correctness-focused: kid 0 (k32 fused) is a fixed baseline with no
@@ -189,11 +296,15 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     xs_in = xs_mx.transpose(0, 1)  # [m, g, k/128] view
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32)  # [g, m, n] batch-major
 
+    weight_for = _weight_picker(W_mx)
+
     def _call_raw(kid):
         # Batch-major output buffer; hand the kernel its [m, g, n] view so the
         # store lands at Y.stride(1) (batch) = m*n (outermost), N contiguous.
         Yb = torch.empty((g, m, n), dtype=ydt)
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, 1, kid)
+        _opus_bmm_a8w8_mxscale_raw(
+            O_in, weight_for(kid), Yb.transpose(0, 1), xs_in, ws_mx, 1, kid
+        )
         return Yb  # [g, m, n]
 
     def _call_auto():
@@ -326,21 +437,28 @@ def _align_inputs(m, n, k):
         _ALIGN_INPUTS[key] = (
             O_mx.transpose(0, 1),
             W_mx,
-            xs_mx.transpose(0, 1),
-            ws_mx,
+            shuffle_weight(W_mx, layout=(16, 16)),
+            # The pickers are cached with the buffers they relay out, so each
+            # layout is built once per shape rather than once per kid and M.
+            _scale_picker(xs_mx, ws_mx, n, k),
             ref,
         )
     return _ALIGN_INPUTS[key]
 
 
-def _align_run(kid, m, n, k):
+def _align_run(kid, inst, m, n, k):
     """Return (ok, rel_err). ok False means the launcher refused the shape."""
-    O_in, W_mx, xs_in, ws_mx, ref = _align_inputs(m, n, k)
+    O_in, W_mx, W_sh, scale_for, ref = _align_inputs(m, n, k)
+    # A preshuffled kid reading the row-major buffer does not fail, it just
+    # returns a wrong answer, so the weight has to follow the kid -- and so must
+    # the scales.
+    W_in = W_sh if inst.needs_preshuffled_b else W_mx
+    xs_in, ws_mx = scale_for(kid)
     # NaN-filled so a row the kernel never writes shows up as nan, not as a
     # plausible value that a mean error would dilute.
     Y = torch.full((m, _ALIGN_G, n), float("nan"), dtype=dtypes.bf16)
     try:
-        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        _opus_bmm_a8w8_mxscale_raw(O_in, W_in, Y, xs_in, ws_mx, 1, kid)
         torch.cuda.synchronize()
     except RuntimeError:
         # The launcher's AITER_CHECK on M surfaces here. Deliberately not a
@@ -357,7 +475,7 @@ def _align_pick_shape(kid, inst):
     for n, k in _ALIGN_SHAPES:
         if n % inst.B_N or k % inst.B_K:
             continue
-        if _align_run(kid, max(inst.m_align, inst.B_M), n, k)[0]:
+        if _align_run(kid, inst, max(inst.m_align, inst.B_M), n, k)[0]:
             return n, k
     return None
 
@@ -376,6 +494,10 @@ def check_m_align():
     the declaration accepts, the launch must succeed and match the dequantized
     fp32 reference; at an M it rejects, the launch must raise. Kids are never
     silently skipped -- an unrunnable kid is reported.
+
+    Each kid gets the B buffer and the scale layout its family reads, so the
+    reference check is a real correctness gate for the preshuffled and
+    rearranged-scale kids too, and not an m_align check riding on a wrong answer.
     """
     kids = _align_kids()
     failures, unrunnable = [], []
@@ -388,7 +510,7 @@ def check_m_align():
         n, k = shape
         align = inst.m_align
         for m in _ALIGN_MS:
-            ok, err = _align_run(kid, m, n, k)
+            ok, err = _align_run(kid, inst, m, n, k)
             if m % align == 0:
                 if not ok:
                     failures.append(f"kid {kid}: m_align={align} but M={m} rejected")

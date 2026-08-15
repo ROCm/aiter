@@ -440,6 +440,118 @@ def shuffle_scale_a16w4(
     )
 
 
+def shuffle_scale_mxsk_mpack(
+    a_scale: torch.Tensor, b_m: int, sfa_mb: int
+) -> torch.Tensor:
+    """A-side e8m0 scales -> the M-packed panel the wave8 mxscale kids read.
+
+    Those kids take a K tile's A scales as one COM_REP_M-byte load per lane, so
+    the bytes for the lane's COM_REP_M M subtiles have to be adjacent. A subtile
+    index is the high part of a B_M row block and the lane-dependent part the low
+    part -- row = m_tile*b_m + im*sfa_mb + r0, per make_layout_sfa_mxsk -- so the
+    packing is a pure permutation that moves im innermost:
+
+        (..., M, Ksc) -> (..., [m_tile][r0][k][im]) with COM_REP_M = b_m/sfa_mb
+
+    and the kernel reads its bytes at ``(r0*Ksc + k) * COM_REP_M`` off the tile.
+
+    Doing this on the host is what keeps the panel out of LDS. Staging it in the
+    kernel needs a byte-granular scatter (the destination bytes for one row are
+    COM_REP_M apart), and those writes conflict on every bank: kid194 measures
+    LdsBankConflict 0.88 against flydsl's 0.00 at the same tile, which costs more
+    than the panel saves.
+    """
+    s = a_scale.view(torch.uint8)
+    *lead, rows, ksc = s.shape
+    com_rep_m = b_m // sfa_mb
+    if b_m != sfa_mb * com_rep_m:
+        raise ValueError(f"b_m={b_m} must be a multiple of sfa_mb={sfa_mb}")
+    if rows % b_m:
+        # A partial M tile still needs a whole panel: the kernel's OOB masking
+        # bounds the A and C buffers, but every lane reads its scale bytes
+        # unconditionally. 0x7F = E8M0 1.0 makes the pad rows harmless.
+        s = F.pad(s, (0, 0, 0, (-rows) % b_m), value=0x7F)
+        rows = s.shape[-2]
+    s = s.view(*lead, rows // b_m, com_rep_m, sfa_mb, ksc)
+    nd = len(lead)
+    perm = (*range(nd), nd, nd + 2, nd + 3, nd + 1)
+    out = s.permute(*perm).contiguous().view(*lead, rows * ksc)
+    return out.view(a_scale.dtype)
+
+
+def _shuf_kblock_pairs(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
+    """Pad the 128-K block axis to whole pairs, since a scale dword holds two.
+
+    K1 = (K+255)//256 is the pair count. 0x7F is E8M0 1.0, so a padded block
+    scales by one and the A/B tails the kernel reads past K contribute nothing.
+    """
+    K1 = (K + 255) // 256
+    if s.shape[-1] < 2 * K1:
+        s = F.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
+    return s, K1
+
+
+def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int = 16) -> torch.Tensor:
+    """A-side e8m0 scales in the reference (FlyDSL) blockscale layout.
+
+    One dword holds four scales -- two adjacent M subtiles crossed with two
+    consecutive 128-blocks of K -- and the row-within-a-subtile axis sits outside
+    it at a stride of exactly one dword. That is the point of the layout: 16 lanes
+    read 16 adjacent dwords, so a wave's scale load is one 64B line per (subtile
+    pair, K block pair) instead of the 16 lines shuffle_scale_mxsk_mpack's row
+    stride spreads it over. The MFMA picks its byte with scale_op_sel =
+    (kp << 1) | (im & 1), one immediate for both operands.
+
+    ``sub`` is the row distance between adjacent M subtiles, i.e. the kernel's
+    T_M*W_M. FlyDSL's own layout is sub=16, which is the T_M=1 case; a T_M=2 grid
+    pairs rows 32 apart instead. Take it from the kid's needs_shuffle_scale.
+
+        row = n1*(2*sub) + np*sub + nl,  kblock = k1*2 + kp
+        byte index = (((n1*K1 + k1)*sub + nl)*2 + kp)*2 + np
+
+    Leading dims are kept, so a batched (G, M, K//128) comes back as (G, -1) and
+    the launcher takes the per-batch slab from stride(1).
+    """
+    s = a_scale.view(torch.uint8)
+    *lead, rows, ksc = s.shape
+    if ksc != K // 128:
+        raise ValueError(
+            f"a_scale must be (..., rows, K//128)=(..., {K // 128}); got {tuple(a_scale.shape)}"
+        )
+    if rows % (2 * sub):
+        # A partial row block still needs whole dwords: every lane reads its scale
+        # bytes unconditionally, and only A and C are OOB-masked.
+        s = F.pad(s, (0, 0, 0, (-rows) % (2 * sub)), value=0x7F)
+        rows = s.shape[-2]
+    s, K1 = _shuf_kblock_pairs(s, K)
+    nd = len(lead)
+    # (..., rows, 2*K1) -> [n1, np, nl, k1, kp] -> [n1, k1, nl, kp, np]
+    s = s.view(*lead, rows // (2 * sub), 2, sub, K1, 2)
+    perm = (*range(nd), nd, nd + 3, nd + 2, nd + 4, nd + 1)
+    return s.permute(*perm).contiguous().view(*lead, -1).view(a_scale.dtype)
+
+
+def shuffle_scale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """B-side e8m0 scales in the reference (FlyDSL) blockscale layout.
+
+    B has one scale per 128 columns, so its dword carries the same two K tiles as
+    A's with each byte doubled: (k, k, k+1, k+1). The duplicate is what lets one
+    scale_op_sel immediate serve both operands -- A spends the low bit on its M
+    subtile, B ignores it -- which is the whole reason to duplicate rather than
+    pack two N blocks in.
+    """
+    s = b_scale.view(torch.uint8)
+    *lead, nblk, ksc = s.shape
+    if (nblk, ksc) != (N // 128, K // 128):
+        raise ValueError(
+            f"b_scale must be (..., N//128, K//128)=(..., {N // 128}, {K // 128}); "
+            f"got {tuple(b_scale.shape)}"
+        )
+    s, K1 = _shuf_kblock_pairs(s, K)
+    out = s.view(*lead, nblk, K1, 2, 1).expand(*lead, nblk, K1, 2, 2)
+    return out.contiguous().view(*lead, -1).view(b_scale.dtype)
+
+
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
     """Pack a preshuffled int8 tensor (values in [-8, 7]) into packed int4 bytes.
 

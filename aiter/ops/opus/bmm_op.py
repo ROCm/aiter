@@ -83,12 +83,67 @@ def _kid_runs_m(kid: int, m: int) -> bool:
 
     Only a tuned row found at a padded M can name a kernel that rejects the
     real, smaller M, so this is what an incoming id is checked against below.
-    No tuned winner needs alignment today (all 11 mask their partial M tile),
-    but 10 of the 45 codegen instances require M % 128 or % 256, so a re-tune
-    can put one in the CSV.
+    No tuned winner needs alignment today (all 11 row-major and all 21
+    preshuffled ones mask their partial M tile), but 10 of the 93 codegen
+    instances require M % 128 or % 256, so a re-tune can put one in the CSV.
     """
     align = _mxscale_kid_m_align().get(int(kid))
     return align is not None and m % align == 0
+
+
+@functools.cache
+def _mxscale_kid_pre_b() -> dict[int, bool]:
+    """kid -> whether it reads B in the (16,16) preshuffled MFMA-fragment layout.
+
+    Same source as the M alignment above. Needed because B's layout is not
+    inferable from the tensor: a preshuffled weight has the same shape, dtype and
+    strides as a row-major one, so a kid mismatched to it reads the right bytes in
+    the wrong order and returns a plausible wrong answer instead of failing.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid): bool(inst.needs_preshuffled_b)
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+    }
+
+
+def _kid_takes_b_layout(kid: int, b_preshuffled: bool) -> bool:
+    """True iff kid wants B in the layout the caller says it has."""
+    return _mxscale_kid_pre_b().get(int(kid)) == bool(b_preshuffled)
+
+
+@functools.cache
+def _mxscale_kid_host_scale() -> frozenset[int]:
+    """kids whose scales have to be rearranged on the host before the launch.
+
+    Some kids read the e8m0 scales through an M-packed panel or the shuffle_scale
+    layout (aiter.ops.shuffle.shuffle_scale_*) rather than the plain per-token /
+    per-block arrays. Same hazard as the B layout and dangerous for the same
+    reason: the rearranged panel holds the same bytes, so a kid handed plain
+    scales runs and answers wrongly. Reachable only through
+    _opus_bmm_a8w8_mxscale_raw, where the caller does the rearranging (see
+    op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py).
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return frozenset(
+        int(kid)
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+        if inst.needs_mpacked_sfa or inst.needs_shuffle_scale
+    )
+
+
+def _kid_takes_plain_scales(kid: int) -> bool:
+    """True iff kid reads x_scale / w_scale as this entry passes them through.
+
+    No tuned row names such a kid today, but 7 of the 93 codegen instances are
+    ones, so a re-tune can put one in the CSV -- and unlike an M-alignment
+    mismatch it would not throw.
+    """
+    return int(kid) not in _mxscale_kid_host_scale()
 
 
 def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
@@ -134,6 +189,7 @@ def bmm_a8w8_mxscale_opus(
     dtype: torch.dtype = torch.bfloat16,
     kernelId: int | None = None,
     splitK: int | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     """Opus fp8 e8m0 mxscale (block-scale) BMM by kernel id.
 
@@ -146,6 +202,20 @@ def bmm_a8w8_mxscale_opus(
     An id this backend cannot run at this M gets the heuristic too, so the
     caller never has to know the alignment rules; _opus_bmm_a8w8_mxscale_raw is
     the entry that launches an id verbatim. ``splitK`` defaults to 1.
+
+    ``b_preshuffled`` declares that ``wo_a`` arrives in the (16,16) MFMA-fragment
+    layout (``aiter.ops.shuffle.shuffle_weight``), which a serving stack bakes into
+    the weight offline. It has to be declared because it is not observable: the
+    shuffled weight is the same shape, dtype and strides as the row-major one, so a
+    mismatched kid returns a plausible wrong answer instead of failing. An id whose
+    layout disagrees is therefore dropped like one that cannot run this M -- with
+    row-major B the heuristic then answers correctly, which is what a caller
+    pinning a preshuffled id (or one read from a mismatched table) gets. Under
+    True there is nothing to fall back to (every heuristic kid reads B row-major),
+    so that raises rather than run one.
+
+    The scales, by contrast, are always passed through as given, so an id wanting
+    them rearranged on the host is dropped too (see _kid_takes_plain_scales).
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -157,10 +227,26 @@ def bmm_a8w8_mxscale_opus(
 
     # A tuned row found at a padded M can name a kernel whose launcher rejects
     # the real, smaller M; drop its splitK along with it and let the heuristic
-    # pick instead of letting the launcher throw.
-    if kernelId is not None and not _kid_runs_m(int(kernelId), m):
+    # pick instead of letting the launcher throw. A kernel wanting the other B
+    # layout, or scales this entry does not rearrange, is dropped the same way --
+    # those two would not throw.
+    if kernelId is not None and not (
+        _kid_runs_m(int(kernelId), m)
+        and _kid_takes_b_layout(int(kernelId), b_preshuffled)
+        and _kid_takes_plain_scales(int(kernelId))
+    ):
         kernelId = splitK = None
     if kernelId is None:
+        if b_preshuffled:
+            raise ValueError(
+                f"no preshuffled-B kid this entry can run for (g={g}, m={m}, "
+                f"n={n}, k={k}): the tuned row is absent, names a row-major kid, "
+                "or wants host-rearranged scales, and every heuristic fallback "
+                "reads B row-major. Tune this shape into the preshuffle table "
+                "(AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE, "
+                "read only for b_preshuffled=True), or pass b_preshuffled=False "
+                "with row-major B."
+            )
         kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:
         splitK = 1
