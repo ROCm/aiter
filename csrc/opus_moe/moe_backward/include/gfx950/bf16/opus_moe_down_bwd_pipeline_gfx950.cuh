@@ -170,13 +170,14 @@ down_bwd_load_rb_tr_split_n64(opus::smem<typename T::D_B>& s_b,
 
 // Locally permute each row's four K vectors with a self-inverse XOR.  Both the
 // direct-to-LDS writer and MFMA reader need only one shift/mask/xor, the tile
-// footprint is unchanged, and source-lane reordering stays within four rows.
+// footprint is unchanged, and source-lane reordering stays within each row.
 // Keeping the native fragment addressing explicit also gives the compiler a
 // shorter LDS dependency chain than the generic layout expression.
-template<typename T, typename Mma>
+template<typename T, typename Mma, typename RouteGroup>
 inline __device__ auto
-down_bwd_load_ra_swizzled_xor2(opus::smem<typename T::D_A>& s_a,
-                               int lane_id)
+down_bwd_load_ra_swizzled_xor(opus::smem<typename T::D_A>& s_a,
+                              int lane_id,
+                              RouteGroup route_group)
 {
     static_assert(T::B_K == 32 && T::W_M == 32 && T::W_K == 16);
     static_assert(T::E_M == 1 && T::E_K == 2 && T::VEC_A == 8);
@@ -191,8 +192,15 @@ down_bwd_load_ra_swizzled_xor2(opus::smem<typename T::D_A>& s_a,
             lane_k_vector + ek.value * (T::W_K / T::VEC_A);
         const int logical_vector =
             logical_row * vectors_per_row + logical_k_vector;
+        constexpr int group_vector_base =
+            route_group.value * T::ROUTE_M * vectors_per_row;
+        const int global_logical_vector =
+            group_vector_base + logical_vector;
         const int physical_vector =
-            logical_vector ^ ((logical_vector >> 2) & 3);
+            (global_logical_vector ^
+             ((global_logical_vector >> T::A_XOR_SHIFT) &
+              T::A_XOR_MASK)) -
+            group_vector_base;
         auto values = s_a.template load<T::VEC_A>(
             physical_vector * T::VEC_A);
 #pragma unroll
@@ -279,18 +287,28 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::SPLIT_B_N64_SWIZZLE;
         return false;
     }();
-    constexpr bool swizzle_a_xor2 = []() constexpr {
-        if constexpr(requires { T::SWIZZLE_A_XOR2; })
-            return T::SWIZZLE_A_XOR2;
-        return false;
+    constexpr int a_xor_shift = []() constexpr {
+        if constexpr(requires { T::A_XOR_SHIFT; })
+            return T::A_XOR_SHIFT;
+        return 0;
     }();
+    constexpr int a_xor_mask = []() constexpr {
+        if constexpr(requires { T::A_XOR_MASK; })
+            return T::A_XOR_MASK;
+        return 0;
+    }();
+    constexpr bool swizzle_a_xor = a_xor_mask != 0;
     static_assert(!split_b_n64 ||
                       (BN == 256 && BK == 32 && T::BLOCK_SIZE == 256),
                   "split-B down backward requires the four-wave BN256 tile");
-    static_assert(!swizzle_a_xor2 ||
+    static_assert(!swizzle_a_xor ||
                       (BK == 32 && T::W_M == 32 && T::W_K == 16 &&
                        T::E_M == 1 && T::E_K == 2 && T::VEC_A == 8),
                   "A XOR layout requires the native BF16 K32 fragment");
+    static_assert(!swizzle_a_xor ||
+                      (a_xor_shift >= 2 && a_xor_shift <= 6 &&
+                       a_xor_mask > 0 && a_xor_mask <= 3),
+                  "A XOR layout requires shift 2..6 and a two-bit mask");
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -647,10 +665,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 {
                     int local_m;
                     int local_k;
-                    if constexpr(swizzle_a_xor2)
+                    if constexpr(swizzle_a_xor)
                     {
                         const int logical_vector =
-                            a_vector ^ ((a_vector >> 2) & 3);
+                            a_vector ^
+                            ((a_vector >> a_xor_shift) & a_xor_mask);
                         local_m = logical_vector >> 2;
                         local_k =
                             (logical_vector & 3) * T::VEC_A;
@@ -743,9 +762,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 auto s_a = make_smem(reinterpret_cast<D_A*>(
                     tile_storage + buffer * gemm_buffer_bytes +
                     route_group.value * ROUTE_M * BK * sizeof(D_A)));
-                if constexpr(swizzle_a_xor2)
-                    return down_bwd_load_ra_swizzled_xor2<T, decltype(mma)>(
-                        s_a, lane_id);
+                if constexpr(swizzle_a_xor)
+                    return down_bwd_load_ra_swizzled_xor<T, decltype(mma)>(
+                        s_a, lane_id, route_group);
                 else
                     return s_a.template load<T::VEC_A>(u_ra);
             };
