@@ -75,7 +75,7 @@
   "BLOCK_M": 32,
   "BLOCK_N": 32,
   "BLOCK_K": 512,
-  "NUM_BUFFERS": 3,
+  "NUM_BUFFERS": 4,
   "num_warps": 4,
   "kernel_type": "compute_bound"
  },

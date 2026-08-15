@@ -58,8 +58,8 @@
  "M_LEQ_256": {
   "BLOCK_M": 32,
   "BLOCK_N": 64,
-  "BLOCK_K": 512,
-  "NUM_BUFFERS": 3,
+  "BLOCK_K": 256,
+  "NUM_BUFFERS": 6,
   "num_warps": 4,
   "kernel_type": "compute_bound"
  },
