@@ -12,9 +12,9 @@ K_Extend/V_Extend gather, and no host sync.
 
 It uses no LDS: K and V tiles stay in registers, which is the main structural
 difference from the CK-tile pipeline (`qr_ks_vs_async`, which stages K/V through
-LDS). On gfx950 at head_dim 256 that is worth ~1.4x on the kernel and +5.71%
-end-to-end on an SGLang Qwen3.8-MoE TP8 server; see the PR body for the full
-measurement.
+LDS). On gfx950 at head_dim 256 that is worth 1.40-1.50x on the kernel and +8.6%
+to +8.9% end-to-end on an SGLang Qwen3.8-MoE TP8 server; see the PR body for the
+full measurement.
 
 Scope is deliberately narrow and enforced by `is_supported()`: causal only,
 page_size 1, ONE kv head in the cache view, and a power-of-two head dim from
@@ -35,24 +35,47 @@ import triton.language as tl
 _DEFAULT_CFG = {
     "BLOCK_M": 128,
     "BLOCK_N": 64,
-    "num_warps": 8,
-    "num_stages": 2,
-    "waves_per_eu": 2,
+    # num_warps 4 rather than 8 because 8 caps the budget at 256 VGPR/thread and this
+    # kernel does not fit: at head_dim 256 it spills 113 registers. At 4 warps the cap
+    # doubles, the kernel settles at 419 VGPR with no spills, and occupancy stays at
+    # 1 wave/SIMD either way. Worth 5.6% of kernel time on the captured live shapes.
+    # num_stages/waves_per_eu/matrix_instr_nonkdim were re-picked together with it: the
+    # 5.6% is the set, not num_warps alone, and only the register count is explained.
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 1,
     "kpack": 2,
-    "matrix_instr_nonkdim": 16,
+    "matrix_instr_nonkdim": 32,
     # How the softmax scale reaches the QK product. 2 folds only the power-of-two part
     # of sm_scale*log2e into q, which is exact in bf16, and applies the small remainder
-    # to the product. Mode 1 folds the whole thing for at most ~2% of kernel time (1.8%
-    # and 0.0% in two processes), but its rounding error is data-dependent: on a
+    # to the product. Mode 1 folds the whole thing for at most ~1% of kernel time (0.7%
+    # in each of two processes), but its rounding error is data-dependent: on a
     # distribution with large late kv values it measured 8.0x the CK-tile path's error
     # against an fp32 reference (7.8e-3 vs 9.8e-4), where mode 2 matches CK-tile to
-    # 1.00x. Not worth ~2% on a path that silently replaces a more accurate kernel.
+    # 1.00x. Not worth ~1% on a path that silently replaces a more accurate kernel.
     "PRESCALE_Q": 2,
     "DOT_ACC": 0,
     "SWAP_GRID": 1,  # head-major grid: 8 GQA heads of one (req, m-tile) dispatch together
     "CONTIG": 0,  # contiguous-page fast path measured SLOWER (11.6 vs 10.5 ms) -> off
     "NUM_XCDS": 8,
 }
+
+
+# AMD instruction-scheduling hint: `attention` inserts the FA-aware sched barriers and
+# `memory-bound-attention` sets amdgpu-sched-strategy=iterative-ilp. Worth ~2% here.
+# Guarded because it is an AMD-backend option that older Triton does not accept, and
+# this kernel must still compile there.
+_SCHED_HINT = "attention,memory-bound-attention"
+try:
+    import dataclasses as _dc
+
+    from triton.backends.amd.compiler import HIPOptions as _HIPOptions
+
+    _HAS_SCHED = any(f.name == "schedule_hint" for f in _dc.fields(_HIPOptions))
+except (ImportError, TypeError):
+    # ImportError: no AMD backend (or an older layout). TypeError: HIPOptions is not
+    # a dataclass in this version, so its fields cannot be inspected.
+    _HAS_SCHED = False
 
 
 def _cfg():
@@ -68,8 +91,9 @@ def _cfg():
 
 # NUM_M / BS are RUNTIME scalars, never tl.constexpr and never specialized: they are derived from
 # (max_seqlen_q, batch_size), which the live chunked-prefill scheduler varies call-to-call.  Baking
-# them into the JIT key forces a fresh compile per ragged shape (elevated live TTFT).  They are only
-# read by the SWAP_GRID==2 flat-grid path; the default SWAP_GRID==1 grid never touches them.
+# them into the JIT key forces a fresh compile per ragged shape (elevated live TTFT).  NUM_M is read
+# by the default grid to reverse the tile order (see below) and by the SWAP_GRID==2 flat grid; BS
+# only by the latter.  Reversing with a runtime NUM_M is what keeps that free of respecialization.
 @triton.jit(do_not_specialize=["NUM_M", "BS"])
 def _fused_paged_prefill_kernel(
     Q,
@@ -111,7 +135,11 @@ def _fused_paged_prefill_kernel(
         cur_b = rid // (H_Q * NUM_M)
     elif SWAP_GRID == 1:
         cur_head = tl.program_id(0)
-        pid_m = tl.program_id(1)
+        # Longest tile first. Tile m scans kv up to delta + m + BLOCK_M, so work grows
+        # with m, and dim 0 (the head) is dispatched fastest -- ascending m therefore
+        # hands the hardware its shortest tiles first and leaves the longest ones to
+        # straggle at the end. Reversing shortens that tail by ~2% of kernel time.
+        pid_m = NUM_M - 1 - tl.program_id(1)
         cur_b = tl.program_id(2)
     else:
         pid_m = tl.program_id(0)
@@ -223,10 +251,10 @@ Restricted rather than "any power of two" on purpose:
 
 * 192 (and any non-power-of-two) fails to COMPILE -- `tl.arange(0, HEAD_DIM)`
   requires a power of two. Loud, but still must not be dispatched.
-* 128 is correct but SLOWER than CK-tile: measured 0.930x (CK reaches 863 TFLOP/s
-  at that head dim, versus 663 at 256). CK's tiling is tuned for 128, which is the
+* 128 is correct but only reaches parity: measured 1.040x (CK reaches 812 TFLOP/s
+  at that head dim, versus 618 at 256). CK's tiling is tuned for 128, which is the
   head dim most models use; there is nothing to win there.
-* 64 (1.445x) and 256 (1.277x) are where CK leaves throughput on the table.
+* 64 (1.55-1.61x) and 256 (1.46-1.48x) are where CK leaves throughput on the table.
 """
 
 
@@ -446,5 +474,6 @@ def mha_batch_prefill_func(
         waves_per_eu=cfg["waves_per_eu"],
         kpack=cfg["kpack"],
         matrix_instr_nonkdim=cfg["matrix_instr_nonkdim"],
+        **({"schedule_hint": _SCHED_HINT} if _HAS_SCHED else {}),
     )
     return o
