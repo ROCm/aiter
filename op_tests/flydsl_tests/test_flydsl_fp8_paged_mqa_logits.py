@@ -187,9 +187,8 @@ def _build_inputs(
 
     # Block table: one entry per KVBlockSize-token block, handed out of a
     # shuffled pool in sequence order. The pool is sized from max_model_len, so
-    # sequences share blocks once the batch needs more than it holds -- harmless
-    # here (and extra coverage of block reuse), unlike in the benchmarks where
-    # it would shrink the measured working set into cache.
+    # sequences share blocks once the batch needs more than it holds. That is
+    # deliberate: it costs nothing for correctness and exercises block reuse.
     blocks_per_seq = (context_lens.to(torch.int64) + block_size - 1) // block_size
     max_block_len = int(blocks_per_seq.max().item())
     pool = list(range(num_blocks))

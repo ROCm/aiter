@@ -75,17 +75,10 @@ def _auto_split_kv(
 
         SplitKV = round(WavePerEU * 4 * TotalCuCount / (batch*next_n*WavePerBlock))
 
-    Resident wave count is the lever that matters here -- the kernel is bound by
-    memory throughput, not per-wave latency, so too few waves leaves the memory
-    system idle and too many just queue. Measured on gfx950/256 CU across six
-    shapes (batch 4..128, kv_len 4k..128k), the curve is flat between 2.0 and 2.5
-    waves/SIMD and rises steeply either side: at the reference shape 1.0/SIMD
-    costs 33.9 us and 4.0/SIMD costs 29.4 us against 27.6 us at 2.0.
-
-    The earlier formula, ``((TotalCuCount // (batch*next_n) + 4) // 5 * 5) *
-    WavePerEU``, ignored the CTA's wave count, so it drifted with shape --
-    2.5 waves/SIMD at the reference shape but 10 at batch=128 -- and left 4-14%
-    on the table. Returns >= 1.
+    Resident wave count is the lever that matters here: the kernel is bound by
+    memory throughput rather than per-wave latency, so too few waves leaves the
+    memory system idle and too many just queue. Accounting for the CTA's wave
+    count keeps the target fixed across shapes. Returns >= 1.
     """
     tile_q_count = max(1, batch_size * next_n)
     if total_cu is None:
@@ -348,11 +341,10 @@ def _build_paged_kernel(
 # Kernel variants: single-token-per-block, wave-split only ("paged_w<WPB>").
 # WPB must divide the column-tile count BKV/16 (=8 at the default BKV=128).
 #
-# WPB=1 (one wave per CTA) is the default: with SplitKV set to hit the same
-# resident wave count, splitting a CTA across 2 or 4 waves is 4-14% slower on
-# every shape measured -- a 1-wave CTA schedules more freely and pays no
-# whole-CTA granularity cost, and the waves have no work to share anyway (each
-# owns a disjoint set of KV columns, with no barrier or LDS between them).
+# WPB=1 (one wave per CTA) is the default: a 1-wave CTA schedules more freely
+# and pays no whole-CTA granularity cost, and the waves have no work to share
+# anyway, each owning a disjoint set of KV columns with no barrier or LDS
+# between them.
 KERNEL_VARIANTS = tuple(f"paged_w{w}" for w in (1, 2, 4))
 DEFAULT_VARIANT = "paged_w1"
 
@@ -451,8 +443,7 @@ def flydsl_fp8_paged_mqa_logits(
     max_model_len: out_logits column count.
     SplitKV:      KV-column split count (grid = split_kv*batch*next_n). None =>
                   sized for WavePerEU waves per SIMD; 1 disables splitting.
-    WavePerEU:    target resident waves per SIMD (default 2, where the measured
-                  curve bottoms out).
+    WavePerEU:    target resident waves per SIMD for the auto-SplitKV formula.
     TotalCuCount: CU count for that formula; None => query the device.
     ChunkK:       KV tile width, a multiple of MFMA_N=32. Defaults to 128.
 
