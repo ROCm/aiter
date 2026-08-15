@@ -307,7 +307,8 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int cohort1_bm128_dual_lds_kid = 9;
     constexpr int bm128x128_adaptive_routes_kid = 10;
     constexpr int bm256x128_direct_kid = 11;
-    constexpr int bm256x128_k32_double_lds_kid = 12;
+    constexpr int bm256x128_k32_triple_lds_kid = 12;
+    constexpr int bm256x128_k32_prefetch_ab_triple_lds_kid = 13;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the larger output tile.  Require at least
@@ -349,14 +350,22 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
            bm256_output_blocks >= bm256_min_output_blocks &&
            bm256_blocks_per_expert <= bm256_max_blocks_per_expert)
         {
-            // K32 uses the same BM256xBN128 output tile but alternates two
-            // 24-KiB operand stages, overlapping the next route tile's
-            // global-to-LDS transfer with current MFMA.  The extra pipeline
-            // boundary pays off from roughly 1024 padded routes per expert;
-            // shorter reductions retain K64's lower loop/barrier count.
+            // K32 uses the same BM256xBN128 output tile with three 24-KiB
+            // operand stages, overlapping two future route tiles with the
+            // current MFMA.  The extra pipeline boundary pays off from
+            // roughly 1024 padded routes per expert; shorter reductions
+            // retain K64's lower loop/barrier count.  On long reductions,
+            // queue both second-K16 LDS fragments before the first MFMA
+            // chain.  The crossover is expressed only in reduction/output
+            // geometry: the containing branch already requires at least
+            // 4096 BM256xBN128 output blocks.
             constexpr uint64_t k32_min_average_routes = 1024;
+            constexpr uint64_t k32_prefetch_ab_min_average_routes = 3072;
+            if(average_padded_routes >=
+               k32_prefetch_ab_min_average_routes)
+                return bm256x128_k32_prefetch_ab_triple_lds_kid;
             return average_padded_routes >= k32_min_average_routes
-                       ? bm256x128_k32_double_lds_kid
+                       ? bm256x128_k32_triple_lds_kid
                        : bm256x128_direct_kid;
         }
         return bm128x128_adaptive_routes_kid;

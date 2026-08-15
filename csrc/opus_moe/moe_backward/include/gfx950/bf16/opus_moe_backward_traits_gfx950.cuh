@@ -1024,6 +1024,17 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4TripleLds
     static constexpr bool TRIPLE_BUFFER = true;
 };
 
+// Keep the current three-stage operand residency, but issue both second-K16
+// transpose fragments before the first MFMA chain.  This is the dW2 analogue
+// of the long-reduction dW1 schedule and is screened independently because
+// dO and a_scaled have different cache/reuse behavior.
+struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4PrefetchABTripleLds
+    : Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4TripleLds
+{
+    static constexpr bool PREFETCH_REDUCTION_A = false;
+    static constexpr bool PREFETCH_REDUCTION_AB = true;
+};
+
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
     : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {
