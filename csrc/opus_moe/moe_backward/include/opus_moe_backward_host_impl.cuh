@@ -309,6 +309,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int bm256x128_direct_kid = 11;
     constexpr int bm256x128_k32_triple_lds_kid = 12;
     constexpr int bm256x128_k32_prefetch_ab_triple_lds_kid = 13;
+    constexpr int bm256x128_k32_native_b32_zero_pad_kid = 16;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the larger output tile.  Require at least
@@ -363,7 +364,9 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
             constexpr uint64_t k32_prefetch_ab_min_average_routes = 3072;
             if(average_padded_routes >=
                k32_prefetch_ab_min_average_routes)
-                return bm256x128_k32_prefetch_ab_triple_lds_kid;
+                return kargs.a_scaled_padding_zero
+                           ? bm256x128_k32_native_b32_zero_pad_kid
+                           : bm256x128_k32_prefetch_ab_triple_lds_kid;
             return average_padded_routes >= k32_min_average_routes
                        ? bm256x128_k32_triple_lds_kid
                        : bm256x128_direct_kid;
@@ -607,6 +610,9 @@ void launch_dw2_bf16(const Dw2Kargs& kargs,
     detail::check_gfx950_or_fail();
     const int selected_kernel_id =
         detail::select_fixed_dw2_kernel_id(kargs, kernel_id);
+    AITER_CHECK(selected_kernel_id != 16 || kargs.a_scaled_padding_zero,
+                "dw2: kernel 16 requires exact-zero a_scaled padding from "
+                "the full K1--K5 cache contract");
     detail::invoke(
         gfx950::dispatch_dw2(selected_kernel_id), kargs, stream, family);
 }
@@ -758,7 +764,7 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
         (down_kernel_id == 14 || down_kernel_id == 15 ||
          down_kernel_id == 16) &&
         (dw1_kernel_id == 15 || dw1_kernel_id == 17 ||
-         dw1_kernel_id == 18);
+         dw1_kernel_id == 18 || dw1_kernel_id == 19);
     const bool launch_saved_dw2_before_down =
         mid_width_d && uses_saved_a_and_sorted_x &&
         dz_bytes >= dz_k5_before_route_min_bytes;
@@ -1997,6 +2003,7 @@ void opus_moe_weight_bwd(aiter_tensor_t& x,
     dw2_args.model_dim = model_dim;
     dw2_args.inter_dim = inter_dim;
     dw2_args.split_k = 1;
+    dw2_args.a_scaled_padding_zero = false;
     dw2_args.stride_do_t = d_out.stride(0);
     dw2_args.stride_a_scaled_r = a_scaled.stride(0);
     dw2_args.stride_dw2_e = d_w2.stride(0);
@@ -2473,6 +2480,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
     dw2_args.model_dim = model_dim;
     dw2_args.inter_dim = inter_dim;
     dw2_args.split_k = 1;
+    dw2_args.a_scaled_padding_zero = true;
     dw2_args.stride_do_t = d_out.stride(0);
     dw2_args.stride_a_scaled_r = a_scaled.stride(0);
     dw2_args.stride_dw2_e = d_w2.stride(0);

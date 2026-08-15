@@ -735,6 +735,17 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirs
     static constexpr bool EAGER_PREFETCH_REDUCTION_AB = true;
 };
 
+// Keep the production geometry and three-stage ring, but partition both LDS
+// operands into independent logical K32 x native-M32 tiles.  Each tile uses
+// the conflict-free 16-row x 32-column transpose-read swizzle also used by
+// the gfx950 MLA BF16 path.  This changes only the physical LDS encoding;
+// global traffic, MFMA order, accumulator layout, and stage size stay fixed.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
+{
+    static constexpr bool NATIVE_M32_LDS_SWIZZLE = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
@@ -1033,6 +1044,16 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4PrefetchABTripleLds
 {
     static constexpr bool PREFETCH_REDUCTION_A = false;
     static constexpr bool PREFETCH_REDUCTION_AB = true;
+};
+
+// Full-pipeline upper bound: K1 materializes exact zero for every padded
+// a_scaled row, so K5 can consume the sorted cache without a second route
+// validity lookup.  Keep explicit until the contract/performance is proven.
+struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4NativeB32ZeroPadTripleLds
+    : Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4PrefetchABTripleLds
+{
+    static constexpr bool NATIVE_B_M32_LDS_SWIZZLE = true;
+    static constexpr bool ASSUME_SORTED_B_PADDING_ZERO = true;
 };
 
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720

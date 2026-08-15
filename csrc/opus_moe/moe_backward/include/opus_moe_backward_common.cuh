@@ -256,6 +256,10 @@ struct Dw2Kargs
     int model_dim;
     int inter_dim;
     int split_k;
+    // True only when every sorter-padding row of a_scaled is exact zero.
+    // The full K1--K5 pipeline owns this producer contract; standalone K5
+    // leaves it false so auto-dispatch cannot consume uninitialized padding.
+    bool a_scaled_padding_zero;
 
     int64_t stride_do_t;
     int64_t stride_a_scaled_r;

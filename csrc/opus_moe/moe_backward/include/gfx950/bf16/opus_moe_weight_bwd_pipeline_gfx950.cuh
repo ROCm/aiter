@@ -201,6 +201,25 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::TRIPLE_BUFFER;
         return false;
     }();
+    constexpr bool native_m32_lds_swizzle = []() constexpr {
+        if constexpr(requires { T::NATIVE_M32_LDS_SWIZZLE; })
+            return T::NATIVE_M32_LDS_SWIZZLE;
+        return false;
+    }();
+    constexpr bool native_b_m32_lds_swizzle =
+        native_m32_lds_swizzle || []() constexpr {
+            if constexpr(requires { T::NATIVE_B_M32_LDS_SWIZZLE; })
+                return T::NATIVE_B_M32_LDS_SWIZZLE;
+            return false;
+        }();
+    constexpr bool assume_sorted_b_padding_zero = []() constexpr {
+        if constexpr(requires { T::ASSUME_SORTED_B_PADDING_ZERO; })
+            return T::ASSUME_SORTED_B_PADDING_ZERO;
+        return false;
+    }();
+    static_assert(!assume_sorted_b_padding_zero ||
+                      native_b_m32_lds_swizzle,
+                  "zero-padding contract is only used by native B loads");
     static_assert(!triple_buffer || T::DOUBLE_BUFFER);
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 128 || BN == 256) && BK == 32);
@@ -222,6 +241,18 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                   "split-B K4 requires a four-wave BN128 tile");
     static_assert(!sorted_b_rows || (split_b_n64 && !swap_route_sources),
                   "sorted-B K4 requires the split-B dW1 load path");
+    static_assert(!native_m32_lds_swizzle ||
+                      (BM == 256 && BN == 128 && BK == 32 &&
+                       T::BLOCK_SIZE == 256 && split_b_n64 &&
+                       (sorted_b_rows || swap_route_sources) &&
+                       triple_buffer),
+                  "native-M32 LDS swizzle requires a sorted-row K32 path");
+    static_assert(!native_b_m32_lds_swizzle ||
+                      (BM == 256 && BN == 128 && BK == 32 &&
+                       T::BLOCK_SIZE == 256 && split_b_n64 &&
+                       (sorted_b_rows || swap_route_sources) &&
+                       triple_buffer),
+                  "native B-M32 swizzle requires a sorted-row K32 path");
     int expert;
     int output_m_base;
     int output_n_base;
@@ -303,6 +334,26 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());
     const int wave_id_m = wave_id / T::T_N;
     const int wave_id_n = wave_id % T::T_N;
+
+    // Native-M32 LDS candidate: collapse the standard 32x32x16 BF16 MFMA
+    // lane mapping once, outside the reduction loop.  The two bases select
+    // each lane's K0..3 and K4..7 fragments.  Wave and repeat offsets remain
+    // compile-time immediates at the transpose reads below.
+    const int native32_lane_group = lane_id >> 4;
+    const int native32_k =
+        (native32_lane_group >> 1) * 8 + ((lane_id >> 2) & 3);
+    const int native32_m_bytes =
+        (native32_lane_group & 1) * 32 + (lane_id & 3) * 8;
+    const int native32_read_base0 =
+        native32_k * 64 + native32_m_bytes;
+    const int native32_read_base1 =
+        (native32_k + 4) * 64 + (native32_m_bytes ^ 32);
+
+    // A direct-to-LDS issue deposits lane L in physical vector L.  Decode
+    // that slot once; every unrolled issue differs only by its native tile.
+    const int native32_load_k = (tid >> 2) & 31;
+    const int native32_load_vec = (tid & 3) ^ ((tid >> 3) & 2);
+    const int native32_load_half = tid >> 7;
 
     constexpr int smem_a_bytes = BM * BK * sizeof(D_A);
     constexpr int smem_b_bytes = BN * BK * sizeof(D_B);
@@ -387,7 +438,12 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         int b_split;
     };
     auto tile_sources = [&](int tile_k) __attribute__((always_inline)) {
-        const int a_sorted_row = route_start + tile_k * BK + a_local_k;
+        // Native-M32 stores assign one K row to each physical vector lane.
+        // Resolve that exact row here so the same path supports both dW1
+        // (sorted dZ/sorted X) and dW2 (gathered dO/sorted a_scaled).
+        const int source_local_k =
+            native_m32_lds_swizzle ? native32_load_k : a_local_k;
+        const int a_sorted_row = route_start + tile_k * BK + source_local_k;
         const int b_sorted_row0 = route_start + tile_k * BK + b_local_k0;
         const int b_sorted_row1 = route_start + tile_k * BK + b_local_k1;
         int token_a;
@@ -444,6 +500,29 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         {
             static_assert(split_b_n64,
                           "swapped K32 route sources require split-B loads");
+            if constexpr(native_b_m32_lds_swizzle &&
+                         !native_m32_lds_swizzle)
+            {
+                // Keep A's production 8-lane/64-byte dO gather, but resolve
+                // B's native K32xN32 physical lane independently.  The
+                // validity lookup prevents uninitialized sorter padding from
+                // entering an explicit raw K5 launch.
+                const int b_sorted_row =
+                    route_start + tile_k * BK + native32_load_k;
+                int b_source;
+                if constexpr(assume_sorted_b_padding_zero)
+                    b_source = b_sorted_row;
+                else
+                {
+                    const int b_token =
+                        weight_bwd_source_row<T::ROUTE_LAYOUT, true>(
+                            kargs.route, b_sorted_row, true);
+                    b_source = b_token < kargs.route.token_num
+                                   ? b_sorted_row
+                                   : kargs.route.sorted_capacity;
+                }
+                return TileSources{source_b_split, 0, 0, b_source};
+            }
             return TileSources{source_b_split, 0, 0, source_a};
         }
         else
@@ -461,7 +540,37 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
             wave_id * opus::get_warp_size() * VEC;
         auto issue_a = [&]() __attribute__((always_inline)) {
-            if constexpr(wide_workgroup)
+            if constexpr(native_m32_lds_swizzle)
+            {
+                // One direct load per thread fills 256 consecutive physical
+                // vectors.  Decode that destination slot back to its logical
+                // K row and M vector so the hardware's implicit lane*16 LDS
+                // displacement materializes eight independent K32xM32 tiles.
+                constexpr int native_m = 32;
+                constexpr int vectors_per_native = BK * native_m / VEC;
+                constexpr int loads = BM * BK / (T::BLOCK_SIZE * VEC);
+                static_assert(vectors_per_native == 128 && loads == 4);
+                opus::static_for<loads>([&](auto load) {
+                    constexpr int native_tile_pair =
+                        load.value * T::BLOCK_SIZE / vectors_per_native;
+                    const int native_tile =
+                        native_tile_pair + native32_load_half;
+                    OPUS_LDS_ADDR D_A* a_wave_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
+                        (load.value * T::BLOCK_SIZE +
+                         wave_id * opus::get_warp_size()) * VEC;
+                    g_a.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                        (sources.a * kargs.stride_a_row +
+                         output_m_base + native_tile * native_m +
+                         native32_load_vec * VEC) *
+                            sizeof(D_A),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_A>{});
+                });
+            }
+            else if constexpr(wide_workgroup)
             {
                 // Eight waves form two four-wave loader groups.  Each group
                 // owns one slab in each half of BM256.
@@ -500,7 +609,33 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             }
         };
         auto issue_b = [&]() __attribute__((always_inline)) {
-            if constexpr(split_b_n64)
+            if constexpr(native_b_m32_lds_swizzle)
+            {
+                constexpr int native_n = 32;
+                constexpr int vectors_per_native = BK * native_n / VEC;
+                constexpr int loads = BN * BK / (T::BLOCK_SIZE * VEC);
+                static_assert(vectors_per_native == 128 && loads == 2);
+                opus::static_for<loads>([&](auto load) {
+                    constexpr int native_tile_pair =
+                        load.value * T::BLOCK_SIZE / vectors_per_native;
+                    const int native_tile =
+                        native_tile_pair + native32_load_half;
+                    OPUS_LDS_ADDR D_B* b_load_dst =
+                        reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
+                        (load.value * T::BLOCK_SIZE +
+                         wave_id * opus::get_warp_size()) * VEC;
+                    g_b.template _async_load<VEC>(
+                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_load_dst),
+                        (sources.b_split * kargs.stride_b_row +
+                         output_n_base + native_tile * native_n +
+                         native32_load_vec * VEC) *
+                            sizeof(D_B),
+                        0,
+                        opus::number<0>{},
+                        opus::number<T::CACHECTL_B>{});
+                });
+            }
+            else if constexpr(split_b_n64)
             {
                 opus::static_for<2>([&](auto slab) {
                     OPUS_LDS_ADDR D_B* b_slab_dst =
@@ -569,7 +704,29 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 opus::static_for<T::E_M>([&](auto em) {
                     constexpr int k_byte_offset = ek.value * 2048;
                     int base;
-                    if constexpr(T::T_M == 1)
+                    if constexpr(native_m32_lds_swizzle)
+                    {
+                        constexpr int native_tile_bytes = 32 * BK * sizeof(D_A);
+                        constexpr int repeat_offset =
+                            em.value * T::T_M * native_tile_bytes +
+                            ek.value * 16 * 32 * sizeof(D_A);
+                        const int wave_offset = wave_id_m * native_tile_bytes;
+                        auto lo = s_a_tile.template _tr_load<
+                            T::VEC_TR_B, repeat_offset>(
+                            native32_read_base0 + wave_offset);
+                        auto hi = s_a_tile.template _tr_load<
+                            T::VEC_TR_B, repeat_offset>(
+                            native32_read_base1 + wave_offset);
+#pragma unroll
+                        for(int j = 0; j < T::VEC_TR_B; ++j)
+                        {
+                            v_a[em.value * 2 * T::VEC_TR_B + j] = lo[j];
+                            v_a[em.value * 2 * T::VEC_TR_B +
+                                T::VEC_TR_B + j] = hi[j];
+                        }
+                        return;
+                    }
+                    else if constexpr(T::T_M == 1)
                     {
                         constexpr int slab = em.value / 2;
                         constexpr int em_in_slab = em.value % 2;
@@ -603,7 +760,29 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     constexpr int k_byte_offset =
                         ek.value * (split_b_n64 ? 2048 : 4096);
                     int base;
-                    if constexpr(split_b_n64)
+                    if constexpr(native_b_m32_lds_swizzle)
+                    {
+                        constexpr int native_tile_bytes = 32 * BK * sizeof(D_B);
+                        constexpr int repeat_offset =
+                            en.value * T::T_N * native_tile_bytes +
+                            ek.value * 16 * 32 * sizeof(D_B);
+                        const int wave_offset = wave_id_n * native_tile_bytes;
+                        auto lo = s_b_tile.template _tr_load<
+                            T::VEC_TR_B, repeat_offset>(
+                            native32_read_base0 + wave_offset);
+                        auto hi = s_b_tile.template _tr_load<
+                            T::VEC_TR_B, repeat_offset>(
+                            native32_read_base1 + wave_offset);
+#pragma unroll
+                        for(int j = 0; j < T::VEC_TR_B; ++j)
+                        {
+                            v_b[en.value * 2 * T::VEC_TR_B + j] = lo[j];
+                            v_b[en.value * 2 * T::VEC_TR_B +
+                                T::VEC_TR_B + j] = hi[j];
+                        }
+                        return;
+                    }
+                    else if constexpr(split_b_n64)
                     {
                         const int native_n =
                             en.value * T::T_N + wave_id_n;

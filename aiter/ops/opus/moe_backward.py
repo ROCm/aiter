@@ -190,6 +190,15 @@ def _select_saved_a_scaled_down_kernel(
     return 16 if sorted_capacity >= 65_536 else 13
 
 
+def _reject_saved_a_scaled_down_without_cache(kernel_id: int) -> None:
+    """Keep no-store K1 instances away from an uninitialized output cache."""
+
+    if int(kernel_id) in (13, 14, 15, 16):
+        raise ValueError(
+            "K1 kernel_id=13/14/15/16 requires saved_a_scaled"
+        )
+
+
 def _validate_saved_a_scaled(
     saved_a_scaled: Tensor,
     sorted_capacity: int,
@@ -200,7 +209,8 @@ def _validate_saved_a_scaled(
 
     Live rows must contain the BF16-rounded value
     ``route_weight * SwiGLU(z_sorted)`` in expert-sorted route-major order.
-    Sorter padding rows are never consumed and need not be initialized.
+    Every sorter-padding row must be exact zero.  The full pipeline uses this
+    producer contract to select a K5 instance that reads padded rows directly.
     """
 
     if saved_a_scaled.dtype != torch.bfloat16:
@@ -249,25 +259,26 @@ def _select_saved_x_dw1_kernel(
     reverse cohort-4 schedule.  Auto uses the same long-reduction and
     output-grid crossover instead of a model tuple, then enables a third LDS
     stage while two future BK32 tiles can remain in flight.  Explicit kids
-    14/15/17/18 remain available for family benchmarking.
+    14/15/17/18/19 remain available for family benchmarking.  Kid 19 is an
+    explicit-only physical-LDS-layout experiment; auto retains kid 18.
     """
 
     if gate_up_dim % 256 != 0 or model_dim % 128 != 0:
         raise ValueError(
             "saved_x_sorted K4 requires 2I divisible by 256 and D by 128"
         )
-    if kernel_id not in (-1, 14, 15, 17, 18):
+    if kernel_id not in (-1, 14, 15, 17, 18, 19):
         raise ValueError(
             "saved_x_sorted currently supports auto or K4 "
-            "kernel_id=14/15/17/18"
+            "kernel_id=14/15/17/18/19"
         )
-    if kernel_id in (14, 15, 17, 18):
+    if kernel_id in (14, 15, 17, 18, 19):
         return kernel_id
 
     if num_experts < 2:
         raise ValueError(
             "saved_x_sorted auto requires at least two experts; use "
-            "kernel_id=14/15/17/18 only for explicit tuning"
+            "kernel_id=14/15/17/18/19 only for explicit tuning"
         )
     average_padded_routes = sorted_capacity // num_experts
     inter_dim = gate_up_dim // 2
@@ -284,7 +295,7 @@ def _select_saved_x_dw1_kernel(
     ):
         raise ValueError(
             "saved_x_sorted auto requires the production long-reduction "
-            "BM256 K4 geometry; use kernel_id=14/15/17/18 only for explicit "
+            "BM256 K4 geometry; use kernel_id=14/15/17/18/19 only for explicit "
             "tuning"
         )
     # Long reductions with sufficiently wide output/reduction grids amortize
@@ -306,8 +317,8 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15, 17, 18):
-        raise ValueError("K4 kernel_id=14/15/17/18 requires saved_x_sorted")
+    if int(kernel_id) in (14, 15, 17, 18, 19):
+        raise ValueError("K4 kernel_id=14/15/17/18/19 requires saved_x_sorted")
 
 
 @dataclass(frozen=True)
@@ -710,7 +721,7 @@ def opus_moe_down_backward(
     shape ``[sorted_capacity, I]``.  When supplied, K1 skips recomputing and
     writing ``route_weight * SwiGLU(z_sorted)``; the returned ``a_scaled`` is
     the same tensor and K5 consumes it directly.  Only routed rows identified
-    by the sorting metadata are live; padding contents are ignored.
+    by the sorting metadata are live; every padding row must be exact zero.
     """
 
     if d_out.dtype != torch.bfloat16 or any(
@@ -745,6 +756,8 @@ def opus_moe_down_backward(
             expert_padded_offsets,
             kernel_id,
         )
+    else:
+        _reject_saved_a_scaled_down_without_cache(kernel_id)
     down_block_n = _select_fixed_down_block_n(
         inter_dim, sorted_expert_ids, expert_padded_offsets, kernel_id
     )
@@ -1622,7 +1635,8 @@ def opus_moe_backward(
     A BF16 ``saved_a_scaled=[sorted_capacity,I]`` may be supplied by forward
     to remove K1's scale/pack/global-store epilogue.  It must use the same
     sorting metadata and contain ``route_weight * SwiGLU(z_sorted)`` for each
-    routed row; sorter padding rows are ignored.  The cache is treated as
+    routed row; every sorter-padding row must be exact zero.  The cache is
+    treated as
     non-differentiable because K1 still computes dZ and dScore explicitly.
 
     A BF16 ``saved_x_sorted=[sorted_capacity,D]`` may independently preserve
@@ -1650,6 +1664,8 @@ def opus_moe_backward(
             metadata.expert_padded_offsets,
             down_kernel_id,
         )
+    else:
+        _reject_saved_a_scaled_down_without_cache(down_kernel_id)
     x_dw1 = x
     if saved_x_sorted is not None:
         _validate_saved_x_sorted(
@@ -2190,7 +2206,7 @@ def opus_moe_attach_backward(
     here. Forward owns out/A_sorted/Z_sorted and passes the exact sorting
     metadata used to produce them.  It may also pass the non-differentiable
     BF16 ``saved_a_scaled=route_weight*SwiGLU(z_sorted)`` cache in the same
-    expert-sorted route-major layout; sorter padding rows are ignored.
+    expert-sorted route-major layout; sorter padding rows must be exact zero.
     ``saved_x_sorted`` may similarly preserve ``x[token]`` in padded sorted
     order, but its padding rows must be exact zero because K4 reduces them.
     """

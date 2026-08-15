@@ -106,6 +106,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` sorted-X pipelined | 15 | kid 14 geometry + both K16 fragments prefetched, sorted-X issued first |
 | K4 `dw1` sorted-X three-stage | 17 | kid 15 geometry + two future BK32 tiles in flight |
 | K4 `dw1` sorted-X eager-AB | 18 | kid 17 geometry + both K16 LDS fragments issued before one wait |
+| K4 `dw1` native-M32 LDS experiment | 19 | kid 18 schedule + independent conflict-free K32 x M32 physical LDS tiles; explicit only |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
@@ -163,11 +164,11 @@ smaller D/I family screens were bit-exact and favored the pipelined instance;
 the selector remains a sorted-capacity/BN256 geometry policy rather than an
 exact model-shape check.  Kids 14 and 15 remain explicit comparison overrides.
 The cache has shape `[sorted_capacity,I]`, must have been produced with the
-same sorting metadata, and is non-differentiable.  Sorter padding rows are
-ignored.  Shapes that do not select the general BN256 geometry reject this
-fast path instead of silently falling back to a kernel that overwrites the
-cache.  The default path remains kids 2/9/10/11/12 and has no API or numerical
-change.
+same sorting metadata, and is non-differentiable.  Every sorter-padding row
+must be exact zero.  Shapes that do not select the general BN256 geometry
+reject this fast path instead of silently falling back to a kernel that
+overwrites the cache.  The default path remains kids 2/9/10/11/12 and has no
+API or numerical change.
 
 K4 auto-dispatch uses runtime launch geometry rather than an exact model
 tuple. Kid 11 is selected once the average padded expert interval reaches
@@ -194,11 +195,16 @@ MFMA and issues the smaller sorted-X transfer before dZ.  Kid 17 extends that
 path from two 24-KiB LDS stages to three.  After the first stage is ready it
 keeps two future BK32 tiles outstanding, uses `vmcnt(6)` to retire only the
 older tile, and overlaps the younger tile with the next 16 MFMAs.  Its 72-KiB
-LDS and 116 VGPR footprint retains two CTAs per gfx950 CU.  Auto selects kid 17
+LDS and 116 VGPR footprint retains two CTAs per gfx950 CU.  Kid 18 queues both
+K16 LDS fragments before one full wait.  Auto selects kid 18
 when kid 13's long-reduction, `I <= 1024`, BM256 output-grid conditions hold,
 `I >= 768`, `D >= 1536`, and average padded routes are at most 6400.  Longer
 reductions retain two-stage kid 15.  These are runtime grouped-GEMM geometry
-boundaries; explicit kids 14/15/17 remain tuning overrides.
+boundaries; explicit kids 14/15/17/18 remain tuning overrides.  Kid 19 keeps
+kid 18's global traffic and MFMA schedule but encodes both LDS operands as
+independent conflict-free K32 x native-M32 tiles.  Its mixed family screen,
+including regressions at I=768, E=32, and active-eight routing, keeps it an
+explicit-only comparison instance rather than an auto-dispatch choice.
 
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output
@@ -207,6 +213,12 @@ one 128-column `a_scaled` slab across 256 `dO` rows; each wave owns eight native
 C tiles and consumes the K64 reduction as four K16 transpose-load/MFMA
 fragments.  The production kid launches BM256 directly for every expert
 interval without a host readback.
+Long K32 reductions use a three-stage BM256 pipeline.  In the full K1--K5
+pipeline, kid 16 preserves dO's 8-lane/64-byte gathered load while encoding
+the contiguous `a_scaled` operand as native K32xN32 LDS tiles.  It relies on
+the exact-zero padding contract above.  Standalone K5 auto-dispatch retains
+kid 13, and an explicit standalone kid-16 launch is rejected, so arbitrary
+caller-owned padding is never consumed accidentally.
 The retired BM128 mid-route fallback was slower not only for balanced and
 skewed routing but also for its intended 20993--30720 interval after the K16
 pipeline landed.  The target code object uses 52 arch VGPRs, 132 accum VGPRs,
