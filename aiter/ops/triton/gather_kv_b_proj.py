@@ -117,15 +117,25 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    grid = (batch_size * tp_k_head_num_k,)
+    # Both impls partition (batch, head, KV chunk). The chunk axis is sized
+    # from `k_prefix`'s row count -- the batch's total output tokens -- rather
+    # than from `kv_indices`, whose length is a capacity in serving paths that
+    # pass a preallocated buffer far larger than the valid range `kv_indptr`
+    # describes. The per-sequence maximum would be tighter still, but the only
+    # thing that knows it is `kv_indptr`, which is on device and reading it
+    # here would cost a sync. So the axis is an upper bound: with B sequences
+    # in the batch it launches up to B x more programs than have work, and
+    # each of the extras loads two indptr entries and returns.
+    #
+    # Also the bound cannot be too *small*: a sequence's chunk count is
+    # computed in the kernel from its block span, and `ChunkK % block_size == 0`
+    # above makes ceil(blocks * block_size / ChunkK) == ceil(tokens / ChunkK),
+    # so no sequence ever asks for a chunk id this grid does not cover.
+    max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
+    grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
     if is_fp4_weight:
-        # Use the actual output token count, not kv_indices capacity. Serving
-        # paths may pass a preallocated kv_indices buffer that is much larger
-        # than the valid range described by kv_indptr/k_prefix.
-        max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
-        fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
-        _triton_gather_kv_b_proj[fp4_grid](
+        _triton_gather_kv_b_proj[grid](
             batch_size,
             k_buffer,
             k_scale,
