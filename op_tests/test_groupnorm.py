@@ -1,10 +1,14 @@
 import argparse
+import os
 import random
+import resource
+import subprocess
+import sys
 
 import numpy as np
 import torch
 
-from aiter.ops.groupnorm import GroupNorm, groupnorm_run
+from aiter.ops.groupnorm import GroupNorm
 from aiter.test_common import checkAllclose, perftest
 
 random.seed(0)
@@ -69,17 +73,36 @@ def test_autocast_matches_torch(spatial_size=64):
 
 
 def test_mixed_dtype_without_autocast_is_rejected():
-    device = torch.device("cuda")
-    x = torch.randn((1, 8, 4, 4), dtype=torch.float16, device=device)
-    weight = torch.randn(8, dtype=torch.bfloat16, device=device)
-    bias = torch.randn(8, dtype=torch.bfloat16, device=device)
+    code = """
+import torch
+from aiter.ops.groupnorm import groupnorm_run
 
-    try:
-        groupnorm_run(x, 4, weight, bias, 1e-6)
-    except RuntimeError as error:
-        assert "same dtype" in str(error)
-    else:
-        raise AssertionError("mixed dtype GroupNorm call did not raise")
+x = torch.randn((1, 8, 4, 4), dtype=torch.float16, device="cuda")
+weight = torch.randn(8, dtype=torch.bfloat16, device="cuda")
+bias = torch.randn(8, dtype=torch.bfloat16, device="cuda")
+groupnorm_run(x, 4, weight, bias, 1e-6)
+"""
+    env = os.environ.copy()
+    env.pop("AITER_REBUILD", None)
+
+    def disable_core_dump():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    process = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        preexec_fn=disable_core_dump,
+        check=False,
+    )
+    output = process.stdout + process.stderr
+    assert process.returncode != 0
+    assert (
+        "groupnorm requires input, output, weight, and bias to have the same dtype"
+        in output
+    )
 
 
 class GroupNormTimer:
