@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared FlyDSL building blocks for the dense and paged FP8 MQA-logits kernels.
-
-Both compute the same core per query row / KV column::
+"""FlyDSL building blocks for the paged FP8 MQA-logits kernel::
 
     logits[row, n] = sum_h ReLU(<Q[row, h, :], K[n, :]> * kv_scale[n]) * weights[row, h]
 
-and differ only in how K / kv_scale are addressed (contiguous vs paged gather)
-and in the windowing / output layout. Everything else lives here.
+Split out of ``fp8_paged_mqa_logits`` to keep the gather layouts, the MFMA
+head-reduce and the output view separable from the kernel body. The dense
+``fp8_mqa_logits`` carries its own copies and does not import this.
 """
 
 # No `from __future__ import annotations`: FlyDSL arg typing needs real
@@ -141,11 +140,12 @@ def load_pack_kv(key_view, physical, tok_in_block, kk_step, lane_div_N):
     ).bitcast(fx.Int32)
 
 
-def make_out_row_view(logits, stride_i64, row_i32):
+def make_out_row_view(logits, stride_out, row_i32):
     """1-D output GTensor for ``row_i32``, with the row byte base folded into
     the pointer in i64 so the column offset stays i32. A 2-D (row, col) view
     would compute ``row*stride + col`` in i32 and silently overflow past 2^31.
     """
+    stride_i64 = arith.extui(T.i64, _to_raw(stride_out))
     _ri64 = arith.extui(T.i64, _to_raw(row_i32))
     _byte = arith.muli(arith.muli(_ri64, stride_i64), arith.constant(4, type=T.i64))
     _idx = arith.index_cast(T.index, _byte)
@@ -160,11 +160,9 @@ def mfma_head_reduce(
     *,
     m_tiles,
     k_steps,
-    res_ty,
-    f32_0,
-    fm_fast,
-    mfma_fn=MFMA_FN,
     dreg_count=16,
+    fm_fast=arith.FastMathFlags.fast,
+    mfma_fn=MFMA_FN,
 ):
     """One column's logit: fp8 MFMA over heads, ReLU * weight sum, kv-scale,
     in-wave head reduce. Returns the reduced f32 ``col_sum`` (raw ir value).
@@ -173,6 +171,8 @@ def mfma_head_reduce(
     ReLU is positively homogeneous, so ReLU(s*x) = s*ReLU(x) and hoisting it out
     of the head sum is exact.
     """
+    res_ty = Vec.make_type(dreg_count, fx.Float32)
+    f32_0 = arith.constant(0.0, type=T.f32)
     col_sum = _to_raw(f32_0)
     for mi in range_constexpr(m_tiles):
         acc = Vec.filled(dreg_count, 0.0, fx.Float32)

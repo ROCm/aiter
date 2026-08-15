@@ -51,7 +51,6 @@ from ._mqa_logits_common import (
     MFMA_K,
     MFMA_M,
     MFMA_N,
-    Vec,
     device_cu_count,
     load_pack_kv,
     load_pack_v8i32,
@@ -99,8 +98,6 @@ def _build_paged_kernel(
     kv_block_size: int = 1,
     preshuffle: bool = False,
     scale_mul: float = 1.0,
-    convert_q_fn: bool = False,
-    convert_kv_fn: bool = False,
 ):
     """Paged MQA-logits kernel with SplitKV column parallelism.
 
@@ -135,16 +132,9 @@ def _build_paged_kernel(
     N_TILES_PER_WAVE = N_TILES // WPB
 
     fm_fast = arith.FastMathFlags.fast
-
-    _cvt_tag = ""
-    if convert_q_fn:
-        _cvt_tag += "_cq"
-    if convert_kv_fn:
-        _cvt_tag += "_ck"
-    _ps_tag = "_ps" if preshuffle else ""
     _kname = (
         f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_kvb{KVB}_w{WPB}"
-        f"{_ps_tag}{_cvt_tag}_flydsl"
+        f"{'_ps' if preshuffle else ''}{'' if scale_mul == 1.0 else '_s2'}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -165,8 +155,6 @@ def _build_paged_kernel(
         max_block_len: fx.Int32,  # kv_indices row width
         stride_out: fx.Int32,  # out_logits.stride(0) == max_model_len
     ):
-        f32_0 = arith.constant(0.0, type=T.f32)
-        mfma_res_ty = Vec.make_type(16, fx.Float32)
         scale_mul_c = arith.constant(float(scale_mul), type=T.f32)
 
         tid = fx.thread_idx.x
@@ -201,13 +189,11 @@ def _build_paged_kernel(
         q_limit = context_length - next_n + pid_next_n
 
         out_row = pid_batch * next_n + pid_next_n
-        stride_out_i64 = arith.extui(T.i64, _to_raw(stride_out))
-        out_row_t = make_out_row_view(out_logits, stride_out_i64, out_row)
+        out_row_t = make_out_row_view(out_logits, stride_out, out_row)
 
         # ---- Preload Q frags + weights for the single query row ----
         # The A-operand layout is per in-wave lane, so `lane` indexes Q, not
-        # `tid`. convert_q_fn is always False here: the v8i32 operand has no
-        # fn_to_fnuz path, and gfx950 is native fp8 anyway.
+        # `tid`.
         q_row_base = pid_batch * stride_q_batch + pid_next_n * stride_q_next_n
         a_pack = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
@@ -274,16 +260,7 @@ def _build_paged_kernel(
                     ).result
 
                 col_sum = mfma_head_reduce(
-                    a_pack,
-                    b_col,
-                    w_frag,
-                    kv_scale,
-                    m_tiles=M_TILES,
-                    k_steps=K_STEPS,
-                    res_ty=mfma_res_ty,
-                    f32_0=f32_0,
-                    fm_fast=fm_fast,
-                    dreg_count=_DREG,
+                    a_pack, b_col, w_frag, kv_scale, m_tiles=M_TILES, k_steps=K_STEPS
                 )
 
                 # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
@@ -377,16 +354,13 @@ def compile_fp8_paged_mqa_logits(
     preshuffle: bool = False,
     variant: str = DEFAULT_VARIANT,
     scale_mul: float = 1.0,
-    convert_q_fn: bool = False,
-    convert_kv_fn: bool = False,
 ):
     """Return a cached, compiled FlyDSL paged launcher for the given config.
 
     ``num_heads``/``head_size``/``kv_block_size``/``preshuffle`` are compile-time
-    constants; ``variant`` is a ``paged_w<WPB>`` tag; ``convert_q_fn``/
-    ``convert_kv_fn`` mark an FP8 FN operand whose -0 (0x80) byte the kernel
-    patches to FNUZ +0, and ``scale_mul`` folds the 2x-per-converted-operand
-    compensation into the co-packed scale.
+    constants and ``variant`` is a ``paged_w<WPB>`` tag. ``scale_mul`` folds a
+    constant into the co-packed dequant scale; it carries the gfx942 FN->FNUZ
+    2x compensation.
     """
     launcher = _build_paged_kernel(
         num_heads=num_heads,
@@ -396,8 +370,6 @@ def compile_fp8_paged_mqa_logits(
         kv_block_size=kv_block_size,
         preshuffle=preshuffle,
         scale_mul=scale_mul,
-        convert_q_fn=convert_q_fn,
-        convert_kv_fn=convert_kv_fn,
     )
     launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
     return launcher
@@ -498,15 +470,12 @@ def flydsl_fp8_paged_mqa_logits(
         _fn,
     ), f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
 
-    # gfx942 fp8 MFMA reads operands as e4m3 FNUZ (bias 8). Q may arrive as FN
-    # (OCP, bias 7); patch its 0x80 byte and undo the implied 2x via scale_mul.
-    # The co-packed KV in the cache is arch-native fp8 (fnuz on gfx942, fn on
-    # gfx950), so it is never converted.
-    gfx = get_gfx()
-    convert_q_fn = gfx == "gfx942" and q_fp8.dtype == _fn
-    convert_kv_fn = False
-    scale_mul = 2.0 if convert_q_fn else 1.0
-
+    # gfx942's fp8 MFMA reads operands as e4m3 FNUZ (bias 8), so an FN (OCP,
+    # bias 7) Q byte decodes to half its value there; scale_mul undoes that on
+    # the co-packed scale. NOTE: FN -0 (0x80) is FNUZ NaN and is *not* patched
+    # -- the vector<8xi32> operand has no byte-patch path. The KV cache is
+    # always arch-native fp8, so it never needs either.
+    scale_mul = 2.0 if (get_gfx() == "gfx942" and q_fp8.dtype == _fn) else 1.0
     variant = _resolve_variant(variant)
 
     launcher = compile_fp8_paged_mqa_logits(
@@ -517,8 +486,6 @@ def flydsl_fp8_paged_mqa_logits(
         preshuffle=bool(Preshuffle),
         variant=variant,
         scale_mul=scale_mul,
-        convert_q_fn=convert_q_fn,
-        convert_kv_fn=convert_kv_fn,
     )
 
     # Co-packed cache -> raw uint8 byte view [num_blocks * KVBlockSize * index_dim].
