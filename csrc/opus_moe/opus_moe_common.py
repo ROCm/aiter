@@ -39,9 +39,6 @@ _a8w4_meta = _load_ops_meta_module(
     Path("aiter") / "ops" / "opus" / "moe_stage2_a8w4_meta.py",
     "_opus_moe_stage2_a8w4_meta",
 )
-OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (
-    _a8w4_meta.OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS
-)
 OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = (
     _a8w4_meta.OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
 )
