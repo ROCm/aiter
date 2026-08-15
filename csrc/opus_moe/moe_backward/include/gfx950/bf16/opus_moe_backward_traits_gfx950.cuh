@@ -394,12 +394,16 @@ struct RouteReduceBf16Gfx950Bm16Bn128
     static constexpr int MAX_TOPK = 8;
     static constexpr bool READ_SORTED_ROUTES = false;
     static constexpr bool BROADCAST_ROUTE_ID = false;
+    static constexpr int CACHECTL_ROUTE = 0;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128SortedInput
     : RouteReduceBf16Gfx950Bm16Bn128
 {
     static constexpr bool READ_SORTED_ROUTES = true;
+    // Reverse-gathered route rows are consumed exactly once.  Marking those
+    // reads non-temporal avoids replacing reusable K1/K2/K4 state in L2.
+    static constexpr int CACHECTL_ROUTE = 2;
 };
 
 // When one 2048-column tile covers the complete token row, all four waves in

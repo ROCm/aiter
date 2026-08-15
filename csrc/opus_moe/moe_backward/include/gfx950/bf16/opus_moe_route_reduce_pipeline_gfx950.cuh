@@ -72,6 +72,25 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
 
     static_assert(VEC == 8);
     route_reduce_f32x2 accum[VEC / 2];
+    opus::gmem<opus::bf16_t> route_gmem(kargs.d_x_route);
+
+    const auto load_route = [&](int route) {
+        const int64_t element_offset =
+            static_cast<int64_t>(route) * kargs.stride_dx_route_r + col;
+        if constexpr(T::CACHECTL_ROUTE == 0)
+        {
+            return *reinterpret_cast<const route_reduce_u32x4*>(
+                kargs.d_x_route + element_offset);
+        }
+        else
+        {
+            const auto values = route_gmem.template load<VEC>(
+                element_offset,
+                0,
+                opus::number<T::CACHECTL_ROUTE>{});
+            return __builtin_bit_cast(route_reduce_u32x4, values);
+        }
+    };
 
     const int logical_base = token * TopK;
     constexpr int route_broadcast_width =
@@ -87,10 +106,7 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
                           : logical_base;
     if constexpr(T::BROADCAST_ROUTE_ID)
         first_route = __shfl(first_route, 0, route_broadcast_width);
-    const int64_t route_base =
-        static_cast<int64_t>(first_route) * kargs.stride_dx_route_r + col;
-    const auto first = *reinterpret_cast<const route_reduce_u32x4*>(
-        kargs.d_x_route + route_base);
+    const auto first = load_route(first_route);
 #pragma unroll
     for(int pair = 0; pair < VEC / 2; ++pair)
         accum[pair] = route_reduce_unpack_bf16x2(first[pair]);
@@ -106,9 +122,7 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
                         : logical_base + slot;
         if constexpr(T::BROADCAST_ROUTE_ID)
             route = __shfl(route, 0, route_broadcast_width);
-        const auto values = *reinterpret_cast<const route_reduce_u32x4*>(
-            kargs.d_x_route +
-            static_cast<int64_t>(route) * kargs.stride_dx_route_r + col);
+        const auto values = load_route(route);
 #pragma unroll
         for(int pair = 0; pair < VEC / 2; ++pair)
             accum[pair] += route_reduce_unpack_bf16x2(values[pair]);
