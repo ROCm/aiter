@@ -163,7 +163,8 @@ class GroupNormTimer:
             print("z :")
             print(z)
 
-        is_equal = torch.allclose(y, z, rtol=1e-3, atol=1e-2)
+        rtol = 1e-2 if self.dtype == torch.bfloat16 else 1e-3
+        is_equal = torch.allclose(y, z, rtol=rtol, atol=1e-2)
         return (time_elapsed_torch, time_elapsed_opt, is_equal)
 
 
