@@ -398,6 +398,7 @@ struct RouteReduceBf16Gfx950Bm16Bn128
     static constexpr int MAX_TOPK = 8;
     static constexpr bool READ_SORTED_ROUTES = false;
     static constexpr bool BROADCAST_ROUTE_ID = false;
+    static constexpr bool DISTRIBUTE_ROUTE_IDS = false;
     static constexpr int CACHECTL_ROUTE = 0;
 };
 
@@ -421,6 +422,17 @@ struct RouteReduceBf16Gfx950Bm1Bn2048SortedInput
     static constexpr int B_M = 1;
     static constexpr int B_N = 2048;
     static constexpr bool BROADCAST_ROUTE_ID = true;
+};
+
+// The full-row kernel needs the same TopK route ids in every lane of a wave.
+// Have the first TopK lanes fetch one id each in a single coalesced VMEM issue,
+// then broadcast lane `slot`, instead of masking lane zero around TopK separate
+// scalar loads.  The route-row accumulation order and data traffic are
+// unchanged, and the mechanism is generic for every supported fixed TopK.
+struct RouteReduceBf16Gfx950Bm1Bn2048SortedInputDistributedIds
+    : RouteReduceBf16Gfx950Bm1Bn2048SortedInput
+{
+    static constexpr bool DISTRIBUTE_ROUTE_IDS = true;
 };
 
 // Router scores and their gradients remain FP32 even though the surrounding

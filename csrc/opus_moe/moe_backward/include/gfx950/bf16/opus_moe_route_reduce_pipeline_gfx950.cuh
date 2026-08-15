@@ -98,14 +98,27 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
     static_assert(!T::BROADCAST_ROUTE_ID ||
                   (route_broadcast_width > 0 &&
                    64 % route_broadcast_width == 0));
-    int first_route = T::READ_SORTED_ROUTES
-                          ? ((!T::BROADCAST_ROUTE_ID ||
-                              lane_n % route_broadcast_width == 0)
-                                 ? kargs.route.reverse_sorted[logical_base]
-                                 : 0)
-                          : logical_base;
-    if constexpr(T::BROADCAST_ROUTE_ID)
-        first_route = __shfl(first_route, 0, route_broadcast_width);
+    const int route_lane = lane_n % route_broadcast_width;
+    int distributed_route = 0;
+    if constexpr(T::DISTRIBUTE_ROUTE_IDS)
+        distributed_route = route_lane < TopK
+                                ? kargs.route.reverse_sorted[logical_base +
+                                                              route_lane]
+                                : 0;
+    const auto route_for_slot = [&](int slot) {
+        if constexpr(T::DISTRIBUTE_ROUTE_IDS)
+            return __shfl(distributed_route, slot, route_broadcast_width);
+        int route = T::READ_SORTED_ROUTES
+                        ? ((!T::BROADCAST_ROUTE_ID || route_lane == 0)
+                               ? kargs.route.reverse_sorted[logical_base + slot]
+                               : 0)
+                        : logical_base + slot;
+        if constexpr(T::BROADCAST_ROUTE_ID)
+            route = __shfl(route, 0, route_broadcast_width);
+        return route;
+    };
+
+    const int first_route = route_for_slot(0);
     const auto first = load_route(first_route);
 #pragma unroll
     for(int pair = 0; pair < VEC / 2; ++pair)
@@ -114,14 +127,7 @@ route_reduce_process_tile_gfx950(RouteReduceKargs kargs)
 #pragma unroll
     for(int slot = 1; slot < TopK; ++slot)
     {
-        int route = T::READ_SORTED_ROUTES
-                        ? ((!T::BROADCAST_ROUTE_ID ||
-                            lane_n % route_broadcast_width == 0)
-                               ? kargs.route.reverse_sorted[logical_base + slot]
-                               : 0)
-                        : logical_base + slot;
-        if constexpr(T::BROADCAST_ROUTE_ID)
-            route = __shfl(route, 0, route_broadcast_width);
+        const int route = route_for_slot(slot);
         const auto values = load_route(route);
 #pragma unroll
         for(int pair = 0; pair < VEC / 2; ++pair)

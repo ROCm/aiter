@@ -661,13 +661,15 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr uint64_t bn512_min_dz_bytes = 1024ull * 1024ull * 1024ull;
     constexpr int sorted_route_reduce_kid = 1;
     constexpr int full_row_sorted_route_reduce_kid = 2;
+    constexpr int distributed_ids_route_reduce_kid = 3;
     const auto is_sorted_route_reduce_kid = [&](int kid) {
         return kid == sorted_route_reduce_kid ||
-               kid == full_row_sorted_route_reduce_kid;
+               kid == full_row_sorted_route_reduce_kid ||
+               kid == distributed_ids_route_reduce_kid;
     };
     const auto select_sorted_route_reduce_kid = [&]() {
         return route_reduce.model_dim == 2048
-                   ? full_row_sorted_route_reduce_kid
+                   ? distributed_ids_route_reduce_kid
                    : sorted_route_reduce_kid;
     };
     const auto sorted_route_kid = [&](int logical_kid) {
@@ -2335,7 +2337,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                     "z must have shape [sorted_capacity,2I]");
         const bool uses_sorted_x =
             dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
-            dw1_kernel_id == 17 || dw1_kernel_id == 18;
+            dw1_kernel_id == 17 || dw1_kernel_id == 18 ||
+            dw1_kernel_id == 19;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,
