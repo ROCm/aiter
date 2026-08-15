@@ -16,13 +16,13 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 
-@perftest(num_iters=25, num_warmup=5, use_cuda_event=True)
+@perftest(num_iters=25, num_warmup=5, num_rotate_args=1, use_cuda_event=True)
 def run_torch_autocast(norm, x):
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16):
         return norm(x, use_torch=True)
 
 
-@perftest(num_iters=25, num_warmup=5, use_cuda_event=True)
+@perftest(num_iters=25, num_warmup=5, num_rotate_args=1, use_cuda_event=True)
 def run_aiter_autocast(norm, x):
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16):
         return norm(x)
