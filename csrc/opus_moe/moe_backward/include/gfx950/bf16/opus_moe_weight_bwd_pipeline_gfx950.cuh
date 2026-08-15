@@ -174,7 +174,13 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::PREFETCH_REDUCTION_AB;
         return false;
     }();
+    constexpr bool eager_prefetch_reduction_ab = []() constexpr {
+        if constexpr(requires { T::EAGER_PREFETCH_REDUCTION_AB; })
+            return T::EAGER_PREFETCH_REDUCTION_AB;
+        return false;
+    }();
     static_assert(!(prefetch_reduction_a && prefetch_reduction_ab));
+    static_assert(!eager_prefetch_reduction_ab || prefetch_reduction_ab);
     constexpr bool swap_route_sources = []() constexpr {
         if constexpr(requires { T::SWAP_ROUTE_SOURCES; })
             return T::SWAP_ROUTE_SOURCES;
@@ -658,12 +664,21 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 typename decltype(mma_k_fragment)::vtype_a v_a1;
                 typename decltype(mma_k_fragment)::vtype_b v_b1;
                 load_fragment(opus::number<0>{}, v_a0, v_b0);
-                s_waitcnt_lgkmcnt(0_I);
-                load_a_fragment(opus::number<1>{}, v_a1);
-                load_b_fragment(opus::number<1>{}, v_b1);
+                if constexpr(eager_prefetch_reduction_ab)
+                {
+                    load_fragment(opus::number<1>{}, v_a1, v_b1);
+                    s_waitcnt_lgkmcnt(0_I);
+                }
+                else
+                {
+                    s_waitcnt_lgkmcnt(0_I);
+                    load_a_fragment(opus::number<1>{}, v_a1);
+                    load_b_fragment(opus::number<1>{}, v_b1);
+                }
                 __builtin_amdgcn_s_setprio(1);
                 v_c = mma_k_fragment(v_a0, v_b0, v_c);
-                s_waitcnt_lgkmcnt(0_I);
+                if constexpr(!eager_prefetch_reduction_ab)
+                    s_waitcnt_lgkmcnt(0_I);
                 v_c = mma_k_fragment(v_a1, v_b1, v_c);
                 __builtin_amdgcn_s_setprio(0);
             }

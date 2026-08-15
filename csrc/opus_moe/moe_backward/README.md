@@ -105,6 +105,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` forward-saved sorted-X | 14 | kid 13 geometry + direct padded sorted-row X reads |
 | K4 `dw1` sorted-X pipelined | 15 | kid 14 geometry + both K16 fragments prefetched, sorted-X issued first |
 | K4 `dw1` sorted-X three-stage | 17 | kid 15 geometry + two future BK32 tiles in flight |
+| K4 `dw1` sorted-X eager-AB | 18 | kid 17 geometry + both K16 LDS fragments issued before one wait |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |

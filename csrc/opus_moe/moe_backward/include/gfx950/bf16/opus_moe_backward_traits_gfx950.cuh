@@ -718,6 +718,15 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstTrip
     static constexpr bool TRIPLE_BUFFER = true;
 };
 
+// Queue both K16 LDS fragments before one full wait.  This exposes all 24
+// transpose reads to the LDS scheduler at once and removes the otherwise
+// redundant wait between the two unchanged MFMA chains.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstTripleLds
+{
+    static constexpr bool EAGER_PREFETCH_REDUCTION_AB = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
