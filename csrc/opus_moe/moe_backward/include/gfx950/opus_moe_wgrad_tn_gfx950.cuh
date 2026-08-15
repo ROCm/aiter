@@ -612,38 +612,41 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     };
 
     // Each wave owns four consecutive row pairs so its Direct-to-LDS writes
-    // stay in one contiguous LDS region.  Reuse one wave-uniform destination
-    // base and select pairs with the MUBUF immediate; that immediate advances
-    // both VMEM and LDS, hence the matching subtraction from each vaddr.
-    auto async_load_half = [&](auto half_tag, int stage, int buf) {
+    // stay in one contiguous LDS region. Issue all four A copies before the
+    // four B copies: keeping one LDS destination base live lets clang retain
+    // M0 instead of switching it A/B for every row pair. The MUBUF immediate
+    // advances both VMEM and LDS, hence the matching subtraction from vaddr.
+    auto async_load_stage = [&](int stage, int buf) {
         if constexpr(PAIR_DIRECT_TO_LDS)
         {
-            constexpr int HALF = decltype(half_tag)::value;
-            constexpr int PAIR0 = HALF * 2;
-            constexpr int PAIR1 = PAIR0 + 1;
-            constexpr int OFF0 = PAIR0 * PAIR_LD * sizeof(__bf16);
-            constexpr int OFF1 = PAIR1 * PAIR_LD * sizeof(__bf16);
-            static_assert(OFF1 < 4096);
             const int lane_row = lane >> 5;
             const int feature = (lane & 31) * 8;
-            const int row0 = warp * 8 + PAIR0 * 2 + lane_row;
-            const int row1 = warp * 8 + PAIR1 * 2 + lane_row;
             void* a_dst = reinterpret_cast<void*>(
                 &As[buf][scalar_warp * 4][0]);
             void* b_dst = reinterpret_cast<void*>(
                 &Bs[buf][scalar_warp * 4][0]);
-            g_dy.template async_load<8, OFF0>(
-                a_dst,
-                (stage * BK + row0) * P + feature - OFF0 / sizeof(__bf16));
-            g_a.template async_load<8, OFF0>(
-                b_dst,
-                (stage * BK + row0) * Q + feature - OFF0 / sizeof(__bf16));
-            g_dy.template async_load<8, OFF1>(
-                a_dst,
-                (stage * BK + row1) * P + feature - OFF1 / sizeof(__bf16));
-            g_a.template async_load<8, OFF1>(
-                b_dst,
-                (stage * BK + row1) * Q + feature - OFF1 / sizeof(__bf16));
+            auto copy_a_pair = [&](auto pair_tag) {
+                constexpr int PAIR = decltype(pair_tag)::value;
+                constexpr int OFF = PAIR * PAIR_LD * sizeof(__bf16);
+                static_assert(OFF < 4096);
+                const int row = warp * 8 + PAIR * 2 + lane_row;
+                g_dy.template async_load<8, OFF>(
+                    a_dst,
+                    (stage * BK + row) * P + feature -
+                        OFF / sizeof(__bf16));
+            };
+            auto copy_b_pair = [&](auto pair_tag) {
+                constexpr int PAIR = decltype(pair_tag)::value;
+                constexpr int OFF = PAIR * PAIR_LD * sizeof(__bf16);
+                static_assert(OFF < 4096);
+                const int row = warp * 8 + PAIR * 2 + lane_row;
+                g_a.template async_load<8, OFF>(
+                    b_dst,
+                    (stage * BK + row) * Q + feature -
+                        OFF / sizeof(__bf16));
+            };
+            opus::static_for<4>(copy_a_pair);
+            opus::static_for<4>(copy_b_pair);
         }
     };
 
@@ -656,10 +659,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
     if(num_k_stages > 0)
     {
         if constexpr(PAIR_DIRECT_TO_LDS)
-        {
-            async_load_half(opus::number<0>{}, 0, 0);
-            async_load_half(opus::number<1>{}, 0, 0);
-        }
+            async_load_stage(0, 0);
         else
         {
             load_regs first;
@@ -823,10 +823,7 @@ void opus_moe_wgrad_tn_8wave_kernel(const __bf16* __restrict__ dy,
         if constexpr(HAS_NEXT)
         {
             if constexpr(PAIR_DIRECT_TO_LDS)
-            {
-                async_load_half(opus::number<0>{}, stage + 1, cur ^ 1);
-                async_load_half(opus::number<1>{}, stage + 1, cur ^ 1);
-            }
+                async_load_stage(stage + 1, cur ^ 1);
             else if constexpr(MASKED_NEXT)
                 load_global_tail(stage + 1, 0, next);
             else
