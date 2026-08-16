@@ -162,15 +162,13 @@ logical_route_count(const RouteMetadata& route)
         return route.token_num * route.topk;
 }
 
-// Private K1 -> K2/K4 dZ layout.  A logical [M32,K32] tile is split into
+// Private G2 encoding for a logical [M32,K32] tile.  The tile is split into
 // pairs of route rows and four K8 vectors.  The two rows of every pair are
-// adjacent inside each K8 vector, so K2 reads one contiguous 32-B segment
-// while K1 and K4 retain their native M32 lane mapping.  Only the fused full
-// pipeline may select consumers of this layout; standalone APIs remain
-// logical row-major.
+// adjacent inside each K8 vector, so native M32 producers/consumers retain
+// their lane mapping while each row pair exposes contiguous 32-B segments.
 template<typename Offset>
 static __device__ __forceinline__ Offset
-blocked_dz_g2_offset(int sorted_row, int logical_col, Offset row_stride)
+blocked_g2_offset(int sorted_row, int logical_col, Offset row_stride)
 {
     constexpr int route_tile = 32;
     constexpr int column_tile = 32;
@@ -186,6 +184,16 @@ blocked_dz_g2_offset(int sorted_row, int logical_col, Offset row_stride)
            group_base +
            (logical_col % column_tile / vector) * row_group * vector +
            (row_in_tile % row_group) * vector;
+}
+
+// K1 -> K2/K4 dZ uses the same encoding.  Keep the dZ-named wrapper at the
+// existing call sites to make the private full-pipeline ABI explicit;
+// standalone APIs continue to use logical row-major dZ.
+template<typename Offset>
+static __device__ __forceinline__ Offset
+blocked_dz_g2_offset(int sorted_row, int logical_col, Offset row_stride)
+{
+    return blocked_g2_offset(sorted_row, logical_col, row_stride);
 }
 
 // K1: dO @ W2, dScore partial/reduce, SwiGLU backward, and score * activation.

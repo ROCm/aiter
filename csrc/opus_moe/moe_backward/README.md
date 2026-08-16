@@ -18,13 +18,14 @@ stream:
 | K4 `dw1` | expert-grouped varlen-K `dZ^T @ X` | `dW1` |
 | K5 `dw2` | expert-grouped varlen-K `dO^T @ (S * A)` | `dW2` |
 
-The host keeps both legal dependency orders flat.  When `1536 <= D <= 2048`
-and the runtime `dZ` working set is at least 512 MiB it launches
-`K1 -> K4 -> K2 -> K3 -> K5`: K4 consumes K1's large `dZ` stream immediately,
-then K2 refreshes the same stream before route reduction.  Smaller working
-sets and narrower or wider model dimensions retain
-`K1 -> K2 -> K3 -> K4 -> K5`.  This policy is derived from runtime dimensions
-and sorted capacity, not an exact model shape.
+The host keeps the legal dependency orders flat.  When `1536 <= D <= 2048`
+and the runtime `dZ` working set is at least 512 MiB it places K4 immediately
+after K1, then lets K2 refresh the same stream before route reduction.  With
+both forward-owned caches and at least 1 GiB of `dZ`, K5 is independent of K1
+and runs first, giving `K5 -> K1 -> K4 -> K2 -> K3`.  The other large-working-
+set order is `K1 -> K4 -> K2 -> K3 -> K5`; smaller working sets and narrower
+or wider model dimensions retain `K1 -> K2 -> K3 -> K4 -> K5`.  The policy is
+derived from runtime dimensions and sorted capacity, not an exact model shape.
 
 Backward consumes the sorting metadata saved by forward. The low 24 bits of
 `sorted_token_ids` hold the token and the high 8 bits hold the top-k slot.
@@ -83,6 +84,9 @@ fallback when a genuinely different working-set regime needs it.
 | K1 `down_bwd` long wide-N grid | 12 | kid 11 geometry + deferred Z wait |
 | K1 `down_bwd` forward-cache grid | 13 | kid 11 without the `a_scaled` scale/pack/store epilogue |
 | K1 `down_bwd` long forward-cache grid | 14 | kid 12 without the `a_scaled` scale/pack/store epilogue |
+| K1 `down_bwd` split-N64 cache grid | 15 | kid 14 with four native N64 W2 slabs |
+| K1 `down_bwd` pipelined-Z cache grid | 16 | kid 15 with the following route group's Z transfer in flight |
+| K1 `down_bwd` private blocked-dZ producer | 17 | kid 16 with G2 blocked dZ stores for the flat full pipeline |
 | K2 `route_dx` legacy | 5 | `BM32 x BN128 x BK64`, route-major grid |
 | K2 `route_dx` cohort baseline | 6 | `BM32 x BN128 x BK64`, four-route cohort |
 | K2 `route_dx` small working set | 7 | `BM32 x BN128 x BK32`, M2/four-route cohort |
@@ -95,7 +99,11 @@ fallback when a genuinely different working-set regime needs it.
 | K2 `route_dx` wide-N M5 binary compact | 17 | kid 16 geometry with binary expert-boundary decode |
 | K2 `route_dx` BN512 binary compact | 18 | `BM32 x BN512 x BK32`, M3/six-route compact cohort |
 | K2 `route_dx` BN512 N-fast | 19 | kid 18 compute; contiguous output-N traversal, selected for four/eight-tile grids |
-| K3 `route_reduce` | 0 | `BM16 x BN128` |
+| K2 `route_dx` private blocked-dZ consumer | 20 | kid 19 with G2 blocked dZ loads |
+| K3 `route_reduce` logical input | 0 | `BM16 x BN128` |
+| K3 `route_reduce` sorted input | 1 | `BM16 x BN128`, reverse gather by route id |
+| K3 `route_reduce` full-row sorted input | 2 | `BM1 x BN2048` |
+| K3 `route_reduce` distributed-id input | 3 | kid 2 with metadata loads distributed across lanes |
 | K4 `dw1` small working set | 5 | `BM64 x BN128 x BK32`, expert-fastest |
 | K4 `dw1` direct-LDS baseline | 8 | `BM64 x BN128 x BK32`, two-expert cohort |
 | K4 `dw1` production | 9 | `BM128 x BN128 x BK32`, double LDS + two-expert cohort |
@@ -107,9 +115,13 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` sorted-X three-stage | 17 | kid 15 geometry + two future BK32 tiles in flight |
 | K4 `dw1` sorted-X eager-AB | 18 | kid 17 geometry + both K16 LDS fragments issued before one wait |
 | K4 `dw1` native-M32 LDS experiment | 19 | kid 18 schedule + independent conflict-free K32 x M32 physical LDS tiles; explicit only |
+| K4 `dw1` private blocked-dZ consumer | 20 | kid 19 with G2 blocked dZ loads and row-major sorted-X |
+| K4 `dw1` blocked-dZ/blocked-X | 21 | kid 20 with direct G2 blocked sorted-X loads |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
+| K5 `dw2` standalone pipelined reduction | 13 | kid 11 with three K32 stages |
+| K5 `dw2` full-pipeline native-B | 16 | kid 13 with direct padded `a_scaled` reads |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
 
@@ -208,6 +220,18 @@ independent conflict-free K32 x native-M32 tiles.  Its mixed family screen,
 including regressions at I=768, E=32, and active-eight routing, keeps it an
 explicit-only comparison instance rather than an auto-dispatch choice.
 
+The flat full pipeline can additionally keep K1's dZ in a private G2
+encoding: K1 kid 17, K2 kid 20, and K4 kid 20 or 21 must be selected together.
+K4 kid 21 uses the same blocked-dZ contract but also consumes a forward-owned
+sorted-X cache written directly in G2 row-pair order.  It is never selected
+for standalone K4 or the two autograd Functions, which exchange canonical
+row-major dZ.  For `(T,D,I,E,K)=(32768,2048,1024,64,8)`, kid 21 reduced
+isolated K4 by about 128 us and the full pipeline by 87--121 us in repeated
+same-address ABBA runs.  Eight bitwise screens covered six shape families,
+32 empty experts, and a single-expert extreme skew.  A one-pass forward gather
+measured only about 16 us more than producing the row-major cache, so no
+backward-side conversion is part of this path.
+
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output
 tiles per expert, and at least 128 average padded routes.  Its four waves share
@@ -237,6 +261,10 @@ The current no-tail fixed kernels require:
 - concat `W1=[E,2I,D]` and `W2=[E,D,I]`;
 - `D % 128 == 0` and `I % 128 == 0`;
 - fixed top-k in `{1,2,4,8}` for route reduction and router backward.
+
+The private blocked-dZ full pipeline further requires `D % 512 == 0` and
+`I % 256 == 0`.  Its blocked sorted-X cache uses the exact same sorting
+metadata and contains zero for every padded row.
 
 K4/K5 consume padded expert offsets directly. Empty experts must be written
 as exact zero gradients. K1 owns its internal multipart `dS` finalize; this is

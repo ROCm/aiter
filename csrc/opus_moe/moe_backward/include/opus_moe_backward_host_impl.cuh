@@ -638,9 +638,12 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int blocked_down_kid = 17;
     constexpr int blocked_route_dx_kid = 20;
     constexpr int blocked_dw1_kid = 20;
+    constexpr int blocked_dw1_blocked_x_kid = 21;
     const bool blocked_down = down_kernel_id == blocked_down_kid;
     const bool blocked_route_dx = route_dx_kernel_id == blocked_route_dx_kid;
-    const bool blocked_dw1 = dw1_kernel_id == blocked_dw1_kid;
+    const bool blocked_dw1 =
+        dw1_kernel_id == blocked_dw1_kid ||
+        dw1_kernel_id == blocked_dw1_blocked_x_kid;
     const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
     AITER_CHECK(!any_blocked_dz ||
                     (blocked_down && blocked_route_dx && blocked_dw1),
@@ -780,7 +783,7 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
          down_kernel_id == 16 || down_kernel_id == blocked_down_kid) &&
         (dw1_kernel_id == 15 || dw1_kernel_id == 17 ||
          dw1_kernel_id == 18 || dw1_kernel_id == 19 ||
-         dw1_kernel_id == blocked_dw1_kid);
+         blocked_dw1);
     const bool launch_saved_dw2_before_down =
         mid_width_d && uses_saved_a_and_sorted_x &&
         dz_bytes >= dz_k5_before_route_min_bytes;
@@ -2353,7 +2356,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         const bool uses_sorted_x =
             dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
             dw1_kernel_id == 17 || dw1_kernel_id == 18 ||
-            dw1_kernel_id == 19 || dw1_kernel_id == 20;
+            dw1_kernel_id == 19 || dw1_kernel_id == 20 ||
+            dw1_kernel_id == 21;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,

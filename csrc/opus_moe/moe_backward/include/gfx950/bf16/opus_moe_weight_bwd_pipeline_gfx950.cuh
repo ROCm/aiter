@@ -211,6 +211,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::BLOCKED_DZ_G2;
         return false;
     }();
+    constexpr bool blocked_sorted_b_g2 = []() constexpr {
+        if constexpr(requires { T::BLOCKED_SORTED_B_G2; })
+            return T::BLOCKED_SORTED_B_G2;
+        return false;
+    }();
     constexpr bool native_b_m32_lds_swizzle =
         native_m32_lds_swizzle || []() constexpr {
             if constexpr(requires { T::NATIVE_B_M32_LDS_SWIZZLE; })
@@ -255,6 +260,10 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert(!blocked_dz_g2 ||
                       (native_m32_lds_swizzle && BK == 32 && VEC == 8),
                   "blocked A requires the native M32/K32 vector path");
+    static_assert(!blocked_sorted_b_g2 ||
+                      (sorted_b_rows && native_b_m32_lds_swizzle &&
+                       !swap_route_sources && BK == 32 && VEC == 8),
+                  "blocked sorted B requires native dW1 K32 loads");
     static_assert(!native_b_m32_lds_swizzle ||
                       (BM == 256 && BN == 128 && BK == 32 &&
                        T::BLOCK_SIZE == 256 && split_b_n64 &&
@@ -641,12 +650,21 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                         reinterpret_cast<OPUS_LDS_ADDR D_B*>(s_b_tile.ptr) +
                         (load.value * T::BLOCK_SIZE +
                          wave_id * opus::get_warp_size()) * VEC;
+                    const int logical_col =
+                        output_n_base + native_tile * native_n +
+                        native32_load_vec * VEC;
+                    const int64_t source_offset =
+                        blocked_sorted_b_g2
+                            ? blocked_g2_offset(
+                                  sources.b_split,
+                                  logical_col,
+                                  kargs.stride_b_row)
+                            : static_cast<int64_t>(sources.b_split) *
+                                      kargs.stride_b_row +
+                                  logical_col;
                     g_b.template _async_load<VEC>(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(b_load_dst),
-                        (sources.b_split * kargs.stride_b_row +
-                         output_n_base + native_tile * native_n +
-                         native32_load_vec * VEC) *
-                            sizeof(D_B),
+                        source_offset * sizeof(D_B),
                         0,
                         opus::number<0>{},
                         opus::number<T::CACHECTL_B>{});

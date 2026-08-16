@@ -783,6 +783,15 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlo
     static constexpr bool BLOCKED_DZ_G2 = true;
 };
 
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2
+{
+    // Forward owns this cache and writes x[token] directly in the same G2
+    // row-pair encoding.  K4 must never reinterpret an ordinary row-major
+    // saved-X tensor as this physical layout.
+    static constexpr bool BLOCKED_SORTED_B_G2 = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
