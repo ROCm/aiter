@@ -220,14 +220,17 @@ def launch_gemm_a8w4_tdm(
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _persist = f"_persist{persistent_workers}" if ep_persistent_gemm1 else ""
-    # Not named _ov: that is the overlap module alias the kernel body calls into.
-    _ovtag = f"_ovstage1_d{OV.dispatch_ctas}" if OV is not None else ""
-    _ov_nruns = _ov.work_runs(OV) if OV is not None else 1
+    # With the dispatch fused in, this launch is no longer a GEMM -- it is the
+    # whole of stage-1 -- so it takes its own name instead of a suffix on the
+    # GEMM's. A suffix also read the same as plain GEMM1 in a profile: the table
+    # truncates at 58 characters, which both names shared.
+    _dtag = f"_d{OV.dispatch_ctas}" if OV is not None else ""
+    _prefix = "mega_moe_stage1" if OV is not None else "a8w4_tdm"
     _kname = (
-        f"a8w4_tdm_{_afp}"
+        f"{_prefix}_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_persist}{_ovtag}"
+        f"{_grouped}{_act}{_bias}{_qout}{_persist}{_dtag}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -1101,24 +1104,14 @@ def launch_gemm_a8w4_tdm(
                 )
                 valid_rows = fx.recast_iter(_nvr_ptr, arg_num_valid_rows)[0]
                 valid_m_tiles = valid_rows // tile_m
-                # A work item is one M-tile crossed with a RUN-long stretch of N,
-                # not a single (M, N) tile, because the arrival gate is keyed on
-                # M alone: at one N-tile per item the same counter is polled once
-                # per N-tile (24x over at inter=3072), and that poll is a
-                # cache-bypassing load plus an acquire fence taken while the
-                # producers still own the fabric. Grouping N amortizes it over
-                # the run and leaves the queue fine-grained enough to balance.
+                # A work item is one (M, N) tile, and one queue atomic hands out a
+                # contiguous PULL_CHUNK of them. Widening the item to a whole
+                # M-tile's N -- which is what let the M-keyed arrival gate be asked
+                # once per item -- tied the item count to the M-tile count and left
+                # a third of the resident grid idle in the last round. Gating the
+                # chunk instead keeps one poll per M-tile without the imbalance.
                 _n_tiles = (i32_n + (tile_n - 1)) // tile_n
-                if const_expr(_ov.WORK_RUN):
-                    _wrun = fx.Int32(_ov.WORK_RUN)
-                    _n_runs = (_n_tiles + _wrun - fx.Int32(1)) // _wrun
-                else:
-                    # N is dynamic, so the shape-derived split count is clamped
-                    # here rather than turned into a width on the host.
-                    _nr = fx.Int32(_ov_nruns)
-                    _n_runs = (_nr < _n_tiles).select(_nr, _n_tiles)
-                    _wrun = (_n_tiles + _n_runs - fx.Int32(1)) // _n_runs
-                total_work = valid_m_tiles * _n_runs
+                total_work = valid_m_tiles * _n_tiles
                 _shard = ticket & fx.Int32(_ov.WORK_SHARDS - 1)
                 _has_work = fx.Int32(1) == fx.Int32(1)
                 _trb = fx.recast_iter(
@@ -1130,39 +1123,66 @@ def launch_gemm_a8w4_tdm(
                     arg_tile_row_base,
                 )
                 while _has_work:
-                    work_id = _ov.emit_take_work(OV, _shard, _tid, _work_lds)
-                    _has_work = work_id < total_work
+                    _wbase = _ov.emit_take_work(OV, _shard, _tid, _work_lds)
+                    _has_work = _wbase < total_work
                     if _has_work:
-                        _m_tile = work_id // _n_runs
-                        _n_base = (work_id - _m_tile * _n_runs) * _wrun
-                        _n_end = _n_base + _wrun
-                        _n_end = (_n_end < _n_tiles).select(_n_end, _n_tiles)
+                        # The queue hands out whole chunks, so the last one of the
+                        # layer runs off the end of the schedule.
+                        _wend = _wbase + fx.Int32(_ov.PULL_CHUNK)
+                        _wend = (_wend < total_work).select(_wend, total_work)
                         if const_expr(_OV_PHASES >= 4 and _ov.TILE_GATE):
-                            # Gate on the M-tile's planned row count before any A
-                            # load, once for the whole run. trb[m_tile] is the
-                            # fixed-slot row le*CAP + t*tile_m, which is all the
-                            # arrival key needs -- no extra per-tile metadata.
+                            # Wait for every M-tile the chunk covers before any A
+                            # load of it, then take a single acquire for the lot.
+                            # trb[m_tile] is the fixed-slot row le*CAP + t*tile_m,
+                            # which is all the arrival key needs -- no extra
+                            # per-tile metadata.
                             #
-                            # It blocks. Probing it instead and holding a
-                            # not-yet-ready item back to run the next one costs
-                            # 50 us/layer more than the stall it saves: two more
-                            # workgroup barriers on every work item, and there
-                            # are thousands. Device-scope probe loads do not
-                            # change that, so it is the barriers, not the scope.
-                            _ov.emit_wait_tile(OV, _trb[_m_tile], _tid)
-                        _nloop = scf.ForOp(
-                            arith.index_cast(T.index, _n_base),
-                            arith.index_cast(T.index, _n_end),
+                            # It blocks. Probing instead and holding a not-yet-ready
+                            # item back to run the next one costs 50 us/layer more
+                            # than the stall it saves: two more workgroup barriers
+                            # per item, and there are thousands. Device-scope probe
+                            # loads do not change that, so it is the barriers, not
+                            # the scope.
+                            # Ids are M-major, so the tiles the chunk covers are the
+                            # contiguous range its ends fall in -- normally one.
+                            _gloop = scf.ForOp(
+                                arith.index_cast(T.index, _wbase // _n_tiles),
+                                arith.index_cast(
+                                    T.index,
+                                    (_wend - fx.Int32(1)) // _n_tiles + fx.Int32(1),
+                                ),
+                                arith.index(1),
+                            )
+                            with ir.InsertionPoint(_gloop.body):
+                                _ov.emit_spin_tile(
+                                    OV,
+                                    _trb[
+                                        arith.index_cast(
+                                            T.i32, _gloop.induction_variable
+                                        )
+                                    ],
+                                    _tid,
+                                )
+                                scf.YieldOp([])
+                            _ov.emit_tile_acquire(_tid)
+                        _iloop = scf.ForOp(
+                            arith.index_cast(T.index, _wbase),
+                            arith.index_cast(T.index, _wend),
                             arith.index(1),
                         )
-                        with ir.InsertionPoint(_nloop.body):
-                            # The LDS arena is reused across N-tiles; the first
-                            # one is covered by emit_take_work's leading barrier.
+                        with ir.InsertionPoint(_iloop.body):
+                            # M-major, not the persistent scheduler's contiguous-M
+                            # swizzle. The swizzle exists to keep a B tile hot across
+                            # the 16 M-tiles sharing it, but tile_m is 16 rows here,
+                            # so holding A and its scales across the N walk is worth
+                            # more: measured 301 us/call of GEMM M-major against 317
+                            # swizzled, and 427 against 459 on the full path.
+                            _wid = arith.index_cast(T.i32, _iloop.induction_variable)
+                            _m_tile = _wid // _n_tiles
+                            # The LDS arena is reused across items; the first is
+                            # covered by the pull's leading barrier.
                             workgroup_barrier()
-                            _run_tile(
-                                _m_tile,
-                                arith.index_cast(T.i32, _nloop.induction_variable),
-                            )
+                            _run_tile(_m_tile, _wid - _m_tile * _n_tiles)
                             scf.YieldOp([])
         elif const_expr(ep_persistent_gemm1):
             # Push-group fixed-slot: the static grid would be E*CAP/tile_m M-tiles,

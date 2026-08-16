@@ -167,22 +167,27 @@ if WORK_SHARDS not in (1, 2, 4, 8) or WORK_SHARDS > _WORK_SHARDS_MAX:
     raise ValueError(
         f"WORK_SHARDS must be a power of two <= {_WORK_SHARDS_MAX}, got {WORK_SHARDS}"
     )
-#: Fixed N-tiles per work item; 0 leaves the split derived by :func:`work_runs`.
-WORK_RUN = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_WORK_RUN", "0"))
-if WORK_RUN < 0:
-    raise ValueError(f"WORK_RUN must be >= 0, got {WORK_RUN}")
-#: Work items to aim the queue at. Both ends of this cost real time at bs=256
-#: (inter=3072, 24 N-tiles, 32 M-tiles): 96 items runs 946 us/layer and 32 runs
-#: 905, because the gate is keyed on M alone and 96 items ask it three times per
-#: M-tile for one answer. Below the floor it goes the other way and much harder
-#: -- bs=8 has one M-tile, so one item per M-tile is one item for the whole
-#: grid, at 523 us against 348 for three.
-_WORK_ITEMS = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_WORK_ITEMS", "32"))
-#: Ceiling on the split, for the shapes with too few M-tiles to reach the target
-#: any other way. bs=8 has one, so the target alone asks for a split per N-tile
-#: -- which is the ungrouped gate this all started from, and it costs 372
-#: us/layer against 335. The floor stops mattering long before the polling does.
-_WORK_RUNS_MAX = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_WORK_RUNS_MAX", "4"))
+#: Work items handed out per queue atomic.
+#:
+#: A work item is one (M, N) tile. It used to be a whole M-tile's worth of N, so
+#: that the arrival gate -- keyed on M -- was asked once per item, but that tied
+#: the item count to the M-tile count: 384 items at bs=256 over a grid whose
+#: resident half is 256 CTAs, so a third of the machine sat out the last round.
+#: Measured GEMM-only under this launch with the gate off, 423 us/call at a whole
+#: M-tile per item against 279 at one (M, N) tile.
+#:
+#: What the coarse item bought is bought here instead, without the imbalance: one
+#: atomic hands out a contiguous run of ids, and the ids are M-major, so a run
+#: nearly always lies inside one M-tile and is gated once. It also divides the
+#: pull's own cost -- three workgroup barriers and an atomic, otherwise paid 9216
+#: times a layer at bs=256.
+#:
+#: Four. A chunk is also the granularity the queue balances at, so widening it
+#: trades the pull's cost against the tail a coarse chunk leaves. Measured on the
+#: full fused path at bs=256, us/call: 1 -> 920, 2 -> 884, 4 -> 869, 8 -> 895.
+PULL_CHUNK = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PULL_CHUNK", "4"))
+if PULL_CHUNK < 1:
+    raise ValueError(f"PULL_CHUNK must be >= 1, got {PULL_CHUNK}")
 # Do the dispatch CTAs join the GEMM1 work pool once their payload is out? They
 # are a small slice of the grid, but they are also the CTAs that are guaranteed
 # resident, so they are worth having.
@@ -241,25 +246,6 @@ def pay_rows(C, block):
         return _PAY_ROWS
     warps = max(C.n_producers * (block // WAVE), 1)
     return max(2, min(_PAY_ROWS_MAX, (C.max_tok * C.topk) // warps))
-
-
-def work_runs(C):
-    """How many ways to split an M-tile's N range across GEMM1 work items.
-
-    The arrival gate is keyed on the M-tile, so N is only split to give the
-    queue something to balance with: every extra split re-asks a question whose
-    answer cannot have changed. So take the coarsest split that still reaches
-    :data:`_WORK_ITEMS`, and let the M-tile count decide how coarse that is --
-    it is the term that moves with the shape, from one M-tile at 64 rows to 32
-    at 2048. Rows arrive from every peer but this rank owns 1/npes of the
-    experts, so the count is just this rank's own route total.
-
-    A count of splits and not a width, because N is a runtime value here: the
-    same compiled GEMM serves every intermediate dim, so the caller clamps this
-    against the real N-tile count and divides.
-    """
-    m_tiles = max((C.max_tok * C.topk) // C.tile_m, 1)
-    return min(max(-(-_WORK_ITEMS // m_tiles), 1), _WORK_RUNS_MAX)
 
 
 # Width of the two-level scan over the histogram. The inner runs unrolled in one
@@ -1085,12 +1071,12 @@ def _emit_rowmap(C, addr_inp_idx, addr_inp_wts, role, tid, nthreads, cur_tok):
     """Write the GEMM2 combine map for every route this rank owns.
 
     A pass of its own, one thread per route, rather than a few bytes tacked onto
-    each row of the payload push. In the push a row is one warp's whole iteration
-    and ends in a store drain, so these 12 bytes cost that warp a full fabric
-    round trip -- 26 us of the payload's 171 measured at 768 routes. Nothing
-    downstream reads the map until GEMM2, a kernel away, so it has no reason to be
-    on the payload's critical path; here all 4096 producer threads issue their one
-    store together and pay a single round trip between them.
+    each row of the payload push. Nothing downstream reads the map until GEMM2, a
+    kernel away, so it has no reason to be on the payload's critical path, and
+    here all 4096 producer threads issue their one store together. Inside the
+    push only one lane per row would have an entry to store -- at most
+    _PAY_ROWS_MAX of a warp's 32 -- and that measured 169 us against 160 for the
+    dispatch half.
     """
     if role > fx.Int32(0):
         window = cco.Window(fx.Int64(C.arena_handle))
@@ -1102,6 +1088,10 @@ def _emit_rowmap(C, addr_inp_idx, addr_inp_wts, role, tid, nthreads, cur_tok):
         work_limit = cur_tok * fx.Int32(C.topk)
         base = (role - fx.Int32(1)) * nthreads + tid
         stride = fx.Int32(C.n_producers) * nthreads
+        # Raw route order, not the push's expert-sorted walk. Sorting would land
+        # neighbouring lanes on neighbouring fixed-slot rows and coalesce the two
+        # stores, but it gathers the four metadata loads that feed them; measured
+        # a wash across four samples either way.
         for w in range(base, work_limit, stride):
             src_tok = w // fx.Int32(C.topk)
             k_slot = w - src_tok * fx.Int32(C.topk)
@@ -1137,6 +1127,50 @@ def _emit_rowmap(C, addr_inp_idx, addr_inp_wts, role, tid, nthreads, cur_tok):
                 )
 
 
+def _emit_pay_meta(C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit,
+                   n_pay_rows):
+    """Destination metadata for one run's rows: where each route lands.
+
+    Integer loads only -- no payload traffic -- which is what makes it cheap
+    enough for :func:`_emit_payload` to recompute rather than carry across its
+    two passes.
+    """
+    src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows = (
+        [], [], [], [], [], [])
+    for i in range_constexpr(n_pay_rows):
+        pos = run_base + fx.Int32(i)
+        # Expert-sorted, so a run is usually one expert's contiguous rows on
+        # one peer, and the early tiles complete while the later experts are
+        # still being pushed.
+        work_idx = (
+            buffer_load(rs_order, pos, vec_width=1, dtype=T.i32)
+            if const_expr(ROUTE_ORDER)
+            else pos
+        )
+        src_tok = work_idx // fx.Int32(C.topk)
+        ge = buffer_load(rs_idx, work_idx, vec_width=1, dtype=T.i32)
+        dest_pe = ge // fx.Int32(C.epr)
+        local_expert = ge - dest_pe * fx.Int32(C.epr)
+        row_in_expert = buffer_load(
+            rs_base, ge, vec_width=1, dtype=T.i32
+        ) + buffer_load(rs_slot, work_idx, vec_width=1, dtype=T.i32)
+        # A run is indivisible, so the last one of the push runs off the end
+        # of the route list. Those slots load in bounds but stale, and CAP is
+        # how they are retired: it is already the overflow row's answer --
+        # the planner clamped the schedule to match, so such a row is simply
+        # dropped on both sides -- and it kills every store below.
+        if const_expr(i > 0):
+            row_in_expert = arith.select(
+                pos < work_limit, row_in_expert, fx.Int32(C.cap)
+            )
+        src_toks.append(src_tok)
+        dest_pes.append(dest_pe)
+        local_exps.append(local_expert)
+        rows_in_exp.append(row_in_expert)
+        lives.append(row_in_expert < fx.Int32(C.cap))
+        dest_rows.append(local_expert * fx.Int32(C.cap) + row_in_expert)
+    return src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows
+
 
 def _emit_payload(
     C,
@@ -1149,7 +1183,7 @@ def _emit_payload(
     cur_tok,
     n_pay_rows,
 ):
-    """Push ``n_pay_rows`` routes per warp, then publish their rows' arrival.
+    """Push this CTA's routes, then publish their rows' arrival.
 
     Row allocation is entirely deterministic here -- ``my_base[ge] + route_slot``
     -- unlike the non-overlap path's remote ``atomic_add(pg_running)``. That is
@@ -1157,11 +1191,26 @@ def _emit_payload(
     the payload shows up, and hence start GEMM1 on complete tiles while later ones
     are still in flight.
 
-    A run is metadata for all its rows, then all its copies, then one publish.
-    Interleaving the three per row is what the publish's drain would force, and
-    it costs twice: the drain waits out a round trip that only the arrival atomic
-    needs, and it also stops the next row's metadata chain from being issued
-    behind the current row's copy.
+    The push is two passes over the same runs with one release between them,
+    rather than a copy-then-publish per run. A publish has to drain the copies it
+    covers and then fence at system scope, and the fence is the expensive half:
+    at one per run per warp it ran 512 times a layer at bs=256 and cost 330 us of
+    the 455 the whole dispatch half took -- more than five times the 55 us of
+    token payload it was ordering. Hoisting it makes it once per CTA. The second
+    pass recomputes each row's destination instead of carrying it in registers or
+    LDS across the first; that is a handful of integer loads against a 7 KB row
+    copy, and it keeps the run width free of a live-range budget.
+
+    Ordering still holds. A CTA only ever signals arrival for rows it pushed
+    itself, so its own drain and its own release cover exactly the writes its
+    atomics announce.
+
+    The GEMM2 combine map stays in :func:`_emit_rowmap`, a pass of its own, even
+    though hoisting the drain removed the round trip that originally justified
+    it. Folding it in here measured 169 us against 160 for the dispatch half: a
+    run holds at most _PAY_ROWS_MAX rows, so only that many lanes of a warp have
+    a map entry to store, while the separate pass spreads one store over every
+    producer thread. It is thread count, not the drain, that keeps it out.
     """
     window = cco.Window(fx.Int64(C.arena_handle))
     lane = tid & fx.Int32(LANE_MASK)
@@ -1185,41 +1234,12 @@ def _emit_payload(
     rs_order = _rsrc(C.ptr_route_order)
 
     run_stride = global_warps * fx.Int32(n_pay_rows)
-    for run_base in range(global_warp * fx.Int32(n_pay_rows), work_limit, run_stride):
-        src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows = (
-            [], [], [], [], [], [])
-        for i in range_constexpr(n_pay_rows):
-            pos = run_base + fx.Int32(i)
-            # Expert-sorted, so a run is usually one expert's contiguous rows on
-            # one peer, and the early tiles complete while the later experts are
-            # still being pushed.
-            work_idx = (
-                buffer_load(rs_order, pos, vec_width=1, dtype=T.i32)
-                if const_expr(ROUTE_ORDER)
-                else pos
-            )
-            src_tok = work_idx // fx.Int32(C.topk)
-            ge = buffer_load(rs_idx, work_idx, vec_width=1, dtype=T.i32)
-            dest_pe = ge // fx.Int32(C.epr)
-            local_expert = ge - dest_pe * fx.Int32(C.epr)
-            row_in_expert = buffer_load(
-                rs_base, ge, vec_width=1, dtype=T.i32
-            ) + buffer_load(rs_slot, work_idx, vec_width=1, dtype=T.i32)
-            # A run is indivisible, so the last one of the push runs off the end
-            # of the route list. Those slots load in bounds but stale, and CAP is
-            # how they are retired: it is already the overflow row's answer --
-            # the planner clamped the schedule to match, so such a row is simply
-            # dropped on both sides -- and it kills every store below.
-            if const_expr(i > 0):
-                row_in_expert = arith.select(
-                    pos < work_limit, row_in_expert, fx.Int32(C.cap)
-                )
-            src_toks.append(src_tok)
-            dest_pes.append(dest_pe)
-            local_exps.append(local_expert)
-            rows_in_exp.append(row_in_expert)
-            lives.append(row_in_expert < fx.Int32(C.cap))
-            dest_rows.append(local_expert * fx.Int32(C.cap) + row_in_expert)
+    run_start = global_warp * fx.Int32(n_pay_rows)
+    # Pass 1: the copies, with nothing ordering them.
+    for run_base in range(run_start, work_limit, run_stride):
+        src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows = _pay_meta(
+            C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit, n_pay_rows
+        )
 
         for i in range_constexpr(n_pay_rows):
             src_tok = src_toks[i]
@@ -1306,21 +1326,31 @@ def _emit_payload(
                      v = buffer_load(rs_src, chunk, vec_width=4, dtype=T.i32)
                      buffer_store(v, rs_dst, chunk)
 
-        # Publish the run. The drain + release fence must cover payload, scale,
-        # rowmap and tis; the counter is additive, so the consumer's "tile is
-        # complete" test is arrived == planned rather than a boolean flag that
-        # could be set while a sibling row is still in flight. One drain and one
-        # release cover every row of the run -- the release is the expensive half
-        # and it is scope, not extent, that it pays for.
-        P.waitcnt_stores()
-        if const_expr(_PARTS & 8):
-          if lane == fx.Int32(0):
-            # A system release over all address spaces. The narrower one-as
-            # scope measured identical and drain-only alone is wrong, so this
-            # keeps the safe end of a choice that costs nothing here. It is
-            # unconditional: row 0 of a run is always in range, so only a run
-            # made entirely of CAP overflow can waste it.
-            P.fence_release_all()
+    # One drain and one release for everything this CTA pushed. They must cover
+    # payload, scale, rowmap and tis, and the release is what the whole two-pass
+    # split exists to amortize: it is a system-scope fence, and its cost is scope,
+    # not extent, so covering a CTA's entire push costs what covering one run did.
+    # The barrier below it is what makes it a CTA-wide guarantee -- every warp has
+    # drained before the one thread that fences runs.
+    P.waitcnt_stores()
+    workgroup_barrier()
+    if tid == fx.Int32(0):
+        # A system release over all address spaces. The narrower one-as scope
+        # measured identical and drain-only alone is wrong, so this keeps the safe
+        # end of a choice that costs nothing here.
+        P.fence_release_all()
+    workgroup_barrier()
+
+    # Pass 2: the arrivals, now that every row they announce is visible. The
+    # counter is additive, so the consumer's "tile is complete" test is
+    # arrived == planned rather than a boolean flag that could be set while a
+    # sibling row is still in flight.
+    if const_expr(_PARTS & 8):
+      for run_base in range(run_start, work_limit, run_stride):
+        _, dest_pes, local_exps, rows_in_exp, lives, _ = _pay_meta(
+            C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit, n_pay_rows
+        )
+        if lane == fx.Int32(0):
             # One atomic per tile the run touches, not per row. The run is a
             # contiguous window of the destination-sorted order, so its rows carry
             # a non-decreasing key and usually a single one: counting the group and
@@ -1406,7 +1436,11 @@ def _emit_wait_all_payload(C, epoch, tid):
 
 
 def _emit_take_work(C, shard, tid, lds_idx):
-    """Pull this CTA's next GEMM1 work item and broadcast it over the block.
+    """Pull this CTA's next run of GEMM1 work items and broadcast its base.
+
+    One atomic hands out :data:`PULL_CHUNK` *contiguous* ids, and the caller
+    walks them; the id space is M-major, so a run usually lies inside one M-tile
+    and the caller's cached arrival gate opens once for all of it.
 
     Pull, not a grid-stride: the grid is superscribed for GEMM1 occupancy, so
     binding work item w to the CTA with role w would park most of the schedule
@@ -1414,7 +1448,7 @@ def _emit_take_work(C, shard, tid, lds_idx):
     on a tile those very CTAs would have filled. Pulling means only a running
     CTA ever holds work.
 
-    Each CTA pulls from one shard, and shard s only ever hands out items
+    Each CTA pulls from one shard, and shard s only ever hands out the chunks
     ``s, s+SHARDS, ...``; every shard must therefore have at least one CTA, which
     holds because shards are assigned by ticket over a grid far wider than
     ``WORK_SHARDS``.
@@ -1429,10 +1463,11 @@ def _emit_take_work(C, shard, tid, lds_idx):
     workgroup_barrier()
     if tid == fx.Int32(0):
         got = fx.Int32(P.atomic_add_agent(work_head_addr(C, shard), fx.Int32(1)))
+        chunk = shard + got * fx.Int32(WORK_SHARDS)
         lds_store(
             lds_idx,
             arith.index(0),
-            Vec.from_elements([shard + got * fx.Int32(WORK_SHARDS)], fx.Int32),
+            Vec.from_elements([chunk * fx.Int32(PULL_CHUNK)], fx.Int32),
         )
     workgroup_barrier()
     work = lds_load(lds_idx, arith.index(0))[0]
@@ -1440,12 +1475,34 @@ def _emit_take_work(C, shard, tid, lds_idx):
     return work
 
 
-def _emit_wait_tile(C, row_base, tid):
-    """Gate one GEMM1 M-tile on its planned row count.
+def _emit_tile_acquire(tid):
+    """Close a run of :func:`_emit_spin_tile` waits with one acquire.
+
+    Split out from the wait because the two have very different costs and very
+    different natural rates. A spin is a load off a counter thread 0 already has
+    the address of; the acquire is a cache invalidate that also throws away the
+    B tile the GEMM is about to reuse. Taking one per work item is what forced
+    the schedule to hand out coarse items, so the caller takes one per pull
+    instead and spins on every tile the pull covers underneath it.
+    """
+    workgroup_barrier()
+    if const_expr(_TILE_FENCE >= 2):
+        P.fence_acquire_all()
+    elif const_expr(_TILE_FENCE == 1):
+        P.fence_system_acquire()
+    else:
+        P.fence_agent_acquire()
+
+
+def _emit_spin_tile(C, row_base, tid):
+    """Wait for one GEMM1 M-tile's planned rows, with no fence of its own.
 
     ``row_base`` is the fixed-slot row ``local_expert*CAP + tile*tile_m``, which is
     exactly what the tile schedule already carries, so the arrival key needs no
     extra per-tile metadata array.
+
+    Thread 0 alone spins and there is no barrier here, so the caller must run
+    :func:`_emit_tile_acquire` before any wave reads the rows.
     """
     le = row_base // fx.Int32(C.cap)
     tile_idx = (row_base - le * fx.Int32(C.cap)) // fx.Int32(C.tile_m)
@@ -1483,13 +1540,6 @@ def _emit_wait_tile(C, row_base, tid):
             P.spin_until_ge_i32_backoff(
                 fx.Int64(C.ptr_tile_arrived) + fx.Int64(key) * fx.Int64(4), want
             )
-    workgroup_barrier()
-    if const_expr(_TILE_FENCE >= 2):
-        P.fence_acquire_all()
-    elif const_expr(_TILE_FENCE == 1):
-        P.fence_system_acquire()
-    else:
-        P.fence_agent_acquire()
 
 
 emit_ticket = ASTRewriter.transform(_emit_ticket)
@@ -1499,8 +1549,10 @@ _route_order_body = ASTRewriter.transform(_emit_route_order_body)
 emit_route_order = ASTRewriter.transform(_emit_route_order)
 emit_plan = ASTRewriter.transform(_emit_plan)
 emit_rowmap = ASTRewriter.transform(_emit_rowmap)
+_pay_meta = ASTRewriter.transform(_emit_pay_meta)
 emit_payload = ASTRewriter.transform(_emit_payload)
 emit_wait_plan = ASTRewriter.transform(_emit_wait_plan)
 emit_wait_all_payload = ASTRewriter.transform(_emit_wait_all_payload)
 emit_take_work = ASTRewriter.transform(_emit_take_work)
-emit_wait_tile = ASTRewriter.transform(_emit_wait_tile)
+emit_spin_tile = ASTRewriter.transform(_emit_spin_tile)
+emit_tile_acquire = ASTRewriter.transform(_emit_tile_acquire)
