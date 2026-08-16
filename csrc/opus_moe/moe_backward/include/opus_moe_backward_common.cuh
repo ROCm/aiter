@@ -196,6 +196,26 @@ blocked_dz_g2_offset(int sorted_row, int logical_col, Offset row_stride)
     return blocked_g2_offset(sorted_row, logical_col, row_stride);
 }
 
+// Forward-owned cache producer for K4's private blocked-G2 sorted-X input.
+// The launch grid is sized from sorted_capacity because num_valid_ids remains
+// device-resident after sorting.  CTAs beyond the padded expert prefix return
+// after reading num_valid_ids[0]; invalid sorter rows inside that prefix are
+// written as exact zero.
+struct SortedXBlockedG2Kargs
+{
+    const hip_bfloat16* __restrict__ x;          // [T, D], row major
+    const int32_t* __restrict__ sorted_token_ids; // [P]
+    const int32_t* __restrict__ num_valid_ids;    // [>=1]
+    hip_bfloat16* __restrict__ x_sorted;          // [P, D], blocked G2
+
+    int token_num;
+    int model_dim;
+    int sorted_capacity;
+
+    int64_t stride_x_t;
+    int64_t stride_x_sorted_r;
+};
+
 // K1: dO @ W2, dScore partial/reduce, SwiGLU backward, and score * activation.
 // Saved route tensors are sorted-route-major in the first native contract.
 struct DownBwdKargs

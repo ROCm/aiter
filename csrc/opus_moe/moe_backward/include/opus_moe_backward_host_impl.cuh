@@ -617,6 +617,27 @@ void launch_dw2_bf16(const Dw2Kargs& kargs,
         gfx950::dispatch_dw2(selected_kernel_id), kargs, stream, family);
 }
 
+void launch_sorted_x_blocked_g2_bf16(const SortedXBlockedG2Kargs& kargs,
+                                     hipStream_t stream)
+{
+    AITER_CHECK(kargs.x != nullptr && kargs.sorted_token_ids != nullptr &&
+                    kargs.num_valid_ids != nullptr &&
+                    kargs.x_sorted != nullptr,
+                "sorted-X blocked-G2: required input/output pointer is null");
+    AITER_CHECK(kargs.token_num > 0 &&
+                    kargs.token_num <= static_cast<int>(kPackedTokenMask),
+                "sorted-X blocked-G2: token count must fit packed metadata");
+    AITER_CHECK(kargs.model_dim > 0 && kargs.model_dim % 32 == 0,
+                "sorted-X blocked-G2: D must be positive and divisible by 32");
+    AITER_CHECK(kargs.sorted_capacity > 0,
+                "sorted-X blocked-G2: sorted capacity must be positive");
+    AITER_CHECK(kargs.stride_x_t == kargs.model_dim &&
+                    kargs.stride_x_sorted_r == kargs.model_dim,
+                "sorted-X blocked-G2: X and cache must be contiguous");
+    detail::check_gfx950_or_fail();
+    gfx950::sorted_x_blocked_g2_launch_gfx950(kargs, stream);
+}
+
 namespace detail
 {
 
@@ -632,6 +653,7 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                                   int route_reduce_kernel_id,
                                   int dw1_kernel_id,
                                   int dw2_kernel_id,
+                                  bool x_dw1_blocked_g2,
                                   hipStream_t stream)
 {
     check_gfx950_or_fail();
@@ -644,6 +666,10 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     const bool blocked_dw1 =
         dw1_kernel_id == blocked_dw1_kid ||
         dw1_kernel_id == blocked_dw1_blocked_x_kid;
+    AITER_CHECK(x_dw1_blocked_g2 ==
+                    (dw1_kernel_id == blocked_dw1_blocked_x_kid),
+                "fixed full pipeline: blocked-G2 sorted-X layout must be "
+                "selected if and only if K4 kernel 21 is selected");
     const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
     AITER_CHECK(!any_blocked_dz ||
                     (blocked_down && blocked_route_dx && blocked_dw1),
@@ -2213,6 +2239,60 @@ void opus_moe_dw2_bwd(aiter_tensor_t& d_out,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
+void opus_moe_gather_x_blocked_g2(aiter_tensor_t& x,
+                                  aiter_tensor_t& sorted_token_ids,
+                                  aiter_tensor_t& num_valid_ids,
+                                  aiter_tensor_t& x_sorted,
+                                  int block_m)
+{
+    check_down_tensor(x, "x", 2, AITER_DTYPE_bf16, "bfloat16");
+    check_down_tensor(
+        sorted_token_ids, "sorted_token_ids", 1, AITER_DTYPE_i32, "int32");
+    check_down_tensor(
+        num_valid_ids, "num_valid_ids", 1, AITER_DTYPE_i32, "int32");
+    check_down_tensor(
+        x_sorted, "x_sorted", 2, AITER_DTYPE_bf16, "bfloat16");
+    check_down_same_device(x, sorted_token_ids, "sorted_token_ids");
+    check_down_same_device(x, num_valid_ids, "num_valid_ids");
+    check_down_same_device(x, x_sorted, "x_sorted");
+
+    const int token_num = static_cast<int>(x.size(0));
+    const int model_dim = static_cast<int>(x.size(1));
+    const int sorted_capacity = static_cast<int>(sorted_token_ids.size(0));
+    AITER_CHECK(token_num > 0 && model_dim > 0,
+                "sorted-X blocked-G2: X must have positive [T,D] dimensions");
+    AITER_CHECK(model_dim % 32 == 0,
+                "sorted-X blocked-G2: D must be divisible by 32");
+    AITER_CHECK(sorted_capacity > 0 &&
+                    x_sorted.size(0) == sorted_capacity &&
+                    x_sorted.size(1) == model_dim,
+                "sorted-X blocked-G2: cache must have shape "
+                "[sorted_capacity,D]");
+    AITER_CHECK(num_valid_ids.numel() >= 1,
+                "sorted-X blocked-G2: num_valid_ids must not be empty");
+    AITER_CHECK(block_m == 32,
+                "sorted-X blocked-G2: sorting block_m must be 32");
+
+    opus_moe_backward::SortedXBlockedG2Kargs args{};
+    args.x = reinterpret_cast<const hip_bfloat16*>(x.data_ptr());
+    args.sorted_token_ids =
+        reinterpret_cast<const int32_t*>(sorted_token_ids.data_ptr());
+    args.num_valid_ids =
+        reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
+    args.x_sorted =
+        reinterpret_cast<hip_bfloat16*>(x_sorted.data_ptr());
+    args.token_num = token_num;
+    args.model_dim = model_dim;
+    args.sorted_capacity = sorted_capacity;
+    args.stride_x_t = x.stride(0);
+    args.stride_x_sorted_r = x_sorted.stride(0);
+
+    HipDeviceGuard guard(x.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    opus_moe_backward::launch_sorted_x_blocked_g2_bf16(args, stream);
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
+
 template<bool Validate>
 void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                             aiter_tensor_t& x,
@@ -2239,7 +2319,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
                             int route_dx_kernel_id,
                             int route_reduce_kernel_id,
                             int dw1_kernel_id,
-                            int dw2_kernel_id)
+                            int dw2_kernel_id,
+                            bool x_dw1_blocked_g2)
 {
     if constexpr(Validate)
     {
@@ -2523,6 +2604,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
             route_reduce_kernel_id,
             dw1_kernel_id,
             dw2_kernel_id,
+            x_dw1_blocked_g2,
             stream);
         HIP_CALL_LAUNCH(hipGetLastError());
     }
@@ -2542,6 +2624,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
             route_reduce_kernel_id,
             dw1_kernel_id,
             dw2_kernel_id,
+            x_dw1_blocked_g2,
             stream);
     }
 }
@@ -2571,7 +2654,8 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
                        int route_dx_kernel_id,
                        int route_reduce_kernel_id,
                        int dw1_kernel_id,
-                       int dw2_kernel_id)
+                       int dw2_kernel_id,
+                       bool x_dw1_blocked_g2)
 {
     opus_moe_full_bwd_impl<true>(d_out,
                                  x,
@@ -2598,7 +2682,8 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
                                  route_dx_kernel_id,
                                  route_reduce_kernel_id,
                                  dw1_kernel_id,
-                                 dw2_kernel_id);
+                                 dw2_kernel_id,
+                                 x_dw1_blocked_g2);
 }
 
 void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
@@ -2626,7 +2711,8 @@ void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
                                int route_dx_kernel_id,
                                int route_reduce_kernel_id,
                                int dw1_kernel_id,
-                               int dw2_kernel_id)
+                               int dw2_kernel_id,
+                               bool x_dw1_blocked_g2)
 {
     opus_moe_full_bwd_impl<false>(d_out,
                                   x,
@@ -2653,5 +2739,6 @@ void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
                                   route_dx_kernel_id,
                                   route_reduce_kernel_id,
                                   dw1_kernel_id,
-                                  dw2_kernel_id);
+                                  dw2_kernel_id,
+                                  x_dw1_blocked_g2);
 }

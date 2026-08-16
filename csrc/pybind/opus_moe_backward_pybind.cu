@@ -177,6 +177,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("topk"),
           py::arg("block_m"),
           py::arg("kernel_id") = -1);
+    m.def("opus_moe_gather_x_blocked_g2",
+          &opus_moe_gather_x_blocked_g2,
+          "Gather a blocked-G2 expert-sorted X cache for Opus MoE K4",
+          py::arg("x"),
+          py::arg("sorted_token_ids"),
+          py::arg("num_valid_ids"),
+          py::arg("x_sorted"),
+          py::arg("block_m"));
     m.def("opus_moe_full_bwd",
           &opus_moe_full_bwd,
           "Opus MoE complete K1--K5 backward launch chain",
@@ -205,7 +213,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("route_dx_kernel_id") = -1,
           py::arg("route_reduce_kernel_id") = -1,
           py::arg("dw1_kernel_id") = -1,
-          py::arg("dw2_kernel_id") = -1);
+          py::arg("dw2_kernel_id") = -1,
+          py::arg("x_dw1_blocked_g2") = false);
     m.def("opus_moe_full_bwd_trusted",
           &opus_moe_full_bwd_trusted,
           "Trusted Opus MoE complete K1--K5 backward launch chain",
@@ -234,7 +243,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("route_dx_kernel_id") = -1,
           py::arg("route_reduce_kernel_id") = -1,
           py::arg("dw1_kernel_id") = -1,
-          py::arg("dw2_kernel_id") = -1);
+          py::arg("dw2_kernel_id") = -1,
+          py::arg("x_dw1_blocked_g2") = false);
 }
 
 #endif // !__HIP_DEVICE_COMPILE__

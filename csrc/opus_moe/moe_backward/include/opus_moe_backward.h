@@ -30,6 +30,8 @@ void launch_router_bwd_fp32(const RouterBwdKargs& kargs,
 void launch_bias_bwd_bf16(const BiasBwdKargs& kargs,
                           int kernel_id,
                           hipStream_t stream);
+void launch_sorted_x_blocked_g2_bf16(const SortedXBlockedG2Kargs& kargs,
+                                     hipStream_t stream);
 
 } // namespace opus_moe_backward
 
@@ -186,6 +188,15 @@ void opus_moe_dw2_bwd(aiter_tensor_t& d_out,
                       int block_m,
                       int kernel_id);
 
+// Gather X with the existing forward sorting metadata and write K4's private
+// blocked-G2 cache.  Python supplies the allocation so this is graph-safe and
+// can be integrated directly into the forward producer pipeline.
+void opus_moe_gather_x_blocked_g2(aiter_tensor_t& x,
+                                  aiter_tensor_t& sorted_token_ids,
+                                  aiter_tensor_t& num_valid_ids,
+                                  aiter_tensor_t& x_sorted,
+                                  int block_m);
+
 // Full K1--K5 launch entry.  Keeping the five dependent launches behind one
 // extension boundary avoids Python/custom-op bubbles between kernel families
 // while preserving the independently testable family entry points above.
@@ -214,7 +225,8 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
                        int route_dx_kernel_id,
                        int route_reduce_kernel_id,
                        int dw1_kernel_id,
-                       int dw2_kernel_id);
+                       int dw2_kernel_id,
+                       bool x_dw1_blocked_g2);
 
 // Trusted full-chain entry for an internal training wrapper that has already
 // validated all reusable tensors and established the current device/stream.
@@ -245,4 +257,5 @@ void opus_moe_full_bwd_trusted(aiter_tensor_t& d_out,
                                int route_dx_kernel_id,
                                int route_reduce_kernel_id,
                                int dw1_kernel_id,
-                               int dw2_kernel_id);
+                               int dw2_kernel_id,
+                               bool x_dw1_blocked_g2);

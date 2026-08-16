@@ -223,14 +223,32 @@ explicit-only comparison instance rather than an auto-dispatch choice.
 The flat full pipeline can additionally keep K1's dZ in a private G2
 encoding: K1 kid 17, K2 kid 20, and K4 kid 20 or 21 must be selected together.
 K4 kid 21 uses the same blocked-dZ contract but also consumes a forward-owned
-sorted-X cache written directly in G2 row-pair order.  It is never selected
-for standalone K4 or the two autograd Functions, which exchange canonical
-row-major dZ.  For `(T,D,I,E,K)=(32768,2048,1024,64,8)`, kid 21 reduced
-isolated K4 by about 128 us and the full pipeline by 87--121 us in repeated
-same-address ABBA runs.  Eight bitwise screens covered six shape families,
-32 empty experts, and a single-expert extreme skew.  A one-pass forward gather
-measured only about 16 us more than producing the row-major cache, so no
-backward-side conversion is part of this path.
+sorted-X cache written directly in G2 row-pair order.  The native
+`sorted_x_blocked_g2_kernel_gfx950` producer gathers `X[token]` from the
+existing forward `sorted_token_ids`, writes invalid sorter rows as exact zero,
+and never materializes a row-major intermediate.  Its grid is based on the
+allocated sorted capacity while `num_valid_ids[0]` remains device-resident, so
+there is no host readback.  Python exposes both the preallocated raw binding
+and `opus_moe_gather_x_blocked_g2(..., out=...)` for graph/forward integration.
+
+The full/trusted ABI carries an explicit `x_dw1_blocked_g2` layout bit and
+requires it if and only if K4 kid 21 is selected.  K1/K2/K4 blocked-dZ kids are
+also coupled, preventing either row-major dZ or row-major sorted-X from being
+silently reinterpreted.  Standalone K4 and the two autograd Functions continue
+to exchange canonical row-major tensors.
+
+For `(T,D,I,E,K)=(32768,2048,1024,64,8)`, kid 21 reduced isolated K4 by about
+128 us.  Repeated full-pipeline ABBA measured 87--121 us on an earlier clean
+window and, under a later externally loaded window, median improvements of
+92.50 us (graph) and 130.86 us (direct).  The paired delta remains usable when
+the loaded absolute time does not.  Eight K4 bitwise screens covered six shape
+families, 32 empty experts, and a single-expert extreme skew; native-producer
+plus full K1--K5 validation additionally covered four `D/I/E/K` families.
+
+The target native producer measured 371.63 us versus 379.88 us for the Triton
+row-major gather and 394.69 us for the Triton blocked-G2 gather.  Thus the
+physical layout no longer has a forward production penalty in the measured
+family, and no backward-side conversion is part of this path.
 
 K5 auto-dispatch is also geometry based.  Kid 11 requires `D % 256 == 0`,
 `I % 128 == 0`, at least 4096 BM256 output tiles, no more than 64 output
@@ -264,7 +282,10 @@ The current no-tail fixed kernels require:
 
 The private blocked-dZ full pipeline further requires `D % 512 == 0` and
 `I % 256 == 0`.  Its blocked sorted-X cache uses the exact same sorting
-metadata and contains zero for every padded row.
+metadata and contains zero for every padded row.  K3 uses distributed-id kid 3
+when `D % 2048 == 0`; other compatible widths use the general sorted-route
+kid 1.  This choice follows each reducer's legal tile domain rather than a
+model tuple.
 
 K4/K5 consume padded expert offsets directly. Empty experts must be written
 as exact zero gradients. K1 owns its internal multipart `dS` finalize; this is
@@ -274,7 +295,9 @@ not a separate public family.
 
 `aiter/ops/opus/moe_backward.py` contains the JIT bindings, allocation,
 validation, fixed/compact metadata objects, public wrappers, and the two
-autograd attachment Functions. It has no Torch reference fallback.
+autograd attachment Functions. `opus_moe_gather_x_blocked_g2` is the
+forward-cache producer, while `saved_x_sorted_blocked_g2=True` selects the
+coupled full-pipeline ABI. It has no Torch reference fallback.
 
 ## Adding or tuning a kernel
 

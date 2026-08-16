@@ -227,11 +227,12 @@ def _validate_saved_x_sorted(
     model_dim: int,
     device: torch.device,
 ) -> None:
-    """Validate an optional forward-saved padded expert-sorted X cache.
+    """Validate an optional forward-saved padded expert-sorted X container.
 
-    Live row ``r`` must contain ``x[token(r)]`` in BF16.  Unlike the ordinary
-    gather path, the direct sorted-row K4 kernel also consumes padded reduction
-    rows, so the producer must materialize every padding row as exact zero.
+    The ordinary layout stores logical row ``r`` as ``x[token(r)]``.  The
+    blocked-G2 layout uses the same allocation shape but is selected through a
+    separate explicit ABI bit.  Both producers must materialize sorter padding
+    as exact zero because direct K4 consumes every padded reduction row.
     """
 
     if saved_x_sorted.dtype != torch.bfloat16:
@@ -317,8 +318,56 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15, 17, 18, 19):
-        raise ValueError("K4 kernel_id=14/15/17/18/19 requires saved_x_sorted")
+    if int(kernel_id) in (14, 15, 17, 18, 19, 20, 21):
+        raise ValueError(
+            "direct sorted-X K4 kernel_id requires saved_x_sorted"
+        )
+
+
+def _select_blocked_g2_full_pipeline(
+    inter_dim: int,
+    model_dim: int,
+    down_kernel_id: int,
+    route_dx_kernel_id: int,
+    route_reduce_kernel_id: int,
+    dw1_kernel_id: int,
+) -> tuple[int, int, int, int]:
+    """Select the coupled blocked-dZ/blocked-X producer-consumer ABI.
+
+    The policy is defined by tile divisibility and physical-layout contracts,
+    not an exact model tuple.  Explicit incompatible kernel requests fail so
+    no tensor can be silently reinterpreted with the wrong layout.
+    """
+
+    if inter_dim % 256 != 0 or model_dim % 512 != 0:
+        raise ValueError(
+            "blocked-G2 full pipeline requires I divisible by 256 and "
+            "D divisible by 512"
+        )
+    # K3 kid3 distributes one complete D=2048 row across route-id owners.
+    # Other blocked-K2-compatible D tiles retain the general sorted-route
+    # reducer rather than constraining the whole cache ABI to one width.
+    route_reduce_kernel_id_selected = 3 if model_dim % 2048 == 0 else 1
+    selected = (17, 20, route_reduce_kernel_id_selected, 21)
+    requested = (
+        int(down_kernel_id),
+        int(route_dx_kernel_id),
+        int(route_reduce_kernel_id),
+        int(dw1_kernel_id),
+    )
+    names = (
+        "down_kernel_id",
+        "route_dx_kernel_id",
+        "route_reduce_kernel_id",
+        "dw1_kernel_id",
+    )
+    for name, value, expected in zip(names, requested, selected):
+        if value not in (-1, expected):
+            raise ValueError(
+                f"blocked-G2 full pipeline requires {name}={expected}, "
+                f"got {value}"
+            )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -598,6 +647,30 @@ def _opus_moe_dw2_bwd_raw(
 ) -> Tensor: ...
 
 
+def _gen_opus_moe_gather_x_blocked_g2_fake_tensors(
+    x: Tensor,
+    sorted_token_ids: Tensor,
+    num_valid_ids: Tensor,
+    x_sorted: Tensor,
+) -> Tensor:
+    return x_sorted
+
+
+@compile_ops(
+    "module_opus_moe_backward",
+    fc_name="opus_moe_gather_x_blocked_g2",
+    gen_fake=_gen_opus_moe_gather_x_blocked_g2_fake_tensors,
+    develop=True,
+)
+def _opus_moe_gather_x_blocked_g2_raw(
+    x: Tensor,
+    sorted_token_ids: Tensor,
+    num_valid_ids: Tensor,
+    x_sorted: Tensor,
+    block_m: int,
+) -> Tensor: ...
+
+
 def _gen_opus_moe_full_bwd_fake_tensors(
     d_out: Tensor,
     x: Tensor,
@@ -656,6 +729,7 @@ def _opus_moe_full_bwd_raw(
     route_reduce_kernel_id: int,
     dw1_kernel_id: int,
     dw2_kernel_id: int,
+    x_dw1_blocked_g2: bool = False,
 ) -> Tensor: ...
 
 
@@ -692,6 +766,7 @@ def _opus_moe_full_bwd_trusted_raw(
     route_reduce_kernel_id: int,
     dw1_kernel_id: int,
     dw2_kernel_id: int,
+    x_dw1_blocked_g2: bool = False,
 ) -> Tensor:
     """Internal launch after the complete reusable tensor contract is checked."""
 
@@ -1103,6 +1178,50 @@ def opus_moe_route_backward(
         d_x_route=d_x_route,
         d_x=d_x,
     )
+
+
+def opus_moe_gather_x_blocked_g2(
+    x: Tensor,
+    sorted_token_ids: Tensor,
+    num_valid_ids: Tensor,
+    *,
+    block_m: int,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Gather ``x[token]`` directly into K4's private blocked-G2 cache.
+
+    The existing forward sorter metadata is reused verbatim; no TopK or host
+    readback is performed.  Sorter-padding rows in the live padded prefix are
+    materialized as exact zero.  Supplying ``out`` exposes the graph-safe
+    preallocated-output form needed by a forward pipeline.
+    """
+
+    if x.dtype != torch.bfloat16 or x.ndim != 2:
+        raise TypeError("x must be a rank-2 BF16 tensor")
+    if sorted_token_ids.dtype != torch.int32 or sorted_token_ids.ndim != 1:
+        raise TypeError("sorted_token_ids must be a rank-1 int32 tensor")
+    if num_valid_ids.dtype != torch.int32 or num_valid_ids.ndim != 1:
+        raise TypeError("num_valid_ids must be a rank-1 int32 tensor")
+    if num_valid_ids.numel() < 1:
+        raise ValueError("num_valid_ids must contain at least one entry")
+    if int(block_m) != 32:
+        raise ValueError("blocked-G2 sorted-X requires block_m=32")
+    if x.shape[0] <= 0 or x.shape[1] <= 0 or x.shape[1] % 32 != 0:
+        raise ValueError("x must have positive [T,D] with D divisible by 32")
+    expected_shape = (sorted_token_ids.numel(), x.shape[1])
+    if out is None:
+        out = torch.empty(expected_shape, dtype=x.dtype, device=x.device)
+    if out.dtype != torch.bfloat16 or out.shape != expected_shape:
+        raise ValueError("out must be BF16 with shape [sorted_capacity,D]")
+    tensors = (x, sorted_token_ids, num_valid_ids, out)
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("x, sorting metadata, and out must share one device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("x, sorting metadata, and out must be contiguous")
+    _opus_moe_gather_x_blocked_g2_raw(
+        x, sorted_token_ids, num_valid_ids, out, int(block_m)
+    )
+    return out
 
 
 def opus_moe_weight_backward(
@@ -1629,6 +1748,7 @@ def opus_moe_backward(
     bias_kernel_id: int = -1,
     saved_a_scaled: Tensor | None = None,
     saved_x_sorted: Tensor | None = None,
+    saved_x_sorted_blocked_g2: bool = False,
 ) -> OpusMoeBackwardOutput:
     """Run the complete checked fixed-top-k K1--K5 backward chain.
 
@@ -1641,8 +1761,10 @@ def opus_moe_backward(
 
     A BF16 ``saved_x_sorted=[sorted_capacity,D]`` may independently preserve
     the forward input in expert-sorted route order.  Its live rows must equal
-    ``x[token]`` and every sorter-padding row must be exact zero.  K4 then reads
-    both operands by sorted row instead of repeating token decode and gather.
+    ``x[token]`` and every sorter-padding row must be exact zero.  Set
+    ``saved_x_sorted_blocked_g2=True`` only for a cache produced by
+    :func:`opus_moe_gather_x_blocked_g2`; this couples K1/K2/K4 to their
+    blocked-G2 producer-consumer instances and requires ``saved_a_scaled``.
     """
 
     if not isinstance(metadata, OpusMoeFixedMetadata):
@@ -1653,31 +1775,57 @@ def opus_moe_backward(
         )
     )
     sorted_capacity = metadata.sorted_token_ids.numel()
+    saved_x_sorted_blocked_g2 = bool(saved_x_sorted_blocked_g2)
+    if saved_x_sorted_blocked_g2 and saved_x_sorted is None:
+        raise ValueError(
+            "saved_x_sorted_blocked_g2=True requires saved_x_sorted"
+        )
     if saved_a_scaled is not None:
         _validate_saved_a_scaled(
             saved_a_scaled, sorted_capacity, inter_dim, x.device
         )
-        down_kernel_id = _select_saved_a_scaled_down_kernel(
-            inter_dim,
-            sorted_capacity,
-            metadata.sorted_expert_ids,
-            metadata.expert_padded_offsets,
-            down_kernel_id,
-        )
+        if not saved_x_sorted_blocked_g2:
+            down_kernel_id = _select_saved_a_scaled_down_kernel(
+                inter_dim,
+                sorted_capacity,
+                metadata.sorted_expert_ids,
+                metadata.expert_padded_offsets,
+                down_kernel_id,
+            )
     else:
+        if saved_x_sorted_blocked_g2:
+            raise ValueError(
+                "blocked-G2 full pipeline requires saved_a_scaled because "
+                "K1 kernel 17 does not rewrite that forward cache"
+            )
         _reject_saved_a_scaled_down_without_cache(down_kernel_id)
     x_dw1 = x
     if saved_x_sorted is not None:
         _validate_saved_x_sorted(
             saved_x_sorted, sorted_capacity, model_dim, x.device
         )
-        dw1_kernel_id = _select_saved_x_dw1_kernel(
-            2 * inter_dim,
-            model_dim,
-            sorted_capacity,
-            num_experts,
-            int(dw1_kernel_id),
-        )
+        if saved_x_sorted_blocked_g2:
+            (
+                down_kernel_id,
+                route_dx_kernel_id,
+                route_reduce_kernel_id,
+                dw1_kernel_id,
+            ) = _select_blocked_g2_full_pipeline(
+                inter_dim,
+                model_dim,
+                down_kernel_id,
+                route_dx_kernel_id,
+                route_reduce_kernel_id,
+                dw1_kernel_id,
+            )
+        else:
+            dw1_kernel_id = _select_saved_x_dw1_kernel(
+                2 * inter_dim,
+                model_dim,
+                sorted_capacity,
+                num_experts,
+                int(dw1_kernel_id),
+            )
         x_dw1 = saved_x_sorted
     else:
         _reject_sorted_x_dw1_without_cache(dw1_kernel_id)
@@ -1738,6 +1886,7 @@ def opus_moe_backward(
         int(route_reduce_kernel_id),
         int(dw1_kernel_id),
         int(dw2_kernel_id),
+        saved_x_sorted_blocked_g2,
     )
 
     d_b1 = None

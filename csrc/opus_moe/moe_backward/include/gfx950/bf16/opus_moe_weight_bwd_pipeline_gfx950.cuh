@@ -68,6 +68,98 @@ struct WeightBwdKernelArgs
     int64_t stride_c_m;
 };
 
+// One CTA covers 32 sorted rows by 256 model columns.  Each thread moves four
+// naturally aligned BF16x8 vectors, while the first wave decodes one token id
+// per row into LDS.  The destination address is K4's private G2 row-pair
+// encoding, so forward never materializes an intermediate row-major cache.
+__global__ __launch_bounds__(256, 2)
+void sorted_x_blocked_g2_kernel_gfx950(SortedXBlockedG2Kargs kargs)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+    constexpr int route_tile = 32;
+    constexpr int column_tile = 256;
+    constexpr int vector = 8;
+    constexpr int vectors_per_cta = route_tile * column_tile / vector;
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+
+    const int num_valid_rows = kargs.num_valid_ids[0];
+    const int sorted_row_base = static_cast<int>(blockIdx.x) * route_tile;
+    if(sorted_row_base >= num_valid_rows)
+        return;
+
+    __shared__ int tokens[route_tile];
+    const int tid = static_cast<int>(threadIdx.x);
+    if(tid < route_tile)
+    {
+        const int sorted_row = sorted_row_base + tid;
+        int token = kargs.token_num;
+        if(sorted_row < num_valid_rows && sorted_row < kargs.sorted_capacity)
+        {
+            const int packed = kargs.sorted_token_ids[sorted_row];
+            const int decoded_token = packed_token_id(packed);
+            const int slot = packed_topk_slot(packed);
+            if(decoded_token < kargs.token_num && slot < kMaxPackedTopk)
+                token = decoded_token;
+        }
+        tokens[tid] = token;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for(int iteration = 0; iteration < vectors_per_cta / 256; ++iteration)
+    {
+        const int linear_vector = tid + iteration * 256;
+        const int row_in_tile = linear_vector / (column_tile / vector);
+        const int column_vector = linear_vector % (column_tile / vector);
+        const int sorted_row = sorted_row_base + row_in_tile;
+        const int logical_col =
+            static_cast<int>(blockIdx.y) * column_tile + column_vector * vector;
+        if(sorted_row >= num_valid_rows ||
+           sorted_row >= kargs.sorted_capacity ||
+           logical_col + vector > kargs.model_dim)
+            continue;
+
+        u32x4 values{0, 0, 0, 0};
+        const int token = tokens[row_in_tile];
+        if(token < kargs.token_num)
+        {
+            const int64_t source_offset =
+                static_cast<int64_t>(token) * kargs.stride_x_t + logical_col;
+            values = *reinterpret_cast<const u32x4*>(kargs.x + source_offset);
+        }
+        const int64_t destination_offset = blocked_g2_offset(
+            sorted_row, logical_col, kargs.stride_x_sorted_r);
+        *reinterpret_cast<u32x4*>(kargs.x_sorted + destination_offset) = values;
+    }
+#endif
+}
+
+inline void
+sorted_x_blocked_g2_launch_gfx950(const SortedXBlockedG2Kargs& kargs,
+                                  hipStream_t stream)
+{
+    constexpr int block_size = 256;
+    constexpr int route_tile = 32;
+    constexpr int column_tile = 256;
+    AITER_CHECK(kargs.token_num > 0 && kargs.model_dim > 0,
+                "sorted-X blocked-G2: X must have positive [T,D] dimensions");
+    AITER_CHECK(kargs.sorted_capacity > 0,
+                "sorted-X blocked-G2: sorted capacity must be positive");
+    AITER_CHECK(kargs.model_dim % 32 == 0,
+                "sorted-X blocked-G2: D must be divisible by 32");
+    hipLaunchKernelGGL(sorted_x_blocked_g2_kernel_gfx950,
+                       dim3(static_cast<unsigned int>(
+                                (kargs.sorted_capacity + route_tile - 1) /
+                                route_tile),
+                            static_cast<unsigned int>(
+                                (kargs.model_dim + column_tile - 1) /
+                                column_tile)),
+                       dim3(block_size),
+                       0,
+                       stream,
+                       kargs);
+}
+
 #ifdef __HIP_DEVICE_COMPILE__
 
 // Repack each native 32x32 MFMA result from four-column lane fragments into
