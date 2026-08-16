@@ -310,6 +310,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int bm256x128_k32_triple_lds_kid = 12;
     constexpr int bm256x128_k32_prefetch_ab_triple_lds_kid = 13;
     constexpr int bm256x128_k32_native_b32_zero_pad_kid = 16;
+    constexpr int bm128x256_k32_native_b32_zero_pad_kid = 17;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the larger output tile.  Require at least
@@ -362,6 +363,13 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
             // 4096 BM256xBN128 output blocks.
             constexpr uint64_t k32_min_average_routes = 1024;
             constexpr uint64_t k32_prefetch_ab_min_average_routes = 3072;
+            // The balanced BM128xBN256 tile preserves CTA count, MFMA count,
+            // and LDS footprint while halving repeated random dO gathers.
+            // Prefer it whenever the forward-owned zero-padded activation
+            // cache can support the native BN256 operand layout.
+            if(average_padded_routes >= k32_min_average_routes &&
+               kargs.a_scaled_padding_zero && kargs.inter_dim % 256 == 0)
+                return bm128x256_k32_native_b32_zero_pad_kid;
             if(average_padded_routes >=
                k32_prefetch_ab_min_average_routes)
                 return kargs.a_scaled_padding_zero
@@ -610,9 +618,10 @@ void launch_dw2_bf16(const Dw2Kargs& kargs,
     detail::check_gfx950_or_fail();
     const int selected_kernel_id =
         detail::select_fixed_dw2_kernel_id(kargs, kernel_id);
-    AITER_CHECK(selected_kernel_id != 16 || kargs.a_scaled_padding_zero,
-                "dw2: kernel 16 requires exact-zero a_scaled padding from "
-                "the full K1--K5 cache contract");
+    AITER_CHECK((selected_kernel_id != 16 && selected_kernel_id != 17) ||
+                    kargs.a_scaled_padding_zero,
+                "dw2: native-B K32 kernels require exact-zero a_scaled "
+                "padding from the full K1--K5 cache contract");
     detail::invoke(
         gfx950::dispatch_dw2(selected_kernel_id), kargs, stream, family);
 }

@@ -339,8 +339,9 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert((BM == 64 && BN == 128) || T::DIRECT_GMEM_TO_LDS,
                   "wide K4 tiles require direct GMEM-to-LDS loads");
     static_assert(!split_b_n64 ||
-                      (BN == 128 && T::BLOCK_SIZE == 256),
-                  "split-B K4 requires a four-wave BN128 tile");
+                      ((BN == 128 || BN == 256) &&
+                       T::BLOCK_SIZE == 256),
+                  "split-B K32 requires a four-wave BN128/BN256 tile");
     static_assert(!sorted_b_rows || (split_b_n64 && !swap_route_sources),
                   "sorted-B K4 requires the split-B dW1 load path");
     static_assert(!native_m32_lds_swizzle ||
@@ -357,7 +358,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                        !swap_route_sources && BK == 32 && VEC == 8),
                   "blocked sorted B requires native dW1 K32 loads");
     static_assert(!native_b_m32_lds_swizzle ||
-                      (BM == 256 && BN == 128 && BK == 32 &&
+                      (((BM == 256 && BN == 128) ||
+                        (BM == 128 && BN == 256)) && BK == 32 &&
                        T::BLOCK_SIZE == 256 && split_b_n64 &&
                        (sorted_b_rows || swap_route_sources) &&
                        triple_buffer),
@@ -732,7 +734,8 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 constexpr int native_n = 32;
                 constexpr int vectors_per_native = BK * native_n / VEC;
                 constexpr int loads = BN * BK / (T::BLOCK_SIZE * VEC);
-                static_assert(vectors_per_native == 128 && loads == 2);
+                static_assert(vectors_per_native == 128 &&
+                              (loads == 2 || loads == 4));
                 opus::static_for<loads>([&](auto load) {
                     constexpr int native_tile_pair =
                         load.value * T::BLOCK_SIZE / vectors_per_native;
@@ -1087,9 +1090,14 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         static_assert(T::DIRECT_GMEM_TO_LDS && split_b_n64 &&
                           (sorted_b_rows || swap_route_sources),
                       "triple-buffered K32 requires a direct split-B path");
-        static_assert(BM == 256 && BN == 128 && T::BLOCK_SIZE == 256,
-                      "triple-buffered K32 requires the wave4 production tile");
-        constexpr int direct_loads_per_tile = a_m_slabs + 2;
+        static_assert(((BM == 256 && BN == 128) ||
+                       (BM == 128 && BN == 256)) &&
+                          T::BLOCK_SIZE == 256,
+                      "triple-buffered K32 requires a wave4 balanced tile");
+        constexpr int native_b_loads =
+            BN * BK / (T::BLOCK_SIZE * VEC);
+        constexpr int direct_loads_per_tile =
+            a_m_slabs + (native_b_m32_lds_swizzle ? native_b_loads : 2);
         static_assert(direct_loads_per_tile == 6);
 
         auto s_a_1 = make_smem(

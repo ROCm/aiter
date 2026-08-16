@@ -1104,6 +1104,21 @@ struct Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4NativeB32ZeroPadTripleLds
     static constexpr bool ASSUME_SORTED_B_PADDING_ZERO = true;
 };
 
+// Preserve K5's CTA count, accumulator footprint, and 24-KiB stage while
+// trading one M repeat for one N repeat.  The wider N tile halves repeated
+// random dO gathers; the extra traffic lands on contiguous sorted a_scaled.
+struct Dw2Bf16Gfx950Bm128Bn256Bk32Cohort4NativeB32ZeroPadTripleLds
+    : Dw2Bf16Gfx950Bm256Bn128Bk32Cohort4NativeB32ZeroPadTripleLds
+{
+    static constexpr int B_M = 128;
+    static constexpr int B_N = 256;
+    static constexpr int E_M = 2;
+    static constexpr int E_N = 4;
+    static constexpr bool ISSUE_DIRECT_B_FIRST = true;
+    static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720
     : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
 {
