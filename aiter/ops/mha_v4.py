@@ -310,10 +310,22 @@ def mha_v4_packed(
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     expected_scale_modes = scale_modes_for_formats(q_format, k_format, v_format)
-    if (q_scale_mode, k_scale_mode, v_scale_mode) != expected_scale_modes:
+    scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
+    mxfp8_scale_modes = (
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+    is_mxfp8_recipe = (
+        q_format in _FP8_FORMATS
+        and k_format == q_format
+        and v_format == q_format
+        and scale_modes == mxfp8_scale_modes
+    )
+    if scale_modes != expected_scale_modes and not is_mxfp8_recipe:
         raise ValueError(
             "unsupported scale recipe for formats: "
-            f"got {(q_scale_mode.name, k_scale_mode.name, v_scale_mode.name)}, "
+            f"got {tuple(mode.name for mode in scale_modes)}, "
             f"expected {tuple(mode.name for mode in expected_scale_modes)}"
         )
 

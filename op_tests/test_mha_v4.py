@@ -437,6 +437,27 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
         )
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
+    q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    mha_v4_packed(
+        q,
+        q,
+        q,
+        qk_scale,
+        qk_scale,
+        v_scale,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
 def test_mha_v4_packed_rejects_wrong_fp8_encoding():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)

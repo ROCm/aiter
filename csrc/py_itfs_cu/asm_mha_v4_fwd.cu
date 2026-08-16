@@ -283,9 +283,12 @@ void fmha_v4_fwd(const at::Tensor& q,
     TORCH_CHECK(out.sizes() == torch::IntArrayRef({batch, seqlen_q, nhead_q, kHeadDim}),
                 "out must have shape [batch, query_length, query_heads, 128]");
 
-    const bool mx_qk = q_format == format_id(AttentionFormat::Fp6E2M3) ||
-                       q_format == format_id(AttentionFormat::Fp4E2M1);
-    if(mx_qk)
+    const bool mx_qk_format = q_format == format_id(AttentionFormat::Fp6E2M3) ||
+                              q_format == format_id(AttentionFormat::Fp4E2M1);
+    const bool e8m0_qk_scales =
+        q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
+        k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    if(e8m0_qk_scales)
     {
         TORCH_CHECK(q_descale.scalar_type() == at::ScalarType::Byte &&
                         k_descale.scalar_type() == at::ScalarType::Byte,
@@ -313,7 +316,7 @@ void fmha_v4_fwd(const at::Tensor& q,
         TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({batch, nhead_k, tiles * 512}),
                     "MX V descale must have shape [batch, key_heads, tiles * 512]");
     }
-    else if(mx_qk)
+    else if(mx_qk_format)
     {
         TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
                     "MX FP8 V descale must be a float32 tensor");

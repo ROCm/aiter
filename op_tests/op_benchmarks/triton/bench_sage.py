@@ -22,6 +22,7 @@ from aiter.ops.mha import (
 )
 from aiter.ops.mha_v4 import (
     AttentionFormat,
+    AttentionScaleMode,
     mha_v4,
     mha_v4_packed,
     mha_v4_q_multiplier,
@@ -53,6 +54,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -85,6 +87,20 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
     v_fp8, v_scale = _production_quantize_v(value)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+
+
+def _production_quantize_mxfp8(query, key, value, softmax_scale):
+    q_rotated = torch.empty_like(query)
+    k_rotated = torch.empty_like(key)
+    rotate_activation(q_rotated, query)
+    rotate_activation(k_rotated, key)
+    q_fp8, q_scale = dynamic_mxfp8_quant(
+        q_rotated * mha_v4_q_multiplier(softmax_scale),
+        quant_dtype=aiter.dtypes.fp8,
+    )
+    k_fp8, k_scale = dynamic_mxfp8_quant(k_rotated, quant_dtype=aiter.dtypes.fp8)
+    v_fp8, v_scale = quantize_fp8(value)
+    return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
 def _production_quantize_f4f4(query, key, value, softmax_scale):
@@ -122,6 +138,7 @@ KernelName = Literal[
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp8",
     "aiter_fp8",
     "aiter_f8f6",
     "aiter_mxfp6",
@@ -133,6 +150,7 @@ KernelName = Literal[
 
 ALL_KERNELS: list[str] = [
     "aiter_i8fp8",
+    "aiter_mxfp8",
     "aiter_fp8",
     "aiter_f8f6",
     "aiter_mxfp6",
@@ -147,6 +165,7 @@ QUANT_KERNELS = {
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp8",
     "aiter_fp8",
     "aiter_f8f6",
     "aiter_mxfp6",
@@ -1070,6 +1089,38 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
+    if args.kernel == "aiter_mxfp8":
+        if not args.hadamard_rotate or args.block_r != 128 or args.qsmooth:
+            raise ValueError("aiter_mxfp8 requires block_r=128 Hadamard rotation")
+        mxfp8_scale_modes = (
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_TENSOR,
+        )
+
+        def _run_aiter_mxfp8():
+            packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
+            return mha_v4_packed(
+                *packed,
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                *mxfp8_scale_modes,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return _run_aiter_mxfp8
+        packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
+        return lambda: mha_v4_packed(
+            *packed,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            *mxfp8_scale_modes,
+            softmax_scale=softmax_scale,
+        )
+
     if args.kernel == "aiter_f8f6":
         if args.qsmooth or (args.hadamard_rotate and args.block_r != 128):
             raise ValueError(
@@ -1544,6 +1595,7 @@ def benchmark_single_case(
         "sage_mxfp4",
         "fav3_fp8",
         "aiter_i8fp8",
+        "aiter_mxfp8",
         "aiter_fp8",
         "aiter_f8f6",
         "aiter_mxfp6",
@@ -1562,6 +1614,7 @@ def benchmark_single_case(
         if args.kernel
         in (
             "fav3_fp8",
+            "aiter_mxfp8",
             "aiter_fp8",
             "aiter_f8f6",
             "aiter_i8fp8",
@@ -1768,6 +1821,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "sage_mxfp4",
         "fav3_fp8",
         "aiter_i8fp8",
+        "aiter_mxfp8",
         "aiter_fp8",
         "aiter_f8f6",
         "aiter_mxfp6",
@@ -1783,6 +1837,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "sage_fp8",
         "sage_mxfp4",
         "fav3_fp8",
+        "aiter_mxfp8",
         "aiter_fp8",
         "aiter_f8f6",
         "aiter_mxfp6",
@@ -2115,6 +2170,7 @@ def parse_args() -> argparse.Namespace:
             "sage_mxfp4",
             "fav3_fp8",
             "aiter_i8fp8",
+            "aiter_mxfp8",
             "aiter_fp8",
             "aiter_f8f6",
             "aiter_mxfp6",
