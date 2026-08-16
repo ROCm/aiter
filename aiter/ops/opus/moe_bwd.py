@@ -716,6 +716,36 @@ def _opus_moe_scatter_add_bf16_raw(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_forward_combine_token8_h2048_bf16",
+    develop=True,
+)
+def _opus_moe_forward_combine_token8_h2048_bf16_raw(
+    src: Tensor,
+    token_routes: Tensor,
+    route_scores: Tensor,
+    dst: Tensor,
+) -> None: ...
+
+
+def opus_moe_forward_combine_token8_h2048_bf16(
+    src: Tensor, token_routes: Tensor, route_scores: Tensor
+) -> Tensor:
+    """Exact token-major weighted route sum with FP32 accumulation."""
+    T, topk = token_routes.shape
+    if topk != 8 or src.shape != (T * topk, 2048):
+        raise ValueError("forward combine requires topk=8 and H=2048")
+    dst = torch.empty(T, 2048, device=src.device, dtype=torch.bfloat16)
+    _opus_moe_forward_combine_token8_h2048_bf16_raw(
+        src.contiguous(),
+        token_routes,
+        route_scores.contiguous(),
+        dst,
+    )
+    return dst
+
+
 def opus_moe_combine_bwd_bf16(dout: Tensor, gather: Tensor, p_sorted: Tensor, y: Tensor):
     """dy[m,:]=p[m]*dout[gather[m],:]; dp[m]=<dout[gather[m],:],y[m,:]>.
     p_sorted is FP32, matching SonicMoE routing-score precision. Returns
@@ -1262,9 +1292,18 @@ class OpusMoERefFunc(torch.autograd.Function):
         h = _act_fwd(act_input, act_type, I).to(dtype)                 # [M,I]
         y = fwd_gemm(h, w2)                                            # [M,H]=h@W2ᵀ
 
-        out = torch.zeros(T, H, device=x.device, dtype=torch.float32)
-        out.index_add_(0, x_gather_idx, (y.float() * p_sorted.float()[:, None]))
-        out = out.to(dtype)
+        if exact_shape:
+            token_routes = build_token_routes(x_gather_idx, T, topk)
+            out = opus_moe_forward_combine_token8_h2048_bf16(
+                y, token_routes, p_sorted
+            )
+        else:
+            out = torch.zeros(T, H, device=x.device, dtype=torch.float32)
+            out.index_add_(
+                0, x_gather_idx, y.float() * p_sorted.float()[:, None]
+            )
+            out = out.to(dtype)
+            token_routes = build_token_routes(x_gather_idx, T, topk)
 
         # Exact stage2 derives dscore from <dO @ W2, h>; its combine backward
         # only scales dO and never reads expert-packed Y. Release this 1-GiB
@@ -1292,7 +1331,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         ctx.offs = offs
         # dx reverse map for the deterministic gather-sum (no atomics); built once
         # here (moe-sort semantics), reused in backward.
-        ctx.token_routes = build_token_routes(x_gather_idx, T, topk)
+        ctx.token_routes = token_routes
         ctx.w1t = _backward_weight_transpose(w1)
         ctx.w2t = _backward_weight_transpose(w2)
         ctx.w2_ref = w2

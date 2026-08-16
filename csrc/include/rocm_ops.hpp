@@ -504,6 +504,13 @@ namespace py = pybind11;
           py::arg("src"), \
           py::arg("gather"), \
           py::arg("dst")); \
+    m.def("opus_moe_forward_combine_token8_h2048_bf16", \
+          &opus_moe_forward_combine_token8_h2048_bf16, \
+          "MoE exact token-major training-forward combine", \
+          py::arg("src"), \
+          py::arg("token_routes"), \
+          py::arg("route_scores"), \
+          py::arg("dst")); \
     m.def("opus_moe_gather_sum_bf16", \
           &opus_moe_gather_sum_bf16, \
           "MoE dx gather-sum (deterministic, no atomics)", \

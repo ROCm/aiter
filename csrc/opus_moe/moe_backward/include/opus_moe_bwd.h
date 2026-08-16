@@ -178,6 +178,14 @@ void opus_moe_scatter_add_bf16(aiter_tensor_t& src,
                                aiter_tensor_t& gather,
                                aiter_tensor_t& dst);
 
+// Exact training-forward weighted gather. One token owns its eight grouped
+// route rows; accumulate y[route,h] * score[route] in FP32 and store BF16.
+void opus_moe_forward_combine_token8_h2048_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& dst);
+
 // Deterministic dx gather-sum (fixed top-k, no atomics). One block per token
 // sums its topk route rows. src [M,H] bf16, token_routes [T,topk] i32,
 // dst [T,H] bf16 (FP32 accumulation). Requires H % 8 == 0.

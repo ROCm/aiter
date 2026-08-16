@@ -1209,6 +1209,84 @@ void opus_moe_scatter_add_bf16(aiter_tensor_t& src,    // [M,H] bf16
         H);
 }
 
+// Exact training-forward combine. Two independent 256-thread token partitions
+// share one CTA. For H=2048 each thread owns one aligned bf16x8 vector and
+// accumulates the token's eight grouped route rows directly in FP32, avoiding
+// the 2-GiB FP32 scale temporary and atomic index_add path.
+__global__ __launch_bounds__(512, 1)
+void opus_moe_forward_combine_token8_h2048_bf16_kernel(
+    const __bf16* __restrict__ src,
+    const int32_t* __restrict__ token_routes,
+    const float* __restrict__ route_scores,
+    __bf16* __restrict__ dst,
+    int T)
+{
+    constexpr int H = 2048;
+    constexpr int TOPK = 8;
+    constexpr int THREADS_PER_TOKEN = 256;
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const int token_in_block = threadIdx.x / THREADS_PER_TOKEN;
+    const int token_thread = threadIdx.x % THREADS_PER_TOKEN;
+    const int token = blockIdx.x * TOKENS_PER_BLOCK + token_in_block;
+    if(token >= T)
+        return;
+
+    const int h = token_thread * 8;
+    const int32_t* routes = token_routes + static_cast<int64_t>(token) * TOPK;
+    float acc[8] = {};
+#pragma unroll
+    for(int k = 0; k < TOPK; ++k)
+    {
+        const int route = routes[k];
+        const float score = route_scores[route];
+        const opus_bf16x8 value = __builtin_nontemporal_load(
+            reinterpret_cast<const opus_bf16x8*>(
+                src + static_cast<int64_t>(route) * H + h));
+#pragma unroll
+        for(int i = 0; i < 8; ++i)
+            acc[i] = fmaf(static_cast<float>(value[i]), score, acc[i]);
+    }
+
+    opus_bf16x8 result;
+#pragma unroll
+    for(int i = 0; i < 8; ++i)
+        result[i] = static_cast<__bf16>(acc[i]);
+    *reinterpret_cast<opus_bf16x8*>(
+        dst + static_cast<int64_t>(token) * H + h) = result;
+}
+
+void opus_moe_forward_combine_token8_h2048_bf16(
+    aiter_tensor_t& src,
+    aiter_tensor_t& token_routes,
+    aiter_tensor_t& route_scores,
+    aiter_tensor_t& dst)
+{
+    constexpr int TOPK = 8;
+    constexpr int H = 2048;
+    constexpr int TOKENS_PER_BLOCK = 2;
+    const int T = static_cast<int>(dst.size(0));
+    AITER_CHECK(static_cast<int>(dst.size(1)) == H,
+                "forward combine requires H=2048");
+    AITER_CHECK(static_cast<int>(token_routes.size(0)) == T &&
+                    static_cast<int>(token_routes.size(1)) == TOPK,
+                "forward combine requires token_routes[T,8]");
+    AITER_CHECK(static_cast<int>(src.size(0)) == T * TOPK &&
+                    static_cast<int>(src.size(1)) == H,
+                "forward combine requires src[T*8,2048]");
+    AITER_CHECK(static_cast<int>(route_scores.numel()) == T * TOPK,
+                "forward combine route score size mismatch");
+    const dim3 grid((T + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK);
+    const dim3 block(TOKENS_PER_BLOCK * 256);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    opus_moe_forward_combine_token8_h2048_bf16_kernel<<<
+        grid, block, 0, stream>>>(
+        reinterpret_cast<const __bf16*>(src.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<const float*>(route_scores.data_ptr()),
+        reinterpret_cast<__bf16*>(dst.data_ptr()),
+        T);
+}
+
 // Deterministic dx gather-sum (replaces the atomic scatter for fixed top-k):
 // Two tokens per block; an independent 256-thread half-block sums each token's
 // topk route rows of src -> dst[t]. No atomics (each dst[t] is written by one
