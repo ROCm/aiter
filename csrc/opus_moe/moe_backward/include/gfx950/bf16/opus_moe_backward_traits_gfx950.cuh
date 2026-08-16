@@ -203,6 +203,9 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
     // path and wins across token count, D, I, and routing-skew families.
     static constexpr int A_XOR_SHIFT = 4;
     static constexpr int A_XOR_MASK = 3;
+    // Z is a one-shot stream.  Keeping it out of the normal L2 replacement
+    // path preserves state reused by the following dW1 and route-dX stages.
+    static constexpr int CACHECTL_Z = 2;
 };
 
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.

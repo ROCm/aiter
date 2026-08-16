@@ -158,8 +158,10 @@ BF16 pack and global `a_scaled` store; K5 consumes the supplied cache directly.
 Kid 16 retains kid 15's split-N64 W2 and exact MFMA/activation order, but uses
 two 12-KiB Z slabs.  While the current route group's SwiGLU epilogue runs, its
 global-to-LDS transfer for the following group is already outstanding.  The
-gfx950 trace reports 72,192 bytes of LDS, 128 VGPRs and zero scratch, retaining
-two CTAs per CU.  Balanced, active-eight, skewed, K=4, E=8, T=8K--65K and
+one-shot Z transfers use the gfx950 non-temporal cache policy so they do not
+replace dZ and weight state reused by the following K4/K2 stages.  The gfx950
+trace reports 72,192 bytes of LDS, 128 VGPRs and zero scratch, retaining two
+CTAs per CU.  Balanced, active-eight, skewed, K=4, E=8, T=8K--65K and
 smaller D/I family screens were bit-exact and favored the pipelined instance;
 the selector remains a sorted-capacity/BN256 geometry policy rather than an
 exact model-shape check.  Kids 14 and 15 remain explicit comparison overrides.

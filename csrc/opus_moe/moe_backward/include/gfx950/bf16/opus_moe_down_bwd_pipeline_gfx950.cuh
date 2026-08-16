@@ -267,6 +267,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     }();
     constexpr bool pipeline_z_route_groups =
         request_pipeline_z_route_groups && RouteTiles > 1;
+    constexpr int cachectl_z = []() constexpr {
+        if constexpr(requires { T::CACHECTL_Z; })
+            return T::CACHECTL_Z;
+        return 0;
+    }();
     constexpr bool issue_b_first = []() constexpr {
         if constexpr(requires { T::ISSUE_B_FIRST; })
             return T::ISSUE_B_FIRST;
@@ -843,7 +848,10 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                         reinterpret_cast<void*>(
                             reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_z_tile.ptr) +
                             lds_offset),
-                        static_cast<int>(global_offset));
+                        static_cast<int>(global_offset),
+                        0,
+                        opus::number<0>{},
+                        opus::number<cachectl_z>{});
                 });
             });
         }
