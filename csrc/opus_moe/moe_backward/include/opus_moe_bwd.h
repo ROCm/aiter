@@ -91,7 +91,8 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
                                      aiter_tensor_t& expert_offsets,
                                      aiter_tensor_t& tile_offsets,
                                      int num_tiles,
-                                     int max_m);
+                                     int max_m,
+                                     int reverse_tiles);
 
 // Fused opus-MFMA grouped wgrad (BF16->FP32), transposed+padded inputs.
 //   dyT [P,Mp] bf16, aT [Q,Mp] bf16, pad_offs [E+1] i32, dW [E,P,Q] fp32

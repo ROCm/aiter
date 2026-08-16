@@ -440,13 +440,16 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
                                      aiter_tensor_t& expert_offsets,
                                      aiter_tensor_t& tile_offsets,
                                      int num_tiles,
-                                     int max_m)
+                                     int max_m,
+                                     int reverse_tiles)
 {
     const int E = static_cast<int>(w.size(0));
     const int N = static_cast<int>(w.size(1));
     const int K = static_cast<int>(w.size(2));
     const int M = static_cast<int>(dy.size(0));
     AITER_CHECK(max_m > 0, "max_m must be positive");
+    AITER_CHECK(reverse_tiles == 0 || reverse_tiles == 1,
+                "reverse_tiles must be 0 or 1");
     AITER_CHECK(static_cast<int>(expert_offsets.size(0)) == E + 1,
                 "expert_offsets must have E + 1 elements");
     AITER_CHECK(static_cast<int>(tile_offsets.size(0)) == E + 1 ||
@@ -487,6 +490,7 @@ void opus_moe_dgrad_mono_ragged_bf16(aiter_tensor_t& dy,
         ? (packed_tiles ? 4 : 3)
         : (packed_tiles ? 2 : 1);
     k.num_tiles = num_tiles;
+    k.reverse_tiles = reverse_tiles;
     opus_moe_dgrad_plain_ragged_launch_gfx950(
         k, aiter::getCurrentHIPStream());
 }

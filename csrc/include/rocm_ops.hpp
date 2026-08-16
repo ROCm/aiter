@@ -422,7 +422,8 @@ namespace py = pybind11;
           py::arg("expert_offsets"), \
           py::arg("tile_offsets"), \
           py::arg("num_tiles"), \
-          py::arg("max_m")); \
+          py::arg("max_m"), \
+          py::arg("reverse_tiles")); \
     m.def("opus_moe_wgrad_mfma_bf16", \
           &opus_moe_wgrad_mfma_bf16, \
           "MoE fused MFMA grouped wgrad (BF16->FP32, transposed+padded)", \

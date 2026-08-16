@@ -421,6 +421,7 @@ def _opus_moe_dgrad_mono_ragged_bf16_raw(
     tile_offsets: Tensor,
     num_tiles: int,
     max_m: int,
+    reverse_tiles: int,
 ) -> None: ...
 
 
@@ -570,6 +571,7 @@ def opus_moe_dgrad_mono_ragged_prepared(
     num_tiles: int,
     max_m: int,
     out: Tensor,
+    reverse_tiles: bool = False,
 ) -> Tensor:
     """Compact ragged plain dgrad through the target mono mainloop."""
     E, N, K = w_bnk.shape
@@ -588,6 +590,7 @@ def opus_moe_dgrad_mono_ragged_prepared(
         tile_offsets,
         num_tiles,
         max_m,
+        int(reverse_tiles),
     )
     return out
 
@@ -1341,6 +1344,7 @@ class OpusMoERefFunc(torch.autograd.Function):
                     ctx.num_mono_tiles,
                     ctx.max_expert_m,
                     out,
+                    reverse_tiles=(wt.shape[1] == 2048),
                 )
             return opus_moe_dgrad_mfma_prepared(dy_op.contiguous(), wt, seid, bms, bme, out)
 

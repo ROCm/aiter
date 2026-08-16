@@ -41,6 +41,7 @@ struct opus_moe_dgrad_swiglu_kargs
     int ragged;
     int compact_tiles;
     int num_tiles;
+    int reverse_tiles;
 };
 
 __device__ __forceinline__ void opus_moe_dgrad_tile_map(
@@ -133,8 +134,11 @@ void opus_moe_dgrad_swiglu_kernel_gfx950(opus_moe_dgrad_swiglu_kargs kargs)
             // operations into shifts/masks; one scalar load replaces the
             // six-step expert-prefix search in every CTA.
             const int global_tile_m = wgid / num_tiles_n;
+            const int descriptor_tile_m = kargs.reverse_tiles
+                ? kargs.tile_offsets[problem_batch] - 1 - global_tile_m
+                : global_tile_m;
             const uint32_t tile_desc = static_cast<uint32_t>(
-                kargs.tile_offsets[problem_batch + 1 + global_tile_m]);
+                kargs.tile_offsets[problem_batch + 1 + descriptor_tile_m]);
             batch_id = tile_desc & 0xffu;
             const int local_tile_m = (tile_desc >> 8) & 0x7ffu;
             num_tiles_m = tile_desc >> 19;
