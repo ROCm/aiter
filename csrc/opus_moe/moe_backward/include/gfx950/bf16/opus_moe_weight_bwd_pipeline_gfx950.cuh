@@ -206,6 +206,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::NATIVE_M32_LDS_SWIZZLE;
         return false;
     }();
+    constexpr bool blocked_dz_g2 = []() constexpr {
+        if constexpr(requires { T::BLOCKED_DZ_G2; })
+            return T::BLOCKED_DZ_G2;
+        return false;
+    }();
     constexpr bool native_b_m32_lds_swizzle =
         native_m32_lds_swizzle || []() constexpr {
             if constexpr(requires { T::NATIVE_B_M32_LDS_SWIZZLE; })
@@ -247,6 +252,9 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                        (sorted_b_rows || swap_route_sources) &&
                        triple_buffer),
                   "native-M32 LDS swizzle requires a sorted-row K32 path");
+    static_assert(!blocked_dz_g2 ||
+                      (native_m32_lds_swizzle && BK == 32 && VEC == 8),
+                  "blocked A requires the native M32/K32 vector path");
     static_assert(!native_b_m32_lds_swizzle ||
                       (BM == 256 && BN == 128 && BK == 32 &&
                        T::BLOCK_SIZE == 256 && split_b_n64 &&
@@ -381,6 +389,14 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         static_cast<unsigned long long>(kargs.stride_b_row) * sizeof(D_B));
     auto g_a = make_gmem(a, a_bytes);
     auto g_b = make_gmem(b, b_bytes);
+    auto a_global_offset = [&](int sorted_row, int logical_col)
+        __attribute__((always_inline)) -> int64_t {
+        if constexpr(blocked_dz_g2)
+            return blocked_dz_g2_offset(
+                sorted_row, logical_col, kargs.stride_a_row);
+        return static_cast<int64_t>(sorted_row) * kargs.stride_a_row +
+               logical_col;
+    };
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
@@ -559,12 +575,13 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                         reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
                         (load.value * T::BLOCK_SIZE +
                          wave_id * opus::get_warp_size()) * VEC;
+                    const int64_t source_offset = a_global_offset(
+                        sources.a,
+                        output_m_base + native_tile * native_m +
+                            native32_load_vec * VEC);
                     g_a.template _async_load<VEC>(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                        (sources.a * kargs.stride_a_row +
-                         output_m_base + native_tile * native_m +
-                         native32_load_vec * VEC) *
-                            sizeof(D_A),
+                        source_offset * sizeof(D_A),
                         0,
                         opus::number<0>{},
                         opus::number<T::CACHECTL_A>{});

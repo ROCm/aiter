@@ -162,6 +162,32 @@ logical_route_count(const RouteMetadata& route)
         return route.token_num * route.topk;
 }
 
+// Private K1 -> K2/K4 dZ layout.  A logical [M32,K32] tile is split into
+// pairs of route rows and four K8 vectors.  The two rows of every pair are
+// adjacent inside each K8 vector, so K2 reads one contiguous 32-B segment
+// while K1 and K4 retain their native M32 lane mapping.  Only the fused full
+// pipeline may select consumers of this layout; standalone APIs remain
+// logical row-major.
+template<typename Offset>
+static __device__ __forceinline__ Offset
+blocked_dz_g2_offset(int sorted_row, int logical_col, Offset row_stride)
+{
+    constexpr int route_tile = 32;
+    constexpr int column_tile = 32;
+    constexpr int row_group = 2;
+    constexpr int vector = 8;
+    const int tile_row = sorted_row & ~(route_tile - 1);
+    const int row_in_tile = sorted_row & (route_tile - 1);
+    const int group_base =
+        (row_in_tile / row_group) * row_group * column_tile;
+    return static_cast<Offset>(tile_row) * row_stride +
+           static_cast<Offset>(logical_col / column_tile) *
+               route_tile * column_tile +
+           group_base +
+           (logical_col % column_tile / vector) * row_group * vector +
+           (row_in_tile % row_group) * vector;
+}
+
 // K1: dO @ W2, dScore partial/reduce, SwiGLU backward, and score * activation.
 // Saved route tensors are sorted-route-major in the first native contract.
 struct DownBwdKargs

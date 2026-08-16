@@ -635,6 +635,18 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                                   hipStream_t stream)
 {
     check_gfx950_or_fail();
+    constexpr int blocked_down_kid = 17;
+    constexpr int blocked_route_dx_kid = 20;
+    constexpr int blocked_dw1_kid = 20;
+    const bool blocked_down = down_kernel_id == blocked_down_kid;
+    const bool blocked_route_dx = route_dx_kernel_id == blocked_route_dx_kid;
+    const bool blocked_dw1 = dw1_kernel_id == blocked_dw1_kid;
+    const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
+    AITER_CHECK(!any_blocked_dz ||
+                    (blocked_down && blocked_route_dx && blocked_dw1),
+                "fixed full pipeline: blocked dZ K1/K2/K4 instances must "
+                "be selected together");
+
     int selected_route_dx =
         select_fixed_route_dx_kernel_id(route_dx, route_dx_kernel_id);
     int selected_route_reduce =
@@ -720,7 +732,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                kid == sorted_bn256_m5_b_first_route_dx_kid ||
                kid == sorted_bn256_m5_binary_route_dx_kid ||
                kid == sorted_bn512_m3_binary_route_dx_kid ||
-               kid == sorted_bn512_m3_binary_n_fast_route_dx_kid;
+               kid == sorted_bn512_m3_binary_n_fast_route_dx_kid ||
+               kid == blocked_route_dx_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&
@@ -764,9 +777,10 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
         static_cast<uint64_t>(2 * down.inter_dim) * sizeof(hip_bfloat16);
     const bool uses_saved_a_and_sorted_x =
         (down_kernel_id == 14 || down_kernel_id == 15 ||
-         down_kernel_id == 16) &&
+         down_kernel_id == 16 || down_kernel_id == blocked_down_kid) &&
         (dw1_kernel_id == 15 || dw1_kernel_id == 17 ||
-         dw1_kernel_id == 18 || dw1_kernel_id == 19);
+         dw1_kernel_id == 18 || dw1_kernel_id == 19 ||
+         dw1_kernel_id == blocked_dw1_kid);
     const bool launch_saved_dw2_before_down =
         mid_width_d && uses_saved_a_and_sorted_x &&
         dz_bytes >= dz_k5_before_route_min_bytes;
@@ -794,8 +808,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                dw1,
                stream,
                Family::Dw1);
-        // Keep K2/K3 as one producer-consumer pair.  K5 has either already
-        // consumed its forward cache or remains last for smaller dZ streams.
+        // Keep K2/K3 as one producer-consumer pair after K4.  This order also
+        // gives both dominant grouped GEMMs adjacent access to K1's dZ stream.
         invoke(gfx950::dispatch_route_dx(selected_route_dx),
                route_dx,
                stream,
@@ -1462,7 +1476,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     const bool use_bn256 =
         kernel_id == 11 || kernel_id == 12 ||
         kernel_id == 13 || kernel_id == 14 || kernel_id == 15 ||
-        kernel_id == 16 ||
+        kernel_id == 16 || kernel_id == 17 ||
         (kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              geometry));
@@ -2307,6 +2321,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         down_kernel_id == 11 || down_kernel_id == 12 ||
             down_kernel_id == 13 || down_kernel_id == 14 ||
             down_kernel_id == 15 || down_kernel_id == 16 ||
+            down_kernel_id == 17 ||
         (down_kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              down_geometry));
@@ -2338,7 +2353,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         const bool uses_sorted_x =
             dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
             dw1_kernel_id == 17 || dw1_kernel_id == 18 ||
-            dw1_kernel_id == 19;
+            dw1_kernel_id == 19 || dw1_kernel_id == 20;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,

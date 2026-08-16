@@ -154,8 +154,21 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::COMPACT_OUTPUT_N_FAST;
         return false;
     }();
+    constexpr bool blocked_dz_g2 = []() constexpr {
+        if constexpr(requires { T::BLOCKED_DZ_G2; })
+            return T::BLOCKED_DZ_G2;
+        return false;
+    }();
+    constexpr bool precompute_blocked_dz_base = []() constexpr {
+        if constexpr(requires { T::PRECOMPUTE_BLOCKED_DZ_BASE; })
+            return T::PRECOMPUTE_BLOCKED_DZ_BASE;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
+    static_assert(!blocked_dz_g2 ||
+                      (BM == 32 && BK == 32 && T::VEC_A == 8),
+                  "blocked dZ requires the native M32/K32 vector path");
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));
     static_assert(!fixed_shape || (FixedD % BN == 0 && 2 * FixedI % BK == 0));
@@ -314,18 +327,48 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
     opus::static_for<RouteTiles>([&](auto tile) { clear(v_c[tile.value]); });
 
     constexpr int a_vectors = CTA_M * BK / T::VEC_A;
+    constexpr int a_loads_per_thread =
+        (a_vectors + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
     static_assert(a_vectors > 0);
-    int a_loader_base = 0;
+    int a_loader_row = 0;
     if(tid < a_vectors)
     {
         const int local_m = tid / (BK / T::VEC_A);
-        const int sorted_row = route_base + local_m;
+        a_loader_row = route_base + local_m;
         // num_valid_ids is block_m padded, so every row of an active tile is
         // allocated.  Padding dZ may contain arbitrary BF16 values, but its
         // route is discarded by the epilogue; masking the GEMM load only adds
         // a metadata dependency to the hot prologue.
-        a_loader_base = static_cast<int32_t>(
-            static_cast<int64_t>(sorted_row) * stride_dz_r);
+    }
+
+    auto d_z_offset = [&](int sorted_row, int logical_col)
+        __attribute__((always_inline)) -> int32_t {
+        if constexpr(blocked_dz_g2)
+            return blocked_dz_g2_offset(
+                sorted_row,
+                logical_col,
+                static_cast<int32_t>(stride_dz_r));
+        return static_cast<int32_t>(
+            static_cast<int64_t>(sorted_row) * stride_dz_r + logical_col);
+    };
+
+    int32_t blocked_a_base[a_loads_per_thread];
+    if constexpr(precompute_blocked_dz_base)
+    {
+        static_assert(blocked_dz_g2 && BK == 32);
+        opus::static_for<a_loads_per_thread>([&](auto load) {
+            const int a_vector = load.value * T::BLOCK_SIZE + tid;
+            if(a_vector < a_vectors)
+            {
+                const int a_element = a_vector * T::VEC_A;
+                const int local_m = a_element / BK;
+                const int local_k = a_element % BK;
+                blocked_a_base[load.value] = blocked_dz_g2_offset(
+                    route_base + local_m,
+                    local_k,
+                    static_cast<int32_t>(stride_dz_r));
+            }
+        });
     }
 
     auto issue_tile = [&](int buffer, int tile_k) {
@@ -405,7 +448,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                          : wave_id * opus::get_warp_size() * T::VEC_A);
                 g_a.template _async_load<T::VEC_A>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
+                    d_z_offset(a_loader_row, tile_k * BK + local_k) *
+                        sizeof(D_A),
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_A>{});
@@ -421,7 +465,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                          : wave_id * opus::get_warp_size() * T::VEC_A);
                 g_a.template _async_load<T::VEC_A>(
                     reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                    (a_loader_base + tile_k * BK + local_k) * sizeof(D_A),
+                    d_z_offset(a_loader_row, tile_k * BK + local_k) *
+                        sizeof(D_A),
                     0,
                     opus::number<0>{},
                     opus::number<T::CACHECTL_A>{});
@@ -430,8 +475,6 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
         else
         {
             static_assert(a_vectors % opus::get_warp_size() == 0);
-            constexpr int a_loads_per_thread =
-                (a_vectors + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
             opus::static_for<a_loads_per_thread>([&](auto load) {
                 const int a_vector =
                     load.value * T::BLOCK_SIZE + tid;
@@ -441,8 +484,6 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                     const int local_m = a_element / BK;
                     const int local_k = a_element % BK;
                     const int sorted_row = route_base + local_m;
-                    const int source_base = static_cast<int32_t>(
-                        static_cast<int64_t>(sorted_row) * stride_dz_r);
                     OPUS_LDS_ADDR D_A* a_wave_dst =
                         a_lds +
                         (T::SMEM_A_SLAB_PAD > 0
@@ -454,9 +495,15 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                              : (load.value * T::BLOCK_SIZE +
                                 wave_id * opus::get_warp_size()) *
                                    T::VEC_A);
+                    const int32_t source_offset =
+                        precompute_blocked_dz_base
+                            ? blocked_a_base[load.value] +
+                                  tile_k * 32 * 32
+                            : d_z_offset(
+                                  sorted_row, tile_k * BK + local_k);
                     g_a.template _async_load<T::VEC_A>(
                         reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                        (source_base + tile_k * BK + local_k) * sizeof(D_A),
+                        source_offset * sizeof(D_A),
                         0,
                         opus::number<0>{},
                         opus::number<T::CACHECTL_A>{});

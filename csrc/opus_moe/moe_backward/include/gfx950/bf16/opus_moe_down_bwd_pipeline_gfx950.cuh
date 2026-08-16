@@ -287,6 +287,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::WRITE_A_SCALED;
         return true;
     }();
+    constexpr bool blocked_dz_g2 = []() constexpr {
+        if constexpr(requires { T::BLOCKED_DZ_G2; })
+            return T::BLOCKED_DZ_G2;
+        return false;
+    }();
     constexpr bool split_b_n64 = []() constexpr {
         if constexpr(requires { T::SPLIT_B_N64_SWIZZLE; })
             return T::SPLIT_B_N64_SWIZZLE;
@@ -314,6 +319,9 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                       (a_xor_shift >= 2 && a_xor_shift <= 6 &&
                        a_xor_mask > 0 && a_xor_mask <= 3),
                   "A XOR layout requires shift 2..6 and a two-bit mask");
+    static_assert(!blocked_dz_g2 ||
+                      (ROUTE_M == 32 && T::VEC_C == 4),
+                  "blocked dZ requires M32 and eight-BF16 stores");
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -1078,12 +1086,28 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
 
                 if(row_in_range && col + 8 <= inter_dim)
                 {
-                    const int64_t dz_base =
-                        static_cast<int64_t>(sorted_row) * stride_dz_r + col;
-                    *reinterpret_cast<u32x4*>(kargs.d_z + dz_base) =
-                        d_gate_store;
-                    *reinterpret_cast<u32x4*>(
-                        kargs.d_z + dz_base + inter_dim) = d_up_store;
+                    if constexpr(blocked_dz_g2)
+                    {
+                        const int64_t gate_base =
+                            blocked_dz_g2_offset(
+                                sorted_row, col, stride_dz_r);
+                        const int64_t up_base =
+                            blocked_dz_g2_offset(
+                                sorted_row, col + inter_dim, stride_dz_r);
+                        *reinterpret_cast<u32x4*>(kargs.d_z + gate_base) =
+                            d_gate_store;
+                        *reinterpret_cast<u32x4*>(kargs.d_z + up_base) =
+                            d_up_store;
+                    }
+                    else
+                    {
+                        const int64_t dz_base =
+                            static_cast<int64_t>(sorted_row) * stride_dz_r + col;
+                        *reinterpret_cast<u32x4*>(kargs.d_z + dz_base) =
+                            d_gate_store;
+                        *reinterpret_cast<u32x4*>(
+                            kargs.d_z + dz_base + inter_dim) = d_up_store;
+                    }
                     if constexpr(write_a_scaled)
                     {
                         const int64_t a_scaled_base =

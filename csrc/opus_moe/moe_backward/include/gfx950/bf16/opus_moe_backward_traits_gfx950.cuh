@@ -208,6 +208,15 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
     static constexpr int CACHECTL_Z = 2;
 };
 
+// Private producer/consumer layout for the fused full backward pipeline.
+// Paired K2/K4 instances invert the address mapping while preserving the
+// production LDS and MFMA schedules.
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZBlockedDzG2
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
+{
+    static constexpr bool BLOCKED_DZ_G2 = true;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>
@@ -385,6 +394,13 @@ struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSort
     : RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirst
 {
     static constexpr bool COMPACT_OUTPUT_N_FAST = true;
+};
+
+struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirstNFastBlockedDzG2
+    : RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirstNFast
+{
+    static constexpr bool BLOCKED_DZ_G2 = true;
+    static constexpr bool PRECOMPUTE_BLOCKED_DZ_BASE = true;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128
@@ -759,6 +775,12 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLds
     : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
 {
     static constexpr bool NATIVE_M32_LDS_SWIZZLE = true;
+};
+
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLds
+{
+    static constexpr bool BLOCKED_DZ_G2 = true;
 };
 
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
