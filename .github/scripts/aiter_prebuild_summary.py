@@ -59,6 +59,9 @@ def main() -> int:
     print(f"GPU_ARCHS: {os.environ.get('GPU_ARCHS', 'unknown')}")
     print(f"PREBUILD_KERNELS: {os.environ.get('PREBUILD_KERNELS', 'unknown')}")
     print(f"MAX_JOBS: {os.environ.get('MAX_JOBS', 'unknown')}")
+    print(
+        f"AITER_PREBUILD_THREAD_NUM: {os.environ.get('AITER_PREBUILD_THREAD_NUM', 'unknown')}"
+    )
     print(f"Build status: {args.build_status}")
     print(f"Prebuild wall time: {wall_seconds}s ({wall_seconds / 60:.1f} min)")
     print(f"Kernel count: {len(kernels)}")

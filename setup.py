@@ -379,12 +379,21 @@ if PREBUILD_KERNELS != 0:
                 third_party=one_opt_args["third_party"],
             )
 
-        prebuid_thread_num = 5
+        prebuild_thread_num_env = os.environ.get("AITER_PREBUILD_THREAD_NUM")
+        if (
+            prebuild_thread_num_env is not None
+            and prebuild_thread_num_env.isdigit()
+            and int(prebuild_thread_num_env) > 0
+        ):
+            prebuild_thread_num = int(prebuild_thread_num_env)
+        else:
+            prebuild_thread_num = 5
         max_jobs = os.environ.get("MAX_JOBS")
         if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
-            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+            prebuild_thread_num = min(prebuild_thread_num, int(max_jobs))
         else:
-            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+            prebuild_thread_num = min(prebuild_thread_num, getMaxJobs())
+        prebuid_thread_num = prebuild_thread_num
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---

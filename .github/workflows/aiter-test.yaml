@@ -22,6 +22,7 @@ env:
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "64"
+  AITER_PREBUILD_THREAD_NUM: "6"
   TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
@@ -179,6 +180,7 @@ jobs:
           docker run --rm \
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+            -e AITER_PREBUILD_THREAD_NUM="${{ env.AITER_PREBUILD_THREAD_NUM }}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
@@ -195,7 +197,7 @@ jobs:
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
-              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}" &&
+              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}, and AITER_PREBUILD_THREAD_NUM: ${AITER_PREBUILD_THREAD_NUM}" &&
               export PREBUILD_KERNELS=1 &&
               export MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" &&
               export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
@@ -229,6 +231,7 @@ jobs:
           GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" \
           PREBUILD_KERNELS=1 \
           MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+          AITER_PREBUILD_THREAD_NUM="${{ env.AITER_PREBUILD_THREAD_NUM }}" \
           python3 .github/scripts/aiter_prebuild_summary.py \
             --log .aiter-prebuild.log \
             --build-status "${BUILD_STATUS}" \
