@@ -3,6 +3,7 @@
 
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
+import functools
 import math
 import os
 from collections import namedtuple
@@ -1020,6 +1021,7 @@ def launch_gemm_a8w4_tdm(
             ticket, epoch = _ov.emit_ticket(OV, _tid, _work_lds)
             role = ticket % fx.Int32(OV.grid_ctas)
             parity = epoch % fx.Int32(2)
+            _t0 = _ov.emit_now()
             if role < fx.Int32(OV.dispatch_ctas):
                 if const_expr(_ov.PREFIX_OWNER):
                     # Reset, count and sort all belong to the planner, ahead of
@@ -1031,17 +1033,27 @@ def launch_gemm_a8w4_tdm(
                                 OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
                                 i32_ov_cur_tok,
                             )
+                        _ov.emit_tstamp(OV, _ov.TS_PLAN_COUNT, _t0, _tid, True)
+                        _sort = None
                         if const_expr(_OV_PHASES >= 3 and _ov.ROUTE_ORDER):
-                            _ov.emit_route_order(
+                            _sort = functools.partial(
+                                _ov.emit_route_order,
                                 OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
                                 i32_ov_cur_tok,
                             )
+                            if const_expr(not _ov.ORDER_IN_GATHER):
+                                _sort()
+                                _sort = None
+                                _ov.emit_tstamp(
+                                    OV, _ov.TS_PLAN_ORDER, _t0, _tid, True
+                                )
                         if const_expr(_OV_PHASES >= 2):
                             _ov.emit_plan(
                                 OV, arg_tile_row_base, arg_expert_ids,
                                 arg_tile_valid, arg_num_valid_rows,
-                                epoch, parity, _tid, _nthreads,
+                                epoch, parity, _tid, _nthreads, _t0, _sort,
                             )
+                        _ov.emit_tstamp(OV, _ov.TS_PLAN_OWNER, _t0, _tid, True)
                 else:
                     if const_expr(_OV_PHASES >= 1):
                         _ov.emit_zero_and_count(
@@ -1069,6 +1081,9 @@ def launch_gemm_a8w4_tdm(
                     # derives from the count matrix. Pushing before it is
                     # published sends every rank's rows to the same rows.
                     _ov.emit_wait_plan(OV, epoch, _tid, bid_x)
+                    _ov.emit_tstamp(
+                        OV, _ov.TS_PROD_WAIT, _t0, _tid, role == fx.Int32(1)
+                    )
                     if const_expr(_ov.PAYLOAD_PARTS & 1):
                         _ov.emit_rowmap(
                             OV, i64_ov_inp_idx, i64_ov_inp_wts, role, _tid,
@@ -1079,9 +1094,20 @@ def launch_gemm_a8w4_tdm(
                         role, _tid, _nthreads, i32_ov_cur_tok,
                         _ov.pay_rows(OV, block),
                     )
+                    _ov.emit_tstamp(
+                        OV, _ov.TS_PROD_END, _t0, _tid, role == fx.Int32(1)
+                    )
+                    _ov.emit_tstamp_max(OV, _ov.TS_PROD_LAST, _t0, _tid)
             else:
                 if const_expr(_OV_PHASES >= 2 and not _ov.NO_WAIT_PLAN):
                     _ov.emit_wait_plan(OV, epoch, _tid, bid_x)
+                _ov.emit_tstamp(
+                    OV,
+                    _ov.TS_CONS_WAIT,
+                    _t0,
+                    _tid,
+                    role == fx.Int32(OV.dispatch_ctas),
+                )
                 if const_expr(_ov.BULK_SYNC):
                     _ov.emit_wait_all_payload(OV, epoch, _tid)
 
@@ -1104,8 +1130,8 @@ def launch_gemm_a8w4_tdm(
                 )
                 valid_rows = fx.recast_iter(_nvr_ptr, arg_num_valid_rows)[0]
                 valid_m_tiles = valid_rows // tile_m
-                # A work item is one (M, N) tile, and one queue atomic hands out a
-                # contiguous PULL_CHUNK of them. Widening the item to a whole
+                # A work item is one (M, N) tile, and one queue atomic hands out
+                # a contiguous pull_chunk of them. Widening the item to a whole
                 # M-tile's N -- which is what let the M-keyed arrival gate be asked
                 # once per item -- tied the item count to the M-tile count and left
                 # a third of the resident grid idle in the last round. Gating the
@@ -1128,8 +1154,9 @@ def launch_gemm_a8w4_tdm(
                     if _has_work:
                         # The queue hands out whole chunks, so the last one of the
                         # layer runs off the end of the schedule.
-                        _wend = _wbase + fx.Int32(_ov.PULL_CHUNK)
+                        _wend = _wbase + fx.Int32(_ov.pull_chunk(OV))
                         _wend = (_wend < total_work).select(_wend, total_work)
+                        _tg = _ov.emit_now()
                         if const_expr(_OV_PHASES >= 4 and _ov.TILE_GATE):
                             # Wait for every M-tile the chunk covers before any A
                             # load of it, then take a single acquire for the lot.
@@ -1165,6 +1192,7 @@ def launch_gemm_a8w4_tdm(
                                 )
                                 scf.YieldOp([])
                             _ov.emit_tile_acquire(_tid)
+                        _ov.emit_tstamp_acc(OV, _ov.TS_GATE_SPIN, _tg, _tid)
                         _iloop = scf.ForOp(
                             arith.index_cast(T.index, _wbase),
                             arith.index_cast(T.index, _wend),
@@ -1184,6 +1212,14 @@ def launch_gemm_a8w4_tdm(
                             workgroup_barrier()
                             _run_tile(_m_tile, _wid - _m_tile * _n_tiles)
                             scf.YieldOp([])
+                _ov.emit_tstamp(
+                    OV,
+                    _ov.TS_CONS_END,
+                    _t0,
+                    _tid,
+                    role == fx.Int32(OV.dispatch_ctas),
+                )
+                _ov.emit_tstamp_max(OV, _ov.TS_POOL_LAST, _t0, _tid)
         elif const_expr(ep_persistent_gemm1):
             # Push-group fixed-slot: the static grid would be E*CAP/tile_m M-tiles,
             # almost all of them padding. num_valid_rows is the device-side count of

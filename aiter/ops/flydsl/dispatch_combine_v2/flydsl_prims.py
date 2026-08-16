@@ -77,6 +77,17 @@ def atomic_add_agent(addr_i64, val):
     ).res
 
 
+def atomic_max_agent(addr_i64, val):
+    """Device-scope signed fetch-and-max at addr_i64; returns old value."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.max,
+        _gptr(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="agent",
+    ).res
+
+
 def store_i32_system(addr_i64, offset, val):
     """System-release i32 store at addr + offset*4."""
     _llvm_d.StoreOp(
@@ -97,6 +108,29 @@ def store_i64_system(addr_i64, offset, val):
         ordering=_llvm_d.AtomicOrdering.release,
         syncscope="one-as",
     )
+
+
+#: ``sendmsg(MSG_RTN_GET_REALTIME)``. gfx11 dropped ``s_memtime`` and gfx12 also
+#: dropped ``s_memrealtime``, so the constant-rate counter is only reachable
+#: through the return-message path.
+_MSG_RTN_GET_REALTIME = 0x83
+
+
+def read_realtime():
+    """The constant-rate 64-bit counter, for in-kernel phase timing.
+
+    Constant-rate rather than shader-clock, so a measurement is not distorted by
+    the clock throttling that makes this box's ranks drift apart. It is a scalar
+    read, so call it from one lane with the surrounding work already waited on --
+    it orders against nothing by itself.
+    """
+    return _llvm_d.CallIntrinsicOp(
+        T.i64,
+        ir.StringAttr.get("llvm.amdgcn.s.sendmsg.rtn.i64"),
+        [arith.unwrap(fx.Int32(_MSG_RTN_GET_REALTIME))],
+        [],
+        ir.DenseI32ArrayAttr.get([]),
+    ).results[0]
 
 
 def _is_gfx12():

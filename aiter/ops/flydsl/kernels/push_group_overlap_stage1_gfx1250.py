@@ -51,6 +51,31 @@ Phase order, per rank, per layer:
      pulls GEMM1 tiles off the sharded work queue until it is empty, gating each
      M-tile on its arrival count
 
+What this does NOT currently buy, measured at bs=256 on 4 ranks, because it keeps
+being re-proposed: the fused kernel runs 311 us against 276 for the unfused trio
+(85 dispatch + 188 GEMM1 + 3 finalize), and the gap is structural rather than
+unfinished work. Phases 2 and 3 are serial with phase 4, not overlapped with it.
+The plan costs 39 us before any producer may push, the push then runs 40 to 106,
+and the first GEMM tile waits for nearly all of it (see :func:`_emit_pay_meta`),
+so phase 4 spans 106 to 307 of a 321 us kernel. Deleting the plan outright would
+recover about 19 us of that and no more.
+
+There is no headroom behind it either, which is what any redesign has to clear
+first. Fusion's one structural advantage was that the push saturates the fabric
+from far fewer CTAs than the unfused dispatch spends on it, but that advantage is
+spent: with no overlap to pay for CU efficiency the push is sized for wall time
+instead (see the producer count in grouped_moe_gfx1250), which takes it from 85
+us on 129 CTAs to 66 on 249 and the CU.us it costs from 11.0k up to 16.3k. Add
+GEMM1's 48.1k and the total is 64.5k, or 252 us across 256 CUs; with nothing in
+front of it but a local route count, and the ramp, that is 275 -- the unfused 276
+to within the run-to-run spread. A perfectly overlapped fusion would tie.
+
+Two things that look like they should help do not, and both were measured rather
+than reasoned about: publishing in stages from inside a CTA (:func:`_emit_payload`)
+and raising the grid multiplier so a stalled producer shares its CU with a
+consumer (330 us at 1 CTA/CU, 327 at 2, 334 at 3 -- the consumers have no ready
+tile to work on, so more of them resident changes nothing).
+
 Everything below is called from inside a ``@flyc.kernel`` body. FlyDSL only
 AST-rewrites the decorated function, so a plain helper module cannot use dynamic
 ``if``; ``ASTRewriter.transform`` at the bottom of this file opts these helpers
@@ -136,6 +161,18 @@ PREFIX_OWNER = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PREFIX_OWNER", "1
 #: Merge a payload run's arrival increments that share a tile into one atomic.
 #: 0 restores one atomic per row.
 PUB_COALESCE = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PUB_COALESCE", "1"))
+#: CPol carried by the payload stores. gfx12 encodes scope in bits 3:4, so 24 is
+#: SCOPE_SYS: the write leaves the local L2 instead of dirtying it. The payload is
+#: peer memory this rank never reads back, so caching it buys nothing and costs a
+#: write-back at the release. Pairs with PUB_FENCE=0 -- a store that is already
+#: system-visible on retirement needs a drain, not a cache flush.
+#: Default because the pair is worth 54 us of the dispatch half at bs=256: the
+#: release used to lower to a device-wide L2 write-back per producer CTA.
+PUB_SCOPE = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PUB_SCOPE", "24"))
+#: Scope of the release that closes the payload copies: 2 = system over all
+#: address spaces (lowers to global_wb), 1 = system one-as, 0 = drain only. 0 is
+#: only sound when PUB_SCOPE already took the stores out to system scope.
+PUB_FENCE = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PUB_FENCE", "0"))
 NO_WAIT_PLAN = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_NO_WAIT_PLAN", "0"))
 # Replicas of the plan_ready epoch, each on its own 128 B line. Every CTA in the
 # grid takes this wait at once, and on a superscribed grid a single flag makes
@@ -182,12 +219,36 @@ if WORK_SHARDS not in (1, 2, 4, 8) or WORK_SHARDS > _WORK_SHARDS_MAX:
 #: pull's own cost -- three workgroup barriers and an atomic, otherwise paid 9216
 #: times a layer at bs=256.
 #:
-#: Four. A chunk is also the granularity the queue balances at, so widening it
-#: trades the pull's cost against the tail a coarse chunk leaves. Measured on the
-#: full fused path at bs=256, us/call: 1 -> 920, 2 -> 884, 4 -> 869, 8 -> 895.
-PULL_CHUNK = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PULL_CHUNK", "4"))
-if PULL_CHUNK < 1:
-    raise ValueError(f"PULL_CHUNK must be >= 1, got {PULL_CHUNK}")
+#: A chunk is also the granularity the queue balances at, so widening it trades
+#: the pull's cost against the tail a coarse chunk leaves, and which way that
+#: goes depends on ``tile_m`` -- see :func:`pull_chunk`. Zero picks by shape.
+_PULL_CHUNK = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PULL_CHUNK", "0"))
+if _PULL_CHUNK < 0:
+    raise ValueError(f"PULL_CHUNK must be >= 0, got {_PULL_CHUNK}")
+
+
+def pull_chunk(C):
+    """Work items handed out per queue atomic, from the M-tile size.
+
+    The tail a coarse chunk leaves is what dominates: at bs=256 the schedule is
+    48 M-tiles by 24 N-tiles, 1152 items over a 256 CTA grid, so at four items a
+    pull there are barely more chunks than CTAs and the last round runs a handful
+    of CTAs against an idle machine. Measured GEMM-only with the gate off, 270 us
+    at four against 236 at one.
+
+    Pulling against that is the gate, asked once per chunk, so halving the chunk
+    doubles how often it is asked. Which side wins is set by how much work an
+    item is, and that is ``tile_m``: at 16 the gate's share is large enough that
+    four still wins, at 32 and above the tail does. On the full path, us/call at
+    four against two: bs=8 262/259, bs=128 500/513, bs=256 599/582, bs=512
+    794/770 -- the split falling exactly where tile_m goes from 16 to 32.
+
+    Four was measured back when bs=256 also ran tile_m=16 and was right for it;
+    what went stale is the M-tile heuristic moving underneath it, not the tuning.
+    """
+    if _PULL_CHUNK:
+        return _PULL_CHUNK
+    return 4 if C.tile_m <= 16 else 2
 # Do the dispatch CTAs join the GEMM1 work pool once their payload is out? They
 # are a small slice of the grid, but they are also the CTAs that are guaranteed
 # resident, so they are worth having.
@@ -212,6 +273,16 @@ PROD_JOIN = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PROD_JOIN", "1"))
 # inner, so every destination's low tiles fill first, and starting each source at
 # a different peer keeps the wire from incasting.
 ROUTE_ORDER = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_ROUTE_ORDER", "2"))
+#: Run the sort inside the count all-gather instead of in front of it. Only the
+#: histogram feeds it and only the payload pass reads it, so on the planner's
+#: timeline it belongs in the one stall that is pure fabric latency -- the wait
+#: for the peers' counts -- rather than ahead of the publish that starts that
+#: latency. Measured 4.5 us of the planner's 43.9 at bs=256, all of it recovered.
+#: Only meaningful under :data:`PREFIX_OWNER`; the spread version already ran the
+#: sort on producers, which are idle across the same window.
+ORDER_IN_GATHER = int(
+    os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_ORDER_IN_GATHER", "1")
+)
 # Rows a run may hold. Each one keeps six values live across the run's copies,
 # so this is a register budget shared with the GEMM the kernel also carries.
 _PAY_ROWS_MAX = 8
@@ -254,6 +325,86 @@ def pay_rows(C, block):
 # but widths from 4 to 32 all measure the same, so the scan is not what the
 # prefix is waiting on.
 _SCAN_CHUNK = 32
+
+
+#: In-kernel phase timing into the spare pg_ov_bar slots. Off by default: it costs
+#: a scalar counter read and one store per instrumented CTA per layer, which is
+#: nothing, but the slots it writes are the ones the debug builds share.
+TSTAMP = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_TSTAMP", "0"))
+#: Timing slots live in the gap between the last work-stealing head (WORK_SLOT +
+#: 7*WORK_STRIDE = 128) and the plan-ready replicas (PLAN_SLOT = 256). Not the
+#: low spare slots: 4..7 are the WAIT_MAX timeout report, and anything inside the
+#: work-head range would false-share a line with an atomic the whole grid hits.
+TS_BASE = 192
+TS_PLAN_OWNER = TS_BASE + 0  # planner: entry -> plan published
+TS_PROD_WAIT = TS_BASE + 1  # producer: entry -> plan seen
+TS_PROD_END = TS_BASE + 2  # producer: entry -> payload pushed
+TS_CONS_WAIT = TS_BASE + 3  # consumer: entry -> plan seen
+TS_CONS_END = TS_BASE + 4  # consumer: entry -> work pool drained
+TS_PLAN_COUNT = TS_BASE + 5  # planner: entry -> reset and route count done
+TS_PLAN_ORDER = TS_BASE + 6  # planner: entry -> routes sorted by destination
+TS_PLAN_PUB = TS_BASE + 7  # planner: entry -> own counts pushed to every peer
+TS_PLAN_GATHER = TS_BASE + 8  # planner: entry -> every peer's counts in hand
+#: Maxima over every CTA of a role, not one representative. The kernel ends when
+#: the LAST CTA does, and a single sample cannot see that: raising the grid
+#: multiplier moves the first consumer 32 us earlier while the kernel does not
+#: budge, which only makes sense once the tail is measured too.
+TS_PROD_LAST = TS_BASE + 9  # last producer to finish pushing
+TS_POOL_LAST = TS_BASE + 10  # last CTA of any role to drain the work pool
+#: Ticks summed over every gate poll by every CTA, so the average wait per CTA is
+#: this over the grid. A sum and not a sample: whether a tile is ready depends on
+#: which band it is in and which CTA drew it, and one CTA's history says nothing
+#: about the grid's.
+TS_GATE_SPIN = TS_BASE + 11
+
+
+def _tstamp_addr(C, slot):
+    return fx.Int64(C.ptr_bar) + fx.Int64(slot * 4)
+
+
+def emit_now():
+    """Read the constant-rate counter, or nothing when timing is compiled out."""
+    if const_expr(not TSTAMP):
+        return None
+    return P.read_realtime()
+
+
+def _emit_tstamp(C, slot, t0, tid, active):
+    """Record ``now - t0`` in ticks for one representative CTA per role.
+
+    A plain store, not an atomic max over the role's CTAs: the point is to split
+    one CTA's timeline into phases that sum to its own total, and a max over CTAs
+    would mix phases from different ones into a total no CTA ever saw. The last
+    layer of the run wins, which is the one worth reading anyway -- the first
+    still pays for cold weights.
+    """
+    if const_expr(not TSTAMP):
+        return
+    if active:
+        if tid == fx.Int32(0):
+            delta = fx.Int32(P.read_realtime() - t0)
+            P.store_i32_system(_tstamp_addr(C, slot), fx.Int32(0), delta)
+
+
+def _emit_tstamp_acc(C, slot, t0, tid):
+    """Add ``now - t0`` to a running total shared by the whole grid."""
+    if const_expr(not TSTAMP):
+        return
+    if tid == fx.Int32(0):
+        P.atomic_add_agent(_tstamp_addr(C, slot), fx.Int32(P.read_realtime() - t0))
+
+
+def _emit_tstamp_max(C, slot, t0, tid):
+    """Fold ``now - t0`` into a max over every CTA that reaches this point.
+
+    The planner zeroes these slots before it publishes the plan, so the value is
+    this launch's tail and not the worst layer of the run -- layer 0 pays for cold
+    weights and would otherwise win every max.
+    """
+    if const_expr(not TSTAMP):
+        return
+    if tid == fx.Int32(0):
+        P.atomic_max_agent(_tstamp_addr(C, slot), fx.Int32(P.read_realtime() - t0))
 
 
 def work_head_addr(C, shard):
@@ -868,7 +1019,8 @@ def _emit_route_order(C, addr_inp_idx, role, epoch, tid, nthreads, cur_tok):
 # Phase 2: count all-gather + plan (planner CTA only)
 # --------------------------------------------------------------------------- #
 def _emit_plan(
-    C, addr_trb, addr_eids, addr_tvd, addr_num_valid, epoch, parity, tid, nthreads
+    C, addr_trb, addr_eids, addr_tvd, addr_num_valid, epoch, parity, tid, nthreads,
+    t0=None, mid=None,
 ):
     """Publish this rank's histogram to every peer, wait for theirs, then plan.
 
@@ -878,6 +1030,11 @@ def _emit_plan(
     Sending only the owned slice would force the destination to prefix-sum and
     send bases back -- a second hop, and on gfx1250 a cross-device handshake costs
     more than the payload it is guarding.
+
+    ``mid`` runs after this rank's counts are on the wire and before the wait for
+    everyone else's -- local work that depends on the histogram but not on the
+    peers, hidden inside a stall that is pure fabric latency. The release in front
+    of plan_ready covers whatever it writes.
     """
     window = cco.Window(fx.Int64(C.arena_handle))
     rs_hist = _rsrc(C.ptr_hist)
@@ -887,6 +1044,14 @@ def _emit_plan(
     # the previous launch's pulls are behind the stream's kernel boundary.
     if tid < fx.Int32(WORK_SHARDS):
         P.store_i32_system(work_head_addr(C, tid), fx.Int32(0), fx.Int32(0))
+    if const_expr(TSTAMP):
+        # Same window, same reason: nobody folds into these until they have seen
+        # the plan this CTA is about to publish, so the release in front of it
+        # orders the reset and these can be plain stores.
+        if tid == fx.Int32(0):
+            buffer_store(fx.Int32(0), _rsrc(C.ptr_bar), fx.Int32(TS_PROD_LAST))
+            buffer_store(fx.Int32(0), _rsrc(C.ptr_bar), fx.Int32(TS_POOL_LAST))
+            buffer_store(fx.Int32(0), _rsrc(C.ptr_bar), fx.Int32(TS_GATE_SPIN))
 
     if const_expr(_PROBE):
         # Four writes that differ in one axis each (local/peer, buffer/raw), so a
@@ -936,7 +1101,12 @@ def _emit_plan(
                 buffer_store(_c0 + fx.Int32(5000), _rsrc(C.ptr_count), 9)
     P.waitcnt_stores()
     workgroup_barrier()
+    # System scope, and it costs nothing to leave it there: taking the counts out
+    # at SCOPE_SYS so this could drop to an agent release measured neutral. The
+    # payload's identical change was worth 54 us only because 129 CTAs were each
+    # paying for a write-back; one CTA paying twice is under a microsecond.
     P.fence_system_release()
+    _emit_tstamp(C, TS_PLAN_PUB, t0, tid, True)
     if const_expr(_PLAN_PARTS & 2):
       if tid < fx.Int32(C.npes):
         # Rotate the peer order by rank so all ranks do not hammer rank 0 first.
@@ -944,6 +1114,10 @@ def _emit_plan(
         done = fx.Int64(window.lsa_ptr(peer, C.off_count_done))
         P.atomic_add_global(done + fx.Int64(C.rank) * fx.Int64(4), fx.Int32(1))
     workgroup_barrier()
+
+    if mid is not None:
+        mid()
+    _emit_tstamp(C, TS_PLAN_ORDER, t0, tid, True)
 
     # Wait for every source's counts, then make them visible to this CTA.
     if const_expr(_PLAN_PARTS & 2):
@@ -953,6 +1127,7 @@ def _emit_plan(
         )
     workgroup_barrier()
     P.fence_system_acquire()
+    _emit_tstamp(C, TS_PLAN_GATHER, t0, tid, True)
 
     rs_count = _rsrc(C.ptr_count)
     parity_base = parity * fx.Int32(C.npes * C.e_total)
@@ -1019,6 +1194,10 @@ def _emit_plan(
     # elements, not a walk over every (expert, tile) slot. The walk was a chain
     # of dependent global loads on one thread and cost ~640 us/layer at
     # epr=96, more than the GEMM it was scheduling.
+    # One thread, and it does not matter: the loop is constexpr-unrolled over
+    # constant LDS addresses, so all epr loads issue together and the only serial
+    # part is the add chain. Scanning it across the CTA in log2(epr) barriered
+    # rounds instead measured the compact phase unchanged at 10.4 us.
     if tid == fx.Int32(0):
         acc = fx.Int32(0)
         for le in range_constexpr(C.epr if _PLAN_PARTS & 16 else 0):
@@ -1077,6 +1256,22 @@ def _emit_rowmap(C, addr_inp_idx, addr_inp_wts, role, tid, nthreads, cur_tok):
     push only one lane per row would have an entry to store -- at most
     _PAY_ROWS_MAX of a warp's 32 -- and that measured 169 us against 160 for the
     dispatch half.
+
+    Both stores go through a buffer descriptor keyed on a lane-varying
+    ``dest_pe``, so the compiler cannot keep it in SGPRs and wraps each in a
+    readfirstlane waterfall that reruns once per distinct peer in the wave, a
+    full ``s_wait_loadcnt`` inside the serialized loop. Measured on its own that
+    is the whole of this pass: 62 us of the dispatch half against 0.4 us with the
+    peer forced to a constant. Two ways out both measure a wash end to end,
+    because what the waterfall costs is latency and this pass only ever runs
+    alongside another CTA's payload push, which absorbs it -- against the payload
+    the pass is worth 11 us, not 62.
+
+      * A constant-peer loop hoisted outside this one: 22 us alone, but it
+        rescans the routes once per peer, and with the payload that is 152 us
+        against 121. Latency the push hides; the rescan's bandwidth it does not.
+      * Pointer-addressed stores, which take no descriptor and so no waterfall:
+        51 us alone, 401 us end to end against 402.
     """
     if role > fx.Int32(0):
         window = cco.Window(fx.Int64(C.arena_handle))
@@ -1140,8 +1335,16 @@ def _emit_pay_meta(C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit,
     for i in range_constexpr(n_pay_rows):
         pos = run_base + fx.Int32(i)
         # Expert-sorted, so a run is usually one expert's contiguous rows on
-        # one peer, and the early tiles complete while the later experts are
-        # still being pushed.
+        # one peer, which is the shape the fabric wants.
+        #
+        # It does NOT make the destination's early tiles complete early, which
+        # is what the ordering looks like it should buy. Every warp owns one run
+        # and they all push at once through a fabric that is already saturated,
+        # so they progress at the same rate and finish together: instrumenting
+        # the first and last per-expert completion put them three quarters of
+        # the way into the push and at its very end, with nothing at all ready
+        # before that. Any consumer gate, however fine-grained, waits that long,
+        # which is why the arrival counters below buy no overlap.
         work_idx = (
             buffer_load(rs_order, pos, vec_width=1, dtype=T.i32)
             if const_expr(ROUTE_ORDER)
@@ -1235,8 +1438,71 @@ def _emit_payload(
 
     run_stride = global_warps * fx.Int32(n_pay_rows)
     run_start = global_warp * fx.Int32(n_pay_rows)
-    # Pass 1: the copies, with nothing ordering them.
-    for run_base in range(run_start, work_limit, run_stride):
+    _pay_copies(
+        C, window, addr_inp_tok, addr_inp_scales, rs_order, rs_idx, rs_base,
+        rs_slot, lane, run_start, work_limit, run_stride, work_limit, n_pay_rows,
+    )
+    # One drain and one release for everything this CTA pushed. They must cover
+    # payload, scale, rowmap and tis, and the release is what the whole two-pass
+    # split exists to amortize: it is a system-scope fence, and its cost is scope,
+    # not extent, so covering a CTA's entire push costs what covering one run did.
+    # The barrier below it is what makes it a CTA-wide guarantee -- every warp has
+    # drained before the one thread that fences runs.
+    #
+    # Per CTA and not once for the whole dispatch set, even though the release
+    # lowers to ``global_wb``, a device-wide L2 write-back that one CTA could take
+    # on everyone's behalf once they had all drained. These write-backs do
+    # serialize in the cache controller and they are not cheap -- deleting them
+    # takes the dispatch half from 162 us to 125 at 129 producers and 151 to 104
+    # at 224 -- but the CTA barrier needed to make one of them sound costs more
+    # than they do: the same measurement with the release hoisted onto a barrier
+    # runs 201 us at 129 producers and 230 at 224. Arrival there is an atomic on
+    # one line, so the barrier gets worse exactly as the producer count grows,
+    # which is the direction that would have made hoisting worth it.
+    #
+    # Splitting this into several publishes so the low tiles could open while the
+    # high ones were still in flight cannot work from inside a CTA, and not just
+    # because it measured flat: pay_rows is chosen to give each warp exactly one
+    # run, so a CTA's push is a single round and there is no seam in it to cut.
+    # The tiles all open at once for a different reason anyway -- the producers
+    # are symmetric and share a saturated fabric, so they all finish together, and
+    # a per-CTA schedule cannot stagger that. Only a grid-wide one could.
+    P.waitcnt_stores()
+    workgroup_barrier()
+    if tid == fx.Int32(0):
+        # A system release over all address spaces. The narrower one-as scope
+        # measured identical, and drain-only is wrong for stores left at default
+        # scope -- it is only sound once PUB_SCOPE has taken them to SCOPE_SYS,
+        # which is what makes them visible on retirement rather than at a flush.
+        if const_expr(PUB_FENCE >= 2):
+            P.fence_release_all()
+        elif const_expr(PUB_FENCE == 1):
+            P.fence_system_release()
+    workgroup_barrier()
+    if const_expr(_PARTS & 8):
+        _pay_arrivals(
+            C, window, rs_order, rs_idx, rs_base, rs_slot, lane,
+            run_start, work_limit, run_stride, work_limit, n_pay_rows,
+        )
+
+    if const_expr(_BULK_SYNC):
+        # Debug: collapse the pipeline to "dispatch, then GEMM1" so a wrong
+        # result can be blamed on the payload rather than on the tile gating.
+        P.waitcnt_stores()
+        workgroup_barrier()
+        if tid == fx.Int32(0):
+            P.fence_system_release()
+            P.atomic_add_global(
+                fx.Int64(C.ptr_bar) + fx.Int64(_SYNC_SLOT * 4), fx.Int32(1)
+            )
+
+
+def _emit_pay_copies(
+    C, window, addr_inp_tok, addr_inp_scales, rs_order, rs_idx, rs_base, rs_slot,
+    lane, run_first, run_end, run_stride, work_limit, n_pay_rows,
+):
+    """Pass 1 of one stage: the copies, with nothing ordering them."""
+    for run_base in range(run_first, run_end, run_stride):
         src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows = _pay_meta(
             C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit, n_pay_rows
         )
@@ -1289,7 +1555,10 @@ def _emit_payload(
                             else sc
                         )
                         buffer_store(
-                            elem, rs_peer_sc, dst_off + fx.Int32(j * C.wmma_rep)
+                            elem,
+                            rs_peer_sc,
+                            dst_off + fx.Int32(j * C.wmma_rep),
+                            cache_modifier=PUB_SCOPE,
                         )
 
             # fp8 token payload: each lane owns 16 B, _NSTREAMS vec4 streams in
@@ -1312,41 +1581,36 @@ def _emit_payload(
                          for k in range_constexpr(_NSTREAMS)
                      ]
                      for k in range_constexpr(_NSTREAMS):
-                         buffer_store(vecs[k], rs_dst, chunk + k * _LANE_STRIDE_I32)
+                         buffer_store(
+                             vecs[k],
+                             rs_dst,
+                             chunk + k * _LANE_STRIDE_I32,
+                             cache_modifier=PUB_SCOPE,
+                         )
              if const_expr(safe_end < C.n_i32):
                  end_tail = arith.select(live, fx.Int32(C.n_i32), lane_i32_off)
                  for chunk in range(
                      lane_i32_off + fx.Int32(safe_end), end_tail, _LANE_STRIDE_I32
                  ):
                      v = buffer_load(rs_src, chunk, vec_width=4, dtype=T.i32)
-                     buffer_store(v, rs_dst, chunk)
+                     buffer_store(v, rs_dst, chunk, cache_modifier=PUB_SCOPE)
              elif const_expr(C.n_i32 < _MAIN_STRIDE_I32):
                  end_small = arith.select(live, fx.Int32(C.n_i32), lane_i32_off)
                  for chunk in range(lane_i32_off, end_small, _LANE_STRIDE_I32):
                      v = buffer_load(rs_src, chunk, vec_width=4, dtype=T.i32)
-                     buffer_store(v, rs_dst, chunk)
+                     buffer_store(v, rs_dst, chunk, cache_modifier=PUB_SCOPE)
 
-    # One drain and one release for everything this CTA pushed. They must cover
-    # payload, scale, rowmap and tis, and the release is what the whole two-pass
-    # split exists to amortize: it is a system-scope fence, and its cost is scope,
-    # not extent, so covering a CTA's entire push costs what covering one run did.
-    # The barrier below it is what makes it a CTA-wide guarantee -- every warp has
-    # drained before the one thread that fences runs.
-    P.waitcnt_stores()
-    workgroup_barrier()
-    if tid == fx.Int32(0):
-        # A system release over all address spaces. The narrower one-as scope
-        # measured identical and drain-only alone is wrong, so this keeps the safe
-        # end of a choice that costs nothing here.
-        P.fence_release_all()
-    workgroup_barrier()
 
-    # Pass 2: the arrivals, now that every row they announce is visible. The
-    # counter is additive, so the consumer's "tile is complete" test is
-    # arrived == planned rather than a boolean flag that could be set while a
-    # sibling row is still in flight.
-    if const_expr(_PARTS & 8):
-      for run_base in range(run_start, work_limit, run_stride):
+def _emit_pay_arrivals(
+    C, window, rs_order, rs_idx, rs_base, rs_slot, lane, run_first, run_end,
+    run_stride, work_limit, n_pay_rows,
+):
+    """Pass 2 of one stage: the arrivals, now that every row they announce is
+    visible. The counter is additive, so the consumer's "tile is complete" test is
+    arrived == planned rather than a boolean flag that could be set while a
+    sibling row is still in flight -- which is also what lets a stage publish on
+    its own, with no agreement between producers about where a stage ends."""
+    for run_base in range(run_first, run_end, run_stride):
         _, dest_pes, local_exps, rows_in_exp, lives, _ = _pay_meta(
             C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit, n_pay_rows
         )
@@ -1393,16 +1657,6 @@ def _emit_payload(
                         window.lsa_ptr(dests[i], C.off_tile_arrived)
                     ) + fx.Int64(keys[i]) * fx.Int64(4)
                     P.atomic_add_global(peer_arr, group)
-    if const_expr(_BULK_SYNC):
-        # Debug: collapse the pipeline to "dispatch, then GEMM1" so a wrong
-        # result can be blamed on the payload rather than on the tile gating.
-        P.waitcnt_stores()
-        workgroup_barrier()
-        if tid == fx.Int32(0):
-            P.fence_system_release()
-            P.atomic_add_global(
-                fx.Int64(C.ptr_bar) + fx.Int64(_SYNC_SLOT * 4), fx.Int32(1)
-            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1438,7 +1692,7 @@ def _emit_wait_all_payload(C, epoch, tid):
 def _emit_take_work(C, shard, tid, lds_idx):
     """Pull this CTA's next run of GEMM1 work items and broadcast its base.
 
-    One atomic hands out :data:`PULL_CHUNK` *contiguous* ids, and the caller
+    One atomic hands out :func:`pull_chunk` *contiguous* ids, and the caller
     walks them; the id space is M-major, so a run usually lies inside one M-tile
     and the caller's cached arrival gate opens once for all of it.
 
@@ -1467,7 +1721,7 @@ def _emit_take_work(C, shard, tid, lds_idx):
         lds_store(
             lds_idx,
             arith.index(0),
-            Vec.from_elements([chunk * fx.Int32(PULL_CHUNK)], fx.Int32),
+            Vec.from_elements([chunk * fx.Int32(pull_chunk(C))], fx.Int32),
         )
     workgroup_barrier()
     work = lds_load(lds_idx, arith.index(0))[0]
@@ -1542,6 +1796,9 @@ def _emit_spin_tile(C, row_base, tid):
             )
 
 
+emit_tstamp = ASTRewriter.transform(_emit_tstamp)
+emit_tstamp_max = ASTRewriter.transform(_emit_tstamp_max)
+emit_tstamp_acc = ASTRewriter.transform(_emit_tstamp_acc)
 emit_ticket = ASTRewriter.transform(_emit_ticket)
 emit_zero_and_count = ASTRewriter.transform(_emit_zero_and_count)
 _prefix_owner = ASTRewriter.transform(_emit_prefix_owner)
@@ -1550,6 +1807,8 @@ emit_route_order = ASTRewriter.transform(_emit_route_order)
 emit_plan = ASTRewriter.transform(_emit_plan)
 emit_rowmap = ASTRewriter.transform(_emit_rowmap)
 _pay_meta = ASTRewriter.transform(_emit_pay_meta)
+_pay_copies = ASTRewriter.transform(_emit_pay_copies)
+_pay_arrivals = ASTRewriter.transform(_emit_pay_arrivals)
 emit_payload = ASTRewriter.transform(_emit_payload)
 emit_wait_plan = ASTRewriter.transform(_emit_wait_plan)
 emit_wait_all_payload = ASTRewriter.transform(_emit_wait_all_payload)

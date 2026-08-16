@@ -287,6 +287,21 @@ def _push_tiles(tok_per_rank, topk, experts_per_rank):
     rows per expert so it holds across EP width and topk. M must stay a multiple
     of 16 and divide cap, which is why 128 is not offered (it fails at bs=8).
 
+    The 16-row tier turned out to run one step too far. At exactly 16 live rows
+    per expert (EP4 bs=256) a 32-wide tile wins on both paths -- fused stage-1
+    428 -> 404 us/call and the layer 644 -> 601, unfused GEMM1 220 -> 184 and the
+    layer 523 -> 504 -- while 8 rows per expert (bs=128) still prefers 16, at
+    330 against 349. So the tiers track the live rows rather than jumping from
+    16 straight to 64.
+
+    ``m_warp``/``n_warp`` shape GEMM1 alone, since that is the launch the fused
+    dispatch lives in and its block size is how many threads the push gets. More
+    of them does not pay: at tile_m=32 the fused stage-1 runs 586 us/call at 2
+    warps and 403 at 4. 8 warps needs tile_n=512 to come with it, because
+    ``tile_n/n_warp`` must stay 64 -- the preshuffled B layout is built for that
+    warp tile and a 32-wide one returns nan on both paths -- and paying for the
+    wider N gives 433, worse than the 4-warp 403.
+
     The K tiles and buffer counts went the other way from what the push path
     originally inherited: GEMM1 wants the widest K it can hold plus a third
     buffer (k512/b3 is 3-13% per layer better than k256/b2 at every size, and
@@ -297,10 +312,12 @@ def _push_tiles(tok_per_rank, topk, experts_per_rank):
     """
     rows_per_expert = tok_per_rank * topk / max(experts_per_rank, 1)
     tiles = dict(
-        tile_m=64 if rows_per_expert >= 32 else 16,
+        tile_m=64 if rows_per_expert >= 32 else (32 if rows_per_expert >= 16 else 16),
         tile_n=256,
         tile_k=512,
         num_buffers=3,
+        m_warp=1,
+        n_warp=4,
         tile_k2=256,
         num_buffers2=2,
     )
@@ -821,6 +838,85 @@ def _event_device_us(e):
     return 0.0
 
 
+def _dump_stage1_phases(pipe):
+    """Decode the in-kernel phase counters the fused stage-1 leaves in pg_ov_bar.
+
+    Each span is measured by one representative CTA of its role against its own
+    entry, so cons_total is the consumer's whole residency and the rest are cuts
+    of it. It lands a little under the profiler's stage-1 time, which also counts
+    launch and drain that no CTA is resident for.
+    """
+    if not os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_TSTAMP"):
+        return
+    try:
+        from aiter.ops.flydsl.kernels import push_group_overlap_stage1_gfx1250 as _ov
+
+        d = pipe.op.push_group_overlap_debug()
+    except Exception as _e:
+        print(f"# stage1-phases unavailable: {_e}", flush=True)
+        return
+    if d is None:
+        return
+    torch.cuda.synchronize()
+    bar = d["bar"]
+    t = {n: int(bar[s]) for n, s in (
+        ("plan_owner", _ov.TS_PLAN_OWNER),
+        ("prod_wait", _ov.TS_PROD_WAIT),
+        ("prod_end", _ov.TS_PROD_END),
+        ("cons_wait", _ov.TS_CONS_WAIT),
+        ("cons_end", _ov.TS_CONS_END),
+        ("plan_count", _ov.TS_PLAN_COUNT),
+        ("plan_order", _ov.TS_PLAN_ORDER),
+        ("plan_pub", _ov.TS_PLAN_PUB),
+        ("plan_gather", _ov.TS_PLAN_GATHER),
+        ("prod_last", _ov.TS_PROD_LAST),
+        ("pool_last", _ov.TS_POOL_LAST),
+        ("gate_spin", _ov.TS_GATE_SPIN),
+    )}
+    if t["cons_end"] <= 0:
+        print(f"# stage1-phases: no samples (raw={t})", flush=True)
+        return
+    # The counter is the 100 MHz constant-rate one, so a tick is 10 ns. Do not
+    # scale by the per_layer wall: that covers GEMM2 and the combine as well, and
+    # these spans are all inside stage-1.
+    us = 0.01
+    print(
+        "# stage1-phases (us) planner_plan={:.1f} prod_planwait={:.1f} "
+        "prod_push={:.1f} cons_planwait={:.1f} cons_gemm={:.1f} "
+        "cons_total={:.1f}".format(
+            us * t["plan_owner"],
+            us * t["prod_wait"],
+            us * (t["prod_end"] - t["prod_wait"]),
+            us * t["cons_wait"],
+            us * (t["cons_end"] - t["cons_wait"]),
+            us * t["cons_end"],
+        ),
+        flush=True,
+    )
+    # Planner cuts along its own timeline; they sum to planner_plan. The sort sits
+    # between the publish and the gather under ORDER_IN_GATHER (the default), so
+    # its span is what the peers' counts did not already cover.
+    marks = ["plan_count", "plan_pub", "plan_order", "plan_gather", "plan_owner"]
+    names = ["count", "publish", "order", "gather", "compact"]
+    prev, cuts = 0, []
+    for m, n in zip(marks, names):
+        cuts.append("{}={:.1f}".format(n, us * (t[m] - prev)))
+        prev = t[m]
+    print(
+        "# stage1-planner (us) {}".format(" ".join(cuts)),
+        flush=True,
+    )
+    # Maxima over every CTA of the role. pool_last is the whole grid's tail, so
+    # the kernel's profiler time minus it is launch plus drain.
+    print(
+        "# stage1-tail (us) prod_last={:.1f} pool_last={:.1f} gate_spin_total={:.1f}"
+        "  [raw ticks {}]".format(
+            us * t["prod_last"], us * t["pool_last"], us * t["gate_spin"], t
+        ),
+        flush=True,
+    )
+
+
 def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     """Aggregate the torch.profiler per-kernel table ACROSS ranks (collective;
     call on every rank). Each rank contributes {name: (self_device_us_total,
@@ -978,6 +1074,7 @@ def main():
         )
         if tbl is not None:
             print(tbl, flush=True)
+        _dump_stage1_phases(pipe)
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
     if args.acc_verify:

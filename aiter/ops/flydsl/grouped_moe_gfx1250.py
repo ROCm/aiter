@@ -878,18 +878,25 @@ def _build_overlap_consts(overlap, ov_inputs, *, tile_m, model_dim, persistent_w
     # pays the ticket handshake and the plan wait, and past ~1 CTA per CU that
     # cost outgrows the extra latency hiding (measured 191 us/layer at 256 CTAs
     # vs 213 at 512 and 253 at 1024 on the 64-token config).
-    # Producers, sized by the bytes they have to push. The push wants as many as
-    # it can get -- at 8 MB it costs 246 us/layer on 32 producers and 59 on 128 --
-    # but every producer also joins three grid-wide barriers per layer, and on a
-    # small push that fixed cost is what dominates. 64 KB per producer put both
-    # measured shapes on their optimum (8 MB -> 128, 0.5 MB -> the floor), which
-    # is two points, so the clamps are deliberately narrow.
-    push_bytes = (
-        overlap["max_tok_per_rank"] * overlap["experts_per_token"] * model_dim
+    # Every CTA the grid can hold without growing past one per CU is a producer.
+    # Holding back a reserve of consumers to overlap the push against does not
+    # work: the tile gate does not open until the push is nearly over (see the
+    # module docstring of push_group_overlap_stage1_gfx1250), so a CTA kept out
+    # of the push does not compute either, it just waits. At 512 tokens that
+    # reserve cost 78 us/layer of stage 1 -- 477 us at 129 producers against 400
+    # at 255 -- and 23 us at 256 tokens. At 128 tokens and below the count stops
+    # mattering: every value from 33 to 249 lands inside the noise.
+    #
+    # Taking the maximum, rather than sizing to the bytes, is also what keeps the
+    # push to a single round. pay_rows floors at 2, so the routes a round covers
+    # is 2*4*producers, and a producer count that lands just under the route
+    # count leaves a second round with almost every warp idle -- 169 producers,
+    # which is what a bytes-proportional rule asked for at 256 tokens, measures
+    # WORSE than either 129 or 249 for exactly that reason.
+    dispatch_ctas = (
+        int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_DISPATCH_CTAS", 0))
+        or get_cu_num() - PG_OV_WORK_SHARDS + 1
     )
-    dispatch_ctas = int(
-        os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_DISPATCH_CTAS", 0)
-    ) or min(128, max(32, push_bytes // (64 << 10))) + 1
     grid_mult = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_GRID_MULT", 1))
     # The floor keeps the work queue fed: one CTA per shard, plus the dispatch
     # roles that never pull until their payload is out. Sizing it to
@@ -940,6 +947,10 @@ def grouped_a8w4_tdm_moe_push_scatter(
     E_local, model_dim, inter_dim, cap, activation, swiglu_limit=None,
     situ_beta=1.0, situ_linear_beta=1.0,
     tile_m=64, tile_n=256, tile_k=256, num_buffers=3,
+    # GEMM1 only. It is the launch the dispatch fuses into, so its warp shape --
+    # and hence its block size -- is what decides how many threads the P2P push
+    # gets, which GEMM2 has no stake in.
+    m_warp=1, n_warp=4,
     tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
     dtype=None, bias1=None, bias2=None, disp_scale=None,
     ep_arena_handle, ep_comb_inp_off, ep_wire_nbytes, ep_slot_stride, ep_world,
@@ -1127,6 +1138,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
             a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32,
             psum_dummy, n_experts=E, contiguous_m=cm, N=two_inter, K=model_dim,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            m_warp=m_warp, n_warp=n_warp,
             out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=stage1_act, bias=_b1,
             swiglu_limit=sl, num_buffers=num_buffers,
             stage1_quant_out=1, quant_scale=a2_scale, quant_wmma_rep=wmma_rep2,
@@ -1141,6 +1153,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
             y, a1_payload, w1_u8, a1_scale, w1s_i32, psum_dummy,
             n_experts=E, contiguous_m=cm, N=two_inter, K=model_dim,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            m_warp=m_warp, n_warp=n_warp,
             out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=stage1_act, bias=_b1,
             swiglu_limit=sl, num_buffers=num_buffers,
             push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
