@@ -41,6 +41,12 @@ from .quant_utils import (
 # gather/scatter wrappers land upstream, import them from
 # flydsl.expr.rocdl.tdm_ops instead and delete tdm_gather_shim.py.
 from .tdm_gather_shim import make_tensor_gather_descriptor, tensor_store_gather
+from . import push_group_overlap_stage1_gfx1250 as _ov
+
+# Debug bisect for the fused stage-1: 1 count-only, 2 +plan, 3 +payload, 4 full
+# (the consumer gate). Anything below 4 computes garbage -- it exists to isolate
+# which phase a fault or hang comes from, not to produce results.
+_OV_PHASES = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_PHASES", "4"))
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
@@ -103,6 +109,17 @@ def launch_gemm_a8w4_tdm(
     ep_persistent_gemm1: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 1,
     arg_num_valid_rows: fx.Pointer = None,
+    # Fused stage-1: run the push-group dispatch INSIDE this kernel so its P2P
+    # payload transfer overlaps the GEMM1 compute of already-arrived M-tiles.
+    # ``ep_overlap`` is an OverlapConsts (compile-time geometry + arena offsets)
+    # or None; see push_group_overlap_stage1_gfx1250.py for the phase order.
+    # Requires ep_persistent_gemm1 (the tile schedule is device-side only).
+    ep_overlap: Constexpr[tuple] = (),
+    i64_ov_inp_tok: fx.Int64 = 0,
+    i64_ov_inp_idx: fx.Int64 = 0,
+    i64_ov_inp_wts: fx.Int64 = 0,
+    i64_ov_inp_scales: fx.Int64 = 0,
+    i32_ov_cur_tok: fx.Int32 = 0,
 ):
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
@@ -110,9 +127,19 @@ def launch_gemm_a8w4_tdm(
         stage1_quant_out, quant_wmma_rep,
         ep_p2p_write, ep_off_comb_inp, ep_wire_nbytes, ep_slot_stride,
         ep_arena_handle, ep_world,
-        push_group, ep_persistent_gemm1, persistent_workers,
+        push_group, ep_persistent_gemm1, persistent_workers, ep_overlap,
     )
     _ = cache_tag
+    OV = None
+    if ep_overlap:
+        from .push_group_overlap_stage1_gfx1250 import OverlapConsts
+
+        OV = OverlapConsts.from_tuple(ep_overlap)
+        if not (push_group and ep_persistent_gemm1):
+            raise ValueError(
+                "the fused stage-1 needs push_group + ep_persistent_gemm1: the "
+                "tile schedule it builds only exists on the device"
+            )
     if ep_p2p_write:
         # The fused P2P scatter epilogue scatters each (route-weighted) output row
         # into peers' symmetric comb_inp via a TDM gather-store; it replaces the
@@ -171,6 +198,15 @@ def launch_gemm_a8w4_tdm(
         (tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128
     ) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
+    if OV is not None:
+        # The stage-1 phases run their scans in the tile arena, before this CTA
+        # touches a tile.
+        _ov_lds = _ov.lds_scratch_bytes(OV)
+        if _ov_lds > ARENA_B:
+            raise ValueError(
+                f"overlap stage-1 needs {_ov_lds} B of LDS scratch but the tile "
+                f"arena is only {ARENA_B} B (e_total={OV.e_total}, epr={OV.epr})"
+            )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -184,11 +220,14 @@ def launch_gemm_a8w4_tdm(
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _persist = f"_persist{persistent_workers}" if ep_persistent_gemm1 else ""
+    # Not named _ov: that is the overlap module alias the kernel body calls into.
+    _ovtag = f"_ovstage1_d{OV.dispatch_ctas}" if OV is not None else ""
+    _ov_nruns = _ov.work_runs(OV) if OV is not None else 1
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_persist}"
+        f"{_grouped}{_act}{_bias}{_qout}{_persist}{_ovtag}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -206,8 +245,13 @@ def launch_gemm_a8w4_tdm(
         arg_expert_ids: fx.Pointer,
         arg_tile_valid: fx.Pointer,
         arg_num_valid_rows: fx.Pointer,
+        i64_ov_inp_tok: fx.Int64,
+        i64_ov_inp_idx: fx.Int64,
+        i64_ov_inp_wts: fx.Int64,
+        i64_ov_inp_scales: fx.Int64,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_ov_cur_tok: fx.Int32,
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
@@ -228,21 +272,23 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
-        def _run_tile(work_id, total_m_tiles):
-            bid_x = work_id
-            # DeepGEMM contiguous-M swizzle
+        def _swizzle_mn(work_id, total_m_tiles):
+            """DeepGEMM contiguous-M swizzle: work item -> (M tile, N tile)."""
             TILES_PER_GROUP = 16
             total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
             # total_m_tiles is provided by the fixed or persistent scheduler.
             blocks_per_group = total_n_tiles * TILES_PER_GROUP
-            group = bid_x // blocks_per_group
+            group = work_id // blocks_per_group
             group_first_tile = group * TILES_PER_GROUP
-            in_group = bid_x - group * blocks_per_group
+            in_group = work_id - group * blocks_per_group
             rem_tiles = total_m_tiles - group_first_tile
             group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
             m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+            return m_tile, in_group // group_tiles
+
+        def _run_tile(m_tile, n_tile):
             blk_m = m_tile * tile_m
-            blk_n = (in_group // group_tiles) * tile_n
+            blk_n = n_tile * tile_n
             i32_ptr = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
             tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
             if const_expr(push_group):
@@ -958,7 +1004,167 @@ def launch_gemm_a8w4_tdm(
                     fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
                     tdm_ops.tensor_wait(0)
 
-        if const_expr(ep_persistent_gemm1):
+        if const_expr(OV is not None):
+            # Fused stage-1. One atomic per CTA hands out both a role and a launch
+            # generation, so the roles land on CTAs that are actually resident and
+            # the epoch advances on its own under graph replay.
+            _tid = tid
+            _nthreads = fx.Int32(block)
+            # The queue hands out one item at a time, so the scratch it is
+            # broadcast through can be the tile arena itself: emit_take_work
+            # barriers on both sides of the slot, and so does emit_ticket.
+            _work_lds = fx.index_cast(T.index, fx.ptrtoint(fx.get_dyn_shared()))
+            ticket, epoch = _ov.emit_ticket(OV, _tid, _work_lds)
+            role = ticket % fx.Int32(OV.grid_ctas)
+            parity = epoch % fx.Int32(2)
+            if role < fx.Int32(OV.dispatch_ctas):
+                if const_expr(_ov.PREFIX_OWNER):
+                    # Reset, count and sort all belong to the planner, ahead of
+                    # its own plan. Producers skip straight to the plan wait,
+                    # which is now the only thing they wait on before pushing.
+                    if role == fx.Int32(0):
+                        if const_expr(_OV_PHASES >= 1):
+                            _ov.emit_zero_and_count(
+                                OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
+                                i32_ov_cur_tok,
+                            )
+                        if const_expr(_OV_PHASES >= 3 and _ov.ROUTE_ORDER):
+                            _ov.emit_route_order(
+                                OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
+                                i32_ov_cur_tok,
+                            )
+                        if const_expr(_OV_PHASES >= 2):
+                            _ov.emit_plan(
+                                OV, arg_tile_row_base, arg_expert_ids,
+                                arg_tile_valid, arg_num_valid_rows,
+                                epoch, parity, _tid, _nthreads,
+                            )
+                else:
+                    if const_expr(_OV_PHASES >= 1):
+                        _ov.emit_zero_and_count(
+                            OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
+                            i32_ov_cur_tok,
+                        )
+                    if const_expr(_OV_PHASES >= 2):
+                        if role == fx.Int32(0):
+                            _ov.emit_plan(
+                                OV, arg_tile_row_base, arg_expert_ids,
+                                arg_tile_valid, arg_num_valid_rows,
+                                epoch, parity, _tid, _nthreads,
+                            )
+                    if const_expr(_OV_PHASES >= 3 and _ov.ROUTE_ORDER):
+                        # Producers only, and deliberately before the plan wait:
+                        # the sort needs nothing from the planner, so it runs
+                        # inside the count all-gather's latency instead of after.
+                        _ov.emit_route_order(
+                            OV, i64_ov_inp_idx, role, epoch, _tid, _nthreads,
+                            i32_ov_cur_tok,
+                        )
+                if const_expr(_OV_PHASES >= 3):
+                    # Producers need the plan too: the destination row of a route
+                    # is my_base[ge] + its slot, and my_base is what the planner
+                    # derives from the count matrix. Pushing before it is
+                    # published sends every rank's rows to the same rows.
+                    _ov.emit_wait_plan(OV, epoch, _tid, bid_x)
+                    if const_expr(_ov.PAYLOAD_PARTS & 1):
+                        _ov.emit_rowmap(
+                            OV, i64_ov_inp_idx, i64_ov_inp_wts, role, _tid,
+                            _nthreads, i32_ov_cur_tok,
+                        )
+                    _ov.emit_payload(
+                        OV, i64_ov_inp_tok, i64_ov_inp_idx, i64_ov_inp_scales,
+                        role, _tid, _nthreads, i32_ov_cur_tok,
+                        _ov.pay_rows(OV, block),
+                    )
+            else:
+                if const_expr(_OV_PHASES >= 2 and not _ov.NO_WAIT_PLAN):
+                    _ov.emit_wait_plan(OV, epoch, _tid, bid_x)
+                if const_expr(_ov.BULK_SYNC):
+                    _ov.emit_wait_all_payload(OV, epoch, _tid)
+
+            # GEMM1 work pool, joined by every CTA that has no dispatch duty left
+            # (all of them, unless PROD_JOIN is off). Sitting outside the role
+            # branch is the point: the dispatch CTAs are the ones guaranteed
+            # resident, so making them wait out the GEMM idle would cost the
+            # whole machine's worth of the tail.
+            _in_pool = (
+                fx.Int32(1) == fx.Int32(1)
+                if const_expr(_ov.PROD_JOIN)
+                else role >= fx.Int32(OV.dispatch_ctas)
+            )
+            if _in_pool:
+                workgroup_barrier()
+                _nvr_ptr = fx.PointerType.get(
+                    elem_ty=fx.Int32.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4,
+                )
+                valid_rows = fx.recast_iter(_nvr_ptr, arg_num_valid_rows)[0]
+                valid_m_tiles = valid_rows // tile_m
+                # A work item is one M-tile crossed with a RUN-long stretch of N,
+                # not a single (M, N) tile, because the arrival gate is keyed on
+                # M alone: at one N-tile per item the same counter is polled once
+                # per N-tile (24x over at inter=3072), and that poll is a
+                # cache-bypassing load plus an acquire fence taken while the
+                # producers still own the fabric. Grouping N amortizes it over
+                # the run and leaves the queue fine-grained enough to balance.
+                _n_tiles = (i32_n + (tile_n - 1)) // tile_n
+                if const_expr(_ov.WORK_RUN):
+                    _wrun = fx.Int32(_ov.WORK_RUN)
+                    _n_runs = (_n_tiles + _wrun - fx.Int32(1)) // _wrun
+                else:
+                    # N is dynamic, so the shape-derived split count is clamped
+                    # here rather than turned into a width on the host.
+                    _nr = fx.Int32(_ov_nruns)
+                    _n_runs = (_nr < _n_tiles).select(_nr, _n_tiles)
+                    _wrun = (_n_tiles + _n_runs - fx.Int32(1)) // _n_runs
+                total_work = valid_m_tiles * _n_runs
+                _shard = ticket & fx.Int32(_ov.WORK_SHARDS - 1)
+                _has_work = fx.Int32(1) == fx.Int32(1)
+                _trb = fx.recast_iter(
+                    fx.PointerType.get(
+                        elem_ty=fx.Int32.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=4,
+                    ),
+                    arg_tile_row_base,
+                )
+                while _has_work:
+                    work_id = _ov.emit_take_work(OV, _shard, _tid, _work_lds)
+                    _has_work = work_id < total_work
+                    if _has_work:
+                        _m_tile = work_id // _n_runs
+                        _n_base = (work_id - _m_tile * _n_runs) * _wrun
+                        _n_end = _n_base + _wrun
+                        _n_end = (_n_end < _n_tiles).select(_n_end, _n_tiles)
+                        if const_expr(_OV_PHASES >= 4 and _ov.TILE_GATE):
+                            # Gate on the M-tile's planned row count before any A
+                            # load, once for the whole run. trb[m_tile] is the
+                            # fixed-slot row le*CAP + t*tile_m, which is all the
+                            # arrival key needs -- no extra per-tile metadata.
+                            #
+                            # It blocks. Probing it instead and holding a
+                            # not-yet-ready item back to run the next one costs
+                            # 50 us/layer more than the stall it saves: two more
+                            # workgroup barriers on every work item, and there
+                            # are thousands. Device-scope probe loads do not
+                            # change that, so it is the barriers, not the scope.
+                            _ov.emit_wait_tile(OV, _trb[_m_tile], _tid)
+                        _nloop = scf.ForOp(
+                            arith.index_cast(T.index, _n_base),
+                            arith.index_cast(T.index, _n_end),
+                            arith.index(1),
+                        )
+                        with ir.InsertionPoint(_nloop.body):
+                            # The LDS arena is reused across N-tiles; the first
+                            # one is covered by emit_take_work's leading barrier.
+                            workgroup_barrier()
+                            _run_tile(
+                                _m_tile,
+                                arith.index_cast(T.i32, _nloop.induction_variable),
+                            )
+                            scf.YieldOp([])
+        elif const_expr(ep_persistent_gemm1):
             # Push-group fixed-slot: the static grid would be E*CAP/tile_m M-tiles,
             # almost all of them padding. num_valid_rows is the device-side count of
             # rows the dispatch finalize actually filled, so a CU-resident worker set
@@ -981,10 +1187,10 @@ def launch_gemm_a8w4_tdm(
                 work_id = arith.index_cast(T.i32, loop.induction_variable)
                 # The arena LDS is reused across iterations; fence before reuse.
                 workgroup_barrier()
-                _run_tile(work_id, valid_m_tiles)
+                _run_tile(*_swizzle_mn(work_id, valid_m_tiles))
                 scf.YieldOp([])
         else:
-            _run_tile(bid_x, (i32_m + (tile_m - 1)) // tile_m)
+            _run_tile(*_swizzle_mn(bid_x, (i32_m + (tile_m - 1)) // tile_m))
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
@@ -1000,14 +1206,23 @@ def launch_gemm_a8w4_tdm(
         arg_tile_valid = arg_a
     if arg_num_valid_rows is None:
         arg_num_valid_rows = arg_a
+    # The fused grid is the role space (producers + planner + consumers), the
+    # persistent grid is a fixed worker set, and the plain grid is one CTA per
+    # output tile. Written as an expression: names bound only inside a branch of
+    # a traced ``if`` do not survive it.
+    grid_x = (
+        OV.grid_ctas if OV is not None
+        else (persistent_workers if ep_persistent_gemm1 else m_tiles * n_tiles)
+    )
     kernel(
         arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map,
         arg_bias, arg_quant_scale, arg_ep_rowmap, arg_tile_row_base, arg_expert_ids, arg_tile_valid,
         arg_num_valid_rows,
-        i32_m, N, f32_swiglu_limit,
+        i64_ov_inp_tok, i64_ov_inp_idx, i64_ov_inp_wts, i64_ov_inp_scales,
+        i32_m, N, i32_ov_cur_tok, f32_swiglu_limit,
         f32_situ_beta, f32_situ_linear_beta,
     ).launch(
-        grid=((persistent_workers if ep_persistent_gemm1 else m_tiles * n_tiles), 1, 1),
+        grid=(grid_x, 1, 1),
         block=(block, 1, 1), stream=stream,
     )
 

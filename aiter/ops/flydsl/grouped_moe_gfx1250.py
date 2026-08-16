@@ -847,6 +847,94 @@ def _push_group_tile_meta(device, max_tiles, E, prefill):
     return trb, eids, tvd, num_valid
 
 
+def _build_overlap_consts(overlap, ov_inputs, *, tile_m, model_dim, persistent_workers):
+    """Turn the dispatch op's arena handles into the mega-kernel's geometry.
+
+    The CTA split is the one real decision here. The dispatch half is sized to
+    saturate the xGMI links rather than the CUs -- past that point extra producers
+    only steal M-tiles from the GEMM they are supposed to be feeding.
+    """
+    from aiter.ops.flydsl.kernels.push_group_overlap_stage1_gfx1250 import (
+        OverlapConsts,
+    )
+    from aiter.ops.flydsl.dispatch_combine_v2.dispatch_combine_op import (
+        PG_OV_WORK_SHARDS,
+        _validate_overlap_ctas,
+    )
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    if ov_inputs is None:
+        raise ValueError("overlap= also needs ov_inputs= (the pre-dispatch tensors)")
+    if tile_m != overlap["tile_m"]:
+        raise ValueError(
+            f"GEMM1 tile_m={tile_m} != the dispatch op's overlap tile_m="
+            f"{overlap['tile_m']}; the arrival counters are keyed on that tile, "
+            "and it is the same knob as the send-side scale preshuffle"
+        )
+    # Only the dispatch roles need to be co-resident, and the ticket handout is
+    # what guarantees that: a role can only land on a CTA that is already
+    # running. Everything above them is a GEMM1 worker pulling from the work
+    # queue, so oversubscribing is safe -- but it is not free either: every CTA
+    # pays the ticket handshake and the plan wait, and past ~1 CTA per CU that
+    # cost outgrows the extra latency hiding (measured 191 us/layer at 256 CTAs
+    # vs 213 at 512 and 253 at 1024 on the 64-token config).
+    # Producers, sized by the bytes they have to push. The push wants as many as
+    # it can get -- at 8 MB it costs 246 us/layer on 32 producers and 59 on 128 --
+    # but every producer also joins three grid-wide barriers per layer, and on a
+    # small push that fixed cost is what dominates. 64 KB per producer put both
+    # measured shapes on their optimum (8 MB -> 128, 0.5 MB -> the floor), which
+    # is two points, so the clamps are deliberately narrow.
+    push_bytes = (
+        overlap["max_tok_per_rank"] * overlap["experts_per_token"] * model_dim
+    )
+    dispatch_ctas = int(
+        os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_DISPATCH_CTAS", 0)
+    ) or min(128, max(32, push_bytes // (64 << 10))) + 1
+    grid_mult = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_GRID_MULT", 1))
+    # The floor keeps the work queue fed: one CTA per shard, plus the dispatch
+    # roles that never pull until their payload is out. Sizing it to
+    # dispatch_ctas + 1 instead turns an over-large dispatch request into a
+    # single-consumer grid and a validator error that reads like a hang.
+    grid_ctas = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_CTAS", 0)) or max(
+        dispatch_ctas + PG_OV_WORK_SHARDS, grid_mult * get_cu_num()
+    )
+    _validate_overlap_ctas(grid_ctas=grid_ctas, dispatch_ctas=dispatch_ctas)
+    return OverlapConsts(
+        rank=overlap["rank"],
+        npes=overlap["world_size"],
+        experts_per_rank=overlap["experts_per_rank"],
+        experts_per_token=overlap["experts_per_token"],
+        token_nbytes=model_dim,
+        max_tok_per_rank=overlap["max_tok_per_rank"],
+        cap=overlap["cap"],
+        tile_m=tile_m,
+        tiles_per_expert=overlap["tiles_per_expert"],
+        scale_num_i32=(model_dim // 32) // 4,
+        scale_wmma_rep=tile_m // 16,
+        dispatch_ctas=dispatch_ctas,
+        grid_ctas=grid_ctas,
+        arena_handle=overlap["arena_handle"],
+        off_count=overlap["off_count"],
+        off_count_done=overlap["off_count_done"],
+        off_tile_arrived=overlap["off_tile_arrived"],
+        off_disp_out=overlap["off_disp_out"],
+        off_out_scales=overlap["off_out_scales"],
+        off_pg_rowmap=overlap["off_pg_rowmap"],
+        off_tis=overlap["off_tis"],
+        ptr_entry=overlap["entry_ptr"],
+        ptr_bar=overlap["bar_ptr"],
+        ptr_plan_ready=overlap["plan_ready_ptr"],
+        ptr_my_base=overlap["my_base_ptr"],
+        ptr_hist=overlap["hist_ptr"],
+        ptr_route_slot=overlap["route_slot_ptr"],
+        ptr_route_order=overlap["route_order_ptr"],
+        ptr_count=overlap["count_ptr"],
+        ptr_count_done=overlap["count_done_ptr"],
+        ptr_tile_arrived=overlap["tile_arrived_ptr"],
+        ptr_tile_expected=overlap["tile_expected_ptr"],
+    )
+
+
 def grouped_a8w4_tdm_moe_push_scatter(
     disp_out, pg_running, pg_rowmap, w1, w2, w1_scale, w2_scale, *,
     E_local, model_dim, inter_dim, cap, activation, swiglu_limit=None,
@@ -855,6 +943,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
     tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
     dtype=None, bias1=None, bias2=None, disp_scale=None,
     ep_arena_handle, ep_comb_inp_off, ep_wire_nbytes, ep_slot_stride, ep_world,
+    overlap=None, ov_inputs=None,
 ):
     """Push-group fixed-slot MoE (gemm2-fused scatter). Consumes the grouped recv
     grid dispatch already produced -- no topids_to_rows / contiguous_psum_remap /
@@ -926,21 +1015,43 @@ def grouped_a8w4_tdm_moe_push_scatter(
     trb, eids, tvd, num_valid = _push_group_tile_meta(
         device, max_tiles, E, prefill=not persistent
     )
+    # Fused stage-1: GEMM1 also runs the dispatch, so there is no landed-count
+    # tensor to finalize from -- its planner derives the same tile schedule from
+    # the count matrix it exchanges, straight into trb/eids/tvd/num_valid.
+    ov_consts = None
+    if overlap is not None:
+        if disp_scale is None:
+            raise ValueError(
+                "the fused stage-1 requires send-side quant: it scatters the "
+                "preshuffled scale as it lands each row, and there is no later "
+                "pass that could produce one"
+            )
+        if not persistent:
+            raise ValueError(
+                "the fused stage-1 requires the persistent GEMM1 schedule "
+                "(AITER_EP_PUSH_GROUP_PERSISTENT_GEMM1)"
+            )
+        ov_consts = _build_overlap_consts(
+            overlap, ov_inputs, tile_m=tile_m, model_dim=model_dim,
+            persistent_workers=persistent_workers,
+        )
+
     presorted = disp_scale is not None
-    if not presorted:
+    if overlap is None and not presorted:
         # Snapshot the counts for the preshuffle mask BEFORE finalize, which read-
         # then-zeros pg_running (its per-layer reset). Clamp to cap: a token that
         # overflowed its expert's CAP never landed, so preshuffle must not read
         # past cap.
         masked = torch.clamp(pg_running.to(torch.int32), max=cap).contiguous()
-    launch_push_group_finalize(
-        pg_running_ptr=pg_running.data_ptr(),
-        tile_row_base_ptr=trb.data_ptr(),
-        expert_ids_ptr=eids.data_ptr(),
-        num_valid_ptr=num_valid.data_ptr(),
-        tile_valid_ptr=tvd.data_ptr(),
-        num_local_experts=E, cap=cap, tile_m=tile_m, rank=0, experts_per_rank=E,
-    )
+    if overlap is None:
+        launch_push_group_finalize(
+            pg_running_ptr=pg_running.data_ptr(),
+            tile_row_base_ptr=trb.data_ptr(),
+            expert_ids_ptr=eids.data_ptr(),
+            num_valid_ptr=num_valid.data_ptr(),
+            tile_valid_ptr=tvd.data_ptr(),
+            num_local_experts=E, cap=cap, tile_m=tile_m, rank=0, experts_per_rank=E,
+        )
 
     # 2) fixed-slot fp8 payload + preshuffled e8m0 scale, exactly the layout the
     #    push-group gemm reads via tile_row_base. Either the sender already produced
@@ -991,6 +1102,19 @@ def grouped_a8w4_tdm_moe_push_scatter(
         if persistent
         else {}
     )
+    # Only GEMM1 fuses the dispatch; GEMM2 keeps its own plain persistent launch.
+    _ov_kw = (
+        dict(
+            ep_overlap=ov_consts,
+            ov_inp_tok=ov_inputs["tokens"],
+            ov_inp_idx=ov_inputs["indices"],
+            ov_inp_wts=ov_inputs["weights"],
+            ov_inp_scales=ov_inputs["scales"],
+            ov_cur_tok=int(ov_inputs["num_tokens"]),
+        )
+        if ov_consts is not None
+        else {}
+    )
 
     # 3) GEMM1 (+ fused silu/swiglu + fp8 quant epilogue), fixed-slot rows.
     if _fuse_quant:
@@ -1008,6 +1132,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
             stage1_quant_out=1, quant_scale=a2_scale, quant_wmma_rep=wmma_rep2,
             push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
             **_persist_kw,
+            **_ov_kw,
             **_situ_kw,
         )
     else:
@@ -1020,6 +1145,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
             swiglu_limit=sl, num_buffers=num_buffers,
             push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
             **_persist_kw,
+            **_ov_kw,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(

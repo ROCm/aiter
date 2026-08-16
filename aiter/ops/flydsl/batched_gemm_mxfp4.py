@@ -67,6 +67,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_gemm1=0,
     num_valid_rows=None,
     persistent_workers=None,
+    ep_overlap=None,
+    ov_inp_tok=None,
+    ov_inp_idx=None,
+    ov_inp_wts=None,
+    ov_inp_scales=None,
+    ov_cur_tok=0,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -124,12 +130,31 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers = 1
     # Once the worker set covers the whole static grid the loop can only add
     # per-iteration overhead, so keep the plain one-tile-per-workgroup launch.
-    if persistent_gemm1:
+    # Not applicable to the fused stage-1: there the grid is the role space, and
+    # dropping the persistent loop would leave the dispatch half unscheduled.
+    if persistent_gemm1 and ep_overlap is None:
         static_blocks = (
             (contiguous_m + tile_m - 1) // tile_m * ((N + tile_n - 1) // tile_n)
         )
         if persistent_workers >= static_blocks:
             persistent_gemm1 = 0
+    # The fused stage-1 runs the push-group dispatch inside this GEMM, reading the
+    # pre-dispatch inputs straight from the caller's tensors.
+    ov_tuple = () if ep_overlap is None else tuple(ep_overlap.as_tuple())
+    if ep_overlap is not None:
+        missing = [
+            n
+            for n, t in (
+                ("ov_inp_tok", ov_inp_tok), ("ov_inp_idx", ov_inp_idx),
+                ("ov_inp_wts", ov_inp_wts), ("ov_inp_scales", ov_inp_scales),
+            )
+            if t is None
+        ]
+        if missing:
+            raise ValueError(f"ep_overlap needs the dispatch inputs: {missing}")
+
+    def _addr(t):
+        return int(t.data_ptr()) if t is not None else 0
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -173,6 +198,12 @@ def flydsl_grouped_gemm_a8w4_masked(
         ep_persistent_gemm1=int(persistent_gemm1),
         persistent_workers=int(persistent_workers),
         arg_num_valid_rows=ptr_arg(num_valid_rows_tensor),
+        ep_overlap=ov_tuple,
+        i64_ov_inp_tok=_addr(ov_inp_tok),
+        i64_ov_inp_idx=_addr(ov_inp_idx),
+        i64_ov_inp_wts=_addr(ov_inp_wts),
+        i64_ov_inp_scales=_addr(ov_inp_scales),
+        i32_ov_cur_tok=int(ov_cur_tok),
     )
     return out
 

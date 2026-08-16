@@ -543,6 +543,14 @@ class DeviceMoEPipeline:
         )
         self.push_tiles = _push_tiles(self.ct, self.topk, self.EPR)
         self.pg_wmma_rep = self.push_tiles["tile_m"] // 16
+        # Fused stage-1: the dispatch runs inside GEMM1 so its P2P transfer
+        # overlaps the compute of tiles that have already landed. Needs the
+        # send-side quant (the scale is preshuffled as each row lands).
+        self.overlap = bool(
+            self.push_group
+            and self.send_quant
+            and os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP", "0") not in ("0", "")
+        )
         cfg = EpDispatchCombineConfig(
             rank=r,
             world_size=self.dist_ctx.world,
@@ -558,6 +566,7 @@ class DeviceMoEPipeline:
             scale_dim=(self.hdim // 32) if self.send_quant else 0,
             scale_type_size=1 if self.send_quant else 0,
             push_group_scale_wmma_rep=self.pg_wmma_rep if self.send_quant else 0,
+            push_group_overlap=self.overlap,
             combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
             push_group=self.push_group,      # explicit switch (was AITER_EP_PUSH_GROUP)
             # 0 => worst case ws*tokens_per_rank (one expert could take every token).
@@ -567,6 +576,51 @@ class DeviceMoEPipeline:
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
+
+    def _dump_overlap_state(self, layer):
+        """Print how far the stage-1 handshake got (rank 0 only, outside graphs)."""
+        if self.dist_ctx.rank != 0:
+            return
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import _PG_TILE_META_CACHE
+
+        torch.cuda.synchronize()
+        d = self.op.push_group_overlap_debug()
+        cap = self.op.push_group_moe_inputs()["cap"]
+        tile_m = self.push_tiles["tile_m"]
+        # Read the cached buffers directly: _push_group_tile_meta() would zero
+        # num_valid on the way out and hide what the planner published.
+        trb, _, tvd, num_valid = _PG_TILE_META_CACHE[
+            (self.dev, self.EPR * cap // tile_m, self.EPR)
+        ]
+        print(
+            f"[ov l{layer}] entry={d['entry'].item()} bar={d['bar'].tolist()} "
+            f"plan_ready={d['plan_ready'].item()} "
+            f"count_done={d['count_done'].tolist()} "
+            f"hist_sum={int(d['hist'].sum())} "
+            f"count_sum={int(d['count'].sum())} "
+            f"expected_sum={int(d['tile_expected'].sum())} "
+            f"arrived_sum={int(d['tile_arrived'].sum())} "
+            f"num_valid={num_valid.item()} tvd_sum={int(tvd.sum())} "
+            f"trb[:6]={trb[:6].tolist()} "
+            f"probe={d['count'].view(-1)[1:10].tolist()} "
+            f"timeout[n,key,want,got]={d['bar'][4:8].tolist()}",
+            flush=True,
+        )
+        exp, arr = d["tile_expected"], d["tile_arrived"]
+        short = (arr < exp).nonzero().flatten().tolist()
+        if short:
+            print(
+                f"[ov l{layer}] short tiles={[(k, int(exp[k]), int(arr[k])) for k in short[:12]]}"
+                f" n_short={len(short)}",
+                flush=True,
+            )
+        over = (arr > exp).nonzero().flatten().tolist()
+        if over:
+            print(
+                f"[ov l{layer}] over tiles={[(k, int(exp[k]), int(arr[k])) for k in over[:12]]}"
+                f" n_over={len(over)}",
+                flush=True,
+            )
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
     def _layer_step(self, x, l):
@@ -578,12 +632,18 @@ class DeviceMoEPipeline:
         send_x, send_scale = (xn, None)
         if self.send_quant:
             send_x, send_scale = per_1x32_mx_quant(xn, quant_mode="fp8")
-        # Recompute routing every layer (mode A: atomic routing inside dispatch)
-        # instead of replaying a precomputed handle. return_routing=True hands
-        # back this layer's forward dest-slot map, which combine then consumes.
-        recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
-            send_x, wts, send_scale, ids, return_routing=True
-        )
+        if self.overlap:
+            # Fused stage-1: there is no dispatch launch to make -- GEMM1 does the
+            # routing, the count exchange and the payload push itself. scatter_fused
+            # combine only needs the token count off the handle.
+            handle = self.op.overlap_routing(self.ct)
+        else:
+            # Recompute routing every layer (mode A: atomic routing inside dispatch)
+            # instead of replaying a precomputed handle. return_routing=True hands
+            # back this layer's forward dest-slot map, which combine then consumes.
+            recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
+                send_x, wts, send_scale, ids, return_routing=True
+            )
         ep_kwargs = None
         if self.op.cfg.is_fused and self.op.cfg.push_group:
             # push-group fixed-slot path: dispatch already landed tokens grouped by
@@ -613,7 +673,18 @@ class DeviceMoEPipeline:
                 ep_wire_nbytes=ep["ep_wire_nbytes"],
                 ep_slot_stride=pg["slot_stride"],
                 ep_world=self.dist_ctx.world,
+                overlap=self.op.push_group_overlap_ptrs(),
+                ov_inputs=(
+                    dict(
+                        tokens=send_x, indices=ids, weights=wts,
+                        scales=send_scale, num_tokens=self.ct,
+                    )
+                    if self.overlap
+                    else None
+                ),
             )
+            if self.overlap and os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_DEBUG"):
+                self._dump_overlap_state(l)
             # combine (scatter_fused) ignores its input arg -- it reads comb_inp.
             combine_out, _ = self.op.combine(xn, routing=handle)
             y = combine_out[: self.ct].to(dtypes.bf16)
@@ -712,7 +783,12 @@ class DeviceMoEPipeline:
         # torch.profiler breakdown over CUDA-graph replays: roctracer/kineto does
         # surface the per-kernel timeline inside the graph on this build, so we
         # profile the actual graph (matches the measured per-layer wall) instead of
-        # a separate eager pass.
+        # a separate eager pass. Past ~55 captured layers kineto segfaults in
+        # stop_trace on this build (the wall-clock number above is already in
+        # hand by then), so long-chain runs can opt out.
+        if os.environ.get("AITER_MEGA_NO_PROFILE", "0") not in ("0", ""):
+            self._prof = None
+            return total_us, total_us / self.n_layers, 0.0
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
@@ -866,7 +942,7 @@ def main():
     per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
     prof_us = dist_ctx.allreduce_avg_float(prof_us)
     tbl = None
-    if args.profile_table:
+    if args.profile_table and pipe._prof is not None:
         tbl = _aggregate_prof_table(
             pipe._prof,
             dist_ctx,

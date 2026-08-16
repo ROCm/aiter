@@ -33,6 +33,8 @@ from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
 from flydsl.expr.typing import T
+import os
+
 import flydsl.expr as fx
 
 
@@ -55,6 +57,23 @@ def atomic_add_global(addr_i64, val):
         _gptr(addr_i64),
         arith.unwrap(val),
         _llvm_d.AtomicOrdering.monotonic,
+    ).res
+
+
+def atomic_add_agent(addr_i64, val):
+    """Device-scope fetch-and-add at addr_i64; returns old value.
+
+    Same op as :func:`atomic_add_global` but scoped to this GPU, so it stays in
+    L2 instead of being routed as a potentially remote transaction. Only correct
+    for counters no peer ever touches -- the work-stealing heads, not the
+    arrival counters.
+    """
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _gptr(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="agent",
     ).res
 
 
@@ -115,6 +134,30 @@ def fence_system_release():
     _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release, syncscope="one-as")
 
 
+def fence_acquire_all():
+    """System acquire over ALL address spaces: unlike the ``one-as`` variant this
+    is what invalidates the caches a peer's P2P payload was written behind."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire)
+
+
+def fence_release_all():
+    """System release over all address spaces (pairs with fence_acquire_all)."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release)
+
+
+def fence_agent_acquire():
+    """Device-scope acquire: invalidates the per-CU caches but not the L2, so it
+    is safe only for data already landed in this device's L2."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope="agent-one-as")
+
+
+def fence_agent_release():
+    """Device-scope release: orders prior writes before a following device-scoped
+    flag, without the L2 writeback a system release pays for. Correct only when
+    the reader is another CTA on this GPU."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release, syncscope="agent-one-as")
+
+
 def _unwrap(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
 
@@ -130,6 +173,20 @@ def load_i32_acquire(addr_i64):
         volatile_=True,
         ordering=_llvm_d.AtomicOrdering.monotonic,
         syncscope="one-as",
+    ).res
+
+
+def load_i32_agent(addr_i64):
+    """Volatile monotonic i32 load at DEVICE scope: unlike the system-scope load
+    this may be served by the L2, which matters for a flag hundreds of waves poll
+    at once. Only valid for flags written by this device."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _gptr(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="agent-one-as",
     ).res
 
 
@@ -162,14 +219,23 @@ def load_v4i32_nt(base_i64, offset):
     ).res
 
 
-def _spin(addr_i64, keep_waiting, *, width=32):
+def _backoff(cycles):
+    """s_sleep between polls. A wave re-reading a flag as fast as it can issue
+    starves the very traffic it is waiting for -- with a few hundred waves on the
+    same cache line the peer's atomic can take milliseconds to get through."""
+    if cycles:
+        _rocdl_d.s_sleep(cycles)
+
+
+def _spin(addr_i64, keep_waiting, *, width=32, backoff=0, agent=False):
     """Spin on a volatile/atomic load at addr_i64 until keep_waiting(cur) is false;
     returns the awaited value. Self-contained (mori's wait_until_* need ShmemStates
     and cannot run on a cco-only stack)."""
     if width == 64:
         ty, load, wrap = T.i64, load_i64_acquire, fx.Int64
     else:
-        ty, load, wrap = T.i32, load_i32_acquire, fx.Int32
+        ty, wrap = T.i32, fx.Int32
+        load = load_i32_agent if agent else load_i32_acquire
     loop = scf.WhileOp([ty], [_unwrap(load(addr_i64))])
     cond = ir.Block.create_at_start(loop.before, [ty])
     body = ir.Block.create_at_start(loop.after, [ty])
@@ -178,6 +244,7 @@ def _spin(addr_i64, keep_waiting, *, width=32):
             _unwrap(keep_waiting(wrap(cond.arguments[0]))), [cond.arguments[0]]
         )
     with ir.InsertionPoint(body):
+        _backoff(backoff)
         scf.YieldOp([_unwrap(load(addr_i64))])
     return wrap(loop.results[0])
 
@@ -206,3 +273,44 @@ def spin_until_eq_i32(addr_i64, val):
 def spin_until_gt_i32(addr_i64, val):
     """Spin until *addr > val (signed); returns the value seen."""
     return _spin(addr_i64, lambda cur: cur <= fx.Int32(val))
+
+
+_SPIN_BACKOFF = int(os.environ.get("AITER_FLYDSL_SPIN_BACKOFF", "8"))
+
+
+def spin_until_ge_i32_backoff(addr_i64, val, cycles=_SPIN_BACKOFF, agent=False):
+    """spin_until_ge_i32 with an s_sleep between polls, for waits that many waves
+    perform at once on the same address. ``agent`` polls at device scope (L2), the
+    difference between a cache hit and a fabric round trip per poll."""
+    return _spin(
+        addr_i64, lambda cur: cur < fx.Int32(val), backoff=cycles, agent=agent
+    )
+
+
+def spin_until_ge_i32_bounded(addr_i64, val, max_iters):
+    """Spin until *addr >= val or `max_iters` re-reads elapse; returns the value
+    seen. Debug-only escape hatch: turns a stuck handshake into observable state
+    instead of a hang."""
+    loop = scf.WhileOp(
+        [T.i32, T.i32], [_unwrap(load_i32_acquire(addr_i64)), _unwrap(fx.Int32(0))]
+    )
+    cond = ir.Block.create_at_start(loop.before, [T.i32, T.i32])
+    body = ir.Block.create_at_start(loop.after, [T.i32, T.i32])
+    with ir.InsertionPoint(cond):
+        cur, it = fx.Int32(cond.arguments[0]), fx.Int32(cond.arguments[1])
+        keep = (cur < fx.Int32(val)) & (it < fx.Int32(max_iters))
+        scf.ConditionOp(_unwrap(keep), [cond.arguments[0], cond.arguments[1]])
+    with ir.InsertionPoint(body):
+        _backoff(8)
+        nxt = _unwrap(load_i32_acquire(addr_i64))
+        scf.YieldOp([nxt, _unwrap(fx.Int32(body.arguments[1]) + fx.Int32(1))])
+    return fx.Int32(loop.results[0])
+
+
+def spin_until_ge_i32(addr_i64, val):
+    """Spin until *addr >= val (signed); returns the value seen.
+
+    The i32 counterpart of :func:`spin_until_ge_i64`: use it on monotonic
+    counters (launch generations, arrival tallies) where a peer may already have
+    run ahead of the value being waited on -- `==` would spin forever there."""
+    return _spin(addr_i64, lambda cur: cur < fx.Int32(val))

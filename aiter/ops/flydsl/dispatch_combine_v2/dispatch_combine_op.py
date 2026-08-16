@@ -107,6 +107,43 @@ class SymmArena:
 # GEMM1 a8w4 sort_block_m; push-group CAP and finalize tile metadata align to it.
 _PUSH_GROUP_TILE_M = 64
 
+# ``pg_ov_bar`` layout, in i32 slots. Slots 0..15 are the protocol barrier arrival
+# counters plus the debug scratch; then the work-stealing heads, one per shard on
+# its own 64 B line so the shards do not ping-pong one line between CUs; then the
+# plan-ready replicas, spaced a full 128 B apart because that wait is taken by
+# every CTA in the grid at once and a shared line serialises the whole launch;
+# then the same treatment for the producer barriers' release side. Keep in sync
+# with the WORK_/PLAN_/BREL_ constants in
+# kernels/push_group_overlap_stage1_gfx1250.py.
+PG_OV_WORK_SLOT = 16
+PG_OV_WORK_SHARDS = 8
+PG_OV_WORK_STRIDE = 16
+PG_OV_PLAN_SLOT = 256
+PG_OV_PLAN_STRIDE = 32
+PG_OV_PLAN_FANOUT_MAX = 64
+# Release replicas for the producer-wide barriers. Arriving on a counter and then
+# spinning on that same counter makes every producer's poll miss against every
+# other producer's atomic, which is quadratic in the producer count: measured
+# free at 32 producers and 284 us/layer at 128. The last arriver instead posts a
+# monotonic phase to these lines and the others only ever read their own.
+PG_OV_BREL_SLOT = PG_OV_PLAN_SLOT + PG_OV_PLAN_FANOUT_MAX * PG_OV_PLAN_STRIDE
+PG_OV_BREL_STRIDE = 32
+PG_OV_BREL_FANOUT = 64
+# One replica bank per barrier (zero, count, route-order): sharing a bank would
+# let a CTA still leaving one barrier read the next one's release.
+PG_OV_BREL_PHASES = 3
+# Optional group counters for the arrival side (see BAR_GROUP in
+# kernels/push_group_overlap_stage1_gfx1250.py). Off by default, so this bank is
+# normally dead space; it is 12 KB and the arena is per-rank, not per-layer.
+PG_OV_BARR_SLOT = (
+    PG_OV_BREL_SLOT + PG_OV_BREL_PHASES * PG_OV_BREL_FANOUT * PG_OV_BREL_STRIDE
+)
+PG_OV_BARR_GROUPS = 32
+PG_OV_BARR_STRIDE = 32
+PG_OV_BAR_SLOTS = (
+    PG_OV_BARR_SLOT + PG_OV_BREL_PHASES * PG_OV_BARR_GROUPS * PG_OV_BARR_STRIDE
+)
+
 
 def _push_group_regions(cfg, tile_m=_PUSH_GROUP_TILE_M):
     """Extra symmetric regions for fixed-slot push-group dispatch (empty when off).
@@ -125,6 +162,107 @@ def _push_group_regions(cfg, tile_m=_PUSH_GROUP_TILE_M):
         ("pg_running", cfg.num_experts_per_rank * 4),
         ("pg_rowmap", (rrows + 1) * 2 * 4),
     ]
+
+
+def _push_group_overlap_regions(cfg):
+    """Extra symmetric regions for the fused dispatch->GEMM1 overlap stage-1
+    (empty unless push_group_overlap). All of them are graph-safe without a
+    host-side memset: see the reset argument on each entry.
+
+    * ``pg_ov_count[parity][src_rank][global_expert]`` -- the all-gathered route
+      count matrix. Every rank pushes its whole per-global-expert histogram to
+      every peer, so both roles are then computable locally with no second hop:
+      as a SOURCE, ``base[ge] = sum(count[s][ge] for s < rank)``; as a
+      DESTINATION, ``total[le] = sum(count[s][rank*EPR+le] for s)``. Parity
+      double-buffering is what makes the plain overwrite safe -- a peer can be at
+      most one layer ahead (its layer L+1 counts need ours), never two.
+    * ``pg_ov_count_done[src_rank]`` -- monotonic arrival counter, one
+      ``atomic_add`` per source per layer. Monotonic (never reset) so it survives
+      CUDA-graph replay, where a host-supplied epoch would repeat.
+    * ``pg_ov_tile_arrived[local_expert][tile]`` -- additive per-tile row arrival.
+      Zeroed at the top of each stage-1 launch by the producers, which is
+      race-free: a peer only writes here after it observes our count publication,
+      and that publication is release-ordered after the zeroing.
+    * ``pg_ov_tile_expected[local_expert][tile]`` -- planner-written row count the
+      consumer waits for. Local-only, rewritten every layer.
+    * ``pg_ov_entry`` -- the ticket counter. One ``atomic_add`` per CTA per launch
+      hands out both the CTA role and the launch generation, so roles go to the
+      CTAs that are actually resident first. Thread 0 broadcasts the ticket to
+      the rest of its block over LDS, so no global slot is needed.
+    * ``pg_ov_bar`` -- monotonic grid-barrier counters for the producer CTAs
+      (compared against ``(generation+1)*dispatch_ctas``, hence no reset). Slots 0
+      and 1 are the two protocol barriers; the rest are spare, and the debug
+      builds use them for diagnostics that must not collide with peer traffic.
+      The tail (slot ``PG_OV_WORK_SLOT`` onwards) holds the GEMM1 work-stealing
+      heads, one per shard on its own 64 B line; the planner zeroes them before
+      it publishes the plan, which is the only point at which no CTA can be
+      pulling from them.
+    * ``pg_ov_plan_ready`` -- monotonic; the planner bumps it once the tile
+      schedule and ``pg_ov_my_base`` are visible, and every other CTA waits on it.
+    * ``pg_ov_my_base[global_expert]`` -- this rank's first destination row within
+      each expert, i.e. the exclusive prefix over lower-numbered source ranks. The
+      planner derives it once so producers do not each redo the prefix sum.
+    * ``pg_ov_hist`` / ``pg_ov_route_slot`` -- local scratch: this rank's route
+      histogram and, per (token,k) route, its index within this rank's rows for
+      that expert. The payload pass needs the latter to reconstruct the row the
+      count pass reserved.
+    * ``pg_ov_route_order`` -- the routes counting-sorted by destination expert
+      (``order[local_base[expert] + slot] = route``). Pushing in this order is
+      what makes the destination's early tiles fill first, so its GEMM1 can start
+      while the later experts are still in flight.
+    """
+    if not (cfg.push_group and cfg.push_group_overlap):
+        return []
+    e_local = cfg.num_experts_per_rank
+    e_total = cfg.world_size * e_local
+    tiles = cfg.num_experts_per_rank * cfg.push_group_overlap_tiles_per_expert
+    return [
+        ("pg_ov_count", 2 * cfg.world_size * e_total * 4),
+        ("pg_ov_count_done", cfg.world_size * 4),
+        ("pg_ov_tile_arrived", tiles * 4),
+        ("pg_ov_tile_expected", tiles * 4),
+        ("pg_ov_entry", 4),
+        ("pg_ov_bar", PG_OV_BAR_SLOTS * 4),
+        ("pg_ov_plan_ready", 4),
+        ("pg_ov_my_base", e_total * 4),
+        ("pg_ov_hist", e_total * 4),
+        (
+            "pg_ov_route_slot",
+            cfg.max_num_inp_token_per_rank * cfg.num_experts_per_token * 4,
+        ),
+        (
+            "pg_ov_route_order",
+            cfg.max_num_inp_token_per_rank * cfg.num_experts_per_token * 4,
+        ),
+    ]
+
+
+def _validate_overlap_ctas(*, grid_ctas, dispatch_ctas):
+    """Split the stage-1 mega grid into (producers, planner, consumers).
+
+    ``dispatch_ctas`` is the whole dispatch half INCLUDING the planner, which is
+    role 0 -- the same partition the kernel derives from a CTA's ticket. The roles
+    are handed out by ticket order, not blockIdx, so they can only land on CTAs
+    that are already resident; a producer that never got a slot would deadlock the
+    consumers spinning on the payload it owes.
+    """
+    dispatch_ctas = int(dispatch_ctas)
+    grid_ctas = int(grid_ctas)
+    producers = dispatch_ctas - 1
+    consumer_ctas = grid_ctas - dispatch_ctas
+    if producers < 1:
+        raise ValueError(
+            f"dispatch_ctas={dispatch_ctas} leaves no producer after the planner"
+        )
+    if consumer_ctas < PG_OV_WORK_SHARDS:
+        # A work-queue shard only hands out items i == shard (mod SHARDS), so a
+        # shard nobody pulls from is a set of tiles nobody computes.
+        raise ValueError(
+            f"need at least {PG_OV_WORK_SHARDS} consumer CTAs (one per work "
+            f"shard): grid={grid_ctas} leaves {consumer_ctas} after "
+            f"{dispatch_ctas} dispatch CTAs"
+        )
+    return producers, 1, consumer_ctas
 
 
 @dataclass
@@ -179,6 +317,12 @@ class EpDispatchCombineConfig:
     # tile_m//16 to have dispatch apply that permutation as it scatters the scale,
     # which removes the receiver-side quant+repack pass entirely. 0 => linear scale.
     push_group_scale_wmma_rep: int = 0
+    # Fuse the push-group dispatch INTO GEMM1 as one stage-1 mega kernel so the
+    # P2P payload transfer of later M-tiles overlaps the GEMM1 compute of earlier
+    # arrived ones. Requires push_group + send-side quant (push_group_scale_wmma_rep
+    # > 0): the wire must carry fp8 + e8m0 only, never bf16 alongside it. Default
+    # off; the existing dispatch -> finalize -> GEMM1 sequence stays the fallback.
+    push_group_overlap: bool = False
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -215,6 +359,22 @@ class EpDispatchCombineConfig:
                 f"hidden_dim={self.hidden_dim}, dispatch_dtype={self.dispatch_dtype} -> "
                 f"token_nbytes={self.token_nbytes}"
             )
+        if self.push_group_overlap:
+            if not self.push_group:
+                raise ValueError("push_group_overlap requires push_group=True")
+            if self.push_group_scale_wmma_rep <= 0:
+                raise ValueError(
+                    "push_group_overlap requires send-side quant "
+                    "(push_group_scale_wmma_rep > 0): the fused stage-1 pushes fp8 "
+                    "payload + e8m0 scale straight into GEMM1's layout, so there is "
+                    "no receiver-side quant pass to fall back on"
+                )
+            tile_m = self.push_group_overlap_tile_m
+            if self.effective_cap_per_expert % tile_m:
+                raise ValueError(
+                    f"push_group_overlap needs cap ({self.effective_cap_per_expert}) "
+                    f"to be a multiple of tile_m ({tile_m})"
+                )
         if self.is_asymmetric_dtype:
             # asymmetric dtype (separate disp_out/comb_stg buffers): non-quant /
             # non-StdMoE. Every combine mode is fine as long as the return wire is
@@ -464,6 +624,17 @@ class EpDispatchCombineConfig:
         base = max(tile_m, base)
         return ((base + tile_m - 1) // tile_m) * tile_m
 
+    @property
+    def push_group_overlap_tile_m(self) -> int:
+        """GEMM1 M-tile the overlap arrival counters are keyed on. It is the same
+        knob as the send-side scale preshuffle geometry (wmma_rep = tile_m//16),
+        so the two can never drift apart."""
+        return self.push_group_scale_wmma_rep * 16
+
+    @property
+    def push_group_overlap_tiles_per_expert(self) -> int:
+        return self.effective_cap_per_expert // self.push_group_overlap_tile_m
+
 
 class EpDispatchRoutingHandle:
     """Per-call routing snapshot.
@@ -559,6 +730,7 @@ class EpDispatchCombineOp:
         # rows) to grouped [num_local_experts, CAP] rows so tokens land grouped.
         self._push_group = cfg.push_group
         self._pg_initialized = False
+        self._pg_ov_initialized = False
         self._push_group_cap = cfg.effective_cap_per_expert if cfg.push_group else 0
         rrows = (
             cfg.num_experts_per_rank * self._push_group_cap
@@ -583,6 +755,7 @@ class EpDispatchCombineOp:
         if self._enable_scales:
             regions.append(("out_scales", rrows * self._scale_num_i32 * 4))
         regions += _push_group_regions(cfg)
+        regions += _push_group_overlap_regions(cfg)
         # scatter combine needs its own staging regions
         if cfg.is_scatter:
             wire_elem_size = cfg.wire_elem_size
@@ -1282,6 +1455,119 @@ class EpDispatchCombineOp:
             "out_idx_ptr": self.arena.local_ptr("out_idx"),
             "out_wts_ptr": self.arena.local_ptr("out_wts"),
         }
+
+    def push_group_overlap_ptrs(self):
+        """Arena offsets + local pointers the fused stage-1 mega kernel needs.
+
+        Offsets (not local pointers) for anything a peer writes: the producer
+        reaches a destination's copy via ``cco.Window(handle).lsa_ptr(pe, off)``.
+        """
+        if not self.cfg.push_group_overlap:
+            return None
+        cfg = self.cfg
+        arena = self.arena
+        return {
+            "rank": cfg.rank,
+            "world_size": cfg.world_size,
+            "experts_per_rank": cfg.num_experts_per_rank,
+            "experts_per_token": cfg.num_experts_per_token,
+            "max_tok_per_rank": cfg.max_num_inp_token_per_rank,
+            "arena_handle": arena.handle,
+            "off_count": arena.offset("pg_ov_count"),
+            "off_count_done": arena.offset("pg_ov_count_done"),
+            "off_tile_arrived": arena.offset("pg_ov_tile_arrived"),
+            "off_disp_out": arena.offset("disp_out"),
+            "off_out_scales": arena.offset("out_scales"),
+            "off_pg_rowmap": arena.offset("pg_rowmap"),
+            "off_tis": arena.offset("recv_to_src_token"),
+            "tile_expected_ptr": arena.local_ptr("pg_ov_tile_expected"),
+            "count_ptr": arena.local_ptr("pg_ov_count"),
+            "count_done_ptr": arena.local_ptr("pg_ov_count_done"),
+            "tile_arrived_ptr": arena.local_ptr("pg_ov_tile_arrived"),
+            "entry_ptr": arena.local_ptr("pg_ov_entry"),
+            "bar_ptr": arena.local_ptr("pg_ov_bar"),
+            "plan_ready_ptr": arena.local_ptr("pg_ov_plan_ready"),
+            "my_base_ptr": arena.local_ptr("pg_ov_my_base"),
+            "hist_ptr": arena.local_ptr("pg_ov_hist"),
+            "route_slot_ptr": arena.local_ptr("pg_ov_route_slot"),
+            "route_order_ptr": arena.local_ptr("pg_ov_route_order"),
+            "cap": self._push_group_cap,
+            "tile_m": cfg.push_group_overlap_tile_m,
+            "tiles_per_expert": cfg.push_group_overlap_tiles_per_expert,
+        }
+
+    def overlap_routing(self, num_tokens):
+        """Combine handle for the fused stage-1, which makes no dispatch call.
+
+        scatter_fused combine reads comb_inp and only needs the origin token
+        count; the forward dest-slot map exists solely for the gather/scatter
+        combines, which the fused stage-1 does not feed. Seeds the overlap
+        counters on first use, the same one-time deal as reset_push_group.
+        """
+        if not self.cfg.push_group_overlap:
+            raise ValueError("overlap_routing requires push_group_overlap")
+        if not self._pg_ov_initialized:
+            self.reset_push_group_overlap()
+            self._pg_ov_initialized = True
+        return EpDispatchRoutingHandle(
+            disp_dest_tok_id_map=self._empty_i32,
+            inter_node_disp_dest_tok_id_map=self._empty_i32,
+            inter_node_disp_send_map=self._empty_i32,
+            total_recv_token_num=self.total_recv,
+            cur_rank_num_token=num_tokens,
+        )
+
+    def push_group_overlap_debug(self):
+        """Torch views of the overlap protocol state, for diagnosing a stage-1 run.
+
+        Reading these tells you how far the handshake got: a zero ``plan_ready``
+        means the planner never finished, an all-zero ``count`` row means a peer
+        never published, and a ``tile_expected`` that disagrees with ``hist``
+        means the prefix sum is wrong.
+        """
+        if not self.cfg.push_group_overlap:
+            return None
+        cfg = self.cfg
+        e_total = cfg.world_size * cfg.num_experts_per_rank
+        tiles = cfg.num_experts_per_rank * cfg.push_group_overlap_tiles_per_expert
+
+        def _v(name, shape):
+            return from_gpu_ptr(self.arena.local_ptr(name), shape, torch.int32)
+
+        return dict(
+            entry=_v("pg_ov_entry", (1,)),
+            bar=_v("pg_ov_bar", (PG_OV_BAR_SLOTS,)),
+            plan_ready=_v("pg_ov_plan_ready", (1,)),
+            count_done=_v("pg_ov_count_done", (cfg.world_size,)),
+            count=_v("pg_ov_count", (2, cfg.world_size, e_total)),
+            hist=_v("pg_ov_hist", (e_total,)),
+            my_base=_v("pg_ov_my_base", (e_total,)),
+            tile_expected=_v("pg_ov_tile_expected", (tiles,)),
+            tile_arrived=_v("pg_ov_tile_arrived", (tiles,)),
+        )
+
+    def reset_push_group_overlap(self):
+        """One-time seeding of the overlap counters before the FIRST stage-1
+        launch. Like reset_push_group this is NOT per-layer: ``pg_ov_count_done``
+        and ``pg_ov_entry``/``pg_ov_bar`` are monotonic by construction, and
+        ``pg_ov_tile_arrived`` is zeroed inside the kernel at a point no peer can
+        be writing. A per-layer host memset here would race peers' P2P atomics."""
+        if not self.cfg.push_group_overlap:
+            return
+        for name in (
+            "pg_ov_count",
+            "pg_ov_count_done",
+            "pg_ov_tile_arrived",
+            "pg_ov_tile_expected",
+            "pg_ov_entry",
+            "pg_ov_bar",
+            "pg_ov_plan_ready",
+            "pg_ov_my_base",
+            "pg_ov_hist",
+            "pg_ov_route_slot",
+            "pg_ov_route_order",
+        ):
+            self.arena.zero(name)
 
     def push_group_moe_inputs(self):
         """Torch views of the fixed-slot recv grid + the dispatch-emitted combine
