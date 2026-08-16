@@ -186,6 +186,11 @@ void opus_moe_forward_combine_token8_h2048_bf16(
     aiter_tensor_t& route_scores,
     aiter_tensor_t& dst);
 
+// Invert grouped_to_flat[route] into flat_to_grouped and cache an INT32 copy.
+void opus_moe_invert_route_order_i32(aiter_tensor_t& order,
+                                     aiter_tensor_t& token_routes,
+                                     aiter_tensor_t& order_i32);
+
 // Deterministic dx gather-sum (fixed top-k, no atomics). One block per token
 // sums its topk route rows. src [M,H] bf16, token_routes [T,topk] i32,
 // dst [T,H] bf16 (FP32 accumulation). Requires H % 8 == 0.

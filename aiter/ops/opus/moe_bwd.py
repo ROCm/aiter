@@ -944,6 +944,28 @@ def _opus_moe_gather_sum_dscore_router_dx_grouped_cached_meta_token8_h2048_e64_b
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_opus_bwd",
+    fc_name="opus_moe_invert_route_order_i32",
+    develop=True,
+)
+def _opus_moe_invert_route_order_i32_raw(
+    order: Tensor, token_routes: Tensor, order_i32: Tensor
+) -> None: ...
+
+
+def build_token_routes_from_order(
+    order: Tensor, T: int, topk: int
+) -> tuple[Tensor, Tensor]:
+    """Invert grouped-to-flat route order and cache its INT32 form in one pass."""
+    if order.numel() != T * topk or order.dtype != torch.int64:
+        raise ValueError("route order must be INT64 with T*topk elements")
+    token_routes = torch.empty(T, topk, device=order.device, dtype=torch.int32)
+    order_i32 = torch.empty_like(order, dtype=torch.int32)
+    _opus_moe_invert_route_order_i32_raw(order, token_routes, order_i32)
+    return token_routes, order_i32
+
+
 def build_token_routes(gather: Tensor, T: int, topk: int) -> Tensor:
     """Fixed top-k reverse map for the dx gather-sum: token_routes[t,k] = the
     compact route index of token t's k-th selection. Built once per moe-sort
@@ -1238,6 +1260,12 @@ class OpusMoERefFunc(torch.autograd.Function):
 
         offs = _offs_from_lens(lens)
         exact_shape = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
+        token_routes = None
+        router_order_i32 = None
+        if exact_shape:
+            token_routes, router_order_i32 = build_token_routes_from_order(
+                order, T, topk
+            )
         ctx.use_flat_dscore_layout = (
             exact_shape and ctx.use_sparse_router_dx and _USE_FLAT_DSCORE_LAYOUT
         )
@@ -1293,7 +1321,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         y = fwd_gemm(h, w2)                                            # [M,H]=h@W2ᵀ
 
         if exact_shape:
-            token_routes = build_token_routes(x_gather_idx, T, topk)
+            assert token_routes is not None
             out = opus_moe_forward_combine_token8_h2048_bf16(
                 y, token_routes, p_sorted
             )
@@ -1315,9 +1343,7 @@ class OpusMoERefFunc(torch.autograd.Function):
         # INT32 copies during forward so the bandwidth-critical dx/router
         # kernel avoids INT64 loads and address arithmetic in backward.
         exact_router_tail = (T, H, E, I, topk) == (32768, 2048, 64, 1024, 8)
-        ctx.router_order_i32 = (
-            order.to(torch.int32).contiguous() if exact_router_tail else None
-        )
+        ctx.router_order_i32 = router_order_i32 if exact_router_tail else None
         ctx.topk_ids_i32 = (
             topk_ids.to(torch.int32).contiguous() if exact_router_tail else None
         )

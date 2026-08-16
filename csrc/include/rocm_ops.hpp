@@ -511,6 +511,12 @@ namespace py = pybind11;
           py::arg("token_routes"), \
           py::arg("route_scores"), \
           py::arg("dst")); \
+    m.def("opus_moe_invert_route_order_i32", \
+          &opus_moe_invert_route_order_i32, \
+          "Invert grouped route order and cache INT32 metadata", \
+          py::arg("order"), \
+          py::arg("token_routes"), \
+          py::arg("order_i32")); \
     m.def("opus_moe_gather_sum_bf16", \
           &opus_moe_gather_sum_bf16, \
           "MoE dx gather-sum (deterministic, no atomics)", \

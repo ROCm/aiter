@@ -1287,6 +1287,42 @@ void opus_moe_forward_combine_token8_h2048_bf16(
         T);
 }
 
+__global__ void opus_moe_invert_route_order_i32_kernel(
+    const int64_t* __restrict__ order,
+    int32_t* __restrict__ token_routes,
+    int32_t* __restrict__ order_i32,
+    int M)
+{
+    const int grouped_route = blockIdx.x * blockDim.x + threadIdx.x;
+    if(grouped_route >= M)
+        return;
+    const int flat_route = static_cast<int>(order[grouped_route]);
+    token_routes[flat_route] = grouped_route;
+    order_i32[grouped_route] = flat_route;
+}
+
+void opus_moe_invert_route_order_i32(aiter_tensor_t& order,
+                                     aiter_tensor_t& token_routes,
+                                     aiter_tensor_t& order_i32)
+{
+    const int M = static_cast<int>(order.numel());
+    AITER_CHECK(static_cast<int>(token_routes.numel()) == M &&
+                    static_cast<int>(order_i32.numel()) == M,
+                "route-order metadata sizes must match");
+    AITER_CHECK(order.dtype() == AITER_DTYPE_i64 &&
+                    token_routes.dtype() == AITER_DTYPE_i32 &&
+                    order_i32.dtype() == AITER_DTYPE_i32,
+                "route-order metadata dtypes must be i64/i32/i32");
+    constexpr int BLOCK = 256;
+    opus_moe_invert_route_order_i32_kernel<<<
+        dim3((M + BLOCK - 1) / BLOCK), dim3(BLOCK), 0,
+        aiter::getCurrentHIPStream()>>>(
+        reinterpret_cast<const int64_t*>(order.data_ptr()),
+        reinterpret_cast<int32_t*>(token_routes.data_ptr()),
+        reinterpret_cast<int32_t*>(order_i32.data_ptr()),
+        M);
+}
+
 // Deterministic dx gather-sum (replaces the atomic scatter for fixed top-k):
 // Two tokens per block; an independent 256-thread half-block sums each token's
 // topk route rows of src -> dst[t]. No atomics (each dst[t] is written by one
