@@ -401,6 +401,8 @@ struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSort
 {
     static constexpr bool BLOCKED_DZ_G2 = true;
     static constexpr bool PRECOMPUTE_BLOCKED_DZ_BASE = true;
+    static constexpr bool SPLIT_BLOCKED_DZ_SOFFSET = true;
+    static constexpr bool SPLIT_B_SOFFSET = true;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128

@@ -164,11 +164,24 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::PRECOMPUTE_BLOCKED_DZ_BASE;
         return false;
     }();
+    constexpr bool split_blocked_dz_soffset = []() constexpr {
+        if constexpr(requires { T::SPLIT_BLOCKED_DZ_SOFFSET; })
+            return T::SPLIT_BLOCKED_DZ_SOFFSET;
+        return false;
+    }();
+    constexpr bool split_b_soffset = []() constexpr {
+        if constexpr(requires { T::SPLIT_B_SOFFSET; })
+            return T::SPLIT_B_SOFFSET;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert(!blocked_dz_g2 ||
                       (BM == 32 && BK == 32 && T::VEC_A == 8),
                   "blocked dZ requires the native M32/K32 vector path");
+    static_assert(!split_blocked_dz_soffset ||
+                      precompute_blocked_dz_base,
+                  "split blocked-dZ soffset requires precomputed bases");
     static_assert((FixedD == 0 && FixedI == 0 && FixedTopK == 0) ||
                   (FixedD > 0 && FixedI > 0 && FixedTopK > 0));
     static_assert(!fixed_shape || (FixedD % BN == 0 && 2 * FixedI % BK == 0));
@@ -413,18 +426,41 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                         ((lane_id / n_vectors) +
                          load.value * source_rows_per_issue) *
                             T::T_N;
-                    const int b_global_offset =
-                        (tile_k * BK + b_local_k +
-                         stage.value * mfma_stage_rows) *
-                            stride_w1_i +
-                        col_base + b_local_n;
-                    g_b.template _async_load<T::VEC_B>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(
-                            b_wave_dst + stage_offset + load_byte_offset),
-                        b_global_offset * sizeof(D_B),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_B>{});
+                    if constexpr(split_b_soffset)
+                    {
+                        // Only N is lane-varying in the BN512 path.  Keep it
+                        // in voffset and carry the uniform expert-row/tile
+                        // address in soffset instead of rebuilding a vector
+                        // byte address before every W1 issue.
+                        const int b_s_offset =
+                            ((tile_k * BK + b_local_k +
+                              stage.value * mfma_stage_rows) *
+                                 stride_w1_i +
+                             col_base) *
+                            sizeof(D_B);
+                        g_b.template _async_load<T::VEC_B>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                b_wave_dst + stage_offset + load_byte_offset),
+                            b_local_n * sizeof(D_B),
+                            b_s_offset,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_B>{});
+                    }
+                    else
+                    {
+                        const int b_global_offset =
+                            (tile_k * BK + b_local_k +
+                             stage.value * mfma_stage_rows) *
+                                stride_w1_i +
+                            col_base + b_local_n;
+                        g_b.template _async_load<T::VEC_B>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                b_wave_dst + stage_offset + load_byte_offset),
+                            b_global_offset * sizeof(D_B),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_B>{});
+                    }
                 });
             });
         };
@@ -495,18 +531,34 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                              : (load.value * T::BLOCK_SIZE +
                                 wave_id * opus::get_warp_size()) *
                                    T::VEC_A);
-                    const int32_t source_offset =
-                        precompute_blocked_dz_base
-                            ? blocked_a_base[load.value] +
-                                  tile_k * 32 * 32
-                            : d_z_offset(
-                                  sorted_row, tile_k * BK + local_k);
-                    g_a.template _async_load<T::VEC_A>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                        source_offset * sizeof(D_A),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_A>{});
+                    if constexpr(split_blocked_dz_soffset)
+                    {
+                        // Keep the lane-varying blocked row/K base in voffset
+                        // and carry the uniform K-tile advance in MUBUF
+                        // soffset.  Combining them first makes LLVM emit a
+                        // v_add for every A issue in every K tile.
+                        g_a.template _async_load<T::VEC_A>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                            blocked_a_base[load.value] * sizeof(D_A),
+                            tile_k * BK * BK * sizeof(D_A),
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_A>{});
+                    }
+                    else
+                    {
+                        const int32_t source_offset =
+                            precompute_blocked_dz_base
+                                ? blocked_a_base[load.value] +
+                                      tile_k * BK * BK
+                                : d_z_offset(
+                                      sorted_row, tile_k * BK + local_k);
+                        g_a.template _async_load<T::VEC_A>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                            source_offset * sizeof(D_A),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_A>{});
+                    }
                 }
             });
         }
