@@ -284,13 +284,15 @@ def _moe_ref_backward_impl(ctx, dout, dgrad, wgrad, actbwd, combine_bwd=None,
     if dW2_handle is None:
         dW2 = wgrad(dy, h, lens)                                  # [E,H,I]
 
+    # Consume the freshly produced d_act and saved forward input before the
+    # stage1 dgrad streams another large weight/output working set.
+    dW1 = wgrad(d_act, x_g, lens)                                  # [E,2I,H]
+
     # stage1
     dA_route = dgrad(d_act, w1, lens)                             # [M,H] = d_act @ W1
     early_dx = None
     if early_dx_scatter is not None:
         early_dx = early_dx_scatter(dA_route, x_gather_idx, T)
-    dW1 = wgrad(d_act, x_g, lens)                                  # [E,2I,H]
-
     # dx: sum topk route contribs back to token
     if early_dx is not None:
         dx = early_dx.to(dtype)
