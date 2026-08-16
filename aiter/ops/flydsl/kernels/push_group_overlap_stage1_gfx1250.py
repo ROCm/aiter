@@ -51,30 +51,43 @@ Phase order, per rank, per layer:
      pulls GEMM1 tiles off the sharded work queue until it is empty, gating each
      M-tile on its arrival count
 
-What this does NOT currently buy, measured at bs=256 on 4 ranks, because it keeps
-being re-proposed: the fused kernel runs 311 us against 276 for the unfused trio
-(85 dispatch + 188 GEMM1 + 3 finalize), and the gap is structural rather than
-unfinished work. Phases 2 and 3 are serial with phase 4, not overlapped with it.
-The plan costs 39 us before any producer may push, the push then runs 40 to 106,
-and the first GEMM tile waits for nearly all of it (see :func:`_emit_pay_meta`),
-so phase 4 spans 106 to 307 of a 321 us kernel. Deleting the plan outright would
-recover about 19 us of that and no more.
+Where this stands, measured on 4 ranks from 8 to 512 tokens: the fused kernel is
+at or under the unfused trio (dispatch + GEMM1 + finalize) at 8 and 256 tokens --
+222 us a layer against 224, and 482 against 480 -- and 25 to 27 us over it at 64,
+128 and 512. Phases 2 and 3 are still serial with phase 4 rather than overlapped
+with it, so what remains of the gap is close to what phase 2 costs outright.
 
-There is no headroom behind it either, which is what any redesign has to clear
-first. Fusion's one structural advantage was that the push saturates the fabric
-from far fewer CTAs than the unfused dispatch spends on it, but that advantage is
-spent: with no overlap to pay for CU efficiency the push is sized for wall time
-instead (see the producer count in grouped_moe_gfx1250), which takes it from 85
-us on 129 CTAs to 66 on 249 and the CU.us it costs from 11.0k up to 16.3k. Add
-GEMM1's 48.1k and the total is 64.5k, or 252 us across 256 CUs; with nothing in
-front of it but a local route count, and the ramp, that is 275 -- the unfused 276
-to within the run-to-run spread. A perfectly overlapped fusion would tie.
+The push is no longer any of it, though it was: 158 us of a 407 us kernel on the
+512-token shape. The fabric was never the reason. The standalone ep_dispatch
+moves the same bytes in 92 us, and it does so with 192 blocks of 32 warps against
+this kernel's 249 of 4 -- six times the warps in flight, hence six times the
+latency hidden. That geometry cannot be matched: the grid belongs to the
+persistent GEMM and its LDS tile arena pins occupancy at one CTA per CU, and
+asking for producers past that count deadlocks the ticket handout, since a role
+can only go to a CTA that is already resident. What a warp cannot get from its
+neighbours it can get from its own outstanding requests instead, and deepening
+the copy from 4 vec4 streams per lane to a whole row's 14 (:func:`pay_streams`)
+took the push to 80 us -- under ep_dispatch's 92 -- and 24 to 37 us a layer off
+every token count.
 
-Two things that look like they should help do not, and both were measured rather
-than reasoned about: publishing in stages from inside a CTA (:func:`_emit_payload`)
-and raising the grid multiplier so a stalled producer shares its CU with a
-consumer (330 us at 1 CTA/CU, 327 at 2, 334 at 3 -- the consumers have no ready
-tile to work on, so more of them resident changes nothing).
+What is left is the plan: 33 us at 128 tokens, 40 at 256, 49 at 512, all of it
+serial on the one CTA every producer waits behind. Half is fixed -- ~11 us
+publishing the count matrix, whose drain is a genuine cross-device round trip,
+and ~10 compacting the tile schedule -- and the rest is the route count and the
+counting sort, which scale with tokens. Spreading those two over the producers is
+implemented and still loses (PREFIX_OWNER=0 measures 666 us a layer against 578
+at 512 tokens): the three grid barriers it needs cost more than one CTA's
+arithmetic does. Removing the plan rather than moving it means giving up
+deterministic row placement, which is what lets a destination know a tile's
+expected row count before the payload lands.
+
+Three things that look like they should help do not, and all were measured rather
+than reasoned about: publishing in stages from inside a CTA (:func:`_emit_payload`),
+raising the grid multiplier so a stalled producer shares its CU with a consumer
+(330 us at 1 CTA/CU, 327 at 2, 334 at 3 -- the consumers have no ready tile to
+work on, so more of them resident changes nothing), and landing the scale run on
+contiguous destination dwords instead of the WMMA-strided ones, which is a
+quarter-full cache line per store and still measured no better.
 
 Everything below is called from inside a ``@flyc.kernel`` body. FlyDSL only
 AST-rewrites the decorated function, so a plain helper module cannot use dynamic
@@ -122,11 +135,13 @@ from aiter.ops.flydsl.dispatch_combine_v2.dispatch_combine_op import (
 WAVE = 32
 LANE_MASK = WAVE - 1
 LOG2_WAVE = 5
-# Token payload copy: 4 vec4 streams per lane for memory-level parallelism, the
-# same shape the standalone gfx1250 ep_dispatch settled on.
-_NSTREAMS = 4
 _LANE_STRIDE_I32 = WAVE * 4
-_MAIN_STRIDE_I32 = _NSTREAMS * _LANE_STRIDE_I32
+#: Ceiling on the vec4 streams a lane keeps in flight; 16 is 64 VGPRs of payload
+#: in flight, which this kernel can afford because its occupancy is pinned at one
+#: CTA per CU by the GEMM's LDS tile arena, not by registers.
+_NSTREAMS_MAX = 16
+#: Override the derived stream count (see :func:`pay_streams`) for tuning.
+_NSTREAMS_PIN = int(os.environ.get("AITER_EP_PUSH_GROUP_OVERLAP_NSTREAMS", "0"))
 
 # Debug bisect for the payload push: bit 1 rowmap+tis, 2 scale, 4 token, 8 the
 # arrival publish. Anything but 15 computes garbage; it exists to isolate which
@@ -317,6 +332,37 @@ def pay_rows(C, block):
         return _PAY_ROWS
     warps = max(C.n_producers * (block // WAVE), 1)
     return max(2, min(_PAY_ROWS_MAX, (C.max_tok * C.topk) // warps))
+
+
+def pay_streams(n_i32):
+    """vec4 streams per lane the token copy keeps in flight.
+
+    This is the one knob that compensates for the geometry the push is stuck
+    with. The standalone ep_dispatch copies the same bytes with 192 blocks of 32
+    warps; here the producers are 249 blocks of 4, because the grid is the
+    persistent GEMM's and its LDS tile arena pins that at one CTA per CU. Six
+    times fewer warps hide six times less latency, so what a warp cannot get
+    from its neighbours it has to get from its own outstanding requests: at 4
+    streams -- ep_dispatch's own choice -- the 512-token push takes 160 us, at 7
+    it takes 103 and at 14, one whole row per iteration, 75. That last figure is
+    under ep_dispatch's 92 for the same traffic, and the win holds at every
+    token count (29 us a layer at 8 tokens, 37 at 512).
+
+    Whole rows are preferred, then divisors, because the remainder falls into a
+    tail loop that runs one stream deep: at 4 streams the 7168-byte row spends
+    two of its five iterations there, which is most of why 4 is so much worse
+    than 7 rather than merely half as deep.
+    """
+    full = n_i32 // _LANE_STRIDE_I32
+    if _NSTREAMS_PIN:
+        return _NSTREAMS_PIN
+    cap = min(full, _NSTREAMS_MAX)
+    if cap < 1:
+        return 1
+    for s in range(cap, cap // 2, -1):
+        if full % s == 0:
+            return s
+    return cap
 
 
 # Width of the two-level scan over the histogram. The inner runs unrolled in one
@@ -1502,6 +1548,7 @@ def _emit_pay_copies(
     lane, run_first, run_end, run_stride, work_limit, n_pay_rows,
 ):
     """Pass 1 of one stage: the copies, with nothing ordering them."""
+    nstreams = pay_streams(C.n_i32)
     for run_base in range(run_first, run_end, run_stride):
         src_toks, dest_pes, local_exps, rows_in_exp, lives, dest_rows = _pay_meta(
             C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit, n_pay_rows
@@ -1561,8 +1608,9 @@ def _emit_pay_copies(
                             cache_modifier=PUB_SCOPE,
                         )
 
-            # fp8 token payload: each lane owns 16 B, _NSTREAMS vec4 streams in
-            # flight.
+            # fp8 token payload: each lane owns 16 B, nstreams vec4 streams in
+            # flight (see :func:`pay_streams` -- this is where the push gets back
+            # the latency hiding its warp count cannot buy).
             if const_expr(_PARTS & 4):
              peer_tok = fx.Int64(window.lsa_ptr(dest_pe, C.off_disp_out))
              rs_src = _rsrc(
@@ -1570,17 +1618,18 @@ def _emit_pay_copies(
              )
              rs_dst = _rsrc(peer_tok + fx.Int64(dest_row) * fx.Int64(C.token_nbytes))
              lane_i32_off = lane * fx.Int32(4)
-             safe_end = (C.n_i32 // _MAIN_STRIDE_I32) * _MAIN_STRIDE_I32
-             if const_expr(C.n_i32 >= _MAIN_STRIDE_I32 and safe_end > 0):
+             main_stride = nstreams * _LANE_STRIDE_I32
+             safe_end = (C.n_i32 // main_stride) * main_stride
+             if const_expr(C.n_i32 >= main_stride and safe_end > 0):
                  end_main = arith.select(live, fx.Int32(safe_end), lane_i32_off)
-                 for chunk in range(lane_i32_off, end_main, _MAIN_STRIDE_I32):
+                 for chunk in range(lane_i32_off, end_main, main_stride):
                      vecs = [
                          buffer_load(
                              rs_src, chunk + k * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32
                          )
-                         for k in range_constexpr(_NSTREAMS)
+                         for k in range_constexpr(nstreams)
                      ]
-                     for k in range_constexpr(_NSTREAMS):
+                     for k in range_constexpr(nstreams):
                          buffer_store(
                              vecs[k],
                              rs_dst,
@@ -1594,7 +1643,7 @@ def _emit_pay_copies(
                  ):
                      v = buffer_load(rs_src, chunk, vec_width=4, dtype=T.i32)
                      buffer_store(v, rs_dst, chunk, cache_modifier=PUB_SCOPE)
-             elif const_expr(C.n_i32 < _MAIN_STRIDE_I32):
+             elif const_expr(C.n_i32 < main_stride):
                  end_small = arith.select(live, fx.Int32(C.n_i32), lane_i32_off)
                  for chunk in range(lane_i32_off, end_small, _LANE_STRIDE_I32):
                      v = buffer_load(rs_src, chunk, vec_width=4, dtype=T.i32)
