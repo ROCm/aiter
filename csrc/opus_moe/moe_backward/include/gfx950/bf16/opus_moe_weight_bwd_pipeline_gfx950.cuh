@@ -271,6 +271,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::EAGER_PREFETCH_REDUCTION_AB;
         return false;
     }();
+    constexpr bool stagger_reduction_ab_by_wave_n = []() constexpr {
+        if constexpr(requires { T::STAGGER_REDUCTION_AB_BY_WAVE_N; })
+            return T::STAGGER_REDUCTION_AB_BY_WAVE_N;
+        return false;
+    }();
     static_assert(!(prefetch_reduction_a && prefetch_reduction_ab));
     static_assert(!eager_prefetch_reduction_ab || prefetch_reduction_ab);
     constexpr bool swap_route_sources = []() constexpr {
@@ -947,8 +952,24 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             };
             auto load_fragment = [&](auto ek, auto& v_a, auto& v_b)
                 __attribute__((always_inline)) {
-                load_a_fragment(ek, v_a);
-                load_b_fragment(ek, v_b);
+                if constexpr(stagger_reduction_ab_by_wave_n)
+                {
+                    if(wave_id_n & 1)
+                    {
+                        load_b_fragment(ek, v_b);
+                        load_a_fragment(ek, v_a);
+                    }
+                    else
+                    {
+                        load_a_fragment(ek, v_a);
+                        load_b_fragment(ek, v_b);
+                    }
+                }
+                else
+                {
+                    load_a_fragment(ek, v_a);
+                    load_b_fragment(ek, v_b);
+                }
             };
             if constexpr(prefetch_reduction_a)
             {

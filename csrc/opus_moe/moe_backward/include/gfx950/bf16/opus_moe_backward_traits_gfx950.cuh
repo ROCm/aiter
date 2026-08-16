@@ -1119,6 +1119,10 @@ struct Dw2Bf16Gfx950Bm128Bn256Bk32Cohort4NativeB32ZeroPadTripleLds
     static constexpr int E_M = 2;
     static constexpr int E_N = 4;
     static constexpr bool ISSUE_DIRECT_B_FIRST = true;
+    // The two N-wave groups reuse identical dO fragments.  Reverse the LDS
+    // issue order in the odd group so those reads do not contend for the same
+    // banks in the same cycle; the wait and MFMA order remain unchanged.
+    static constexpr bool STAGGER_REDUCTION_AB_BY_WAVE_N = true;
     static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };

@@ -122,6 +122,7 @@ fallback when a genuinely different working-set regime needs it.
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
 | K5 `dw2` standalone pipelined reduction | 13 | kid 11 with three K32 stages |
 | K5 `dw2` full-pipeline native-B | 16 | kid 13 with direct padded `a_scaled` reads |
+| K5 `dw2` balanced full-pipeline | 17 | `BM128 x BN256 x BK32`, native-B three-stage LDS + N-wave A/B issue staggering |
 | `router_bwd` | 0 | `BM32 x BE8` |
 | `bias_bwd` | 0 | `BM32 x BN16` |
 
@@ -261,8 +262,16 @@ Long K32 reductions use a three-stage BM256 pipeline.  In the full K1--K5
 pipeline, kid 16 preserves dO's 8-lane/64-byte gathered load while encoding
 the contiguous `a_scaled` operand as native K32xN32 LDS tiles.  It relies on
 the exact-zero padding contract above.  Standalone K5 auto-dispatch retains
-kid 13, and an explicit standalone kid-16 launch is rejected, so arbitrary
+kid 13, and explicit standalone kid-16/17 launches are rejected, so arbitrary
 caller-owned padding is never consumed accidentally.
+When `I % 256 == 0`, kid 17 trades one M repeat for one N repeat while keeping
+the same CTA count, MFMA count, global dO gather width, and 72-KiB three-stage
+LDS footprint.  The two N-wave groups reuse the same dO fragments, so the odd
+group issues each B fragment before A while the even group retains A before B.
+The full wait and MFMA accumulation order are unchanged, but the stagger hides
+same-cycle LDS contention: on the target shape, isolated K5 improved by about
+11.4 us and LDS-wait/busy fell from 11.50% to 10.62%.  Five adjacent compatible
+shape families were bitwise exact and showed no median regression.
 The retired BM128 mid-route fallback was slower not only for balanced and
 skewed routing but also for its intended 20993--30720 interval after the K16
 pipeline landed.  The target code object uses 52 arch VGPRs, 132 accum VGPRs,

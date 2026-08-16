@@ -1010,7 +1010,7 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         kid=17,
         name=(
             "dw2_bf16_gfx950_bm128_bn256_bk32_"
-            "cohort4_native_b32_zero_pad_triple_lds"
+            "cohort4_native_b32_zero_pad_triple_lds_stagger_ab"
         ),
         family=OpusMoeBackwardFamily.DW2,
         arch="gfx950",
