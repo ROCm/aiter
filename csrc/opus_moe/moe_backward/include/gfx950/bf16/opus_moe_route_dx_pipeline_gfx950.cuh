@@ -174,6 +174,11 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::SPLIT_B_SOFFSET;
         return false;
     }();
+    constexpr bool mfma_priority = []() constexpr {
+        if constexpr(requires { T::MFMA_PRIORITY; })
+            return T::MFMA_PRIORITY;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert(!blocked_dz_g2 ||
@@ -618,6 +623,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             tile_storage + buffer * stage_bytes + smem_a_bytes));
         auto v_b = route_dx_load_rb_tr<T, decltype(mma)>(
             s_b_current, lane_id, wave_id_n);
+        if constexpr(mfma_priority)
+            __builtin_amdgcn_s_setprio(1);
         opus::static_for<RouteTiles>([&](auto route_group) {
             auto s_a_current = make_smem(reinterpret_cast<D_A*>(
                 tile_storage + buffer * stage_bytes +
@@ -628,6 +635,8 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             v_c[route_group.value] =
                 mma(v_a, v_b, v_c[route_group.value]);
         });
+        if constexpr(mfma_priority)
+            __builtin_amdgcn_s_setprio(0);
 
         if(has_next)
         {

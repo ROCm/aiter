@@ -403,6 +403,10 @@ struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSort
     static constexpr bool PRECOMPUTE_BLOCKED_DZ_BASE = true;
     static constexpr bool SPLIT_BLOCKED_DZ_SOFFSET = true;
     static constexpr bool SPLIT_B_SOFFSET = true;
+    // Once the next GMEM-to-LDS stage is in flight, prioritize the current
+    // LDS fragment/MFMA chain so its consumer retires before vmcnt gates the
+    // following stage.  This does not change resources or numerical order.
+    static constexpr bool MFMA_PRIORITY = true;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128
