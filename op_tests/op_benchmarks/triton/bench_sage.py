@@ -54,6 +54,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
 from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
@@ -298,6 +299,13 @@ def generate_test_tensors(
     distribution: str,
     hadamard_rotate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # "zero": all-zero Q/K/V for degenerate-input and quantization smoke tests.
+    if distribution == "zero":
+        q = torch.zeros((batch, hq, sq, d_head), device=device, dtype=dtype)
+        k = torch.zeros((batch, hk, sk, d_head), device=device, dtype=dtype)
+        v = torch.zeros((batch, hk, sk, d_head_v), device=device, dtype=dtype)
+        return q, k, v
+
     # "normal": plain iid Gaussian Q/K/V -- the simplest smoke-test inputs.
     if distribution == "normal":
         q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
@@ -713,13 +721,26 @@ def f8f6_quantize(
     k: torch.Tensor,
     v: torch.Tensor,
     rotate_qk: bool = True,
+    v_scale_mode: Literal["block", "tensor", "head"] = "block",
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     quantize_qk = quantize_fp8_rotated if rotate_qk else quantize_fp8
     q_quant, q_descale = quantize_qk(q)
     k_quant, k_descale = quantize_qk(k)
-    v_quant, v_descale = quantize_v_mxfp6(v)
+    if v_scale_mode == "block":
+        v_quant, v_descale = quantize_v_mxfp6(v)
+    else:
+        reduce_dims = (0, 1, 2, 3) if v_scale_mode == "tensor" else (1, 3)
+        amax = v.abs().to(torch.float32).amax(dim=reduce_dims, keepdim=True)
+        scale = torch.clamp(amax / 7.5, min=torch.finfo(torch.float32).tiny)
+        v_quant, v_descale = pack_fp6_v_data_scale_views(
+            v.to(torch.float32) / scale, fixed_e8m0=True
+        )
+        batch, _, heads, _ = v.shape
+        scale_by_head = scale.expand(batch, 1, heads, 1)[:, 0, :, 0].contiguous()
+        scale_bytes = scale_by_head.view(torch.uint8).reshape(batch, heads, 4)
+        v_descale.view(batch, heads, -1)[..., :4] = scale_bytes
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
@@ -1127,7 +1148,7 @@ def make_kernel_runner(
                 "aiter_f8f6 Hadamard preprocessing requires block_r=128 "
                 "and does not support --qsmooth"
             )
-        if args.e2e and args.hadamard_rotate:
+        if args.e2e and args.hadamard_rotate and args.f8f6_v_scale == "block":
             return lambda: mha_v4(
                 q_bshd,
                 k_bshd,
@@ -1144,6 +1165,7 @@ def make_kernel_runner(
                 k_bshd,
                 v_bshd,
                 rotate_qk=args.hadamard_rotate,
+                v_scale_mode=args.f8f6_v_scale,
             )
             return mha_v4_packed(
                 *packed,
@@ -1156,7 +1178,13 @@ def make_kernel_runner(
 
         if args.e2e:
             return _run_aiter_f8f6
-        packed = f8f6_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
+        packed = f8f6_quantize(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            rotate_qk=args.hadamard_rotate,
+            v_scale_mode=args.f8f6_v_scale,
+        )
         return lambda: mha_v4_packed(
             *packed,
             fp8_format,
@@ -2200,9 +2228,18 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=str,
         default="transformer",
-        choices=["normal", "transformer", "sink", "underflow", "latesink", "maxstair"],
+        choices=[
+            "zero",
+            "normal",
+            "transformer",
+            "sink",
+            "underflow",
+            "latesink",
+            "maxstair",
+        ],
         help=(
-            "Distribution used for generated Q/K/V tensors. 'sink' is a realistic "
+            "Distribution used for generated Q/K/V tensors. 'zero' sets all Q/K/V values "
+            "to zero; 'sink' is a realistic "
             "StreamingLLM attention sink pattern; 'underflow'/'latesink' are "
             "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
             "'maxstair' raises the max every KV tile and triggers rollback for alternating "
@@ -2214,6 +2251,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Clip factor applied to Q and K absmax before int8 quantization for aiter_i8fp8",
+    )
+    parser.add_argument(
+        "--f8f6-v-scale",
+        choices=["block", "tensor", "head"],
+        default="block",
+        help="F8F6 V quantization scale granularity",
     )
     parser.add_argument(
         "--q-clip",
@@ -2347,6 +2390,9 @@ def parse_args() -> argparse.Namespace:
         value = getattr(args, name)
         if value is not None and value <= 0.0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
+    args.f8f6_v_scale = os.environ.get("AITER_F8F6_V_SCALE", args.f8f6_v_scale)
+    if args.f8f6_v_scale not in ("block", "tensor", "head"):
+        parser.error("AITER_F8F6_V_SCALE must be one of: block, tensor, head")
     return args
 
 
