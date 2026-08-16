@@ -688,9 +688,14 @@ def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
 def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     tiles = (sequence + 127) // 128
-    return input.new_empty(
-        (batch, sequence, heads, head_dim), dtype=torch.uint8
-    ), input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
+    head_stride = tiles * 12288
+    raw = input.new_empty((batch * heads * head_stride + 256,), dtype=torch.uint8)
+    quantized = torch.as_strided(
+        raw,
+        (batch, sequence, heads, head_dim),
+        (heads * head_stride, 96, head_stride, 1),
+    )
+    return quantized, input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
 
 
 _quantize_mxfp4 = quantize_mxfp4_q

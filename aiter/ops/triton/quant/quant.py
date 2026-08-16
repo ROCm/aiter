@@ -271,7 +271,8 @@ def dynamic_mxfp8_quant(
         assert scale.dtype == torch.uint8
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
-    NUM_PRGMS = M
+    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+    NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
     _dynamic_mxfp8_quant_kernel[grid](

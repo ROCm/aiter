@@ -364,11 +364,6 @@ quantize_fp6_v_operand_tileflat = quantize_fp6_v_clean
 # ---------------------------------------------------------------------------
 # Triton GPU V packer (eliminates the one-time host pack)
 # ---------------------------------------------------------------------------
-# E2M3 magnitude grid as python literals (code 0..31 -> ascending magnitude); the
-# Triton kernel reconstructs searchsorted/RNE against these compile-time constants.
-_E2M3_GRID = tuple(float(x) for x in _E2M3_MAG)
-
-
 def _v_field_perm() -> np.ndarray:
     """Per-output-field source index into a 32-kv MX block.
 
@@ -382,8 +377,25 @@ def _v_field_perm() -> np.ndarray:
     return inv32[c].astype(np.int32)  # fieldperm[f] = inv32[c(f)]
 
 
+_V_KVTAB_CACHE: dict = {}
+
+
+def _v_kvtab_dev(device, direct_p: bool):
+    """Return the cached per-device field-to-KV permutation for V packing."""
+    key = (device, direct_p)
+    kvtab = _V_KVTAB_CACHE.get(key)
+    if kvtab is None:
+        table = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
+        kvtab = torch.from_numpy(table.reshape(-1)).to(device)
+        _V_KVTAB_CACHE[key] = kvtab
+    return kvtab
+
+
 def quantize_fp6_v_clean_triton(
-    v_fp8: "torch.Tensor", tile: int = 128, direct_p: bool = False
+    v_fp8: "torch.Tensor",
+    tile: int = 128,
+    direct_p: bool = False,
+    fixed_e8m0: bool = False,
 ):
     """GPU (Triton) equivalent of quantize_fp6_v_clean (byte-identical).
 
@@ -398,12 +410,12 @@ def quantize_fp6_v_clean_triton(
     nT = sk // tile
     n_blocks = b * h_kv * nT * 128 * 4
     out = torch.empty(b * h_kv * nT * 12800, dtype=torch.uint8, device=v_fp8.device)
-    kvtab_np = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
-    kvtab = torch.from_numpy(kvtab_np.reshape(-1)).to(v_fp8.device)
+    kvtab = _v_kvtab_dev(v_fp8.device, direct_p)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
     _pack_v_fp6_kernel[grid](
         v_fp8,
+        out,
         out,
         kvtab,
         v_fp8.stride(0),
@@ -413,10 +425,46 @@ def quantize_fp6_v_clean_triton(
         h_kv,
         nT,
         n_blocks,
-        GRID=_E2M3_GRID,
+        FIXED_E8M0=fixed_e8m0,
+        SEPARATE_OUTPUT=False,
         BLOCK_N=BLOCK_N,
     )
     return out.view(b, h_kv, nT * 12800)
+
+
+def quantize_fp6_v_data_scale_triton(
+    v_fp8: "torch.Tensor", tile: int = 128, fixed_e8m0: bool = False
+):
+    """Pack F8F6 V directly into its separate data and scale ABI buffers."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h_kv, d = v_fp8.shape
+    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
+    nT = sk // tile
+    n_blocks = b * h_kv * nT * 128 * 4
+    data = torch.empty(
+        b * h_kv * nT * 12288 + 256, dtype=torch.uint8, device=v_fp8.device
+    )
+    scale = torch.empty(b * h_kv * nT * 512, dtype=torch.uint8, device=v_fp8.device)
+    kvtab = _v_kvtab_dev(v_fp8.device, True)
+    BLOCK_N = 128
+    grid = (triton.cdiv(n_blocks, BLOCK_N),)
+    _pack_v_fp6_kernel[grid](
+        v_fp8,
+        data,
+        scale,
+        kvtab,
+        v_fp8.stride(0),
+        v_fp8.stride(1),
+        v_fp8.stride(2),
+        v_fp8.stride(3),
+        h_kv,
+        nT,
+        n_blocks,
+        FIXED_E8M0=fixed_e8m0,
+        SEPARATE_OUTPUT=True,
+        BLOCK_N=BLOCK_N,
+    )
+    return data, scale
 
 
 # ---------------------------------------------------------------------------
@@ -473,9 +521,31 @@ def _v_direct_kvtab() -> np.ndarray:
 if _HAVE_TRITON:
 
     @triton.jit
+    def _e2m3_encode_triton(value):
+        """Encode scaled FP32 values to signed E2M3 with round-to-nearest-even."""
+        magnitude = tl.minimum(tl.abs(value), 7.5)
+        magnitude_bits = magnitude.to(tl.int32, bitcast=True)
+        rounded_bits = magnitude_bits + 0x7FFFF + ((magnitude_bits >> 20) & 1)
+        exponent = ((rounded_bits >> 23) & 0xFF) - 126
+        normal_code = (exponent << 3) | ((rounded_bits >> 20) & 7)
+
+        scaled_subnormal = magnitude * 8.0
+        floor_value = tl.floor(scaled_subnormal)
+        floor_code = floor_value.to(tl.int32)
+        fraction = scaled_subnormal - floor_value
+        round_up = (fraction > 0.5) | ((fraction == 0.5) & ((floor_code & 1) == 1))
+        subnormal_code = floor_code + round_up.to(tl.int32)
+
+        magnitude_code = tl.where(magnitude >= 1.0, normal_code, subnormal_code)
+        magnitude_code = tl.minimum(tl.maximum(magnitude_code, 0), 31)
+        sign = (value.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
+        return magnitude_code | sign
+
+    @triton.jit
     def _pack_v_fp6_kernel(
         v_ptr,  # fp8 V [b, sk, h_kv, d] (any strides)
         out_ptr,  # uint8 [b*h_kv*nT*12800]
+        scale_ptr,
         kvtab_ptr,  # int32 [64*32] (L*32 + f) -> kv-in-64-chunk offset
         stride_vb,
         stride_vs,
@@ -484,7 +554,8 @@ if _HAVE_TRITON:
         h_kv,
         nT,
         n_blocks,  # total 32-kv MX blocks
-        GRID: tl.constexpr,  # 32 e2m3 magnitudes (ascending)
+        FIXED_E8M0: tl.constexpr,
+        SEPARATE_OUTPUT: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -517,31 +588,10 @@ if _HAVE_TRITON:
         amax = tl.max(tl.abs(vals), axis=1)  # [BN]
         bits = amax.to(tl.int32, bitcast=True)
         exp = (bits >> 23) & 0xFF
-        E = tl.where(amax == 0.0, 0, exp - 129)  # frexp_exp-3 = (exp-126)-3
+        E = 0 if FIXED_E8M0 else tl.where(amax == 0.0, 0, exp - 129)
         inv_scale = tl.exp2((-E).to(tl.float32))  # 2^-E (exact dyadic)
         y = vals * inv_scale[:, None]  # scaled (exact in fp32 for fp8 input)
-        mag = tl.abs(y)
-        mag = tl.minimum(mag, 7.5)  # clamp to grid max
-
-        idx = tl.zeros([BLOCK_N, 32], tl.int32)
-        glo = tl.full([BLOCK_N, 32], -1.0e30, tl.float32)
-        ghi = tl.full([BLOCK_N, 32], 1.0e30, tl.float32)
-        for j in tl.static_range(32):
-            gj = GRID[j]
-            lt = mag > gj  # grid[j] < mag
-            idx += lt.to(tl.int32)
-            glo = tl.where(lt, tl.maximum(glo, gj), glo)
-            ge = mag <= gj  # grid[j] >= mag
-            ghi = tl.where(ge, tl.minimum(ghi, gj), ghi)
-        lo = tl.maximum(idx - 1, 0)
-        dlo = mag - glo
-        dhi = ghi - mag
-        pick_hi = (dhi < dlo) | ((dhi == dlo) & ((lo & 1) == 1))
-        chosen = tl.where(pick_hi, idx, lo)
-        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
-        ybits = y.to(tl.int32, bitcast=True)
-        sign = (ybits < 0).to(tl.int32) * 32
-        codes = chosen | sign  # [BN,32] field-order 6-bit codes
+        codes = _e2m3_encode_triton(y)  # [BN,32] field-order 6-bit codes
 
         cf = codes.reshape(BLOCK_N, 8, 4)
         w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)  # [1,6,12,18] shifts
@@ -550,16 +600,27 @@ if _HAVE_TRITON:
         b1 = ((u >> 8) & 0xFF).to(tl.uint8)
         b2 = ((u >> 16) & 0xFF).to(tl.uint8)
 
-        base = (bh * nT + t) * 12800  # tile byte base
+        base = (bh * nT + t) * (12288 if SEPARATE_OUTPUT else 12800)
         data_off = base + bn * 1536 + L * 24  # [BN]
         g = tl.arange(0, 8)
         off0 = data_off[:, None] + g[None, :] * 3
         tl.store(out_ptr + off0 + 0, b0, mask=m[:, None])
         tl.store(out_ptr + off0 + 1, b1, mask=m[:, None])
         tl.store(out_ptr + off0 + 2, b2, mask=m[:, None])
-        scale_off = base + 12288 + physical_d * 4 + kvblk
         sb = ((E + 127) & 0xFF).to(tl.uint8)
-        tl.store(out_ptr + scale_off, sb, mask=m)
+        if SEPARATE_OUTPUT:
+            scale_base = (bh * nT + t) * 512
+            scale_lane = physical_d % 32 + 32 * (kvblk % 2)
+            scale_off = (
+                scale_base + (kvblk // 2) * 256 + scale_lane * 4 + physical_d // 32
+            )
+            tl.store(scale_ptr + scale_off, sb, mask=m)
+            if pid == 0:
+                tail = tl.arange(0, 256)
+                tl.store(out_ptr + n_blocks * 24 + tail, 0)
+        else:
+            scale_off = base + 12288 + physical_d * 4 + kvblk
+            tl.store(out_ptr + scale_off, sb, mask=m)
 
 
 # Single proven V layout: the historic "noswap" Triton name is kept as an alias.
@@ -610,34 +671,7 @@ if _HAVE_TRITON:
         E = tl.where(amax == 0.0, 0, exp - 129)  # frexp_exp-3
         inv_scale = tl.exp2((-E).to(tl.float32))
         y = vals * inv_scale[:, None]
-        mag = tl.minimum(tl.abs(y), 7.5)
-
-        # Branchless round-half-even E2M3 encode. The magnitude grid IS a minifloat
-        # (2 exp bits, 3 mantissa bits, bias 1): normals mag>=1 are 2^(exp2-1)*(1+m/8),
-        # subnormals mag<1 are m/8 (uniform step 1/8). So the 32-way linear search is
-        # replaced by (a) fp32 RNE-round-to-3-mantissa-bits for the normal range and
-        # (b) round(mag*8) for the subnormal range -- bit-identical, ~2.9x faster.
-        magbits = mag.to(tl.int32, bitcast=True)
-        # (a) NORMAL: add the RNE rounding bias for dropping the low 20 mantissa bits
-        # ((1<<19)-1 + kept-LSB for ties-to-even); the carry propagates into the exp.
-        bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
-        exp2 = (
-            (bits_r >> 23) & 0xFF
-        ) - 126  # (ef-127)+1 = E2M3 exp field for mag in [1,8)
-        m3n = (bits_r >> 20) & 7
-        code_norm = (exp2 << 3) | m3n
-        # (b) SUBNORMAL: round-half-even of mag*8 (0..8; 8 == first normal code, exact).
-        t8 = mag * 8.0
-        fl = tl.floor(t8)
-        fli = fl.to(tl.int32)
-        frac = t8 - fl
-        up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
-        code_sub = fli + up.to(tl.int32)
-        chosen = tl.where(mag >= 1.0, code_norm, code_sub)
-        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
-        ybits = y.to(tl.int32, bitcast=True)
-        sign = (ybits < 0).to(tl.int32) * 32
-        codes = chosen | sign  # [BN,32] field-order codes
+        codes = _e2m3_encode_triton(y)  # [BN,32] field-order codes
 
         cf = codes.reshape(BLOCK_N, 8, 4)
         w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)
@@ -694,21 +728,7 @@ if _HAVE_TRITON:
         exp = (bits >> 23) & 0xFF
         E = tl.where(amax == 0.0, 0, exp - 129)
         y = vals * tl.exp2((-E).to(tl.float32))[:, None]
-        mag = tl.minimum(tl.abs(y), 7.5)
-        magbits = mag.to(tl.int32, bitcast=True)
-        bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
-        exp2 = ((bits_r >> 23) & 0xFF) - 126
-        code_norm = (exp2 << 3) | ((bits_r >> 20) & 7)
-        t8 = mag * 8.0
-        fl = tl.floor(t8)
-        fli = fl.to(tl.int32)
-        frac = t8 - fl
-        up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
-        code_sub = fli + up.to(tl.int32)
-        chosen = tl.where(mag >= 1.0, code_norm, code_sub)
-        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
-        sign = (y.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
-        codes = chosen | sign
+        codes = _e2m3_encode_triton(y)
 
         cf = codes.reshape(BLOCK_N, 8, 4)
         w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)
@@ -1326,7 +1346,9 @@ def pack_fp6_v_kernel_view(
     return buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
 
 
-def pack_fp6_v_data_scale_views(v: "torch.Tensor", tile: int = 128):
+def pack_fp6_v_data_scale_views(
+    v: "torch.Tensor", tile: int = 128, fixed_e8m0: bool = False
+):
     """Pack V into separate F8F6 data and E8M0 scale images."""
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v.shape
@@ -1336,27 +1358,10 @@ def pack_fp6_v_data_scale_views(v: "torch.Tensor", tile: int = 128):
         tail = v[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
         v = torch.cat([v, tail], dim=1)
 
-    packed = quantize_fp6_v_clean_triton(v, tile=tile, direct_p=True).view(
-        b, h_kv, n_tiles, 12800
+    data_flat, scale_flat = quantize_fp6_v_data_scale_triton(
+        v, tile=tile, fixed_e8m0=fixed_e8m0
     )
-    data = packed[..., :12288].contiguous()
-    scale_tail = packed[..., 12288:].view(b, h_kv, n_tiles, 128, 4)
-    lane = torch.arange(64, device=v.device)
-    physical_channel = (
-        lane[:, None] % 32 + 32 * torch.arange(4, device=v.device)[None, :]
-    )
-    channel = physical_channel
-    scale = (
-        torch.stack(
-            [scale_tail[..., channel, 2 * k + lane[:, None] // 32] for k in range(2)],
-            dim=-3,
-        )
-        .contiguous()
-        .view(b, h_kv, n_tiles * 512)
-    )
-
     v_hs = n_tiles * 12288
     v_bs = h_kv * v_hs
-    data_flat = torch.cat([data.reshape(-1), data.new_zeros(256)])
     view = data_flat.as_strided((b, sk, h_kv, d), (v_bs, 96, v_hs, 1))
-    return view, scale
+    return view, scale_flat.view(b, h_kv, n_tiles * 512)

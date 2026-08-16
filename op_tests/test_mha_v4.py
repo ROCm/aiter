@@ -28,6 +28,8 @@ from aiter.ops.mha_v4 import (
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
+    quantize_fp6_v_clean_triton,
+    quantize_fp6_v_data_scale_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
@@ -178,6 +180,37 @@ def test_mha_v4_mxfp6_v_layout_contract():
     assert packed.stride() == (2 * 2 * 12288, 96, 2 * 12288, 1)
     assert scale.shape == (1, 2, 2 * 512)
     assert scale.dtype == torch.uint8
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@pytest.mark.parametrize("sequence", [256, 257])
+def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
+    torch.manual_seed(sequence)
+    value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=torch.bfloat16)
+    tiles = (sequence + 127) // 128
+    if sequence % 128:
+        value = torch.cat(
+            [value, value[:, -1:].expand(-1, tiles * 128 - sequence, -1, -1)],
+            dim=1,
+        )
+
+    combined = quantize_fp6_v_clean_triton(value, direct_p=True).view(
+        1, 2, tiles, 12800
+    )
+    data, scale = quantize_fp6_v_data_scale_triton(value)
+    expected_data = combined[..., :12288].contiguous().view(-1)
+
+    scale_tail = combined[..., 12288:].view(1, 2, tiles, 128, 4)
+    lane = torch.arange(64, device=value.device)
+    channel = lane[:, None] % 32 + 32 * torch.arange(4, device=value.device)[None, :]
+    expected_scale = torch.stack(
+        [scale_tail[..., channel, 2 * half + lane[:, None] // 32] for half in range(2)],
+        dim=-3,
+    ).contiguous()
+
+    assert torch.equal(data[: expected_data.numel()], expected_data)
+    assert torch.count_nonzero(data[expected_data.numel() :]) == 0
+    assert torch.equal(scale, expected_scale.view(-1))
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
