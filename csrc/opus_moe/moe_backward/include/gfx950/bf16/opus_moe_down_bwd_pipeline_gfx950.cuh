@@ -965,6 +965,26 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         }
         const down_bwd_f32x2 score2{score, score};
         const down_bwd_f32x2 one{1.0f, 1.0f};
+        int64_t blocked_dz_row_base = 0;
+        int64_t blocked_dz_up_delta = 0;
+        if constexpr(blocked_dz_g2)
+        {
+            constexpr int route_tile = 32;
+            constexpr int column_tile = 32;
+            constexpr int row_group = 2;
+            constexpr int vector = 8;
+            const int row_in_tile = sorted_row & (route_tile - 1);
+            const int tile_row = sorted_row - row_in_tile;
+            blocked_dz_row_base =
+                static_cast<int64_t>(tile_row) * stride_dz_r +
+                (row_in_tile / row_group) * row_group * column_tile +
+                (row_in_tile % row_group) * vector;
+            // This BN256 family requires I to be divisible by 256.  Gate and
+            // up therefore have identical within-tile coordinates and differ
+            // only by a whole number of G2 column tiles.
+            blocked_dz_up_delta =
+                static_cast<int64_t>(inter_dim) * route_tile;
+        }
         float ds_wave_partial = 0.0f;
 #pragma unroll
         for(int repeat = 0; repeat < T::E_N; ++repeat)
@@ -1088,12 +1108,17 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                 {
                     if constexpr(blocked_dz_g2)
                     {
+                        constexpr int column_tile = 32;
+                        constexpr int row_group = 2;
+                        constexpr int vector = 8;
+                        const int col_in_tile = col & (column_tile - 1);
                         const int64_t gate_base =
-                            blocked_dz_g2_offset(
-                                sorted_row, col, stride_dz_r);
+                            blocked_dz_row_base +
+                            static_cast<int64_t>(col - col_in_tile) *
+                                column_tile +
+                            (col_in_tile / vector) * row_group * vector;
                         const int64_t up_base =
-                            blocked_dz_g2_offset(
-                                sorted_row, col + inter_dim, stride_dz_r);
+                            gate_base + blocked_dz_up_delta;
                         *reinterpret_cast<u32x4*>(kargs.d_z + gate_base) =
                             d_gate_store;
                         *reinterpret_cast<u32x4*>(kargs.d_z + up_base) =

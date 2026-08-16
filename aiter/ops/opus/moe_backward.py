@@ -140,7 +140,7 @@ def _select_fixed_down_block_n(
 ) -> int:
     """Mirror native K1 dispatch so workspace shape and kernel stay coupled."""
 
-    if kernel_id in (11, 12, 13, 14, 15, 16):
+    if kernel_id in (11, 12, 13, 14, 15, 16, 17):
         if inter_dim % 256 != 0:
             raise ValueError("BN256 down kernels require I divisible by 256")
         return 256
@@ -167,7 +167,7 @@ def _select_saved_a_scaled_down_kernel(
 ) -> int:
     """Map a BN256 K1 policy to its no-a_scaled-write counterpart."""
 
-    if kernel_id in (13, 14, 15, 16):
+    if kernel_id in (13, 14, 15, 16, 17):
         return kernel_id
     if kernel_id == 11:
         return 13
