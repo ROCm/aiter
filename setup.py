@@ -448,7 +448,11 @@ setup_requires = [
     "psutil",
     "ninja",
     "setuptools_scm",
-    "vcs_versioning",  # transitive dep of setuptools_scm>=10
+    # Transitive dep of setuptools_scm>=10. The lower bound matters: setuptools_scm
+    # 10.2 imports vcs_versioning._environment, which only exists from 2.0 on, and
+    # an unpinned requirement lets fetch_build_eggs keep a stale 1.x already in
+    # site-packages, failing at import time rather than at resolution time.
+    "vcs_versioning>=2.0.0",
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
