@@ -56,9 +56,9 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
-from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,

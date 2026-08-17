@@ -7,6 +7,7 @@
 namespace aiter {
 namespace torch_itfs {
 
+// Validate packed operands, select the exact format/scale manifest row, and launch its code object.
 void fmha_v4_fwd(const at::Tensor& q,
                  const at::Tensor& k,
                  const at::Tensor& v,

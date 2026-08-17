@@ -16,6 +16,7 @@ namespace aiter {
 namespace torch_itfs {
 namespace {
 
+// These IDs are shared with AttentionFormat in mha_v4.py and the HSA manifests.
 enum class AttentionFormat : int64_t
 {
     Fp32        = 0,
@@ -36,6 +37,7 @@ enum class AttentionFormat : int64_t
 
 constexpr int64_t format_id(AttentionFormat format) { return static_cast<int64_t>(format); }
 
+// Scale granularity is dispatched independently from the operand encoding.
 enum class AttentionScaleMode : int64_t
 {
     None                 = 0,
@@ -68,6 +70,7 @@ struct ScalarSlot
     uint32_t padding[3];
 };
 
+// Fixed-width slots reproduce the 656-byte kernarg layout embedded in MHA v4 code objects.
 struct __attribute__((packed)) FmhaV4Kernarg
 {
     PointerSlot ptr_o;

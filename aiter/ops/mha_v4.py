@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""Dense MHA v4 preprocessing, packed-layout helpers, and launch APIs.
+
+Raw BF16 BSHD operands are quantized into the layouts consumed by the MHA v4
+ASM kernels. Format and scale-mode IDs are part of the launcher ABI.
+"""
+
 from enum import IntEnum
 from typing import Optional
 
@@ -89,29 +95,38 @@ def rotate_activation_mxfp4_quant_k(
 
 
 class AttentionFormat(IntEnum):
+    """Stable operand-encoding IDs used by the Python/C++ dispatch ABI.
+
+    MX names are aliases for their underlying element encoding; scale
+    granularity is represented independently by :class:`AttentionScaleMode`.
+    """
+
     FP32 = 0
     FP16 = 1
     BF16 = 2
     FP8_E4M3 = 3
-    FP8 = FP8_E4M3
     FP8_E4M3_FNUZ = 4
     FP8_E5M2 = 5
     FP8_E5M2_FNUZ = 6
     FP6_E2M3 = 7
-    MXFP6_E2M3 = FP6_E2M3
-    MXFP6 = FP6_E2M3
     FP6_E3M2 = 8
-    MXFP6_E3M2 = FP6_E3M2
-    MXBF6 = FP6_E3M2
     FP4_E2M1 = 9
-    MXFP4 = FP4_E2M1
     INT8 = 10
     UINT8 = 11
     INT4 = 12
     UINT4 = 13
+    # Aliases
+    FP8 = FP8_E4M3
+    MXFP6_E2M3 = FP6_E2M3
+    MXFP6 = FP6_E2M3
+    MXFP6_E3M2 = FP6_E3M2
+    MXBF6 = FP6_E3M2
+    MXFP4 = FP4_E2M1
 
 
 class AttentionScaleMode(IntEnum):
+    """Stable IDs describing how each operand's descale tensor is indexed."""
+
     NONE = 0
     F32_PER_TENSOR = 1
     F32_PER_HEAD = 2
@@ -132,6 +147,7 @@ _PACKED_QK_WIDTH = {
 
 
 def native_fp8_format() -> AttentionFormat:
+    """Return the FP8 E4M3 encoding native to the active GPU architecture."""
     return (
         AttentionFormat.FP8_E4M3_FNUZ
         if get_gfx() == "gfx942"
@@ -182,6 +198,7 @@ def scale_modes_for_formats(
     k_format: AttentionFormat,
     v_format: AttentionFormat,
 ) -> tuple[AttentionScaleMode, AttentionScaleMode, AttentionScaleMode]:
+    """Return the canonical Q, K, and V scale modes for a format recipe."""
     _validate_format_contract(q_format, k_format, v_format)
     if q_format == AttentionFormat.INT8 or q_format in _FP8_FORMATS:
         v_scale_mode = (
@@ -329,7 +346,11 @@ def mha_v4_packed(
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
 ) -> Tensor:
-    """Launch a dense, non-causal MHA v4 kernel over pre-quantized BSHD operands."""
+    """Launch dense, non-causal MHA v4 over pre-quantized BSHD operands.
+
+    Formats and scale modes select an explicit ASM row. Packed widths and
+    nonstandard K layouts are validated before launch; output is BF16 BSHD.
+    """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     expected_scale_modes = scale_modes_for_formats(q_format, k_format, v_format)
@@ -457,6 +478,7 @@ def _quantize_per_tensor(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_int8_v2", mutates_args=())
 def quantize_int8(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tensor]:
+    """Per-tensor quantize a contiguous tensor to INT8 and return its scale."""
     return _quantize_per_tensor(input, torch.int8, 127.0, clip)
 
 
@@ -470,6 +492,7 @@ def _quantize_int8_fake(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tenso
 
 @torch.library.custom_op("aiter::mha_v4_quantize_fp8", mutates_args=())
 def quantize_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-tensor quantize a contiguous tensor to native FP8 and return its scale."""
     return _quantize_per_tensor(input, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0)
 
 
@@ -491,6 +514,7 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and quantize hd128 BSHD Q to MXFP8 data and E8M0 block scales."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP8 quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
     scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
@@ -509,6 +533,7 @@ def _quantize_mxfp8_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k", mutates_args=())
 def quantize_mxfp8_k(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Rotate and quantize hd128 BSHD K to MXFP8 data and E8M0 block scales."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(
         input, "MXFP8 K quantization"
     )
@@ -528,6 +553,7 @@ def _quantize_mxfp8_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
 def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd128 BSHD Q as MXFP4 data with E8M0 block scales."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP4 quantization")
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
@@ -554,6 +580,7 @@ def mxfp4_k_raw_buffer_size(batch: int, sequence: int, heads: int) -> int:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_k_raw", mutates_args=())
 def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd128 BSHD K into the coalesced MXFP4 ASM layout."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(
         input, "MXFP4 K quantization"
     )
@@ -598,6 +625,7 @@ def mxfp6_k_view(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
 def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd128 BSHD Q as MXFP6 E2M3 with E8M0 block scales."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(
         input, "MXFP6 E2M3 Q quantization"
     )
@@ -620,6 +648,7 @@ def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_raw", mutates_args=())
 def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd128 BSHD K into raw MXFP6 ASM data and scale buffers."""
     batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP6 E2M3 K quantization")
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
     raw = input.new_empty((data_size,), dtype=torch.uint8)
@@ -639,6 +668,7 @@ def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
 def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize hd128 BSHD V to FP8 with one FP32 scale per channel."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "FP8 V quantization")
     fp8_max = torch.finfo(dtypes.fp8).max
     scale_block_k = 256
@@ -707,6 +737,7 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
 def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
     _validate_bshd_hd128(input, "MXFP4 V quantization")
     return pack_v_mxfp4_colmajor_raw(input)
 
@@ -722,6 +753,7 @@ def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
 def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd128 BSHD V into MXFP6 data and E8M0 scale views."""
     _validate_bshd_hd128(input, "MXFP6 V quantization")
     return pack_fp6_v_data_scale_views(input)
 
@@ -881,7 +913,11 @@ def mha_v4(
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
 ) -> Tensor:
-    """Quantize BF16 BSHD operands and run dense, non-causal MHA v4."""
+    """Quantize BF16 BSHD operands and run dense, non-causal MHA v4.
+
+    Q and K formats must match. The selected Q/K/V recipe determines canonical
+    quantizers, scale modes, and the packed ASM row; output is BF16 BSHD.
+    """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:

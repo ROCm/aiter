@@ -15,6 +15,7 @@ namespace torch_itfs {
 namespace {
 
 constexpr int32_t kHeadDim             = 128;
+// Packed K tile offsets mirror the layouts loaded by the corresponding ASM kernels.
 constexpr int32_t kMxfp4KTileBytes     = 8192;
 constexpr int32_t kMxfp6KTileBytes     = 17408;
 constexpr int32_t kMxfp6C1Offset       = 8192;
