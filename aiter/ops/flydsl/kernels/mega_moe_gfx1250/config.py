@@ -7,13 +7,6 @@ _WAVE_SIZE = 32
 _LANE_MASK = _WAVE_SIZE - 1
 _LOG2_WAVE_SIZE = 5
 
-_FUSED_COMBINE_TIERS = (
-    (32, (8, 16)),
-    (256, (16, 16)),
-    (1024, (32, 16)),
-    (None, (64, 16)),
-)
-
 _DISPATCH_EP4 = (
     (256, 128, 16),
     (512, 192, 32),

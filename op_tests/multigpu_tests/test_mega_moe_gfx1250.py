@@ -23,7 +23,7 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
     ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
-    torchrun --standalone --nproc_per_node=4 test_mega_moe.py \
+    torchrun --standalone --nproc_per_node=4 test_mega_moe_gfx1250.py \
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
@@ -885,6 +885,7 @@ def main():
             print(tbl, flush=True)
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
+    accuracy_failure = None
     if args.acc_verify:
         out_dev = pipe.final_output().float()
         ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
@@ -899,9 +900,16 @@ def main():
                 f"tol={args.logits_tol})",
                 flush=True,
             )
+        if errs != 0:
+            accuracy_failure = (
+                f"MegaMoE accuracy check failed on {errs}/{dist_ctx.world} ranks: "
+                f"average logits_diff={avg_diff:.6f}, tolerance={args.logits_tol}"
+            )
 
     pipe.teardown()
     dist_ctx.shutdown()
+    if accuracy_failure is not None:
+        raise AssertionError(accuracy_failure)
 
 
 def _parse_args():
