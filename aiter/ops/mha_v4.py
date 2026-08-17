@@ -9,6 +9,8 @@ import triton
 from torch import Tensor
 
 from aiter import dtypes
+from aiter.jit.core import compile_ops
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
@@ -28,9 +30,6 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_raw_buffer_size,
     pack_v_mxfp4_colmajor_raw,
 )
-
-from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
 
 MHA_V4_LOG2E = 1.4426950408889634
 MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
@@ -142,6 +141,12 @@ def native_fp8_format() -> AttentionFormat:
 
 def _is_fp8_format(format: AttentionFormat) -> bool:
     return format in _FP8_FORMATS
+
+
+def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
+    if input.dim() != 4 or input.shape[-1] != 128 or not input.is_contiguous():
+        raise ValueError(f"{operation} requires contiguous hd128 BSHD input")
+    return input.shape
 
 
 def _validate_format_contract(
@@ -374,28 +379,11 @@ def mha_v4_packed(
     if v.shape[-1] != logical_head_dim:
         raise ValueError("MHA v4 currently requires logical V head dimension 128")
     if q_format == AttentionFormat.MXFP4:
-        if _is_fp8_format(v_format):
-            tiles = (k.shape[1] + 127) // 128
-            expected_k_stride = (
-                k.shape[2] * tiles * 8192,
-                64,
-                tiles * 8192,
-                1,
-            )
-            if k.stride() != expected_k_stride:
-                raise ValueError(
-                    "MXFP4/FP8 K must use the coalesced MHA v4 tile layout"
-                )
-        else:
-            tiles = (k.shape[1] + 127) // 128
-            expected_k_stride = (
-                k.shape[2] * tiles * 8192,
-                64,
-                tiles * 8192,
-                1,
-            )
-            if k.stride() != expected_k_stride:
-                raise ValueError("F4F4 K must use the coalesced MHA v4 tile layout")
+        tiles = (k.shape[1] + 127) // 128
+        head_stride = tiles * 8192
+        expected_k_stride = (k.shape[2] * head_stride, 64, head_stride, 1)
+        if k.stride() != expected_k_stride:
+            raise ValueError("MXFP4 K must use the coalesced MHA v4 tile layout")
 
     if softmax_scale is None:
         softmax_scale = logical_head_dim**-0.5
@@ -503,9 +491,7 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError("MXFP8 quantization requires contiguous hd128 BSHD input")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP8 quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
     scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
     rotate_activation_mxfp8_quant(quantized, scale, input, multiplier)
@@ -523,9 +509,9 @@ def _quantize_mxfp8_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k", mutates_args=())
 def quantize_mxfp8_k(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError("MXFP8 K quantization requires contiguous hd128 BSHD input")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "MXFP8 K quantization"
+    )
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
     scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
     rotate_activation_mxfp8_quant(quantized, scale, input, 1.0)
@@ -542,9 +528,7 @@ def _quantize_mxfp8_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
 def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError("MXFP4 quantization requires contiguous hd128 BSHD input")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP4 quantization")
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
     )
@@ -570,9 +554,9 @@ def mxfp4_k_raw_buffer_size(batch: int, sequence: int, heads: int) -> int:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_k_raw", mutates_args=())
 def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError("MXFP4 K quantization requires contiguous hd128 BSHD input")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "MXFP4 K quantization"
+    )
     raw = input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
@@ -614,11 +598,9 @@ def mxfp6_k_view(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
 def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError(
-            "MXFP6 E2M3 Q quantization requires contiguous hd128 BSHD input"
-        )
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "MXFP6 E2M3 Q quantization"
+    )
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
@@ -638,11 +620,7 @@ def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_raw", mutates_args=())
 def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError(
-            "MXFP6 E2M3 K quantization requires contiguous hd128 BSHD input"
-        )
+    batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP6 E2M3 K quantization")
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
     raw = input.new_empty((data_size,), dtype=torch.uint8)
     scale_raw = input.new_empty((scale_size,), dtype=torch.uint8)
@@ -661,9 +639,7 @@ def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
 def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    if head_dim != 128 or not input.is_contiguous():
-        raise ValueError("FP8 V quantization requires contiguous hd128 BSHD input")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "FP8 V quantization")
     fp8_max = torch.finfo(dtypes.fp8).max
     scale_block_k = 256
     scale_blocks = triton.cdiv(sequence, scale_block_k)
@@ -731,8 +707,7 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
 def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
-    if input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError("MXFP4 V quantization requires contiguous hd128 BSHD input")
+    _validate_bshd_hd128(input, "MXFP4 V quantization")
     return pack_v_mxfp4_colmajor_raw(input)
 
 
@@ -747,8 +722,7 @@ def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
 def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
-    if input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError("MXFP6 V quantization requires contiguous hd128 BSHD input")
+    _validate_bshd_hd128(input, "MXFP6 V quantization")
     return pack_fp6_v_data_scale_views(input)
 
 
@@ -764,13 +738,6 @@ def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
         (heads * head_stride, 96, head_stride, 1),
     )
     return quantized, input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
-
-
-_quantize_mxfp4 = quantize_mxfp4_q
-_quantize_v_mxfp4_raw = quantize_v_mxfp4
-_quantize_mxfp6_q = quantize_mxfp6_q
-_quantize_mxfp6_k_raw = quantize_mxfp6_k
-_quantize_v_fp8 = quantize_v_fp8
 
 
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:

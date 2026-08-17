@@ -65,9 +65,6 @@ def mha_v4_per_tensor_quant_kernel(
     tl.store(output_ptr + offsets, quantized, mask=mask)
 
 
-################# Sage V2 quantization kernels ####################
-
-
 @triton.jit
 def _compute_mx_quant_and_scale_rne(
     src_tensor,
@@ -1240,9 +1237,6 @@ def _q_smooth_int8_kernel(
         q_tile,
         mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
     )
-
-
-################# Sage V1 quantization kernels ####################
 
 
 @triton.jit

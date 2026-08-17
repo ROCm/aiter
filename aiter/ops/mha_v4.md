@@ -5,8 +5,8 @@
 
 ## Current Status
 
-Last updated: 2026-08-10. Dense BF16-output MHA v4 and the xDiT integration are implemented and
-validated on gfx950. A gfx942 signed INT8/FP8 row is also preserved under v4.
+Dense BF16-output MHA v4 and the xDiT integration are implemented and validated on gfx950. A
+gfx942 signed INT8/FP8 row is also preserved under v4.
 
 The public raw and packed APIs support six dense combinations:
 
@@ -72,8 +72,8 @@ for Ulysses overlap.
 Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
 finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
 unaligned and unequal sequence lengths, retained Wan captures, and balanced multi-GPU target-shape
-benchmarks. The focused suites currently pass `46/46` in `op_tests/test_mha_v4.py` and `15/15` in
-xDiT `tests/test_aiter_mixed_attention.py`.
+benchmarks. Focused coverage lives in `op_tests/test_mha_v4.py` and xDiT
+`tests/test_aiter_mixed_attention.py`.
 
 Still deferred:
 
@@ -90,10 +90,10 @@ Current gfx950 long-sequence dense ASM kernel throughput, excluding Q/K/V prepro
 | Q/K format | V format | Throughput (TFLOP/s) |
 |---|---|---:|
 | INT8 | FP8 | 2315 |
-| FP8 | FP8 | 3118 |
+| FP8 | FP8 | 3050 |
 | MXFP6 | FP8 | 3450 |
-| MXFP6 | MXFP4 | 3610 |
-| MXFP4 | FP8 | 3650 |
+| MXFP6 | MXFP4 | 3700 |
+| MXFP4 | FP8 | 3695 |
 | MXFP4 | MXFP4 | 4000 |
 
 These values are the current optimization baselines, not portable performance guarantees. Attach
@@ -186,26 +186,16 @@ both focused suites, and repeated retained Wan captures. At
 `212981592d1e4801f93db1cb8cc37db1ed7335e3fdadf53c0d01e7bd53917d72` (F4F4) and
 `a5046f1dcc0d51033122310efab70796e690086391285b9e5cdeaa5496d292a9` (F6F4).
 
-### Future MXFP6 K Fusion
+### MXFP6 K Contract
 
-Production MXFP6 K deliberately remains two stages: native hd128 Hadamard/scale/E2M3 packing, then
-a Triton reorder into the compact 17,408-byte-per-tile ABI. Direct fusion must preserve exactly
-12,288 bytes of C0/C1 data, a 4,096-byte reserved region, and a 1,024-byte scale tail. The safest
-next design is one tile per Triton program, with disjoint 16-byte C0, 8-byte C1, and scale-tail
-owners.
+MXFP6 K preprocessing fuses hd128 Hadamard rotation, E2M3 quantization, and final ASM-order packing
+in one HIP launch. Each 128-token/head tile contains 12,288 data bytes, a 4,096-byte reserved
+region, and a 1,024-byte scale tail. Partial tiles are zero-filled, and the public custom op returns
+contiguous raw data and scale buffers so compiled callers never carry the exotic logical view.
 
-Rejected native attempts split `__builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32` through element
-indexing, shuffles, temporary vectors, `memcpy`, or LDS reinterpretation. They could match sampled
-bytes yet corrupt later allocations. Do not use overlapping scale-image stores, form out-of-bounds
-tail pointers, or assume a masked selection prevents speculative invalid loads.
-
-Promotion requires byte equality against `reorder_fp6_k_lds_order_triton` for compact data, scale
-tails, and valid scale bytes at sequence lengths `1, 127, 128, 129, 257`; guarded-allocation stress;
-the complete MHA v4 and xDiT mixed-attention suites in one process; compiled allocator churn; and
-repeated full Wan captures. Keep the contiguous raw-buffer custom-op ABI unchanged.
-
-Arbitrary code-object paths and symbols are not a production API. Kernel-development tools may
-retain a separate direct launcher.
+Changes to this path require byte equality against `reorder_fp6_k_lds_order_triton` for compact
+data, scale tails, and valid scale bytes at aligned and ragged sequence lengths. Keep the raw-buffer
+custom-op ABI unchanged unless the op name is versioned with the layout.
 
 ## Formats And Scales
 

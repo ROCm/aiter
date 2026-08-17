@@ -3,7 +3,6 @@ import functools
 import torch
 import triton
 
-import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
@@ -22,89 +21,12 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
-def fused_sage_quant_mxfp4(
-    q,
-    k,
-    v,
-    BLOCK_M,
-    hadamard_rotation=False,
-    R=None,
-    BLOCK_R=None,
-    q_smoothing=False,
-    layout="bshd",
-):
+def _bshd_order(layout):
+    if layout == "bshd":
+        return [0, 1, 2, 3]
     if layout == "bhsd":
-        b, _h_qo, _qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-        )
-
-    elif layout == "bshd":
-        b, _qo_len, _h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
-    sm_scale = head_dim**-0.5
-
-    q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
-        q,
-        k,
-        BLOCK_SIZE_M=BLOCK_M,
-        hadamard_rotation=hadamard_rotation,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
-
-    FP8_TYPE = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(FP8_TYPE).max
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    BLOCK_K = 1024
-    K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
-
-    # V tensor per channel quantization
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
-    v_task_count = b * h_kv * K_NUM_BLKS
-    grid = (v_task_count,)
-    sage_quant_v_kernel[grid](
-        v,
-        v_fp8,
-        v_scale,
-        stride_bz_v,
-        stride_h_v,
-        stride_seq_v,
-        stride_d_v,
-        v_scale.stride(0),
-        v_scale.stride(1),
-        b,
-        h_kv,
-        K_NUM_BLKS,
-        kv_len,
-        D=head_dim,
-        BLK_K=BLOCK_K,
-        num_stages=5,
-        num_warps=8,
-    )
-
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+        return [0, 2, 1, 3]
+    raise ValueError(f"Unknown tensor layout: {layout}")
 
 
 def sage_quant_mxfp4(
@@ -125,39 +47,16 @@ def sage_quant_mxfp4(
     return_lse=False,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-        )
-
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
+    order = _bshd_order(layout)
+    b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
+    _, kv_len, h_kv, _ = map_dims(v.shape, order)
+    stride_bz_v, stride_seq_v, stride_h_v, stride_d_v = map_dims(v.stride(), order)
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -239,9 +138,9 @@ def sage_quant_mxfp4(
 
 def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     """Center Q per block and compute delta_s bias for INT8 Sage v1 (no Hadamard)."""
-    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-    b, s_q, h_q, d = map_dims(q.shape, bshd)
-    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+    order = _bshd_order(layout)
+    b, s_q, h_q, d = map_dims(q.shape, order)
+    _, s_k, h_k, _ = map_dims(k.shape, order)
 
     Q_NUM_BLKS = (s_q + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (s_k + BLKQ - 1) // BLKQ
@@ -252,9 +151,9 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     )
     q_out = torch.empty_like(q)
 
-    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
-    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(q_out.stride(), bshd)
-    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), order)
+    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(q_out.stride(), order)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), order)
 
     sm_scale_log2 = sm_scale * 1.4426950408889634
     grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
@@ -677,21 +576,11 @@ def sage_quant(
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
+    order = _bshd_order(layout)
+    b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
+    _, kv_len, h_kv, _ = map_dims(k.shape, order)
+    stride_bz_q, stride_seq_q, stride_h_q, _ = map_dims(q.stride(), order)
+    stride_bz_k, stride_seq_k, stride_h_k, _ = map_dims(k.stride(), order)
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
@@ -1122,8 +1011,6 @@ def smooth_rotate_downcast_qk(
     )
 
     if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
@@ -1153,21 +1040,14 @@ def smooth_rotate_downcast_qk(
 
 @functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
-    """
-    Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
-    """
+    """Return an unnormalized Sylvester Hadamard matrix."""
     assert (block_size & (block_size - 1)) == 0, "block_size must be power of 2"
     assert block_size > 0, "block_size must be positive"
 
-    # Base case: H_1 = [1]
     if block_size == 1:
         return torch.ones(1, 1, device=device, dtype=dtype)
 
-    # Recursive construction: H_{2n} = [H_n   H_n  ]
-    #                                   [H_n  -H_n ]
     H_half = create_hadamard_matrix(block_size // 2, device=device, dtype=dtype)
-
-    # Build the full matrix (unnormalized)
     H = torch.zeros(block_size, block_size, device=device, dtype=dtype)
     half = block_size // 2
     H[:half, :half] = H_half
@@ -1175,22 +1055,4 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
     H[half:, :half] = H_half
     H[half:, half:] = -H_half
 
-    # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
-    # remember to divide by sqrt(block_size) to get orthogonal matrix
     return H
-
-
-def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
-    # 1. Generate the deterministic Hadamard matrix (H)
-    H = create_hadamard_matrix(block_size, device=device, dtype=dtype) / (
-        block_size**0.5
-    )
-    # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
-    # This generates random +1 or -1 for each column
-    random_signs = (
-        torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
-    )
-    # 3. Apply the random signs (H @ D)
-    # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
-    H_tilde = H * random_signs
-    return H_tilde
