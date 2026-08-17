@@ -301,15 +301,21 @@ the FlyDSL cold harness.
       Per-cell spread is **<1% for almost all cells**; CK is extremely stable (mostly <0.5%).
       The only noisy (>5%) cells are the small/fast `down` cells (e.g. deepseek down fp4 B=1
       ~7%, minimax down fp8 B=1/B=2 ~6–7%) — exactly the under-converged fast-cell regime D1
-      warned about. Artifact regenerated: `tickets/667/g9_compare_postroute.{md,csv}`.
+      warned about. Artifact: `tickets/667/g9_compare.{md,csv}` (D6 of-record).
 - [x] `%peak>100%` resolved (2026-08-17): was the shared-expert routing bug (FlyDSL read
       TOPK vs CK's B*TOPK per launch); after the distinct-per-token fix all cells are
       `%peak≤100%` (post-route table). `_HBM_PEAK_TBS=8.0` confirmed reasonable for gfx950.
 
-#### D6 — one-command reproducible driver + checked-in artifact  [ ]
-- [ ] Top-level entry (script / Make target) that optionally rebuilds CK, locks clocks, runs
-      `compare.py` under `flydsl_venv` on GPU 6, and writes CSV + markdown into `tickets/667/`.
-- [ ] Reference the generated artifact from the plan doc.
+#### D6 — one-command reproducible driver + checked-in artifact  [x]
+- [x] `tickets/667/harness/run_g9_compare.sh` — one-command driver that optionally
+      rebuilds CK (`--build-ck`), then runs `compare.py` under `flydsl_venv` on GPU 6 with
+      the of-record flags (`--iters 1000 --cold 20 --repeats 3`) and writes CSV + markdown to
+      `tickets/667/g9_compare.{md,csv}`. Flags: `--gpu/--repeats/--iters/--cold/--out-prefix`
+      plus `-- <compare.py args>` passthrough. **No clock-locking step** — clocks can't be
+      pinned on this gfx950 (D1); D5's N-repeat spread + effective-SCLK sampling record the
+      clock regime in the artifact header instead.
+- [x] Checked-in artifact: `tickets/667/g9_compare.{md,csv}` (of-record, repeats=3). Reproduce
+      with `bash tickets/667/harness/run_g9_compare.sh`.
 
 #### D7 — (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs  [ ]
 Both harnesses are currently **perf-only** (CK runs uninitialized weights + dummy scales;
@@ -419,7 +425,8 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   byte-for-byte matching CK; dropped `n_route`; bounded the correctness gate to the first
   `_COS_CHK_TOKENS=4` tokens (per-token work is uniform) so the fp32 reference doesn't
   dequant the whole pool (would OOM at DeepSeek B=32). Verified `cos=1.0000` (FP4+FP8) and no
-  OOM through DeepSeek B=32. Regenerated `tickets/667/g9_compare_postroute.{md,csv}`:
+  OOM through DeepSeek B=32. Regenerated the compare table (then `g9_compare_postroute`,
+  since superseded by the D6 of-record `g9_compare.{md,csv}`):
   **all `%peak≤100%`** (max 80.9%) and B>1 ratios corrected sharply toward parity, e.g.
   minimax down fp8 B=32 0.563→0.995, qwen gate_up fp8 B=32 0.430→0.922, deepseek down fp4
   B=32 0.596→0.863. New story: FlyDSL's edge is largest at B=1 (latency regime) and converges
@@ -437,12 +444,18 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   headline us = per-cell median, new `fly_spr%`/`ck_spr%` = 100·(max−min)/median), a
   `--noise-pct` (default 5%) noisy-cell flag, and a background `ClockSampler` that polls
   `rocm-smi --showgpuclocks` SCLK @0.25s and folds loaded (≥400 MHz) min/median/max +
-  repeats into the provenance header. Regenerated `g9_compare_postroute.{md,csv}` (repeats=3):
+  repeats into the provenance header. Regenerated the of-record table (repeats=3):
   effective **loaded SCLK median ~2391 MHz** under sustained load (near the top {2400} DPM
   level — the decode sweep pins it higher than the ~1789 matmul probe). Spread is **<1% for
   almost every cell**; CK is rock-steady (<0.5%). Only the small/fast `down` cells trip the
   5% flag (deepseek down fp4 B=1 ~7%, minimax down fp8 B=1/B=2 ~6–7%), matching D1's
   under-converged fast-cell caveat. ruff/py_compile clean.
+- 2026-08-17 — **D6 reproducible driver + checked-in artifact DONE.** Added
+  `tickets/667/harness/run_g9_compare.sh` (one command: optional `--build-ck`, then the
+  of-record `compare.py` sweep on GPU 6 with `--iters 1000 --cold 20 --repeats 3`, writing
+  `tickets/667/g9_compare.{md,csv}`; flags `--gpu/--repeats/--iters/--cold/--out-prefix` + a
+  `-- <args>` passthrough). No clock-lock step (D1). Generated the canonical of-record
+  `g9_compare.{md,csv}` and retired the transitional `g9_compare_postroute.{md,csv}`.
 - 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
   measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
   entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in
