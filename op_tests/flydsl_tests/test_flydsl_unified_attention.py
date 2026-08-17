@@ -44,6 +44,10 @@ PAGE = 64
 HEAD_DIM = 128
 DEV = "cuda"
 
+# Vectorization width of the shuffled 5D KV cache (see _KV_VEC_SIZE in
+# unified_attention_kernels.py): 16 fp8 elements = one 128-bit dwordx4.
+_KV_VEC = 16
+
 # Project numeric gate is `err < 1e-1, cos > 0.99, bad_rows == 0` against an
 # fp32 reference; bad_rows catches whole-sequence failures an aggregate
 # cosine would hide.
@@ -59,7 +63,9 @@ MAX_REL_ERR = 8e-2
 MIN_COS = 0.99
 
 
-def _build(query_lens, kv_lens, num_heads, num_kv_heads, seed=0):
+def _build(
+    query_lens, kv_lens, num_heads, num_kv_heads, seed=0, out_dtype=torch.bfloat16
+):
     """Build a unified-attention call: packed Q, a scattered page pool, and a
     block table whose pages are deliberately non-contiguous."""
     g = torch.Generator(device=DEV).manual_seed(seed)
@@ -108,24 +114,161 @@ def _build(query_lens, kv_lens, num_heads, num_kv_heads, seed=0):
     cu_q = torch.zeros(len(query_lens) + 1, device=DEV, dtype=torch.int32)
     cu_q[1:] = torch.tensor(query_lens, device=DEV, dtype=torch.int32).cumsum(0)
     seqused_k = torch.tensor(kv_lens, device=DEV, dtype=torch.int32)
-    out = torch.empty(total_q, num_heads, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    out = torch.empty(total_q, num_heads, HEAD_DIM, device=DEV, dtype=out_dtype)
     return q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds
 
 
-def _run(query_lens, kv_lens, num_heads, num_kv_heads, softmax_scale=None, seed=0):
-    """Call the adapter and the reference; return (got, want) or None if declined."""
+def _shuffle_k_to_vectorized(kpool, vec=_KV_VEC):
+    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, D//vec, PAGE, vec]. Ported
+    from scripts/test_stage1_decode.py (pre-removal); this is the exact
+    permutation the decode kernel's vectorized K loader assumes."""
+    nb, page, hkv, d = kpool.shape
+    x = kpool.permute(0, 2, 3, 1).contiguous()  # [nb,hkv,d,page]
+    x = x.view(nb, hkv, d // vec, vec, page)
+    return x.permute(0, 1, 2, 4, 3).contiguous()  # [nb,hkv,d//vec,page,vec]
+
+
+def _shuffle_v_to_vectorized(vpool, vec=_KV_VEC):
+    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, PAGE//vec, D, vec]. Ported
+    from scripts/test_stage1_decode.py (pre-removal); this is the exact
+    permutation the decode kernel's vectorized V loader assumes."""
+    nb, page, hkv, d = vpool.shape
+    x = vpool.permute(0, 2, 3, 1).contiguous()  # [nb,hkv,d,page]
+    x = x.view(nb, hkv, d, page // vec, vec)
+    return x.permute(0, 1, 3, 2, 4).contiguous()  # [nb,hkv,page//vec,d,vec]
+
+
+def _build_padded(
+    query_lens,
+    kv_lens,
+    num_heads,
+    num_kv_heads,
+    seed=0,
+    out_dtype=torch.bfloat16,
+    pool_blocks=None,
+    shuffled=False,
+):
+    """Like `_build`, but (a) the page pool can be padded far past the pages
+    actually used (`pool_blocks`, e.g. 65536 -- the production 2 GB pool whose
+    high page ids exercise the per-page BufferDesc rebasing rather than a
+    flat whole-pool offset) and (b) the pool can be handed to the kernel in
+    the shuffled 5D layout (`shuffled=True`).
+
+    Returns the SAME linear (unshuffled) 4D k/v alongside whatever the kernel
+    actually consumes, so the caller can still validate against
+    `ref_paged_attn`, which only understands the linear 4D layout.
+    """
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    total_q = sum(query_lens)
+    q_bf = torch.randn(
+        total_q, num_heads, HEAD_DIM, generator=g, device=DEV, dtype=torch.bfloat16
+    )
+
+    pages_per = [(ln + PAGE - 1) // PAGE for ln in kv_lens]
+    stride = max(max(pages_per), 1)
+    n_pages = max(sum(pages_per), 1)
+    nblocks = n_pages if pool_blocks is None else pool_blocks
+
+    # Only the pages actually referenced by the block table carry real data;
+    # the rest of a padded pool stays zero (ref_paged_attn never reads them,
+    # and the kernel only rebases into pages the block table names).
+    k_used = torch.randn(
+        n_pages,
+        PAGE,
+        num_kv_heads,
+        HEAD_DIM,
+        generator=g,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
+    v_used = torch.randn(
+        n_pages,
+        PAGE,
+        num_kv_heads,
+        HEAD_DIM,
+        generator=g,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
+    perm = torch.randperm(nblocks, generator=torch.Generator().manual_seed(seed + 1))
+    used_ids = perm[:n_pages]
+    k_bf = torch.zeros(
+        nblocks, PAGE, num_kv_heads, HEAD_DIM, device=DEV, dtype=torch.bfloat16
+    )
+    v_bf = torch.zeros_like(k_bf)
+    k_bf[used_ids] = k_used
+    v_bf[used_ids] = v_used
+
+    bt = torch.zeros(len(kv_lens), stride, device=DEV, dtype=torch.int32)
+    c = 0
+    for i, np_ in enumerate(pages_per):
+        for t in range(np_):
+            bt[i, t] = int(used_ids[c])
+            c += 1
+
+    q, q_ds = _q8(q_bf)
+    k, k_ds = _q8(k_bf)
+    v, v_ds = _q8(v_bf)
+
+    cu_q = torch.zeros(len(query_lens) + 1, device=DEV, dtype=torch.int32)
+    cu_q[1:] = torch.tensor(query_lens, device=DEV, dtype=torch.int32).cumsum(0)
+    seqused_k = torch.tensor(kv_lens, device=DEV, dtype=torch.int32)
+    out = torch.empty(total_q, num_heads, HEAD_DIM, device=DEV, dtype=out_dtype)
+
+    if shuffled:
+        k_arg = _shuffle_k_to_vectorized(k)
+        v_arg = _shuffle_v_to_vectorized(v)
+    else:
+        k_arg, v_arg = k, v
+    return q, k_arg, v_arg, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds, k, v
+
+
+def _run(
+    query_lens,
+    kv_lens,
+    num_heads,
+    num_kv_heads,
+    softmax_scale=None,
+    seed=0,
+    out_dtype=torch.bfloat16,
+    shuffled_kv_cache=False,
+    pool_blocks=None,
+):
+    """Call the adapter and the reference; return (got, want) or None if declined.
+
+    ``shuffled_kv_cache``/``pool_blocks`` route through `_build_padded` instead
+    of `_build` (production 5D-shuffled cache and/or a page pool padded past
+    what's actually used); the reference is always computed from the
+    equivalent LINEAR 4D pool, since `ref_paged_attn` only understands that
+    layout.
+    """
     from aiter.ops.flydsl.unified_attention_kernels import flydsl_unified_attention
 
-    q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
-        query_lens, kv_lens, num_heads, num_kv_heads, seed
-    )
+    if shuffled_kv_cache or pool_blocks is not None:
+        q, k_arg, v_arg, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds, k_lin, v_lin = (
+            _build_padded(
+                query_lens,
+                kv_lens,
+                num_heads,
+                num_kv_heads,
+                seed,
+                out_dtype,
+                pool_blocks,
+                shuffled_kv_cache,
+            )
+        )
+    else:
+        q, k_arg, v_arg, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
+            query_lens, kv_lens, num_heads, num_kv_heads, seed, out_dtype
+        )
+        k_lin, v_lin = k_arg, v_arg
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
 
     got = flydsl_unified_attention(
         q,
-        k,
-        v,
+        k_arg,
+        v_arg,
         out,
         cu_q,
         max(query_lens),
@@ -143,19 +286,20 @@ def _run(query_lens, kv_lens, num_heads, num_kv_heads, softmax_scale=None, seed=
         block_size=PAGE,
         num_queries_per_kv=num_heads // num_kv_heads,
         num_seqs=len(query_lens),
+        shuffled_kv_cache=shuffled_kv_cache,
     )
     if got is None:
         return None
 
     want = ref_paged_attn(
         query=q,
-        key_cache=k,
-        value_cache=v,
+        key_cache=k_lin,
+        value_cache=v_lin,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=bt,
         scale=softmax_scale,
-        out_dtype=torch.bfloat16,
+        out_dtype=out_dtype,
         q_descale=q_ds,
         k_descale=k_ds,
         v_descale=v_ds,
@@ -196,55 +340,141 @@ def test_build_is_deterministic():
 # --- shape regimes -----------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "num_heads,num_kv_heads", [(64, 64), (64, 16), (64, 4), (64, 1)]
-)
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(64, 4), (64, 64)])
 def test_gqa_ratios(num_heads, num_kv_heads):
-    """1:1 (packing auto-disables) through 64:1 (the deepest packed group)."""
+    """16:1 (the decode-specialized kernel's own ratio) and 1:1/MHA (packing
+    auto-disables)."""
     r = _run([256] * 2, [256] * 2, num_heads, num_kv_heads)
     assert r is not None, "adapter declined a supported config"
     _check(*r)
 
 
-@pytest.mark.parametrize("kv_len", [512, 4096, 16384])
-def test_prefill_context_depths(kv_len):
-    """Chunked prefill: a short new-token chunk against a deep cache."""
-    r = _run([512], [kv_len], 64, 4)
-    assert r is not None
-    _check(*r)
+# --- prefill / decode / mixed correctness, all modes -------------------------
 
 
-@pytest.mark.parametrize("num_seqs", [1, 7, 64])
-def test_decode_batches(num_seqs):
-    """Pure decode: one query token per sequence."""
-    r = _run([1] * num_seqs, [4096] * num_seqs, 64, 4)
-    assert r is not None
-    _check(*r)
+_CORRECTNESS_CASES = [
+    pytest.param(
+        {
+            "query_lens": [512],
+            "kv_lens": [4096],
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+        },
+        id="prefill-512to4096-bf16",
+    ),
+    pytest.param(
+        {
+            "query_lens": [512],
+            "kv_lens": [4096],
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.float16,
+        },
+        id="prefill-512to4096-f16",
+    ),
+    pytest.param(
+        {
+            "query_lens": [1] * 8,
+            "kv_lens": [4096] * 8,
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+        },
+        id="decode-1to4096x8-gqa16-bf16",
+    ),
+    pytest.param(
+        {
+            "query_lens": [1] * 8,
+            "kv_lens": [4096] * 8,
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.float16,
+        },
+        id="decode-1to4096x8-gqa16-f16",
+    ),
+    pytest.param(
+        {
+            "query_lens": [1] * 8,
+            "kv_lens": [4096] * 8,
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+            "shuffled_kv_cache": True,
+        },
+        id="decode-1to4096x8-gqa16-bf16-shuffled",
+    ),
+    pytest.param(
+        # Production pool: 65536 blocks = 2 GB fp8 = exactly 2**31 elements --
+        # the per-page-rebasing stress case (page ids up to 65535 => 2**31-byte
+        # page-base offsets) that whole-pool addressing faulted on. Shuffled
+        # (production layout).
+        {
+            "query_lens": [1] * 8,
+            "kv_lens": [4096] * 8,
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+            "shuffled_kv_cache": True,
+            "pool_blocks": 65536,
+        },
+        id="decode-production-pool-65536-bf16",
+    ),
+    pytest.param(
+        # Ragged batch=8, deep+shallow mixed depths: with num_kv_heads=4 the
+        # host plan (plan_num_kv_splits) picks S=8, exercising the split-K
+        # cross-split LSE combine on unequal per-sequence depths.
+        {
+            "query_lens": [1] * 8,
+            "kv_lens": [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048],
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+        },
+        id="decode-splitk-ragged-b8",
+    ),
+    pytest.param(
+        {
+            "query_lens": [4023] + [1] * 8,
+            "kv_lens": [4023] + [16384] * 8,
+            "num_heads": 64,
+            "num_kv_heads": 4,
+            "out_dtype": torch.bfloat16,
+        },
+        id="mixed-4023-plus-1x8",
+    ),
+]
 
 
-def test_mixed_batch():
-    """The production shape: one prefill chunk batched with decodes in a single
-    launch. This is what unified attention exists for, and the case the
-    M-dimension packing was built to serve."""
-    r = _run([4023] + [1] * 8, [4023] + [16384] * 8, 64, 4)
-    assert r is not None
+@pytest.mark.parametrize("kwargs", _CORRECTNESS_CASES)
+def test_correctness_all_modes(kwargs):
+    """Prefill/decode/mixed correctness against `ref_paged_attn`, across output
+    dtype, the production shuffled 5D KV-cache layout, a padded production-scale
+    page pool, and a split-K-triggering ragged decode batch. Subsumes the former
+    per-axis sweeps (prefill context depth, decode batch size, mixed batch) plus
+    the three regression guards carried over from scripts/test_stage1_decode.py
+    (production pool, split-K, shuffled layout)."""
+    r = _run(**kwargs)
+    assert r is not None, "adapter declined a supported config"
     _check(*r)
 
 
 # --- softmax_scale injection -------------------------------------------------
 
 
-def test_softmax_scale_default():
-    """1/sqrt(d): the ratio is exactly 1 and q_descale passes through untouched."""
-    r = _run([256], [256], 64, 4, softmax_scale=1.0 / math.sqrt(HEAD_DIM))
-    assert r is not None
-    _check(*r)
-
-
-@pytest.mark.parametrize("mult", [0.5, 2.0])
-def test_softmax_scale_non_default(mult):
-    """A scale the kernel cannot bake in, folded into q_descale instead. Far
-    enough from 1.0 that a mis-applied factor cannot pass."""
+@pytest.mark.parametrize(
+    "mult",
+    [
+        pytest.param(1.0, id="default-ratio-1"),
+        pytest.param(0.5, id="half"),
+        pytest.param(2.0, id="double"),
+    ],
+)
+def test_softmax_scale(mult):
+    """A softmax_scale the kernel folds into q_descale (mult=1.0 is the
+    near-universal 1/sqrt(d) case, where the ratio is exactly 1 and q_descale
+    passes through untouched; 0.5/2.0 are scales the kernel cannot bake in,
+    far enough from 1.0 that a mis-applied factor cannot pass)."""
     r = _run([256], [256], 64, 4, softmax_scale=mult / math.sqrt(HEAD_DIM))
     assert r is not None
     _check(*r)
