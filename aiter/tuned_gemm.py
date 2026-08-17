@@ -180,6 +180,12 @@ def get_GEMM_A16W16_config_():
     return gemm_dict
 
 
+# The skinny GEMM kernels (wvSpltK / LLMM1 / wv_splitk_small_fp16_bf16) only have a
+# real body under __HIP__MI350_MI300_MI250__ in csrc/kernels/custom_kernels.cu; every
+# other arch compiles the assert(false) stub, so never pick skinny as the default.
+_SKINNY_GEMM_ARCHS = {"gfx90a", "gfx942", "gfx950"}
+
+
 def is_skinny_default_shape(
     M: int,
     N: int,
@@ -187,6 +193,8 @@ def is_skinny_default_shape(
     dtype,
     cu_num: int | None = None,
 ):
+    if get_gfx() not in _SKINNY_GEMM_ARCHS:
+        return False
     if isinstance(dtype, str):
         dtype = eval(dtype)
     cu_num = get_cu_num() if cu_num is None else cu_num
