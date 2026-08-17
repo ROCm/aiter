@@ -2541,7 +2541,8 @@ def get_2stage_cfgs(
         is_layout_gemm2 = isinstance(kernelName2, str) and kernelName2.startswith(
             "flydsl_moe2_layout_"
         )
-        if _is_mxfp4_kname(kernelName2) or is_layout_gemm2:
+        is_native_gemm2 = _is_mxfp4_kname(kernelName2)
+        if is_native_gemm2 or is_layout_gemm2:
             stage2_func = functools.partial(
                 _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
             )
@@ -2563,6 +2564,9 @@ def get_2stage_cfgs(
         stage2_supports_bias = isinstance(kernelName2, str) and (
             kernelName2.startswith(("flydsl_", "cktile_"))
         )
+        needs_reverse_sorted = (
+            is_native_gemm2 and not parse_g2_kname_any(kernelName2)["atomic"]
+        )
         return MOEMetadata(
             stage1=functools.partial(
                 _mxfp4_a4w4_stage1_fw,
@@ -2576,7 +2580,7 @@ def get_2stage_cfgs(
             block_m=_bm,
             ksplit=int(ksplit),
             fuse_quant=_p1["out_dtype"],
-            output_aux=False,
+            output_aux=needs_reverse_sorted,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,
