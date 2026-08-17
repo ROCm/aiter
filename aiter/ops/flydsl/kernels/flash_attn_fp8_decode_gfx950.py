@@ -59,6 +59,26 @@ HEAD_DIM = 128
 BLOCK_M = 16  # one GQA group = MMA M-dim
 VEC = 16  # 5D-shuffled vectorization width
 _LOG2E = _math.log2(_math.e)
+GFX950_CUS = 256  # MI355X compute units
+
+
+def plan_num_kv_splits(batch, num_kv_heads, npages, target_wg=GFX950_CUS, s_max=8):
+    """Fill-aware host plan for the inter-workgroup KV split S.
+
+    The base grid is ``batch * num_kv_heads`` workgroups; at low batch this
+    under-fills the 256 CUs. Split so the total grid reaches ``target_wg``
+    resident workgroups. ``target_wg=256`` (1 WG/CU) is the measured optimum:
+    although freeing V's LDS opened 2 WG/CU, over-splitting past one-WG/CU fill
+    regresses (the per-split combine overhead and smaller tiles outweigh the
+    extra occupancy). This gives S = ceil(256/(b*H_kv)), i.e. b=8->8, b=16->4,
+    b=32->2, b=64->1 -- matching the per-cell S sweep and never regressing b=64
+    (base=256 -> S=1). S is capped at ``s_max`` and at ``npages`` (>= 1 page per
+    split; the -1e30 mask makes an over-split correct anyway, just wasteful).
+    """
+    base = max(1, batch * num_kv_heads)
+    s = (target_wg + base - 1) // base  # ceil(target_wg / base)
+    s = max(1, min(s, s_max, max(1, int(npages))))
+    return s
 
 
 def build_flash_attn_fp8_decode_module(
@@ -72,6 +92,7 @@ def build_flash_attn_fp8_decode_module(
     paged=True,
     kv_cache_layout="linear",
     num_waves=8,  # tuned for full-machine b=64 (8 waves/CU, matches the asm ref)
+    num_kv_splits=1,  # Stage-3 inter-workgroup KV split S; host-computed per shape
 ):
     """Build the gfx950 decode-specialized fp8 flash-attention launcher.
 
@@ -113,13 +134,22 @@ def build_flash_attn_fp8_decode_module(
     NW = int(num_waves)
     BUFSZ = PAGE * HEAD_DIM  # one K (or V) tile in bytes/elements, per wave
     OPART = D * BLOCK_M  # one wave's O^T partial (128*16 f32)
+    # Stage-3 inter-workgroup KV split. S=1 => the Stage-2 kernel (direct O
+    # store, no workspace). S>1 => each (batch, kv-head, split) workgroup writes
+    # an UNNORMALIZED partial (m, l, O) for its contiguous KV sub-range to a
+    # global workspace; a separate combine kernel LSE-merges the S partials.
+    SPLK = int(num_kv_splits)
+    SPLITK = SPLK > 1
+    # per (b,h,s) workspace row: O[D*BLOCK_M] + m[BLOCK_M] + l[BLOCK_M].
+    WS_PER = D * BLOCK_M + 2 * BLOCK_M
     # JIT-cache disambiguator. Builds that differ ONLY in out_dtype (bf16 vs
     # f16), cache layout, or wave count produce near-identical IR; without a
     # distinct closure value the flydsl disk cache aliases them and serves the
     # wrong binary. Referenced inside launch so it is part of the cache key.
     _cache_tag = (
         f"flash_attn_fp8_decode|out={out_dtype_str}|layout={kv_cache_layout}"
-        f"|varlen={int(VARLEN)}|causal={int(bool(causal))}|H={H}|HKV={HKV}|nw={NW}"
+        f"|varlen={int(VARLEN)}|causal={int(bool(causal))}|H={H}|HKV={HKV}"
+        f"|nw={NW}|splk={SPLK}"
     )
     # rsqrt(d)*log2e folds the softmax scale and the exp->exp2 change of base;
     # q/k per-tensor descale multiply it in-kernel (see c_logit_scale below).
@@ -208,6 +238,7 @@ def build_flash_attn_fp8_decode_module(
         qd_ptr: fx.Pointer,
         kd_ptr: fx.Pointer,
         vd_ptr: fx.Pointer,
+        ws_ptr: fx.Pointer,  # split-K partial workspace (unused when SPLITK is off)
         seq_len_kv: fx.Int32,
         bt_stride: fx.Int32,
     ):
@@ -217,6 +248,7 @@ def build_flash_attn_fp8_decode_module(
         lane = tid % WARP
         h = fx.block_idx.x  # kv-head in [0, HKV)
         b = fx.block_idx.y  # batch index
+        split = fx.block_idx.z  # KV split in [0, SPLK); 0 when SPLITK is off
         lg = lane // 16
         n = lane % 16
 
@@ -261,6 +293,16 @@ def build_flash_attn_fp8_decode_module(
         gq2 = gviewi8_2d(q_ptr)
         go = gviewout(o_ptr)
         gbt = gviewi32(bt_ptr)
+        if const_expr(SPLITK):
+            gws = fx.make_view(
+                fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Float32.ir_type, address_space=AS_G, alignment=4
+                    ),
+                    fx.Int64(fx.ptrtoint(ws_ptr)),
+                ),
+                fx.make_layout((1 << 28,), (1,)),
+            )
 
         # Async global->LDS DMA (buffer_load_dwordx4 ... lds) for K: src must be a
         # byte-typed buffer tensor. k_div is the whole-pool descriptor; per-lane
@@ -387,20 +429,32 @@ def build_flash_attn_fp8_decode_module(
 
         npages = (kv_len + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
 
+        # Inter-workgroup KV split: this workgroup handles split `split`'s
+        # contiguous page sub-range [sp0, sp1). Host caps SPLK <= npages so
+        # sp0 < sp1 for every launched split (wave 0 always gets sp0).
+        if const_expr(SPLITK):
+            pages_per_split = (npages + fx.Int32(SPLK - 1)) // fx.Int32(SPLK)
+            sp0 = split * pages_per_split
+            sp1 = sp0 + pages_per_split
+            sp1 = (sp1 < npages).select(sp1, npages)
+        else:
+            sp0 = fx.Int32(0)
+            sp1 = npages
+
         m_init = fx.Float32(NEG)
         l_init = fx.Float32(0.0)
         fo_init = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range_constexpr(8)]
         init_state = [m_init, l_init] + fo_init
 
-        # Wave-strided KV split: wave w streams pages w, w+NW, w+2*NW, ...  Each
-        # wave keeps its own register-resident partial (m_c, l_c, fo_c) over its
-        # disjoint token slice; the NW partials are LSE-merged in the epilogue.
+        # Wave-strided KV split within this split's range: wave w streams pages
+        # sp0+w, sp0+w+NW, ...  Each wave keeps its own register-resident partial
+        # (m_c, l_c, fo_c); the NW partials are LSE-merged in the epilogue.
         # NO s_barrier inside this loop: waves have unequal trip counts, so a
         # workgroup-wide barrier here would deadlock. Ordering within a wave (DMA
         # -> LDS read, and read -> next-page overwrite) is a wave-local s_waitcnt.
         cur_bufoff = wave_kv
-        p_start = fx.Int64(wave)
-        p_stop = fx.Int64(npages)
+        p_start = fx.Int64(sp0 + wave)
+        p_stop = fx.Int64(sp1)
         p_step = fx.Int64(NW)
         for pv, state in range(p_start, p_stop, p_step, init=init_state):
             m_c = state[0]
@@ -569,19 +623,43 @@ def build_flash_attn_fp8_decode_module(
             s_w = _exp2(m_part[fx.Int32(w * BLOCK_M) + n] - mg)
             sc.append(s_w)
             den = den + l_part[fx.Int32(w * BLOCK_M) + n] * s_w
-        inv = vd / den  # vd folds the V descale into the combined 1/l
 
-        o_row_base = fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
-        for c in range_constexpr(8):
-            for v in range_constexpr(4):
-                d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
-                acc = fx.Float32(0.0)
-                for w in range_constexpr(NW):
-                    acc = (
-                        acc + o_part[fx.Int32(w * OPART) + d_idx * BLOCK_M + n] * sc[w]
-                    )
-                ooff = o_row_base + fx.Int64(d_idx)
-                go[ooff] = (acc * inv).to(OUT)
+        if const_expr(SPLITK):
+            # Write this split's UNNORMALIZED partial (O at running max mg, plus
+            # mg and combined l=den) to the global workspace. The combine kernel
+            # LSE-merges the SPLK splits and applies vd + 1/l. Layout per
+            # (b,h,split): O[D*BLOCK_M] + m[BLOCK_M] + l[BLOCK_M].
+            ws_base = fx.Int64(
+                (b * fx.Int32(HKV) + h) * fx.Int32(SPLK) + split
+            ) * fx.Int64(WS_PER)
+            for c in range_constexpr(8):
+                for v in range_constexpr(4):
+                    d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
+                    acc = fx.Float32(0.0)
+                    for w in range_constexpr(NW):
+                        acc = (
+                            acc
+                            + o_part[fx.Int32(w * OPART) + d_idx * BLOCK_M + n] * sc[w]
+                        )
+                    gws[ws_base + fx.Int64(d_idx * BLOCK_M) + fx.Int64(n)] = acc
+            gws[ws_base + fx.Int64(D * BLOCK_M) + fx.Int64(n)] = mg
+            gws[ws_base + fx.Int64(D * BLOCK_M + BLOCK_M) + fx.Int64(n)] = den
+        else:
+            inv = vd / den  # vd folds the V descale into the combined 1/l
+            o_row_base = (
+                fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
+            )
+            for c in range_constexpr(8):
+                for v in range_constexpr(4):
+                    d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
+                    acc = fx.Float32(0.0)
+                    for w in range_constexpr(NW):
+                        acc = (
+                            acc
+                            + o_part[fx.Int32(w * OPART) + d_idx * BLOCK_M + n] * sc[w]
+                        )
+                    ooff = o_row_base + fx.Int64(d_idx)
+                    go[ooff] = (acc * inv).to(OUT)
 
     @flyc.jit
     def launch(
@@ -595,6 +673,7 @@ def build_flash_attn_fp8_decode_module(
         qd_ptr: fx.Pointer,
         kd_ptr: fx.Pointer,
         vd_ptr: fx.Pointer,
+        ws_ptr: fx.Pointer,
         batch_size: fx.Int32,
         seq_len_kv: fx.Int32,
         bt_stride: fx.Int32,
@@ -612,22 +691,134 @@ def build_flash_attn_fp8_decode_module(
             qd_ptr,
             kd_ptr,
             vd_ptr,
+            ws_ptr,
             seq_len_kv,
             bt_stride,
         ).launch(
-            grid=(HKV, fx.Index(batch_size), 1),
+            grid=(HKV, fx.Index(batch_size), SPLK),
             block=(NW * WARP, 1, 1),
+            stream=stream,
+        )
+
+    # GENERALIZATION CANDIDATE (post-Stage-4): DualwaveSplitKCombineContext /
+    # dualwave_splitk_workspace_elems -- reuse the split-K combine scaffolding
+    # once it is de-welded from the prefill traits (num_waves=8/rows_per_wave=32)
+    # and the CDNA4 no-cluster (plain global reduction) reality. This decode
+    # combine is a self-contained global-reduction LSE merge; one wave per
+    # (batch, kv-head) merges the SPLK partials.
+    @flyc.kernel(known_block_size=(WARP, 1, 1))
+    def combine_kernel(
+        o_ptr: fx.Pointer,
+        ws_ptr: fx.Pointer,
+        vd_ptr: fx.Pointer,
+        cuq_ptr: fx.Pointer,
+    ):
+        AS_G = fx.AddressSpace.Global
+        lane = fx.thread_idx.x
+        h = fx.block_idx.x
+        b = fx.block_idx.y
+        lg = lane // 16
+        n = lane % 16
+
+        def gviewf32c(ptr):
+            pt = fx.PointerType.get(fx.Float32.ir_type, AS_G, alignment=4)
+            return fx.make_view(
+                fx.inttoptr(pt, fx.Int64(fx.ptrtoint(ptr))),
+                fx.make_layout((1 << 28,), (1,)),
+            )
+
+        def gviewoutc(ptr):
+            pt = fx.PointerType.get(OUT.ir_type, AS_G, alignment=2)
+            return fx.make_view(
+                fx.inttoptr(pt, fx.Int64(fx.ptrtoint(ptr))),
+                fx.make_layout((1 << 30,), (1,)),
+            )
+
+        gws = gviewf32c(ws_ptr)
+        go = gviewoutc(o_ptr)
+        vd = gviewf32c(vd_ptr)[0]
+        if const_expr(VARLEN):
+            gcuq = fx.make_view(
+                fx.inttoptr(
+                    fx.PointerType.get(fx.Int32.ir_type, AS_G, alignment=4),
+                    fx.Int64(fx.ptrtoint(cuq_ptr)),
+                ),
+                fx.make_layout((1 << 20,), (1,)),
+            )
+            token = gcuq[b]
+        else:
+            token = b
+
+        # ws_base(s) = ((b*HKV + h)*SPLK + s) * WS_PER
+        bh = (b * fx.Int32(HKV) + h) * fx.Int32(SPLK)
+
+        def m_of(s):
+            base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+            return gws[base + fx.Int64(D * BLOCK_M) + fx.Int64(n)]
+
+        def l_of(s):
+            base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+            return gws[base + fx.Int64(D * BLOCK_M + BLOCK_M) + fx.Int64(n)]
+
+        mg = m_of(0)
+        for s in range_constexpr(SPLK - 1):
+            mg = mg.maximumf(m_of(s + 1))
+        sc = []
+        den = fx.Float32(0.0)
+        for s in range_constexpr(SPLK):
+            s_w = _exp2(m_of(s) - mg)
+            sc.append(s_w)
+            den = den + l_of(s) * s_w
+        inv = vd / den
+
+        o_row_base = fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
+        for c in range_constexpr(8):
+            for v in range_constexpr(4):
+                d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
+                acc = fx.Float32(0.0)
+                for s in range_constexpr(SPLK):
+                    base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+                    acc = (
+                        acc
+                        + gws[base + fx.Int64(d_idx * BLOCK_M) + fx.Int64(n)] * sc[s]
+                    )
+                go[o_row_base + fx.Int64(d_idx)] = (acc * inv).to(OUT)
+
+    @flyc.jit
+    def combine_launch(
+        o_ptr: fx.Pointer,
+        ws_ptr: fx.Pointer,
+        vd_ptr: fx.Pointer,
+        cuq_ptr: fx.Pointer,
+        batch_size: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = _cache_tag
+        combine_kernel(o_ptr, ws_ptr, vd_ptr, cuq_ptr).launch(
+            grid=(HKV, fx.Index(batch_size), 1),
+            block=(WARP, 1, 1),
             stream=stream,
         )
 
     _dummy_holder = {}
 
-    def _dummy_i32():
+    def _dummy_f32():
         import torch
 
         if "d" not in _dummy_holder:
-            _dummy_holder["d"] = torch.zeros(1, device="cuda", dtype=torch.int32)
+            _dummy_holder["d"] = torch.zeros(1, device="cuda", dtype=torch.float32)
         return _dummy_holder["d"]
+
+    def _dummy_i32():
+        import torch
+
+        if "i" not in _dummy_holder:
+            _dummy_holder["i"] = torch.zeros(1, device="cuda", dtype=torch.int32)
+        return _dummy_holder["i"]
+
+    def workspace_elems(batch):
+        """f32 workspace element count for a split-K launch (0 when SPLK==1)."""
+        return batch * HKV * SPLK * WS_PER if SPLITK else 0
 
     def mod(
         q,
@@ -644,6 +835,7 @@ def build_flash_attn_fp8_decode_module(
         q_descale,
         k_descale,
         v_descale,
+        workspace=None,
         stream=None,
     ):
         import torch
@@ -652,6 +844,13 @@ def build_flash_attn_fp8_decode_module(
             stream = torch.cuda.current_stream()
         cuq = cu_seqlens_q if cu_seqlens_q is not None else _dummy_i32()
         cukv = cu_seqlens_kv if cu_seqlens_kv is not None else _dummy_i32()
+        if SPLITK:
+            need = workspace_elems(int(batch))
+            if workspace is None or workspace.numel() < need:
+                workspace = torch.empty(need, device="cuda", dtype=torch.float32)
+            ws = workspace
+        else:
+            ws = _dummy_f32()
         # K is the DMA source (fx.Tensor): pass a byte-typed torch tensor so
         # make_buffer_tensor sees the full flat pool as i8 records. V is a plain
         # pointer (never DMA'd).
@@ -668,10 +867,22 @@ def build_flash_attn_fp8_decode_module(
             ptr_arg(q_descale),
             ptr_arg(k_descale),
             ptr_arg(v_descale),
+            ptr_arg(ws),
             int(batch),
             int(seq_len_kv),
             int(block_table_stride),
             stream,
         )
+        if SPLITK:
+            _run_compiled(
+                combine_launch,
+                ptr_arg(o),
+                ptr_arg(ws),
+                ptr_arg(v_descale),
+                ptr_arg(cuq),
+                int(batch),
+                stream,
+            )
 
+    mod.workspace_elems = workspace_elems
     return mod

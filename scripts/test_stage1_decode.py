@@ -146,7 +146,7 @@ def reference(qf, qs, kf, ks, vf, vs, cu, seqs):
     return out
 
 
-def _launch(mode, seqs, layout, out_dt, seed):
+def _launch(mode, seqs, layout, out_dt, seed, splits=1):
     """Build inputs, run the kernel, return (output, reference, inputs)."""
     qf, qs, kf, ks, vf, vs, cu = make_inputs(mode, seqs, seed)
     kpool, vpool, bt, stride = build_pool(kf, vf, seqs, cu, seed)
@@ -167,9 +167,13 @@ def _launch(mode, seqs, layout, out_dt, seed):
         paged=True,
         kv_cache_layout=layout,
         num_waves=NUM_WAVES,
+        num_kv_splits=splits,
     )
     o = torch.zeros(b, 1, H, D, device=DEV, dtype=OUT_DT[out_dt])
     cu_q = torch.arange(b + 1, device=DEV, dtype=torch.int32)
+    ws = None
+    if splits > 1:
+        ws = torch.empty(mod.workspace_elems(b), device=DEV, dtype=torch.float32)
     mod(
         qf.contiguous().view(-1),
         k_arg.contiguous().view(-1),
@@ -183,13 +187,14 @@ def _launch(mode, seqs, layout, out_dt, seed):
         q_descale=qs,
         k_descale=ks,
         v_descale=vs,
+        workspace=ws,
     )
     torch.cuda.synchronize()
     return o, reference(qf, qs, kf, ks, vf, vs, cu, seqs)
 
 
-def run_one(mode, seqs, layout, out_dt, seed=7):
-    o, ref = _launch(mode, seqs, layout, out_dt, seed)
+def run_one(mode, seqs, layout, out_dt, seed=7, splits=1):
+    o, ref = _launch(mode, seqs, layout, out_dt, seed, splits=splits)
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
@@ -197,7 +202,7 @@ def run_one(mode, seqs, layout, out_dt, seed=7):
     ).item()
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     n_rows = len(seqs) * H
-    tag = f"{mode:8s} {layout:10s} {out_dt:4s}"
+    tag = f"{mode:8s} {layout:10s} {out_dt:4s} S={splits}"
     ok = (bad == 0) and (cos > 0.99)
     print(
         f"[{'PASS' if ok else 'FAIL'}] {tag}  err={err:.4g}  cos={cos:.6f}  "
@@ -240,6 +245,29 @@ def main():
 
     print("\n=== 1a->1b isolation (bit-identity) ===")
     ok &= check_isolation(small)
+
+    # Stage 3: inter-workgroup split-KV. The cross-split LSE combine is the
+    # tricky part; distinct mode catches a botched merge. Ragged batches at
+    # b<=32 across S in {1,2,4,8}, both layouts, both dtypes.
+    print("\n=== Stage 3: split-KV correctness (S in {1,2,4,8}) ===")
+    s3_seqs = {
+        8: [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048],
+        16: [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048] * 2,
+        32: [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048] * 4,
+    }
+    for bcount in (8, 16, 32):
+        seqs = s3_seqs[bcount]
+        for splits in (1, 2, 4, 8):
+            for layout in ("linear", "vectorized"):
+                for out_dt in ("bf16", "f16"):
+                    for mode in ("ones", "distinct", "random"):
+                        ok &= run_one(mode, seqs, layout, out_dt, splits=splits)
+
+    # b=64 must NOT regress: S=1 direct path, correctness intact.
+    print("\n=== b=64 unregressed (S=1) ===")
+    b64 = [4096] * 64
+    for layout in ("linear", "vectorized"):
+        ok &= run_one("random", b64, layout, "bf16", splits=1)
 
     print("\n" + ("ALL PASS" if ok else "FAILURES PRESENT"))
     sys.exit(0 if ok else 1)
