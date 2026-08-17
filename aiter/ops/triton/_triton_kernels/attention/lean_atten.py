@@ -27,14 +27,27 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_j
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
-def _get_config():
+def _get_config(causal: bool = True, n_ctx_q: int | None = None):
     # No lru_cache here: load_config_json already caches the parse, and
     # caching the .copy() would hand every caller the same mutable object.
     dev = arch_info.get_arch()
     config = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
     )
-    return config["any"].copy()  # fresh copy per call — safe for callers to mutate
+    # Decode and prefill want different tilings; arch files without the split just
+    # have "any". Keyed on n_ctx_q, not causal: BLOCK_M must fit the query (Mp/Lp are
+    # validated against it) and causal needs BLOCK_M % BLOCK_N == 0.
+    prefill = config.get("causal", config["any"])
+    decode = config.get("decode")
+    if (
+        not causal
+        and decode is not None
+        and n_ctx_q is not None
+        and n_ctx_q < prefill["BLOCK_SIZE_M"]
+        and decode["BLOCK_SIZE_M"] <= n_ctx_q
+    ):
+        return decode.copy()
+    return prefill.copy()  # fresh copy per call
 
 
 @triton.jit

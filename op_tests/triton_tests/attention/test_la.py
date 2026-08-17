@@ -13,8 +13,12 @@ from aiter.ops.triton.attention.lean_atten import (
     persistent_lean_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 DEBUG_MODE = False
+
+# Heads per chunk in the torch reference; bounds its peak score-matrix memory.
+ref_head_chunk = 8
 
 
 def get_lean_attn_inputs(
@@ -91,15 +95,22 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
             group_size = qb_reshaped.shape[0] // kb_reshaped.shape[0]
             kb_reshaped = kb_reshaped.repeat_interleave(group_size, dim=0)
             vb_reshaped = vb_reshaped.repeat_interleave(group_size, dim=0)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) / math.sqrt(d)
+        inv_mask = None
         if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
-            mask = M == 0
-            p[:, mask] = float("-inf")
-        # print(f"p shape: {p.shape}")
-        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)
-        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+            inv_mask = torch.tril(torch.ones((n_ctx_q, b), device="cuda")) == 0
+        # Chunk over heads: independent, and doing all at once materialises
+        # hq x n_ctx_q x b scores -- 16 GiB in fp32 for 64 heads at 8192 x 8192, which OOMs
+        for h0 in range(0, qb_reshaped.shape[0], ref_head_chunk):
+            h1 = min(h0 + ref_head_chunk, qb_reshaped.shape[0])
+            p = torch.matmul(
+                qb_reshaped[h0:h1], kb_reshaped[h0:h1].transpose(-2, -1)
+            ) / math.sqrt(d)
+            if inv_mask is not None:
+                p.masked_fill_(inv_mask, float("-inf"))
+            p = torch.softmax(p.float(), dim=-1).to(q.dtype)
+            refb = torch.matmul(p, vb_reshaped[h0:h1])
+            ref_out[start_q : (start_q + int(n_ctx_q)), h0:h1, :] = refb.transpose(0, 1)
+            del p, refb
         start += b
         start_q += n_ctx_q
     return ref_out
@@ -499,6 +510,73 @@ def test_persistent_lean_attention_outer(
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+
+
+# Covers the config path: the public entry point is the only reader of
+# <arch>-LEANATTN-DEFAULT.json, and nothing else exercised it. One case per entry,
+# since each is only legal in its own regime (BLOCK_M has to fit n_ctx_q).
+@pytest.mark.parametrize(
+    "causal, batch, hq, hk, n_ctx_q, n_ctx, d",
+    [
+        (True, 1, 64, 64, 1024, [1024], 128),  # -> prefill/"causal" entry
+        (False, 1, 64, 64, 16, [8192], 128),  # -> "decode" entry
+    ],
+)
+def test_persistent_lean_attention_config_path(
+    causal, batch, hq, hk, n_ctx_q, n_ctx, d
+):
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    dev = arch_info.get_arch()
+    try:
+        config = _get_config(causal=causal, n_ctx_q=n_ctx_q)
+    except FileNotFoundError:
+        pytest.skip(f"no {dev}-LEANATTN-DEFAULT.json to exercise the config path")
+
+    # An arch file with only "any" (gfx942) has no decode entry, so the decode case
+    # gets the prefill tile and Mp/Lp validation would fail.
+    if config["BLOCK_SIZE_M"] > n_ctx_q:
+        pytest.skip(
+            f"{dev} config has no entry legal here: "
+            f"BLOCK_SIZE_M={config['BLOCK_SIZE_M']} > n_ctx_q={n_ctx_q}"
+        )
+
+    # Caller sizes the buffers by total_programs, which the entry point re-derives
+    # and validates against.
+    total_programs = get_num_sms() * config["SM_CNT_FACTOR"]
+
+    q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
+        batch,
+        n_ctx_q,
+        n_ctx,
+        config["BLOCK_SIZE_N"],
+        hq,
+        hk,
+        d,
+        total_programs,
+        torch.float16,
+    )
+
+    la_out = persistent_lean_attention(
+        q,
+        k,
+        v,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        batch_num_block_n,
+        batch,
+        sm_scale=d**-0.5,
+        causal=causal,
+        RAGGED_BATCH=False,
+    )
+    if isinstance(la_out, tuple):
+        la_out = la_out[0]
+
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
+    torch.testing.assert_close(ref_out, la_out, atol=1e-2, rtol=3e-3)
 
 
 def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
