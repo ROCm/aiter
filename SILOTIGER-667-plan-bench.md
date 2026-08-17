@@ -14,7 +14,10 @@ In particular:
   `HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python -m pytest -q op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`.
 - **GPU 6** (`HIP_VISIBLE_DEVICES=6`) for clean cold-HBM numbers.
 - **Methodology:** perf only via `run_perftest` (IQR-trimmed device time); cold-HBM
-  rotation; `cos ≥ 0.999` + `checkAllclose`; markdown tables.
+  rotation; `checkAllclose`; markdown tables. (Note: the *cold comparison* benches gate at
+  `cos ≥ 0.99` on the first `_COS_CHK_TOKENS=4` tokens — per-token work is uniform and the
+  full-pool fp32 dequant would OOM at DeepSeek B=32; the stricter `cos ≥ 0.999` still applies
+  to the primitive/warm unit tests.)
 - **Kernel/harness locations:** FlyDSL entry points in `aiter/ops/flydsl/warp_decode_moe.py`
   and the op_test/bench in `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`; the CK
   bench is `tickets/667/harness/ck_bench_warp_decode.cpp` (+ `build_ck_bench.sh`), built
@@ -37,7 +40,9 @@ shapes/dtypes/batches and emits a joined **FlyDSL/CK ratio table**.
   single source of truth, applied identically to both sides' raw times.
 - **Default-vs-default config policy.** Headline compares each family at its default/
   recommended config (avoids the tuning-asymmetry bias, since we can deeply tune FlyDSL but
-  not CK). Tuned FlyDSL upside (e.g. `prefetch=True` for B≤2 FP4 down) is a footnote row.
+  not CK). Tuned FlyDSL upside (e.g. `prefetch=True` for B≤2 FP4 down) is disclosed as a
+  footnote/caveat, not folded into the headline — the of-record table itself carries only the
+  default config (no tuned row is materialized today).
 - **Both sides cold.** CK's `cold_niters_` is only *warmup*; it must be made truly cold to
   match FlyDSL's rotate-over-disjoint-experts sweep before any ratio is meaningful.
 - **When a change is needed, prefer changing the CK side over FlyDSL** (keeps FlyDSL's
@@ -95,7 +100,8 @@ the FlyDSL cold harness.
       (15 per B) in both the warm and cold sweeps *and* in CSV mode, so no
       `IsSupportedArgument` skips. B=32 is OOM-free with the A1 rotation (rotation only adds
       a KB router buffer; verified DeepSeek B=32 earlier).
-- [ ] (C1) Ensure `compare.py` joins on the full B set so every FlyDSL row has a CK peer.
+- [x] (C1) `compare.py` joins on the full B set so every FlyDSL row has a CK peer — verified
+      in every of-record regen (B∈{1,2,4,8,32} all paired).
 
 #### A4 — extend the CK cpp with a gate_up FP4 bench  [x]
 - [x] Added `GUProbFP4 = WarpDecodeGateUpProblem<bf16_t, pk_fp4_t, …, XScaleBF16, WScalePT,
@@ -224,30 +230,35 @@ the FlyDSL cold harness.
       perf-only/uninitialized. n/a cells noted (DeepSeek FP8 → B5; gate_up FP4 CK now ✅ A4).
 - [x] Output: markdown ratio table (HTML-comment provenance header: gfx, aiter+CK commits,
       iters/cold/timing/method, CK provenance line, config-policy note) + optional `--csv-out`.
-- **Depends on:** A1 (cold) ✅, A2 (CSV) ✅, B2 (TOPK) ✅, B3 (compute_metrics) ✅.
-  Fairness/completeness still depends on B1 (scale), A4/B4 (extra peers), B5 (Tier-2); those
-  cells show as n/a until landed.
+- **Depends on:** A1 (cold) ✅, A2 (CSV) ✅, B2 (TOPK) ✅, B3 (compute_metrics) ✅, B1 (scale)
+  ✅, A4 (gate_up FP4 peer) ✅. Remaining completeness depends on **B4** (FP8-act peer) and
+  **B5** (DeepSeek Tier-2); those cells show as n/a until landed.
 
 ### Group D — methodology, rigor, reproducibility
 
-#### D1 — align timing methodology  [ ]
-- [ ] **Use a flat `iters=1000` for the of-record numbers on both sides (measured 2026-08-14).**
-      Small-shape × low-B × FP4 cells are so fast (~10 µs) that fixed per-launch/event
-      overhead dominates and a flat `iters=30–100` gives noisy, *pessimistic* numbers, e.g.
-      Qwen `down_fp4_h2` B=1 read 1917 GB/s (original) / 2334 (iters=100) but converges to
-      ~2731 GB/s by iters≥1000; the big cells are already flat at iters=100. A per-cell
-      auto-scaling scheme is unnecessary at this scale: a full flat-1000 sweep (75 cells,
-      B∈{1,2,4,8,32}, cold=20) is only **~11 s** (a warm+cold pair ~23 s), because the few
-      slow cells (DeepSeek B=32 gate ~1.3 ms) dominate and 1000 iters on the fast cells costs
-      almost nothing. `iters=1000` clears the fastest cell we have (Qwen B=1 FP4 = 2696 GB/s
-      @1000, within ~1.3% of the 3000-iter asymptote). Keep warmup `cold≥15` (e.g. 20).
-      - Keep a smaller default (e.g. `CK_WD_ITERS=100`) for quick smoke/dev runs; pin
-        `iters=1000` in the one-command driver (D6) for the recorded table. Same on FlyDSL.
+#### D1 — align timing methodology  [x]
+- [x] **Flat `iters=1000` for the of-record numbers on both sides (measured 2026-08-14; now
+      pinned in the D6 driver).** Small-shape × low-B × FP4 cells are so fast (~10 µs) that
+      fixed per-launch/event overhead dominates and a flat `iters=30–100` gives noisy,
+      *pessimistic* numbers, e.g. Qwen `down_fp4_h2` B=1 read 1917 GB/s (original) / 2334
+      (iters=100) but converges to ~2731 GB/s by iters≥1000; the big cells are already flat at
+      iters=100. A per-cell auto-scaling scheme is unnecessary at this scale. `iters=1000`
+      clears the fastest cell we have (Qwen B=1 FP4 = 2696 GB/s @1000, within ~1.3% of the
+      3000-iter asymptote). Keep warmup `cold≥15` (e.g. 20).
+      - Keep a smaller default (`CK_WD_ITERS=100`) for quick smoke/dev runs; `iters=1000` is
+        pinned in the D6 driver for the recorded table. Same on FlyDSL.
+      - Cost (post distinct-per-token routing): a full single-pass FlyDSL+CK compare is
+        **~22–25 s**; the D6 of-record run at `--repeats 3` is **~66–75 s**. (The old "~11 s"
+        note referred to the CK-only bench alone.)
       - Corollary: a low-iter run can invert fast pairs (it spuriously showed Qwen B=1 FP4
         down *slower* than FP8; converged, FP4 is marginally faster in time). Do not trust
-        ratios from under-converged fast cells — treat unconverged cells as noisy in D5.
-- [ ] Document the residual stat difference (FlyDSL IQR-trimmed median vs CK mean); pick one
-      to report or report both.
+        ratios from under-converged fast cells — D5 flags them as noisy.
+- [x] **Residual statistic difference documented (report both, no reconciliation needed).**
+      FlyDSL `device` timing = torch-profiler device time, **IQR-trimmed** when iters>30
+      (`_timing_kwargs`); CK = **arithmetic mean** (`ms/iters` over the hipEvent loop). At the
+      flat `iters=1000` with the measured <1% per-cell spread (D5), trimmed-median and mean
+      differ negligibly, so both sides' raw µs are reported as-is and the ratio is unaffected;
+      the small definitional difference is disclosed here rather than forced into one statistic.
 - [x] **GPU clocks: lock NOT available on this gfx950 — use variance control instead
       (decided 2026-08-17).** The driver exposes only two discrete SCLK DPM levels
       (`0:500`, `1:2400` MHz; plus `S:94` idle) — **no mid ~1700 level** — so
@@ -364,7 +375,9 @@ Legend: ✅ FlyDSL+CK pair present in the of-record artifact for every B ·
 ⏳ pending the named step · ⛔ blocked (+reason).
 Shapes: DeepSeek-V3 (H7168/I2048/E256/K8), MiniMax (H3072/I1536/E256/K8),
 Qwen3Next-TP1 (H2048/I512/E512/K10). Each ✅ covers all **B∈{1,2,4,8,32}**.
-Reconciled against `tickets/667/g9_compare.{md,csv}` (aiter `256d1001b`, repeats=3).
+Reconciled against the of-record `tickets/667/g9_compare.{md,csv}` (repeats=3); the exact
+aiter/CK commits are recorded in that artifact's provenance header, not pinned here (they
+change on every regen).
 
 | Op | dtype (act × w) | DeepSeek-V3 | MiniMax | Qwen3Next-TP1 |
 |---|---|---|---|---|
@@ -394,11 +407,17 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
 - **Full FP8 coverage** (DeepSeek) needs **B5**.
 - **gate_up FP4 pair** — ✅ done (A4; needed a one-line CK gate_up kernel packed-stride fix).
 - **gate_up FP8-act pair** needs **B4** (FlyDSL side) — CK already has `gate_fp8_d2`.
-- **Trustworthy ratios** need **A1 (cold), B1 (scale), D1 (timing), D3 (config), D4 (equiv)**.
+- **Trustworthy ratios** need A1 (cold) ✅, B1 (scale) ✅, D3 (config) ✅, D1 (timing) ✅,
+  and **D4 (equiv)** — the last open prerequisite.
 
 ## 5. Risks / watch-items
-- **Cold flush unproven:** A1 must be *verified* (numbers drop), not assumed.
-- **Rotating-buffer OOM:** GB-scale weight pools × `rotating_count_` can OOM at B=32/DeepSeek.
+- **Cold flush** — *resolved (A1):* verified cold numbers drop vs warm on the cache-resident
+  small Qwen shapes (e.g. `down_h2_d2` B=1 4977→2999 GB/s); no longer an open assumption.
+- **Rotating-buffer OOM** — *obsolete (A1):* the `stream_config` `rotating_count_` path is a
+  no-op on this launcher and is not used. The cold mechanism only grows a **KB-scale router-id
+  buffer** (`rotate*B*K` int32), leaving the GB weight pool untouched — verified OOM-free at
+  DeepSeek B=32. (The original concern was about `rotating_count_` deep-copying the weight
+  pool, which this launcher never does.)
 - **`total_traffic` drift:** pinned to CK commit `62e30c9098`; revisit if CK's byte/FLOP
   formulas change.
 - **CK worktree carries a local patch (A4):** `warp_decode_gate_up_kernel.hpp` has a one-line
@@ -421,6 +440,17 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **Plan hygiene pass (review items #2–#11).** Reconciled stale checkboxes and
+  dependency lines: A3's C1-join sub-item ✅, C1 depends-on now shows B1/A4 done (only B4/B5
+  left), §4 trustworthy-ratios shows only D4 open. Marked **D1 done** — flat `iters=1000`
+  pinned in the D6 driver, and documented the FlyDSL(IQR-trimmed device)-vs-CK(mean) statistic
+  difference (negligible at iters=1000; report both, ratio unaffected); corrected the stale
+  "~11 s" sweep estimate to the measured ~22–25 s single-pass / ~66–75 s at repeats=3. Reworded
+  §5 risks: cold-flush → *resolved (A1)*, rotating-buffer OOM → *obsolete (A1)* (the
+  `rotating_count_` path is unused; only a KB router buffer grows). Nits: dropped the churny
+  pinned aiter SHA from §3 (defer to the artifact header), reconciled the `cos≥0.99` cold-gate
+  vs the `≥0.999` primitive-test constraint, and clarified the tuned-upside "footnote" wording
+  (no tuned row is materialized). Docs only — no code/artifact change.
 - 2026-08-17 — **CK provenance corrected (#1).** The cpp's stderr provenance previously
   hardcoded a bare commit that didn't reflect the A4 patch. Set it to
   `base_commit=62e30c9098 patch=A4-gateup-fp4-packed-stride`, rebuilt, and regenerated the
