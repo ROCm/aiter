@@ -557,7 +557,9 @@ docker rm -f mi355x_bench 2>/dev/null || true
 set -e
 PIP=\\$1; DIP=\\$2
 bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before bench; runtime will fall back to model id"
-chmod -R a+rwX "$WORKDIR" || true
+OUTPUT_DIR="$WORKDIR/outputs"
+mkdir -p "$OUTPUT_DIR"
+chmod a+rwX "$OUTPUT_DIR" || true
 docker rm -f mi355x_bench 2>/dev/null || true
 """,
     )
@@ -610,6 +612,56 @@ docker rm -f mi355x_bench 2>/dev/null || true
     python3 \\$CIDIR/assert_nonempty.py < "\\$PROBE_OUT" \\
       || { echo "[probe] empty/invalid generation; aborting before sweep"; cat "\\$PROBE_OUT" 2>/dev/null || true; exit 1; }
 """,
+    )
+    text = replace_once(
+        text,
+        """    CIDIR=/ci_workdir
+    bash \\$CIDIR/install_checkout_sglang.sh
+""",
+        """    CIDIR=/ci_workdir
+    OUTDIR=/ci_workdir/outputs
+    mkdir -p "\\$OUTDIR"
+    bash \\$CIDIR/install_checkout_sglang.sh
+""",
+    )
+    text = replace_once(
+        text,
+        """      python3 -m sglang.test.few_shot_gsm8k \\
+        --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \\
+        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \\
+        \\$DP_ARG 2>&1 | tee \\$CIDIR/gsm8k.log
+      ACC=\\$(grep -oE "Accuracy: [0-9.]+" \\$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
+""",
+        """      GSM8K_LOG="\\$OUTDIR/gsm8k.log"
+      python3 -m sglang.test.few_shot_gsm8k \\
+        --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \\
+        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \\
+        \\$DP_ARG 2>&1 | tee "\\$GSM8K_LOG"
+      ACC=\\$(grep -oE "Accuracy: [0-9.]+" "\\$GSM8K_LOG" | tail -1 | cut -d" " -f2)
+""",
+    )
+    text = replace_once(
+        text,
+        """      OUT=/ci_workdir/raw_conc\\${C}.json
+      rm -f \\$OUT
+""",
+        """      OUT="\\$OUTDIR/raw_conc\\${C}.json"
+      rm -f "\\$OUT"
+""",
+    )
+    text = replace_once(
+        text,
+        """        --num-prompts \\$((C*$NPF)) --warmup-requests \\$C \\
+        --output-file \\$OUT || true
+""",
+        """        --num-prompts \\$((C*$NPF)) --warmup-requests \\$C \\
+        --output-file "\\$OUT" || true
+""",
+    )
+    text = replace_once(
+        text,
+        '    RAW="$WORKDIR/raw_conc${C}.json"\n',
+        '    RAW="$WORKDIR/outputs/raw_conc${C}.json"\n',
     )
     text = replace_once(
         text,
