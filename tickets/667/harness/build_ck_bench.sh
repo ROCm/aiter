@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the CK warp-decode benchmark binary from commit 62e30c9098.
+# Build the CK warp-decode benchmark binary from commit c03392a91b.
 #
 # Compiles bench_warp_decode.cpp DIRECTLY with amdclang++ — no CMake.
 # CK-Tile is header-only, so the whole build is one compile+link invocation.
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-CK_COMMIT="62e30c9098"
+CK_COMMIT="c03392a91b"
 ROCM_LIBS_ORIG="/workspaces/rocm-libraries"
 WORKTREE_DIR="/workspaces/rocm-libraries-wdec"
 CK_SRC="${WORKTREE_DIR}/projects/composablekernel"
