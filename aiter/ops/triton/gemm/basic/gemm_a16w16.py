@@ -129,8 +129,6 @@ def gemm_a16w16_(
         if config is None:
             config, _ = get_gemm_config("GEMM-A16W16-PERSISTENT", M, N, K)
             if backend == "triton":
-                # fills in SPLITK_BLOCK_SIZE / cache_modifier defaults and clamps
-                # BLOCK_SIZE_K, which the triton kernel needs; the gluon kernel does not
                 config = compute_splitk_params(config, K)
 
         assert config.get("NUM_KSPLIT", 1) == 1, (
@@ -177,14 +175,11 @@ def gemm_a16w16_(
             if y is None:
                 y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-            # A must be (M, K) row-major; the kernel has no 'N' path for it.
             assert x.stride(1) == 1, (
                 f"gluon persistent gemm requires x row-major (M, K), got strides "
                 f"{x.stride()}"
             )
-            # B after the transpose above is (K, N).  TRANSPOSE=True means N is
-            # contiguous (TT); False means K is contiguous (TN, the nn.Linear
-            # order).  The pad interval follows whichever axis is contiguous.
+            
             if w.stride(1) == 1:
                 TRANSPOSE = True
             elif w.stride(0) == 1:
@@ -213,6 +208,9 @@ def gemm_a16w16_(
             )
 
             # Persistent, NUM_WGS processes num_tiles
+            _LOGGER.info(
+                f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+            )
             NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
             num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
 
@@ -332,34 +330,11 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
 
-        # The kernels walk K with update_tensor_descriptor(add_offsets=...),
-        # which advances the load position without shrinking the descriptor's
-        # OOB bound. The final K tile is peeled out of the pipeline loop and
-        # reloaded with set_bounds, so a partial last tile (K not a multiple of
-        # BLOCK_K) is clamped and zero-filled instead of read out of bounds.
-        # Hence K need not be aligned to BLOCK_K. (M and N partial tiles are
-        # likewise handled by the descriptor bounds + store mask.)
-
-        # Clamp the software-pipeline depth to the number of K-tiles.
-        #
-        # The prologue/epilogue walk a fixed number of K-tiles determined by
-        # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
-        # exceeds that count the pipeline loop counts go negative, so cap the
-        # depth at the real tile count. Both variants peel the final K tile out
-        # of the main loop for the bounds-checked tail load, which costs one
-        # extra tile of reach. Variants differ in reach and in the minimum depth
-        # they require:
-        #   bandwidth_bound : peels the last tile (needs num_k_tiles >= NB)
-        #                     -> cap = num_k_tiles
-        #   compute_bound : preloads one tile ahead AND peels the last tile
-        #                   (needs num_k_tiles >= NB + 2) -> cap = num_k_tiles - 2
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
         _DEPTH_SLACK = {"compute_bound": 2}
 
         if kernel_type_from_config is None:
-            # Fall back to the bandwidth_bound kernel when the requested variant
-            # cannot satisfy its minimum pipeline depth for this K.
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
@@ -377,9 +352,6 @@ def gemm_a16w16_(
 
         w = w.T
 
-        # Operand layout in BLAS TT/TN/NT/NN form: 'T' (row-major, trailing dim
-        # contiguous) or 'N' (column-major, leading dim contiguous). First char
-        # is x (A), second is w (B, after the internal transpose above).
         if x.stride(1) == 1:
             layout = "T"
         elif x.stride(0) == 1:
@@ -405,6 +377,10 @@ def gemm_a16w16_(
         shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+
+        _LOGGER.info(
+            f"GEMM_A16W16 [gluon, non-persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+        )
 
         _KERNEL_MAP[kernel_type][grid](
             x,
