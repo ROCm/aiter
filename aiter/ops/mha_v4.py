@@ -22,7 +22,6 @@ from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
     pack_fp6_v_data_scale_views,
-    reorder_fp6_k_lds_order_triton,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
@@ -43,6 +42,16 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
 
 
 @compile_ops("module_fmha_v4_fwd")
+def rotate_activation_mxfp8_quant(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    multiplier: float,
+) -> None:
+    """Apply hd128 Walsh-Hadamard rotation and quantize directly to MXFP8."""
+
+
+@compile_ops("module_fmha_v4_fwd")
 def rotate_activation_mxfp6_quant(
     out: Tensor,
     scale: Tensor,
@@ -50,6 +59,15 @@ def rotate_activation_mxfp6_quant(
     multiplier: float,
 ) -> None:
     """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
+
+
+@compile_ops("module_fmha_v4_fwd")
+def rotate_activation_mxfp6_quant_k(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers."""
 
 
 @compile_ops("module_fmha_v4_fwd")
@@ -483,6 +501,45 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
     return quantize_fp8(rotated)
 
 
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
+def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, head_dim = input.shape
+    if head_dim != 128 or not input.is_contiguous():
+        raise ValueError("MXFP8 quantization requires contiguous hd128 BSHD input")
+    quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
+    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    rotate_activation_mxfp8_quant(quantized, scale, input, multiplier)
+    return quantized, scale
+
+
+@quantize_mxfp8_q.register_fake
+def _quantize_mxfp8_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    del multiplier
+    batch, sequence, heads, head_dim = input.shape
+    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
+        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
+    )
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k", mutates_args=())
+def quantize_mxfp8_k(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, head_dim = input.shape
+    if head_dim != 128 or not input.is_contiguous():
+        raise ValueError("MXFP8 K quantization requires contiguous hd128 BSHD input")
+    quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
+    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    rotate_activation_mxfp8_quant(quantized, scale, input, 1.0)
+    return quantized, scale
+
+
+@quantize_mxfp8_k.register_fake
+def _quantize_mxfp8_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, head_dim = input.shape
+    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
+        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
+    )
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
 def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
@@ -586,12 +643,11 @@ def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
         raise ValueError(
             "MXFP6 E2M3 K quantization requires contiguous hd128 BSHD input"
         )
-    packed = input.new_empty(
-        (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
-    )
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
-    rotate_activation_mxfp6_quant(packed, scale, input, 1.0)
-    return reorder_fp6_k_lds_order_triton(packed, scale, tile=128, return_raw=True)
+    data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
+    raw = input.new_empty((data_size,), dtype=torch.uint8)
+    scale_raw = input.new_empty((scale_size,), dtype=torch.uint8)
+    rotate_activation_mxfp6_quant_k(raw, scale_raw, input)
+    return raw, scale_raw
 
 
 @quantize_mxfp6_k.register_fake

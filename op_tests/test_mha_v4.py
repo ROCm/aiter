@@ -21,8 +21,11 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp8_k,
+    quantize_mxfp8_q,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
@@ -30,7 +33,9 @@ from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     fp6_k_raw_buffer_sizes,
     quantize_fp6_v_clean_triton,
     quantize_fp6_v_data_scale_triton,
+    reorder_fp6_k_lds_order_triton,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
@@ -258,6 +263,75 @@ def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
     assert torch.equal(scale, expected_scale)
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
+@pytest.mark.parametrize("case", ["random", "zero", "powers", "extreme"])
+def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
+    from aiter import dtypes
+    from aiter.ops.quant import rotate_activation
+
+    if case == "random":
+        torch.manual_seed(29)
+        value = torch.randn((1, 129, 5, 128), device="cuda", dtype=torch.bfloat16)
+    elif case == "zero":
+        value = torch.zeros((1, 7, 5, 128), device="cuda", dtype=torch.bfloat16)
+    elif case == "powers":
+        powers = torch.tensor(
+            [0.0] + [2.0**exponent for exponent in range(-12, 13)],
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        value = powers.repeat((128 + powers.numel() - 1) // powers.numel())[:128]
+        value = value.reshape(1, 1, 1, 128)
+    else:
+        value = torch.full(
+            (1, 1, 1, 128),
+            torch.finfo(torch.bfloat16).max,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+    multiplier = mha_v4_q_multiplier(128**-0.5)
+    rotated = torch.empty_like(value)
+    rotate_activation(rotated, value)
+    expected, expected_scale = dynamic_mxfp8_quant(
+        rotated * multiplier, quant_dtype=dtypes.fp8
+    )
+
+    actual, scale = quantize_mxfp8_q(value, multiplier)
+
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scale, expected_scale)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
+@pytest.mark.parametrize("case", ["random", "zero", "extreme"])
+def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
+    from aiter import dtypes
+    from aiter.ops.quant import rotate_activation
+
+    if case == "random":
+        torch.manual_seed(41)
+        value = torch.randn((1, 129, 5, 128), device="cuda", dtype=torch.bfloat16)
+    elif case == "zero":
+        value = torch.zeros((1, 7, 5, 128), device="cuda", dtype=torch.bfloat16)
+    else:
+        value = torch.full(
+            (1, 1, 1, 128),
+            torch.finfo(torch.bfloat16).max,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+    rotated = torch.empty_like(value)
+    rotate_activation(rotated, value)
+    expected, expected_scale = dynamic_mxfp8_quant(rotated, quant_dtype=dtypes.fp8)
+
+    actual, scale = quantize_mxfp8_k(value)
+
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scale, expected_scale)
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
 @pytest.mark.parametrize(
     "quantize", [quantize_int8, quantize_fp8, quantize_fp8_rotated]
@@ -330,7 +404,14 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")
 @pytest.mark.parametrize("sequence", [128, 129, 257])
 def test_mha_v4_mxfp6_k_raw_views(sequence):
+    torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
+    dense = torch.empty((2, sequence, 3, 96), device="cuda", dtype=torch.uint8)
+    dense_scale = torch.empty((2, sequence, 3, 4), device="cuda", dtype=torch.uint8)
+    rotate_activation_mxfp6_quant(dense, dense_scale, value, 1.0)
+    expected_raw, expected_scale_raw = reorder_fp6_k_lds_order_triton(
+        dense, dense_scale, return_raw=True
+    )
     raw, scale_raw = quantize_mxfp6_k(value)
     packed, scale = mxfp6_k_view(raw, scale_raw, 2, sequence, 3)
 
@@ -338,6 +419,20 @@ def test_mha_v4_mxfp6_k_raw_views(sequence):
     assert scale.shape == (2, sequence, 3, 4)
     assert packed.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     assert scale.untyped_storage().data_ptr() == scale_raw.untyped_storage().data_ptr()
+    tiles = (sequence + 127) // 128
+    for batch_head in range(2 * 3):
+        for tile in range(tiles):
+            base = batch_head * tiles * 17408 + tile * 17408
+            assert torch.equal(
+                raw[base : base + 12288], expected_raw[base : base + 12288]
+            )
+            assert torch.equal(
+                raw[base + 16384 : base + 17408],
+                expected_raw[base + 16384 : base + 17408],
+            )
+    assert torch.equal(
+        scale_raw[: dense_scale.numel()], expected_scale_raw[: dense_scale.numel()]
+    )
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")

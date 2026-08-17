@@ -7,10 +7,19 @@
 namespace aiter {
 namespace torch_itfs {
 
+void rotate_activation_mxfp8_quant(at::Tensor& out,
+                                   at::Tensor& scale,
+                                   const at::Tensor& input,
+                                   double multiplier);
+
 void rotate_activation_mxfp6_quant(at::Tensor& out,
                                    at::Tensor& scale,
                                    const at::Tensor& input,
                                    double multiplier);
+
+void rotate_activation_mxfp6_quant_k(at::Tensor& out,
+                                     at::Tensor& scale,
+                                     const at::Tensor& input);
 
 void rotate_activation_mxfp4_quant(at::Tensor& out,
                                    at::Tensor& scale,

@@ -37,6 +37,8 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp4_q,
     quantize_mxfp6_k,
     quantize_mxfp6_q,
+    quantize_mxfp8_k,
+    quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
@@ -55,7 +57,6 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     get_sage_fwd_configs_mxfp4,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
-from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -91,15 +92,8 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
 
 
 def _production_quantize_mxfp8(query, key, value, softmax_scale):
-    q_rotated = torch.empty_like(query)
-    k_rotated = torch.empty_like(key)
-    rotate_activation(q_rotated, query)
-    rotate_activation(k_rotated, key)
-    q_fp8, q_scale = dynamic_mxfp8_quant(
-        q_rotated * mha_v4_q_multiplier(softmax_scale),
-        quant_dtype=aiter.dtypes.fp8,
-    )
-    k_fp8, k_scale = dynamic_mxfp8_quant(k_rotated, quant_dtype=aiter.dtypes.fp8)
+    q_fp8, q_scale = quantize_mxfp8_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_fp8, k_scale = quantize_mxfp8_k(key)
     v_fp8, v_scale = quantize_fp8(value)
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
