@@ -306,11 +306,32 @@ the FlyDSL cold harness.
       Also noted: FP4 rows carry a ~6% CK-favored scale-traffic bias (CK dummy PerTensor vs
       FlyDSL e8m0 `(1,32)`). Both caveats are in the artifact header (D3 line).
 
-#### D4 — confirm functional equivalence between the harnesses  [ ]
-- [ ] Verify (with code refs) both compute the same work: SiLU on both; same `silu(gate)·up`
-      (gate_up) and `Σ rw·(inter·w)` (down); same scale semantics (block2d weight/activation
-      scale) and output dtype (bf16). Flag any epilogue/scale difference; if the math differs,
-      the pair is not comparable and is marked n/a.
+#### D4 — confirm functional equivalence between the harnesses  [x]
+Audited both sides by code inspection (2026-08-17). **Conclusion: the compared cells compute
+the same math** — no cell needs to be marked n/a on equivalence grounds. Details:
+- [x] **gate_up epilogue — identical.** CK computes `result = silu(gate_acc) * up_acc` and
+      stores bf16 intermediate (`warp_decode_gate_up_kernel.hpp` ~824–830); FlyDSL ref is
+      `(gate * sigmoid(gate)) * up` → bf16 (`_ref_gate_up_fp4_pool`/`_fp8_pool`, test ~1717/
+      1773). CK's `element_wise::Silu` is `x*(1/(1+exp(-x)))` = `x*sigmoid(x)`
+      (`unary_element_wise_operation.hpp` ~1364) — same function, SiLU on the **gate** only.
+- [x] **down reduction — identical.** CK: `y[b,out_j] = Σ_k w_k · ds_k · Σ_i inter·w_down`,
+      bf16 store (`warp_decode_down_reduce_kernel.hpp` ~756–872); FlyDSL ref:
+      `y[b] += rwt[b,k] · (inter[b,k] @ w_down_eᵀ)` → bf16 (`_ref_down_fp4_pool`, test ~1461–
+      1474). Same `Σ router_wt · (inter·w)` structure, same bf16 output.
+- [x] **FP8 weight scale — matched (B1).** Both apply a `Block2D<128,128>` weight scale
+      (`load_block2d_scale` on CK vs the `_block2d_scale_matrix` dequant on FlyDSL). Output/
+      intermediate dtype bf16 on both.
+- [x] **FP4 weight scale — the one documented difference (not a formula difference).** FlyDSL
+      applies a real e8m0 `(1,32)` block scale; CK uses a dummy PerTensor scale=1.0. This is a
+      **scale-granularity / traffic** difference (the ~6% CK-favored caveat, B1/D3/§5), not a
+      difference in the compute graph, so the cells remain comparable on *time* — just flagged.
+- [x] **Router weights are perf-irrelevant.** CK's harness fills `rwts=1/K` (uniform) and runs
+      **uninitialized weights** (perf-only, data-independent timing); FlyDSL runs real
+      quantized weights and validates `cos≥0.99`. So equivalence of the *math* is established
+      here by inspection; a numerical output cross-check on identical inputs is the separate
+      **D7** (still optional/stretch).
+- [x] **FP8-activation (`gate_fp8_d2`) not in scope yet.** That peer needs FlyDSL **B4**; until
+      then it isn't joined, so there's no equivalence claim to make for it.
 
 #### D5 — capture environment/provenance + run-to-run variance  [x]
 - [x] `compare.py` header records arch (`get_gfx()`), aiter commit, CK worktree commit
@@ -408,7 +429,7 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
 - **gate_up FP4 pair** — ✅ done (A4; needed a one-line CK gate_up kernel packed-stride fix).
 - **gate_up FP8-act pair** needs **B4** (FlyDSL side) — CK already has `gate_fp8_d2`.
 - **Trustworthy ratios** need A1 (cold) ✅, B1 (scale) ✅, D3 (config) ✅, D1 (timing) ✅,
-  and **D4 (equiv)** — the last open prerequisite.
+  and D4 (equiv) ✅ — **all prerequisites now met**; ratios are defensible for review.
 
 ## 5. Risks / watch-items
 - **Cold flush** — *resolved (A1):* verified cold numbers drop vs warm on the cache-resident
@@ -440,6 +461,16 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **D4 done — functional-equivalence audit.** Cross-checked both harnesses by
+  code inspection: gate_up epilogue (`silu(gate)·up`, SiLU on gate only, bf16) and down
+  reduction (`Σ router_wt · (inter·w)`, bf16) are identical; CK `element_wise::Silu` =
+  `x·sigmoid(x)` matches FlyDSL. FP8 uses matched `Block2D<128,128>` weight scale both sides.
+  The only difference is FP4 weight-scale *granularity* (FlyDSL e8m0 `(1,32)` vs CK dummy
+  PerTensor) — a documented traffic/granularity caveat (~6%, B1/§5), not a compute-graph
+  difference, so cells stay comparable on time. No cell marked n/a. CK's math equivalence is
+  by inspection (perf harness runs uninitialized weights / uniform rwts); a numerical output
+  cross-check remains the optional **D7**. **This closes the D-track rigor/methodology prereqs
+  (A1/B1/D1/D3/D4 ✅)** — time ratios are now defensible for review. Docs only.
 - 2026-08-17 — **Plan hygiene pass (review items #2–#11).** Reconciled stale checkboxes and
   dependency lines: A3's C1-join sub-item ✅, C1 depends-on now shows B1/A4 done (only B4/B5
   left), §4 trustworthy-ratios shows only D4 open. Marked **D1 done** — flat `iters=1000`
