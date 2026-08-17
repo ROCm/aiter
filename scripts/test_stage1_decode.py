@@ -103,16 +103,22 @@ def make_inputs(mode, seqs, seed):
     return qf, qs, kf, ks, vf, vs, cu
 
 
-def build_pool(kf, vf, seqs, cu, seed):
+def build_pool(kf, vf, seqs, cu, seed, pool_blocks=None):
     """Scatter packed ragged KV into a scrambled linear page pool + block table.
-    Per-seq page pool, block_table [b, max_pages]."""
+    Per-seq page pool, block_table [b, max_pages].
+
+    ``pool_blocks`` pads the pool to that many blocks and scatters the used pages
+    across the full range -- set it to 65536 to exercise the production 2 GB pool
+    (page ids up to 65535 => 2**31-byte page-base offsets, the per-page-rebasing
+    stress case that the old whole-pool addressing faulted on)."""
     b = len(seqs)
     npages_per = [(ln + PAGE - 1) // PAGE for ln in seqs]
     stride = max(npages_per)
     tot_pages = sum(npages_per)
+    nblocks = tot_pages if pool_blocks is None else pool_blocks
     pg = torch.Generator().manual_seed(seed + 101)
-    flat = torch.randperm(tot_pages, generator=pg).tolist()
-    kpool = torch.zeros(tot_pages, PAGE, HKV, D, device=DEV, dtype=kf.dtype)
+    flat = torch.randperm(nblocks, generator=pg).tolist()[:tot_pages]
+    kpool = torch.zeros(nblocks, PAGE, HKV, D, device=DEV, dtype=kf.dtype)
     vpool = torch.zeros_like(kpool)
     bt = torch.zeros(b, stride, device=DEV, dtype=torch.int32)
     c = 0
@@ -146,10 +152,10 @@ def reference(qf, qs, kf, ks, vf, vs, cu, seqs):
     return out
 
 
-def _launch(mode, seqs, layout, out_dt, seed, splits=1):
+def _launch(mode, seqs, layout, out_dt, seed, splits=1, pool_blocks=None):
     """Build inputs, run the kernel, return (output, reference, inputs)."""
     qf, qs, kf, ks, vf, vs, cu = make_inputs(mode, seqs, seed)
-    kpool, vpool, bt, stride = build_pool(kf, vf, seqs, cu, seed)
+    kpool, vpool, bt, stride = build_pool(kf, vf, seqs, cu, seed, pool_blocks)
     if layout == "vectorized":
         k_arg = shuffle_k_to_vectorized(kpool)
         v_arg = shuffle_v_to_vectorized(vpool)
@@ -193,8 +199,10 @@ def _launch(mode, seqs, layout, out_dt, seed, splits=1):
     return o, reference(qf, qs, kf, ks, vf, vs, cu, seqs)
 
 
-def run_one(mode, seqs, layout, out_dt, seed=7, splits=1):
-    o, ref = _launch(mode, seqs, layout, out_dt, seed, splits=splits)
+def run_one(mode, seqs, layout, out_dt, seed=7, splits=1, pool_blocks=None):
+    o, ref = _launch(
+        mode, seqs, layout, out_dt, seed, splits=splits, pool_blocks=pool_blocks
+    )
     of = o.float()
     err = (of - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
@@ -202,7 +210,8 @@ def run_one(mode, seqs, layout, out_dt, seed=7, splits=1):
     ).item()
     bad = int(((of - ref).abs().amax(dim=(2, 3)) > 1e-1).sum().item())
     n_rows = len(seqs) * H
-    tag = f"{mode:8s} {layout:10s} {out_dt:4s} S={splits}"
+    poolt = "" if pool_blocks is None else f" pool={pool_blocks}"
+    tag = f"{mode:8s} {layout:10s} {out_dt:4s} S={splits}{poolt}"
     ok = (bad == 0) and (cos > 0.99)
     print(
         f"[{'PASS' if ok else 'FAIL'}] {tag}  err={err:.4g}  cos={cos:.6f}  "
@@ -268,6 +277,20 @@ def main():
     b64 = [4096] * 64
     for layout in ("linear", "vectorized"):
         ok &= run_one("random", b64, layout, "bf16", splits=1)
+
+    # PRODUCTION POOL: 65536 blocks = 2 GB fp8 = exactly 2**31 elements -- the
+    # per-page-rebasing stress case (page ids up to 65535 => 2**31-byte page-base
+    # offsets) that the old whole-pool addressing faulted on. all-1s/distinct/
+    # random x S in {1,2,4,8} x b in {8,16,32,64}, shuffled (production layout).
+    print("\n=== production pool (65536 blocks, 2 GB) ===")
+    for bcount in (8, 16, 32, 64):
+        seqs = [4096] * bcount  # 64 pages/seq; bcount*64 used pages scattered in 65536
+        for splits in (1, 2, 4, 8):
+            for mode in ("ones", "distinct", "random"):
+                ok &= run_one(
+                    mode, seqs, "vectorized", "bf16", splits=splits, pool_blocks=65536
+                )
+        torch.cuda.empty_cache()
 
     print("\n" + ("ALL PASS" if ok else "FAILURES PRESENT"))
     sys.exit(0 if ok else 1)

@@ -403,7 +403,11 @@ def test_fp16_output_with_packed_splitk():
     alone or split-K alone (item 13)."""
     import aiter.ops.flydsl.unified_attention_kernels as uak
 
-    real_get_kernel = uak._get_kernel.__wrapped__
+    # Stage 4: all-decode now routes to the decode-specialized kernel, whose own
+    # host split-K plan (plan_num_kv_splits) picks S. Probe _get_decode_kernel
+    # (not the prefill-body _get_kernel) to confirm the fp16-output + split-K
+    # combine path fires, and keep the correctness assertion.
+    real_get_decode = uak._get_decode_kernel.__wrapped__
     seen = {}
 
     def spy(
@@ -411,32 +415,29 @@ def test_fp16_output_with_packed_splitk():
         num_kv_heads,
         causal,
         out_dtype_str,
-        use_sinks,
-        num_kv_splits=1,
-        shuffled_kv_cache=False,
+        shuffled_kv_cache,
+        num_kv_splits,
     ):
         seen["num_kv_splits"] = num_kv_splits
-        return real_get_kernel(
+        return real_get_decode(
             num_heads,
             num_kv_heads,
             causal,
             out_dtype_str,
-            use_sinks,
-            num_kv_splits,
             shuffled_kv_cache,
+            num_kv_splits,
         )
 
-    # All-decode, deep context: the regime `flydsl_unified_attention` routes to
-    # split-K (see its tier-selection comment).
-    # b=8 * max_seqlen_k=8192 = 65536, at (not over) _DECODE_CEDE_WORK, so this
-    # stays on FlyDSL under the top-level pure-decode cede threshold.
+    # All-decode, deep context, b=8: below the mid-batch cede band (num_seqs < 9),
+    # so it routes to the decode kernel; its host plan picks S = 8 at b=8 (deep
+    # ctx), exercising the fp16-output split-K combine.
     query_lens, kv_lens = [1] * 8, [8192] * 8
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
         query_lens, kv_lens, 64, 4
     )
     out = out.to(torch.float16)
-    uak._get_kernel.cache_clear()
-    with mock.patch.object(uak, "_get_kernel", spy):
+    uak._get_decode_kernel.cache_clear()
+    with mock.patch.object(uak, "_get_decode_kernel", spy):
         got = ua.unified_attention(
             q=q,
             k=k,
@@ -456,8 +457,8 @@ def test_fp16_output_with_packed_splitk():
             v_descale=v_ds,
         )
     assert seen.get("num_kv_splits", 1) > 1, (
-        "expected this all-decode/16384-ctx shape to route through split-K; "
-        "the cross-feature combination under test did not fire"
+        "expected this all-decode/deep-ctx shape to route through the decode "
+        "kernel's split-K; the fp16-output + split-K combine did not fire"
     )
     want = ref_paged_attn(
         query=q,
@@ -695,10 +696,13 @@ def test_predicate_declines_wrong_dtypes():
 
 
 def test_decode_cede_threshold():
-    """Top-level pure-decode batches cede (return None) once the KV-read
-    volume `num_seqs * max_seqlen_k` crosses `_DECODE_CEDE_WORK`; below it, or
-    in the always-FlyDSL shallow-context region (`max_seqlen_k <=
-    _PAGE_SIZE * 20`), they are still served."""
+    """Stage-4 conservative decode-kernel cede boundary
+    (`_decode_dispatch_action`). All-decode GQA-16:1 routes to the
+    decode-specialized kernel EXCEPT the mid-batch x deep-context band --
+    `_DECODE_CEDE_MIN_SEQS <= num_seqs <= _DECODE_CEDE_MAX_SEQS` (9..48) AND
+    `max_seqlen_k >= _DECODE_CEDE_MIN_KV` (8192) -- which cedes to Triton
+    (return None). Outside it -- small batch, full batch, or shallow context --
+    it is served."""
     import aiter.ops.flydsl.unified_attention_kernels as uak
 
     def _call_direct(num_seqs, max_seqlen_k, num_heads=64, num_kv_heads=4):
@@ -730,13 +734,19 @@ def test_decode_cede_threshold():
             num_seqs=num_seqs,
         )
 
-    # 64 * 4096 = 262144 > 65536: ceded.
-    assert _call_direct(64, 4096) is None
-    # 16 * 4096 = 65536 (at, not over, the threshold): kept.
+    # Full batch (num_seqs > 48) fills the machine and wins at every depth ->
+    # served (was ceded under the old prefill-body policy).
+    assert _call_direct(64, 4096) is not None
+    assert _call_direct(64, 16384) is not None
+    # Small batch (num_seqs < 9) wins at every depth -> served.
+    assert _call_direct(8, 4096) is not None
+    assert _call_direct(8, 16384) is not None
+    # Mid batch, shallow context (max_seqlen_k < 8192) -> served.
     assert _call_direct(16, 4096) is not None
-    # 64 * 1024: max_seqlen_k <= _PAGE_SIZE * 20 (1280), so the shallow-context
-    # guard keeps this on FlyDSL regardless of batch size.
-    assert _call_direct(64, 1024) is not None
+    # Mid batch, deep context (9..48 x >=8192, the conservative loss band) -> ceded.
+    assert _call_direct(16, 16384) is None
+    assert _call_direct(32, 8192) is None
+    assert _call_direct(9, 16384) is None
 
 
 def test_mixed_split_decode_half_never_cedes():

@@ -38,6 +38,10 @@ from functools import cache, lru_cache
 import torch
 
 from .kernels.flash_attn_dualwave_common import dualwave_splitk_workspace_elems
+from .kernels.flash_attn_fp8_decode_gfx950 import (
+    build_flash_attn_fp8_decode_module,
+    plan_num_kv_splits,
+)
 from .kernels.flash_attn_fp8_gfx950 import build_flash_attn_dualwave_swp_fp8_module
 from .utils import is_flydsl_available
 
@@ -139,6 +143,10 @@ _SPLIT_MIN_DECODE_KV = 6144
 # wins ~2x; split-K does not recover it (monotonic-worse at full fill). Boundary
 # from a gfx950 A/B grid (SILOTIGER-877): every winning cell has b*ctx <= 65536,
 # every losing cell >= 98304. See the decode-regression vault doc.
+#
+# NOTE: this gates the LEGACY prefill-body decode path only (non-16:1 GQA the
+# decode kernel declines). The decode-specialized kernel's own cede lives in the
+# centralized _decode_dispatch_action block below.
 _DECODE_CEDE_WORK = 65536
 
 
@@ -231,6 +239,158 @@ def _get_kernel(
         gqa_pack_m=True if num_kv_splits > 1 else None,
         kv_cache_layout="vectorized" if shuffled_kv_cache else "linear",
     )
+
+
+# ===========================================================================
+# Decode dispatch gates (SILOTIGER-877 Stage 4). All decode routing/cede
+# thresholds live here so retuning is a one-line edit. See
+# _decode_dispatch_action for how they combine.
+# ===========================================================================
+# GQA group size the decode-specialized kernel is built for (BLOCK_M=16).
+_DECODE_GQA = 16
+# Master on/off; AITER_DECODE_KERNEL=0 forces the legacy prefill-body/cede path.
+_USE_DECODE_KERNEL = bool(int(os.environ.get("AITER_DECODE_KERNEL", "1")))
+# Conservative cede band: mid-batch x deep-context is the measured
+# near-parity/loss region vs Triton on gfx950 (crossover sweep; noisy and not
+# cleanly separable), so cede the whole band to guarantee no regression. Retune
+# against production traces.
+_DECODE_CEDE_MIN_SEQS = 9  # below: machine underfills, split-K decode wins
+_DECODE_CEDE_MAX_SEQS = 48  # above (incl. b=64): batch fills the machine, wins
+_DECODE_CEDE_MIN_KV = 8192  # shallower context always wins on the decode kernel
+
+
+def _decode_dispatch_action(
+    max_seqlen_q,
+    num_queries_per_kv,
+    sinks,
+    window_size,
+    softcap,
+    num_seqs,
+    max_seqlen_k,
+    from_split,
+):
+    """Single decode-dispatch decision: ``"route"`` the decode-specialized
+    kernel, ``"cede"`` to Triton, or ``"legacy"`` (fall through to the
+    prefill-body path). The one place all decode gates and thresholds live."""
+    if not _USE_DECODE_KERNEL:
+        return "legacy"
+    # only all-decode (single query token) is a candidate for this kernel
+    if max_seqlen_q != 1:
+        return "legacy"
+    # decode kernel supports only GQA-16:1 fp8, no sinks/window/softcap
+    if (
+        num_queries_per_kv != _DECODE_GQA
+        or sinks is not None
+        or (window_size is not None and window_size != (-1, -1))
+        or (softcap is not None and softcap != 0.0)
+    ):
+        return "legacy"
+    # cede the mid-batch x deep-context loss band (see constants). Never cede a
+    # decode half reached via the mixed split -- the split drops its return value
+    # on the invariant that a decode sub-call always serves.
+    if (
+        not from_split
+        and _DECODE_CEDE_MIN_SEQS <= num_seqs <= _DECODE_CEDE_MAX_SEQS
+        and max_seqlen_k >= _DECODE_CEDE_MIN_KV
+    ):
+        return "cede"
+    return "route"
+
+
+@lru_cache(maxsize=64)
+def _get_decode_kernel(
+    num_heads: int,
+    num_kv_heads: int,
+    causal: bool,
+    out_dtype_str: str,
+    shuffled_kv_cache: bool,
+    num_kv_splits: int,
+):
+    """Build (and cache) the decode-specialized fp8 launcher.
+
+    Separate memo from ``_get_kernel``: this is a different kernel body (BLOCK_M
+    =16 multi-wave + register-V + split-K combine), so its binary must never
+    alias the prefill body's. The builder's own ``_cache_tag`` keys the JIT disk
+    cache on ``(out_dtype, layout, varlen, causal, H, HKV, nw, splk)``; this
+    ``lru_cache`` is the process-level memo one layer up, keyed on the same
+    distinguishing fields plus the split count so linear/vectorized and each S
+    get distinct closures.
+    """
+    return build_flash_attn_fp8_decode_module(
+        num_heads=num_heads,
+        head_dim=_HEAD_DIM,
+        num_kv_heads=num_kv_heads,
+        causal=causal,
+        dtype_str="fp8",
+        out_dtype_str=out_dtype_str,
+        varlen=True,
+        paged=True,
+        kv_cache_layout="vectorized" if shuffled_kv_cache else "linear",
+        num_kv_splits=num_kv_splits,
+    )
+
+
+def _route_decode_kernel(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    block_table,
+    q_descale,
+    k_descale,
+    v_descale,
+    *,
+    num_kv_heads,
+    num_seqs,
+    shuffled_kv_cache,
+):
+    """Marshal an all-decode call to the decode-specialized kernel and run it.
+
+    Host-computes the fill-aware split S (``plan_num_kv_splits``), builds/caches
+    the matching binary, and forwards through the kernel's own ``mod`` wrapper
+    (which allocates the split-K workspace internally). K/V are the contiguous
+    paged pool flattened to 1-D (the kernel flat-addresses via
+    ``page_id * PAGE_REGION``, matching the validated Stage-1..3 layout);
+    q_descale folds the softmax scale exactly as the prefill path does. Returns
+    ``out`` written in place.
+    """
+    num_query_heads = q.shape[1]
+    out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
+    npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
+    num_kv_splits = plan_num_kv_splits(num_seqs, num_kv_heads, npages)
+    mod = _get_decode_kernel(
+        num_query_heads,
+        num_kv_heads,
+        causal,
+        out_dtype_str,
+        shuffled_kv_cache,
+        num_kv_splits,
+    )
+    with torch.cuda.device(q.device.index):
+        mod(
+            q.reshape(-1),
+            # K/V pass as base pointers only: the kernel rebases a BufferDesc per
+            # page from the block table (int32-safe within-page voffset), so the
+            # 2 GB (2**31-element) production pool needs no whole-pool memref.
+            k,
+            v,
+            out.reshape(-1),
+            num_seqs,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=_cu_seqlens_kv(seqused_k, num_seqs),
+            block_table=block_table.reshape(-1),
+            block_table_stride=int(block_table.stride(0)),
+            q_descale=_scaled_q_descale(q_descale, softmax_scale, q.shape[-1]),
+            k_descale=k_descale,
+            v_descale=v_descale,
+            stream=torch.cuda.current_stream(q.device),
+        )
+    return out
 
 
 def _split_count(num_2d_prgms: int, target_num_prgms: int) -> int:
@@ -679,6 +839,41 @@ def flydsl_unified_attention(
         skip_reduce,
     ):
         return None
+
+    # Decode-specialized kernel (Stage 4): the all-decode region routes to the
+    # BLOCK_M=16 multi-wave + register-V + split-K decode body. All gates and
+    # thresholds live in _decode_dispatch_action (see that block).
+    _decode_action = _decode_dispatch_action(
+        max_seqlen_q,
+        num_queries_per_kv,
+        sinks,
+        window_size,
+        softcap,
+        num_seqs,
+        max_seqlen_k,
+        _from_split,
+    )
+    if _decode_action == "cede":
+        return None
+    if _decode_action == "route":
+        return _route_decode_kernel(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            max_seqlen_k,
+            softmax_scale,
+            bool(causal),
+            block_table,
+            q_descale,
+            k_descale,
+            v_descale,
+            num_kv_heads=num_kv_heads,
+            num_seqs=num_seqs,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
 
     # Cede the pure-decode region FlyDSL loses to Triton (return None -> caller
     # runs Triton). Guard on max_seqlen_k > _PAGE_SIZE * 20 keeps the shallow

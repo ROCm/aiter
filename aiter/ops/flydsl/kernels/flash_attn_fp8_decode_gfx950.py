@@ -49,6 +49,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import _make_page_view
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, ptr_arg
 
 FP8 = fx.Float8E4M3FN
@@ -229,8 +231,8 @@ def build_flash_attn_fp8_decode_module(
     @flyc.kernel(known_block_size=(NW * WARP, 1, 1))
     def decode_kernel(
         q_ptr: fx.Pointer,
-        K: fx.Tensor,  # fx.Tensor (not Pointer) so make_buffer_tensor -> async DMA
-        v_ptr: fx.Pointer,  # V is not DMA'd (global operand read / scalar) -> plain view
+        k_ptr: fx.Pointer,  # per-page buffer resource rebased from block table
+        v_ptr: fx.Pointer,  # per-page plain view rebased from block table
         o_ptr: fx.Pointer,
         bt_ptr: fx.Pointer,
         cuq_ptr: fx.Pointer,
@@ -251,15 +253,6 @@ def build_flash_attn_fp8_decode_module(
         split = fx.block_idx.z  # KV split in [0, SPLK); 0 when SPLITK is off
         lg = lane // 16
         n = lane % 16
-
-        def gviewi8(ptr):
-            # fp8 KV/Q are read as raw bytes (i8) and bitcast to fp8 in the
-            # fragment; this keeps the LDS store/load path byte-typed.
-            pt = fx.PointerType.get(fx.Int8.ir_type, address_space=AS_G, alignment=1)
-            return fx.make_view(
-                fx.inttoptr(pt, fx.Int64(fx.ptrtoint(ptr))),
-                fx.make_layout((1 << 30,), (1,)),
-            )
 
         def gviewi8_2d(ptr):
             # [N, 8] i8 view (8-byte rows) for coalesced b64 operand loads.
@@ -304,20 +297,53 @@ def build_flash_attn_fp8_decode_module(
                 fx.make_layout((1 << 28,), (1,)),
             )
 
-        # Async global->LDS DMA (buffer_load_dwordx4 ... lds) for K: src must be a
-        # byte-typed buffer tensor. k_div is the whole-pool descriptor; per-lane
-        # src_elem carries the (page_id, kv-head, layout) gather offset.
+        # Per-page buffer rebasing (production-safe). A >= 2**31-element KV pool
+        # cannot be one int32-shaped memref, and the buffer voffset is 32-bit, so
+        # instead of one whole-pool resource + flat page_id*PAGE_REGION offset we
+        # anchor a BufferDesc at each page's base (from the block table) and index
+        # only WITHIN the page (< PAGE_REGION, int32-safe). Same pattern as the
+        # prefill kernel's kv_page_div (_make_page_view, reused).
         dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         lds_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, 2, 16)
-        k_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(K), fx.make_layout(1, 1))
-        # V is never DMA'd: shuffled reads the V^T fragment straight from global
-        # (already in operand order); linear scalar-reads it for the LDS transpose.
-        # Both use plain make_view (make_buffer_tensor + fx.copy trips an
-        # LLVMPointerType assertion on the b64 operand load).
-        if const_expr(SHUF):
-            gv2 = gviewi8_2d(v_ptr)  # [N,8] for b64 V^T operand loads
-        else:
-            gv = gviewi8(v_ptr)  # flat, for the scalar transpose-scatter
+        _page_i8_ty = fx.PointerType.get(
+            fx.Int8.ir_type, address_space=AS_G, alignment=1
+        )
+        _page_nrec = fx.Int64(PAGE_REGION)
+        _page_layout = fx.make_layout(fx.Int32(PAGE_REGION), fx.Int32(1))
+        _buf_flags = fx.Int32(buffer_ops._get_buffer_flags())
+        v_base_addr = fx.Int64(fx.ptrtoint(v_ptr))
+
+        def k_page_div(page_id):
+            # BufferDesc covering exactly page `page_id` (num_records = one page).
+            return _make_page_view(
+                k_ptr,
+                _page_i8_ty,
+                1,
+                fx.Int64(page_id),
+                PAGE_REGION,
+                _page_nrec,
+                _page_layout,
+                fx.Int8.ir_type,
+                _buf_flags,
+            )
+
+        def _v_page_addr(page_id):
+            return v_base_addr + fx.Int64(page_id) * fx.Int64(PAGE_REGION)
+
+        def v_page_view2d(page_id):
+            # Per-page [PAGE_REGION//8, 8] i8 view for coalesced b64 V^T operand
+            # loads (shuffled V is already in operand order within the page).
+            return fx.make_view(
+                fx.inttoptr(_page_i8_ty, _v_page_addr(page_id)),
+                fx.make_layout((PAGE_REGION // 8, 8), (8, 1)),
+            )
+
+        def v_page_flat(page_id):
+            # Per-page flat i8 view for the linear scatter-transpose scalar reads.
+            return fx.make_view(
+                fx.inttoptr(_page_i8_ty, _v_page_addr(page_id)),
+                fx.make_layout((PAGE_REGION,), (1,)),
+            )
 
         # Per-tensor descale scalars. c_logit_scale multiplies the fp32 QK
         # logits (fp8 Q/K feed the MFMA raw); vd folds into the epilogue 1/l.
@@ -373,12 +399,11 @@ def build_flash_attn_fp8_decode_module(
             fx.copy(dma_atom, src, dst, soffset=fx.Int32(0))
 
         def dma_page_k_shuf(page_id, kbufoff):
-            # Issue this wave's 8 K DMAs for a shuffled-cache page into K buffer
-            # at byte offset kbufoff. K lands canonical LDS_K[n_kv, d]; V is not
-            # staged (read straight from global in the PV loop).
-            hoff32 = fx.Int32(page_id) * fx.Int32(PAGE_REGION) + fx.Int32(h) * fx.Int32(
-                SHUF_HEAD_STRIDE
-            )
+            # Issue this wave's 8 K DMAs for a shuffled-cache page into K buffer at
+            # byte offset kbufoff. The BufferDesc is rebased to this page, so k_src
+            # is the WITHIN-page offset (kv-head + layout), int32-safe.
+            kdv = k_page_div(page_id)
+            hoff32 = fx.Int32(h) * fx.Int32(SHUF_HEAD_STRIDE)
             for c in range_constexpr(8):
                 flat0 = fx.Int32(c * 1024) + fx.Int32(lane) * 16
                 n_kv = flat0 // D
@@ -386,7 +411,7 @@ def build_flash_attn_fp8_decode_module(
                 k_src = (
                     hoff32 + (d0 // VEC) * fx.Int32(SHUF_K_DCHUNK_STRIDE) + n_kv * VEC
                 )
-                dma128(k_div, lk_base + kbufoff + fx.Int32(c * 1024), k_src)
+                dma128(kdv, lk_base + kbufoff + fx.Int32(c * 1024), k_src)
 
         cp64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Int8)
 
@@ -469,9 +494,8 @@ def build_flash_attn_fp8_decode_module(
             if const_expr(SHUF):
                 page_id = gbt[b * bt_stride + pvi]
                 dma_page_k_shuf(page_id, wave_kv)  # K -> LDS (async)
-                hoff_v = fx.Int32(page_id) * fx.Int32(PAGE_REGION) + fx.Int32(
-                    h
-                ) * fx.Int32(SHUF_HEAD_STRIDE)
+                gv2p = v_page_view2d(page_id)  # this page's V view
+                hoff_v = fx.Int32(h) * fx.Int32(SHUF_HEAD_STRIDE)  # within-page
                 # Prefetch every V^T operand fragment (8 chunks x 2 steps) as a b64
                 # global load into registers NOW, so V's global latency overlaps
                 # the K DMA (and each other) instead of stalling the PV loop.
@@ -487,7 +511,7 @@ def build_flash_attn_fp8_decode_module(
                             + d_op * VEC
                             + (lg % 2) * 8
                         )
-                        vf_step.append(load_frag8(gv2, voff))
+                        vf_step.append(load_frag8(gv2p, voff))
                     v_frags.append(vf_step)
                 _waitcnt_vm_n(0)  # K DMA + all V loads complete (vmcnt)
             else:
@@ -496,17 +520,20 @@ def build_flash_attn_fp8_decode_module(
                 # axis is d, but the transposed LDS tile needs n_kv contiguous, so
                 # it cannot be DMA-transposed).
                 page_id = gbt[b * bt_stride + pvi]
-                pf = fx.Int64(page_id) * PAGE_REGION
-                pf32 = fx.Int32(page_id) * fx.Int32(PAGE_REGION)
+                kdv = k_page_div(page_id)  # BufferDesc rebased to this page
+                gvp = v_page_flat(page_id)
                 for c in range_constexpr(8):
                     flat0 = fx.Int32(c * 1024) + fx.Int32(lane) * 16
                     n_kv = flat0 // D
                     d0 = flat0 % D
-                    k_src = pf32 + n_kv * fx.Int32(LIN_T_STRIDE) + fx.Int32(h) * D + d0
-                    dma128(k_div, lk_base + wave_kv + fx.Int32(c * 1024), k_src)
-                base_lin = pf + fx.Int64(lane) * LIN_T_STRIDE + fx.Int64(h) * D
+                    # within-page linear offset (page anchored in the BufferDesc)
+                    k_src = n_kv * fx.Int32(LIN_T_STRIDE) + fx.Int32(h) * D + d0
+                    dma128(kdv, lk_base + wave_kv + fx.Int32(c * 1024), k_src)
+                base_lin = fx.Int32(lane) * fx.Int32(LIN_T_STRIDE) + fx.Int32(h) * D
                 for d in range_constexpr(D):
-                    lvf[wave_v + fx.Int32(d * PAGE) + fx.Int32(lane)] = gv[base_lin + d]
+                    lvf[wave_v + fx.Int32(d * PAGE) + fx.Int32(lane)] = gvp[
+                        base_lin + d
+                    ]
                 fx.rocdl.s_waitcnt(0)  # linear: DMA (vmcnt) + scalar V write (lgkmcnt)
 
             # ---- two 32-token flash steps per 64-token page ----
@@ -664,7 +691,7 @@ def build_flash_attn_fp8_decode_module(
     @flyc.jit
     def launch(
         q_ptr: fx.Pointer,
-        K: fx.Tensor,
+        k_ptr: fx.Pointer,
         v_ptr: fx.Pointer,
         o_ptr: fx.Pointer,
         bt_ptr: fx.Pointer,
@@ -682,7 +709,7 @@ def build_flash_attn_fp8_decode_module(
         _ = _cache_tag  # bind into the JIT cache key (see _cache_tag comment)
         decode_kernel(
             q_ptr,
-            K,
+            k_ptr,
             v_ptr,
             o_ptr,
             bt_ptr,
@@ -851,14 +878,12 @@ def build_flash_attn_fp8_decode_module(
             ws = workspace
         else:
             ws = _dummy_f32()
-        # K is the DMA source (fx.Tensor): pass a byte-typed torch tensor so
-        # make_buffer_tensor sees the full flat pool as i8 records. V is a plain
-        # pointer (never DMA'd).
-        kb = k.view(torch.uint8)
+        # K/V are plain pointers: the kernel rebases a BufferDesc per page from
+        # the block table (no whole-pool memref), so any pool size is fine.
         _run_compiled(
             launch,
             ptr_arg(q),
-            kb,
+            ptr_arg(k),
             ptr_arg(v),
             ptr_arg(o),
             ptr_arg(block_table),
