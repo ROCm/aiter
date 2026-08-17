@@ -401,8 +401,17 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         {
             expert = scheduled_expert;
         }
-        output_m_base = (output_tile % m_tiles) * BM;
-        output_n_base = (output_tile / m_tiles) * BN;
+        constexpr bool output_n_fast = []() constexpr {
+            if constexpr(requires { T::COMPACT_OUTPUT_N_FAST; })
+                return T::COMPACT_OUTPUT_N_FAST;
+            return false;
+        }();
+        output_m_base =
+            (output_n_fast ? output_tile / n_tiles
+                           : output_tile % m_tiles) * BM;
+        output_n_base =
+            (output_n_fast ? output_tile % n_tiles
+                           : output_tile / m_tiles) * BN;
     }
     else
     {

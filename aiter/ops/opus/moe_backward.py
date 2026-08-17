@@ -318,7 +318,7 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15, 17, 18, 19, 20, 21):
+    if int(kernel_id) in (14, 15, 17, 18, 19, 20, 21, 22):
         raise ValueError(
             "direct sorted-X K4 kernel_id requires saved_x_sorted"
         )
@@ -361,13 +361,19 @@ def _select_blocked_g2_full_pipeline(
         "route_reduce_kernel_id",
         "dw1_kernel_id",
     )
-    for name, value, expected in zip(names, requested, selected):
+    for name, value, expected in zip(names[:3], requested[:3], selected[:3]):
         if value not in (-1, expected):
             raise ValueError(
                 f"blocked-G2 full pipeline requires {name}={expected}, "
                 f"got {value}"
             )
-    return selected
+    requested_dw1 = requested[3]
+    if requested_dw1 not in (-1, 21, 22):
+        raise ValueError(
+            "blocked-G2 full pipeline requires dw1_kernel_id=21 or 22, "
+            f"got {requested_dw1}"
+        )
+    return selected[:3] + (22 if requested_dw1 == 22 else 21,)
 
 
 @dataclass(frozen=True)

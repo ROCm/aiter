@@ -117,6 +117,7 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` native-M32 LDS experiment | 19 | kid 18 schedule + independent conflict-free K32 x M32 physical LDS tiles; explicit only |
 | K4 `dw1` private blocked-dZ consumer | 20 | kid 19 with G2 blocked dZ loads and row-major sorted-X |
 | K4 `dw1` blocked-dZ/blocked-X | 21 | kid 20 with direct G2 blocked sorted-X loads |
+| K4 `dw1` blocked-G2 N-fast | 22 | kid 21 compute/layout with contiguous output-N CTA traversal; explicit only |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
@@ -233,10 +234,20 @@ there is no host readback.  Python exposes both the preallocated raw binding
 and `opus_moe_gather_x_blocked_g2(..., out=...)` for graph/forward integration.
 
 The full/trusted ABI carries an explicit `x_dw1_blocked_g2` layout bit and
-requires it if and only if K4 kid 21 is selected.  K1/K2/K4 blocked-dZ kids are
-also coupled, preventing either row-major dZ or row-major sorted-X from being
-silently reinterpreted.  Standalone K4 and the two autograd Functions continue
-to exchange canonical row-major tensors.
+requires it if and only if K4 kid 21 or 22 is selected.  K1/K2/K4 blocked-dZ
+kids are also coupled, preventing either row-major dZ or row-major sorted-X
+from being silently reinterpreted.  Standalone K4 and the two autograd
+Functions continue to exchange canonical row-major tensors.
+
+Kid 22 preserves kid 21's LDS, MFMA, blocked-dZ and blocked-X contracts but
+walks output-N tiles before output-M tiles inside each four-expert cohort.  It
+therefore reuses the larger dZ slab across adjacent CTAs instead of prioritizing
+the smaller sorted-X slab.  On the target family it is bit-exact and reduced
+the full graph by a paired median 5.50 us (11/14 wins), while direct launch
+improved by 2.66 us (9/14 wins).  Family screens found real regressions for
+short/very-long reductions and for output-N tile counts other than 16, so kid
+22 remains an explicit runtime-geometry tuning choice instead of an exact-shape
+auto special case.
 
 For `(T,D,I,E,K)=(32768,2048,1024,64,8)`, kid 21 reduced isolated K4 by about
 128 us.  Repeated full-pipeline ABBA measured 87--121 us on an earlier clean

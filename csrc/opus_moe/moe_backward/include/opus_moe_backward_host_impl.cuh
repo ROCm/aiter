@@ -670,15 +670,18 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int blocked_route_dx_kid = 20;
     constexpr int blocked_dw1_kid = 20;
     constexpr int blocked_dw1_blocked_x_kid = 21;
+    constexpr int blocked_dw1_blocked_x_n_fast_kid = 22;
     const bool blocked_down = down_kernel_id == blocked_down_kid;
     const bool blocked_route_dx = route_dx_kernel_id == blocked_route_dx_kid;
     const bool blocked_dw1 =
         dw1_kernel_id == blocked_dw1_kid ||
-        dw1_kernel_id == blocked_dw1_blocked_x_kid;
+        dw1_kernel_id == blocked_dw1_blocked_x_kid ||
+        dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid;
     AITER_CHECK(x_dw1_blocked_g2 ==
-                    (dw1_kernel_id == blocked_dw1_blocked_x_kid),
+                    (dw1_kernel_id == blocked_dw1_blocked_x_kid ||
+                     dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid),
                 "fixed full pipeline: blocked-G2 sorted-X layout must be "
-                "selected if and only if K4 kernel 21 is selected");
+                "selected if and only if K4 kernel 21 or 22 is selected");
     const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
     AITER_CHECK(!any_blocked_dz ||
                     (blocked_down && blocked_route_dx && blocked_dw1),
@@ -2447,7 +2450,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
             dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
             dw1_kernel_id == 17 || dw1_kernel_id == 18 ||
             dw1_kernel_id == 19 || dw1_kernel_id == 20 ||
-            dw1_kernel_id == 21;
+            dw1_kernel_id == 21 || dw1_kernel_id == 22;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,
