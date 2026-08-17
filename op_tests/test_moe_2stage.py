@@ -1278,7 +1278,13 @@ if args.bm16_scale_boundary:
 elif args.verify_aot_cache:
     _verify_csv = _prepare_aot_verify_cache(args.verify_aot_cache)
     # Match regular CSV CI coverage and do not append legacy cases.
-    _case_iters.append(_iter_csv_cases(_verify_csv, force_check_aot_cache=True))
+    _case_iters.append(
+        _iter_with_env(
+            _iter_csv_cases(_verify_csv, force_check_aot_cache=True),
+            AITER_SITUV2_A8W4="1",
+            AITER_SITUV2_A4W4=None,
+        )
+    )
 else:
     if not args.no_flydsl_csv:
         _case_iters.append(
@@ -1348,6 +1354,12 @@ for kwargs, extras in case_iter:
     ret.update(extras)
     df.append(ret)
     _write_bench_csv(df)
+
+if args.verify_aot_cache and seen == 0:
+    parser.error(
+        "--verify-aot-cache selected no cases; check CU, CSV tags/filter, "
+        "and SiTUv2 runtime mode"
+    )
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",
