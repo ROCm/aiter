@@ -8,7 +8,11 @@ name: PR Title Tags
 # [Triton-Gluon-MLA-GFX950], ...) are recomputed from the changed files, so
 # dropped components disappear and new ones appear. Tags outside the
 # component namespace ([fix], [Perf], [MLA], [gfx1250], ...) are never
-# touched. To opt a PR out entirely, add the 'no-auto-title' label.
+# touched. To opt a PR out entirely, add the 'no-auto-title' label — it takes
+# effect immediately, and removing it re-syncs the title on the spot.
+#
+# The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
+# two in sync when adding or renaming tags.
 #
 # pull_request_target is used so the default token can edit titles on fork
 # PRs as well. This is safe here because the job never checks out or executes
@@ -16,7 +20,8 @@ name: PR Title Tags
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, ready_for_review, synchronize, reopened, labeled, unlabeled]
+    branches: [main]
 
 permissions:
   pull-requests: write
@@ -34,6 +39,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const action = context.payload.action;
+            if ((action === 'labeled' || action === 'unlabeled')
+                && context.payload.label?.name !== 'no-auto-title') {
+              core.info(`Label '${context.payload.label?.name}' is not title-related — skipping.`);
+              return;
+            }
             const pr = context.payload.pull_request;
             if (pr.labels.some(l => l.name === 'no-auto-title')) {
               core.info("Label 'no-auto-title' set — skipping.");
@@ -51,19 +62,26 @@ jobs:
             // ---- path predicates ----
             const isDoc    = f => f.startsWith('docs/') || f.endsWith('.md');
             const isTriton = f => f.startsWith('aiter/ops/triton/')
+                               || f.startsWith('aiter/aot/triton/')
+                               || f.startsWith('aiter/utility/triton/')
                                || f.startsWith('op_tests/triton_tests/')
                                || f.startsWith('op_tests/op_benchmarks/triton/');
             const isAsm    = f => f.startsWith('hsa/') || /_asm\.py$/.test(f);
-            const isCk     = f => /^csrc\/(ck_|cktile_|py_itfs_ck\/)/.test(f)
+            const isCk     = f => /^csrc\/(ck_|cktile_|py_itfs_ck\/|include\/ck_tile\/)/.test(f)
                                || f.startsWith('3rdparty/composable_kernel');
             const isOpus   = f => f.startsWith('aiter/ops/opus/')
                                || f.startsWith('csrc/opus_gemm/')
                                || f.startsWith('csrc/opus_moe/')
+                               || f.startsWith('csrc/include/opus/')
                                || f.startsWith('op_tests/opus/')
-                               || f === 'aiter/ops/moe_sorting_opus.py';
-            const isHip    = f => f.startsWith('csrc/') && !isCk(f) && !isOpus(f);
+                               || /^aiter\/ops\/[^/]*opus[^/]*\.py$/.test(f)
+                               || /^op_tests\/[^/]*opus[^/]*\.py$/.test(f);
+            const isHip    = f => (f.startsWith('csrc/') && !isCk(f) && !isOpus(f))
+                               || f.startsWith('op_tests/op_benchmarks/hip/');
             const isFlyDsl = f => f.startsWith('aiter/ops/flydsl/')
-                               || f.startsWith('op_tests/flydsl_tests/');
+                               || f.startsWith('aiter/aot/flydsl/')
+                               || f.startsWith('op_tests/flydsl_tests/')
+                               || /^op_tests\/[^/]*flydsl[^/]*\.py$/.test(f);
             const isCi     = f => f.startsWith('.github/');
             const isJit    = f => f.startsWith('aiter/jit/');
             const isBuild  = f => ['setup.py', 'pyproject.toml', 'MANIFEST.in'].includes(f)
@@ -98,7 +116,7 @@ jobs:
             // prepend the computed canonical set.
             const COMPONENT_WORDS = new Set([
               'triton', 'gluon', 'ck', 'cktile', 'asm', 'hip', 'opus',
-              'flydsl', 'ci', 'jit', 'build', 'config', 'docs',
+              'flydsl', 'ci', 'jit', 'build', 'config', 'docs', 'doc',
             ]);
             const tokenWords = t => t.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
             const original = pr.title;
