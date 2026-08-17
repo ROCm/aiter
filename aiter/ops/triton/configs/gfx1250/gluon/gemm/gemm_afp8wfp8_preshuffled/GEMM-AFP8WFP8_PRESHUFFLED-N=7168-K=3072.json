@@ -9,6 +9,7 @@
         "waves_per_eu": 0,
         "NUM_BUFFERS": 4,
         "cache_modifier": ".ca",
+        "LOOP_UNROLL_FACTOR": 1,
         "kernel_type": "bandwidth_bound"
     },
     "M_LEQ_512": {
@@ -18,9 +19,10 @@
         "GROUP_SIZE_M": 1,
         "NUM_KSPLIT": 1,
         "num_warps": 4,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "NUM_BUFFERS": 4,
         "cache_modifier": null,
+        "LOOP_UNROLL_FACTOR": 1,
         "kernel_type": "bandwidth_bound"
     },
     "any": {
@@ -33,6 +35,7 @@
         "waves_per_eu": 1,
         "NUM_BUFFERS": 4,
         "cache_modifier": null,
+        "LOOP_UNROLL_FACTOR": 1,
         "kernel_type": "bandwidth_bound"
     }
 }

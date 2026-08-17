@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -29,6 +30,7 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "waves_per_eu",
     "cache_modifier",
     "NUM_BUFFERS",
+    "LOOP_UNROLL_FACTOR",
 ]
 
 _gemm_mxfp8_preshuffle_bandwidth_bound_repr = make_kernel_repr(
@@ -184,6 +186,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    LOOP_UNROLL_FACTOR: gl.constexpr = 1,
     waves_per_eu: gl.constexpr = 0,
 ):
     """
@@ -272,6 +275,37 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         and NUM_SCALE_CHUNKS == 1
     )
 
+    # ---- B-scale staging in LDS ----
+    # Same trade as the A slab, but the payoff is much larger and the reason is
+    # not the byte count: a global load anywhere in the main loop puts an
+    # s_wait_loadcnt on the critical path between the ds_loads and the wmma, and
+    # the TDM operand pipeline cannot cover it. With the B scales staged, the
+    # loop has NO global access at all -- which is what the FlyDSL kernel this is
+    # measured against does. Measured at M512/N7168/K16384, BLOCK 128x128x256,
+    # NUM_BUFFERS 4, num_warps 4: 53.8 us -> 38.2 us. Moving the A scales alone
+    # was worth 2.7 us on the same shape; the two are not additive because the
+    # win is removing the LAST global load, not each one.
+    #
+    # The slab is tiny in real terms -- B scales are one byte per 128(N) x 128(K)
+    # block, so a CTA needs only BLOCK_SIZE_N // 128 rows x K // 128 bytes (128
+    # bytes at BLOCK_SIZE_N 128, K 16384) for its whole K span. It is stored
+    # replicated to BLOCK_SIZE_N rows because memdesc.gather indexes along one
+    # dim only: row i of the result comes from row i of the slab, so the slab has
+    # to carry a row per N element even though only every 128th differs.
+    B_SCALE_SPAN_K: gl.constexpr = (
+        (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    ) * BLOCK_SIZE_K
+    B_SCALE_COLS: gl.constexpr = triton.next_power_of_2(
+        max(1, B_SCALE_SPAN_K // B_SCALE_K_GROUP)
+    )
+    # Budget matches A_SCALE_SLAB_BYTES for the same reason: at BLOCK 128x128x256
+    # / NUM_BUFFERS 4 the operand buffers plus both slabs come to 299008 B, which
+    # still rounds into the same five 64 KiB LDS partitions as the 282624 B the
+    # kernel took before -- so the slab is free in occupancy terms. Configs that
+    # would exceed it (BLOCK_SIZE_N 256, or a K span past 16384 per split) keep
+    # the in-loop global path rather than risk an LDS overflow at launch.
+    B_SCALE_IN_LDS: gl.constexpr = (BLOCK_SIZE_N * B_SCALE_COLS) <= 16384
+
     # The wmma instruction shape is [16, 16, 128], so a K tile must be a whole
     # number of k-steps; 128 also keeps K_GROUPS aligned to the 32-element MX
     # groups and to the 128-element scale blocks.
@@ -279,6 +313,23 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     gl.static_assert(BLOCK_SIZE_N % 16 == 0)
     gl.static_assert(NUM_BUFFERS >= 2)
     gl.static_assert(A_SCALE_K_GROUP % SCALE_GROUP_SIZE == 0)
+
+    # ---- main-loop unroll ----
+    # Unrolling gives the scheduler several K tiles in one basic block so the
+    # next tile's ds_loads can issue into the shadow of this tile's wmma; within
+    # a single-tile body those loads sit behind the loop back-edge.
+    #
+    # Clamped to the trip count. LLVM guards the unrolled body with a runtime
+    # trip check, so an oversized factor is *correct* but emits a multi-tile body
+    # that never executes -- dead I-cache and compile time. The bound is exact
+    # rather than conservative: K_local is SPLITK_BLOCK_SIZE for NUM_KSPLIT > 1,
+    # and equals it for NUM_KSPLIT == 1 too since the wrapper sets
+    # SPLITK_BLOCK_SIZE = cdiv(K, 1) = K.
+    STATIC_K_ITER: gl.constexpr = (
+        SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1
+    ) // BLOCK_SIZE_K
+    STATIC_MAIN_ITERS: gl.constexpr = STATIC_K_ITER - (NUM_BUFFERS - 1)
+    UNROLL: gl.constexpr = max(1, min(LOOP_UNROLL_FACTOR, STATIC_MAIN_ITERS))
 
     # ---- program setup: split-K decomposition ----
     pid_unified = gl.program_id(axis=0)
@@ -357,6 +408,11 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     ) % N
     offs_bs_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
     bs_row_off = (offs_bs_n // B_SCALE_N_GROUP) * stride_bsn
+    # Zero column, same role as as_zeros_m: broadcasts the K-group vector to the
+    # full tile shape for memdesc.gather.
+    bs_zeros_n = gl.zeros(
+        [BLOCK_SIZE_N], dtype=gl.int32, layout=gl.SliceLayout(1, b_scale_layout)
+    )
 
     # ---- TDM descriptors ----
     off_am_tdm = pid_m * BLOCK_SIZE_M
@@ -408,6 +464,40 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             as_desc.dtype, shape=[A_SCALE_COLS, BLOCK_SIZE_M], layout=as_shared
         )
 
+    # B-scale slab. Filled by a plain global load rather than TDM: TDM copies,
+    # it does not broadcast, and the slab needs every 128th source row replicated
+    # across 128 rows (see B_SCALE_IN_LDS). The load is issued here, as early as
+    # possible, and consumed after the TDM prologue's async_wait so its latency
+    # sits under the operand fill instead of in front of the main loop.
+    if B_SCALE_IN_LDS:
+        bs_fill_layout: gl.constexpr = gl.BlockedLayout(
+            [1, B_SCALE_COLS], [32, 1], [num_warps, 1], [1, 0]
+        )
+        # Clamped, not masked, exactly as _load_scale_tile does: a column past
+        # the real K span is only ever gathered for a K tile the loop does not
+        # reach, so pinning it to the last valid group keeps the address in
+        # bounds without a mask. B_SCALE_COLS is a power of 2 and the real count
+        # need not be, so this does fire on non-power-of-2 K spans.
+        bs_fill_kg = gl.arange(
+            0, B_SCALE_COLS, layout=gl.SliceLayout(0, bs_fill_layout)
+        )
+        bs_fill_kg = gl.minimum(
+            bs_fill_kg, gl.cdiv(K_local, B_SCALE_K_GROUP) - 1
+        )
+        bs_fill_n = (
+            pid_n * BLOCK_SIZE_N
+            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, bs_fill_layout))
+        ) % N
+        bs_fill = gl.load(
+            b_scale_ptr
+            + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
+            + ((bs_fill_n // B_SCALE_N_GROUP) * stride_bsn)[:, None]
+            + (bs_fill_kg * stride_bsk)[None, :]
+        )
+        bs_slab = gl.allocate_shared_memory(
+            bs_fill.dtype, shape=[BLOCK_SIZE_N, B_SCALE_COLS], layout=as_shared
+        )
+
     num_loads = 0
     num_computes = 0
 
@@ -433,8 +523,17 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
+    # The fill layout spreads rows across waves but the gather reads them in the
+    # wmma scale layout, so a wave reads rows it did not write: the barrier is
+    # required for correctness, not just ordering. It is paid once.
+    if B_SCALE_IN_LDS:
+        bs_slab.store(bs_fill)
+        gl.barrier()
+
     # ---------------- Main loop ----------------
-    for _ in range(NUM_K_ITER - (NUM_BUFFERS - 1)):
+    for _ in tl.range(
+        0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL
+    ):
         slot_c = num_computes % NUM_BUFFERS
         cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
         cur_b = depreshuffle_b(
@@ -465,18 +564,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 SCALE_K_GROUP=A_SCALE_K_GROUP,
                 cache_modifier=cache_modifier,
             )
-        cur_bs = _load_scale_tile(
-            b_scale_ptr,
-            num_computes,
-            k_split_offset,
-            K,
-            bs_row_off,
-            offs_bs_kg,
-            stride_bsk,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=B_SCALE_K_GROUP,
-            cache_modifier=cache_modifier,
-        )
+        if B_SCALE_IN_LDS:
+            cur_bs = _gather_scale_tile(
+                bs_slab,
+                num_computes,
+                bs_zeros_n,
+                offs_bs_kg,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=B_SCALE_K_GROUP,
+                SLAB_COLS=B_SCALE_COLS,
+            )
+        else:
+            cur_bs = _load_scale_tile(
+                b_scale_ptr,
+                num_computes,
+                k_split_offset,
+                K,
+                bs_row_off,
+                offs_bs_kg,
+                stride_bsk,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=B_SCALE_K_GROUP,
+                cache_modifier=cache_modifier,
+            )
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
@@ -531,18 +641,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 SCALE_K_GROUP=A_SCALE_K_GROUP,
                 cache_modifier=cache_modifier,
             )
-        cur_bs = _load_scale_tile(
-            b_scale_ptr,
-            num_computes,
-            k_split_offset,
-            K,
-            bs_row_off,
-            offs_bs_kg,
-            stride_bsk,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=B_SCALE_K_GROUP,
-            cache_modifier=cache_modifier,
-        )
+        if B_SCALE_IN_LDS:
+            cur_bs = _gather_scale_tile(
+                bs_slab,
+                num_computes,
+                bs_zeros_n,
+                offs_bs_kg,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=B_SCALE_K_GROUP,
+                SLAB_COLS=B_SCALE_COLS,
+            )
+        else:
+            cur_bs = _load_scale_tile(
+                b_scale_ptr,
+                num_computes,
+                k_split_offset,
+                K,
+                bs_row_off,
+                offs_bs_kg,
+                stride_bsk,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                SCALE_K_GROUP=B_SCALE_K_GROUP,
+                cache_modifier=cache_modifier,
+            )
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
@@ -582,18 +703,29 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             SCALE_K_GROUP=A_SCALE_K_GROUP,
             cache_modifier=cache_modifier,
         )
-    cur_bs = _load_scale_tile(
-        b_scale_ptr,
-        num_computes,
-        k_split_offset,
-        K,
-        bs_row_off,
-        offs_bs_kg,
-        stride_bsk,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        SCALE_K_GROUP=B_SCALE_K_GROUP,
-        cache_modifier=cache_modifier,
-    )
+    if B_SCALE_IN_LDS:
+        cur_bs = _gather_scale_tile(
+            bs_slab,
+            num_computes,
+            bs_zeros_n,
+            offs_bs_kg,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=B_SCALE_K_GROUP,
+            SLAB_COLS=B_SCALE_COLS,
+        )
+    else:
+        cur_bs = _load_scale_tile(
+            b_scale_ptr,
+            num_computes,
+            k_split_offset,
+            K,
+            bs_row_off,
+            offs_bs_kg,
+            stride_bsk,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=B_SCALE_K_GROUP,
+            cache_modifier=cache_modifier,
+        )
     acc = gl.amd.gfx1250.wmma_scaled(cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc)
 
     # ---------------- Store ----------------
