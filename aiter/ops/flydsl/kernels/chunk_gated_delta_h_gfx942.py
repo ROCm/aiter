@@ -568,22 +568,7 @@ def compile_chunk_gated_delta_h_gfx942(
             co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
 
         # -- MMA atom --
-        # One 16x16x16 bf16 MFMA per wave, replicated 1x1x1 (this kernel does its
-        # own wave decomposition via wid_m/wid_n, so the tiled_mma stays a single
-        # atom and the per-wave tile offsets remain explicit below).
-        #
-        # Every MFMA in this kernel goes through fx.gemm on register-tensor
-        # fragments. The operands are still loaded by hand from LDS at
-        # XOR-swizzled addresses (_lds_*_idx) and pushed into the fragments with
-        # .store(); only the MFMA itself is expressed at the atom level. fly.gemm
-        # requires all of d/a/b/c to be !fly.memref, which is why the raw
-        # vector<4xbf16> from fx.ptr_load cannot be passed directly.
-        #
-        # The fragments do not survive to codegen: fly.gemm expands to
-        # fly.mma_atom_call, fly-convert-atom-call-to-ssa-form rewrites that to
-        # mma_atom_call_ssa, and the register allocas are promoted to SSA
-        # vectors. The emitted ISA is identical to the hand-written
-        # rocdl.mfma_f32_16x16x16bf16_1k form this replaced.
+        # One 16x16x16 bf16 MFMA per wave, replicated 1x1x1.
         mma_atom_bf16_16x16x16 = fx.make_mma_atom(
             fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16)
         )
@@ -740,12 +725,6 @@ def compile_chunk_gated_delta_h_gfx942(
         lane_m_base = lane // fx.Int32(16)
 
         # -- Initialize h accumulators --
-        # The h accumulators are register tensors that live ACROSS the serial
-        # chunk loop. They are deliberately NOT part of the loop's explicit
-        # init/yield state: fly-promote-reg-mem-to-vector-ssa collects register
-        # allocas touched inside an scf.for and threads them as iter_args itself
-        # (PromoteRegMemToVectorSSA.cpp:466-516), which is the same SSA form the
-        # hand-written carry produced -- with none of the plumbing.
         h_accs = [
             fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(NUM_H_ACCS)
         ]
@@ -831,9 +810,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
         gu_prefetch_init = _load_gate_u(i_t0_i32)
 
-        init_state = [_to_raw(v) for v in w_prefetch_init] + [
-            _to_raw(v) for v in gu_prefetch_init
-        ]
+        init_state = w_prefetch_init + gu_prefetch_init
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
@@ -1273,9 +1250,6 @@ def compile_chunk_gated_delta_h_gfx942(
                     fx.make_rmem_tensor(4, fx.Float32)
                     for _ in fx.range_constexpr(N_REPEAT_LOCAL)
                 ]
-                # make_rmem_tensor does NOT zero: the K-loop below accumulates
-                # into these, so they must be cleared first (fx.full did this
-                # implicitly in the pre-atom version).
                 for frag in o_accs:
                     frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
 
@@ -1351,11 +1325,9 @@ def compile_chunk_gated_delta_h_gfx942(
                                     result_type=v4bf16_type,
                                 )
                             )
-                            # Bridge style: the B operand is a 4-scalar gather
+                            # The B operand is a 4-scalar gather
                             # (lds_kt is [K, BT], so the 4 contraction elements
                             # are one row apart), which no copy atom expresses.
-                            # Assemble the vector by hand, then store it into the
-                            # fragment.
                             b_frag_t.store(
                                 fx.Vector.from_elements(
                                     [
@@ -1458,8 +1430,6 @@ def compile_chunk_gated_delta_h_gfx942(
                         exp_gi_gl, dtype=fx.Float32
                     )
                     for nr in range_constexpr(N_REPEAT_LOCAL):
-                        # Both accumulators are register tensors (GEMM3/GEMM4b);
-                        # .load() yields the f32x4 the arithmetic below expects.
                         o_accs[nr] = (
                             o_accs[nr].load() * exp_gi_vec
                             + o_intra_accs[nr].load() * exp_gi_gl_vec
@@ -1492,9 +1462,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
                 w_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
 
-            yield [_to_raw(v) for v in w_next_prefetch] + [
-                _to_raw(v) for v in gu_next_prefetch
-            ]
+            yield w_next_prefetch + gu_next_prefetch
 
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
