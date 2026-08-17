@@ -21,6 +21,13 @@ and, with N fixed, doubles the N x H (sequence, head) chains the state scan has
 to run -- which is what separates the fused and split families.  The GQA ratio
 is Hv/Hk and the split has to be exact in both directions.
 
+``--full-prompt-len`` sets the tokens per sequence, which the group's own sweep
+holds at 8192 and only varies through ``--n-seqs``.  That couples three
+quantities -- token total, sequence count and chain count -- so pass both flags
+to separate them: the same token budget cut into a different number of segments,
+or the same segment count at a different length.  The C families need it to stay
+a multiple of BT=64; the W/U families accept any length.
+
 Usage:
 
     # every backend, then the comparison tables
@@ -36,6 +43,10 @@ Usage:
 
     # plain MHA instead of GQA 4 (Hk == Hv)
     python <this> --Hk 64 --Hv 64
+
+    # one 65536-token budget, four ways to cut it
+    python <this> --n-seqs 8 --full-prompt-len 8192  --outdir /tmp/gdn_bench_8x8k
+    python <this> --n-seqs 1 --full-prompt-len 65536 --outdir /tmp/gdn_bench_1x64k
 
 Backends:
     ws       opus_gdn_wu_prefill_fwd, k2_mode=0, which packed varlen resolves to
@@ -83,7 +94,7 @@ D = 128  # K == V
 HK, HV, TP = 16, 64, 8
 HG = HK // TP  # 2 key heads per rank
 H = HV // TP  # 8 value heads per rank
-FULL_PROMPT_LEN = 8192
+FULL_PROMPT_LEN = 8192  # tokens per sequence; `--full-prompt-len` overrides
 
 NUM_WARMUP = 5
 NUM_ITERS = 50
@@ -592,7 +603,7 @@ def compare(outdir: str, n: int) -> None:
 
 
 def main() -> int:
-    global HK, HV, TP, HG, H
+    global HK, HV, TP, HG, H, FULL_PROMPT_LEN
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -605,6 +616,12 @@ def main() -> int:
     )
     ap.add_argument("--compare", action="store_true", help="diff the saved outputs")
     ap.add_argument("--n-seqs", type=int, nargs="+", default=[1, 2, 4, 8])
+    ap.add_argument(
+        "--full-prompt-len",
+        type=int,
+        default=FULL_PROMPT_LEN,
+        help=f"tokens per sequence (default {FULL_PROMPT_LEN})",
+    )
     ap.add_argument(
         "--tp", type=int, default=TP, help=f"tensor-parallel split (default {TP})"
     )
@@ -623,6 +640,9 @@ def main() -> int:
 
     HK, HV, TP = args.Hk, args.Hv, args.tp
     HG, H = resolve_heads(HK, HV, TP)
+    FULL_PROMPT_LEN = args.full_prompt_len
+    if FULL_PROMPT_LEN <= 0:
+        raise SystemExit(f"--full-prompt-len must be positive, got {FULL_PROMPT_LEN}")
 
     if args.report or args.compare:
         if args.report:
