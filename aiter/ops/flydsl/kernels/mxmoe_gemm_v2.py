@@ -803,6 +803,7 @@ def atomic_bf16_epilog(
     stids = flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
+    out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
     out_i8 = flat_buffer(arg_out, T.i8, 4)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
@@ -1004,7 +1005,7 @@ def atomic_bf16_epilog(
                 out_frag.store(pk)
                 out_off = row_base_addr + fx.Int64(s * store_group_n)
                 if const_expr(use_reduce):
-                    fx.copy(store_bf16x2, out_frag, out_bf16[None, out_off])
+                    fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
