@@ -438,8 +438,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi35x-1-nodind
+            label: MI35X-nodind
             shard_total: 8
             shard_idx: 0
           - runner: linux-aiter-mi35x-1
