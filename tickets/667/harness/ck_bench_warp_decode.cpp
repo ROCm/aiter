@@ -558,8 +558,10 @@ int main()
         batches = {1, 2, 4, 8};
 
     // Config/provenance to stderr (keeps stdout table clean for parsing).
-    std::cerr << "# ck_bench_warp_decode  commit=62e30c9098" << "  cold=" << cold
-              << "  iters=" << iters << "  rotate="
+    // base_commit = pinned CK checkout; patch = local A4 fix on top (the gate_up
+    // kernel packed-FP4 stride acceptance), so the worktree is not pristine.
+    std::cerr << "# ck_bench_warp_decode  base_commit=62e30c9098 patch=A4-gateup-fp4-packed-stride"
+              << "  cold=" << cold << "  iters=" << iters << "  rotate="
               << (rotate_env > 0 ? std::to_string(rotate_env) : std::string("auto(ceil(E/BK))"))
               << "  format=" << (g_csv ? "csv" : "table")
               << "  mechanism=manual-hipEvent+disjoint-router-rotation\n";

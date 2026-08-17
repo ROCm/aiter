@@ -403,9 +403,14 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   formulas change.
 - **CK worktree carries a local patch (A4):** `warp_decode_gate_up_kernel.hpp` has a one-line
   `IsSupportedArgument` fix so packed-FP4 gate/up rows (`stride=H/2`) are accepted (mirrors the
-  down kernel). The kernel *math* is unchanged, but the worktree no longer matches pinned
-  `62e30c9098` byte-for-byte — `compare.py`'s header still prints that commit. If CK provenance
-  must be pristine, upstream the fix or record the patch alongside the artifact.
+  down kernel). The kernel *math* is unchanged. The fix is **committed on top of the pinned
+  base**: worktree HEAD `c03392a91b8` = base `62e30c9098` + the A4 patch. Provenance now names
+  both accurately — `compare.py`'s header prints `ck_worktree=c03392a91b8` (git) and the cpp's
+  stderr line prints `base_commit=62e30c9098 patch=A4-gateup-fp4-packed-stride`.
+  **Reproducibility:** `build_ck_bench.sh` pins a fresh worktree to `CK_COMMIT=c03392a91b`
+  (= base + A4), so a clean rebuild checks out the patched commit and includes the `gate_up_fp4`
+  row. The only residual caveat is that a pristine/upstream CK checkout wouldn't carry the fix
+  until it is upstreamed.
 - **Env reconciliation** (shared with the full-MoE track): one env must import FlyDSL +
   aiter; the CK side is a standalone binary so it's driven via subprocess.
 - **Regime honesty:** ratios are only "apples-to-apples" once cold + scale + timing + config
@@ -416,6 +421,13 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **CK provenance corrected (#1).** The cpp's stderr provenance previously
+  hardcoded a bare commit that didn't reflect the A4 patch. Set it to
+  `base_commit=62e30c9098 patch=A4-gateup-fp4-packed-stride`, rebuilt, and regenerated the
+  artifact so both provenance fields agree: `ck_worktree=c03392a91b8` (git = base + A4 commit)
+  and the explicit base+patch stderr line. Reframed the §5 risk note (patch is committed at
+  `c03392a91b8`; `build_ck_bench.sh` pins `CK_COMMIT=c03392a91b` so a clean rebuild checks out
+  the patched commit and includes `gate_up_fp4` — only a pristine/upstream CK lacks the fix).
 - 2026-08-17 — **D3 config policy DONE.** Verified the FlyDSL defaults the benches actually
   use (no overrides in `bench_*_cold`): `serialize_dot2=True`, `kh_per_warp=auto(2)`,
   `prefetch=False`, `down_fp4 dot2_acc=4`, `gate_up_fp4 dot2_acc=1`, `down_fp8 split_k=1`, FP8
