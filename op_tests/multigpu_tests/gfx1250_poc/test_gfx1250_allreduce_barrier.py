@@ -64,9 +64,7 @@ def _worker(
     graph_out = None
     if with_graph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as capture, torch.cuda.graph(
-            graph, stream=capture.stream
-        ):
+        with graph_capture() as capture, torch.cuda.graph(graph, stream=capture.stream):
             graph_out = tensor_model_parallel_all_reduce(inp)
         torch.cuda.synchronize()
 
