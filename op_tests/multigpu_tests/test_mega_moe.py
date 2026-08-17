@@ -29,6 +29,7 @@ Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -m -hd -id -e -k --shared_E -q
 """
+
 import argparse
 import os
 
@@ -37,17 +38,23 @@ import torch.distributed as dist
 import torch.profiler as tprof
 
 import aiter
-from aiter import dtypes
-from aiter import ActivationType, QuantType, get_gfx
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    get_gfx,
+    get_hip_quant,
+    get_torch_quant,
+    pertoken_quant,
+)
 from aiter.fused_moe import fused_moe
-from aiter.ops.shuffle import shuffle_weight, moe_shuffle_scale
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
-from aiter import get_hip_quant, get_torch_quant, pertoken_quant
 
 try:
     from aiter.test_common import get_trace_perf
-except Exception:  # pragma: no cover
+except Exception:  # noqa: BLE001 # pragma: no cover
     get_trace_perf = None
 
 # a8w4 (fp8 activation + mxfp4 weight) grouped kernel knobs. Force the real
@@ -157,7 +164,7 @@ def _mxfp4_dequant(w_qt, w_scale, orig_shape):
 
 def _gguu_to_gugu_rows(t):
     """`(E, 2*I, ...)` GGUU [g..,u..] -> GUGU [g0,u0,g1,u1,...]."""
-    E, two_inter = t.shape[:2]
+    _E, two_inter = t.shape[:2]
     inter = two_inter // 2
     g, u = t[:, :inter], t[:, inter:]
     return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
@@ -194,8 +201,10 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
             w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
             w1_a = shuffle_weight(w1_phys, layout=(16, 16))
             w1_ss = moe_shuffle_scale(
-                w1_s.contiguous(), experts_cnt=n_experts,
-                is_guinterleave=True, gate_up=True,
+                w1_s.contiguous(),
+                experts_cnt=n_experts,
+                is_guinterleave=True,
+                gate_up=True,
             )
         else:
             w1_a = shuffle_weight(w1_qt.view(torch.uint8), layout=(16, 16))
@@ -245,19 +254,30 @@ def moe_forward(
         )
     if spec["is_mxfp4"]:
         return fused_moe(
-            hidden, w1_a, w2_a, topk_weights, topk_ids,
+            hidden,
+            w1_a,
+            w2_a,
+            topk_weights,
+            topk_ids,
             expert_mask=expert_mask,
             activation=spec["activation"],
             gate_mode=spec["gate_mode"].value,
             quant_type=spec["aiter_qtype"],
-            w1_scale=w1_s, w2_scale=w2_s,
+            w1_scale=w1_s,
+            w2_scale=w2_s,
             dtype=dtypes.bf16,
             num_local_tokens=num_local_tokens,
         )
     return fused_moe(
-        hidden, w1_a, w2_a, topk_weights, topk_ids, expert_mask,
+        hidden,
+        w1_a,
+        w2_a,
+        topk_weights,
+        topk_ids,
+        expert_mask,
         num_local_tokens=num_local_tokens,
-        w1_scale=w1_s, w2_scale=w2_s,
+        w1_scale=w1_s,
+        w2_scale=w2_s,
         quant_type=spec["aiter_qtype"],
         a1_scale=a1_scale,
         dtype=dtypes.bf16,
@@ -274,12 +294,31 @@ def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED
     """One weight set reused by every layer. Same seed on all ranks so the global
     expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2)."""
     gen = torch.Generator(device=dev).manual_seed(seed)
-    w1 = (torch.randn((E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
-    w2 = (torch.randn((E, hdim, idim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
+    w1 = (
+        torch.randn((E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32)
+        / 10
+    ).to(dtype)
+    w2 = (
+        torch.randn((E, hdim, idim), generator=gen, device=dev, dtype=torch.float32)
+        / 10
+    ).to(dtype)
     sw1 = sw2 = None
     if shared_E > 0:
-        sw1 = (torch.randn((shared_E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
-        sw2 = (torch.randn((shared_E, hdim, idim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
+        sw1 = (
+            torch.randn(
+                (shared_E, 2 * idim, hdim),
+                generator=gen,
+                device=dev,
+                dtype=torch.float32,
+            )
+            / 10
+        ).to(dtype)
+        sw2 = (
+            torch.randn(
+                (shared_E, hdim, idim), generator=gen, device=dev, dtype=torch.float32
+            )
+            / 10
+        ).to(dtype)
     return w1, w2, sw1, sw2
 
 
@@ -434,8 +473,23 @@ class DeviceMoEPipeline:
     whole N-layer chain is captured into ONE CUDA graph and timed with
     torch.profiler. No fp32-reference logic here."""
 
-    def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
-                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather"):
+    def __init__(
+        self,
+        dist_ctx,
+        E,
+        hdim,
+        idim,
+        topk,
+        spec,
+        n_layers,
+        w1_bf,
+        w2_bf,
+        sw1,
+        sw2,
+        routings,
+        ct,
+        combine_mode="gather",
+    ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
@@ -478,9 +532,7 @@ class DeviceMoEPipeline:
         # identical). max_num_inp_token_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
-        self.comm = Communicator.init(
-            self.dist_ctx.world, r, uid
-        )
+        self.comm = Communicator.init(self.dist_ctx.world, r, uid)
         if self.combine_mode == "scatter_fused":
             if self.spec["key"] != "a8w4_mxfp4":
                 raise NotImplementedError(
@@ -543,8 +595,15 @@ class DeviceMoEPipeline:
             xn, wts, None, ids, return_routing=True
         )
         out = moe_forward(
-            recv_x, self.w1_a, self.w2_a, self.w1_s, self.w2_s,
-            recv_w, recv_idx.to(dtypes.i32), self.expert_mask, self.spec,
+            recv_x,
+            self.w1_a,
+            self.w2_a,
+            self.w1_s,
+            self.w2_s,
+            recv_w,
+            recv_idx.to(dtypes.i32),
+            self.expert_mask,
+            self.spec,
             num_local_tokens=total_recv_t,
         )
         combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
@@ -697,7 +756,9 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
 def _device_shared_ffn(tokens, sw1, sw2):
     """Dense shared-expert FFN (SwiGLU), graph-capturable (all on-device)."""
     x = tokens.float()
-    acc = torch.zeros(tokens.shape[0], sw2.shape[1], device=tokens.device, dtype=torch.float32)
+    acc = torch.zeros(
+        tokens.shape[0], sw2.shape[1], device=tokens.device, dtype=torch.float32
+    )
     for e in range(sw1.shape[0]):
         gate, up = (x @ sw1[e].float().t()).chunk(2, dim=-1)
         acc = acc + (torch.nn.functional.silu(gate) * up) @ sw2[e].float().t()
@@ -715,13 +776,17 @@ def main():
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
-            print(f"skip {args.quant_type}: mxfp4 requires gfx950/gfx1250, got {get_gfx()}")
+            print(
+                f"skip {args.quant_type}: mxfp4 requires gfx950/gfx1250, got {get_gfx()}"
+            )
         dist_ctx.shutdown()
         return
 
     E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
     ct, n_layers = args.tokens, args.layers
-    assert E % dist_ctx.world == 0, f"E={E} must be divisible by world_size={dist_ctx.world}"
+    assert (
+        E % dist_ctx.world == 0
+    ), f"E={E} must be divisible by world_size={dist_ctx.world}"
 
     if dist_ctx.rank == 0:
         print(
@@ -736,13 +801,22 @@ def main():
     # args.seed shifts all RNG; weights stay rank-independent (identical global
     # experts), tokens/routing vary per rank. Default keeps runs reproducible.
     w1_bf, w2_bf, sw1, sw2 = make_shared_weights(
-        E, hdim, idim, dtypes.bf16, dev, shared_E=args.shared_experts,
+        E,
+        hdim,
+        idim,
+        dtypes.bf16,
+        dev,
+        shared_E=args.shared_experts,
         seed=_WEIGHT_SEED + args.seed,
     )
     x0 = torch.randn(
-        ct, hdim,
-        generator=torch.Generator(device=dev).manual_seed(1000 + dist_ctx.rank + args.seed),
-        device=dev, dtype=torch.float32,
+        ct,
+        hdim,
+        generator=torch.Generator(device=dev).manual_seed(
+            1000 + dist_ctx.rank + args.seed
+        ),
+        device=dev,
+        dtype=torch.float32,
     ).to(dtypes.bf16)
     routings = make_routings(
         n_layers, ct, E, topk, dev, seed=4242 + 100 * dist_ctx.rank + args.seed
@@ -750,7 +824,19 @@ def main():
 
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench.
     pipe = DeviceMoEPipeline(
-        dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct,
+        dist_ctx,
+        E,
+        hdim,
+        idim,
+        topk,
+        spec,
+        n_layers,
+        w1_bf,
+        w2_bf,
+        sw1,
+        sw2,
+        routings,
+        ct,
         combine_mode=args.combine,
     )
     pipe.setup(x0)
@@ -779,7 +865,7 @@ def main():
                         f"# trace saved: /tmp/mega_trace_{args.combine}_rank*.json",
                         flush=True,
                     )
-            except Exception as _e:
+            except Exception as _e:  # noqa: BLE001
                 if dist_ctx.rank == 0:
                     print(f"# trace export failed: {_e}", flush=True)
     if dist_ctx.rank == 0:
@@ -820,30 +906,60 @@ def main():
 
 def _parse_args():
     p = argparse.ArgumentParser(description="multi-layer EP MoE perf + accuracy")
-    p.add_argument("-q", "--quant_type", type=str, choices=QUANT_KEYS,
-                   default="a8w4_mxfp4", help="quantization type")
+    p.add_argument(
+        "-q",
+        "--quant_type",
+        type=str,
+        choices=QUANT_KEYS,
+        default="a8w4_mxfp4",
+        help="quantization type",
+    )
     p.add_argument("-bs", "--tokens", type=int, default=128, help="tokens per rank")
     p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
     p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")
-    p.add_argument("-e", "--expert", type=int, default=384, help="routed experts (global)")
+    p.add_argument(
+        "-e", "--expert", type=int, default=384, help="routed experts (global)"
+    )
     p.add_argument("-k", "--topk", type=int, default=6, help="top-k")
     p.add_argument("--shared_experts", type=int, default=0, help="dense shared experts")
     p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
-    p.add_argument("--seed", type=int, default=0,
-                   help="base RNG seed for weights/tokens/routing (optional; default 0)")
-    p.add_argument("--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol")
-    p.add_argument("--acc_verify", type=int, default=1, help="run fp32 reference accuracy check")
-    p.add_argument("--profile_table", type=int, default=0, help="print per-kernel table")
-    p.add_argument("--save_trace", type=int, default=0,
-                   help="export a chrome/perfetto timeline per rank to /tmp (opt-in; "
-                        "can stall multi-rank graph-profile runs)")
-    p.add_argument("--dispatch_commu_dtype", type=str, choices=["auto", "bf16", "fp8"],
-                   default="auto", help="dispatch transport (communication) dtype")
-    p.add_argument("--combine", type=str,
-                   choices=["gather", "scatter", "scatter_fused"],
-                   default=os.environ.get("COMBINE", "gather"),
-                   help="EP combine mode: gather | scatter | scatter_fused "
-                        "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="base RNG seed for weights/tokens/routing (optional; default 0)",
+    )
+    p.add_argument(
+        "--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol"
+    )
+    p.add_argument(
+        "--acc_verify", type=int, default=1, help="run fp32 reference accuracy check"
+    )
+    p.add_argument(
+        "--profile_table", type=int, default=0, help="print per-kernel table"
+    )
+    p.add_argument(
+        "--save_trace",
+        type=int,
+        default=0,
+        help="export a chrome/perfetto timeline per rank to /tmp (opt-in; "
+        "can stall multi-rank graph-profile runs)",
+    )
+    p.add_argument(
+        "--dispatch_commu_dtype",
+        type=str,
+        choices=["auto", "bf16", "fp8"],
+        default="auto",
+        help="dispatch transport (communication) dtype",
+    )
+    p.add_argument(
+        "--combine",
+        type=str,
+        choices=["gather", "scatter", "scatter_fused"],
+        default=os.environ.get("COMBINE", "gather"),
+        help="EP combine mode: gather | scatter | scatter_fused "
+        "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.",
+    )
     return p.parse_args()
 
 

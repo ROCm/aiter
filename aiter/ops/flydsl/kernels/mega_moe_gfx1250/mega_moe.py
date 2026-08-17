@@ -15,9 +15,9 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .combine import (
+    _XDB_FLAG_SLOTS,
     _make_combine_fused_reduce,
     _make_combine_fused_sync,
-    _XDB_FLAG_SLOTS,
 )
 from .config import _FUSED_COMBINE_TIERS, _select_dispatch_config
 from .dispatch import _make_dispatch

@@ -15,10 +15,10 @@ from flydsl.expr import (
     rocdl,
     tdm_ops,
 )
-from aiter.ops.flydsl.kernels import vector
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
@@ -31,16 +31,19 @@ from .gemm_common_gfx1250 import (
     situv2_consts,
     workgroup_barrier,
 )
-from .quant_utils import (
-    emit_amax_e8m0_native_scale,
-    emit_cvt_scalef32_pk8_fp8_f32,
-)
 
 # tdm_scatter is vendored under MegaMoE (self-contained on the stock FlyDSL
 # wheel's low-level TDM intrinsics) so this kernel needs no FlyDSL-side patch.
 # Once the gather/scatter wrappers land upstream, import them from
 # flydsl.expr.rocdl.tdm_ops instead and delete the local shim.
-from .mega_moe_gfx1250.tdm_gather_shim import make_tensor_gather_descriptor, tensor_store_gather
+from .mega_moe_gfx1250.tdm_gather_shim import (
+    make_tensor_gather_descriptor,
+    tensor_store_gather,
+)
+from .quant_utils import (
+    emit_amax_e8m0_native_scale,
+    emit_cvt_scalef32_pk8_fp8_f32,
+)
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
@@ -91,11 +94,27 @@ def launch_gemm_a8w4_tdm(
     f32_situ_linear_beta: fx.Float32 = 1.0,
 ):
     cache_tag = (
-        K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
-        a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out, quant_wmma_rep,
-        enable_ep_scatter, ep_arena_handle, ep_combine_input_offset,
-        ep_slot_stride_bytes, ep_destination_stride, ep_world_size,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        num_buffers,
+        a_is_fp4,
+        n_experts,
+        stage1_act,
+        has_bias,
+        TDM_DESCRIPTOR_VERSION,
+        stage1_quant_out,
+        quant_wmma_rep,
+        enable_ep_scatter,
+        ep_arena_handle,
+        ep_combine_input_offset,
+        ep_slot_stride_bytes,
+        ep_destination_stride,
+        ep_world_size,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -149,12 +168,8 @@ def launch_gemm_a8w4_tdm(
     C_LDS_ROW_BYTES = ((C_ROW_BYTES + 15) // 16) * 16
     if C_LDS_ROW_BYTES % 32 == 0:
         C_LDS_ROW_BYTES += 16
-    C_LDS_PAD_ELEMS = (
-        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
-    )
-    C_STORE_B = (
-        (tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128
-    ) * 128
+    C_LDS_PAD_ELEMS = (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
+    C_STORE_B = ((tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -568,7 +583,9 @@ def launch_gemm_a8w4_tdm(
                     _rm_i32, blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
                 )
                 _rm_atom = fx.rocdl.make_tdm_atom(
-                    _rm_gt, [mn_oob, None], strides=[fx.Int64(2), None],
+                    _rm_gt,
+                    [mn_oob, None],
+                    strides=[fx.Int64(2), None],
                     num_warps=num_waves,
                 )
                 _rm_dst = lds_view(
@@ -755,9 +772,9 @@ def launch_gemm_a8w4_tdm(
                     # hoisted out of the wn loop (alias analysis would otherwise
                     # re-read it for every wn subtile).
                     _wf_rows = [
-                        lds_load_b32(
-                            rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4
-                        )[0].bitcast(fx.Float32)
+                        lds_load_b32(rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4)[
+                            0
+                        ].bitcast(fx.Float32)
                         for wm in range_constexpr(wmma_m_rep)
                     ]
                 for wm in range_constexpr(wmma_m_rep):
@@ -809,8 +826,14 @@ def launch_gemm_a8w4_tdm(
                                     fx.Float32,
                                 ).to(oc)
                             else:
-                                hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
-                            lds_store_b128(stC_idx, (row_rel * LDS_STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
+                                hv = Vec.from_elements(
+                                    [acc[i] for i in range_constexpr(8)], fx.Float32
+                                ).to(oc)
+                            lds_store_b128(
+                                stC_idx,
+                                (row_rel * LDS_STORE_N + col_rel) * 2,
+                                hv.bitcast(fx.Int32).ir_value(),
+                            )
 
             # -- Shared LDS -> global --
             workgroup_barrier()
@@ -847,9 +870,7 @@ def launch_gemm_a8w4_tdm(
                 )
                 _comb_iter = fx.inttoptr(
                     _comb_ptr_ty,
-                    fx.Int64(
-                        ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)
-                    ),
+                    fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)),
                 )
                 _comb_view = global_view(
                     _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
@@ -857,7 +878,9 @@ def launch_gemm_a8w4_tdm(
                 # LDS C-tile as a fly view -- the gather API extracts its
                 # aligned LDS pointer symmetrically to the global side.
                 _lds_c = lds_view(
-                    fx.recast_iter(oc, base_ptr), (tile_m, LDS_STORE_N), (LDS_STORE_N, 1)
+                    fx.recast_iter(oc, base_ptr),
+                    (tile_m, LDS_STORE_N),
+                    (LDS_STORE_N, 1),
                 )
                 _gboff = arith.index_cast(T.index, blk_n * elem_bytes)
                 for g in range_constexpr(_ngrp):
@@ -917,7 +940,15 @@ def launch_gemm_a8w4_tdm(
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
                 atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
+                fx.copy(
+                    atomC,
+                    lds_view(
+                        fx.recast_iter(oc_store, base_ptr),
+                        (tile_m, STORE_N),
+                        (STORE_N, 1),
+                    ),
+                    gtC,
+                )
                 tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
@@ -925,9 +956,20 @@ def launch_gemm_a8w4_tdm(
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
     kernel(
-        arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map,
-        arg_bias, arg_quant_scale, arg_ep_row_map, i32_m, N, f32_swiglu_limit,
-        f32_situ_beta, f32_situ_linear_beta,
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_m_tile_map,
+        arg_bias,
+        arg_quant_scale,
+        arg_ep_row_map,
+        i32_m,
+        N,
+        f32_swiglu_limit,
+        f32_situ_beta,
+        f32_situ_linear_beta,
     ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
 
