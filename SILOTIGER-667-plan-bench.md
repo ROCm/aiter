@@ -266,9 +266,13 @@ the FlyDSL cold harness.
       matching CK (`rids[i]=i%E`); this both fixed the `%peak>100%` artifact and closed a
       B>1 weight-traffic fairness gap vs CK (see status log).
 
-#### D2 — define the G9 comparison coverage matrix (the completion gate)  [ ]
-- [ ] Enumerate `op × dtype × shape × B` (see §3); mark each cell covered / n/a (+reason).
-- [ ] **G9 closes only when every non-n/a cell has a FlyDSL+CK pair in the table.**
+#### D2 — define the G9 comparison coverage matrix (the completion gate)  [x]
+- [x] Enumerated `op × dtype × shape` (×B∈{1,2,4,8,32}) in §3, reconciled against the
+      of-record `tickets/667/g9_compare.{md,csv}`. **9/15 cells (45 paired points) covered**:
+      `down fp4` ×3, `down fp8` ×{MiniMax,Qwen}, `gate_up fp4` ×3, `gate_up fp8 bf16-act`
+      ×{MiniMax,Qwen}. Each marked covered / ⏳(step) / ⛔(reason).
+- [x] **G9 completion gate:** closes when every non-blocked cell has a FlyDSL+CK pair. Two
+      holes remain — DeepSeek FP8 (→ **B5**) and gate_up FP8-act (→ **B4**); see §3.
 
 #### D3 — decide + document the FlyDSL config policy (default-vs-default)  [ ]
 - [ ] Pin the exact config per side next to the table: FlyDSL default (prefetch off, `kh`
@@ -347,19 +351,32 @@ Steps:
 
 ## 3. G9 comparison coverage matrix (completion gate)
 
-Legend: ✅ has a FlyDSL+CK pair · ⏳ pending the named step · ⛔ n/a (+reason).
+Legend: ✅ FlyDSL+CK pair present in the of-record artifact for every B ·
+⏳ pending the named step · ⛔ blocked (+reason).
 Shapes: DeepSeek-V3 (H7168/I2048/E256/K8), MiniMax (H3072/I1536/E256/K8),
-Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
+Qwen3Next-TP1 (H2048/I512/E512/K10). Each ✅ covers all **B∈{1,2,4,8,32}**.
+Reconciled against `tickets/667/g9_compare.{md,csv}` (aiter `256d1001b`, repeats=3).
 
-| Op | dtype | DeepSeek-V3 | MiniMax | Qwen3Next-TP1 |
+| Op | dtype (act × w) | DeepSeek-V3 | MiniMax | Qwen3Next-TP1 |
 |---|---|---|---|---|
-| gate_up | BF16-act × FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ | ⏳ |
-| gate_up | FP8-act × FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ B4 | ⏳ B4 |
-| gate_up | FP4-w | ✅ (A4) | ✅ (A4) | ✅ (A4) |
-| down | FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ | ⏳ |
-| down | FP4-w | ⏳ | ⏳ | ⏳ |
+| gate_up | BF16-act × FP8-w | ⏳ B5 (FlyDSL n/a) | ✅ | ✅ |
+| gate_up | FP8-act × FP8-w | ⏳ B4 (+B5) | ⏳ B4 | ⏳ B4 |
+| gate_up | BF16-act × FP4-w | ✅ (A4) | ✅ (A4) | ✅ (A4) |
+| down | FP8-w | ⏳ B5 (FlyDSL n/a) | ✅ | ✅ |
+| down | FP4-w | ✅ | ✅ | ✅ |
 
-(DeepSeek FP8 cells stay ⛔ until B5 lands the Tier-2 i64 base addressing.)
+**Covered now:** 9 of 15 (op×dtype×shape) cells are complete FlyDSL+CK pairs across all
+5 batches (= 45 paired data points): `down fp4` ×3 shapes, `down fp8` ×{MiniMax,Qwen},
+`gate_up fp4` ×3, `gate_up fp8 (bf16-act)` ×{MiniMax,Qwen}.
+
+**Remaining holes (the completion gate):**
+- **DeepSeek FP8** — `down fp8` + `gate_up fp8 (bf16-act)`: FlyDSL side n/a until **B5**
+  (E256 Tier-2 i64 base addressing). CK side already measured.
+- **gate_up FP8-act × FP8-w** (all shapes): no FlyDSL FP8-activation peer until **B4**; CK's
+  `gate_fp8_d2` exists but isn't joined (not in `FLYDSL_CELLS`).
+
+**G9 closes when B4 + B5 land** (then all cells are ✅); the FP4 and MiniMax/Qwen-FP8 legs
+are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
 
 ---
 
@@ -390,6 +407,11 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **D2 coverage matrix DONE.** Reconciled §3 against the of-record artifact:
+  **9/15 op×dtype×shape cells complete** (×5 batches = 45 paired points) — all FP4 legs, all
+  MiniMax/Qwen FP8 legs. Two holes gate G9 completion: DeepSeek FP8 (down + gate_up bf16-act)
+  → **B5**, and gate_up FP8-act×FP8-w (all shapes) → **B4**. Matrix now shows accurate
+  ✅/⏳(step) marks with per-cell reasons and a completion-gate statement.
 - 2026-08-17 — **A4 gate_up FP4 CK bench DONE.** Added `GUProbFP4`/`GUKernFP4` +
   `gate_up_fp4` bench block (packed `E*I*H/2` pools, PerTensor dummy scale, `stride=H/2`,
   NPerWarp=1 scalar path). Discovered the gate_up kernel's `IsSupportedArgument` rejected the
