@@ -579,6 +579,67 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp8_w8a8(out_dtype: str) -> dict[str, dict]:
+    """Return validated per-token activation / per-channel weight FP8 configs."""
+    kernels = {}
+    tiles = (
+        (16, 64, 512),
+        (16, 128, 512),
+        (32, 128, 512),
+        (32, 256, 64),
+        (32, 256, 128),
+        (64, 256, 256),
+        (96, 128, 128),
+        (96, 256, 64),
+        (128, 64, 128),
+    )
+    for tm, tn, tk in tiles:
+        name = flydsl_kernel_name(1, "fp8", "fp8_w8a8", out_dtype, tm, tn, tk)
+        kernels[name] = {
+            "stage": 1,
+            "a_dtype": "fp8_w8a8",
+            "b_dtype": "fp8_w8a8",
+            "out_dtype": out_dtype,
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "MPerBlock": tm,
+            "in_dtype": "fp8",
+            "k_batch": 1,
+        }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp8_w8a8(out_dtype: str) -> dict[str, dict]:
+    """Return validated per-token activation / per-channel weight FP8 configs."""
+    kernels = {}
+    tiles = (
+        (16, 64, 256),
+        (16, 128, 128),
+        (16, 128, 256),
+        (32, 128, 256),
+        (32, 256, 128),
+        (64, 128, 256),
+        (64, 256, 256),
+        (96, 256, 256),
+    )
+    for tm, tn, tk in tiles:
+        name = flydsl_kernel_name(2, "fp8", "fp8_w8a8", out_dtype, tm, tn, tk, "atomic")
+        kernels[name] = {
+            "stage": 2,
+            "a_dtype": "fp8_w8a8",
+            "b_dtype": "fp8_w8a8",
+            "out_dtype": out_dtype,
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "MPerBlock": tm,
+            "in_dtype": "fp8",
+            "mode": "atomic",
+        }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -594,6 +655,8 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp8_w8a8("bf16"))
+    _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp8_w8a8("bf16"))
 
 
 _register_all_configs()
@@ -612,6 +675,7 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    swiglu_limit: float | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     persist_m: int = 1,
@@ -689,6 +753,40 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+        )
+    if a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8":
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        if out_dtype != "bf16":
+            raise ValueError("FP8 W8A8 stage1 currently supports only bf16 output")
+        if k_batch != 1:
+            raise ValueError("FP8 W8A8 stage1 does not support split-K")
+        if gate_mode != "separated":
+            raise ValueError("FP8 W8A8 stage1 requires separated gate/up weights")
+        if model_dim_pad or inter_dim_pad:
+            raise ValueError("FP8 W8A8 stage1 does not support padded dimensions")
+        if enable_bias:
+            raise ValueError("FP8 W8A8 stage1 does not support bias")
+        if act != "swiglu" and swiglu_limit is not None:
+            # compile_moe_gemm1 clamps only in swiglu(); accepting a limit here
+            # would drop it without changing the kernel cache name.
+            raise ValueError(f"FP8 W8A8 stage1 ignores swiglu_limit for act={act!r}")
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=False,
+            k_batch=k_batch,
+            act=act,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, act),
         )
     else:
         raise ValueError(
@@ -774,6 +872,30 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+        )
+    if a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8":
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        if out_dtype != "bf16":
+            raise ValueError("FP8 W8A8 stage2 currently supports only bf16 output")
+        if model_dim_pad or inter_dim_pad:
+            raise ValueError("FP8 W8A8 stage2 does not support padded dimensions")
+        if enable_bias:
+            raise ValueError("FP8 W8A8 stage2 does not support bias")
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            sort_block_m=sort_block_m,
         )
     else:
         raise ValueError(
@@ -1722,6 +1844,10 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+    # Only the FP8 W8A8 builder bakes the clamp bound into the kernel; the mixed
+    # and FHMoE builders receive it as a launch argument instead.
+    if a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8":
+        compile_kwargs["swiglu_limit"] = _swiglu_limit_val
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -2127,7 +2253,6 @@ def _flydsl_moe_stage2_impl(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:

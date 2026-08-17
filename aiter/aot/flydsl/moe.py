@@ -260,6 +260,7 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     use_mx_gemm = b_dtype in ("fp4", "fp8")
+    is_fp8_w8a8 = a_dtype == "fp8_w8a8" and b_dtype == "fp8_w8a8"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
@@ -271,7 +272,7 @@ def _precompile_to_cache(
     ) // _block_m_for_sort
 
     def _storage_dtype(dtype: str):
-        if dtype in ("fp4", "fp8"):
+        if dtype in ("fp4", "fp8", "fp8_w8a8"):
             return torch.uint8
         if dtype in ("fp16", "f16"):
             return torch.float16
@@ -317,6 +318,8 @@ def _precompile_to_cache(
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
         if not use_mx_gemm:
+            if is_fp8_w8a8:
+                return torch.ones(tokens, dtype=torch.float32, device=dev)
             return None
         if a_dtype == "fp8":
             if a_scale_one:
@@ -351,6 +354,8 @@ def _precompile_to_cache(
         its own input and the resulting sorted scale uses 32-row alignment.
         """
         if not use_mx_gemm:
+            if is_fp8_w8a8:
+                return torch.ones(tokens * topk, dtype=torch.float32, device=dev)
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
             # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
@@ -497,6 +502,10 @@ def _precompile_to_cache(
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
             if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
+            elif is_fp8_w8a8:
+                w1_scale = torch.zeros(
+                    E * 2 * inter_dim, device=dev, dtype=torch.float32
+                )
             else:
                 w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -671,6 +680,8 @@ def _precompile_to_cache(
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
+            elif is_fp8_w8a8:
+                w2_scale = torch.zeros(E * model_dim, device=dev, dtype=torch.float32)
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
