@@ -119,17 +119,68 @@ def _fused_clamp_silu_mul_kernel(
     )
     
     # register layout for group scale tile
-    reg_group_bases: gl.constexpr = [
-        [0, stride] for stride in [32, 64, 128, 256] if stride < NUM_N_Q_GROUPS
-    ]
+    if NUM_N_Q_GROUPS > 128:
+        reg_group_bases: gl.constexpr = [
+            [0, 32],
+            [0, 64],
+            [0, 128],
+        ]
+    elif NUM_N_Q_GROUPS > 64:
+        reg_group_bases: gl.constexpr = [
+            [0, 32],
+            [0, 64],
+        ]
+    elif NUM_N_Q_GROUPS > 32:
+        reg_group_bases: gl.constexpr = [
+            [0, 32],
+        ]
+    else:
+        reg_group_bases: gl.constexpr = []
 
     # one basis per bit of BLOCK_SIZE_M
-    reg_row_bases: gl.constexpr = [
-        [stride, 0] for stride in [1, 2, 4, 8] if stride < BLOCK_SIZE_M
-    ]
+    if BLOCK_SIZE_M > 8:
+        reg_row_bases: gl.constexpr = [
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+    elif BLOCK_SIZE_M > 4:
+        reg_row_bases: gl.constexpr = [
+            [1, 0],
+            [2, 0],
+            [4, 0],
+        ]
+    elif BLOCK_SIZE_M > 2:
+        reg_row_bases: gl.constexpr = [
+            [1, 0],
+            [2, 0],
+        ]
+    elif BLOCK_SIZE_M > 1:
+        reg_row_bases: gl.constexpr = [
+            [1, 0],
+        ]
+    else:
+        reg_row_bases: gl.constexpr = []
 
     # all-zero bases: every warp holds the whole scale tile
-    warp_bases: gl.constexpr = [[0, 0] for w in [1, 2, 4, 8] if w < num_warps]
+    if num_warps > 4:
+        warp_bases: gl.constexpr = [
+            [0, 0],
+            [0, 0],
+            [0, 0],
+        ]
+    elif num_warps > 2:
+        warp_bases: gl.constexpr = [
+            [0, 0],
+            [0, 0],
+        ]
+    elif num_warps > 1:
+        warp_bases: gl.constexpr = [
+            [0, 0],
+        ]
+    else:
+        warp_bases: gl.constexpr = []
 
     # lanes take the quant groups so the store coalesces
     scaleLayout2D: gl.constexpr = gl.DistributedLinearLayout(
