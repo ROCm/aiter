@@ -177,12 +177,35 @@ def gemm_a16w16_(
             if y is None:
                 y = torch.empty((M, N), dtype=dtype, device=x.device)
 
+            # A must be (M, K) row-major; the kernel has no 'N' path for it.
+            assert x.stride(1) == 1, (
+                f"gluon persistent gemm requires x row-major (M, K), got strides "
+                f"{x.stride()}"
+            )
+            # B after the transpose above is (K, N).  TRANSPOSE=True means N is
+            # contiguous (TT); False means K is contiguous (TN, the nn.Linear
+            # order).  The pad interval follows whichever axis is contiguous.
+            if w.stride(1) == 1:
+                TRANSPOSE = True
+            elif w.stride(0) == 1:
+                TRANSPOSE = False
+            else:
+                raise ValueError(
+                    f"w must be contiguous in at least one dimension, got strides "
+                    f"{w.stride()}"
+                )
+
             shared_a = gl.PaddedSharedLayout.with_identity_for(
                 [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
             )
-            shared_b = gl.PaddedSharedLayout.with_identity_for(
-                [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
-            )
+            if TRANSPOSE:
+                shared_b = gl.PaddedSharedLayout.with_identity_for(
+                    [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+                )
+            else:
+                shared_b = gl.PaddedSharedLayout.with_identity_for(
+                    [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+                )
 
             warp_bases = tuple(
                 (0, 1) if i == 0 else (1 << (i - 1), 0)
@@ -216,6 +239,7 @@ def gemm_a16w16_(
                 SHARED_LAYOUT_A=shared_a,
                 SHARED_LAYOUT_B=shared_b,
                 WARP_BASES=warp_bases,
+                TRANSPOSE=TRANSPOSE,
                 activation=_get_activation_from_str(activation) if activation else None,
                 USE_ACTIVATION=activation is not None,
                 ADD_BIAS=(bias is not None),

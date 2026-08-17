@@ -65,10 +65,9 @@ def bench_gemm_fn(
             **bench_kwargs,
         )
     elif persistent:
-        assert not (backend == "gluon" and layout != "TT"), (
-            f"--persistent with --backend gluon requires --layout TT, got "
-            f"'{layout}' (the gluon persistent kernel has no transposed-operand "
-            f"switch)"
+        assert not (backend == "gluon" and layout not in ("TN", "TT")), (
+            f"--persistent with --backend gluon requires --layout TN or TT, got "
+            f"'{layout}' (the gluon persistent kernel has no 'N' path for A)"
         )
         ms = bench_fn(
             lambda: gemm_a16w16(
