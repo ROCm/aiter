@@ -6,6 +6,7 @@ import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache, wraps
+from threading import local
 
 import torch
 
@@ -644,6 +645,19 @@ def _opus_gemm_a16w16_launch_raw(
 
 _OPUS_A16W16_MODULE = "module_deepgemm_opus"
 _opus_a16w16_cabi_primed = False
+_NULL_AITER_TENSOR = ctypes.POINTER(aiter_tensor_t)()
+
+
+class _OpusA16DescriptorPool(local):
+    def __init__(self) -> None:
+        self.xq = aiter_tensor_t()
+        self.wq = aiter_tensor_t()
+        self.y = aiter_tensor_t()
+        self.bias = aiter_tensor_t()
+        self.workspace = aiter_tensor_t()
+
+
+_OPUS_A16_DESCRIPTOR_POOL = _OpusA16DescriptorPool()
 
 
 @lru_cache(maxsize=1)
@@ -703,22 +717,43 @@ def _invoke_opus_a16w16_cabi(
     split_k: int,
 ) -> None:
     _library, launch, get_error, clear_error = _load_opus_a16w16_cabi()
-    converted = []
-    c_args = []
-    null_tensor = ctypes.POINTER(aiter_tensor_t)()
-    for tensor in (XQ, WQ, Y, bias, workspace):
-        if tensor is None:
-            c_args.append(null_tensor)
-            continue
-        descriptor = torch_to_aiter(tensor)
-        converted.append(descriptor)
-        c_args.append(ctypes.byref(descriptor))
+    pool = _OPUS_A16_DESCRIPTOR_POOL
+    xq_descriptor = torch_to_aiter(XQ, pool.xq)
+    wq_descriptor = torch_to_aiter(WQ, pool.wq)
+    y_descriptor = torch_to_aiter(Y, pool.y)
+    bias_descriptor = None if bias is None else torch_to_aiter(bias, pool.bias)
+    workspace_descriptor = (
+        None
+        if workspace is None
+        else torch_to_aiter(workspace, pool.workspace)
+    )
+    bias_arg = (
+        _NULL_AITER_TENSOR
+        if bias_descriptor is None
+        else ctypes.byref(bias_descriptor)
+    )
+    workspace_arg = (
+        _NULL_AITER_TENSOR
+        if workspace_descriptor is None
+        else ctypes.byref(workspace_descriptor)
+    )
 
     stream = ctypes.c_void_p(torch.cuda.current_stream(XQ.device).cuda_stream)
-    clear_error()
-    status = launch(*c_args, kid, split_k, stream)
-    raw_error = get_error()
-    if status != 0 or raw_error:
+    status = launch(
+        ctypes.byref(xq_descriptor),
+        ctypes.byref(wq_descriptor),
+        ctypes.byref(y_descriptor),
+        bias_arg,
+        workspace_arg,
+        kid,
+        split_k,
+        stream,
+    )
+    if status != 0:
+        # aiter_safe_call clears the thread-local error before every launch.
+        # Avoid two extra C ABI crossings on the successful hot path and only
+        # retrieve the message when the status reports a failure.
+        raw_error = get_error()
         message = (
             raw_error.decode(errors="replace")
             if raw_error
