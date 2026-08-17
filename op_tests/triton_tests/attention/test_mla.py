@@ -6,6 +6,7 @@ import random
 import pytest
 import torch
 
+from aiter.ops.triton.attention import mla as mla_api
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd,
     mla_prefill_fwd,
@@ -429,6 +430,125 @@ def test_mla_decode_fwd(
         )
         <= tol_err_ratio
     )
+
+
+def _gfx950_route_kwargs(num_query_heads: int) -> dict:
+    return {
+        "num_query_heads": num_query_heads,
+        "num_kv_heads": 1,
+        "block_size": 1,
+        "q_dtype": torch.bfloat16,
+        "kv_dtype": torch.bfloat16,
+        "out_dtype": torch.bfloat16,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "shuffled_kv_cache": False,
+        "q_descale": None,
+        "kv_descale": None,
+        "q_scales": None,
+        "out_scale": None,
+        "skip_reduce": False,
+        "q_is_contiguous": True,
+        "kv_buffer_is_contiguous": True,
+        "out_is_contiguous": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "expected"),
+    [(12, True), (16, True), (17, False), (64, False)],
+)
+def test_gfx950_gluon_head_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    num_query_heads: int,
+    expected: bool,
+):
+    monkeypatch.setattr(mla_api, "IS_DEVICE_ARCH_GFX950", True)
+    monkeypatch.setattr(mla_api, "gfx950_mla_decode_fwd", object())
+
+    assert (
+        mla_api._use_gfx950_gluon_decode(**_gfx950_route_kwargs(num_query_heads))
+        is expected
+    )
+
+
+def test_gfx950_gluon_unvalidated_layout_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(mla_api, "IS_DEVICE_ARCH_GFX950", True)
+    monkeypatch.setattr(mla_api, "gfx950_mla_decode_fwd", object())
+    kwargs = _gfx950_route_kwargs(12)
+    kwargs["block_size"] = 64
+
+    assert not mla_api._use_gfx950_gluon_decode(**kwargs)
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 Gluon decode only")
+@pytest.mark.parametrize(
+    ("num_query_heads", "ctx_len", "decode_qlen"),
+    [
+        (12, 4096, 1),
+        (16, 4096, 1),
+        (12, 4096, 3),
+        (16, 4096, 3),
+        (12, 100000, 1),
+    ],
+)
+@torch.inference_mode()
+def test_gfx950_low_head_gluon_decode(
+    num_query_heads: int,
+    ctx_len: int,
+    decode_qlen: int,
+):
+    batch_size = 1
+    num_kv_heads = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    query = torch.randn(
+        (batch_size * decode_qlen, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+    )
+    kv_buffer = torch.randn(
+        (ctx_len, 1, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+    )
+    block_tables = torch.randperm(ctx_len, dtype=torch.int32).view(batch_size, -1)
+    cu_seqlens_q = torch.tensor([0, decode_qlen], dtype=torch.int32)
+    seq_lens_kv = torch.tensor([ctx_len], dtype=torch.int32)
+    output = torch.empty(
+        (batch_size * decode_qlen, num_query_heads, kv_lora_rank),
+        dtype=torch.bfloat16,
+    )
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=ctx_len,
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+    )
+
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1])
