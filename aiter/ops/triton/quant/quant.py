@@ -65,7 +65,7 @@ def static_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
+    grid = (rows,)
     _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
@@ -92,7 +92,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
+    grid = (rows,)
     _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
         x_in,
         scale_out,
@@ -135,7 +135,7 @@ def dynamic_per_token_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
+    grid = (rows,)
     _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,
@@ -335,7 +335,8 @@ def dynamic_mxfp8_quant(
         assert scale.dtype == torch.uint8
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
-    NUM_PRGMS = M
+    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+    NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
     _dynamic_mxfp8_quant_kernel[grid](

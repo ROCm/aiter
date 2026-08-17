@@ -11,6 +11,10 @@ from .aiter_types import aiter_dtypes, aiter_tensor_t
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
     "gfx950": {"fp8": torch.float8_e4m3fn},
+    "gfx1100": {"fp8": torch.float8_e4m3fn},
+    "gfx1101": {"fp8": torch.float8_e4m3fn},
+    "gfx1102": {"fp8": torch.float8_e4m3fn},
+    "gfx1151": {"fp8": torch.float8_e4m3fn},
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
     "gfx1250": {"fp8": torch.float8_e4m3fn},
