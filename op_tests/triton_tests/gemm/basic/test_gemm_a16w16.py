@@ -7,6 +7,9 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.gemm.basic.gemm_a16w16_persistent import (
+    gemm_a16w16_persistent,
+)
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
