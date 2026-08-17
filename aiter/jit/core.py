@@ -1299,6 +1299,17 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
+    # Avoid constructing a Python Stream object on every ctypes invocation.
+    # Keep the public API fallback for torch versions without the private raw
+    # stream getter, and preserve the first tensor's device selection.
+    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream is None:
+
+        def raw_stream(device_index):
+            return torch.cuda.current_stream(device_index).cuda_stream
+
+    current_device = torch.cuda.current_device
+
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -1529,14 +1540,14 @@ def _ctypes_call(func, fc_name, md_name):
                 add_arg(value)
             elif kind == _ARG_TENSOR:
                 if tensor_device is None:
-                    tensor_device = value.device
+                    tensor_device = value.get_device()
                 at = torch_to_aiter(value)
                 keep_alive(at)
                 add_arg(ctypes.byref(at))
             elif kind == _ARG_OPT_TENSOR:
                 if value is not None:
                     if tensor_device is None:
-                        tensor_device = value.device
+                        tensor_device = value.get_device()
                     at = torch_to_aiter(value)
                     keep_alive(at)
                     add_arg(ctypes.byref(at))
@@ -1551,9 +1562,9 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
+        if tensor_device is None:
+            tensor_device = current_device()
+        c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
         if err_clear is not None:
             err_clear()
         ret = c_func(*c_args)
