@@ -16,6 +16,9 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
 )
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+    get_moe_a8w4_layouts,
+)
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
@@ -256,7 +259,26 @@ def m2bucket(m):
     return "xlarge"
 
 
+def get_gluon_a8w4_ctas_per_cga(m):
+    num_ctas = 1
+    if num_ctas == 1 or get_arch() != "gfx1250":
+        return [1, 1]
+    # Decode: shard the cluster along N only.
+    if m < 1024:
+        return [1, 1]
+    # Prefill: shard along both M and N.
+    if num_ctas == 4:
+        return [2, 2]
+    if num_ctas == 8:
+        return [2, 4]
+    if num_ctas == 16:
+        return [4, 4]
+    return [1, num_ctas]
+
+
 def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
+    ctas_per_cga = get_gluon_a8w4_ctas_per_cga(m)
+    num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
@@ -283,6 +305,8 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
+    block_m *= ctas_per_cga[0]
+    block_n *= ctas_per_cga[1]
 
     ret = {
         "block_m": block_m,
@@ -296,6 +320,8 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
         "waves_per_eu": 0,
         "use_persistent": use_persistent,
         "persistent_iters": persistent_iters,
+        "num_ctas": num_ctas,
+        "ctas_per_cga": ctas_per_cga,
     }
     return ret
 
@@ -511,6 +537,10 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
@@ -570,6 +600,23 @@ def moe_gemm_a8w4(
             HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon:
+        layouts = get_moe_a8w4_layouts(
+            num_warps=config["num_warps"],
+            BLOCK_M=config["block_m"],
+            BLOCK_N=config["block_n"],
+            BLOCK_K=config["block_k"],
+            ctas_per_cga=config["ctas_per_cga"],
+            ACTIVATION_REDUCTION_N=reduction_n_matmul,
+            PRESHUFFLED=preshuffled,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            is_x_microscaled=x_scales is not None,
+            has_quant_static_scale=quant_static_scale is not None,
+            apply_swiglu=apply_swiglu_matmul,
+            GatherIndx=gather_indx,
+            X_SCALE_TDM=X_SCALE_TDM,
+            out_mx_quant=out_mx_quant,
+            is_prefill=M >= 1024,
+        )
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
             y,
             y.stride(1),
@@ -619,8 +666,14 @@ def moe_gemm_a8w4(
             X_SCALE_TDM=X_SCALE_TDM,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
+            num_ctas=config["num_ctas"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
+            **layouts,
         )
     else:
         _moe_gemm_a8w4_triton[(grid,)](
