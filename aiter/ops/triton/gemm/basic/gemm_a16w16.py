@@ -381,6 +381,7 @@ def gemm_a16w16_(
         _LOGGER.info(
             f"GEMM_A16W16 [gluon, non-persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
         )
+        print("non-persistent")
 
         _KERNEL_MAP[kernel_type][grid](
             x,
