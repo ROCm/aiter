@@ -11,7 +11,7 @@
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
-#include "ds32/dsa_v32_splitkv.hpp"
+#include "opus/dsa_v32_splitkv.hpp"
 #include "mla.h"
 #include "mla_opus.h"
 
