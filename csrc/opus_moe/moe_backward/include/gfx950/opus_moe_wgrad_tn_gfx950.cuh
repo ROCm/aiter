@@ -1085,7 +1085,7 @@ inline void opus_moe_wgrad_tn_launch_gfx950(const __bf16* dy, const __bf16* a,
                                             int E, int P, int Q, int uniform_m,
                                             hipStream_t stream) {
     if(opus_moe_wgrad_tn_mi16_inline_try_launch_gfx950(
-           dy, a, offs, dW, E, P, Q, stream))
+           dy, a, offs, dW, E, P, Q, uniform_m, stream))
         return;
     if(P % 256 == 0 && Q % 256 == 0)
     {

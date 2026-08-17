@@ -16,7 +16,7 @@ __device__ inline uint32_t opus_wgtn_mi16_inline_read_acc()
     return value;
 }
 
-template<int Q>
+template<int Q, bool INTERLEAVE_EXPERTS = false>
 __global__ __launch_bounds__(256, 1)
 __attribute__((amdgpu_num_vgpr(256)))
 void opus_moe_wgrad_tn_mi16_inline_kernel(
@@ -41,13 +41,35 @@ void opus_moe_wgrad_tn_mi16_inline_kernel(
     const int scalar_warp = __builtin_amdgcn_readfirstlane(warp);
     const int wm = warp & 1;
     const int wn = warp >> 1;
-    const int e = static_cast<int>(blockIdx.z);
     constexpr int GROUP_M = 8;
     constexpr int GROUP_N = 2;
     constexpr int TILES_N = Q / BN;
     constexpr int GROUPS_N = TILES_N / GROUP_N;
-    const int linear = static_cast<int>(blockIdx.y) * TILES_N +
-                       static_cast<int>(blockIdx.x);
+    int e;
+    int linear;
+    if constexpr(INTERLEAVE_EXPERTS)
+    {
+        static_assert(Q == 2048);
+        constexpr int TILES_M = P / BM;
+        constexpr int TILES_PER_EXPERT = TILES_M * TILES_N;
+        constexpr int EXPERT_GROUP = 2;
+        constexpr int TILES_PER_TURN = 2;
+        const int schedule = static_cast<int>(blockIdx.x);
+        const int expert_group =
+            schedule / (TILES_PER_EXPERT * EXPERT_GROUP);
+        const int group_work =
+            schedule % (TILES_PER_EXPERT * EXPERT_GROUP);
+        const int turn = group_work / (EXPERT_GROUP * TILES_PER_TURN);
+        const int in_turn = group_work % (EXPERT_GROUP * TILES_PER_TURN);
+        e = expert_group * EXPERT_GROUP + in_turn / TILES_PER_TURN;
+        linear = turn * TILES_PER_TURN + in_turn % TILES_PER_TURN;
+    }
+    else
+    {
+        e = static_cast<int>(blockIdx.z);
+        linear = static_cast<int>(blockIdx.y) * TILES_N +
+                 static_cast<int>(blockIdx.x);
+    }
     const int group_id = linear / (GROUP_M * GROUP_N);
     const int in_group = linear % (GROUP_M * GROUP_N);
     const int tile_m = (group_id / GROUPS_N) * GROUP_M +
@@ -999,8 +1021,12 @@ R"MI16(
             "a242", "a243", "a244", "a245", "a246", "a247", "a248", "a249",
             "a250", "a251", "a252", "a253", "a254", "a255", "memory"    );
 
+    constexpr int INTERLEAVED_EXPERTS = INTERLEAVE_EXPERTS ? 64 : 0;
+    const int output_experts = INTERLEAVED_EXPERTS > 0
+                                   ? INTERLEAVED_EXPERTS
+                                   : static_cast<int>(gridDim.z);
     const unsigned int dW_resource_bytes = static_cast<unsigned int>(
-        static_cast<uint64_t>(gridDim.z) * P * Q * sizeof(__bf16));
+        static_cast<uint64_t>(output_experts) * P * Q * sizeof(__bf16));
     auto g_dW = opus::make_gmem(
         reinterpret_cast<opus::bf16_t*>(dW), dW_resource_bytes);
     const int dW_e = e * P * Q;
@@ -1034,6 +1060,7 @@ inline bool opus_moe_wgrad_tn_mi16_inline_try_launch_gfx950(
     int E,
     int P,
     int Q,
+    int uniform_m,
     hipStream_t stream)
 {
     // This experimental schedule assumes the target workload's long K loop.
@@ -1041,12 +1068,19 @@ inline bool opus_moe_wgrad_tn_mi16_inline_try_launch_gfx950(
     if((E != 8 && E != 64) || P != 2048 ||
        (Q != 1024 && Q != 2048))
         return false;
-    dim3 grid(Q / 256, P / 256, E);
+    const bool interleave_experts =
+        Q == 2048 && E == 64 && uniform_m == 0;
+    dim3 grid = interleave_experts
+                    ? dim3(E * (P / 256) * (Q / 256))
+                    : dim3(Q / 256, P / 256, E);
     if(Q == 1024)
-        opus_moe_wgrad_tn_mi16_inline_kernel<1024>
+        opus_moe_wgrad_tn_mi16_inline_kernel<1024, false>
+            <<<grid, 256, 0, stream>>>(left, right, offs, dW);
+    else if(interleave_experts)
+        opus_moe_wgrad_tn_mi16_inline_kernel<2048, true>
             <<<grid, 256, 0, stream>>>(left, right, offs, dW);
     else
-        opus_moe_wgrad_tn_mi16_inline_kernel<2048>
+        opus_moe_wgrad_tn_mi16_inline_kernel<2048, false>
             <<<grid, 256, 0, stream>>>(left, right, offs, dW);
     return true;
 }
