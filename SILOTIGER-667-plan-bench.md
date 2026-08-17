@@ -243,8 +243,23 @@ the FlyDSL cold harness.
         ratios from under-converged fast cells — treat unconverged cells as noisy in D5.
 - [ ] Document the residual stat difference (FlyDSL IQR-trimmed median vs CK mean); pick one
       to report or report both.
-- [ ] **Lock GPU clocks** (`rocm-smi` fixed SCLK, disable boost) for both runs; record the
-      locked clock in provenance. Run both under `HIP_VISIBLE_DEVICES=6`.
+- [x] **GPU clocks: lock NOT available on this gfx950 — use variance control instead
+      (decided 2026-08-17).** The driver exposes only two discrete SCLK DPM levels
+      (`0:500`, `1:2400` MHz; plus `S:94` idle) — **no mid ~1700 level** — so
+      `--setperfdeterminism 1700` silently no-ops and `--showsupportedclocks` is empty.
+      MCLK is fixed at **2000 MHz** (single level), and firmware DVFS holds a stable
+      **~1789 MHz** SCLK under sustained load. Forcing `high` would request 2400 (above the
+      sustainable ~1789) and get thermally clamped mid-run, so it is not reliably more
+      deterministic than `auto`. Since MCLK (the dominant factor for these memory-bound
+      kernels) is already pinned and SCLK is empirically stable under load, we **keep `auto`
+      clocks and control run-to-run variance in D5** (warm to steady state, sample the
+      effective SCLK during the sweep into provenance, N-repeat spread, flag noisy cells)
+      rather than pinning. Run both sides under `HIP_VISIBLE_DEVICES=6`.
+- [x] **Cold routing verified + made fair (2026-08-17).** `run_perftest(num_rotate_args=1)`
+      re-invokes the rotation closure every timed iter (rotation is real). `_router_group_list`
+      now routes **B*TOPK distinct experts per launch** (`bk=B*TOPK`, `rotate=ceil(E/bk)`),
+      matching CK (`rids[i]=i%E`); this both fixed the `%peak>100%` artifact and closed a
+      B>1 weight-traffic fairness gap vs CK (see status log).
 
 #### D2 — define the G9 comparison coverage matrix (the completion gate)  [ ]
 - [ ] Enumerate `op × dtype × shape × B` (see §3); mark each cell covered / n/a (+reason).
@@ -272,6 +287,14 @@ the FlyDSL cold harness.
 - [ ] `compare.py` header records GPU model, ROCm version, arch, locked clocks, CK commit
       (`62e30c9098`), and the aiter commit.
 - [ ] Run each config N times; report spread (CV or min/median/max) and flag noisy rows.
+      **This is now the primary defense against clock drift** (clocks can't be pinned on this
+      gfx950 — see D1): warm to steady-state boost before timing, sample the effective SCLK
+      during the sweep and record min/median/max in provenance, and flag any cell whose spread
+      exceeds a threshold as noisy. MCLK is fixed (2000) and SCLK is empirically stable
+      (~1789 under load), so expected spread is modest; N-repeat quantifies it.
+- [x] `%peak>100%` resolved (2026-08-17): was the shared-expert routing bug (FlyDSL read
+      TOPK vs CK's B*TOPK per launch); after the distinct-per-token fix all cells are
+      `%peak≤100%` (post-route table). `_HBM_PEAK_TBS=8.0` confirmed reasonable for gfx950.
 
 #### D6 — one-command reproducible driver + checked-in artifact  [ ]
 - [ ] Top-level entry (script / Make target) that optionally rebuilds CK, locks clocks, runs
@@ -373,9 +396,33 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 - 2026-08-17 — **B1 A/B measured.** PerTensor-vs-Block2D<128,128> FP8 (same weights,
   iters=1000): the scale cost is entirely on `down` (+10–38%, worst minimax B=1); `gate_up`
   neutral (−1.6%..+2.2%). Recorded in B1 + a D3 conservative-lower-bound caveat. Also
-  regenerated the full post-B1 compare table (`tickets/667/g9_compare_postB1.{md,csv}`): all
-  `cos=1.0000`, FP8 cells populated for minimax/qwen; flagged several `%peak>100%` on small
-  FP8/large-B cells as a coldness/peak-constant caveat for D1/D5 (not a B1 regression).
+  regenerated the full post-B1 compare table: all `cos=1.0000`, FP8 cells populated for
+  minimax/qwen; flagged several `%peak>100%` on small FP8/large-B cells (later root-caused
+  below to a routing asymmetry; that post-B1 artifact is superseded by the post-route one).
+- 2026-08-17 — **Routing fairness fix (major; D1/D5).** Investigating the `%peak>100%` cells
+  found the real cause was a **fairness bug**, not just a metric artifact: FlyDSL's cold
+  `_router_group_list` had all B tokens share one TOPK expert set (`expand(B,TOPK)`), so a
+  launch read only TOPK experts and reused them across B, while **CK reads B*TOPK distinct
+  experts per launch** (`rids[i]=i%E` over `bk=B*TOPK`). So at B>1 FlyDSL read up to B× less
+  weight than CK — the time ratio (not just `%peak`) was unfair, flattering FlyDSL. Rewrote
+  `_router_group_list` to distinct-experts-per-token (`bk=B*TOPK`, `rotate=ceil(E/bk)`),
+  byte-for-byte matching CK; dropped `n_route`; bounded the correctness gate to the first
+  `_COS_CHK_TOKENS=4` tokens (per-token work is uniform) so the fp32 reference doesn't
+  dequant the whole pool (would OOM at DeepSeek B=32). Verified `cos=1.0000` (FP4+FP8) and no
+  OOM through DeepSeek B=32. Regenerated `tickets/667/g9_compare_postroute.{md,csv}`:
+  **all `%peak≤100%`** (max 80.9%) and B>1 ratios corrected sharply toward parity, e.g.
+  minimax down fp8 B=32 0.563→0.995, qwen gate_up fp8 B=32 0.430→0.922, deepseek down fp4
+  B=32 0.596→0.863. New story: FlyDSL's edge is largest at B=1 (latency regime) and converges
+  to parity as B grows (both bandwidth-bound on the same bytes). B=1 ratios ~unchanged
+  (distinct==shared at B=1). `compute_metrics` unchanged — its B-scaled weight bytes were
+  always right; the routing now matches them. ruff/py_compile clean.
+- 2026-08-17 — **Clock lock not feasible → variance control (D1/D5).** gfx950 here exposes only
+  discrete SCLK levels {500, 2400} MHz (no mid ~1700; `--setperfdeterminism 1700` silently
+  no-ops, `--showsupportedclocks` empty), MCLK fixed at 2000, DVFS stable ~1789 under load.
+  Forcing `high` (2400) would thermally clamp mid-run, so it's not more deterministic than
+  `auto`. Decided to keep `auto` and control variance in D5 (warm-to-steady + effective-SCLK
+  sampling + N-repeat spread). Post-route numbers stand as-is (auto clocks); of-record run
+  just needs the D5 variance capture, not a clock lock.
 - 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
   measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
   entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in
