@@ -1447,10 +1447,25 @@ def _emit_pay_meta(C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit,
         # the way into the push and at its very end, with nothing at all ready
         # before that. Any consumer gate, however fine-grained, waits that long,
         # which is why the arrival counters below buy no overlap.
+        # A run is indivisible, so the last one of the push runs off the end of
+        # the route list, and the index the loads use is clamped rather than
+        # trusted. Letting it run off instead -- on the grounds that the slots
+        # past the end read stale but in bounds -- holds only while the route
+        # list is shorter than its region. It is not at 512 tokens, where
+        # work_limit is exactly max_tok*topk, so the read leaves route_order
+        # entirely and work_idx stops being a route id; indexing rs_idx with it
+        # then faults the GPU rather than returning a wrong answer, which is what
+        # pay_rows 5 and up did. The row is retired by the cap clamp below either
+        # way, so reading route 0 twice costs nothing.
+        if const_expr(i > 0):
+            in_range = pos < work_limit
+            rd_pos = arith.select(in_range, pos, fx.Int32(0))
+        else:
+            rd_pos = pos
         work_idx = (
-            buffer_load(rs_order, pos, vec_width=1, dtype=T.i32)
+            buffer_load(rs_order, rd_pos, vec_width=1, dtype=T.i32)
             if const_expr(ROUTE_ORDER)
-            else pos
+            else rd_pos
         )
         src_tok = work_idx // fx.Int32(C.topk)
         ge = buffer_load(rs_idx, work_idx, vec_width=1, dtype=T.i32)
@@ -1459,14 +1474,12 @@ def _emit_pay_meta(C, rs_order, rs_idx, rs_base, rs_slot, run_base, work_limit,
         row_in_expert = buffer_load(
             rs_base, ge, vec_width=1, dtype=T.i32
         ) + buffer_load(rs_slot, work_idx, vec_width=1, dtype=T.i32)
-        # A run is indivisible, so the last one of the push runs off the end
-        # of the route list. Those slots load in bounds but stale, and CAP is
-        # how they are retired: it is already the overflow row's answer --
-        # the planner clamped the schedule to match, so such a row is simply
-        # dropped on both sides -- and it kills every store below.
+        # CAP is how an off-the-end slot is retired: it is already the overflow
+        # row's answer -- the planner clamped the schedule to match, so such a
+        # row is simply dropped on both sides -- and it kills every store below.
         if const_expr(i > 0):
             row_in_expert = arith.select(
-                pos < work_limit, row_in_expert, fx.Int32(C.cap)
+                in_range, row_in_expert, fx.Int32(C.cap)
             )
         src_toks.append(src_tok)
         dest_pes.append(dest_pe)
