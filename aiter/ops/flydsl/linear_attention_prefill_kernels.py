@@ -16,6 +16,7 @@ import functools
 import math
 import os
 import warnings
+from collections.abc import Sequence
 
 # NOTE (mfma16_hip fork): ``get_rocm_arch`` is imported here for the additive
 # HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
@@ -29,6 +30,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
@@ -984,6 +986,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     g_head_major: bool = False,
     bf16_convert_trunc: bool = True,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    seq_lens_cpu: Sequence[int] | None = None,
     snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
@@ -1004,6 +1007,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     defaults to ``k.dtype`` (bf16 here), mirroring
     ``chunk_gated_delta_rule_fwd_h_hip_fn``. fp32 snapshots take two half-BV
     transpose rounds, since the f32 tile does not fit the LDS budget whole.
+    In varlen mode, pass ``prefill_metadata`` (preferred for reuse) or
+    ``seq_lens_cpu`` to avoid reading chunk scheduling values back from the GPU.
+    ``gk`` accepts token-major ``[B, T, H, K]`` or the HIP flat layout
+    ``[T, H, K]`` (varlen) / ``[B * T, H, K]`` (dense).
     """
     use_g = g is not None
     use_gk = gk is not None
@@ -1058,6 +1065,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     V = u.shape[-1]
     T_flat = w.shape[2]
     BT = chunk_size
+    is_varlen = cu_seqlens is not None
+
+    if is_varlen and prefill_metadata is None and seq_lens_cpu is not None:
+        prefill_metadata = build_gated_delta_rule_prefill_metadata(
+            seq_lens_cpu,
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
 
     # -- Input validation (k/w/u/gk). These feed the kernel's raw buffer loads
     # with no further checks, so a dtype / layout / shape mismatch would
@@ -1108,11 +1125,17 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             raise ValueError(
                 f"FlyDSL K5 mfma16_hip: gk must be float32, got {gk.dtype}."
             )
-        expected_gk_shape = (B, T_flat, H, K)
-        if tuple(gk.shape) != expected_gk_shape:
+        token_major_shape = (B, T_flat, H, K)
+        flat_shape = (T_flat if is_varlen else B * T_flat, H, K)
+        if tuple(gk.shape) == token_major_shape:
+            pass
+        elif tuple(gk.shape) == flat_shape:
+            gk = gk.reshape(token_major_shape)
+        else:
             raise ValueError(
-                "FlyDSL K5 mfma16_hip: gk must use token-major [B,T,H,K] "
-                f"layout with shape {expected_gk_shape}, got {tuple(gk.shape)}."
+                "FlyDSL K5 mfma16_hip: gk shape mismatch; expected "
+                f"{token_major_shape} (token-major) or {flat_shape} (HIP flat), "
+                f"got {tuple(gk.shape)}."
             )
 
     # Explicitly reject unvalidated configs: this kernel's wave mapping

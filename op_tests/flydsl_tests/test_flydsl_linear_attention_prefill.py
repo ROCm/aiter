@@ -1750,7 +1750,7 @@ class TestCorrectness:
             ("time_shape", "k T dim"),
             ("unsupported_v", "only V=128 is supported"),
             ("gk_dtype", "gk must be float32"),
-            ("gk_shape", "gk must use token-major"),
+            ("gk_shape", "gk shape mismatch"),
             ("state_shape", "initial_state must have shape"),
             ("state_contiguous", "initial_state must be contiguous"),
             ("g_device", "g must be on k's device"),
@@ -1803,6 +1803,45 @@ class TestCorrectness:
         assert torch.count_nonzero(h) == 0
         assert torch.count_nonzero(v_new) == 0
         assert torch.count_nonzero(final_state) == 0
+
+    def test_mfma16_seq_lens_cpu_avoids_gpu_schedule_read(self):
+        """``seq_lens_cpu`` builds the varlen schedule on host, like HIP."""
+        device = "cuda"
+        context_lens = [64]
+        _, cu = _build_cu_seqlens(context_lens, device=device)
+        k, w_orig, u_orig, w_c, u_c, g, h0, _, scheduled_q_lens = _make_inputs(
+            context_lens, device=device
+        )
+        common = dict(
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=True,
+        )
+        h_meta, vn_meta, fs_meta = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k, w_c, u_c, prefill_metadata=_build_prefill_metadata(context_lens, cu), **common
+        )
+        h_cpu, vn_cpu, fs_cpu = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k, w_c, u_c, seq_lens_cpu=scheduled_q_lens, **common
+        )
+        torch.testing.assert_close(h_meta, h_cpu)
+        torch.testing.assert_close(vn_meta, vn_cpu)
+        torch.testing.assert_close(fs_meta, fs_cpu)
+
+    def test_gk_accepts_hip_flat_layout(self):
+        """HIP flat ``[T,H,K]`` / ``[B*T,H,K]`` layouts match token-major ``gk``."""
+        k, w, u = self._minimal_inputs()
+        gk_token = torch.randn(1, 64, 4, 128, dtype=torch.float32, device="cuda")
+        kwargs = dict(gk=gk_token, output_final_state=True)
+        h_tm, vn_tm, fs_tm = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(k, w, u, **kwargs)
+        gk_flat = gk_token.reshape(64, 4, 128).contiguous()
+        h_flat, vn_flat, fs_flat = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k, w, u, gk=gk_flat, output_final_state=True
+        )
+        torch.testing.assert_close(h_tm, h_flat)
+        torch.testing.assert_close(vn_tm, vn_flat)
+        torch.testing.assert_close(fs_tm, fs_flat)
 
     def test_mfma16_accepts_noncontiguous_kwu(self):
         """Non-contiguous k/w/u are silently copied, matching the HIP wrapper."""
