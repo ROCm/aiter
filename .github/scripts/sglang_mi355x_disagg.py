@@ -557,9 +557,8 @@ docker rm -f mi355x_bench 2>/dev/null || true
 set -e
 PIP=\\$1; DIP=\\$2
 bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before bench; runtime will fall back to model id"
-OUTPUT_DIR="$WORKDIR/outputs"
-mkdir -p "$OUTPUT_DIR"
-chmod a+rwX "$OUTPUT_DIR" || true
+mkdir -p "$WORKDIR/outputs"
+chmod a+rwX "$WORKDIR/outputs" || true
 docker rm -f mi355x_bench 2>/dev/null || true
 """,
     )
