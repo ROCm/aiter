@@ -100,6 +100,7 @@ def _job_key(job: dict) -> tuple:
 
 def parse_csv(csv_path: str):
     """Parse a tuned CSV into unique MXMOE-port compile jobs (one per stage)."""
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
@@ -122,6 +123,7 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            token = int(row["token"])
             topk = int(row["topk"])
             # Shape comes from CSV columns; v2 GEMM2 aligns K to its encoded BK.
             model_dim = int(row["model_dim"])
@@ -176,7 +178,7 @@ def parse_csv(csv_path: str):
             if use_replacement and is_a8w4_variant:
                 act = "situv2" if act_type == "ActivationType.Situv2" else "silu"
                 replacement = _select_mxfp4_g1_kernel(
-                    token=int(row["token"]),
+                    token=token,
                     expert=expert,
                     topk=topk,
                     block_m=int(row.get("block_m") or 0) or None,
@@ -196,7 +198,7 @@ def parse_csv(csv_path: str):
                 else:
                     act = "silu"
                 replacement = _select_mxfp4_g1_kernel(
-                    token=int(row["token"]),
+                    token=token,
                     expert=expert,
                     topk=topk,
                     block_m=int(row.get("block_m") or 0) or None,
@@ -232,6 +234,14 @@ def parse_csv(csv_path: str):
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
+                effective_use_nt = _effective_use_nt(
+                    n_tokens=token,
+                    topk=topk,
+                    NE=expert,
+                    BM=p1["BM"],
+                    use_nt=p1["use_nt"],
+                    inline_quant=p1["inline_quant"],
+                )
                 _add(
                     {
                         "stage": 1,
@@ -239,7 +249,11 @@ def parse_csv(csv_path: str):
                         "BM": p1["BM"],
                         "BN": p1["BN"],
                         "BK": p1["BK"],
-                        "use_nt": p1["use_nt"],
+                        # Runtime may disable BM32 streaming loads once routed
+                        # M blocks saturate the experts. AOT must specialize on
+                        # that effective value, not only the kernel-name flag.
+                        "use_nt": effective_use_nt,
+                        "n_tokens": token,
                         "inline_quant": p1["inline_quant"],
                         "D_HIDDEN": model_dim,
                         # GEMM1 specializes on the logical output width. GEMM2
@@ -350,7 +364,7 @@ def _compile_stage1(job):
         inter_sorted_quant=d,
         inter_sorted_shuffled_scale=d,
         hidden_states=d,
-        n_tokens=job["BM"],
+        n_tokens=job["n_tokens"],
         BM=job["BM"],
         BN=job["BN"],
         BK=job["BK"],
