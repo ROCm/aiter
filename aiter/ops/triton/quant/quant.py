@@ -10,10 +10,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx1250,
 )
-
-import torch
-import triton
-
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
     _dynamic_mxfp8_quant_kernel,

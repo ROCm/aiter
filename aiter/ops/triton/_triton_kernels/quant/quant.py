@@ -129,24 +129,22 @@ def _mxfp4_quant_op_hw(
     v_cvt_scalef32_pk_fp4_bf16 hardware conversion instruction.
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], bf16
 
-    x stays bf16 throughout: `tl.max` already promotes the reduction to
-    fp32 internally, so no upfront upcast is needed.
+    x stays bf16 throughout (`tl.max` promotes the reduction to fp32
+    internally, so no upfront upcast is needed). `bs_e8m0` is the biased
+    e8m0 scale byte; `scale_f32` shifts it into the fp32 exponent field
+    (2^(bs_e8m0-127)) as required by `_cvt_scalef32_pk_fp4_bf16`. `byte_sel`
+    is always 0 below since only one packed byte per element pair is
+    needed here (no dword-packing across multiple pairs).
     """
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-    # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True).to(tl.float32)
     amax = amax.to(tl.int32, bitcast=True)
     amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax = amax.to(tl.float32, bitcast=True)
     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-
-    # blockscale_e8m0, in fp32, we have 2^(e - 127)
     bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
-
-    # scale_f32 is the e8m0 byte shifted into the fp32 exponent field, i.e.
-    # 2^(bs_e8m0-127) -- see `_cvt_scalef32_pk_fp4_bf16`.
     scale_f32 = (bs_e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
 
     x = tl.reshape(x, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2])
