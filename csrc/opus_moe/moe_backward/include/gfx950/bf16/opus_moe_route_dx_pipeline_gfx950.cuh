@@ -179,6 +179,11 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             return T::MFMA_PRIORITY;
         return false;
     }();
+    constexpr bool mubuf_output_store = []() constexpr {
+        if constexpr(requires { T::MUBUF_OUTPUT_STORE; })
+            return T::MUBUF_OUTPUT_STORE;
+        return false;
+    }();
     static_assert(RouteTiles >= 1 && RouteTiles <= 5);
     static_assert(RouteTiles * BM <= T::BLOCK_SIZE);
     static_assert(!blocked_dz_g2 ||
@@ -331,6 +336,11 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
           static_cast<unsigned long long>(model_dim)) *
          sizeof(D_B)));
     auto g_b = make_gmem(w1 + w1_expert_base, w1_bytes);
+    const unsigned int d_x_route_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.route.sorted_capacity) *
+        static_cast<unsigned long long>(stride_dx_route_r) * sizeof(D_A));
+    auto g_out = make_gmem(
+        reinterpret_cast<D_A*>(kargs.d_x_route), d_x_route_bytes);
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
@@ -708,12 +718,30 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
                 const int64_t out_row =
                     static_cast<int64_t>(route_row) * stride_dx_route_r +
                     col_base;
-                *reinterpret_cast<u32x4*>(
-                    kargs.d_x_route + out_row + local_n0) =
-                    u32x4{packed[0], packed[1], packed[2], packed[3]};
-                *reinterpret_cast<u32x4*>(
-                    kargs.d_x_route + out_row + local_n1) =
-                    u32x4{packed[4], packed[5], packed[6], packed[7]};
+                const u32x4 values0{
+                    packed[0], packed[1], packed[2], packed[3]};
+                const u32x4 values1{
+                    packed[4], packed[5], packed[6], packed[7]};
+                if constexpr(mubuf_output_store)
+                {
+                    using output_store_t =
+                        typename decltype(g_out)::template vector_type<8>;
+                    g_out.template _store<8>(
+                        __builtin_bit_cast(output_store_t, values0),
+                        static_cast<int>((out_row + local_n0) *
+                                         sizeof(D_A)));
+                    g_out.template _store<8>(
+                        __builtin_bit_cast(output_store_t, values1),
+                        static_cast<int>((out_row + local_n1) *
+                                         sizeof(D_A)));
+                }
+                else
+                {
+                    *reinterpret_cast<u32x4*>(
+                        kargs.d_x_route + out_row + local_n0) = values0;
+                    *reinterpret_cast<u32x4*>(
+                        kargs.d_x_route + out_row + local_n1) = values1;
+                }
             }
         });
     });

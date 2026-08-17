@@ -439,6 +439,15 @@ void launch_down_bwd_bf16(const DownBwdKargs& kargs,
     detail::check_gfx950_or_fail();
     const int selected_kernel_id =
         detail::select_fixed_down_kernel_id(kargs, kernel_id);
+    if(selected_kernel_id == 19)
+    {
+        const uint64_t dz_bytes =
+            static_cast<uint64_t>(kargs.route.sorted_capacity) *
+            static_cast<uint64_t>(kargs.stride_dz_r) *
+            sizeof(hip_bfloat16);
+        AITER_CHECK(dz_bytes <= 0xffffffffull,
+                    "down_bwd: MUBUF dZ store requires d_z below 4 GiB");
+    }
     detail::invoke(
         gfx950::dispatch_down_bwd(selected_kernel_id), kargs, stream, family);
 }
@@ -460,6 +469,16 @@ void launch_route_dx_bf16(const RouteDxKargs& kargs,
     detail::check_gfx950_or_fail();
     const int selected_kernel_id =
         detail::select_fixed_route_dx_kernel_id(kargs, kernel_id);
+    if(selected_kernel_id == 21)
+    {
+        const uint64_t route_output_bytes =
+            static_cast<uint64_t>(kargs.route.sorted_capacity) *
+            static_cast<uint64_t>(kargs.stride_dx_route_r) *
+            sizeof(hip_bfloat16);
+        AITER_CHECK(route_output_bytes <= 0xffffffffull,
+                    "route_dx: MUBUF output store requires d_x_route below "
+                    "4 GiB");
+    }
     detail::invoke(
         gfx950::dispatch_route_dx(selected_kernel_id), kargs, stream, family);
 }
@@ -669,14 +688,39 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     check_gfx950_or_fail();
     constexpr int blocked_down_kid = 17;
     constexpr int blocked_down_sparse_owner_kid = 18;
+    constexpr int blocked_down_mubuf_store_kid = 19;
     constexpr int blocked_route_dx_kid = 20;
+    constexpr int blocked_route_dx_mubuf_store_kid = 21;
     constexpr int blocked_dw1_kid = 20;
     constexpr int blocked_dw1_blocked_x_kid = 21;
     constexpr int blocked_dw1_blocked_x_n_fast_kid = 22;
     constexpr int blocked_dw1_blocked_x_n_fast_grid3d_kid = 23;
     const bool blocked_down = down_kernel_id == blocked_down_kid ||
-                              down_kernel_id == blocked_down_sparse_owner_kid;
-    const bool blocked_route_dx = route_dx_kernel_id == blocked_route_dx_kid;
+                              down_kernel_id == blocked_down_sparse_owner_kid ||
+                              down_kernel_id == blocked_down_mubuf_store_kid;
+    if(down_kernel_id == blocked_down_mubuf_store_kid)
+    {
+        const uint64_t dz_store_bytes =
+            static_cast<uint64_t>(down.route.sorted_capacity) *
+            static_cast<uint64_t>(down.stride_dz_r) *
+            sizeof(hip_bfloat16);
+        AITER_CHECK(dz_store_bytes <= 0xffffffffull,
+                    "fixed full pipeline: MUBUF dZ store requires d_z below "
+                    "4 GiB");
+    }
+    const bool blocked_route_dx =
+        route_dx_kernel_id == blocked_route_dx_kid ||
+        route_dx_kernel_id == blocked_route_dx_mubuf_store_kid;
+    if(route_dx_kernel_id == blocked_route_dx_mubuf_store_kid)
+    {
+        const uint64_t route_output_bytes =
+            static_cast<uint64_t>(route_dx.route.sorted_capacity) *
+            static_cast<uint64_t>(route_dx.stride_dx_route_r) *
+            sizeof(hip_bfloat16);
+        AITER_CHECK(route_output_bytes <= 0xffffffffull,
+                    "fixed full pipeline: MUBUF route output store requires "
+                    "d_x_route below 4 GiB");
+    }
     const bool blocked_dw1 =
         dw1_kernel_id == blocked_dw1_kid ||
         dw1_kernel_id == blocked_dw1_blocked_x_kid ||
@@ -781,7 +825,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                kid == sorted_bn256_m5_binary_route_dx_kid ||
                kid == sorted_bn512_m3_binary_route_dx_kid ||
                kid == sorted_bn512_m3_binary_n_fast_route_dx_kid ||
-               kid == blocked_route_dx_kid;
+               kid == blocked_route_dx_kid ||
+               kid == blocked_route_dx_mubuf_store_kid;
     };
     const bool auto_sorted_route_pair =
         route_dx_kernel_id == kKernelAuto &&
@@ -826,7 +871,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     const bool uses_saved_a_and_sorted_x =
         (down_kernel_id == 14 || down_kernel_id == 15 ||
          down_kernel_id == 16 || down_kernel_id == blocked_down_kid ||
-         down_kernel_id == blocked_down_sparse_owner_kid) &&
+         down_kernel_id == blocked_down_sparse_owner_kid ||
+         down_kernel_id == blocked_down_mubuf_store_kid) &&
         (dw1_kernel_id == 15 || dw1_kernel_id == 17 ||
          dw1_kernel_id == 18 || dw1_kernel_id == 19 ||
          blocked_dw1);
@@ -1526,6 +1572,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
         kernel_id == 11 || kernel_id == 12 ||
         kernel_id == 13 || kernel_id == 14 || kernel_id == 15 ||
         kernel_id == 16 || kernel_id == 17 || kernel_id == 18 ||
+        kernel_id == 19 ||
         (kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              geometry));
@@ -2426,6 +2473,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
             down_kernel_id == 13 || down_kernel_id == 14 ||
             down_kernel_id == 15 || down_kernel_id == 16 ||
             down_kernel_id == 17 || down_kernel_id == 18 ||
+            down_kernel_id == 19 ||
         (down_kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              down_geometry));

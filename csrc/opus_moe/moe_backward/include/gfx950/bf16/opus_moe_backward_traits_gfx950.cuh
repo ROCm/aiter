@@ -226,6 +226,16 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2SparseOwner
     static constexpr bool SPARSE_COMPACT_OWNER = true;
 };
 
+// Keep the production blocked-G2 layout, but encode its 128-bit dZ writes as
+// bounded MUBUF stores.  The destination lies below the four-GiB buffer limit
+// for supported fixed-routing workspaces, allowing each lane to carry one
+// 32-bit voffset instead of a 64-bit flat address through the epilogue.
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2SparseOwnerMubufStore
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2SparseOwner
+{
+    static constexpr bool MUBUF_DZ_STORE = true;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>
@@ -416,6 +426,12 @@ struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSort
     // LDS fragment/MFMA chain so its consumer retires before vmcnt gates the
     // following stage.  This does not change resources or numerical order.
     static constexpr bool MFMA_PRIORITY = true;
+};
+
+struct RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirstNFastBlockedDzG2MubufStore
+    : RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompactCohort6ASlabPadSortedOutputBFirstNFastBlockedDzG2
+{
+    static constexpr bool MUBUF_OUTPUT_STORE = true;
 };
 
 struct RouteReduceBf16Gfx950Bm16Bn128

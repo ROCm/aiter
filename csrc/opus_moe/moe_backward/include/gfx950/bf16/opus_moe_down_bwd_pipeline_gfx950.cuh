@@ -292,6 +292,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
             return T::BLOCKED_DZ_G2;
         return false;
     }();
+    constexpr bool mubuf_dz_store = []() constexpr {
+        if constexpr(requires { T::MUBUF_DZ_STORE; })
+            return T::MUBUF_DZ_STORE;
+        return false;
+    }();
     constexpr bool split_b_n64 = []() constexpr {
         if constexpr(requires { T::SPLIT_B_N64_SWIZZLE; })
             return T::SPLIT_B_N64_SWIZZLE;
@@ -322,6 +327,8 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     static_assert(!blocked_dz_g2 ||
                       (ROUTE_M == 32 && T::VEC_C == 4),
                   "blocked dZ requires M32 and eight-BF16 stores");
+    static_assert(!mubuf_dz_store || blocked_dz_g2,
+                  "MUBUF dZ stores require the blocked-G2 output layout");
     static_assert(RouteTiles > 0);
     static_assert(CTA_M <= T::BLOCK_SIZE,
                   "each predecoded route row requires one workgroup thread");
@@ -594,6 +601,12 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         static_cast<unsigned long long>(kargs.route.sorted_capacity) *
         static_cast<unsigned long long>(stride_z_r) * sizeof(D_A));
     auto g_z = make_gmem(z, z_bytes);
+
+    const unsigned int d_z_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.route.sorted_capacity) *
+        static_cast<unsigned long long>(stride_dz_r) * sizeof(D_A));
+    auto g_dz = make_gmem(reinterpret_cast<D_A*>(kargs.d_z), d_z_bytes);
+    using dz_store_t = typename decltype(g_dz)::template vector_type<8>;
 
     const int64_t w2_expert_base =
         static_cast<int64_t>(expert_id) * stride_w2_e;
@@ -1162,10 +1175,22 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                             (col_in_tile / vector) * row_group * vector;
                         const int64_t up_base =
                             gate_base + blocked_dz_up_delta;
-                        *reinterpret_cast<u32x4*>(kargs.d_z + gate_base) =
-                            d_gate_store;
-                        *reinterpret_cast<u32x4*>(kargs.d_z + up_base) =
-                            d_up_store;
+                        if constexpr(mubuf_dz_store)
+                        {
+                            g_dz.template _store<8>(
+                                __builtin_bit_cast(dz_store_t, d_gate_store),
+                                static_cast<int>(gate_base * sizeof(D_A)));
+                            g_dz.template _store<8>(
+                                __builtin_bit_cast(dz_store_t, d_up_store),
+                                static_cast<int>(up_base * sizeof(D_A)));
+                        }
+                        else
+                        {
+                            *reinterpret_cast<u32x4*>(kargs.d_z + gate_base) =
+                                d_gate_store;
+                            *reinterpret_cast<u32x4*>(kargs.d_z + up_base) =
+                                d_up_store;
+                        }
                     }
                     else
                     {

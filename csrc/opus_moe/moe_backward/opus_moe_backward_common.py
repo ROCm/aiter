@@ -353,6 +353,27 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         launcher="opus_moe_backward::gfx950::down_bwd_launch_gfx950",
     ),
     OpusMoeBackwardInstance(
+        kid=19,
+        name="down_bwd_bf16_gfx950_bn256_m6_blocked_dz_g2_mubuf_store",
+        family=OpusMoeBackwardFamily.DOWN_BWD,
+        arch="gfx950",
+        dtype="bf16",
+        route_layout=OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        block_m=32,
+        block_n=256,
+        block_k=32,
+        block_threads=256,
+        min_blocks_per_cu=2,
+        has_oob=False,
+        split_k=1,
+        trait=(
+            "opus_moe_backward::gfx950::"
+            "DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2"
+            "SparseOwnerMubufStore"
+        ),
+        launcher="opus_moe_backward::gfx950::down_bwd_launch_gfx950",
+    ),
+    OpusMoeBackwardInstance(
         kid=5,
         name="route_dx_bf16_gfx950_bm32_bn128_bk64_padded_wide",
         family=OpusMoeBackwardFamily.ROUTE_DX,
@@ -629,6 +650,27 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
             "opus_moe_backward::gfx950::"
             "RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompact"
             "Cohort6ASlabPadSortedOutputBFirstNFastBlockedDzG2"
+        ),
+        launcher="opus_moe_backward::gfx950::route_dx_launch_gfx950",
+    ),
+    OpusMoeBackwardInstance(
+        kid=21,
+        name="route_dx_bf16_gfx950_bn512_m3_blocked_g2_mubuf_store",
+        family=OpusMoeBackwardFamily.ROUTE_DX,
+        arch="gfx950",
+        dtype="bf16",
+        route_layout=OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        block_m=32,
+        block_n=512,
+        block_k=32,
+        block_threads=256,
+        min_blocks_per_cu=2,
+        has_oob=False,
+        split_k=1,
+        trait=(
+            "opus_moe_backward::gfx950::"
+            "RouteDxBf16Gfx950Bm32Bn512Bk32WideStoreM3BinaryCompact"
+            "Cohort6ASlabPadSortedOutputBFirstNFastBlockedDzG2MubufStore"
         ),
         launcher="opus_moe_backward::gfx950::route_dx_launch_gfx950",
     ),

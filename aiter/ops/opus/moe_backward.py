@@ -140,7 +140,7 @@ def _select_fixed_down_block_n(
 ) -> int:
     """Mirror native K1 dispatch so workspace shape and kernel stay coupled."""
 
-    if kernel_id in (11, 12, 13, 14, 15, 16, 17):
+    if kernel_id in (11, 12, 13, 14, 15, 16, 17, 18, 19):
         if inter_dim % 256 != 0:
             raise ValueError("BN256 down kernels require I divisible by 256")
         return 256
@@ -167,7 +167,7 @@ def _select_saved_a_scaled_down_kernel(
 ) -> int:
     """Map a BN256 K1 policy to its no-a_scaled-write counterpart."""
 
-    if kernel_id in (13, 14, 15, 16, 17):
+    if kernel_id in (13, 14, 15, 16, 17, 18, 19):
         return kernel_id
     if kernel_id == 11:
         return 13
@@ -327,6 +327,7 @@ def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
 def _select_blocked_g2_full_pipeline(
     inter_dim: int,
     model_dim: int,
+    sorted_capacity: int,
     down_kernel_id: int,
     route_dx_kernel_id: int,
     route_reduce_kernel_id: int,
@@ -348,7 +349,29 @@ def _select_blocked_g2_full_pipeline(
     # Other blocked-K2-compatible D tiles retain the general sorted-route
     # reducer rather than constraining the whole cache ABI to one width.
     route_reduce_kernel_id_selected = 3 if model_dim % 2048 == 0 else 1
-    selected = (18, 20, route_reduce_kernel_id_selected, 23)
+    dz_bytes = sorted_capacity * (2 * inter_dim) * 2
+    route_output_bytes = sorted_capacity * model_dim * 2
+    mubuf_down_kernel_id = 19
+    flat_down_kernel_id = 18
+    mubuf_route_dx_kernel_id = 21
+    flat_route_dx_kernel_id = 20
+    if int(down_kernel_id) == mubuf_down_kernel_id and dz_bytes > 0xFFFFFFFF:
+        raise ValueError("down kernel_id=19 requires a d_z buffer below 4 GiB")
+    if (
+        int(route_dx_kernel_id) == mubuf_route_dx_kernel_id
+        and route_output_bytes > 0xFFFFFFFF
+    ):
+        raise ValueError(
+            "route kernel_id=21 requires a d_x_route buffer below 4 GiB"
+        )
+    selected = (
+        mubuf_down_kernel_id if dz_bytes <= 0xFFFFFFFF else flat_down_kernel_id,
+        mubuf_route_dx_kernel_id
+        if route_output_bytes <= 0xFFFFFFFF
+        else flat_route_dx_kernel_id,
+        route_reduce_kernel_id_selected,
+        23,
+    )
     requested = (
         int(down_kernel_id),
         int(route_dx_kernel_id),
@@ -362,7 +385,9 @@ def _select_blocked_g2_full_pipeline(
         "dw1_kernel_id",
     )
     for name, value, expected in zip(names[:3], requested[:3], selected[:3]):
-        if name == "down_kernel_id" and value in (17, 18):
+        if name == "down_kernel_id" and value in (17, 18, 19):
+            continue
+        if name == "route_dx_kernel_id" and value in (20, 21):
             continue
         if value not in (-1, expected):
             raise ValueError(
@@ -376,9 +401,12 @@ def _select_blocked_g2_full_pipeline(
             f"got {requested_dw1}"
         )
     selected_down = (
-        requested[0] if requested[0] in (17, 18) else selected[0]
+        requested[0] if requested[0] in (17, 18, 19) else selected[0]
     )
-    return (selected_down, selected[1], selected[2]) + (
+    selected_route_dx = (
+        requested[1] if requested[1] in (20, 21) else selected[1]
+    )
+    return (selected_down, selected_route_dx, selected[2]) + (
         requested_dw1 if requested_dw1 in (21, 22, 23) else selected[3],
     )
 
@@ -1826,6 +1854,7 @@ def opus_moe_backward(
             ) = _select_blocked_g2_full_pipeline(
                 inter_dim,
                 model_dim,
+                sorted_capacity,
                 down_kernel_id,
                 route_dx_kernel_id,
                 route_reduce_kernel_id,
