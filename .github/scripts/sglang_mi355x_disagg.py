@@ -593,6 +593,25 @@ docker rm -f mi355x_bench 2>/dev/null || true
     )
     text = replace_once(
         text,
+        """    echo "[probe] PD end-to-end check via LB"
+    curl -sf -X POST http://127.0.0.1:$LBPORT/generate \\
+      -H "content-type: application/json" -d @\\$CIDIR/probe.json > \\$CIDIR/probe_out.json \\
+      || { echo "[probe] request failed -- PD path not serving; aborting before sweep"; exit 1; }
+    python3 \\$CIDIR/assert_nonempty.py < \\$CIDIR/probe_out.json \\
+      || { echo "[probe] empty/invalid generation; aborting before sweep"; exit 1; }
+""",
+        """    echo "[probe] PD end-to-end check via LB"
+    PROBE_OUT=/tmp/sglang_probe_out.json
+    rm -f "\\$PROBE_OUT"
+    curl -sf -X POST http://127.0.0.1:$LBPORT/generate \\
+      -H "content-type: application/json" -d @\\$CIDIR/probe.json > "\\$PROBE_OUT" \\
+      || { rc=\\$?; echo "[probe] request failed (curl rc=\\$rc); aborting before sweep"; cat "\\$PROBE_OUT" 2>/dev/null || true; exit 1; }
+    python3 \\$CIDIR/assert_nonempty.py < "\\$PROBE_OUT" \\
+      || { echo "[probe] empty/invalid generation; aborting before sweep"; cat "\\$PROBE_OUT" 2>/dev/null || true; exit 1; }
+""",
+    )
+    text = replace_once(
+        text,
         """NODELIST_ARG=()
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 """,
