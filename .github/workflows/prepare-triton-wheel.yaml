@@ -7,7 +7,7 @@ on:
         description: Docker image used to resolve and download the matching Triton wheel.
         required: false
         type: string
-        default: rocm/pytorch:latest
+        default: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
       artifact-name:
         description: Name of the Triton wheel artifact uploaded for the caller workflow run.
         required: false
