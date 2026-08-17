@@ -1,0 +1,1730 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+"""Host op-layer for the cco-LSA intranode dispatch/combine kernels. One SymmArena
+window holds the symmetric staging; per-rank metadata are plain device tensors."""
+from dataclasses import dataclass
+import math
+import os
+
+import torch
+
+import flydsl.expr as fx
+from mori.tensor_utils import from_gpu_ptr
+
+from .intranode_kernels_tdm import make_dispatch_tdm, tdm_stage_capacity
+from .intranode_kernels import (
+    xdb_flag_slots,
+    make_dispatch,
+    make_combine,
+    make_combine_scatter,
+    make_combine_fused_reduce,
+    make_convert_dispatch_output,
+    make_convert_combine_input,
+    make_local_expert_count,
+)
+
+_COMBINE_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+
+_DT = {
+    torch.bfloat16: 2,
+    torch.float32: 4,
+    torch.float8_e4m3fnuz: 1,
+    torch.float8_e4m3fn: 1,
+}
+_FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+
+
+def _align_up(x, a):
+    return (x + a - 1) // a * a
+
+
+class SymmArena:
+    """One cco symmetric window carved into named, aligned sub-regions. A kernel
+    reaches peer pe's copy of region R via cco.Window(handle).lsa_ptr(pe, off_R)."""
+
+    _ALIGN = 256
+
+    def __init__(self, comm, regions):
+        self._comm = comm
+        self._offsets = {}
+        self._sizes = {}
+        off = 0
+        for name, nbytes in regions:
+            off = _align_up(off, self._ALIGN)
+            self._offsets[name] = off
+            self._sizes[name] = nbytes
+            off += nbytes
+        self._total = max(_align_up(off, self._ALIGN), self._ALIGN)
+        self._mem = comm.alloc_mem(self._total)
+        self._win = comm.register_window(self._mem.ptr, self._total)
+
+    @property
+    def handle(self):
+        return self._win.handle
+
+    @property
+    def total_bytes(self):
+        return self._total
+
+    def offset(self, name):
+        return self._offsets[name]
+
+    def local_ptr(self, name):
+        return self._win.local_ptr + self._offsets[name]
+
+    def zero(self, name=None):
+        """Zero the whole window, or just region `name` (zero-copy int8 torch view)."""
+        if name is None:
+            ptr, nbytes = self._win.local_ptr, self._total
+        else:
+            ptr, nbytes = self.local_ptr(name), self._sizes[name]
+        from_gpu_ptr(ptr, (nbytes,), torch.int8).zero_()
+
+    def close(self):
+        """Free the symmetric window (deregister before freeing the backing mem)."""
+        self._win.close()
+        self._mem.close()
+
+
+# GEMM1 a8w4 sort_block_m; push-group CAP and finalize tile metadata align to it.
+_PUSH_GROUP_TILE_M = 64
+
+# ``pg_ov_bar`` layout, in i32 slots. Slots 0..15 are the protocol barrier arrival
+# counters plus the debug scratch; then the work-stealing heads, one per shard on
+# its own 64 B line so the shards do not ping-pong one line between CUs; then the
+# plan-ready replicas, spaced a full 128 B apart because that wait is taken by
+# every CTA in the grid at once and a shared line serialises the whole launch;
+# then the same treatment for the producer barriers' release side. Keep in sync
+# with the WORK_/PLAN_/BREL_ constants in
+# kernels/push_group_overlap_stage1_gfx1250.py.
+PG_OV_WORK_SLOT = 16
+PG_OV_WORK_SHARDS = 8
+PG_OV_WORK_STRIDE = 16
+PG_OV_PLAN_SLOT = 256
+PG_OV_PLAN_STRIDE = 32
+PG_OV_PLAN_FANOUT_MAX = 64
+# Release replicas for the producer-wide barriers. Arriving on a counter and then
+# spinning on that same counter makes every producer's poll miss against every
+# other producer's atomic, which is quadratic in the producer count: measured
+# free at 32 producers and 284 us/layer at 128. The last arriver instead posts a
+# monotonic phase to these lines and the others only ever read their own.
+PG_OV_BREL_SLOT = PG_OV_PLAN_SLOT + PG_OV_PLAN_FANOUT_MAX * PG_OV_PLAN_STRIDE
+PG_OV_BREL_STRIDE = 32
+PG_OV_BREL_FANOUT = 64
+# One replica bank per barrier (zero, count, route-order): sharing a bank would
+# let a CTA still leaving one barrier read the next one's release.
+PG_OV_BREL_PHASES = 3
+# Optional group counters for the arrival side (see BAR_GROUP in
+# kernels/push_group_overlap_stage1_gfx1250.py). Off by default, so this bank is
+# normally dead space; it is 12 KB and the arena is per-rank, not per-layer.
+PG_OV_BARR_SLOT = (
+    PG_OV_BREL_SLOT + PG_OV_BREL_PHASES * PG_OV_BREL_FANOUT * PG_OV_BREL_STRIDE
+)
+PG_OV_BARR_GROUPS = 32
+PG_OV_BARR_STRIDE = 32
+PG_OV_BAR_SLOTS = (
+    PG_OV_BARR_SLOT + PG_OV_BREL_PHASES * PG_OV_BARR_GROUPS * PG_OV_BARR_STRIDE
+)
+
+
+def _push_group_regions(cfg, tile_m=_PUSH_GROUP_TILE_M):
+    """Extra symmetric regions for fixed-slot push-group dispatch (empty when off).
+
+    * ``pg_running[local_expert]`` -- per-expert landing cursor (atomic_add target).
+    * ``pg_rowmap[grouped_row]``   -- (rrows+1, 2) i32 map dispatch emits for the
+      downstream gemm2 scatter epilogue: col0 = ``origin_pe*slot_stride +
+      origin_lid*topk + k`` (the peer comb_inp slot), col1 = f32 route weight bits.
+      Indexed by the SAME fixed-slot row (``local_expert*CAP + cursor``) the gemm2
+      TDM kernel derives from ``tile_row_base``, so ep_rowmap==pg_rowmap needs no
+      remap. Empty/padding slots carry col0 = -1 (dropped in the scatter)."""
+    if not cfg.push_group:
+        return []
+    rrows = cfg.num_experts_per_rank * cfg.effective_cap_per_expert
+    return [
+        ("pg_running", cfg.num_experts_per_rank * 4),
+        ("pg_rowmap", (rrows + 1) * 2 * 4),
+    ]
+
+
+def _push_group_overlap_regions(cfg):
+    """Extra symmetric regions for the fused dispatch->GEMM1 overlap stage-1
+    (empty unless push_group_overlap). All of them are graph-safe without a
+    host-side memset: see the reset argument on each entry.
+
+    * ``pg_ov_count[parity][src_rank][global_expert]`` -- the all-gathered route
+      count matrix. Every rank pushes its whole per-global-expert histogram to
+      every peer, so both roles are then computable locally with no second hop:
+      as a SOURCE, ``base[ge] = sum(count[s][ge] for s < rank)``; as a
+      DESTINATION, ``total[le] = sum(count[s][rank*EPR+le] for s)``. Parity
+      double-buffering is what makes the plain overwrite safe -- a peer can be at
+      most one layer ahead (its layer L+1 counts need ours), never two.
+    * ``pg_ov_count_done[src_rank]`` -- monotonic arrival counter, one
+      ``atomic_add`` per source per layer. Monotonic (never reset) so it survives
+      CUDA-graph replay, where a host-supplied epoch would repeat.
+    * ``pg_ov_tile_arrived[local_expert][tile]`` -- additive per-tile row arrival.
+      Zeroed at the top of each stage-1 launch by the producers, which is
+      race-free: a peer only writes here after it observes our count publication,
+      and that publication is release-ordered after the zeroing.
+    * ``pg_ov_tile_expected[local_expert][tile]`` -- planner-written row count the
+      consumer waits for. Local-only, rewritten every layer.
+    * ``pg_ov_entry`` -- the ticket counter. One ``atomic_add`` per CTA per launch
+      hands out both the CTA role and the launch generation, so roles go to the
+      CTAs that are actually resident first. Thread 0 broadcasts the ticket to
+      the rest of its block over LDS, so no global slot is needed.
+    * ``pg_ov_bar`` -- monotonic grid-barrier counters for the producer CTAs
+      (compared against ``(generation+1)*dispatch_ctas``, hence no reset). Slots 0
+      and 1 are the two protocol barriers; the rest are spare, and the debug
+      builds use them for diagnostics that must not collide with peer traffic.
+      The tail (slot ``PG_OV_WORK_SLOT`` onwards) holds the GEMM1 work-stealing
+      heads, one per shard on its own 64 B line; the planner zeroes them before
+      it publishes the plan, which is the only point at which no CTA can be
+      pulling from them.
+    * ``pg_ov_plan_ready`` -- monotonic; the planner bumps it once the tile
+      schedule and ``pg_ov_my_base`` are visible, and every other CTA waits on it.
+    * ``pg_ov_my_base[global_expert]`` -- this rank's first destination row within
+      each expert, i.e. the exclusive prefix over lower-numbered source ranks. The
+      planner derives it once so producers do not each redo the prefix sum.
+    * ``pg_ov_hist`` / ``pg_ov_route_slot`` -- local scratch: this rank's route
+      histogram and, per (token,k) route, its index within this rank's rows for
+      that expert. The payload pass needs the latter to reconstruct the row the
+      count pass reserved.
+    * ``pg_ov_route_order`` -- the routes counting-sorted by destination expert
+      (``order[local_base[expert] + slot] = route``). Pushing in this order is
+      what makes the destination's early tiles fill first, so its GEMM1 can start
+      while the later experts are still in flight.
+    """
+    if not (cfg.push_group and cfg.push_group_overlap):
+        return []
+    e_local = cfg.num_experts_per_rank
+    e_total = cfg.world_size * e_local
+    tiles = cfg.num_experts_per_rank * cfg.push_group_overlap_tiles_per_expert
+    return [
+        ("pg_ov_count", 2 * cfg.world_size * e_total * 4),
+        ("pg_ov_count_done", cfg.world_size * 4),
+        ("pg_ov_tile_arrived", tiles * 4),
+        ("pg_ov_tile_expected", tiles * 4),
+        ("pg_ov_entry", 4),
+        ("pg_ov_bar", PG_OV_BAR_SLOTS * 4),
+        ("pg_ov_plan_ready", 4),
+        ("pg_ov_my_base", e_total * 4),
+        ("pg_ov_hist", e_total * 4),
+        (
+            "pg_ov_route_slot",
+            cfg.max_num_inp_token_per_rank * cfg.num_experts_per_token * 4,
+        ),
+        (
+            "pg_ov_route_order",
+            cfg.max_num_inp_token_per_rank * cfg.num_experts_per_token * 4,
+        ),
+    ]
+
+
+def _validate_overlap_ctas(*, grid_ctas, dispatch_ctas):
+    """Split the stage-1 mega grid into (producers, planner, consumers).
+
+    ``dispatch_ctas`` is the whole dispatch half INCLUDING the planner, which is
+    role 0 -- the same partition the kernel derives from a CTA's ticket. The roles
+    are handed out by ticket order, not blockIdx, so they can only land on CTAs
+    that are already resident; a producer that never got a slot would deadlock the
+    consumers spinning on the payload it owes.
+    """
+    dispatch_ctas = int(dispatch_ctas)
+    grid_ctas = int(grid_ctas)
+    producers = dispatch_ctas - 1
+    consumer_ctas = grid_ctas - dispatch_ctas
+    if producers < 1:
+        raise ValueError(
+            f"dispatch_ctas={dispatch_ctas} leaves no producer after the planner"
+        )
+    if consumer_ctas < PG_OV_WORK_SHARDS:
+        # A work-queue shard only hands out items i == shard (mod SHARDS), so a
+        # shard nobody pulls from is a set of tiles nobody computes.
+        raise ValueError(
+            f"need at least {PG_OV_WORK_SHARDS} consumer CTAs (one per work "
+            f"shard): grid={grid_ctas} leaves {consumer_ctas} after "
+            f"{dispatch_ctas} dispatch CTAs"
+        )
+    return producers, 1, consumer_ctas
+
+
+@dataclass
+class EpDispatchCombineConfig:
+    rank: int
+    world_size: int
+    hidden_dim: int
+    max_num_inp_token_per_rank: int
+    num_experts_per_rank: int
+    num_experts_per_token: int
+    # Base token dtype; dispatch_data_type / combine_data_type override per-op
+    # (None => data_type). Asymmetric (fp8 dispatch -> bf16 combine) is gather-only.
+    data_type: torch.dtype = torch.bfloat16
+    dispatch_data_type: torch.dtype = None
+    combine_data_type: torch.dtype = None
+    # Per-token quant scales forwarded verbatim to dest out_scales (0 disables).
+    scale_dim: int = 0
+    scale_type_size: int = 0
+    # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
+    combine_mode: str = "gather"
+    # Combine-side wire quantization (scatter-only; distinct from the dispatch
+    # token dtype). Forcing it != "none" switches combine_mode to scatter.
+    combine_quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # Geometry: None => auto (tuned schedule from tuning_configs in __post_init__);
+    # pin any to opt out. Combine's warp count is kept separate from dispatch's.
+    dispatch_block_num: int = None
+    combine_block_num: int = None
+    dispatch_warp_num_per_block: int = None
+    combine_warp_num_per_block: int = None
+    # Optional per-token plan: (max_tok_inclusive | None, disp_block, disp_warp,
+    # comb_block, comb_warp) buckets; the op precompiles the distinct (block, warp)
+    # variants and picks one at runtime. None => auto or single-shot fallback.
+    schedule: tuple = None
+    enable_std_moe: bool = False
+    max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # Fixed-slot push-group dispatch->GEMM1 fusion (explicit end-to-end switch;
+    # replaces the AITER_EP_PUSH_GROUP env). When True: dispatch lands tokens
+    # grouped per local expert, GEMM1 reads A contiguously (no consumer gather),
+    # GEMM2 scatters via pg_rowmap. gfx1250 a8w4 only; default off.
+    push_group: bool = False
+    # Per-local-expert fixed-slot row capacity (only consulted when push_group=True).
+    #   0 (default) => worst-case ws*max_tok_per_rank: every token could hit one
+    #                  expert, so no routing skew can ever drop a token.
+    #   >0          => caller-pinned capacity (aligned up to tile_m). The caller
+    #                  guarantees the real peak per-expert load fits; a peak above
+    #                  cap_per_expert silently DROPS the overflow (finalize clamp).
+    #                  Smaller cap => fewer padding tiles => faster, at that risk.
+    cap_per_expert: int = 0
+    # push_group + pre-quantized (fp8) tokens: the sender's scale is linear, but the
+    # consuming GEMM wants it WMMA-preshuffled, and the preshuffled position depends
+    # on the row's slot within its destination expert. Set this to the GEMM's
+    # tile_m//16 to have dispatch apply that permutation as it scatters the scale,
+    # which removes the receiver-side quant+repack pass entirely. 0 => linear scale.
+    push_group_scale_wmma_rep: int = 0
+    # Fuse the push-group dispatch INTO GEMM1 as one stage-1 mega kernel so the
+    # P2P payload transfer of later M-tiles overlaps the GEMM1 compute of earlier
+    # arrived ones. Requires push_group + send-side quant (push_group_scale_wmma_rep
+    # > 0): the wire must carry fp8 + e8m0 only, never bf16 alongside it. Default
+    # off; the existing dispatch -> finalize -> GEMM1 sequence stays the fallback.
+    push_group_overlap: bool = False
+    # Which dispatch transport to build: "vector" is the portable per-lane 16 B
+    # copy, "tdm" the gfx1250 Tensor-Data-Mover port of mori's
+    # ep_intranode_1250x (block-local counting + one remote atomic per
+    # (block, peer) + bulk metadata + DMA payload). "auto" picks vector, so
+    # nothing changes for existing callers; env AITER_EP_DISPATCH_TDM=1 flips
+    # the auto default for A/B runs. The two produce interchangeable state, so
+    # combine / replay / the routing handle do not care which ran.
+    dispatch_transport: str = "auto"
+
+    def __post_init__(self):
+        # all-or-none: setting only one silently defaults the other to data_type.
+        if (self.dispatch_data_type is None) != (self.combine_data_type is None):
+            raise ValueError(
+                "dispatch_data_type / combine_data_type must be set together "
+                "(all-or-none): got dispatch_data_type="
+                f"{self.dispatch_data_type}, combine_data_type={self.combine_data_type}. "
+                "Set data_type alone for a symmetric op, or set both explicitly for "
+                "asymmetric dispatch/combine dtypes."
+            )
+        if self.combine_quant_type not in _COMBINE_QUANT_TYPES:
+            raise ValueError(
+                f"combine_quant_type must be one of {_COMBINE_QUANT_TYPES}, "
+                f"got {self.combine_quant_type!r}"
+            )
+        if self.dispatch_transport not in ("auto", "vector", "tdm"):
+            raise ValueError(
+                "dispatch_transport must be auto|vector|tdm, "
+                f"got {self.dispatch_transport!r}"
+            )
+        if self.dispatch_transport == "auto":
+            self.dispatch_transport = (
+                "tdm" if os.environ.get("AITER_EP_DISPATCH_TDM") == "1" else "vector"
+            )
+        if self.dispatch_transport == "tdm":
+            # Each of these has its own staging region / slot arithmetic that the
+            # TDM kernel does not carry; failing loudly beats silently dropping
+            # scales or landing tokens in the wrong group.
+            unsupported = [
+                name
+                for name, on in (
+                    ("scale_dim", self.scale_dim > 0),
+                    ("push_group", self.push_group),
+                    ("fp4 tokens", self.is_fp4),
+                )
+                if on
+            ]
+            if unsupported:
+                raise ValueError(
+                    "dispatch_transport='tdm' does not implement "
+                    + ", ".join(unsupported)
+                    + "; use dispatch_transport='vector'"
+                )
+        if self.combine_mode not in ("gather", "scatter", "scatter_fused"):
+            raise ValueError(
+                "combine_mode must be gather|scatter|scatter_fused, "
+                f"got {self.combine_mode!r}"
+            )
+        if self.combine_quant_type != "none":
+            self.combine_mode = "scatter"
+        # The dispatch grid barrier iterates peers as range(lane, npes, wave) and
+        # resets inside the loop, correct only when npes <= wavefront.
+        if self.world_size > 64:
+            raise ValueError(
+                f"intranode op supports world_size <= 64, got {self.world_size}"
+            )
+        # Token copy moves whole 16 B (vec4) chunks; per-token size must be 16 B aligned.
+        if self.token_nbytes % 16 != 0:
+            raise ValueError(
+                f"per-token transport bytes must be 16 B aligned (vec4 copy); "
+                f"hidden_dim={self.hidden_dim}, dispatch_dtype={self.dispatch_dtype} -> "
+                f"token_nbytes={self.token_nbytes}"
+            )
+        if self.push_group_overlap:
+            if not self.push_group:
+                raise ValueError("push_group_overlap requires push_group=True")
+            if self.push_group_scale_wmma_rep <= 0:
+                raise ValueError(
+                    "push_group_overlap requires send-side quant "
+                    "(push_group_scale_wmma_rep > 0): the fused stage-1 pushes fp8 "
+                    "payload + e8m0 scale straight into GEMM1's layout, so there is "
+                    "no receiver-side quant pass to fall back on"
+                )
+            tile_m = self.push_group_overlap_tile_m
+            if self.effective_cap_per_expert % tile_m:
+                raise ValueError(
+                    f"push_group_overlap needs cap ({self.effective_cap_per_expert}) "
+                    f"to be a multiple of tile_m ({tile_m})"
+                )
+        if self.is_asymmetric_dtype:
+            # asymmetric dtype (separate disp_out/comb_stg buffers): non-quant /
+            # non-StdMoE. Every combine mode is fine as long as the return wire is
+            # sized off combine_dtype, which is what wire_elem_size / the combine
+            # builders use; combine_quant_type would be a second, conflicting say
+            # over that wire, and StdMoE's convert kernels are bf16-only.
+            if self.combine_quant_type != "none" or self.enable_std_moe:
+                raise ValueError(
+                    "combine_data_type (asymmetric dtype) requires "
+                    "combine_quant_type=none, enable_std_moe=False"
+                )
+            if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
+                raise ValueError(
+                    "asymmetric dispatch/combine dtype does not support fp4"
+                )
+            if self.combine_token_nbytes % 16 != 0:
+                raise ValueError(
+                    f"combine per-token bytes must be 16 B aligned; combine_data_type="
+                    f"{self.combine_data_type} -> {self.combine_token_nbytes}"
+                )
+        self._resolve_geometry()
+
+    def _resolve_geometry(self):
+        """Fill block/warp/schedule. Tuned-by-default: if the caller pinned nothing,
+        pull the tuned geometry from tuning_configs.lookup; if any field is pinned,
+        honor it and fill the rest with the single-shot fallback (no schedule)."""
+        pinned = self.schedule is not None or any(
+            g is not None
+            for g in (
+                self.dispatch_block_num,
+                self.combine_block_num,
+                self.dispatch_warp_num_per_block,
+                self.combine_warp_num_per_block,
+            )
+        )
+        if not pinned:
+            from .tuning_configs import lookup
+
+            t = lookup(
+                self.world_size,
+                self.hidden_dim,
+                self.num_experts_per_token,
+                dtype=self.dtype_str,
+            )
+            self.dispatch_block_num = t["dispatch_block_num"]
+            self.combine_block_num = t["combine_block_num"]
+            self.dispatch_warp_num_per_block = t["dispatch_warp_num_per_block"]
+            self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
+            self.schedule = t["schedule"]
+        else:
+            # explicit geometry: fill any unset field with the single-shot default
+            if self.dispatch_block_num is None:
+                self.dispatch_block_num = 64
+            if self.combine_block_num is None:
+                self.combine_block_num = 80
+            if self.dispatch_warp_num_per_block is None:
+                self.dispatch_warp_num_per_block = 16
+            if self.combine_warp_num_per_block is None:
+                self.combine_warp_num_per_block = 4
+
+    @property
+    def is_scatter(self):
+        return self.combine_mode in ("scatter", "scatter_fused")
+
+    @property
+    def is_fused(self):
+        """gemm2-fused scatter: gemm2 P2P-writes weighted per-(token,k) results into
+        comb_inp; combine only barriers + sums. No Stage-1 write, no gather_reduce."""
+        return self.combine_mode == "scatter_fused"
+
+    @property
+    def fp8_direct_cast(self):
+        return self.combine_quant_type == "fp8_direct_cast"
+
+    @property
+    def fp8_blockwise(self):
+        return self.combine_quant_type == "fp8_blockwise"
+
+    @property
+    def combine_scale_dim(self):
+        """Per-token block count for fp8_blockwise combine (block_elems=128)."""
+        return self.hidden_dim // 128 if self.fp8_blockwise else 0
+
+    @property
+    def wire_elem_size(self):
+        """comb_inp transport element size: 1 byte for fp8 paths, else the COMBINE
+        element size (not the dispatch one -- a narrow dispatch dtype must not
+        shrink the return wire that gemm2's epilogue writes)."""
+        return (
+            1
+            if self.combine_quant_type in ("fp8_direct_cast", "fp8_blockwise")
+            else self.combine_elem_size
+        )
+
+    @property
+    def tdm_gather_scatter(self):
+        """gemm2-fused P2P scatter via TDM gather-store. The felix TDM GEMM2's
+        fused epilogue always scatters via the TDM gather-store, which requires a
+        pow2-padded comb_inp slot so the per-slot stride divides the 4GB-aligned
+        per-rank symmetric window (lets gemm2 fold (pe,slot) into a single TDM
+        gather row index). Tied to the same switch that selects the felix TDM
+        GEMM2 (AITER_EP_SCATTER_TDM, default on); set it to 0 to fall back onto
+        the grouped/contiguous mxscale gemm2 (unpadded buffer_store scatter)."""
+        return self.is_fused and os.environ.get("AITER_EP_SCATTER_TDM", "1") in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
+        )
+
+    @property
+    def comb_inp_slot_nbytes(self):
+        """Per-(token,k) comb_inp slot stride in bytes. Padded up to a power of
+        two for the TDM gather-store fused path; else the natural hidden row
+        size (hidden_dim * wire_elem_size)."""
+        base = self.hidden_dim * self.wire_elem_size
+        if self.tdm_gather_scatter:
+            p = 1
+            while p < base:
+                p <<= 1
+            return p
+        return base
+
+    @classmethod
+    def tuned(cls, **kwargs):
+        """Build a config with geometry from tuning_configs (unless overridden in
+        kwargs). Back-compat alias; the plain constructor is also tuned-by-default."""
+        from .tuning_configs import lookup
+
+        dt = kwargs.get("data_type", torch.bfloat16)
+        dtype = (
+            "fp4"
+            if dt == torch.float4_e2m1fn_x2
+            else ("fp8" if dt in _FP8_DTYPES else "bf16")
+        )
+        t = lookup(
+            kwargs["world_size"],
+            kwargs["hidden_dim"],
+            kwargs["num_experts_per_token"],
+            dtype=dtype,
+        )
+        for k, v in t.items():
+            kwargs.setdefault(k, v)
+        return cls(**kwargs)
+
+    @property
+    def dispatch_dtype(self):
+        """Dispatch transport dtype (== data_type unless dispatch_data_type set)."""
+        return (
+            self.dispatch_data_type
+            if self.dispatch_data_type is not None
+            else self.data_type
+        )
+
+    @property
+    def is_fp4(self):
+        return self.dispatch_dtype == torch.float4_e2m1fn_x2
+
+    @property
+    def is_fp8(self):
+        return self.dispatch_dtype in _FP8_DTYPES
+
+    @property
+    def elem_size(self):
+        # fp4 is 0.5 B/elem; return a nominal 1 (kernels use the fp4 flag +
+        # token_nbytes for actual sizing, never elem_size for fp4 token buffers).
+        return 1 if self.is_fp4 else _DT[self.dispatch_dtype]
+
+    @property
+    def token_nbytes(self):
+        """Per-token transport bytes (fp4 packs 2 e2m1/byte -> hidden/2)."""
+        return self.hidden_dim // 2 if self.is_fp4 else self.hidden_dim * self.elem_size
+
+    @property
+    def combine_dtype(self):
+        """Combine transport dtype (== data_type unless combine_data_type set)."""
+        return (
+            self.combine_data_type
+            if self.combine_data_type is not None
+            else self.data_type
+        )
+
+    @property
+    def combine_elem_size(self):
+        cdt = self.combine_dtype
+        return 1 if cdt == torch.float4_e2m1fn_x2 else _DT[cdt]
+
+    @property
+    def combine_token_nbytes(self):
+        cdt = self.combine_dtype
+        return (
+            self.hidden_dim // 2
+            if cdt == torch.float4_e2m1fn_x2
+            else self.hidden_dim * self.combine_elem_size
+        )
+
+    @property
+    def is_asymmetric_dtype(self):
+        return self.dispatch_dtype != self.combine_dtype
+
+    @property
+    def dtype_str(self):
+        """Token/dispatch dtype key for tuning_configs.lookup (fp4/fp8/default)."""
+        if self.is_fp4:
+            return "fp4"
+        if self.is_fp8:
+            return "fp8"
+        return "bf16"
+
+    @property
+    def max_recv(self):
+        """Sentinel / sender-side atomic-add allocation bound (always ws*M)."""
+        return self.world_size * self.max_num_inp_token_per_rank
+
+    @property
+    def effective_max_recv_per_rank(self):
+        if self.max_total_recv_tokens <= 0:
+            return self.max_num_inp_token_per_rank
+        per = (self.max_total_recv_tokens + self.world_size - 1) // self.world_size
+        return min(per, self.max_num_inp_token_per_rank)
+
+    @property
+    def effective_max_recv(self):
+        """Recv-slot cap passed to the kernels as max_recv (mori MaxNumTokensToRecv)."""
+        return self.world_size * self.effective_max_recv_per_rank
+
+    @property
+    def effective_cap_per_expert(self) -> int:
+        """Per-local-expert fixed-slot row capacity, aligned up to the GEMM1 tile_m.
+
+        ``cap_per_expert=0`` (default) => worst-case ``world_size*max_tok_per_rank``:
+        one expert could receive every token, so this can never drop. ``>0`` uses the
+        caller's pinned value (correctness is the caller's responsibility -- a real
+        peak per-expert load above it is silently dropped in finalize).
+
+        A padding M-tile (expert==n_experts sentinel) early-exits at the kernel's
+        ``if expert < n_experts`` guard -- it does NOT run the N/K mainloop -- so
+        over-provisioning costs empty-workgroup dispatch, not padded compute.
+        """
+        tile_m = _PUSH_GROUP_TILE_M
+        base = (
+            int(self.cap_per_expert)
+            if self.cap_per_expert > 0
+            else self.world_size * self.max_num_inp_token_per_rank
+        )
+        base = max(tile_m, base)
+        return ((base + tile_m - 1) // tile_m) * tile_m
+
+    @property
+    def push_group_overlap_tile_m(self) -> int:
+        """GEMM1 M-tile the overlap arrival counters are keyed on. It is the same
+        knob as the send-side scale preshuffle geometry (wmma_rep = tile_m//16),
+        so the two can never drift apart."""
+        return self.push_group_scale_wmma_rep * 16
+
+    @property
+    def push_group_overlap_tiles_per_expert(self) -> int:
+        return self.effective_cap_per_expert // self.push_group_overlap_tile_m
+
+
+class EpDispatchRoutingHandle:
+    """Per-call routing snapshot.
+
+    disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (tok_map).
+    disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (tis).
+    inter_node_*: empty placeholders (intranode-only; kept for 5-tensor shape parity).
+
+    The reverse map is materialized LAZILY on first access: recv_to_src_token is
+    written by peers via P2P during dispatch and is only visible after the caller's
+    post-dispatch barrier, so cloning it eagerly would race those writes.
+    """
+
+    def __init__(
+        self,
+        disp_dest_tok_id_map,
+        inter_node_disp_dest_tok_id_map,
+        inter_node_disp_send_map,
+        total_recv_token_num,
+        disp_tok_id_to_src_tok_id_local=None,
+        cur_rank_num_token=0,
+        *,
+        reverse_src_view=None,
+    ):
+        self.disp_dest_tok_id_map = disp_dest_tok_id_map
+        self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
+        self.inter_node_disp_send_map = inter_node_disp_send_map
+        self.total_recv_token_num = total_recv_token_num
+        self.cur_rank_num_token = cur_rank_num_token
+        # Either an already-materialized reverse map (from_tensors round-trip) or
+        # a live arena view to clone on first access (dispatch()).
+        self._reverse_cache = disp_tok_id_to_src_tok_id_local
+        self._reverse_src_view = reverse_src_view
+
+    @property
+    def disp_tok_id_to_src_tok_id_local(self):
+        if self._reverse_cache is None:
+            # First access (post-barrier): clone off the arena before the next
+            # dispatch overwrites the region.
+            self._reverse_cache = self._reverse_src_view.clone()
+        return self._reverse_cache
+
+    def tensors(self):
+        return (
+            self.disp_dest_tok_id_map,
+            self.inter_node_disp_dest_tok_id_map,
+            self.inter_node_disp_send_map,
+            self.total_recv_token_num,
+            self.disp_tok_id_to_src_tok_id_local,
+        )
+
+    @classmethod
+    def from_tensors(cls, tensors, cur_rank_num_token=0):
+        return cls(*tensors, cur_rank_num_token=cur_rank_num_token)
+
+
+class EpDispatchCombineOp:
+    def __init__(self, cfg: EpDispatchCombineConfig, comm):
+        self.cfg = cfg
+        self.comm = comm
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.dev = device
+        elem_size = cfg.elem_size
+        is_fp4 = cfg.is_fp4
+        is_fp8 = cfg.is_fp8
+        token_nbytes = cfg.token_nbytes  # per-token transport bytes (fp4 = hidden/2)
+        # The restriction is about the COMBINE wire: a scatter combine accumulates
+        # into the peer slot, which the fp4/fp8 accumulators do not implement (that
+        # is what combine_quant_type=fp8_direct_cast is for). A narrow dispatch dtype
+        # with a bf16 combine is fine -- dispatch is a pure byte mover and the two
+        # directions carry independent buffers -- and is how the push path sends
+        # pre-quantized tokens.
+        combine_is_narrow = cfg.combine_dtype == torch.float4_e2m1fn_x2 or (
+            cfg.combine_dtype in _FP8_DTYPES
+        )
+        if (is_fp4 or is_fp8) and cfg.is_scatter and combine_is_narrow:
+            raise ValueError(
+                "plain fp4/fp8 token dtype is gather-only for a symmetric op "
+                "(fp8 quant uses combine_quant_type=fp8_direct_cast, not data_type); "
+                "set combine_data_type=bf16 for a narrow-dispatch / wide-combine op"
+            )
+        topk = cfg.num_experts_per_token
+        hidden_dim = cfg.hidden_dim
+        max_tok_per_rank = cfg.max_num_inp_token_per_rank
+        recv_cap = cfg.effective_max_recv  # recv-slot cap (== ws*M unless capped)
+        self._recv_cap = recv_cap
+
+        self._scale_bytes = cfg.scale_dim * cfg.scale_type_size
+        self._scale_num_i32 = (self._scale_bytes + 3) // 4
+        self._enable_scales = self._scale_bytes > 0
+
+        # push-group fixed-slot: recv-side regions grow from recv-order (recv_cap
+        # rows) to grouped [num_local_experts, CAP] rows so tokens land grouped.
+        self._push_group = cfg.push_group
+        self._pg_initialized = False
+        self._pg_ov_initialized = False
+        self._push_group_cap = cfg.effective_cap_per_expert if cfg.push_group else 0
+        rrows = (
+            cfg.num_experts_per_rank * self._push_group_cap
+            if cfg.push_group
+            else recv_cap
+        )
+        self._pg_recv_rows = rrows
+
+        regions = [
+            ("tok_off", 4),
+            ("recv_num", cfg.world_size * 4),
+            ("recv_to_src_token", rrows * 4),
+            ("out_idx", rrows * topk * 4),
+            ("out_wts", rrows * topk * 4),
+            # disp_out: dispatch dest / expert-GEMM input, kept separate from comb_stg
+            # so combine's copy-in never clobbers the dispatched tokens.
+            ("disp_out", rrows * token_nbytes),
+            # comb_stg: combine staging (post-expert results that peers gather).
+            ("comb_stg", recv_cap * cfg.combine_token_nbytes),
+            ("cross_device_barrier", cfg.world_size * 8),
+        ]
+        if self._enable_scales:
+            regions.append(("out_scales", rrows * self._scale_num_i32 * 4))
+        regions += _push_group_regions(cfg)
+        regions += _push_group_overlap_regions(cfg)
+        # scatter combine needs its own staging regions
+        if cfg.is_scatter:
+            wire_elem_size = cfg.wire_elem_size
+            if cfg.is_fused:
+                # per-(origin_token, k): this rank's own M tokens x topk slots; each
+                # (token,k) is written exactly once by the owner rank's gemm2 (the
+                # expert k of that token lives on one rank) -> no cross-rank collision.
+                # Weights are pre-multiplied in gemm2, so no comb_wts region.
+                regions.append(
+                    ("comb_inp", max_tok_per_rank * topk * cfg.comb_inp_slot_nbytes)
+                )
+            else:
+                regions.append(
+                    (
+                        "comb_inp",
+                        cfg.world_size * max_tok_per_rank * hidden_dim * wire_elem_size,
+                    )
+                )
+                regions.append(
+                    ("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4)
+                )
+                if cfg.fp8_blockwise:
+                    regions.append(
+                        (
+                            "comb_scales",
+                            cfg.world_size
+                            * max_tok_per_rank
+                            * cfg.combine_scale_dim
+                            * 4,
+                        )
+                    )
+        self.arena = SymmArena(comm, regions)
+        self.arena.zero()
+
+        self.token_dest_map = torch.full(
+            (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
+        )
+        self._empty_i32 = torch.empty(
+            0, dtype=torch.int32, device=device
+        )  # inter-node placeholders
+        self.dest_pe_counter = torch.zeros(
+            cfg.world_size, dtype=torch.int32, device=device
+        )
+        self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
+        self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        # Per-block xdb flag counters for the gather combine entry barrier: one
+        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
+        # block_num). Every block owns a private counter and block 0 fills the
+        # unused tail so all stay in lockstep across calls with different
+        # block_num. The scatter/fused combines only use slot 0.
+        self.cross_device_flag = torch.ones(
+            xdb_flag_slots, dtype=torch.int64, device=device
+        )
+        c_dt = cfg.combine_dtype  # combine output dtype
+        c_elem = cfg.combine_elem_size
+        if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
+            self.combine_out = torch.zeros(
+                max_tok_per_rank * (hidden_dim // 2), dtype=torch.int8, device=device
+            )
+        elif c_dt in _FP8_DTYPES:  # fp8 combine outputs fp8 (1 byte/elem)
+            self.combine_out = torch.zeros(
+                max_tok_per_rank * hidden_dim, dtype=torch.int8, device=device
+            )
+        else:
+            self.combine_out = torch.zeros(
+                max_tok_per_rank * hidden_dim,
+                dtype=torch.int16 if c_elem == 2 else torch.int32,
+                device=device,
+            )
+        self.combine_out_weights = torch.zeros(
+            max_tok_per_rank * topk, dtype=torch.float32, device=device
+        )
+
+        arena = self.arena
+        # Distinct (block, warp) variants to precompile; a per-token schedule picks
+        # the best at runtime, else single-shot. Scatter combine is not schedule-tuned.
+        schedule = cfg.schedule
+        if schedule:
+            dispatch_specs = sorted({(db, dw) for (_, db, dw, _, _) in schedule})
+            combine_specs = sorted({(cb, cw) for (_, _, _, cb, cw) in schedule})
+        else:
+            dispatch_specs = [(cfg.dispatch_block_num, cfg.dispatch_warp_num_per_block)]
+            combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
+        # Pin the dispatch geometry via DISPATCH_BW (e.g. "32,8"), mirroring
+        # SCATTER_COMB_BW below. Pinning one spec makes _pick fall back to it for
+        # every token count, which is what a sweep wants.
+        #
+        # Measured on gfx1250 across bs=8/128/512 and both push_group paths: the
+        # only thing block_num controls is whether block*warp covers the
+        # cur_tok*topk work items in one grid-stride pass. Above coverage it is
+        # flat (bs=8 ran the same from 8 to 128 blocks), because the Phase-2 grid
+        # barrier is paced by how late the slowest payload block arrives, not by
+        # the per-block atomic on disp_bar. Below coverage each extra pass costs
+        # ~40% (bs=128 went 73 -> 102 -> 133 us at 96 -> 64 -> 32 blocks). So
+        # tune for coverage while latency-bound and ignore the block count.
+        _disp_bw = os.environ.get("DISPATCH_BW")
+        if _disp_bw:
+            dispatch_specs = [tuple(int(x) for x in _disp_bw.split(","))]
+        if cfg.is_scatter:
+            # Scatter combine hits an all-block grid barrier mid-kernel (Stage 1
+            # write -> barrier -> Stage 3 read). With the gather-tuned (block=80,
+            # warp=4) that barrier serializes badly (occupancy-bound: too many
+            # blocks to co-reside, so the grid barrier spins). Far fewer blocks with
+            # more warps per block (8x16) keeps all blocks resident and roughly
+            # halves the scatter combine kernel time. Override via SCATTER_COMB_BW
+            # (e.g. "16,16") to retune for a different token count / hidden dim.
+            _b, _w = 8, 16
+            _bw = os.environ.get("SCATTER_COMB_BW")
+            if _bw:
+                _b, _w = (int(x) for x in _bw.split(","))
+                combine_specs = [(_b, _w)]
+            elif cfg.is_fused:
+                # The fused combine is an xdb barrier + a light topk sum. Only the
+                # first npes lanes now touch the system-scope xdb flag, so additional
+                # waves are useful bandwidth workers instead of multiplying barrier
+                # traffic. Re-tuned after that change: keep 8 blocks through 32
+                # tokens (16 regresses at bs8), then 16/32/64 blocks win through
+                # 256/1024/larger counts. The next doubling is flat at 128 and
+                # regresses at 512/2048 because comb_bar starts dominating again.
+                # Override via SCATTER_COMB_BW for other token/hidden shapes.
+                self._fused_comb_tiers = [
+                    (32, (8, 16)),
+                    (256, (16, 16)),
+                    (1024, (32, 16)),
+                    (None, (64, 16)),
+                ]
+                combine_specs = [s for _, s in self._fused_comb_tiers]
+            else:
+                combine_specs = [(_b, _w)]
+        self._dispatch_specs = dispatch_specs
+        self._combine_specs = combine_specs
+
+        self._dispatch_kwargs = dict(
+            rank=cfg.rank,
+            npes=cfg.world_size,
+            experts_per_rank=cfg.num_experts_per_rank,
+            experts_per_token=topk,
+            hidden_dim=hidden_dim,
+            hidden_elem_size=elem_size,
+            max_tok_per_rank=max_tok_per_rank,
+            max_recv=recv_cap,
+            off_tok_off=arena.offset("tok_off"),
+            off_recv_num=arena.offset("recv_num"),
+            off_tis=arena.offset("recv_to_src_token"),
+            off_out_idx=arena.offset("out_idx"),
+            off_out_wts=arena.offset("out_wts"),
+            off_out_tok=arena.offset("disp_out"),
+            off_out_scales=arena.offset("out_scales") if self._enable_scales else 0,
+            scale_dim=cfg.scale_dim,
+            scale_type_size=cfg.scale_type_size,
+            fp4=is_fp4,
+            push_group=cfg.push_group,
+            push_group_cap=self._push_group_cap,
+            off_pg_running=arena.offset("pg_running") if cfg.push_group else 0,
+            off_pg_rowmap=arena.offset("pg_rowmap") if cfg.push_group else 0,
+            push_group_scale_wmma_rep=cfg.push_group_scale_wmma_rep,
+        )
+        # (block, warp) -> compiled dispatch / combine kernel.
+        self._dispatch_variants = {
+            (b, w): make_dispatch(
+                block_num=b, warp_num_per_block=w, **self._dispatch_kwargs
+            )
+            for (b, w) in dispatch_specs
+        }
+        self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
+
+        # TDM transport: same kwargs minus the knobs it does not implement, plus
+        # its own staging pool. FINALIZE gathers each route's metadata into a
+        # (block, peer)-contiguous run there so META can ship it in bulk; the
+        # pool is sized for the widest precompiled geometry, since a narrower
+        # grid only ever addresses a prefix of it.
+        self._dispatch_tdm_variants = {}
+        self._tdm_stage = None
+        if cfg.dispatch_transport == "tdm":
+            tdm_kwargs = {
+                k: v
+                for k, v in self._dispatch_kwargs.items()
+                if k
+                not in (
+                    "off_out_scales",
+                    "scale_dim",
+                    "scale_type_size",
+                    "fp4",
+                    "push_group",
+                    "push_group_cap",
+                    "off_pg_running",
+                    "off_pg_rowmap",
+                    "push_group_scale_wmma_rep",
+                )
+            }
+            slots = max(
+                tdm_stage_capacity(
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    max_tok_per_rank=max_tok_per_rank,
+                    block_num=b,
+                    warp_num_per_block=w,
+                )[1]
+                for (b, w) in dispatch_specs
+            )
+            dev = torch.cuda.current_device()
+            self._tdm_stage = (
+                torch.empty(slots * topk, dtype=torch.int32, device=dev),  # indices
+                torch.empty(slots * topk, dtype=torch.int32, device=dev),  # weights
+                torch.empty(slots, dtype=torch.int32, device=dev),  # srcmap
+            )
+            self._dispatch_tdm_variants = {
+                (b, w): make_dispatch_tdm(
+                    block_num=b, warp_num_per_block=w, **tdm_kwargs
+                )
+                for (b, w) in dispatch_specs
+            }
+        if cfg.is_fused:
+            # gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp;
+            # combine only barriers (wait for peers' writes) + sums the topk slots.
+            self._combine_variants = {
+                (b, w): make_combine_fused_reduce(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    hidden_dim=hidden_dim,
+                    hidden_elem_size=cfg.combine_elem_size,
+                    max_tok_per_rank=max_tok_per_rank,
+                    block_num=b,
+                    warp_num_per_block=w,
+                    off_comb_inp=arena.offset("comb_inp"),
+                    off_xdb_mem=arena.offset("cross_device_barrier"),
+                    slot_stride_nbytes=cfg.comb_inp_slot_nbytes,
+                )
+                for (b, w) in combine_specs
+            }
+        elif cfg.is_scatter:
+            self._combine_variants = {
+                (b, w): make_combine_scatter(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    hidden_dim=hidden_dim,
+                    hidden_elem_size=cfg.combine_elem_size,
+                    max_tok_per_rank=max_tok_per_rank,
+                    max_recv=recv_cap,
+                    block_num=b,
+                    warp_num_per_block=w,
+                    off_out_tok=arena.offset("comb_stg"),
+                    off_comb_inp=arena.offset("comb_inp"),
+                    off_tis=arena.offset("recv_to_src_token"),
+                    off_xdb_mem=arena.offset("cross_device_barrier"),
+                    off_out_wts=arena.offset("out_wts"),
+                    off_comb_wts=arena.offset("comb_wts"),
+                    off_comb_scales=(
+                        arena.offset("comb_scales") if cfg.fp8_blockwise else 0
+                    ),
+                    fp8_direct_cast=cfg.fp8_direct_cast,
+                    fp8_blockwise=cfg.fp8_blockwise,
+                    scale_dim=cfg.combine_scale_dim,
+                    reset_total_recv=False,
+                )
+                for (b, w) in combine_specs
+            }
+        else:
+            self._combine_variants = {
+                (b, w): make_combine(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    hidden_dim=hidden_dim,
+                    hidden_elem_size=cfg.combine_elem_size,
+                    max_tok_per_rank=max_tok_per_rank,
+                    max_recv=recv_cap,
+                    block_num=b,
+                    warp_num_per_block=w,
+                    off_out_tok=arena.offset("comb_stg"),
+                    off_xdb_mem=arena.offset("cross_device_barrier"),
+                    off_out_wts=arena.offset("out_wts"),
+                    reset_total_recv=True,
+                    fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                )
+                for (b, w) in combine_specs
+            }
+
+        self._local_expert_count_buf = torch.zeros(
+            cfg.num_experts_per_rank, dtype=torch.int32, device=device
+        )
+        self._local_expert_count = make_local_expert_count(
+            rank=cfg.rank,
+            experts_per_rank=cfg.num_experts_per_rank,
+            experts_per_token=topk,
+            block_num=cfg.dispatch_block_num,
+            warp_num_per_block=cfg.dispatch_warp_num_per_block,
+        )
+
+        if cfg.enable_std_moe:
+            assert elem_size == 2, "StdMoE convert path is bf16-only"
+            experts_per_rank = cfg.num_experts_per_rank
+            max_tok_per_expert = cfg.world_size * max_tok_per_rank
+            self._max_tok_per_expert = max_tok_per_expert
+            self.packed_x = torch.zeros(
+                experts_per_rank * max_tok_per_expert * hidden_dim,
+                dtype=torch.int16,
+                device=device,
+            )
+            self.packed_count = torch.zeros(
+                experts_per_rank, dtype=torch.int32, device=device
+            )
+            self.packed_src = torch.zeros(
+                experts_per_rank * max_tok_per_expert, dtype=torch.int32, device=device
+            )
+            self.slot_map = torch.full(
+                (recv_cap * topk,), -1, dtype=torch.int64, device=device
+            )
+            self._convert_dispatch = make_convert_dispatch_output(
+                rank=cfg.rank,
+                experts_per_rank=experts_per_rank,
+                experts_per_token=topk,
+                hidden_dim=hidden_dim,
+                hidden_elem_size=elem_size,
+                max_tok_per_expert=max_tok_per_expert,
+                block_num=cfg.dispatch_block_num,
+                warp_num_per_block=cfg.dispatch_warp_num_per_block,
+            )
+            self._convert_combine = make_convert_combine_input(
+                rank=cfg.rank,
+                experts_per_rank=experts_per_rank,
+                experts_per_token=topk,
+                hidden_dim=hidden_dim,
+                hidden_elem_size=elem_size,
+                max_tok_per_expert=max_tok_per_expert,
+                block_num=cfg.combine_block_num,
+                warp_num_per_block=cfg.combine_warp_num_per_block,
+            )
+        self._closed = False
+
+    def close(self):
+        """Free this op's symmetric arena window. Call (or use as a context
+        manager) when the op is discarded but its Communicator lives on —
+        otherwise the arena stays in comm._resources until the comm is destroyed."""
+        if self._closed:
+            return
+        self._closed = True
+        self.arena.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def recv_tokens(self):
+        """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        Separate from comb_stg, so combine's copy-in never overwrites it — the
+        expert can read this in place without a defensive .clone().
+        fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
+        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        return from_gpu_ptr(
+            self.arena.local_ptr("disp_out"),
+            (self._recv_cap, cols),
+            self.cfg.dispatch_dtype,
+        )
+
+    def combine_in_view(self):
+        """comb_stg as combine dtype [max_recv, hidden] — combine()'s copy target."""
+        cdt = self.cfg.combine_dtype
+        cols = (
+            self.cfg.hidden_dim // 2
+            if cdt == torch.float4_e2m1fn_x2
+            else self.cfg.hidden_dim
+        )
+        return from_gpu_ptr(
+            self.arena.local_ptr("comb_stg"), (self._recv_cap, cols), cdt
+        )
+
+    def convert_dispatch_output(self):
+        """mori ConvertDispatchOutput: repack recv tokens into per-local-expert
+        buckets. Returns (packed_x, packed_count, packed_src); GEMM overwrites
+        packed_x in place."""
+        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
+        self.packed_count.zero_()
+        self.slot_map.fill_(-1)
+        arena = self.arena
+        stream = fx.Stream(torch.cuda.current_stream())
+        self._convert_dispatch(
+            arena.local_ptr("disp_out"),
+            arena.local_ptr("out_idx"),
+            arena.local_ptr("recv_to_src_token"),
+            self.total_recv.data_ptr(),
+            self.packed_x.data_ptr(),
+            self.packed_count.data_ptr(),
+            self.packed_src.data_ptr(),
+            self.slot_map.data_ptr(),
+            stream,
+        )
+        experts_per_rank = self.cfg.num_experts_per_rank
+        max_tok_per_expert = self._max_tok_per_expert
+        hidden_dim = self.cfg.hidden_dim
+        packed_x_view = from_gpu_ptr(
+            self.packed_x.data_ptr(),
+            (experts_per_rank, max_tok_per_expert, hidden_dim),
+            self.cfg.dispatch_dtype,
+        )
+        return packed_x_view, self.packed_count, self.packed_src
+
+    def convert_combine_input(self, routing):
+        """mori ConvertCombineInput: weighted-reduce each recv token's local-expert
+        outputs from packed_x back into comb_stg. Run after GEMM, before combine."""
+        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
+        arena = self.arena
+        stream = fx.Stream(torch.cuda.current_stream())
+        self._convert_combine(
+            arena.local_ptr("comb_stg"),
+            arena.local_ptr("out_wts"),
+            routing.total_recv_token_num.data_ptr(),
+            self.packed_x.data_ptr(),
+            self.slot_map.data_ptr(),
+            stream,
+        )
+
+    def recv_weights(self):
+        """Arena out_wts as [max_recv, topk] f32 (forwarded per-token weights)."""
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_wts"),
+            (self._recv_cap, self.cfg.num_experts_per_token),
+            torch.float32,
+        )
+
+    def recv_indices(self):
+        """Arena out_idx as [max_recv, topk] i32 (forwarded expert indices)."""
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_idx"),
+            (self._recv_cap, self.cfg.num_experts_per_token),
+            torch.int32,
+        )
+
+    def recv_scales(self):
+        """Forwarded per-token scales as opaque i32 dwords [max_recv, scale_num_i32],
+        or None if built without scales."""
+        if not self._enable_scales:
+            return None
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_scales"),
+            (self._recv_cap, self._scale_num_i32),
+            torch.int32,
+        )
+
+    def _pick(self, num_tokens):
+        """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
+        count via the per-token schedule; falls back to the single-shot specs
+        otherwise. Returned specs are clamped to the precompiled variants."""
+        schedule = self.cfg.schedule
+        disp_spec = comb_spec = None
+        if schedule:
+            for bucket in schedule:
+                max_tok = bucket[0]
+                if max_tok is None or num_tokens <= max_tok:
+                    disp_spec, comb_spec = (bucket[1], bucket[2]), (
+                        bucket[3],
+                        bucket[4],
+                    )
+                    break
+            if disp_spec is None:
+                last = schedule[-1]
+                disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
+        else:
+            disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
+        if disp_spec not in self._dispatch_variants:
+            disp_spec = self._dispatch_specs[-1]
+        if comb_spec not in self._combine_variants:
+            comb_spec = self._combine_specs[-1]
+        return disp_spec, comb_spec
+
+    def dispatch(
+        self, input, weights, scales, indices, *, routing=None, return_routing=False
+    ):
+        """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
+        scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
+
+        routing=: replay a prior handle (reuse cached dest-slot layout, skip
+        atomic routing). return_routing=: also return the handle. Mutually
+        exclusive. Returns (out, out_weights, out_scales, out_indices,
+        total_recv[, routing]); out == arena disp_out (safe to read without
+        .clone() — combine stages into a separate comb_stg buffer).
+        """
+        if routing is not None and return_routing:
+            raise ValueError(
+                "pass either routing= (replay) or return_routing=True, not both"
+            )
+        num_input_tokens = input.shape[0]
+        disp_spec, _ = self._pick(num_input_tokens)
+        if routing is None and self._push_group and not self._pg_initialized:
+            # One-time only: seed pg_running=0 before the very first push-group
+            # landing. Subsequent layers are zeroed race-free inside finalize
+            # (read-then-zero). Doing it per-dispatch would race with peers' P2P
+            # atomic_add into this counter.
+            self.reset_push_group()
+            self._pg_initialized = True
+        # total_recv is self-reset inside the dispatch kernel (warp 0, Phase 2).
+        scale_ptr = (
+            scales.data_ptr() if (scales is not None and self._enable_scales) else 0
+        )
+        stream = fx.Stream(torch.cuda.current_stream())
+        weight_ptr = weights.data_ptr() if weights is not None else 0
+        if routing is not None:
+            if self._dispatch_tdm_variants:
+                raise NotImplementedError(
+                    "replay is not ported to dispatch_transport='tdm': its slots "
+                    "come from a per-(block, peer) reservation, so a cached map is "
+                    "only replayable under the same grid AND the same block->token "
+                    "assignment"
+                )
+            kern = self._dispatch_replay_variants.get(disp_spec)
+            if kern is None:
+                kern = self._dispatch_replay_variants[disp_spec] = make_dispatch(
+                    replay=True,
+                    block_num=disp_spec[0],
+                    warp_num_per_block=disp_spec[1],
+                    **self._dispatch_kwargs,
+                )
+            dest_map_ptr = routing.disp_dest_tok_id_map.data_ptr()
+            kern(
+                self.arena.handle,
+                input.data_ptr(),
+                indices.data_ptr(),
+                weight_ptr,
+                dest_map_ptr,
+                self.dest_pe_counter.data_ptr(),
+                self.dispatch_barrier.data_ptr(),
+                self.total_recv.data_ptr(),
+                scale_ptr,
+                self.cfg.rank,
+                num_input_tokens,
+                stream,
+            )
+        else:
+            # return_routing hands the map to the caller, so give the kernel a
+            # fresh -1 map instead of the shared persistent one (which the handle
+            # would then have to clone to stay valid across calls).
+            dest_map = (
+                torch.full_like(self.token_dest_map, -1)
+                if return_routing
+                else self.token_dest_map
+            )
+            if self._dispatch_tdm_variants:
+                stg_idx, stg_wt, stg_src = self._tdm_stage
+                self._dispatch_tdm_variants[disp_spec](
+                    self.arena.handle,
+                    input.data_ptr(),
+                    indices.data_ptr(),
+                    weight_ptr,
+                    dest_map.data_ptr(),
+                    self.dest_pe_counter.data_ptr(),
+                    self.dispatch_barrier.data_ptr(),
+                    self.total_recv.data_ptr(),
+                    stg_idx.data_ptr(),
+                    stg_wt.data_ptr(),
+                    stg_src.data_ptr(),
+                    self.cfg.rank,
+                    num_input_tokens,
+                    stream,
+                )
+            else:
+                self._dispatch_variants[disp_spec](
+                    self.arena.handle,
+                    input.data_ptr(),
+                    indices.data_ptr(),
+                    weight_ptr,
+                    dest_map.data_ptr(),
+                    self.dest_pe_counter.data_ptr(),
+                    self.dispatch_barrier.data_ptr(),
+                    self.total_recv.data_ptr(),
+                    scale_ptr,
+                    self.cfg.rank,
+                    num_input_tokens,
+                    stream,
+                )
+
+        out = self.recv_tokens()
+        out_weights = self.recv_weights()
+        out_scales = self.recv_scales()
+        out_indices = self.recv_indices()
+        base = (out, out_weights, out_scales, out_indices, self.total_recv)
+        if not return_routing:
+            return base
+
+        recv_to_src_view = from_gpu_ptr(
+            self.arena.local_ptr("recv_to_src_token"),
+            (self._pg_recv_rows,),
+            torch.int32,
+        )
+        routing = EpDispatchRoutingHandle(
+            disp_dest_tok_id_map=dest_map,
+            inter_node_disp_dest_tok_id_map=self._empty_i32,
+            inter_node_disp_send_map=self._empty_i32,
+            total_recv_token_num=self.total_recv,
+            cur_rank_num_token=num_input_tokens,
+            reverse_src_view=recv_to_src_view,
+        )
+        return base + (routing,)
+
+    def combine(self, input, weights=None, indices=None, *, routing):
+        """mori-parity combine. input [<=max_recv,hidden] post-expert tokens
+        (copied into arena comb_stg if not already there). weights/indices are
+        accepted for API parity but unused (weights come from forwarded out_wts,
+        routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
+        """
+        if self.cfg.is_fused:
+            return self._combine_fused(routing)
+        comb_stg_ptr = self.arena.local_ptr("comb_stg")
+        if self.cfg.is_scatter:
+            # Scatter Stage 1 only LOCAL-reads its source, so read the post-expert
+            # tokens (GEMM output) directly and skip the copy into symmetric
+            # comb_stg. StdMoE already staged comb_stg, so use that.
+            src_tok_ptr = comb_stg_ptr if self.cfg.enable_std_moe else input.data_ptr()
+        else:
+            # Gather peers REMOTE-read comb_stg, so the post-expert tokens must be
+            # copied into symmetric memory first. StdMoE already staged comb_stg.
+            if not self.cfg.enable_std_moe and input.data_ptr() != comb_stg_ptr:
+                # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
+                dst = self.combine_in_view().view(-1)[: input.numel()]
+                dst.copy_(input.reshape(-1))
+        stream = fx.Stream(torch.cuda.current_stream())
+        _, comb_spec = self._pick(routing.cur_rank_num_token)
+        if self.cfg.is_scatter:
+            self._combine_variants[comb_spec](
+                self.arena.handle,
+                routing.disp_dest_tok_id_map.data_ptr(),
+                self.combine_barrier.data_ptr(),
+                self.cross_device_flag.data_ptr(),
+                routing.total_recv_token_num.data_ptr(),
+                self.combine_out.data_ptr(),
+                self.combine_out_weights.data_ptr(),
+                src_tok_ptr,
+                self.cfg.rank,
+                routing.cur_rank_num_token,
+                stream,
+            )
+        else:
+            self._combine_variants[comb_spec](
+                self.arena.handle,
+                routing.disp_dest_tok_id_map.data_ptr(),
+                self.combine_barrier.data_ptr(),
+                self.cross_device_flag.data_ptr(),
+                routing.total_recv_token_num.data_ptr(),
+                self.combine_out.data_ptr(),
+                self.combine_out_weights.data_ptr(),
+                self.cfg.rank,
+                routing.cur_rank_num_token,
+                stream,
+            )
+        count = routing.cur_rank_num_token
+        hidden_dim = self.cfg.hidden_dim
+        topk = self.cfg.num_experts_per_token
+        cdt = self.cfg.combine_dtype
+        cols = (
+            hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
+        )  # fp4 out is hidden/2 float4 elems
+        out = self.combine_out[: count * cols].view(cdt).view(count, cols)
+        return out, self.combine_out_weights[: count * topk].view(count, topk)
+
+    # ---- gemm2-fused scatter (combine_mode="scatter_fused") ---- #
+    def zero_fused_staging(self):
+        """Zero the per-(token,k) comb_inp before the gemm2 P2P writes of a layer.
+        Needed because gemm2 writes only the (token,k) slots whose expert survived
+        dispatch/capacity; dropped slots must read 0 in the combine topk sum."""
+        assert self.cfg.is_fused, "zero_fused_staging is scatter_fused-only"
+        self.arena.zero("comb_inp")
+
+    def ep_scatter_params(self):
+        """Handles the moe gemm2 epilogue needs to P2P-write its weighted per-(token,k)
+        results straight into peers' comb_inp (combine_mode='scatter_fused')."""
+        assert self.cfg.is_fused, "ep_scatter_params is scatter_fused-only"
+        return dict(
+            ep_arena_handle=self.arena.handle,
+            ep_comb_inp_off=self.arena.offset("comb_inp"),
+            ep_tis_off=self.arena.offset("recv_to_src_token"),
+            ep_wire_nbytes=self.cfg.comb_inp_slot_nbytes,
+            ep_rank=self.cfg.rank,
+            ep_max_tok=self.cfg.max_num_inp_token_per_rank,
+            ep_topk=self.cfg.num_experts_per_token,
+        )
+
+    def _combine_fused(self, routing):
+        """gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp; just
+        barrier (wait for peers' writes) + sum the topk slots per origin token."""
+        stream = fx.Stream(torch.cuda.current_stream())
+        count = routing.cur_rank_num_token
+        # Token-adaptive geometry: few blocks (barrier-bound) at low token counts,
+        # more blocks (sum/BW-bound) at high token counts. Falls back to _pick when
+        # a single spec is compiled (e.g. SCATTER_COMB_BW pinned).
+        _tiers = getattr(self, "_fused_comb_tiers", None)
+        if _tiers is not None:
+            comb_spec = _tiers[-1][1]
+            for _ub, _spec in _tiers:
+                if _ub is not None and count <= _ub:
+                    comb_spec = _spec
+                    break
+        else:
+            _, comb_spec = self._pick(count)
+        # The kernel overwrites every element of each active token's hidden row.
+        # Unlike comb_inp, there are no dropped slots that require a zero sentinel.
+        self._combine_variants[comb_spec](
+            self.arena.handle,
+            self.arena.local_ptr("comb_inp"),
+            self.combine_barrier.data_ptr(),
+            self.cross_device_flag.data_ptr(),
+            self.combine_out.data_ptr(),
+            self.cfg.rank,
+            count,
+            stream,
+        )
+        hidden_dim = self.cfg.hidden_dim
+        topk = self.cfg.num_experts_per_token
+        cdt = self.cfg.combine_dtype
+        cols = hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
+        out = self.combine_out[: count * cols].view(cdt).view(count, cols)
+        return out, self.combine_out_weights[: count * topk].view(count, topk)
+
+    def local_expert_count(self):
+        """[num_experts_per_rank] i32: recv tokens per local expert. Call after
+        dispatch, before combine (gather resets total_recv)."""
+        self._local_expert_count_buf.zero_()
+        stream = fx.Stream(torch.cuda.current_stream())
+        self._local_expert_count(
+            self.arena.local_ptr("out_idx"),
+            self.total_recv.data_ptr(),
+            self._local_expert_count_buf.data_ptr(),
+            stream,
+        )
+        return self._local_expert_count_buf
+
+    def reset(self):
+        """Zero arena staging + per-rank counters/barriers (mori LaunchReset).
+        Kernels self-reset counters already; this forces a clean slate."""
+        self.arena.zero()
+        self.token_dest_map.fill_(-1)
+        self.dest_pe_counter.zero_()
+        self.dispatch_barrier.zero_()
+        self.total_recv.zero_()
+        self.combine_barrier.zero_()
+        self.cross_device_flag.fill_(1)
+
+    def reset_push_group(self):
+        """One-time init of the per-expert landing cursors (pg_running == 0) before
+        the FIRST push-group dispatch. NOT called per-layer: the finalize kernel
+        read-then-zeros pg_running each layer (race-free, between dispatch's end
+        barrier and the next layer's landing). A per-layer memset here would race
+        with peers' P2P atomic_add into the same counter -> lost increments ->
+        dropped rows -> intermittent wrong results.
+
+        pg_rowmap / recv_to_src_token need NO reset: with the finalize tile_valid
+        bound, the gemm2 scatter only reads a tile's valid rows (< mn_oob), which
+        dispatch overwrites every layer; padding rows are never read."""
+        if not self._push_group:
+            return
+        self.arena.zero("pg_running")
+
+    def push_group_ptrs(self):
+        """Fixed-slot layout descriptor for the GEMM1 contiguous A-load: local
+        pointers + per-expert CAP so the consumer indexes disp_out as
+        [num_local_experts, CAP] without a gather."""
+        if not self._push_group:
+            return None
+        return {
+            "cap": self._push_group_cap,
+            "num_local_experts": self.cfg.num_experts_per_rank,
+            "recv_rows": self._pg_recv_rows,
+            "disp_out_ptr": self.arena.local_ptr("disp_out"),
+            "pg_running_ptr": self.arena.local_ptr("pg_running"),
+            "pg_rowmap_ptr": self.arena.local_ptr("pg_rowmap"),
+            "recv_to_src_token_ptr": self.arena.local_ptr("recv_to_src_token"),
+            "out_idx_ptr": self.arena.local_ptr("out_idx"),
+            "out_wts_ptr": self.arena.local_ptr("out_wts"),
+        }
+
+    def push_group_overlap_ptrs(self):
+        """Arena offsets + local pointers the fused stage-1 mega kernel needs.
+
+        Offsets (not local pointers) for anything a peer writes: the producer
+        reaches a destination's copy via ``cco.Window(handle).lsa_ptr(pe, off)``.
+        """
+        if not self.cfg.push_group_overlap:
+            return None
+        cfg = self.cfg
+        arena = self.arena
+        return {
+            "rank": cfg.rank,
+            "world_size": cfg.world_size,
+            "experts_per_rank": cfg.num_experts_per_rank,
+            "experts_per_token": cfg.num_experts_per_token,
+            "max_tok_per_rank": cfg.max_num_inp_token_per_rank,
+            "arena_handle": arena.handle,
+            "off_count": arena.offset("pg_ov_count"),
+            "off_count_done": arena.offset("pg_ov_count_done"),
+            "off_tile_arrived": arena.offset("pg_ov_tile_arrived"),
+            "off_disp_out": arena.offset("disp_out"),
+            "off_out_scales": arena.offset("out_scales"),
+            "off_pg_rowmap": arena.offset("pg_rowmap"),
+            "off_tis": arena.offset("recv_to_src_token"),
+            "tile_expected_ptr": arena.local_ptr("pg_ov_tile_expected"),
+            "count_ptr": arena.local_ptr("pg_ov_count"),
+            "count_done_ptr": arena.local_ptr("pg_ov_count_done"),
+            "tile_arrived_ptr": arena.local_ptr("pg_ov_tile_arrived"),
+            "entry_ptr": arena.local_ptr("pg_ov_entry"),
+            "bar_ptr": arena.local_ptr("pg_ov_bar"),
+            "plan_ready_ptr": arena.local_ptr("pg_ov_plan_ready"),
+            "my_base_ptr": arena.local_ptr("pg_ov_my_base"),
+            "hist_ptr": arena.local_ptr("pg_ov_hist"),
+            "route_slot_ptr": arena.local_ptr("pg_ov_route_slot"),
+            "route_order_ptr": arena.local_ptr("pg_ov_route_order"),
+            "cap": self._push_group_cap,
+            "tile_m": cfg.push_group_overlap_tile_m,
+            "tiles_per_expert": cfg.push_group_overlap_tiles_per_expert,
+        }
+
+    def overlap_routing(self, num_tokens):
+        """Combine handle for the fused stage-1, which makes no dispatch call.
+
+        scatter_fused combine reads comb_inp and only needs the origin token
+        count; the forward dest-slot map exists solely for the gather/scatter
+        combines, which the fused stage-1 does not feed. Seeds the overlap
+        counters on first use, the same one-time deal as reset_push_group.
+        """
+        if not self.cfg.push_group_overlap:
+            raise ValueError("overlap_routing requires push_group_overlap")
+        if not self._pg_ov_initialized:
+            self.reset_push_group_overlap()
+            self._pg_ov_initialized = True
+        return EpDispatchRoutingHandle(
+            disp_dest_tok_id_map=self._empty_i32,
+            inter_node_disp_dest_tok_id_map=self._empty_i32,
+            inter_node_disp_send_map=self._empty_i32,
+            total_recv_token_num=self.total_recv,
+            cur_rank_num_token=num_tokens,
+        )
+
+    def push_group_overlap_debug(self):
+        """Torch views of the overlap protocol state, for diagnosing a stage-1 run.
+
+        Reading these tells you how far the handshake got: a zero ``plan_ready``
+        means the planner never finished, an all-zero ``count`` row means a peer
+        never published, and a ``tile_expected`` that disagrees with ``hist``
+        means the prefix sum is wrong.
+        """
+        if not self.cfg.push_group_overlap:
+            return None
+        cfg = self.cfg
+        e_total = cfg.world_size * cfg.num_experts_per_rank
+        tiles = cfg.num_experts_per_rank * cfg.push_group_overlap_tiles_per_expert
+
+        def _v(name, shape):
+            return from_gpu_ptr(self.arena.local_ptr(name), shape, torch.int32)
+
+        return dict(
+            entry=_v("pg_ov_entry", (1,)),
+            bar=_v("pg_ov_bar", (PG_OV_BAR_SLOTS,)),
+            plan_ready=_v("pg_ov_plan_ready", (1,)),
+            count_done=_v("pg_ov_count_done", (cfg.world_size,)),
+            count=_v("pg_ov_count", (2, cfg.world_size, e_total)),
+            hist=_v("pg_ov_hist", (e_total,)),
+            my_base=_v("pg_ov_my_base", (e_total,)),
+            tile_expected=_v("pg_ov_tile_expected", (tiles,)),
+            tile_arrived=_v("pg_ov_tile_arrived", (tiles,)),
+        )
+
+    def reset_push_group_overlap(self):
+        """One-time seeding of the overlap counters before the FIRST stage-1
+        launch. Like reset_push_group this is NOT per-layer: ``pg_ov_count_done``
+        and ``pg_ov_entry``/``pg_ov_bar`` are monotonic by construction, and
+        ``pg_ov_tile_arrived`` is zeroed inside the kernel at a point no peer can
+        be writing. A per-layer host memset here would race peers' P2P atomics."""
+        if not self.cfg.push_group_overlap:
+            return
+        for name in (
+            "pg_ov_count",
+            "pg_ov_count_done",
+            "pg_ov_tile_arrived",
+            "pg_ov_tile_expected",
+            "pg_ov_entry",
+            "pg_ov_bar",
+            "pg_ov_plan_ready",
+            "pg_ov_my_base",
+            "pg_ov_hist",
+            "pg_ov_route_slot",
+            "pg_ov_route_order",
+        ):
+            self.arena.zero(name)
+
+    def push_group_moe_inputs(self):
+        """Torch views of the fixed-slot recv grid + the dispatch-emitted combine
+        map, for the push-group MoE (grouped_a8w4_tdm_moe_push_scatter). ``disp_out``
+        is [num_local_experts*CAP, hidden] grouped bf16, ``pg_running`` the per-expert
+        landed counts, ``pg_rowmap`` the (rrows+1,2) {dst_packed, weight} map.
+
+        When the sender pre-quantized (``push_group_scale_wmma_rep > 0``), ``disp_out``
+        is the fp8 payload and ``disp_scale`` is the matching WMMA-preshuffled e8m0
+        scale, both already in the layout GEMM1 reads -- the caller runs no quant
+        pass at all."""
+        if not self._push_group:
+            return None
+        rrows = self._pg_recv_rows
+        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        wmma_rep = self.cfg.push_group_scale_wmma_rep
+        disp_scale = None
+        if wmma_rep > 0:
+            cap = self._push_group_cap
+            disp_scale = from_gpu_ptr(
+                self.arena.local_ptr("out_scales"),
+                (
+                    self.cfg.num_experts_per_rank,
+                    cap // wmma_rep,
+                    (self.cfg.hidden_dim // 32) * wmma_rep,
+                ),
+                torch.uint8,
+            )
+        return dict(
+            disp_out=from_gpu_ptr(
+                self.arena.local_ptr("disp_out"),
+                (rrows, cols),
+                self.cfg.dispatch_dtype,
+            ),
+            disp_scale=disp_scale,
+            pg_running=from_gpu_ptr(
+                self.arena.local_ptr("pg_running"),
+                (self.cfg.num_experts_per_rank,),
+                torch.int32,
+            ),
+            pg_rowmap=from_gpu_ptr(
+                self.arena.local_ptr("pg_rowmap"),
+                (rrows + 1, 2),
+                torch.int32,
+            ),
+            cap=self._push_group_cap,
+            num_local_experts=self.cfg.num_experts_per_rank,
+            slot_stride=self.cfg.max_num_inp_token_per_rank
+            * self.cfg.num_experts_per_token,
+        )
