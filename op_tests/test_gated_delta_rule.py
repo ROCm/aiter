@@ -1924,6 +1924,64 @@ def test_chunk_opt_vk_hip_downgrade_preserves_indexed_state_args(monkeypatch):
     assert captured["inplace_final_state"] is True
 
 
+def test_chunk_opt_vk_flydsl_downgrade_preserves_indexed_state_args(monkeypatch):
+    chunk_module = importlib.import_module(
+        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+    )
+    initial_state = torch.empty(4, 1, 1, 1)
+    initial_state_indices = torch.tensor([3], dtype=torch.int32)
+    captured = {}
+
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_chunk_local_cumsum_scaled_dot_kkt_fwd",
+        lambda **kwargs: (torch.empty(1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_solve_tril_recompute_w_u",
+        lambda **kwargs: (torch.empty(1, 1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+
+    def fake_triton_k5(**kwargs):
+        captured.update(kwargs)
+        return (
+            torch.empty(1, 1, 1, 1, 1),
+            torch.empty(1, 1, 1, 1),
+            initial_state,
+        )
+
+    monkeypatch.setattr(
+        chunk_module, "chunk_gated_delta_rule_fwd_h_opt_vk", fake_triton_k5
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "chunk_fwd_o_opt_vk",
+        lambda **kwargs: kwargs["o"],
+    )
+
+    chunk_module.chunk_gated_delta_rule_fwd_opt_vk(
+        q=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
+        k=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
+        v=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
+        g=torch.empty(1, 1, 1),
+        beta=torch.empty(1, 1, 1),
+        scale=1.0,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, 1, 2]),
+        use_chunk_flydsl=True,
+        o=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
+        num_decodes=1,
+        num_decode_tokens=1,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=True,
+    )
+
+    assert captured["initial_state_indices"] is initial_state_indices
+    assert captured["inplace_final_state"] is True
+
+
 def test_chunk_opt_vk_unsupported_gfx12_downgrades_to_triton(monkeypatch):
     chunk_module = importlib.import_module(
         "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"

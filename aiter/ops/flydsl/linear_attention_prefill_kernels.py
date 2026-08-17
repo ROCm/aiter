@@ -1077,11 +1077,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             "FlyDSL K5 mfma16_hip: k/w/u must be on the same device; got "
             f"k={k.device}, w={w.device}, u={u.device}."
         )
-    if not (k.is_contiguous() and w.is_contiguous() and u.is_contiguous()):
-        raise ValueError(
-            "FlyDSL K5 mfma16_hip: k/w/u must be contiguous; got strides "
-            f"k={k.stride()}, w={w.stride()}, u={u.stride()}."
-        )
+    k = k.contiguous()
+    w = w.contiguous()
+    u = u.contiguous()
     if k.shape[1] != T_flat:
         raise ValueError(
             f"FlyDSL K5 mfma16_hip: k T dim ({k.shape[1]}) must equal w/u T ({T_flat})."

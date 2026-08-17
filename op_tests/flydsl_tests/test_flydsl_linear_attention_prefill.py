@@ -1747,7 +1747,6 @@ class TestCorrectness:
         [
             ("rank", "must be 4-D"),
             ("dtype", "dtype must match"),
-            ("contiguous", "must be contiguous"),
             ("time_shape", "k T dim"),
             ("unsupported_v", "only V=128 is supported"),
             ("gk_dtype", "gk must be float32"),
@@ -1765,8 +1764,6 @@ class TestCorrectness:
             k = k.squeeze(0)
         elif case == "dtype":
             w = w.float()
-        elif case == "contiguous":
-            k = k.transpose(1, 2)
         elif case == "time_shape":
             w = w[:, :, :-1].contiguous()
             u = u[:, :, :-1].contiguous()
@@ -1806,6 +1803,32 @@ class TestCorrectness:
         assert torch.count_nonzero(h) == 0
         assert torch.count_nonzero(v_new) == 0
         assert torch.count_nonzero(final_state) == 0
+
+    def test_mfma16_accepts_noncontiguous_kwu(self):
+        """Non-contiguous k/w/u are silently copied, matching the HIP wrapper."""
+        k, w, u = self._minimal_inputs()
+        k_nc = torch.cat([k, torch.zeros(1, 64, 2, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
+            ..., :128
+        ]
+        w_nc = torch.cat([w, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
+            ..., :128
+        ]
+        u_nc = torch.cat([u, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
+            ..., :128
+        ]
+        assert k_nc.shape == k.shape and w_nc.shape == w.shape and u_nc.shape == u.shape
+        assert not k_nc.is_contiguous()
+        assert not w_nc.is_contiguous()
+        assert not u_nc.is_contiguous()
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k_nc,
+            w_nc,
+            u_nc,
+            output_final_state=True,
+        )
+        assert h.shape[-2:] == (128, 128)
+        assert v_new.shape[-1] == 128
+        assert final_state.shape[-2:] == (128, 128)
 
     def test_reference_empty_tail_passthrough(self):
         """The FP32 reference must pass ``initial_state`` straight through to
