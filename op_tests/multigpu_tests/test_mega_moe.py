@@ -885,6 +885,7 @@ def main():
             print(tbl, flush=True)
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
+    accuracy_failure = None
     if args.acc_verify:
         out_dev = pipe.final_output().float()
         ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
@@ -899,9 +900,16 @@ def main():
                 f"tol={args.logits_tol})",
                 flush=True,
             )
+        if errs != 0:
+            accuracy_failure = (
+                f"MegaMoE accuracy check failed on {errs}/{dist_ctx.world} ranks: "
+                f"average logits_diff={avg_diff:.6f}, tolerance={args.logits_tol}"
+            )
 
     pipe.teardown()
     dist_ctx.shutdown()
+    if accuracy_failure is not None:
+        raise AssertionError(accuracy_failure)
 
 
 def _parse_args():

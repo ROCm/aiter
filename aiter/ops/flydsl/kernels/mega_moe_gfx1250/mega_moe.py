@@ -19,13 +19,15 @@ from .combine import (
     _make_combine_fused_reduce,
     _make_combine_fused_sync,
 )
-from .config import _FUSED_COMBINE_TIERS, _select_dispatch_config
+from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
 _DISPATCH_BACKENDS = ("flydsl", "mori")
+_MAX_WORLD_SIZE = 72
+_MAX_EXPERTS_PER_RANK = 512
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. mori binds
 # all eight when a plan is built, though its dispatch dereferences only the first
@@ -132,10 +134,19 @@ class MegaMoEStage2Config:
             )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
-        if self.world_size > 64:
+        if self.world_size > _MAX_WORLD_SIZE:
             raise ValueError(
-                f"intranode dispatch requires world_size <= 64, "
+                f"rack-scale dispatch requires world_size <= {_MAX_WORLD_SIZE}, "
                 f"got {self.world_size}"
+            )
+        if not 0 < self.topk <= _WAVE_SIZE:
+            raise ValueError(
+                f"dispatch requires topk in [1, {_WAVE_SIZE}], got {self.topk}"
+            )
+        if not 0 < self.experts_per_rank <= _MAX_EXPERTS_PER_RANK:
+            raise ValueError(
+                f"fused EP psum requires experts_per_rank in "
+                f"[1, {_MAX_EXPERTS_PER_RANK}], got {self.experts_per_rank}"
             )
         if self.hidden_dim * 2 % 16:
             raise ValueError(
@@ -215,6 +226,18 @@ class MegaMoEGfx1250:
         gfx = get_gfx()
         if gfx != "gfx1250":
             raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                grouped_gemm_gfx1250_a8w4,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel"
+            ) from exc
+        if not callable(grouped_gemm_gfx1250_a8w4):
+            raise TypeError(
+                "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel"
+            )
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")
         if experts <= 0:
@@ -241,6 +264,25 @@ class MegaMoEGfx1250:
         if hidden_pad < 0 or intermediate_pad < 0:
             raise ValueError(
                 f"padding must be non-negative, got {hidden_pad}, {intermediate_pad}"
+            )
+        activation = ActivationType(activation)
+        gate_mode = GateMode(gate_mode)
+        quant_type = QuantType(quant_type)
+        if gate_mode != GateMode.INTERLEAVE:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires gate_mode=INTERLEAVE"
+            )
+        if quant_type != QuantType.per_1x32:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires quant_type=per_1x32"
+            )
+        if activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            raise ValueError(
+                f"MegaMoE fused stage2 scatter does not support activation={activation}"
             )
 
         self.model_dim = int(model_dim)
@@ -313,6 +355,44 @@ class MegaMoEGfx1250:
             raise ValueError("topk_weights must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+            raise RuntimeError(
+                "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel; "
+                "AITER_DISABLE_GROUPED_A8W4=1 is not supported"
+            )
+        if w1_scale is None or w2_scale is None:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires both w1_scale and w2_scale"
+            )
+        supported_weight_dtypes = (torch.uint8, dtypes.fp4x2)
+        if (
+            w1.dtype not in supported_weight_dtypes
+            or w2.dtype not in supported_weight_dtypes
+        ):
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires MXFP4 w1/w2 weights "
+                f"(uint8 or fp4x2), got {w1.dtype} and {w2.dtype}"
+            )
+        expected_w1_shape = (
+            self.experts_per_rank,
+            2 * self.inter_dim,
+            self.model_dim // 2,
+        )
+        expected_w2_shape = (
+            self.experts_per_rank,
+            self.model_dim,
+            self.inter_dim // 2,
+        )
+        if tuple(w1.shape) != expected_w1_shape:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires interleaved G1U1 w1 with "
+                f"shape {expected_w1_shape}, got {tuple(w1.shape)}"
+            )
+        if tuple(w2.shape) != expected_w2_shape:
+            raise ValueError(
+                f"MegaMoE fused stage2 scatter requires w2 shape "
+                f"{expected_w2_shape}, got {tuple(w2.shape)}"
+            )
         token_count = int(hidden_states.shape[0])
         if token_count > self.max_tokens_per_rank:
             raise ValueError(
@@ -330,13 +410,6 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
-        for name, weight in (("w1", w1), ("w2", w2)):
-            if weight.shape[0] != self.experts_per_rank:
-                raise ValueError(
-                    f"{name} has {weight.shape[0]} local experts, "
-                    f"expected {self.experts_per_rank}"
-                )
-
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
@@ -475,32 +548,9 @@ class MegaMoEGfx1250:
                 for spec in dispatch_specs
             }
 
-        # Fused combine splits the cross-device barrier into its own 1-block
-        # kernel so the reduce grid is unconstrained. On by default;
-        # SCATTER_COMB_SPLIT=0 restores the single-kernel variant.
-        #
-        # The two paths are mutually EXCLUSIVE within a run, not a per-call
-        # choice: the sync kernel keeps its phase in xdb_flag[0] only, while the
-        # single-kernel variant keeps one counter per block, so mixing them would
-        # let a block read a stale counter and clear its barrier without waiting.
-        self._fused_split = os.environ.get("SCATTER_COMB_SPLIT", "1") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
-        combine_override = os.environ.get("SCATTER_COMB_BW")
-        if combine_override:
-            combine_specs = [tuple(int(value) for value in combine_override.split(","))]
-            self._combine_tiers = None
-        elif self._fused_split:
-            # Barrier split out into its own kernel -> reduce grid is free; 512x16
-            # measured best-or-tied at every token count. One geometry, one variant.
-            combine_specs = [(512, 16)]
-            self._combine_tiers = None
-        else:
-            self._combine_tiers = _FUSED_COMBINE_TIERS
-            combine_specs = sorted({geometry for _, geometry in self._combine_tiers})
+        # Keep the cross-device barrier in its own 1-block kernel so the reduce
+        # grid is unconstrained. 512x16 measured best-or-tied at every token count.
+        combine_specs = [(512, 16)]
         self._combine_specs = combine_specs
         self._combine_variants = {
             spec: _make_combine_fused_reduce(
@@ -513,16 +563,15 @@ class MegaMoEGfx1250:
                 off_comb_inp=self._arena.offset("comb_inp"),
                 off_xdb_mem=self._arena.offset("cross_device_barrier"),
                 slot_stride_nbytes=config.combine_slot_stride_bytes,
-                include_sync=not self._fused_split,
+                include_sync=False,
             )
             for spec in combine_specs
         }
-        if self._fused_split:
-            self._combine_sync = _make_combine_fused_sync(
-                rank=config.rank,
-                npes=config.world_size,
-                off_xdb_mem=self._arena.offset("cross_device_barrier"),
-            )
+        self._combine_sync = _make_combine_fused_sync(
+            rank=config.rank,
+            npes=config.world_size,
+            off_xdb_mem=self._arena.offset("cross_device_barrier"),
+        )
 
     def _build_mori_dispatch(self, config: MegaMoEStage2Config) -> dict:
         """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
@@ -622,14 +671,6 @@ class MegaMoEGfx1250:
                 )
         return self._dispatch_specs[-1]
 
-    def _select_combine(self, token_count: int) -> tuple[int, int]:
-        if self._combine_tiers is None:
-            return self._combine_specs[0]
-        for upper_bound, spec in self._combine_tiers:
-            if upper_bound is None or token_count <= upper_bound:
-                return spec
-        return self._combine_specs[-1]
-
     def _recv_tokens(self) -> torch.Tensor:
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
@@ -701,18 +742,17 @@ class MegaMoEGfx1250:
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:
-        spec = self._select_combine(routing.token_count)
+        spec = self._combine_specs[0]
         stream = fx.Stream(torch.cuda.current_stream())
-        if self._fused_split:
-            # 1-block cross-device barrier, then the barrier-free reduce on the
-            # same stream (the kernel boundary is what gives the reduce its
-            # visibility, so no in-kernel fence is needed).
-            self._combine_sync(
-                self._arena.handle,
-                self._cross_device_flag.data_ptr(),
-                self._config.rank,
-                stream,
-            )
+        # 1-block cross-device barrier, then the barrier-free reduce on the same
+        # stream. The kernel boundary gives the reduce its visibility, so no
+        # in-kernel fence is needed.
+        self._combine_sync(
+            self._arena.handle,
+            self._cross_device_flag.data_ptr(),
+            self._config.rank,
+            stream,
+        )
         self._combine_variants[spec](
             self._arena.handle,
             self._arena.local_ptr("comb_inp"),

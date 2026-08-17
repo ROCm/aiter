@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import rocdl as _rocdl_d
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
+from flydsl.expr.typing import T
 
 __all__ = [
     "GeometryTuningTable",
@@ -32,9 +35,17 @@ __all__ = [
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "load_i32_acquire",
+    "load_i32_nt",
+    "load_i64_acquire",
     "load_i64_global",
+    "load_v4i32_nt",
+    "spin_until_eq_i32",
+    "spin_until_ge_i64",
+    "spin_until_gt_i32",
     "store_i32_system",
     "store_i64_global_system",
+    "waitcnt_all",
 ]
 
 
@@ -43,6 +54,95 @@ def _to_ptr_global(v):
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
     ).result
+
+
+def _ptr_plus(base_i64, offset, elem_bytes):
+    """Global pointer for base + offset*elem_bytes."""
+    addr = (
+        fx.Int64(arith.unwrap(base_i64)) + fx.Int64(arith.unwrap(offset)) * elem_bytes
+    )
+    return _to_ptr_global(addr)
+
+
+def _unwrap(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def waitcnt_all():
+    """Drain outstanding gfx12 load/store counters before a grid barrier."""
+    _rocdl_d.s_wait_storecnt(0)
+    _rocdl_d.s_wait_loadcnt(0)
+
+
+def load_i32_acquire(addr_i64):
+    """Volatile monotonic i32 load suitable for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
+
+
+def load_i64_acquire(addr_i64):
+    """Volatile monotonic i64 load suitable for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i64,
+        _to_ptr_global(addr_i64),
+        alignment=8,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
+
+
+def load_i32_nt(base_i64, offset):
+    """Non-temporal global i32 load at base + offset*4."""
+    return _llvm_d.LoadOp(
+        T.i32, _ptr_plus(base_i64, offset, 4), alignment=4, nontemporal=True
+    ).res
+
+
+def load_v4i32_nt(base_i64, offset):
+    """Non-temporal global vector<4xi32> load at base + offset*4."""
+    return _llvm_d.LoadOp(
+        T.i32x4, _ptr_plus(base_i64, offset, 4), alignment=4, nontemporal=True
+    ).res
+
+
+def _spin(addr_i64, keep_waiting, *, width=32):
+    """Spin on a volatile load until ``keep_waiting`` becomes false."""
+    if width == 64:
+        ty, load, wrap = T.i64, load_i64_acquire, fx.Int64
+    else:
+        ty, load, wrap = T.i32, load_i32_acquire, fx.Int32
+    loop = scf.WhileOp([ty], [_unwrap(load(addr_i64))])
+    cond = ir.Block.create_at_start(loop.before, [ty])
+    body = ir.Block.create_at_start(loop.after, [ty])
+    with ir.InsertionPoint(cond):
+        scf.ConditionOp(
+            _unwrap(keep_waiting(wrap(cond.arguments[0]))), [cond.arguments[0]]
+        )
+    with ir.InsertionPoint(body):
+        scf.YieldOp([_unwrap(load(addr_i64))])
+    return wrap(loop.results[0])
+
+
+def spin_until_ge_i64(addr_i64, val):
+    """Spin until a monotonic cross-device i64 flag is at least ``val``."""
+    return _spin(addr_i64, lambda cur: cur < fx.Int64(val), width=64)
+
+
+def spin_until_eq_i32(addr_i64, val):
+    """Spin until an i32 flag equals ``val``."""
+    return _spin(addr_i64, lambda cur: cur != fx.Int32(val))
+
+
+def spin_until_gt_i32(addr_i64, val):
+    """Spin until an i32 flag exceeds ``val`` and return the observed value."""
+    return _spin(addr_i64, lambda cur: cur <= fx.Int32(val))
 
 
 def store_i32_system(addr_i64, offset, val):

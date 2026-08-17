@@ -21,8 +21,6 @@
 # SOFTWARE.
 """Barrier-wait and top-k reduce kernel for gfx1250 Stage2-fused MegaMoE."""
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -37,7 +35,6 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from . import primitives as P
 from .config import (
     _LANE_MASK as LANE_MASK,
 )
@@ -97,15 +94,16 @@ def _make_combine_fused_sync(
 ):
     """Cross-device barrier kernel for the split fused-combine path.
 
-    A single 1-block, 1-wave kernel that does ONLY Stage A: wait until every
-    peer's gemm2 P2P writes into our comb_inp are globally visible. Launch this
-    first on the stream, then the ``include_sync=False`` reduce kernel (grid
-    fully free). Kernel retirement (stream-ordered) is the completion signal the
-    reduce waits on -- no in-kernel fence needed.
+    A single-block kernel that does ONLY Stage A: wait until every peer's gemm2
+    P2P writes into our comb_inp are globally visible. Launch this first on the
+    stream, then the ``include_sync=False`` reduce kernel (grid fully free).
+    Kernel retirement (stream-ordered) is the completion signal the reduce waits
+    on -- no in-kernel fence needed.
 
-    One wave suffices: only lanes [0, npes) do any work (push the phase to each
-    peer, then poll the npes local slots), there is no cross-warp dependency and
-    hence no fx.barrier(). The kernel's cost is the peer wait, not thread count.
+    One thread per peer pushes the phase and polls that peer's local slot. The
+    block is rounded up to whole waves, so rack-scale domains larger than one
+    wave are covered without introducing a cross-wave dependency or barrier.
+    The kernel's cost is the peer wait, not thread count.
 
     Because there is exactly one block, the per-block flag bookkeeping collapses
     to a single monotonic counter in xdb_flag[0]; the remaining _XDB_FLAG_SLOTS
@@ -114,7 +112,9 @@ def _make_combine_fused_sync(
     a stale counter from its own slot and clear its barrier without waiting.
     """
 
-    @flyc.kernel(known_block_size=[WAVE, 1, 1])
+    sync_block_size = ((npes + WAVE - 1) // WAVE) * WAVE
+
+    @flyc.kernel(known_block_size=[sync_block_size, 1, 1])
     def ep_combine_fused_sync(
         arena: Int64,
         addr_xdb_flag: Int64,
@@ -139,7 +139,7 @@ def _make_combine_fused_sync(
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
             ) + fx.Int64(tid) * fx.Int64(8)
-            P.spin_until_ge_i64(xdb_peer_slot, phase)
+            comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
 
     @flyc.jit
     def run(
@@ -150,7 +150,7 @@ def _make_combine_fused_sync(
     ):
         ep_combine_fused_sync(arena, addr_xdb_flag, my_lsa_rank).launch(
             grid=(1, 1, 1),
-            block=[WAVE, 1, 1],
+            block=[sync_block_size, 1, 1],
             stream=stream,
         )
 
@@ -269,7 +269,7 @@ def _make_combine_fused_reduce(
                 xdb_peer_slot = fx.Int64(
                     window.lsa_ptr(my_lsa_rank, off_xdb_mem)
                 ) + fx.Int64(tid) * fx.Int64(8)
-                P.spin_until_ge_i64(xdb_peer_slot, phase)
+                comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
             fx.barrier()
 
         # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
@@ -303,20 +303,14 @@ def _make_combine_fused_reduce(
             def _one(off, expert_addrs=expert_addrs, out_base=out_base):
                 acc = zero_acc()
                 for k_slot in range_constexpr(topk):
-                    v = P.load_i32_nt(expert_addrs[k_slot], off)
+                    v = comm_ops.load_i32_nt(expert_addrs[k_slot], off)
                     acc = acc + to_acc(v)
                 buffer_store(from_acc(acc), rsrc_out, out_base + off)
 
-            # Inner-unrolled vec4: issue _UNROLL x topk v4 loads FIRST (load-first,
-            # high MLP to hide the 6 strided comb_inp streams), then reduce + vec4
-            # store. Tail units
-            # (< STEP_V4) fall back to the scalar _one path.
-            # _UNROLL=1 keeps VGPR low so the grid can fill all CUs (occupancy),
-            # which matters far more than per-wave MLP here: the reduce is HBM-BW
-            # bound, and a big grid (block_num ~= #CUs) is what saturates HBM. A
-            # deep unroll (4) blew VGPR to ~200 and capped occupancy, throttling
-            # load issue (s_clause). Overridable via SCATTER_COMB_UNROLL for tuning.
-            _UNROLL = int(os.environ.get("SCATTER_COMB_UNROLL", "1"))
+            # One vec4 group keeps VGPR low so the grid can fill all CUs. Deeper
+            # unrolling increases VGPR pressure and reduces occupancy on this
+            # HBM-bandwidth-bound reduce.
+            _UNROLL = 1
             VEC = 4
             STEP_CHUNK = WAVE * VEC  # 128 i32 elems/round across the wave
             STEP_V4 = _UNROLL * STEP_CHUNK  # _UNROLL * 128
@@ -328,7 +322,7 @@ def _make_combine_fused_reduce(
                     _off_r = base + _r * STEP_CHUNK
                     _pre.append(
                         [
-                            P.load_v4i32_nt(expert_addrs[k_slot], _off_r)
+                            comm_ops.load_v4i32_nt(expert_addrs[k_slot], _off_r)
                             for k_slot in range_constexpr(topk)
                         ]
                     )

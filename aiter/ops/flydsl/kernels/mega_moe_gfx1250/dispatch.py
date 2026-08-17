@@ -43,7 +43,6 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from . import primitives as P
 from .config import (
     _LANE_MASK as LANE_MASK,
 )
@@ -258,7 +257,7 @@ def _make_dispatch(
         # token/count stores above are complete before the grid barrier makes
         # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
         # implicit s_waitcnt).
-        P.waitcnt_all()
+        comm_ops.waitcnt_all()
         fx.barrier()
         if tid == 0:
             comm_ops.atomic_add_system(fx.Int64(addr_disp_bar), arith.constant(1))
@@ -266,14 +265,14 @@ def _make_dispatch(
         local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
         for dest_pe in range(lane, npes, WAVE):
             if global_warp_id == 0:
-                P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                comm_ops.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
                 buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                 signal_value = (
                     buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32) + 1
                 )
                 peer_recv_num = fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
                 recv_num_remote_addr = peer_recv_num + fx.Int64(rank) * fx.Int64(4)
-                P.spin_until_eq_i32(recv_num_remote_addr, 0)
+                comm_ops.spin_until_eq_i32(recv_num_remote_addr, 0)
                 comm_ops.store_i32_system(
                     recv_num_remote_addr, arith.constant(0), signal_value
                 )
@@ -282,7 +281,7 @@ def _make_dispatch(
         for src_pe in range(lane, npes, WAVE):
             if global_warp_id == 0:
                 recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
-                signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
+                signal_value = comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                 peer_recv_count = signal_value - 1
                 comm_ops.store_i32_system(
                     recv_num_src_addr, arith.constant(0), arith.constant(0)
