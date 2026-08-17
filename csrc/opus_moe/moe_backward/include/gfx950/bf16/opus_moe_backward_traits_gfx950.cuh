@@ -835,6 +835,24 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2NFastGrid3D
     static constexpr bool COHORT_NFAST_GRID_3D = true;
 };
 
+// The blocked-G2 address within each native M32 tile is identical across the
+// unrolled operand loads.  Retain one 32-bit byte base per operand and express
+// the remaining native-tile displacement as a compile-time immediate.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredGrid3D
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2NFastGrid3D
+{
+    static constexpr bool FACTOR_BLOCKED_G2_LOAD_OFFSETS = true;
+};
+
+// The unrolled native-tile increment is uniform across a wave.  Keep the
+// lane-varying byte base in MUBUF voffset and carry each 4-KiB increment in
+// soffset instead of materializing another vector address.
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredGrid3D
+{
+    static constexpr bool FACTOR_BLOCKED_G2_LOAD_SOFFSETS = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>

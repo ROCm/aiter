@@ -313,6 +313,16 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::BLOCKED_SORTED_B_G2;
         return false;
     }();
+    constexpr bool factor_blocked_g2_load_offsets = []() constexpr {
+        if constexpr(requires { T::FACTOR_BLOCKED_G2_LOAD_OFFSETS; })
+            return T::FACTOR_BLOCKED_G2_LOAD_OFFSETS;
+        return false;
+    }();
+    constexpr bool factor_blocked_g2_load_soffsets = []() constexpr {
+        if constexpr(requires { T::FACTOR_BLOCKED_G2_LOAD_SOFFSETS; })
+            return T::FACTOR_BLOCKED_G2_LOAD_SOFFSETS;
+        return false;
+    }();
     constexpr bool native_b_m32_lds_swizzle =
         native_m32_lds_swizzle || []() constexpr {
             if constexpr(requires { T::NATIVE_B_M32_LDS_SWIZZLE; })
@@ -362,6 +372,14 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                       (sorted_b_rows && native_b_m32_lds_swizzle &&
                        !swap_route_sources && BK == 32 && VEC == 8),
                   "blocked sorted B requires native dW1 K32 loads");
+    static_assert(!factor_blocked_g2_load_offsets ||
+                      (blocked_dz_g2 && blocked_sorted_b_g2 &&
+                       native_m32_lds_swizzle &&
+                       native_b_m32_lds_swizzle),
+                  "factored K4 offsets require native blocked-G2 operands");
+    static_assert(!factor_blocked_g2_load_soffsets ||
+                      factor_blocked_g2_load_offsets,
+                  "factored K4 soffsets require a factored vector base");
     static_assert(!native_b_m32_lds_swizzle ||
                       (((BM == 256 && BN == 128) ||
                         (BM == 128 && BN == 256)) && BK == 32 &&
@@ -728,6 +746,14 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 constexpr int vectors_per_native = BK * native_m / VEC;
                 constexpr int loads = BM * BK / (T::BLOCK_SIZE * VEC);
                 static_assert(vectors_per_native == 128 && loads == 4);
+                const uint32_t factored_source_byte_base =
+                    factor_blocked_g2_load_offsets
+                        ? static_cast<uint32_t>(a_global_offset(
+                              sources.a,
+                              output_m_base + native32_load_half * native_m +
+                                  native32_load_vec * VEC)) *
+                              sizeof(D_A)
+                        : 0;
                 opus::static_for<loads>([&](auto load) {
                     constexpr int native_tile_pair =
                         load.value * T::BLOCK_SIZE / vectors_per_native;
@@ -737,16 +763,46 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                         reinterpret_cast<OPUS_LDS_ADDR D_A*>(s_a_tile.ptr) +
                         (load.value * T::BLOCK_SIZE +
                          wave_id * opus::get_warp_size()) * VEC;
-                    const int64_t source_offset = a_global_offset(
-                        sources.a,
-                        output_m_base + native_tile * native_m +
-                            native32_load_vec * VEC);
-                    g_a.template _async_load<VEC>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
-                        source_offset * sizeof(D_A),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_A>{});
+                    if constexpr(factor_blocked_g2_load_offsets)
+                    {
+                        constexpr int source_byte_delta =
+                            native_tile_pair * BK * native_m * sizeof(D_A);
+                        if constexpr(factor_blocked_g2_load_soffsets)
+                        {
+                            g_a.template _async_load<VEC>(
+                                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                    a_wave_dst),
+                                static_cast<int>(factored_source_byte_base),
+                                source_byte_delta,
+                                opus::number<0>{},
+                                opus::number<T::CACHECTL_A>{});
+                        }
+                        else
+                        {
+                            const uint32_t source_byte_offset =
+                                factored_source_byte_base + source_byte_delta;
+                            g_a.template _async_load<VEC>(
+                                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                    a_wave_dst),
+                                static_cast<int>(source_byte_offset),
+                                0,
+                                opus::number<0>{},
+                                opus::number<T::CACHECTL_A>{});
+                        }
+                    }
+                    else
+                    {
+                        const int64_t source_offset = a_global_offset(
+                            sources.a,
+                            output_m_base + native_tile * native_m +
+                                native32_load_vec * VEC);
+                        g_a.template _async_load<VEC>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(a_wave_dst),
+                            source_offset * sizeof(D_A),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_A>{});
+                    }
                 });
             }
             else if constexpr(wide_workgroup)
@@ -795,6 +851,16 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 constexpr int loads = BN * BK / (T::BLOCK_SIZE * VEC);
                 static_assert(vectors_per_native == 128 &&
                               (loads == 2 || loads == 4));
+                const uint32_t factored_source_byte_base =
+                    factor_blocked_g2_load_offsets
+                        ? static_cast<uint32_t>(blocked_g2_offset(
+                              sources.b_split,
+                              output_n_base +
+                                  native32_load_half * native_n +
+                                  native32_load_vec * VEC,
+                              kargs.stride_b_row)) *
+                              sizeof(D_B)
+                        : 0;
                 opus::static_for<loads>([&](auto load) {
                     constexpr int native_tile_pair =
                         load.value * T::BLOCK_SIZE / vectors_per_native;
@@ -807,21 +873,51 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                     const int logical_col =
                         output_n_base + native_tile * native_n +
                         native32_load_vec * VEC;
-                    const int64_t source_offset =
-                        blocked_sorted_b_g2
-                            ? blocked_g2_offset(
-                                  sources.b_split,
-                                  logical_col,
-                                  kargs.stride_b_row)
-                            : static_cast<int64_t>(sources.b_split) *
-                                      kargs.stride_b_row +
-                                  logical_col;
-                    g_b.template _async_load<VEC>(
-                        reinterpret_cast<OPUS_LDS_ADDR void*>(b_load_dst),
-                        source_offset * sizeof(D_B),
-                        0,
-                        opus::number<0>{},
-                        opus::number<T::CACHECTL_B>{});
+                    if constexpr(factor_blocked_g2_load_offsets)
+                    {
+                        constexpr int source_byte_delta =
+                            native_tile_pair * BK * native_n * sizeof(D_B);
+                        if constexpr(factor_blocked_g2_load_soffsets)
+                        {
+                            g_b.template _async_load<VEC>(
+                                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                    b_load_dst),
+                                static_cast<int>(factored_source_byte_base),
+                                source_byte_delta,
+                                opus::number<0>{},
+                                opus::number<T::CACHECTL_B>{});
+                        }
+                        else
+                        {
+                            const uint32_t source_byte_offset =
+                                factored_source_byte_base + source_byte_delta;
+                            g_b.template _async_load<VEC>(
+                                reinterpret_cast<OPUS_LDS_ADDR void*>(
+                                    b_load_dst),
+                                static_cast<int>(source_byte_offset),
+                                0,
+                                opus::number<0>{},
+                                opus::number<T::CACHECTL_B>{});
+                        }
+                    }
+                    else
+                    {
+                        const int64_t source_offset =
+                            blocked_sorted_b_g2
+                                ? blocked_g2_offset(
+                                      sources.b_split,
+                                      logical_col,
+                                      kargs.stride_b_row)
+                                : static_cast<int64_t>(sources.b_split) *
+                                          kargs.stride_b_row +
+                                      logical_col;
+                        g_b.template _async_load<VEC>(
+                            reinterpret_cast<OPUS_LDS_ADDR void*>(b_load_dst),
+                            source_offset * sizeof(D_B),
+                            0,
+                            opus::number<0>{},
+                            opus::number<T::CACHECTL_B>{});
+                    }
                 });
             }
             else if constexpr(split_b_n64)

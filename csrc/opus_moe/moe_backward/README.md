@@ -118,6 +118,9 @@ fallback when a genuinely different working-set regime needs it.
 | K4 `dw1` private blocked-dZ consumer | 20 | kid 19 with G2 blocked dZ loads and row-major sorted-X |
 | K4 `dw1` blocked-dZ/blocked-X | 21 | kid 20 with direct G2 blocked sorted-X loads |
 | K4 `dw1` blocked-G2 N-fast | 22 | kid 21 compute/layout with contiguous output-N CTA traversal; explicit only |
+| K4 `dw1` blocked-G2 N-fast grid3d | 23 | kid 22 traversal encoded as a 3D grid, removing dynamic cohort/tile division |
+| K4 `dw1` blocked-G2 factored grid3d | 24 | kid 23 with one 32-bit byte base per operand and compile-time native-tile offsets |
+| K4 `dw1` blocked-G2 scalar-offset grid3d | 25 | kid 24 with the uniform 4-KiB native-tile steps carried in MUBUF soffset |
 | K5 `dw2` small/degenerate fallback | 3 | `BM64 x BN64 x BK64`, single 8 KiB LDS |
 | K5 `dw2` medium-grid production | 10 | `BM128 x BN128 x BK64`, four waves + dual operand LDS |
 | K5 `dw2` wide-grid production | 11 | `BM256 x BN128 x BK64`, four waves + K16 reduction fragments, single direct kernel |
@@ -223,9 +226,9 @@ including regressions at I=768, E=32, and active-eight routing, keeps it an
 explicit-only comparison instance rather than an auto-dispatch choice.
 
 The flat full pipeline can additionally keep K1's dZ in a private G2
-encoding: K1 kid 17, K2 kid 20, and K4 kid 20 or 21 must be selected together.
-K4 kid 21 uses the same blocked-dZ contract but also consumes a forward-owned
-sorted-X cache written directly in G2 row-pair order.  The native
+encoding: K1 kid 17, K2 kid 20, and K4 kid 20--25 must be selected together.
+K4 kids 21--25 use the same blocked-dZ contract and also consume a
+forward-owned sorted-X cache written directly in G2 row-pair order.  The native
 `sorted_x_blocked_g2_kernel_gfx950` producer gathers `X[token]` from the
 existing forward `sorted_token_ids`, writes invalid sorter rows as exact zero,
 and never materializes a row-major intermediate.  Its grid is based on the
@@ -234,7 +237,7 @@ there is no host readback.  Python exposes both the preallocated raw binding
 and `opus_moe_gather_x_blocked_g2(..., out=...)` for graph/forward integration.
 
 The full/trusted ABI carries an explicit `x_dw1_blocked_g2` layout bit and
-requires it if and only if K4 kid 21 or 22 is selected.  K1/K2/K4 blocked-dZ
+requires it if and only if K4 kid 21--25 is selected.  K1/K2/K4 blocked-dZ
 kids are also coupled, preventing either row-major dZ or row-major sorted-X
 from being silently reinterpreted.  Standalone K4 and the two autograd
 Functions continue to exchange canonical row-major tensors.
@@ -248,6 +251,50 @@ improved by 2.66 us (9/14 wins).  Family screens found real regressions for
 short/very-long reductions and for output-N tile counts other than 16, so kid
 22 remains an explicit runtime-geometry tuning choice instead of an exact-shape
 auto special case.
+
+Kid 23 preserves kid 22's order but maps expert-in-cohort/output-N,
+output-M, and expert-cohort directly onto a 3D launch grid.  This removes the
+dynamic cohort/output-tile divisions from each compute-heavy CTA without
+changing cache locality.  Kid 24 then factors the four dZ and two sorted-X
+blocked-G2 addresses per thread into one 32-bit byte base for each operand
+plus compile-time native-tile byte offsets.  On gfx950 this lowers the kernel
+from 204 to 198 VGPRs while retaining 72 KiB LDS, 256 threads, and zero
+scratch/spill.
+
+Kid 25 is the production blocked-G2 instance.  The native-tile byte increment
+is a wave-uniform multiple of 4096, so it keeps the lane-varying base in MUBUF
+`voffset` and carries the unrolled increment in `soffset`.  Relative to kid 24,
+the emitted kernel removes 32 vector additions and five total instructions;
+it retains 198 VGPRs and increases numbered SGPRs from 52 to 54.  It does not
+change the LDS, MFMA, output, or accumulation order.
+
+Eight initial target-shape rounds comparing kid 25 with kid 24 measured median
+improvements of 6.36 us for isolated K4, 9.28 us for the direct full pipeline,
+and 8.52 us for the graph full pipeline; it won 8/8, 7/8, and 6/8 rounds,
+respectively.  Bitwise family screens covered T=16K, half-empty experts,
+single-heavy-expert routing, D=1536/E=32, I=512/K=4, T=1024/I=384, and T=65K.
+It won 40 of 42 timing rounds, with paired improvements from 0.12 us on the
+smallest family to 18.35 us on the longest reduction.  Auto dispatch therefore
+uses kid 25 as the generic blocked-G2 grid3d implementation rather than an
+exact target-shape specialization.
+
+The final 16-round production run for
+`(T,D,I,E,K)=(32768,2048,1024,64,8)` measured 6586.94 us direct and 6593.02 us
+under a CUDA graph, or 1001.54 and 1000.61 TFLOP/s.  The 1000-TFLOP/s boundary
+for this workload is 6597.07 us, so the full-run medians clear it by 10.13 and
+4.05 us, respectively.  The second-half medians were 6600.08 us direct and
+6601.06 us graph, documenting the remaining 3--4 us sensitivity to the loaded
+steady-state window.
+
+Before the scalar-offset lowering, twenty target-shape ABBA rounds comparing
+kid 24 with kid 23 measured median
+improvements of 6.92 us for isolated K4, 11.65 us for the direct full pipeline,
+and 8.54 us for the graph full pipeline; it won 20/20, 18/20, and 18/20 rounds,
+respectively.  Bitwise family screens covered T=16K, half-empty experts,
+single-heavy-expert routing, D=1536/E=32, I=512/K=4, T=1024/I=384, and T=65K.
+The paired improvements ranged from effectively neutral (0.12 us) on the
+smallest family to 21.02 us on the longest reduction, establishing that the
+address transformation was family-safe before kid 25's additional lowering.
 
 For `(T,D,I,E,K)=(32768,2048,1024,64,8)`, kid 21 reduced isolated K4 by about
 128 us.  Repeated full-pipeline ABBA measured 87--121 us on an earlier clean
