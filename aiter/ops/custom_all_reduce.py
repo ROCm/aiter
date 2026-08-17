@@ -228,6 +228,10 @@ def allocate_meta_buffer(size: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def allocate_data_buffer(size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def free_meta_buffer(ptr: int) -> None: ...
 
 
