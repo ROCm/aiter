@@ -458,3 +458,49 @@ def flydsl_mla_reduce_v1(
         int(final_output.size(0)),
         fx.Stream(stream),
     )
+
+
+# ---------------------------------------------------------------------------
+# Expose flydsl_mla_reduce_v1 to the PyTorch dispatcher
+# (torch.ops.aiter.flydsl_mla_reduce_v1).
+# ---------------------------------------------------------------------------
+import functools as _ft
+import inspect as _insp
+
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+_orig_flydsl_mla_reduce_v1 = flydsl_mla_reduce_v1
+_mlar_sig = _insp.signature(_orig_flydsl_mla_reduce_v1)
+
+
+@_ft.wraps(_orig_flydsl_mla_reduce_v1)
+def _flydsl_mla_reduce_v1_op(*args, **kwargs):
+    kwargs.pop("stream", None)
+    bound = _flydsl_mla_reduce_v1_op.__signature__.bind(*args, **kwargs)
+    bound.apply_defaults()
+    _orig_flydsl_mla_reduce_v1(**bound.arguments)  # writes final_output/final_lse
+
+
+_flydsl_mla_reduce_v1_op.__signature__ = _mlar_sig.replace(
+    parameters=[p for n, p in _mlar_sig.parameters.items() if n != "stream"]
+)
+_flydsl_mla_reduce_v1_op.__annotations__ = {
+    k: v
+    for k, v in _orig_flydsl_mla_reduce_v1.__annotations__.items()
+    if k != "stream"
+}
+
+if not hasattr(torch.ops.aiter, "flydsl_mla_reduce_v1"):
+    direct_register_custom_op(
+        "flydsl_mla_reduce_v1",
+        _flydsl_mla_reduce_v1_op,
+        mutates_args=["final_output", "final_lse"],
+        fake_impl=lambda *a_, **k_: None,
+    )
+
+
+def flydsl_mla_reduce_v1(*args, **kwargs):
+    if kwargs.get("stream") is not None:
+        return _orig_flydsl_mla_reduce_v1(*args, **kwargs)
+    kwargs.pop("stream", None)
+    return torch.ops.aiter.flydsl_mla_reduce_v1(*args, **kwargs)
