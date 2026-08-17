@@ -13,6 +13,10 @@ FlyDSL/CK ratio table.  Design (see SILOTIGER-667-plan-bench.md):
     sides' raw times (``--method weight_stream`` default, or ``total_traffic``).
   * Both sides COLD: CK via ``CK_WD_ROTATE`` disjoint-expert rotation (A1);
     FlyDSL via its cold-HBM benches.  Default-vs-default config (D3).
+  * D5 variance: clocks can't be pinned on this gfx950 (see plan D1), so each sweep
+    is repeated ``--repeats`` times; the headline us is the per-cell median, with a
+    spread%% column per side and a "noisy" flag when spread exceeds ``--noise-pct``.
+    The effective SCLK is sampled during the run and recorded in the header.
 
 Env / prerequisites:
   * Run under flydsl_venv on the isolated GPU, e.g.
@@ -20,13 +24,13 @@ Env / prerequisites:
   * CK binary path via ``CK_BENCH`` (exported by build_ck_bench.sh) or ``--ck-bench``.
 
 Examples:
-  # full cold sweep, of-record iters (D1), markdown + csv artifacts
+  # full cold sweep, of-record iters (D1) + variance (D5), markdown + csv artifacts
   HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py \
-      --iters 1000 --cold 20 --md-out tickets/667/g9_compare.md \
+      --iters 1000 --cold 20 --repeats 3 --md-out tickets/667/g9_compare.md \
       --csv-out tickets/667/g9_compare.csv
-  # quick smoke (one shape, tiny iters)
+  # quick smoke (one shape, tiny iters, single pass)
   HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py \
-      --shapes qwen3next --batches 1 --iters 30 --cold 5
+      --shapes qwen3next --batches 1 --iters 30 --cold 5 --repeats 1
 """
 
 from __future__ import annotations
@@ -35,8 +39,11 @@ import argparse
 import importlib.util
 import math
 import os
+import re
+import statistics
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]  # /workspaces/aiter
@@ -80,6 +87,89 @@ FLYDSL_CELLS = [
 
 def _key(H, I, E, K, B, op, wd, act):  # noqa: E741
     return (int(H), int(I), int(E), int(K), int(B), op, wd, act)
+
+
+# --------------------------------------------------------------------------
+# D5: run-to-run variance + effective-clock sampling
+# --------------------------------------------------------------------------
+# Clocks can't be pinned on this gfx950 (only discrete {500,2400} SCLK levels,
+# MCLK fixed 2000; see plan D1), so we control drift empirically instead: repeat
+# each sweep N times, report per-cell spread, flag noisy cells, and sample the
+# effective SCLK during the run into provenance.
+_SCLK_RE = re.compile(r"sclk clock level:\s*\S+\s*\(?(\d+)\s*Mhz", re.IGNORECASE)
+
+
+class ClockSampler:
+    """Background poller of `rocm-smi -d <gpu> --showgpuclocks` SCLK (MHz).
+
+    Best-effort: if rocm-smi is missing/unparseable it just collects nothing.
+    """
+
+    def __init__(self, gpu, period_s=0.25):
+        self.gpu = gpu
+        self.period_s = period_s
+        self.samples: list[int] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _poll_once(self):
+        try:
+            out = subprocess.run(
+                ["rocm-smi", "-d", str(self.gpu), "--showgpuclocks"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+        except Exception:
+            return
+        m = _SCLK_RE.search(out)
+        if m:
+            self.samples.append(int(m.group(1)))
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._poll_once()
+            self._stop.wait(self.period_s)
+
+    def __enter__(self):
+        if self.gpu is not None:
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def summary(self):
+        s = self.samples
+        if not s:
+            return "sclk: (not sampled)"
+        # Drop obvious-idle samples (< 400 MHz) so the summary reflects the clock
+        # while kernels run, not startup/gap idle; fall back to raw if all idle.
+        loaded = [x for x in s if x >= 400] or s
+        tag = "loaded sclk" if loaded is not s else "sclk"
+        return (
+            f"{tag} MHz min/median/max = "
+            f"{min(loaded)}/{int(statistics.median(loaded))}/{max(loaded)} "
+            f"(n={len(loaded)}/{len(s)})"
+        )
+
+
+def _agg(vals):
+    """(median_us, spread_pct) from a list of per-repeat times; NaN-safe.
+
+    spread_pct = 100*(max-min)/median -- a robust run-to-run drift indicator.
+    """
+    xs = [
+        v for v in vals if isinstance(v, (int, float)) and not math.isnan(v) and v > 0
+    ]
+    if not xs:
+        return float("nan"), float("nan")
+    med = statistics.median(xs)
+    spr = 100.0 * (max(xs) - min(xs)) / med if len(xs) > 1 and med > 0 else 0.0
+    return med, spr
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +250,30 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing):
     return records
 
 
+def run_ck_repeats(shapes, batches, iters, cold, ck_bench, repeats):
+    """Run the CK sweep `repeats` times; return ({key -> [us,...]}, provenance)."""
+    agg: dict = {}
+    prov = "(CK skipped)"
+    for r in range(repeats):
+        records, prov = run_ck(shapes, batches, iters, cold, ck_bench)
+        for k, us in records.items():
+            agg.setdefault(k, []).append(us)
+        print(f"[compare] CK repeat {r + 1}/{repeats} done", file=sys.stderr)
+    return agg, prov
+
+
+def run_flydsl_repeats(mod, shapes, batches, iters, warmup, timing, repeats):
+    """Run the FlyDSL sweep `repeats` times; return {key -> ([us,...], cos)}."""
+    agg: dict = {}
+    for r in range(repeats):
+        records = run_flydsl(mod, shapes, batches, iters, warmup, timing)
+        for k, (us, cos) in records.items():
+            lst, _ = agg.setdefault(k, ([], cos))
+            lst.append(us)
+        print(f"[compare] FlyDSL repeat {r + 1}/{repeats} done", file=sys.stderr)
+    return agg
+
+
 # --------------------------------------------------------------------------
 # Join + emit
 # --------------------------------------------------------------------------
@@ -171,8 +285,12 @@ def _fmt(x, prec=2):
     return f"{x:.{prec}f}" if _isnum(x) else "n/a"
 
 
-def build_rows(mod, fly, ck, shapes, batches, method):
-    """Produce the joined comparison rows (list of dicts)."""
+def build_rows(mod, fly, ck, shapes, batches, method, noise_pct):
+    """Produce the joined comparison rows (list of dicts).
+
+    `fly` is {key -> ([us,...], cos)} and `ck` is {key -> [us,...]} (D5 repeats);
+    the headline us is the per-cell median, with spread% and a noisy flag.
+    """
     rows = []
     for name in shapes:
         s = SHAPES[name]
@@ -180,8 +298,9 @@ def build_rows(mod, fly, ck, shapes, batches, method):
         for B in batches:
             for op, wd, act in FLYDSL_CELLS:
                 key = _key(H, I, E, K, B, op, wd, act)
-                fus, fcos = fly.get(key, (None, None))
-                cus = ck.get(key)
+                fus_list, fcos = fly.get(key, ([], None))
+                fus, fspr = _agg(fus_list)
+                cus, cspr = _agg(ck.get(key, []))
                 fm = mod.compute_metrics(
                     op,
                     B,
@@ -209,14 +328,19 @@ def build_rows(mod, fly, ck, shapes, batches, method):
                     if _isnum(fus) and _isnum(cus) and cus > 0
                     else float("nan")
                 )
-                note = ""
+                notes = []
                 if not _isnum(fus):
-                    note = "FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5)"
+                    notes.append("FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5)")
                 elif not _isnum(cus):
                     if op == "gate_up" and wd == "fp4":
-                        note = "CK n/a (gate_up FP4 -> A4)"
+                        notes.append("CK n/a (gate_up FP4 -> A4)")
                     else:
-                        note = "CK n/a"
+                        notes.append("CK n/a")
+                noisy = (_isnum(fspr) and fspr > noise_pct) or (
+                    _isnum(cspr) and cspr > noise_pct
+                )
+                if noisy:
+                    notes.append(f"noisy (>{noise_pct:.0f}% spread)")
                 rows.append(
                     dict(
                         shape=name,
@@ -230,8 +354,10 @@ def build_rows(mod, fly, ck, shapes, batches, method):
                         fly_tbs=fm["TB/s"],
                         ck_tbs=cm["TB/s"],
                         fly_peak=fm["%peak"],
+                        fly_spr=fspr,
+                        ck_spr=cspr,
                         cos=fcos,
-                        note=note,
+                        note="; ".join(notes),
                     )
                 )
     return rows
@@ -250,6 +376,8 @@ def to_markdown(rows, method, header_lines):
         ("fly_TB/s", "fly_tbs", 1),
         ("ck_TB/s", "ck_tbs", 1),
         ("fly_%peak", "fly_peak", 1),
+        ("fly_spr%", "fly_spr", 1),
+        ("ck_spr%", "ck_spr", 1),
         ("cos", "cos", 4),
         ("note", "note", None),
     ]
@@ -287,6 +415,8 @@ def to_csv(rows):
         "fly_tbs",
         "ck_tbs",
         "fly_peak",
+        "fly_spr",
+        "ck_spr",
         "cos",
         "note",
     ]
@@ -344,9 +474,24 @@ def main() -> int:
     ap.add_argument("--ck-bench", default=os.environ.get("CK_BENCH", CK_BENCH_DEFAULT))
     ap.add_argument("--no-ck", action="store_true", help="skip CK (FlyDSL-only)")
     ap.add_argument("--no-flydsl", action="store_true", help="skip FlyDSL (CK-only)")
+    ap.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="D5: repeat each sweep N times; report per-cell median + spread",
+    )
+    ap.add_argument(
+        "--noise-pct",
+        type=float,
+        default=5.0,
+        help="D5: flag a cell noisy if either side's spread%% exceeds this",
+    )
     ap.add_argument("--md-out", default=None)
     ap.add_argument("--csv-out", default=None)
     args = ap.parse_args()
+
+    if args.repeats < 1:
+        ap.error("--repeats must be >= 1")
 
     shapes = [s for s in args.shapes.split(",") if s]
     unknown = [s for s in shapes if s not in SHAPES]
@@ -354,32 +499,43 @@ def main() -> int:
         ap.error(f"unknown shapes {unknown}; choose from {list(SHAPES)}")
     batches = [int(b) for b in args.batches.split(",") if b]
 
-    ck_records, ck_prov = {}, "(CK skipped)"
-    if not args.no_ck:
-        if not Path(args.ck_bench).exists():
-            ap.error(
-                f"CK binary not found: {args.ck_bench} (build_ck_bench.sh / --ck-bench)"
-            )
-        ck_records, ck_prov = run_ck(
-            shapes, batches, args.iters, args.cold, args.ck_bench
-        )
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+        "CUDA_VISIBLE_DEVICES"
+    )
+    gpu = gpu.split(",")[0].strip() if gpu else None
 
+    ck_records, ck_prov = {}, "(CK skipped)"
     mod = load_flydsl_module()
     fly_records = {}
-    if not args.no_flydsl:
-        fly_records = run_flydsl(
-            mod, shapes, batches, args.iters, args.warmup, args.timing
-        )
+    with ClockSampler(gpu) as clk:
+        if not args.no_ck:
+            if not Path(args.ck_bench).exists():
+                ap.error(
+                    f"CK binary not found: {args.ck_bench} (build_ck_bench.sh / --ck-bench)"
+                )
+            ck_records, ck_prov = run_ck_repeats(
+                shapes, batches, args.iters, args.cold, args.ck_bench, args.repeats
+            )
+        if not args.no_flydsl:
+            fly_records = run_flydsl_repeats(
+                mod, shapes, batches, args.iters, args.warmup, args.timing, args.repeats
+            )
+    clk_summary = clk.summary()
 
-    rows = build_rows(mod, fly_records, ck_records, shapes, batches, args.method)
+    rows = build_rows(
+        mod, fly_records, ck_records, shapes, batches, args.method, args.noise_pct
+    )
 
     header_lines = [
         "SILOTIGER-667 G9 FlyDSL-vs-CK cold warp-decode comparison",
         f"gfx={mod.get_gfx()}  aiter={_git_commit(REPO)}  "
         f"ck_worktree={_git_commit(Path(args.ck_bench).parent)}",
-        f"iters={args.iters} cold={args.cold} timing={args.timing} method={args.method}",
+        f"iters={args.iters} cold={args.cold} timing={args.timing} method={args.method} "
+        f"repeats={args.repeats}",
         f"CK provenance: {ck_prov}",
-        "config policy: default-vs-default (D3); GPU clocks should be locked (D1); "
+        f"clocks: auto (unpinnable on this gfx950; D1) -- effective {clk_summary} on GPU "
+        f"{gpu}; per-cell spread%% + noisy flag (>{args.noise_pct:.0f}%) capture drift (D5).",
+        "config policy: default-vs-default (D3); "
         "treat under-converged fast cells as noisy (D1).",
     ]
     md = to_markdown(rows, args.method, header_lines)
