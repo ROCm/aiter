@@ -16,19 +16,19 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from aiter.ops.flydsl.kernels import buffer_ops
-from flydsl.expr.typing import Int32, T
-from flydsl.expr.arith import ArithValue, CmpIPredicate, CmpFPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    STensor,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    STensor,
     ptr_rsrc,
 )
 
@@ -426,8 +426,8 @@ def build_moe_contiguous_psum_remap_ep_module():
         route_max_m: Int32,
         tile_m: Int32,
         num_valid_routes: fx.Pointer,
-        gather_w: fx.Pointer,   # (numel,) bf16, 0 for dropped/remote
-        tis: fx.Pointer,        # (recv_cap,) i32 recv_slot -> origin enc
+        gather_w: fx.Pointer,  # (numel,) bf16, 0 for dropped/remote
+        tis: fx.Pointer,  # (recv_cap,) i32 recv_slot -> origin enc
         ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) i32 flat out
         cap_rows: Int32,
         topk: Int32,
@@ -460,7 +460,6 @@ def build_moe_contiguous_psum_remap_ep_module():
         tis_rsrc = ptr_rsrc(tis)
         ep_rsrc = ptr_rsrc(ep_rowmap)
 
-        neg1 = arith.constant(-1, type=i32)
         zero = arith.constant(0, type=i32)
         one = arith.constant(1, type=i32)
         two = arith.constant(2, type=i32)
@@ -623,7 +622,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk: fx.Int32,
         max_tok: fx.Int32,
         slot_stride: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -848,9 +847,9 @@ def build_moe_ep_rowmap_module():
     )
     def ep_rowmap_kernel(
         topids_to_rows: fx.Pointer,  # (numel,) i32 final rows
-        gather_w: fx.Pointer,        # (numel,) bf16 weights (0 for dropped)
-        tis: fx.Pointer,             # (recv_cap,) i32 recv_slot -> origin enc
-        ep_rowmap: fx.Pointer,       # (cap_rows+1, 2) i32 flat out
+        gather_w: fx.Pointer,  # (numel,) bf16 weights (0 for dropped)
+        tis: fx.Pointer,  # (recv_cap,) i32 recv_slot -> origin enc
+        ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) i32 flat out
         num_valid_routes: fx.Pointer,  # (1,) i32
         cap_rows: Int32,
         topk: Int32,
@@ -879,9 +878,7 @@ def build_moe_ep_rowmap_module():
             row_i32 = arith.index_cast(i32, init_loop.induction_variable)
             base = ArithValue(row_i32) * ArithValue(two)
             buffer_ops.buffer_store(neg1, ep_rsrc, _raw(base))
-            buffer_ops.buffer_store(
-                zero, ep_rsrc, _raw(base + ArithValue(one))
-            )
+            buffer_ops.buffer_store(zero, ep_rsrc, _raw(base + ArithValue(one)))
             scf.YieldOp([])
 
         gpu.barrier()
@@ -899,7 +896,9 @@ def build_moe_ep_rowmap_module():
         scat_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
         with ir.InsertionPoint(scat_loop.body):
             route = ArithValue(arith.index_cast(i32, scat_loop.induction_variable))
-            w_bf = buffer_ops.buffer_load(w_rsrc, _raw(route), vec_width=1, dtype=T.bf16)
+            w_bf = buffer_ops.buffer_load(
+                w_rsrc, _raw(route), vec_width=1, dtype=T.bf16
+            )
             w_f32 = ArithValue(w_bf).extf(T.f32)
             is_kept = arith.cmpf(
                 CmpFPredicate.ONE, _raw(w_f32), arith.constant(0.0, type=T.f32)
@@ -907,7 +906,9 @@ def build_moe_ep_rowmap_module():
             kept_if = scf.IfOp(is_kept)
             with ir.InsertionPoint(kept_if.then_block):
                 row = ArithValue(
-                    buffer_ops.buffer_load(rows_rsrc, _raw(route), vec_width=1, dtype=i32)
+                    buffer_ops.buffer_load(
+                        rows_rsrc, _raw(route), vec_width=1, dtype=i32
+                    )
                 )
                 t = ArithValue(arith.divui(_raw(route), _raw(topk_v)))
                 k = route - t * topk_v
@@ -937,7 +938,7 @@ def build_moe_ep_rowmap_module():
         topk: fx.Int32,
         max_tok: fx.Int32,
         slot_stride: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ep_rowmap_kernel(
             topids_to_rows,

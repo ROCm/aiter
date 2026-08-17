@@ -492,15 +492,15 @@ def _grouped_a8w4_tdm_moe(
     if enable_ep_scatter:
         _cap_rows = int(contiguous_m)
         ep_rowmap = torch.empty((_cap_rows + 1, 2), dtype=torch.int32, device=device)
-        ep_scatter_params = dict(
-            gather_w=_gather_w_buf,
-            tis=stage2_scatter.source_token_map,
-            ep_rowmap=ep_rowmap,
-            cap_rows=_cap_rows,
-            topk=int(topk),
-            max_tok=int(stage2_scatter.max_tokens_per_rank),
-            slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
-        )
+        ep_scatter_params = {
+            "gather_w": _gather_w_buf,
+            "tis": stage2_scatter.source_token_map,
+            "ep_rowmap": ep_rowmap,
+            "cap_rows": _cap_rows,
+            "topk": int(topk),
+            "max_tok": int(stage2_scatter.max_tokens_per_rank),
+            "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
+        }
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
@@ -514,11 +514,13 @@ def _grouped_a8w4_tdm_moe(
     # gemm2 kwargs that turn the felix TDM GEMM2 epilogue into the fused P2P
     # scatter-combine (see flydsl_grouped_gemm_a8w4_masked / launch_gemm_a8w4_tdm).
     _ep_gemm2_kwargs = (
-        dict(
-            stage2_scatter=stage2_scatter,
-            ep_destination_stride=(int(stage2_scatter.max_tokens_per_rank) * int(topk)),
-            ep_row_map=ep_rowmap,
-        )
+        {
+            "stage2_scatter": stage2_scatter,
+            "ep_destination_stride": (
+                int(stage2_scatter.max_tokens_per_rank) * int(topk)
+            ),
+            "ep_row_map": ep_rowmap,
+        }
         if enable_ep_scatter
         else {}
     )
