@@ -1294,6 +1294,10 @@ _COLD_BATCHES = [1, 2, 4, 8, 32]
 # B1: FP8 cold legs stream a Block2D<128,128> weight scale to mirror CK's
 # `Block2D<128,128>` layout (same scale-byte traffic + per-block scale work).
 _FP8_SCALE_BLOCK = (128, 128)
+# Correctness gate validates only the first few tokens' outputs (per-token work is
+# uniform); bounds the reference's dequant footprint under distinct-per-token
+# routing, where full-B at large B would touch (and fp32-dequant) the whole pool.
+_COS_CHK_TOKENS = 4
 COLD_DOWN_SHAPES = [
     (B, INTER, HIDDEN, E, TOPK)
     for (_name, HIDDEN, INTER, E, TOPK) in _COLD_MODELS
@@ -1323,9 +1327,9 @@ def compute_metrics(
     of (op, dims, dtype, method).  Two named methods:
 
       "weight_stream" (DEFAULT) -- FlyDSL's weight-bandwidth-bound decode metric:
-        only the weight bytes a launch streams for its TOPK experts (+ e8m0 scale
-        bytes for FP4) and the core MAC FLOPs.  Reproduces the cold benches'
-        recorded wbytes/TB-s exactly.
+        the weight bytes a launch streams for its B*TOPK experts (distinct experts
+        per token, so weight bytes scale with B; + e8m0 scale bytes for FP4) and the
+        core MAC FLOPs.  Reproduces the cold benches' recorded wbytes/TB-s exactly.
 
       "total_traffic" -- mirrors CK commit 62e30c9098: every operand touched per
         launch (activation + both weights + intermediate + router + output) for
@@ -1394,17 +1398,23 @@ def compute_metrics(
     }
 
 
-def _router_group_list(B, E, TOPK, device, n_route):
-    """`n_route` router-id sets, each selecting a *disjoint* contiguous block of
-    TOPK experts (group g -> experts [g*TOPK, (g+1)*TOPK)), wrapping mod E.  All
-    B tokens in a set share the group so the union of reads across the list
-    sweeps the whole pool (n_route*TOPK experts)."""
+def _router_group_list(B, E, TOPK, device):
+    """Cold-HBM router-id sets with **distinct experts per token**, byte-for-byte
+    matching the CK harness (`rids[i] = i % E` over `bk = B*TOPK` per launch).
+
+    Each launch reads `B*TOPK` distinct experts, so weight HBM traffic scales with
+    B -- exactly what CK reads and what `compute_metrics(weight_stream)` counts
+    (fixes the earlier shared-expert asymmetry where FlyDSL read only TOPK experts
+    while CK read B*TOPK).  `rotate = ceil(E / (B*TOPK))` disjoint groups tile the
+    E-expert pool and consecutive launches march through it, so every timed launch
+    reads its weights cold from HBM.  When `B*TOPK >= E` one launch already sweeps
+    the whole pool and `rotate` collapses to 1 (still cold: pool >> cache)."""
+    bk = B * TOPK
+    rotate = max(1, (E + bk - 1) // bk)
     rid_list = []
-    for g in range(n_route):
-        base = (g * TOPK) % E
-        experts = [(base + j) % E for j in range(TOPK)]
-        rid = torch.tensor(experts, dtype=torch.int32, device=device)
-        rid_list.append(rid.view(1, TOPK).expand(B, TOPK).contiguous())
+    for g in range(rotate):
+        flat = (g * bk + torch.arange(bk, device=device)) % E
+        rid_list.append(flat.to(torch.int32).view(B, TOPK).contiguous())
     return rid_list
 
 
@@ -1423,7 +1433,7 @@ def _dequant_down_expert_fp4(w_down_e, w_scale_e, lut):
     return lut[codes] * blk.repeat_interleave(_MXFP4_BK, dim=1)
 
 
-def _gen_down_fp4_pool(B, INTER, HIDDEN, E, TOPK, n_route):
+def _gen_down_fp4_pool(B, INTER, HIDDEN, E, TOPK):
     """Full E-expert MXFP4 down pool (packed uint8 weights + E8M0 scales) built
     directly in packed form (no per-element int32/fp32 pool), plus a rotating
     router-id list.  Returns (inter, w_down, w_scale, rid_list, rwt)."""
@@ -1444,7 +1454,7 @@ def _gen_down_fp4_pool(B, INTER, HIDDEN, E, TOPK, n_route):
     )
     rwt = torch.rand((B, TOPK), generator=gen, device=device).float()
     rwt = rwt / rwt.sum(dim=1, keepdim=True)
-    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    rid_list = _router_group_list(B, E, TOPK, device)
     return inter, w_down, w_scale, rid_list, rwt
 
 
@@ -1464,9 +1474,7 @@ def _ref_down_fp4_pool(inter, w_down, w_scale, rid, rwt, HIDDEN):
     return y.to(torch.bfloat16)
 
 
-def _gen_down_fp8_pool(
-    B, INTER, HIDDEN, E, TOPK, n_route, scale_block=_FP8_SCALE_BLOCK
-):
+def _gen_down_fp8_pool(B, INTER, HIDDEN, E, TOPK, scale_block=_FP8_SCALE_BLOCK):
     """Full E-expert FP8 (e4m3) down pool + Block2D weight scale + rotating router
     list, matching :func:`_gen_down_fp4_pool` (same inter/rwt RNG stream).
 
@@ -1487,7 +1495,7 @@ def _gen_down_fp8_pool(
     )
     rwt = torch.rand((B, TOPK), generator=gen, device=device).float()
     rwt = rwt / rwt.sum(dim=1, keepdim=True)
-    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    rid_list = _router_group_list(B, E, TOPK, device)
     return inter, w_down, w_scale, rid_list, rwt
 
 
@@ -1535,12 +1543,12 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     """Cold-HBM A/B: FP4 vs FP8 `down` at real E, router rotated over the pool.
 
     Returns one merged row (FP4 + FP8 side by side).  Metrics come from
-    ``compute_metrics(method="weight_stream")``, which counts only the weights a
-    single launch reads (TOPK experts' rows) -- the effective cold read per launch
-    -- so TB/s reflects real HBM bandwidth, not the whole pool.
+    ``compute_metrics(method="weight_stream")``, which counts the weights a single
+    launch reads -- B*TOPK experts' rows (distinct experts per token, matching CK)
+    -- so TB/s reflects real HBM bandwidth and scales with B.
     """
     device = torch.device("cuda")
-    n_route = max(1, E // TOPK)
+    nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * HIDDEN * INTER
     # K3 i32 addressing limits (see scope): FP4 byte offset = w_row*INTER/2, FP8 =
     # w_row*INTER; the FP8 leg is skipped above 2^31 (needs the Tier-2 i64 base).
@@ -1551,16 +1559,18 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
 
     # ---- FP4 ----
     inter, w_down, w_scale, rid_list, rwt = _gen_down_fp4_pool(
-        B, INTER, HIDDEN, E, TOPK, n_route
+        B, INTER, HIDDEN, E, TOPK
     )
     out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
-    ref4 = _ref_down_fp4_pool(inter, w_down, w_scale, rid_list[0], rwt, HIDDEN)
     entry4 = lambda rid, inter=inter, w_down=w_down, w_scale=w_scale, out=out: flydsl_warp_decode_down_reduce_fp4(  # noqa: E731
         inter, w_down, rid, rwt, w_scale, scale_block=(1, _MXFP4_BK), out=out
     )
     got4 = entry4(rid_list[0])
     torch.cuda.synchronize()
-    cos4 = _cosine(ref4, got4)
+    ref4 = _ref_down_fp4_pool(
+        inter[:nchk], w_down, w_scale, rid_list[0][:nchk], rwt[:nchk], HIDDEN
+    )
+    cos4 = _cosine(ref4, got4[:nchk])
     assert cos4 >= 0.99, f"down fp4 cold: correctness regression (cos={cos4:.4f})"
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
     m4 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp4", us4)
@@ -1571,10 +1581,9 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*H*I < 2^31) ----
     if run_fp8:
         inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
-            B, INTER, HIDDEN, E, TOPK, n_route
+            B, INTER, HIDDEN, E, TOPK
         )
         out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
-        ref8 = _ref_down_fp8_pool(inter8, w_down8, w_scale8, rid_list8[0], rwt8, HIDDEN)
         entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
             inter8,
             w_down8,
@@ -1587,7 +1596,10 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
-        cos8 = _cosine(ref8, got8)
+        ref8 = _ref_down_fp8_pool(
+            inter8[:nchk], w_down8, w_scale8, rid_list8[0][:nchk], rwt8[:nchk], HIDDEN
+        )
+        cos8 = _cosine(ref8, got8[:nchk])
         assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
         _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
         tbs8 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp8", us8)["TB/s"]
@@ -1648,7 +1660,7 @@ def _dequant_expert_fp4_rows(w_e, s_e, lut):
     return lut[codes] * blk.repeat_interleave(_MXFP4_BK, dim=1)
 
 
-def _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK, n_route):
+def _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK):
     """Full E-expert MXFP4 gate_up pool (packed gate+up uint8 + E8M0 scales) +
     rotating router list.  Returns (x, wg, wgs, wu, wus, rid_list)."""
     device = torch.device("cuda")
@@ -1680,7 +1692,7 @@ def _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK, n_route):
     x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
         torch.bfloat16
     )
-    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    rid_list = _router_group_list(B, E, TOPK, device)
     return x, wg, wgs, wu, wus, rid_list
 
 
@@ -1706,9 +1718,7 @@ def _ref_gate_up_fp4_pool(x, wg, wgs, wu, wus, rid, INTER, HIDDEN):
     return out.to(torch.bfloat16)
 
 
-def _gen_gate_up_fp8_pool(
-    B, HIDDEN, INTER, E, TOPK, n_route, scale_block=_FP8_SCALE_BLOCK
-):
+def _gen_gate_up_fp8_pool(B, HIDDEN, INTER, E, TOPK, scale_block=_FP8_SCALE_BLOCK):
     """Full E-expert FP8 gate_up pool + Block2D<128,128> weight scales + rotating
     router list.  B1: mirrors CK's ``Block2D<128,128>`` scale layout."""
     device = torch.device("cuda")
@@ -1737,7 +1747,7 @@ def _gen_gate_up_fp8_pool(
     x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
         torch.bfloat16
     )
-    rid_list = _router_group_list(B, E, TOPK, device, n_route)
+    rid_list = _router_group_list(B, E, TOPK, device)
     return x, wg, wgs, wu, wus, rid_list
 
 
@@ -1769,11 +1779,11 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
 
     Metrics come from ``compute_metrics(method="weight_stream")``, which counts the
-    two weight streams (gate + up) a single launch reads for its TOPK experts, so
-    TB/s reflects real HBM bandwidth.
+    two weight streams (gate + up) a single launch reads for its B*TOPK experts
+    (distinct per token, matching CK), so TB/s reflects real HBM bandwidth.
     """
     device = torch.device("cuda")
-    n_route = max(1, E // TOPK)
+    nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * INTER * HIDDEN
     assert (
         ehi < _COLD_FP4_LIMIT
@@ -1781,17 +1791,17 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     run_fp8 = ehi < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
-    x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp4_pool(
-        B, HIDDEN, INTER, E, TOPK, n_route
-    )
+    x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK)
     out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
-    ref4 = _ref_gate_up_fp4_pool(x, wg, wgs, wu, wus, rid_list[0], INTER, HIDDEN)
     entry4 = lambda rid, x=x, wg=wg, wgs=wgs, wu=wu, wus=wus, out=out: flydsl_warp_decode_gate_up_fp4(  # noqa: E731
         x, wg, wu, rid, wgs, wus, scale_block=(1, _MXFP4_BK), out=out
     )
     got4 = entry4(rid_list[0])
     torch.cuda.synchronize()
-    cos4 = _cosine(ref4, got4)
+    ref4 = _ref_gate_up_fp4_pool(
+        x[:nchk], wg, wgs, wu, wus, rid_list[0][:nchk], INTER, HIDDEN
+    )
+    cos4 = _cosine(ref4, got4[:nchk])
     assert cos4 >= 0.99, f"gate_up fp4 cold: correctness regression (cos={cos4:.4f})"
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
     m4 = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp4", us4)
@@ -1802,12 +1812,9 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*I*H < 2^31) ----
     if run_fp8:
         x8, wg8, wgs8, wu8, wus8, rid_list8 = _gen_gate_up_fp8_pool(
-            B, HIDDEN, INTER, E, TOPK, n_route
+            B, HIDDEN, INTER, E, TOPK
         )
         out8 = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
-        ref8 = _ref_gate_up_fp8_pool(
-            x8, wg8, wgs8, wu8, wus8, rid_list8[0], INTER, HIDDEN
-        )
         entry8 = lambda rid, x8=x8, wg8=wg8, wu8=wu8, wgs8=wgs8, wus8=wus8, out8=out8: flydsl_warp_decode_gate_up(  # noqa: E731
             x8,
             wg8,
@@ -1821,7 +1828,10 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
-        cos8 = _cosine(ref8, got8)
+        ref8 = _ref_gate_up_fp8_pool(
+            x8[:nchk], wg8, wgs8, wu8, wus8, rid_list8[0][:nchk], INTER, HIDDEN
+        )
+        cos8 = _cosine(ref8, got8[:nchk])
         assert (
             cos8 >= 0.99
         ), f"gate_up fp8 cold: correctness regression (cos={cos8:.4f})"
