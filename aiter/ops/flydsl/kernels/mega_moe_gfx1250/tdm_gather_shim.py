@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple, Union
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
@@ -35,14 +34,14 @@ from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.utils.arith import ArithValue as _ArithValue
 
-
 # --- padding encoding helper (from tdm_ops.compute_padding_encoding) ---
+
 
 def compute_padding_encoding(
     pad_interval_elems: int,
     pad_amount_elems: int,
     elem_bits: int = 16,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Compute TDM descriptor padding bitfield values.
 
     Follows Triton TDMUtility.cpp convention:
@@ -64,15 +63,16 @@ def compute_padding_encoding(
     amount_dw = pad_amount_elems * elem_bits // dword_bits
     if interval_dw <= 0 or amount_dw <= 0:
         return (0, 0)
-    assert interval_dw & (interval_dw - 1) == 0, f"padIntervalInDwords must be power-of-2, got {interval_dw}"
+    assert (
+        interval_dw & (interval_dw - 1) == 0
+    ), f"padIntervalInDwords must be power-of-2, got {interval_dw}"
     encoded_interval = int(math.log2(interval_dw)) - 1
     encoded_amount = amount_dw - 1
     return (encoded_interval, encoded_amount)
 
 
-
-
 # --- gather descriptor dataclass (from tdm_ops.TDMGatherDescriptor) ---
+
 
 @dataclass
 class TDMGatherDescriptor:
@@ -93,6 +93,7 @@ class TDMGatherDescriptor:
 
 # --- internal helper (from tdm_ops._zero_dgroup_v8i32) ---
 
+
 def _zero_dgroup_v8i32():
     """Create a zero vector<8xi32> for unused descriptor groups."""
     z = arith.constant(0, type=T.i32)
@@ -104,6 +105,7 @@ def _zero_dgroup_v8i32():
 
 
 # --- gather-mode descriptor builder + wrappers (from tdm_ops, 504-968) ---
+
 
 @dsl_loc_tracing
 def make_tensor_gather_descriptor(
@@ -121,7 +123,7 @@ def make_tensor_gather_descriptor(
     gather_tile_dim1=None,
     lds_byte_offset=None,
     global_byte_offset=None,
-    workgroup_mask: Union[int, "ir.Value"] = 0,
+    workgroup_mask: int | ir.Value = 0,
 ) -> TDMGatherDescriptor:
     """Build a TDM gather descriptor for loading arbitrary rows from global to LDS.
 
@@ -185,7 +187,9 @@ def make_tensor_gather_descriptor(
 
     if pad_interval > 0 and pad_amount > 0:
         elem_bits = elem_bytes * 8
-        enc_interval, enc_amount = compute_padding_encoding(pad_interval, pad_amount, elem_bits)
+        enc_interval, enc_amount = compute_padding_encoding(
+            pad_interval, pad_amount, elem_bits
+        )
         pad_enable = 1
     else:
         enc_interval, enc_amount = 0, 0
@@ -204,7 +208,12 @@ def make_tensor_gather_descriptor(
         )
         g1_s0 = arith.constant(g1_s0_val, type=T.i32)
     else:
-        upper = (data_size_code << 16) | (pad_enable << 20) | (enc_interval << 22) | (enc_amount << 25)
+        upper = (
+            (data_size_code << 16)
+            | (pad_enable << 20)
+            | (enc_interval << 22)
+            | (enc_amount << 25)
+        )
         g1_s0 = arith.ori(
             arith.constant(upper, type=T.i32),
             arith.andi(workgroup_mask, arith.constant(0xFFFF, type=T.i32)),
@@ -260,7 +269,10 @@ def make_tensor_gather_descriptor(
 
     dgroup1 = vector.from_elements(
         T.vec(8, T.i32),
-        [as_ir_value(v) for v in [g1_s0, g1_s1, g1_s2, g1_s3, g1_s4, g1_s5, g1_s6, g1_s7]],
+        [
+            as_ir_value(v)
+            for v in [g1_s0, g1_s1, g1_s2, g1_s3, g1_s4, g1_s5, g1_s6, g1_s7]
+        ],
     )
 
     # ================================================================
@@ -271,7 +283,9 @@ def make_tensor_gather_descriptor(
     if index_size == 32:
         # 32-bit mode: group2 has indices [0..3], group3 has [4..7]
         g2_vals = [row_indices[i] if i < num_indices else zero for i in range(4)]
-        g3_vals = [row_indices[i + 4] if (i + 4) < num_indices else zero for i in range(4)]
+        g3_vals = [
+            row_indices[i + 4] if (i + 4) < num_indices else zero for i in range(4)
+        ]
     else:
         # 16-bit mode: pack 2 x 16-bit indices per 32-bit word
         # Group 2: indices [0..7] packed into 4 x i32
@@ -282,7 +296,10 @@ def make_tensor_gather_descriptor(
             lo = row_indices[lo_idx] if lo_idx < num_indices else zero
             hi = row_indices[hi_idx] if hi_idx < num_indices else zero
             lo_masked = arith.andi(lo, arith.constant(0xFFFF, type=T.i32))
-            hi_shifted = arith.shli(arith.andi(hi, arith.constant(0xFFFF, type=T.i32)), arith.constant(16, type=T.i32))
+            hi_shifted = arith.shli(
+                arith.andi(hi, arith.constant(0xFFFF, type=T.i32)),
+                arith.constant(16, type=T.i32),
+            )
             g2_vals.append(arith.ori(lo_masked, hi_shifted))
         # Group 3: indices [8..15] packed into 4 x i32
         g3_vals = []
@@ -292,7 +309,10 @@ def make_tensor_gather_descriptor(
             lo = row_indices[lo_idx] if lo_idx < num_indices else zero
             hi = row_indices[hi_idx] if hi_idx < num_indices else zero
             lo_masked = arith.andi(lo, arith.constant(0xFFFF, type=T.i32))
-            hi_shifted = arith.shli(arith.andi(hi, arith.constant(0xFFFF, type=T.i32)), arith.constant(16, type=T.i32))
+            hi_shifted = arith.shli(
+                arith.andi(hi, arith.constant(0xFFFF, type=T.i32)),
+                arith.constant(16, type=T.i32),
+            )
             g3_vals.append(arith.ori(lo_masked, hi_shifted))
 
     dgroup2 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(v) for v in g2_vals])
@@ -342,7 +362,9 @@ def make_tensor_gather_dgroup0(
     #   * a std MLIR memref -- via memref.extract_aligned_pointer_as_index.
     if hasattr(lds_memref, "type") and isinstance(lds_memref.type, ir.IndexType):
         lds_base_idx = (
-            lds_memref if isinstance(lds_memref, _ArithValue) else _ArithValue(lds_memref)
+            lds_memref
+            if isinstance(lds_memref, _ArithValue)
+            else _ArithValue(lds_memref)
         )
     elif hasattr(lds_memref, "__extract_to_ir_values__"):
         lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
@@ -368,9 +390,17 @@ def make_tensor_gather_dgroup0(
     i32 = ir.IntegerType.get_signless(32)
     g0_s2 = _ArithValue(std_arith.TruncIOp(i32, _raw(glb_base_i64)).result)
     hi_raw = _ArithValue(_raw(glb_base_i64)).shrui(arith.constant(32, type=T.i64))
-    g0_s3 = _ArithValue(std_arith.TruncIOp(i32, _raw(hi_raw)).result) | arith.constant(1 << 31, type=T.i32)
+    g0_s3 = _ArithValue(std_arith.TruncIOp(i32, _raw(hi_raw)).result) | arith.constant(
+        1 << 31, type=T.i32
+    )
     return vector.from_elements(
-        T.vec(4, T.i32), [as_ir_value(g0_s0), as_ir_value(g0_s1), as_ir_value(g0_s2), as_ir_value(g0_s3)]
+        T.vec(4, T.i32),
+        [
+            as_ir_value(g0_s0),
+            as_ir_value(g0_s1),
+            as_ir_value(g0_s2),
+            as_ir_value(g0_s3),
+        ],
     )
 
 
@@ -480,7 +510,7 @@ def tdm_gather(
     global_byte_offset=None,
     pad_interval: int = 0,
     pad_amount: int = 0,
-    workgroup_mask: Union[int, "ir.Value"] = 0,
+    workgroup_mask: int | ir.Value = 0,
     cache_policy: int = 0,
 ) -> None:
     """Hardware TDM indexed load ``lds[...] = global[row_indices]`` in one call.
@@ -525,7 +555,7 @@ def tdm_scatter(
     global_byte_offset=None,
     pad_interval: int = 0,
     pad_amount: int = 0,
-    workgroup_mask: Union[int, "ir.Value"] = 0,
+    workgroup_mask: int | ir.Value = 0,
     cache_policy: int = 0,
 ) -> None:
     """Hardware TDM indexed store ``global[row_indices] = lds[...]`` in one call.
@@ -568,6 +598,3 @@ def tdm_scatter(
 # the loop and patching only lane 2 inside the loop, we cut the per-iteration
 # work to a single vector.insert plus the addr_lo SGPR add.
 # ---------------------------------------------------------------------------
-
-
-

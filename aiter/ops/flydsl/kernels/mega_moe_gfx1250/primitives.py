@@ -27,13 +27,13 @@ remaining volatile/non-temporal loads stay on ``flydsl._mlir.dialects.llvm``
 because the high-level FlyDSL API does not expose those controls.
 """
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
 from flydsl.expr.typing import T
-import flydsl.expr as fx
 
 
 def _gptr(addr_i64):

@@ -29,12 +29,6 @@ dropped-slot marker (dest PE == npes); "tis" = recv-slot -> source-token map.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
-from aiter.ops.flydsl.kernels.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.rocdl import (
     ballot,
@@ -42,10 +36,21 @@ from flydsl.expr.rocdl import (
 )
 from flydsl.expr.typing import Int32, Int64, T
 
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.kernels.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
+
 from . import primitives as P
 from .config import (
     _LANE_MASK as LANE_MASK,
+)
+from .config import (
     _LOG2_WAVE_SIZE as LOG2_WAVE,
+)
+from .config import (
     _WAVE_SIZE as WAVE,
 )
 
@@ -138,7 +143,7 @@ def _make_dispatch(
             is_dup = dup_ballot != 0
 
             dest_tok_lane0 = arith.constant(0)
-            if lane == 0:
+            if lane == 0:  # noqa: SIM102 - device predicates
                 if dup_ballot == 0:
                     peer_tok_off = fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
                     dest_tok_lane0 = comm_ops.atomic_add_system(
@@ -156,7 +161,7 @@ def _make_dispatch(
             if lane == 0:
                 buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
 
-            if lane == 0:
+            if lane == 0:  # noqa: SIM102 - device predicates
                 if do_publish:
                     # publish this recv slot's origin (global source token id) into
                     # the dest peer's tis, for combine routing.
@@ -173,7 +178,7 @@ def _make_dispatch(
                     comm_ops.atomic_add_system(dest_ctr_addr, fx.Int32(1))
 
             # Per-lane (weight, expert-idx) scatter (lanes < k).
-            if lane < experts_per_token:
+            if lane < experts_per_token:  # noqa: SIM102 - device predicates
                 if do_publish:
                     weight_src_off = src_tok * experts_per_token + lane
                     weight_val = buffer_load(
@@ -240,7 +245,7 @@ def _make_dispatch(
         # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
         # drains this store before the Phase-3 adds; total_recv is local, so
         # no release fence / L2 writeback is needed. CUDAGraph-safe.
-        if global_warp_id == 0:
+        if global_warp_id == 0:  # noqa: SIM102 - device predicates
             if lane == 0:
                 buffer_store(
                     arith.constant(0),
@@ -285,7 +290,7 @@ def _make_dispatch(
                 comm_ops.atomic_add_system(fx.Int64(addr_total_recv), peer_recv_count)
                 buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
 
-        if global_warp_id == 0:
+        if global_warp_id == 0:  # noqa: SIM102 - device predicates
             if lane == 0:
                 local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
                 comm_ops.store_i32_system(
@@ -304,7 +309,7 @@ def _make_dispatch(
         addr_total_recv: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
-        stream=fx.Stream(None),
+        stream=fx.Stream(None),  # noqa: B008
     ):
         ep_dispatch(
             arena,

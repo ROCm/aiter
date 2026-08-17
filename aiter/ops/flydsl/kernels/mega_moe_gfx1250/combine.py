@@ -26,6 +26,9 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
+from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.typing import Int32, Int64, T
+
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (
@@ -33,13 +36,15 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T
 
 from . import primitives as P
 from .config import (
     _LANE_MASK as LANE_MASK,
+)
+from .config import (
     _LOG2_WAVE_SIZE as LOG2_WAVE,
+)
+from .config import (
     _WAVE_SIZE as WAVE,
 )
 
@@ -122,9 +127,9 @@ def _make_combine_fused_sync(
         phase = fx.Int64(buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64))
         # push this call's phase to every peer's shared xdb slot [rank]
         if tid < npes:
-            xdb_remote = fx.Int64(
-                window.lsa_ptr(tid, off_xdb_mem)
-            ) + fx.Int64(rank) * fx.Int64(8)
+            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(
+                rank
+            ) * fx.Int64(8)
             comm_ops.store_i64_global_system(xdb_remote, phase)
         # advance the counter for the next call (single writer, no atomic)
         if tid == 0:
@@ -141,7 +146,7 @@ def _make_combine_fused_sync(
         arena: Int64,
         addr_xdb_flag: Int64,
         my_lsa_rank: Int32,
-        stream=fx.Stream(None),
+        stream=fx.Stream(None),  # noqa: B008
     ):
         ep_combine_fused_sync(arena, addr_xdb_flag, my_lsa_rank).launch(
             grid=(1, 1, 1),
@@ -243,7 +248,9 @@ def _make_combine_fused_reduce(
                 buffer_store(phase + arith.constant(1, type=T.i64), rsrc_xdb_flag, bid)
             # block 0 fills the unused tail counters [block_num, xdb_flag_slots) so a
             # later call that picks a larger block_num still reads synced counters.
-            if const_expr(_XDB_FLAG_SLOTS > block_num):
+            if const_expr(  # noqa: SIM102 - keep the device and compile-time branches separate.
+                _XDB_FLAG_SLOTS > block_num
+            ):
                 if bid == 0:
                     _tail = _XDB_FLAG_SLOTS - block_num
                     _nthr = warp_num_per_block * WAVE
@@ -293,7 +300,7 @@ def _make_combine_fused_reduce(
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)
             out_base = tok_id * n_i32
 
-            def _one(off):
+            def _one(off, expert_addrs=expert_addrs, out_base=out_base):
                 acc = zero_acc()
                 for k_slot in range_constexpr(topk):
                     v = P.load_i32_nt(expert_addrs[k_slot], off)
@@ -352,7 +359,7 @@ def _make_combine_fused_reduce(
         addr_out: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
-        stream=fx.Stream(None),
+        stream=fx.Stream(None),  # noqa: B008
     ):
         ep_combine_fused(
             arena,
