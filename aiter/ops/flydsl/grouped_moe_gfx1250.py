@@ -4,6 +4,9 @@
 
 Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
+The TDM path also supports a CU-resident scheduler selected by CSV
+``grouped_persistent_m``/``persistent_workers`` or the
+``AITER_FLYDSL_GROUPED_PERSISTENT*`` environment overrides.
 """
 
 import csv
@@ -396,6 +399,11 @@ def _grouped_a8w4_tdm_moe(
     tile_n2=None,
     tile_k2=None,
     num_buffers2=None,
+    cluster_n=-1,
+    waves_per_tensor_tdm=-1,
+    next_stage_prefetch=0,
+    grouped_persistent_m=False,
+    persistent_workers=None,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -407,7 +415,10 @@ def _grouped_a8w4_tdm_moe(
 
     import torch
 
-    from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import (
+        _grouped_persistent_enabled,
+        flydsl_grouped_gemm_a8w4_masked,
+    )
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
@@ -501,16 +512,18 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
-    _starts, psum, _ = contiguous_psum_remap(
+    _starts, _psum, _, psum = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
         E,
         max_m,
         tile_m,
         num_valid_routes=_ep_nvr,
+        map_capacity_m=contiguous_m,
+        build_tile_map=_grouped_persistent_enabled(grouped_persistent_m)
+        and ep_scatter_params is None,
         ep_scatter_params=ep_scatter_params,
     )
-    psum = psum.to(torch.int32).contiguous()
     # gemm2 kwargs that turn the felix TDM GEMM2 epilogue into the fused P2P
     # scatter-combine (see flydsl_grouped_gemm_a8w4_masked / launch_gemm_a8w4_tdm).
     _ep_gemm2_kwargs = (
@@ -543,6 +556,16 @@ def _grouped_a8w4_tdm_moe(
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
     _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    _persistent_kw = {
+        "cluster_n": cluster_n,
+        "waves_per_tensor_tdm": waves_per_tensor_tdm,
+        "next_stage_prefetch": next_stage_prefetch,
+        "grouped_persistent_m": grouped_persistent_m,
+        "persistent_workers": persistent_workers,
+    }
+    _gemm2_kw = dict(_ep_gemm2_kwargs)
+    if not enable_ep_scatter:
+        _gemm2_kw.update(_persistent_kw)
     _b1 = (
         bias1.to(dtype).contiguous()
         if (bias1 is not None and bias1.numel() > 0)
@@ -616,6 +639,7 @@ def _grouped_a8w4_tdm_moe(
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             **_situ_kw,
+            **_persistent_kw,
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
@@ -641,6 +665,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             **_situ_kw,
+            **_persistent_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
@@ -674,7 +699,7 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
-        **_ep_gemm2_kwargs,
+        **_gemm2_kw,
     )
 
     if kernel_bench_callable is not None:
@@ -707,6 +732,7 @@ def _grouped_a8w4_tdm_moe(
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         **_situ_kw,
+                        **_persistent_kw,
                     ),
                 )
             )
@@ -736,6 +762,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         **_situ_kw,
+                        **_persistent_kw,
                     ),
                 )
             )
@@ -762,6 +789,7 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    **_gemm2_kw,
                 ),
             )
         )
@@ -1002,6 +1030,19 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
+            )
+            _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["waves_per_tensor_tdm"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["next_stage_prefetch"] = _as_int(
+                cfg_row.get("next_stage_prefetch"), 0
+            )
+            _tdm_kw["grouped_persistent_m"] = _as_bool(
+                cfg_row.get("grouped_persistent_m"), False
+            )
+            _tdm_kw["persistent_workers"] = _as_int(
+                cfg_row.get("persistent_workers"), None
             )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
@@ -1275,18 +1316,36 @@ def contiguous_psum_remap(
     route_max_m: int,
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
+    map_capacity_m: int | None = None,
+    build_tile_map: bool = False,
     ep_scatter_params: dict | None = None,
 ):
-    """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
+    """Tile-aligned psum/remap plus optional direct m_tile -> expert map.
 
-    When ``ep_scatter_params`` is given (dict of gather_w/tis/ep_rowmap/cap_rows/
-    topk/max_tok/slot_stride), the same remap pass ALSO scatters the gemm2-fused
-    EP row map (folds the standalone moe_build_ep_rowmap launch in here)."""
+    When ``ep_scatter_params`` is given, the same remap pass ALSO scatters the
+    gemm2-fused EP row map. Otherwise the returned storage begins with
+    ``experts`` psum entries and may append the direct map for persistent GEMM.
+    """
     device = masked_m.device
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
-    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    if ep_scatter_params is not None:
+        psum = torch.empty(experts, dtype=torch.int32, device=device)
+        m_tile_expert = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        if map_capacity_m is None:
+            map_capacity_m = experts * int(route_max_m)
+        max_m_tiles = (
+            (int(map_capacity_m) + int(tile_m) - 1) // int(tile_m)
+            if build_tile_map
+            else 0
+        )
+        tile_map_storage = torch.empty(
+            experts + max_m_tiles, dtype=torch.int32, device=device
+        )
+        psum = tile_map_storage[:experts]
+        m_tile_expert = tile_map_storage[experts:]
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
@@ -1328,22 +1387,24 @@ def contiguous_psum_remap(
             int(ep_scatter_params["slot_stride"]),
             stream=torch.cuda.current_stream(),
         )
-        return starts, psum, contiguous_m_t
+        return starts, psum, contiguous_m_t, psum
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
         ptr_arg(topids_flat),
         ptr_arg(starts),
         ptr_arg(psum),
+        ptr_arg(m_tile_expert),
         ptr_arg(contiguous_m_t),
         int(topids_flat.numel()),
         experts,
         int(route_max_m),
         int(tile_m),
         ptr_arg(num_valid_routes_i32),
+        int(build_tile_map),
         stream=torch.cuda.current_stream(),
     )
-    return starts, psum, contiguous_m_t
+    return starts, psum, contiguous_m_t, tile_map_storage
 
 
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):

@@ -121,6 +121,93 @@ def is_gfx1250() -> bool:
         return False
 
 
+def test_grouped_persistent_csv_and_env_selection(monkeypatch):
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import _select_grouped_persistent
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.delenv("AITER_FLYDSL_GROUPED_PERSISTENT", raising=False)
+    monkeypatch.delenv("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS", raising=False)
+    assert _select_grouped_persistent(False, None, 1) == (0, 0)
+    assert _select_grouped_persistent(True, 12, 3) == (1, 12)
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    assert _select_grouped_persistent(True, None, 1) == (1, 768)
+
+    monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT", "1")
+    monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS", "10")
+    assert _select_grouped_persistent(False, None, 4) == (1, 8)
+
+    monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT", "0")
+    assert _select_grouped_persistent(True, 12, 3) == (0, 0)
+
+
+def test_grouped_persistent_rejects_partial_cluster(monkeypatch):
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import _select_grouped_persistent
+
+    monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT", "1")
+    monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS", "2")
+    with pytest.raises(ValueError, match="at least one cluster_n=4"):
+        _select_grouped_persistent(False, None, 4)
+
+
+@pytest.mark.parametrize(
+    "stage1_act,stage1_quant_out,expected",
+    [
+        (2, 1, 32 * 128),
+        (2, 0, 32 * 128 * 2),
+        (0, 0, 32 * 272 * 2),
+    ],
+)
+def test_epilogue_lds_live_bytes_tracks_output_form(
+    stage1_act, stage1_quant_out, expected
+):
+    from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        epilogue_lds_live_bytes,
+    )
+
+    assert epilogue_lds_live_bytes(32, 256, stage1_act, stage1_quant_out) == expected
+
+
+def test_persistent_lookahead_reuses_ring_slot_when_epilogue_fits():
+    from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        persistent_lds_plan,
+    )
+
+    pitch, num_buffers = 44032, 2
+    core = num_buffers * pitch
+    off, arena, reuse = persistent_lds_plan(pitch, core, 17408, num_buffers)
+    assert (reuse, off, arena) == (1, pitch, core)
+    assert off >= 17408 and arena == core
+
+
+@pytest.mark.parametrize(
+    "c_live_b,num_buffers",
+    [
+        (139264, 2),
+        (17408, 1),
+    ],
+)
+def test_persistent_lookahead_falls_back_to_private_stage(c_live_b, num_buffers):
+    from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        persistent_lds_plan,
+    )
+
+    pitch = 73728
+    core = max(num_buffers * pitch, c_live_b)
+    off, arena, reuse = persistent_lds_plan(pitch, core, c_live_b, num_buffers)
+    assert reuse == 0
+    assert off >= core and arena == off + pitch
+
+
+def test_persistent_tile_map_cache_preserves_lds_occupancy():
+    from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        persistent_tile_map_cache_plan,
+    )
+
+    arena, off, enabled = persistent_tile_map_cache_plan(88064, 256)
+    assert enabled == 1
+    assert off == 88064 and arena == 89088
+
+
 # Weights/scales use the public shuffle APIs directly:
 #   shuffle_weight(b, layout=(16, 16))            -> FP4 TDM B layout (16-row x
 #       16-byte chunks) the grouped FlyDSL kernels consume.

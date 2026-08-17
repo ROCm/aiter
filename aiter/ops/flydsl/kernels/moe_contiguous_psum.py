@@ -221,12 +221,14 @@ def build_moe_contiguous_psum_remap_module():
         topids_to_rows: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
+        m_tile_expert: fx.Pointer,
         contiguous_m: fx.Pointer,
         numel: Int32,
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
+        build_tile_map: Int32,
     ):
         i32 = T.i32
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
@@ -245,6 +247,7 @@ def build_moe_contiguous_psum_remap_module():
         rows_rsrc = ptr_rsrc(topids_to_rows)
         s_rsrc = ptr_rsrc(starts)
         p_rsrc = ptr_rsrc(psum)
+        mt_rsrc = ptr_rsrc(m_tile_expert)
         c_rsrc = ptr_rsrc(contiguous_m)
 
         is_lane0 = tid == fx.Uint32(0)
@@ -300,6 +303,13 @@ def build_moe_contiguous_psum_remap_module():
                 start = excl + base_off
                 buffer_ops.buffer_store(start, s_rsrc, e)
                 buffer_ops.buffer_store(start + fx.Int32(m_e), p_rsrc, e)
+                if fx.Int32(build_tile_map) != fx.Int32(0):
+                    start_tile = fx.Uint32(start) // tile_v
+                    valid_tiles = (m_e + tile_minus_1) // tile_v
+                    for local_tile in range(fx.Uint32(0), valid_tiles, 1):
+                        buffer_ops.buffer_store(
+                            fx.Int32(e), mt_rsrc, start_tile + local_tile
+                        )
 
             # Fold this chunk's total in before the next one overwrites lds0.
             chunk_total = _lds_load(src, MAX_EXPERTS_PER_BLOCK - 1)
@@ -354,12 +364,14 @@ def build_moe_contiguous_psum_remap_module():
         topids_to_rows: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
+        m_tile_expert: fx.Pointer,
         contiguous_m: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
+        build_tile_map: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_kernel(
@@ -367,12 +379,14 @@ def build_moe_contiguous_psum_remap_module():
             topids_to_rows,
             starts,
             psum,
+            m_tile_expert,
             contiguous_m,
             numel,
             experts,
             route_max_m,
             tile_m,
             num_valid_routes,
+            build_tile_map,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

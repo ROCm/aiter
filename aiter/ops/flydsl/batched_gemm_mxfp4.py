@@ -11,6 +11,8 @@ as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -20,9 +22,113 @@ from .kernels.tensor_shim import ptr_arg
 
 SCALE_GROUP_SIZE = 32
 WMMA_K_GFX1250 = 128
+_SUPPORTED_CLUSTER_N = (4, 3, 2)
+_TRUTHY_ENV = ("1", "true", "yes", "on")
+_FALSEY_ENV = ("0", "false", "no", "off")
+# The common grouped-MoE tiles retain three LDS-resident workgroups after
+# lookahead-stage reuse and psum caching. One CTA/CU leaves latency hiding on
+# the table; three recovered baseline performance on gfx1250. CSV/env worker
+# counts remain authoritative for configurations that tune this explicitly.
+_DEFAULT_PERSISTENT_CTAS_PER_CU = 3
 
 # a_dtype -> A bytes per code (fp4 = 2 codes/byte; fp6/fp8 = 1 byte/code).
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
+
+
+def _grouped_persistent_enabled(csv_enabled: int | bool) -> bool:
+    """Resolve just the persistent mode bit, shared by prep and GEMM launch."""
+    env_enabled = os.environ.get("AITER_FLYDSL_GROUPED_PERSISTENT")
+    if env_enabled is None:
+        return bool(csv_enabled)
+    value = env_enabled.strip().lower()
+    if value not in _TRUTHY_ENV + _FALSEY_ENV:
+        raise ValueError("AITER_FLYDSL_GROUPED_PERSISTENT must be a boolean value")
+    return value in _TRUTHY_ENV
+
+
+def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
+    """Selects the environment override or the CSV setting."""
+    value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
+    if value is None:
+        return int(bool(csv_next_stage_prefetch))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_TDM_NEXT_STAGE_PREFETCH must be 0 or 1")
+    return int(value)
+
+
+def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
+    """Selects the environment override or CSV cluster degree."""
+    env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
+    try:
+        requested_cluster_n = (
+            int(env_cluster_n) if env_cluster_n is not None else int(csv_cluster_n)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_N must be an integer") from exc
+    if requested_cluster_n <= 1:
+        return 1
+    if requested_cluster_n not in _SUPPORTED_CLUSTER_N:
+        return 1
+    return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
+
+
+def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
+    """Selects the CSV value or falls back to the environment setting."""
+    if csv_num_waves in (1, 2, 4):
+        return csv_num_waves
+
+    try:
+        num_waves = int(os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
+    except ValueError as exc:
+        raise ValueError(
+            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
+        ) from exc
+    if num_waves not in (1, 2, 4):
+        raise ValueError(
+            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got "
+            f"{num_waves}"
+        )
+    return num_waves
+
+
+def _select_grouped_persistent(
+    csv_enabled: int | bool,
+    csv_workers: int | None,
+    cluster_n: int,
+) -> tuple[int, int]:
+    """Resolve CSV/env persistent scheduling to a complete-cluster CTA count."""
+    enabled = _grouped_persistent_enabled(csv_enabled)
+    if not enabled:
+        return 0, 0
+
+    env_workers = os.environ.get("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS")
+    try:
+        workers = (
+            int(env_workers)
+            if env_workers is not None and env_workers.strip() != ""
+            else (None if csv_workers is None else int(csv_workers))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS must be an integer"
+        ) from exc
+    if workers is None:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        workers = int(get_cu_num()) * _DEFAULT_PERSISTENT_CTAS_PER_CU
+    if workers < 1:
+        raise ValueError(f"persistent_workers must be >= 1, got {workers}")
+
+    # ``persistent_workers`` counts physical CTAs. A cluster launch may only
+    # contain complete clusters; trim the hardware/default count accordingly.
+    workers -= workers % int(cluster_n)
+    if workers < int(cluster_n):
+        raise ValueError(
+            f"persistent_workers must provide at least one cluster_n={cluster_n} "
+            f"cluster"
+        )
+    return 1, workers
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -55,6 +161,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
+    cluster_n=-1,
+    waves_per_tensor_tdm=-1,
+    next_stage_prefetch=0,
+    grouped_persistent_m=0,
+    persistent_workers=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -103,6 +214,19 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_scale_tensor = quant_scale.view(torch.uint8)
     enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    n_tiles = (N + tile_n - 1) // tile_n
+    cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    if cluster_n > 1 and n_tiles % cluster_n:
+        raise ValueError(
+            f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
+            f"(N={N}, tile_n={tile_n}) to be an exact multiple"
+        )
+    grouped_persistent_m, persistent_workers = _select_grouped_persistent(
+        grouped_persistent_m,
+        persistent_workers,
+        cluster_n,
+    )
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -130,8 +254,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         stage1_quant_out,
         quant_wmma_rep,
         quant_scale_tensor,
-        f32_situ_beta=float(situ_beta),
-        f32_situ_linear_beta=float(situ_linear_beta),
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
@@ -143,6 +265,13 @@ def flydsl_grouped_gemm_a8w4_masked(
         ep_destination_stride=int(ep_destination_stride),
         ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         arg_ep_row_map=ep_row_map_tensor,
+        cluster_n=cluster_n,
+        next_stage_prefetch=_select_next_stage_prefetch(next_stage_prefetch),
+        num_waves_per_tensor_tdm=waves_per_tensor_tdm,
+        f32_situ_beta=float(situ_beta),
+        f32_situ_linear_beta=float(situ_linear_beta),
+        grouped_persistent_m=grouped_persistent_m,
+        persistent_workers=persistent_workers,
     )
     return out
 
