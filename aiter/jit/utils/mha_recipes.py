@@ -7,9 +7,9 @@ def _ck_targets_flag() -> str:
     keep the default (covers both gfx942 and gfx950 like before).
     """
     try:
-        from chip_info import get_gfx
+        from chip_info import get_gfx_runtime
 
-        gfx = get_gfx()
+        gfx = get_gfx_runtime()
     except Exception:  # noqa: BLE001
         return ""
     if gfx.startswith("gfx9"):
