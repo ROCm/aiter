@@ -218,8 +218,9 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("layout", ["TN", "TT"])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, output, backend):
+def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, backend):
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
     if backend == "triton":
@@ -228,9 +229,9 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, output, backend):
             pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
     torch.cuda.empty_cache()
 
-    # TT: the gluon persistent kernel has no transposed-operand switch
+    # TN and TT both supported via the kernel's TRANSPOSE switch; A must be 'T'
     x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, torch.bfloat16, layout="TT", output=output
+        M, N, K, torch.bfloat16, layout=layout, output=output
     )
 
     torch_out = F.linear(x, w, bias=None)
