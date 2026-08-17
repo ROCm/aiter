@@ -959,7 +959,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             return
 
         exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+            inter_dim, topk, quant_mode="none", gui_layout=True, act=act
         )
         x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
         out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)

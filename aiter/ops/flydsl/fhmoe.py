@@ -28,8 +28,6 @@ def compile_flydsl_fhmoe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
