@@ -869,6 +869,7 @@ def _dump_stage1_phases(pipe):
         ("plan_order", _ov.TS_PLAN_ORDER),
         ("plan_pub", _ov.TS_PLAN_PUB),
         ("plan_gather", _ov.TS_PLAN_GATHER),
+        ("plan_base", _ov.TS_PLAN_BASE),
         ("prod_last", _ov.TS_PROD_LAST),
         ("pool_last", _ov.TS_POOL_LAST),
         ("gate_spin", _ov.TS_GATE_SPIN),
@@ -896,8 +897,14 @@ def _dump_stage1_phases(pipe):
     # Planner cuts along its own timeline; they sum to planner_plan. The sort sits
     # between the publish and the gather under ORDER_IN_GATHER (the default), so
     # its span is what the peers' counts did not already cover.
-    marks = ["plan_count", "plan_pub", "plan_order", "plan_gather", "plan_owner"]
-    names = ["count", "publish", "order", "gather", "compact"]
+    # "bases" is where the producers are released; "compact" past it is the tile
+    # schedule, which only the work pool waits for, so it no longer counts
+    # against the push.
+    marks = [
+        "plan_count", "plan_pub", "plan_order", "plan_gather", "plan_base",
+        "plan_owner",
+    ]
+    names = ["count", "publish", "order", "gather", "bases", "compact"]
     prev, cuts = 0, []
     for m, n in zip(marks, names):
         cuts.append("{}={:.1f}".format(n, us * (t[m] - prev)))

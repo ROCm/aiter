@@ -1079,8 +1079,12 @@ def launch_gemm_a8w4_tdm(
                     # Producers need the plan too: the destination row of a route
                     # is my_base[ge] + its slot, and my_base is what the planner
                     # derives from the count matrix. Pushing before it is
-                    # published sends every rank's rows to the same rows.
-                    _ov.emit_wait_plan(OV, epoch, _tid, bid_x)
+                    # published sends every rank's rows to the same rows. Only
+                    # the bases, though -- the tile schedule is waited for below,
+                    # once the push that it would otherwise have delayed is done.
+                    _ov.emit_wait_plan(
+                        OV, epoch, _tid, bid_x, _ov.PLAN_LVL_BASE
+                    )
                     _ov.emit_tstamp(
                         OV, _ov.TS_PROD_WAIT, _t0, _tid, role == fx.Int32(1)
                     )
@@ -1098,6 +1102,13 @@ def launch_gemm_a8w4_tdm(
                         OV, _ov.TS_PROD_END, _t0, _tid, role == fx.Int32(1)
                     )
                     _ov.emit_tstamp_max(OV, _ov.TS_PROD_LAST, _t0, _tid)
+                # The other half of the plan, picked up on the way to the work
+                # pool. By now the planner is long past it, so this is a load and
+                # an acquire rather than a wait.
+                if const_expr(_OV_PHASES >= 2 and not _ov.NO_WAIT_PLAN):
+                    _ov.emit_wait_plan(
+                        OV, epoch, _tid, bid_x, _ov.PLAN_LVL_SCHED
+                    )
             else:
                 if const_expr(_OV_PHASES >= 2 and not _ov.NO_WAIT_PLAN):
                     _ov.emit_wait_plan(OV, epoch, _tid, bid_x)

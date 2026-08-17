@@ -433,6 +433,10 @@ TS_POOL_LAST = TS_BASE + 10  # last CTA of any role to drain the work pool
 #: which band it is in and which CTA drew it, and one CTA's history says nothing
 #: about the grid's.
 TS_GATE_SPIN = TS_BASE + 11
+#: The split point of the two-level publish: everything past it is schedule
+#: build, which no producer waits for. plan_owner - plan_base is what moved off
+#: the producers' critical path and into the push's shadow.
+TS_PLAN_BASE = TS_BASE + 12  # planner: entry -> row bases published
 
 
 def _tstamp_addr(C, slot):
@@ -517,6 +521,28 @@ def plan_ready_addr(C, replica):
         + fx.Int64(_PLAN_SLOT * 4)
         + fx.Int64(replica) * fx.Int64(_PLAN_STRIDE_SLOTS * 4)
     )
+
+
+#: The plan is published in two steps, because its two halves have different
+#: readers. A producer needs only ``my_base`` to know which destination row a
+#: route lands on; the tile schedule it does not read at all until it has pushed
+#: its payload and joined the work pool, tens of microseconds later. Releasing
+#: both at once made every producer sit through the schedule build, which is the
+#: back third of the planner's span and does not depend on anything they do.
+PLAN_LVL_BASE = 0  # pg_ov_my_base is visible: producers may push
+PLAN_LVL_SCHED = 1  # tile schedule is visible: the work pool may pull
+_PLAN_LEVELS = 2
+
+
+def plan_epoch(epoch, level):
+    """Flag value that marks ``level`` of ``epoch``'s plan as published.
+
+    Both levels ride the one counter rather than a second set of replicas: the
+    value stays monotone across launches either way, and every CTA in the grid
+    polls these lines, so doubling them would double the traffic the fanout
+    exists to spread.
+    """
+    return epoch * fx.Int32(_PLAN_LEVELS) - fx.Int32(_PLAN_LEVELS - 1 - level)
 
 
 #: Scope of the release each CTA takes on its way into a producer barrier.
@@ -1120,6 +1146,30 @@ def _emit_route_order(C, addr_inp_idx, role, epoch, tid, nthreads, cur_tok):
 # --------------------------------------------------------------------------- #
 # Phase 2: count all-gather + plan (planner CTA only)
 # --------------------------------------------------------------------------- #
+def _emit_publish_plan(C, epoch, level, tid, nthreads):
+    """Make everything the planner has written so far visible to the grid.
+
+    The counter and the replicas carry the same value, so a waiter can read
+    either; the fence in front covers both, which is why the replicas can go out
+    in parallel from the whole CTA.
+    """
+    P.waitcnt_stores()
+    workgroup_barrier()
+    val = plan_epoch(epoch, level)
+    if tid == fx.Int32(0):
+        P.fence_system_release()
+        # One increment per level, so the counter tracks plan_epoch exactly.
+        P.atomic_add_agent(fx.Int64(C.ptr_plan_ready), fx.Int32(1))
+    for r in range(tid, fx.Int32(_PLAN_FANOUT), nthreads):
+        P.store_i32_system(plan_ready_addr(C, r), fx.Int32(0), val)
+
+
+# Rebound onto its own name, not exported under a second one: the rewriter does
+# not recurse into callees, so a helper with device control flow has to be
+# transformed before the function that calls it looks the name up.
+_emit_publish_plan = ASTRewriter.transform(_emit_publish_plan)
+
+
 def _emit_plan(
     C, addr_trb, addr_eids, addr_tvd, addr_num_valid, epoch, parity, tid, nthreads,
     t0=None, mid=None,
@@ -1249,6 +1299,13 @@ def _emit_plan(
             )
         buffer_store(acc, rs_my_base, ge)
 
+    # Release the producers here rather than at the end of the function. Row
+    # bases are everything they need, and the schedule below is a good ten
+    # microseconds they would otherwise spend blocked on a table only the work
+    # pool reads -- a pool none of them reaches until its own push is done.
+    _emit_publish_plan(C, epoch, PLAN_LVL_BASE, tid, nthreads)
+    _emit_tstamp(C, TS_PLAN_BASE, t0, tid, True)
+
     # Destination side: total rows per local expert -> compacted tile schedule.
     # The compaction is not optional: the static grid is E_local*CAP/tile_m tiles
     # of which only a handful carry rows, and padding tiles are not free (they
@@ -1334,15 +1391,7 @@ def _emit_plan(
             buffer_store(le, rs_eids, m)
             buffer_store(buffer_load(rs_te, w, vec_width=1, dtype=T.i32), rs_tvd, m)
 
-    P.waitcnt_stores()
-    workgroup_barrier()
-    if tid == fx.Int32(0):
-        P.fence_system_release()
-        P.atomic_add_agent(fx.Int64(C.ptr_plan_ready), fx.Int32(1))
-    # The release fence above covers the replicas too, so they can go out in
-    # parallel; a CTA that sees any of them sees the whole plan.
-    for r in range(tid, fx.Int32(_PLAN_FANOUT), nthreads):
-        P.store_i32_system(plan_ready_addr(C, r), fx.Int32(0), epoch)
+    _emit_publish_plan(C, epoch, PLAN_LVL_SCHED, tid, nthreads)
 
 
 # --------------------------------------------------------------------------- #
@@ -1780,16 +1829,21 @@ def _emit_pay_arrivals(
 # --------------------------------------------------------------------------- #
 # Phase 4 helpers: consumer-side waits
 # --------------------------------------------------------------------------- #
-def _emit_wait_plan(C, epoch, tid, bid=None):
-    """Every CTA blocks here until the planner's tile schedule is visible."""
+def _emit_wait_plan(C, epoch, tid, bid=None, level=PLAN_LVL_SCHED):
+    """Block until ``level`` of the planner's output is visible.
+
+    :data:`PLAN_LVL_BASE` is the row bases, all a producer needs to place its
+    payload; :data:`PLAN_LVL_SCHED` is the tile schedule the work pool walks.
+    """
+    want = plan_epoch(epoch, level)
     if tid == fx.Int32(0):
         if const_expr(_PLAN_FANOUT > 1) and bid is not None:
             P.spin_until_ge_i32_backoff(
-                plan_ready_addr(C, bid % fx.Int32(_PLAN_FANOUT)), epoch, agent=True
+                plan_ready_addr(C, bid % fx.Int32(_PLAN_FANOUT)), want, agent=True
             )
         else:
             P.spin_until_ge_i32_backoff(
-                fx.Int64(C.ptr_plan_ready), epoch, agent=True
+                fx.Int64(C.ptr_plan_ready), want, agent=True
             )
     workgroup_barrier()
     P.fence_acquire_all()
