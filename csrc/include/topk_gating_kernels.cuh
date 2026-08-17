@@ -12,13 +12,9 @@
 //   topk_softplus_kernel_opt  - register-only, sort+merge (64/128/256/384 experts)
 //   topk_softplus_kernel      - shared-memory fallback (any expert count)
 //
-// This header is included only by the instantiation TUs under
-// csrc/kernels/topk_gating_inst/; use AITER_TOPK_GATING_INSTANTIATE at the end
-// of such a TU to emit one (gating dtype, score function) slice of the kernel
-// set. The public entry point includes topk_gating_launch.h instead.
+// Instantiated by the TUs under csrc/kernels/topk_gating/, one per score function
+// so they build in parallel; each ends with AITER_TOPK_GATING_INSTANTIATE.
 #pragma once
-
-#include "topk_gating_launch.h"
 
 #include "aiter_dispatch.h"
 #include "aiter_hip_common.h"
@@ -27,9 +23,29 @@
 #include "aiter_opus_plus.h"
 #include <hip/hip_runtime.h>
 #include <cfloat>
+#include <cstddef>
 #include <type_traits>
 
 namespace aiter {
+
+enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
+
+// Element types are carried by the topk_gating_launch template parameters, not
+// by these pointers.
+struct topk_gating_params
+{
+    const void* gating;      // [num_tokens, num_experts], DTYPE_I
+    const void* bias;        // [num_experts], DTYPE_B; nullptr when unbiased
+    float*      weights;     // [num_tokens, topk]
+    int*        ids;         // [num_tokens, topk]
+    size_t      stride_tk;
+    int         num_experts;
+    int         topk;
+    int         num_tokens;
+    float       routed_scaling_factor;
+    bool        need_renorm;
+    hipStream_t stream;
+};
 
 // E=128 opt_n (TPW=4) wins on gfx942 but regresses on gfx950; gate to gfx942.
 // Cached: get_gpu_arch() re-queries the driver on every call.
@@ -1082,7 +1098,7 @@ __global__ void topk_softplus_kernel_smem_n(
                 if(tmp[i] > max_val) { max_val = tmp[i]; max_idx = e * vec_size + i; }
             }
         }
-        // sub-warp argmax (shfl_xor stays within the aligned group)
+        // Sub-warp argmax (shfl_xor stays within the aligned group)
 #pragma unroll
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
         {
@@ -1407,16 +1423,33 @@ void topk_gating_launch(const topk_gating_params& p)
 
 } // namespace aiter
 
-// Emits every (gating dtype, bias dtype) instantiation for one score function.
-// One use per translation unit keeps the build parallel.
-#define _AITER_TOPK_GATING_INST_BIAS(DTYPE_I, SF)                                            \
-    template void topk_gating_launch<DTYPE_I, float, SF>(const topk_gating_params&);         \
-    template void topk_gating_launch<DTYPE_I, __half, SF>(const topk_gating_params&);        \
-    template void topk_gating_launch<DTYPE_I, hip_bfloat16, SF>(const topk_gating_params&);
+// One score function's slice of the kernel set. A bf16 checkpoint can have its
+// router logits and its bias upcast to fp32 independently, hence the
+// {fp32, bf16} x {fp32, bf16} block; fp16 is legacy and never carries a bf16
+// bias. The rest would nearly double the kernels, so the entry point rejects them.
+//
+// KIND is `extern template` to declare the slice or `template` to define it.
+#define _AITER_TOPK_GATING_SLICE(KIND, SF)                                            \
+    KIND void topk_gating_launch<float, float, SF>(const topk_gating_params&);        \
+    KIND void topk_gating_launch<float, hip_bfloat16, SF>(const topk_gating_params&); \
+    KIND void topk_gating_launch<__half, float, SF>(const topk_gating_params&);       \
+    KIND void topk_gating_launch<hip_bfloat16, float, SF>(const topk_gating_params&); \
+    KIND void topk_gating_launch<hip_bfloat16, hip_bfloat16, SF>(const topk_gating_params&);
 
-#define AITER_TOPK_GATING_INSTANTIATE(SF)                                                     \
-    namespace aiter {                                                                         \
-    _AITER_TOPK_GATING_INST_BIAS(float, SF)                                                   \
-    _AITER_TOPK_GATING_INST_BIAS(__half, SF)                                                  \
-    _AITER_TOPK_GATING_INST_BIAS(hip_bfloat16, SF)                                            \
+namespace aiter {
+
+// Keeps a plain includer from implicitly instantiating the kernels, so the entry
+// point can call topk_gating_launch without paying to compile it. A definition
+// may follow such a declaration in the same TU, which is what the instantiation
+// TUs do.
+_AITER_TOPK_GATING_SLICE(extern template, SCORE_SQRTSOFTPLUS)
+_AITER_TOPK_GATING_SLICE(extern template, SCORE_SIGMOID)
+_AITER_TOPK_GATING_SLICE(extern template, SCORE_SOFTMAX)
+
+} // namespace aiter
+
+// Emits one score function's slice. One use per TU keeps the build parallel.
+#define AITER_TOPK_GATING_INSTANTIATE(SF)      \
+    namespace aiter {                          \
+    _AITER_TOPK_GATING_SLICE(template, SF)     \
     }

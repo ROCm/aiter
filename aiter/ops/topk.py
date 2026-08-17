@@ -33,6 +33,16 @@ def topk_softplus(
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 
 
+def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
+    """Bias dtypes instantiated for this gating dtype; see _AITER_TOPK_GATING_SLICE.
+
+    Checked in Python because the C++ side aborts rather than raising.
+    """
+    if gating_dtype is torch.float16:
+        return (torch.float32,)
+    return (torch.float32, torch.bfloat16)
+
+
 def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -48,16 +58,21 @@ def topk_gating(
         score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
                             "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
-        correction_bias: optional bias tensor, pass None for no bias.
+        correction_bias: optional bias tensor, pass None for no bias. Must be
+            float32, or bfloat16 when gating_output is not float16.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
     if correction_bias is None:
-        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
-        # avoiding extra kernel template instantiations.
         correction_bias = torch.empty(
-            0, dtype=gating_output.dtype, device=gating_output.device
+            0, dtype=torch.float32, device=gating_output.device
+        )
+    else:
+        valid = _valid_bias_dtypes(gating_output.dtype)
+        assert correction_bias.dtype in valid, (
+            f"correction_bias dtype {correction_bias.dtype} is not supported for "
+            f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
     topk_softplus(
         topk_weights,

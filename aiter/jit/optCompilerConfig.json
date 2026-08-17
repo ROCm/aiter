@@ -636,7 +636,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/topk_gating_inst'"
+            "f'{AITER_CSRC_DIR}/kernels/topk_gating'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

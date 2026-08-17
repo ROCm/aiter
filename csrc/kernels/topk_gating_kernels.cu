@@ -8,22 +8,22 @@
 //   "sigmoid"       -> sigmoid(x)          - Llama4
 //   "softmax"       -> softmax(x)          - DeepSeek V3 / classic MoE
 //
-// The kernels themselves live in csrc/include/topk_gating_kernels.cuh and are
-// instantiated by the TUs under csrc/kernels/topk_gating_inst/. This file only
-// resolves the runtime dtype/score_func triple to one of those instantiations,
-// so it stays cheap to compile.
+// The kernels live in csrc/include/topk_gating_kernels.cuh, instantiated by the
+// TUs under csrc/kernels/topk_gating/. This file only resolves the runtime
+// dtype/score_func pair to one of those instantiations.
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "moe_topk_op.h"
-#include "topk_gating_launch.h"
+#include "topk_gating_kernels.cuh"
 
 #include <string>
+#include <type_traits>
 
 namespace aiter {
 
-// Resolve "sqrtsoftplus"/"sigmoid"/"softmax" → SCORE_* enum, or AITER_CHECK fail.
+// Resolve "sqrtsoftplus"/"sigmoid"/"softmax" -> SCORE_* enum, or AITER_CHECK fail.
 static inline int parse_score_func(const std::string& s)
 {
     if(s == "sqrtsoftplus") return SCORE_SQRTSOFTPLUS;
@@ -73,20 +73,31 @@ void topk_softplus(aiter_tensor_t& topk_weights,
     p.stream                = aiter::getCurrentHIPStream();
 
     const auto gating_st = gating_output.dtype();
-    const auto bias_st   = has_bias ? correction_bias.dtype() : gating_st;
+    // Unbiased: the pointer is never dereferenced, so pick an instantiated DTYPE_B
+    // rather than depending on the placeholder tensor's dtype.
+    const auto bias_st = has_bias ? correction_bias.dtype() : AITER_DTYPE_fp32;
 
-    // Three-level dispatch: gating dtype → score_func → bias dtype. Each
-    // (gating dtype, score_func) pair is precompiled in its own TU.
+    // Three-level dispatch: gating dtype -> score_func -> bias dtype. See
+    // _AITER_TOPK_GATING_SLICE for which bias dtypes are instantiated.
     auto dispatch_bias = [&](auto gating_tag, auto sf_tag) {
         using scalar_t   = decltype(gating_tag);
         constexpr int SF = decltype(sf_tag)::value;
-        switch(bias_st)
+        if(bias_st == AITER_DTYPE_fp32)
         {
-        case AITER_DTYPE_fp32: topk_gating_launch<scalar_t, float, SF>(p);        break;
-        case AITER_DTYPE_fp16: topk_gating_launch<scalar_t, __half, SF>(p);       break;
-        case AITER_DTYPE_bf16: topk_gating_launch<scalar_t, hip_bfloat16, SF>(p); break;
-        default: AITER_CHECK(false, "unsupported correction_bias dtype"); break;
+            topk_gating_launch<scalar_t, float, SF>(p);
+            return;
         }
+        if constexpr(!std::is_same_v<scalar_t, __half>)
+        {
+            if(bias_st == AITER_DTYPE_bf16)
+            {
+                topk_gating_launch<scalar_t, hip_bfloat16, SF>(p);
+                return;
+            }
+        }
+        AITER_CHECK(false,
+                    "correction_bias dtype must be float32, or bfloat16 when "
+                    "gating_output is not float16");
     };
 
     auto dispatch_sf = [&](auto gating_tag) {
