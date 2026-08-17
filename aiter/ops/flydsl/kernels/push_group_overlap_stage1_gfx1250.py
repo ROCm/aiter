@@ -70,24 +70,55 @@ the copy from 4 vec4 streams per lane to a whole row's 14 (:func:`pay_streams`)
 took the push to 80 us -- under ep_dispatch's 92 -- and 24 to 37 us a layer off
 every token count.
 
-What is left is the plan: 33 us at 128 tokens, 40 at 256, 49 at 512, all of it
-serial on the one CTA every producer waits behind. Half is fixed -- ~11 us
-publishing the count matrix, whose drain is a genuine cross-device round trip,
-and ~10 compacting the tile schedule -- and the rest is the route count and the
-counting sort, which scale with tokens. Spreading those two over the producers is
-implemented and still loses (PREFIX_OWNER=0 measures 666 us a layer against 578
-at 512 tokens): the three grid barriers it needs cost more than one CTA's
-arithmetic does. Removing the plan rather than moving it means giving up
-deterministic row placement, which is what lets a destination know a tile's
-expected row count before the payload lands.
+What is left is the plan: 31 us at 128 tokens, 37 at 256, 45 at 512, all of it
+serial on the one CTA every producer waits behind. It is also the whole of the
+remaining gap, and the arithmetic is simple -- at 512 tokens the fused kernel is
+plan 45 + push 75 + GEMM 232 against the unfused dispatch 92 + GEMM1 235, so the
+17 us the push now wins back is worth less than the plan costs, and the GEMM half
+runs at its standalone speed strictly after the push rather than under it.
 
-Three things that look like they should help do not, and all were measured rather
-than reasoned about: publishing in stages from inside a CTA (:func:`_emit_payload`),
-raising the grid multiplier so a stalled producer shares its CU with a consumer
-(330 us at 1 CTA/CU, 327 at 2, 334 at 3 -- the consumers have no ready tile to
-work on, so more of them resident changes nothing), and landing the scale run on
-contiguous destination dwords instead of the WMMA-strided ones, which is a
-quarter-full cache line per store and still measured no better.
+Two of its five phases are fixed cost -- ~11 us publishing the count matrix and
+~10 compacting the tile schedule -- and the other three scale with tokens. Three
+restructurings of it were tried and only one paid:
+
+* the route count vectorized to four routes a step (:func:`_emit_prefix_owner`),
+  which is the same latency-per-warp argument as :func:`pay_streams` and took the
+  count from 16.3 us to 6.6 at 512 tokens, 5 us off the kernel;
+* draining the count publish after the sort instead of before it, so the
+  cross-device round trip hides under local work. Exactly neutral: publish falls
+  from 10.8 to 7.8 and the gather grows from 0.9 to 4.6, because every rank
+  delays its count_done by the same amount. The drain was only ~3 us of the
+  publish anyway -- the rest is the store loop;
+* fanning each expert group out to all peers from one thread rather than giving a
+  thread one (peer, group) item, to cut the reloads. Worse, 10.8 to 11.0: the flat
+  version has a whole wavefront writing one peer, and that coalescing is worth
+  more than the saved loads.
+
+Spreading the count and the sort over the producers is implemented and still
+loses (PREFIX_OWNER=0 measures 666 us a layer against 578 at 512 tokens): the
+three grid barriers it needs cost more than one CTA's arithmetic does. Removing
+the plan rather than moving it means giving up deterministic row placement, which
+is what lets a destination know a tile's expected row count before the payload
+lands.
+
+Things that look like they should help do not, and all were measured rather than
+reasoned about: publishing in stages from inside a CTA (:func:`_emit_payload`),
+and raising the grid multiplier so a stalled producer shares its CU with a
+consumer (330 us at 1 CTA/CU, 327 at 2, 334 at 3 -- the consumers have no ready
+tile to work on, so more of them resident changes nothing).
+
+The scale scatter in particular reads like the next :func:`pay_streams`, since it
+costs about what the whole token payload does while moving three percent of the
+bytes, and it is not. Three separate attempts on it all measured flat: landing it
+on contiguous destination dwords instead of the WMMA-strided ones (a quarter-full
+cache line per store, tried twice -- once naively, which only introduced write
+conflicts between rows sharing an out_row, and once on the conflict-free linear
+layout); predicating the per-row ``live`` test on the loop bound the way the token
+copy does, to stop the branch from walling the unrolled rows off from each other;
+and collapsing every row's gather onto one cached line, which is worth 8 us of
+push wall and none of the kernel. That last number is the useful one: the push
+ends 230 us before the kernel does, so shaving its tail only pays if it opens
+tiles sooner, and it does not.
 
 Everything below is called from inside a ``@flyc.kernel`` body. FlyDSL only
 AST-rewrites the decorated function, so a plain helper module cannot use dynamic
@@ -851,7 +882,32 @@ def _emit_prefix_owner(C, addr_inp_idx, tid, nthreads, cur_tok):
     # just wrote, from the same CTA, so the L2 orders them.
     rs_idx = _rsrc(addr_inp_idx)
     rs_slot = _rsrc(C.ptr_route_slot)
-    for w in range(tid, cur_tok * fx.Int32(C.topk), nthreads):
+    work = cur_tok * fx.Int32(C.topk)
+    # Four routes a step, gathered in one dwordx4 and returned in one. The scalar
+    # version made every step a load, then an atomic that needs the loaded expert,
+    # then a store that needs the atomic -- a full dependency chain with the load
+    # latency exposed on each, and 3072 routes over one CTA's 128 threads is 24 of
+    # them back to back with no other warp on the CU to cover the stall. Widening
+    # the step cuts the exposed loads fourfold and coalesces both the gather and
+    # the slot write-back; the four atomics in between are independent, so they
+    # issue together and are waited on once.
+    nquad = work // fx.Int32(4)
+    for q in range(tid, nquad, nthreads):
+        w0 = q * fx.Int32(4)
+        ges = buffer_load(rs_idx, w0, vec_width=4, dtype=T.i32)
+        slots = [
+            P.atomic_add_agent(
+                fx.Int64(C.ptr_hist)
+                + fx.Int64(vector.extract(ges, static_position=[k]))
+                * fx.Int64(4),
+                fx.Int32(1),
+            )
+            for k in range_constexpr(4)
+        ]
+        buffer_store(Vec.from_elements(slots, fx.Int32), rs_slot, w0)
+    # topk is not required to be a multiple of four, so the odd tail keeps the
+    # scalar form.
+    for w in range(nquad * fx.Int32(4) + tid, work, nthreads):
         ge = buffer_load(rs_idx, w, vec_width=1, dtype=T.i32)
         slot = P.atomic_add_agent(
             fx.Int64(C.ptr_hist) + fx.Int64(ge) * fx.Int64(4), fx.Int32(1)
