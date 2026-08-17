@@ -131,6 +131,16 @@ _FP8_DTYPE = torch.float8_e4m3fn
 # 6144 (96 pages) is the lowest depth where all sampled chunks win noise-robustly.
 _SPLIT_MIN_DECODE_KV = 6144
 
+# num_seqs * max_seqlen_k above which pure-decode FlyDSL loses to Triton and is
+# ceded (return None). The FlyDSL kernel is prefill-tuned: for GQA decode
+# (query_len=1, 16:1) a BLOCK_M=256 tile has only 16 live M-rows, and that wasted
+# per-tile compute is exposed at 1 WG/CU (the 97 KB BLOCK_N-based LDS ring pins
+# occupancy). Above this KV-read-volume quantum the exposure dominates and Triton
+# wins ~2x; split-K does not recover it (monotonic-worse at full fill). Boundary
+# from a gfx950 A/B grid (SILOTIGER-877): every winning cell has b*ctx <= 65536,
+# every losing cell >= 98304. See the decode-regression vault doc.
+_DECODE_CEDE_WORK = 65536
+
 
 # Bounded memo of mixed-batch signatures whose dispatch-split probe DECLINED.
 # Keyed on host-only quantities (the two device-tensor data_ptrs plus the shape
@@ -623,6 +633,7 @@ def flydsl_unified_attention(
     sinks=None,
     shuffled_kv_cache=False,
     skip_reduce=False,
+    _from_split=False,
 ):
     """Run unified attention on the FlyDSL fp8 gfx950 kernel.
 
@@ -666,6 +677,22 @@ def flydsl_unified_attention(
         sinks,
         shuffled_kv_cache,
         skip_reduce,
+    ):
+        return None
+
+    # Cede the pure-decode region FlyDSL loses to Triton (return None -> caller
+    # runs Triton). Guard on max_seqlen_k > _PAGE_SIZE * 20 keeps the shallow
+    # region (always a win, and never split-K'd) on FlyDSL regardless of batch
+    # size; above that, cede once the KV-read volume crosses _DECODE_CEDE_WORK.
+    # Scoped to the top-level entry only (not _from_split): the mixed-batch
+    # split below drops the decode sub-call's return value on the invariant
+    # that it never declines, so a decode half reached via the split must never
+    # cede here -- see the `_from_split=True` call site.
+    if (
+        not _from_split
+        and max_seqlen_q == 1
+        and max_seqlen_k > _PAGE_SIZE * 20
+        and num_seqs * max_seqlen_k > _DECODE_CEDE_WORK
     ):
         return None
 
@@ -755,6 +782,11 @@ def flydsl_unified_attention(
                     sinks=sinks,
                     shuffled_kv_cache=shuffled_kv_cache,
                     skip_reduce=skip_reduce,
+                    # The split path owns its own routing for both halves; the
+                    # pure-decode cede above applies only to the top-level entry,
+                    # since this decode sub-call's return value is never checked
+                    # (see the invariant note below) and must never be None.
+                    _from_split=True,
                 )
 
             # Prefill first. A small multi-chunk prefill half can underfill and

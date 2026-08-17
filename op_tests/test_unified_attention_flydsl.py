@@ -381,7 +381,9 @@ def test_sinks_route_and_agree_and_stay_single_pass():
 
     # An all-decode shape that would otherwise take split-K (see
     # test_packed_splitk_decode.py), to prove sinks forces single-pass.
-    query_lens, kv_lens = [1] * 8, [16384] * 8
+    # b=8 * max_seqlen_k=8192 = 65536, at (not over) _DECODE_CEDE_WORK, so this
+    # stays on FlyDSL under the top-level pure-decode cede threshold.
+    query_lens, kv_lens = [1] * 8, [8192] * 8
     sinks = torch.randn(64, device="cuda", dtype=torch.float32)
     uak._get_kernel.cache_clear()
     with mock.patch.object(uak, "_get_kernel", spy):
@@ -426,7 +428,9 @@ def test_fp16_output_with_packed_splitk():
 
     # All-decode, deep context: the regime `flydsl_unified_attention` routes to
     # split-K (see its tier-selection comment).
-    query_lens, kv_lens = [1] * 8, [16384] * 8
+    # b=8 * max_seqlen_k=8192 = 65536, at (not over) _DECODE_CEDE_WORK, so this
+    # stays on FlyDSL under the top-level pure-decode cede threshold.
+    query_lens, kv_lens = [1] * 8, [8192] * 8
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
         query_lens, kv_lens, 64, 4
     )
@@ -685,3 +689,105 @@ def test_predicate_declines_wrong_dtypes():
     # test_fp16_output_routes_and_agrees below.
     assert _supported(**{**base, "out": out.to(torch.float16)})
     assert not _supported(**{**base, "block_table": bt.to(torch.int64)})
+
+
+# --- 5. decode cede threshold (_DECODE_CEDE_WORK, SILOTIGER-877) -------------
+
+
+def test_decode_cede_threshold():
+    """Top-level pure-decode batches cede (return None) once the KV-read
+    volume `num_seqs * max_seqlen_k` crosses `_DECODE_CEDE_WORK`; below it, or
+    in the always-FlyDSL shallow-context region (`max_seqlen_k <=
+    _PAGE_SIZE * 20`), they are still served."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    def _call_direct(num_seqs, max_seqlen_k, num_heads=64, num_kv_heads=4):
+        query_lens = [1] * num_seqs
+        kv_lens = [max_seqlen_k] * num_seqs
+        q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
+            query_lens, kv_lens, num_heads, num_kv_heads
+        )
+        return uak.flydsl_unified_attention(
+            q,
+            k,
+            v,
+            out,
+            cu_q,
+            1,
+            seqused_k,
+            max_seqlen_k,
+            SCALE,
+            True,
+            (-1, -1),
+            bt,
+            0,
+            q_ds,
+            k_ds,
+            v_ds,
+            num_kv_heads=num_kv_heads,
+            block_size=PAGE,
+            num_queries_per_kv=num_heads // num_kv_heads,
+            num_seqs=num_seqs,
+        )
+
+    # 64 * 4096 = 262144 > 65536: ceded.
+    assert _call_direct(64, 4096) is None
+    # 16 * 4096 = 65536 (at, not over, the threshold): kept.
+    assert _call_direct(16, 4096) is not None
+    # 64 * 1024: max_seqlen_k <= _PAGE_SIZE * 20 (1280), so the shallow-context
+    # guard keeps this on FlyDSL regardless of batch size.
+    assert _call_direct(64, 1024) is not None
+
+
+def test_mixed_split_decode_half_never_cedes():
+    """Regression guard for the `_from_split` scoping of the cede predicate: a
+    mixed batch whose decode half alone would cross `_DECODE_CEDE_WORK` at the
+    top level (n_dec=8, max_seqlen_k=16384, 8*16384=131072 > 65536) must still
+    be served by the split path, not silently left with uninitialized output
+    rows -- the split's `_sub` closure drops the decode sub-call's return
+    value on the invariant that it never declines. Reuses the production mixed
+    shape from `test_parity_with_triton`."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    query_lens, kv_lens = [4023] + [1] * 8, [4023] + [16384] * 8
+    q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
+        query_lens, kv_lens, 64, 4
+    )
+    got = uak.flydsl_unified_attention(
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        max(query_lens),
+        seqused_k,
+        max(kv_lens),
+        SCALE,
+        True,
+        (-1, -1),
+        bt,
+        0,
+        q_ds,
+        k_ds,
+        v_ds,
+        num_kv_heads=4,
+        block_size=PAGE,
+        num_queries_per_kv=16,
+        num_seqs=len(query_lens),
+    )
+    assert got is not None, "the split path must serve this batch, not cede"
+    want = ref_paged_attn(
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=SCALE,
+        out_dtype=out.dtype,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
+        causal=1,
+    )
+    _assert_close(got.float(), want.float().reshape(got.shape))
