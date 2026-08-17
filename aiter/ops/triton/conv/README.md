@@ -9,8 +9,8 @@
 [![Triton](https://img.shields.io/badge/Triton-3.7-orange.svg)](https://github.com/triton-lang/triton)
 
 A hand-written Triton 2-D convolution library optimized for AMD RDNA
-GPUs. Five kernel families (1×1, 3×3 cblocked, 3×3 NHWC, Winograd
-F(4×4, 3×3), general) behind one shape-driven router and one entry
+GPUs. Six kernel families (1×1, direct NCHW 3×3, 3×3 cblocked, 3×3
+NHWC, Winograd F(4×4, 3×3), general) behind one shape-driven router and one entry
 point. Drop-in for the forward path of `nn.Conv2d`.
 
 ---
@@ -33,12 +33,9 @@ no NHWC↔NCHW conversion), and gets reasonable performance across the
 full matrix **without per-architecture kernel implementations** (one
 set of Triton kernels for every arch, with a thin per-arch JSON config
 layer — see Tuning). A shape-driven
-router picks between five kernel families (1×1, 3×3 cblocked, 3×3 NHWC,
-Winograd F(4×4, 3×3), general) so the right kernel runs per layer
-automatically. Some kernels do repack inputs/weights into kernel-local
-formats (channel-blocked tiles for cblocked, G/Bᵀ transforms for
-Winograd) — these packs are LRU-cached so steady-state cost is
-negligible.
+router picks between six kernel families so the right kernel runs per layer
+automatically. Weight transforms are LRU-cached. Large NCHW 3×3 activations
+are read directly; small activations use one fused Triton NCHWc pack.
 
 ---
 
@@ -92,15 +89,16 @@ y = conv2d(
 )
 ```
 
-A shape-driven router picks one of five kernel families:
+A shape-driven router picks one of six kernel families:
 
 | Family | When it runs |
 |---|---|
 | 1×1 GEMM | `R==1, S==1` |
-| 3×3 cblocked (NCHW) | 3×3, channel-blocked input for coalesced loads |
+| Direct NCHW 3×3 | Large tuned NCHW activations; no input repack |
+| 3×3 cblocked (NCHW) | Small 3×3 activations using a fused NCHWc pack |
 | 3×3 NHWC | 3×3 with channels-last input — no input repack |
-| Winograd F(4×4, 3×3) | 3×3, stride=1, dilation=1, `C ≥ 512`, `K ≥ 512`, enough output tiles |
-| General | anything not 1×1 or 3×3 (5×5, 7×7, dilated, strided) |
+| Winograd F(4×4, 3×3) | Eligible non-wave32 targets where transforms amortize |
+| General | non-1×1/3×3 and narrow-channel NCHW 3×3 |
 
 ### Use as `nn.Conv2d` drop-in
 
@@ -210,7 +208,8 @@ Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`
 ### Tuning
 
 Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
-file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json`. The loader walks
+file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json` and
+`gfx1201-CONV-PREPACK.json`. The loader walks
 three tiers: literal shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.
@@ -239,13 +238,14 @@ in `_triton_kernels/conv/conv_*.py` for the current process.
 ```
 aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
-  _launch.py                          Grid setup + _select_3x3_method
-  _prepack.py                         Weight repack caches (LRU) + input packer
+  _launch.py                          Triton launches, grids + config selection
+  _prepack.py                         Pack allocation/transforms + weight caches
   _utils.py                           Shape math, eligibility predicates
   README.md, DESIGN.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
-  (1x1, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
+  (1x1, direct NCHW/cblocked/NHWC 3x3, general, 5 Winograd kernels)
+  nchw_to_cblocked.py                    Fused NCHW-to-NCHWc layout kernel
 
 op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped on unsupported archs)
   test_conv2d.py                      The only collected test file

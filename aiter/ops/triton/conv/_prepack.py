@@ -18,7 +18,8 @@ from collections import OrderedDict
 
 import torch
 
-from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
+from aiter.ops.triton.conv._launch import _launch_nchw_to_cblocked
+from aiter.ops.triton.conv._utils import BLOCK_K
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
 
@@ -67,6 +68,20 @@ _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
 
 
+def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
+    """Identity for a packed weight, including aliases and in-place updates."""
+    return (
+        w.data_ptr(),
+        w.device.type,
+        w.device.index,
+        tuple(w.shape),
+        tuple(w.stride()),
+        w.dtype,
+        w._version,
+        block,
+    )
+
+
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
     K_out, C, R, S = w_oihw.shape
     K_red = C * R * S
@@ -81,12 +96,7 @@ def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
 
 
 def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_k,
-    )
+    key = _pack_cache_key(w_oihw, block_k)
     entry = _PACK_CACHE.get(key)
     if entry is not None:
         return entry[1]
@@ -110,12 +120,7 @@ def prepack_oihw_to_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
 
 
 def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_c,
-    )
+    key = _pack_cache_key(w_oihw, block_c)
     cached = _PACK_CACHE_3x3.get(key)
     if cached is not None:
         return cached[1]
@@ -125,24 +130,21 @@ def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
 
 
 def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
-    """Pack NCHW input into channel-blocked layout [N, C_blocks, H, W, Cb].
+    """Materialize NCHW as [N, C_blocks, H, W, Cb] in one Triton pass.
 
     Within each block of Cb channels, data is contiguous (stride=1).
     """
+    if not x.is_contiguous():
+        x = x.contiguous()
     N, C, H, W = x.shape
     Cb = block_c
     C_blocks = (C + Cb - 1) // Cb
     C_pad = C_blocks * Cb
 
-    if C_pad != C:
-        x_padded = torch.zeros((N, C_pad, H, W), device=x.device, dtype=x.dtype)
-        x_padded[:, :C, :, :] = x
-    else:
-        x_padded = x
-
-    x_blocked = (
-        x_padded.reshape(N, C_blocks, Cb, H, W).permute(0, 1, 3, 4, 2).contiguous()
+    x_blocked = torch.empty(
+        (N, C_blocks, H, W, Cb), device=x.device, dtype=x.dtype
     )
+    _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, Cb)
     return x_blocked, C_pad
 
 
@@ -178,12 +180,7 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
 
 
 def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_c,
-    )
+    key = _pack_cache_key(w_oihw, block_c)
     cached = _PACK_CACHE_WINOGRAD_F4X3.get(key)
     if cached is not None:
         return cached[1]

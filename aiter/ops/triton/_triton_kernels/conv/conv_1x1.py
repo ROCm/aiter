@@ -11,10 +11,12 @@ from ..activation import _gelu_tanh, _relu, _relu6
 from .helpers import CONV_AUTOTUNE_ENABLED
 
 
-def _get_config(shape_key=None, M=None):
+def _get_config(shape_key=None, M=None, variants=()):
     if CONV_AUTOTUNE_ENABLED:
         return {}
-    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M)
+    return get_conv_config(
+        "CONV-1X1", shape_key=shape_key, M=M, variants=variants
+    )
 
 
 _conv2d_1x1_kernel_repr = make_kernel_repr(
@@ -148,7 +150,7 @@ def _conv2d_1x1_kernel(
 
     # Bias
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     # Activation

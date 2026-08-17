@@ -29,23 +29,24 @@ def _conv_dims(x, w_oihw, stride, padding, dilation):
 
 def _alloc_output(N, K_out, P, Q, x, layout):
     """Allocate the output tensor, channels_last for nhwc else contiguous."""
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     if layout == "nhwc":
-        return y.to(memory_format=torch.channels_last)
-    return y
+        return torch.empty(
+            (N, K_out, P, Q),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last,
+        )
+    return torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
 
 
 def _prep_bias(bias):
-    """Cast bias to contiguous fp32 for the kernels, or None when absent."""
-    return bias.float().contiguous() if bias is not None else None
+    """Return a unit-stride bias without launching a dtype-conversion kernel.
 
-
-def _storage_ptr(t: torch.Tensor) -> int:
-    return (
-        t.untyped_storage().data_ptr()
-        if hasattr(t, "untyped_storage")
-        else t.storage().data_ptr()
-    )
+    The Triton epilogues promote fp16/bf16 bias values to fp32 while loading.
+    """
+    if bias is None:
+        return None
+    return bias if bias.stride(0) == 1 else bias.contiguous()
 
 
 def _is_1x1_conv(R, S, dilation):

@@ -11,10 +11,12 @@ from ..activation import _gelu_tanh, _relu, _relu6
 from .helpers import CONV_AUTOTUNE_ENABLED
 
 
-def _get_config(shape_key=None, M=None):
+def _get_config(shape_key=None, M=None, variants=()):
     if CONV_AUTOTUNE_ENABLED:
         return {}
-    return get_conv_config("CONV-GENERAL", shape_key=shape_key, M=M)
+    return get_conv_config(
+        "CONV-GENERAL", shape_key=shape_key, M=M, variants=variants
+    )
 
 
 _conv2d_general_kernel_repr = make_kernel_repr(
@@ -160,7 +162,7 @@ def _conv2d_general_kernel(
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     if ACTIVATION == "relu":
@@ -182,6 +184,11 @@ def _conv2d_general_kernel(
 
 # Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
 AUTOTUNE_GENERAL_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=8,

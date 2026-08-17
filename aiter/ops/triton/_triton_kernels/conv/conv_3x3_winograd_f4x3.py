@@ -957,7 +957,7 @@ def _winograd_f4x3_output_transform_kernel(
 
     # Bias
     if HAS_BIAS:
-        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0)
+        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         y00 += bias
         y01 += bias
         y02 += bias
