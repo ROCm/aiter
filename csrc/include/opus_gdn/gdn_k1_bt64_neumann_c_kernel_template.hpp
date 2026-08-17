@@ -7,11 +7,17 @@
 //
 // but deliberately does not form the legacy W/U factors.
 //
-// Grid: (ceil(T / 64), B * H), block: 256 threads (4 wave64 waves).
+// Dense grid: (ceil(T / 64), B * H), block: 256 threads (4 wave64 waves).
+// Packed varlen grid: (total_chunks, H), where blockIdx.x selects a global
+// chunk through chunk_indices instead of a per-batch chunk.
 // C layout: bf16 [B, T, H, 64], with the final dimension contiguous.
 #pragma once
 
+#include <cstdint>
+
 #include <hip/hip_runtime.h>
+
+#include "opus_gdn/gdn_defs.h"  // ceil_div
 
 struct gdn_k1_neumann_c_kargs {
     const void* __restrict__ ptr_k;       // bf16 [B, T, Hg, 128]
@@ -24,16 +30,22 @@ struct gdn_k1_neumann_c_kargs {
     int H;
     int Hg;  // key heads; H / Hg value heads share one key head, Hg == H for MHA
     int NT;                               // ceil(T / 64), per batch
+    // Packed varlen metadata.  Null for dense; when present B counts sequences,
+    // T is the packed token total, and every token-major pointer above uses the
+    // [1, total_tokens, ...] layout.
+    const int32_t* __restrict__ ptr_cu_seqlens;    // [N + 1]
+    const int32_t* __restrict__ ptr_chunk_indices; // [total_chunks, 2]
 };
 
-extern "C" __global__ void
-gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs);
+template <bool IS_VARLEN>
+__global__ void gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs);
 
 #ifdef __HIP_DEVICE_COMPILE__
 
 #include "opus_gdn/gdn_mfma_utils.h"
 
-extern "C" __global__ void __launch_bounds__(256, 3)
+template <bool IS_VARLEN>
+__global__ void __launch_bounds__(256, 3)
 gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
     using namespace gdn_mfma;
 
@@ -52,25 +64,59 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
     // Keep all exits uniform because the kernel contains block barriers.
     if (kargs.B <= 0 || kargs.T <= 0 || kargs.H <= 0 || kargs.NT <= 0)
         return;
-    if (static_cast<int>(blockIdx.x) >= kargs.NT)
-        return;
 
-    const int i_t = static_cast<int>(blockIdx.x);
-    const int i_bh = static_cast<int>(blockIdx.y);
-    const int i_b = i_bh / kargs.H;
-    const int i_h = i_bh % kargs.H;
+    // Dense blocks own one chunk of one (batch, head); packed blocks take the
+    // (sequence, chunk) pair from chunk_indices and slice the head extent
+    // across y/z, matching the W/U K1 and K6 grids.
+    int i_t, i_b, i_h;
+    if constexpr (IS_VARLEN) {
+        const int i_chunk = static_cast<int>(blockIdx.x);
+        i_b = kargs.ptr_chunk_indices[2 * i_chunk];
+        i_t = kargs.ptr_chunk_indices[2 * i_chunk + 1];
+        const int64_t i_h_flat =
+            static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+        if (i_h_flat >= kargs.H)
+            return;
+        i_h = static_cast<int>(i_h_flat);
+    } else {
+        if (static_cast<int>(blockIdx.x) >= kargs.NT)
+            return;
+        i_t = static_cast<int>(blockIdx.x);
+        const int i_bh = static_cast<int>(blockIdx.y);
+        i_b = i_bh / kargs.H;
+        i_h = i_bh % kargs.H;
+    }
     if (i_b >= kargs.B)
         return;
 
     const int chunk_start = i_t * BT;
-    if (chunk_start >= kargs.T)
+    // Dense sequences all start at i_b * T and share the uniform length; a
+    // packed sequence starts at its own bos, so every tail predicate below is
+    // expressed against seq_len rather than against the packed token total.
+    // bos stays 64-bit so the dense product keeps its original width; a packed
+    // bos arrives from int32 metadata and cannot overflow either way.
+    int64_t bos;
+    int seq_len;
+    if constexpr (IS_VARLEN) {
+        const int seq_bos = kargs.ptr_cu_seqlens[i_b];
+        const int eos = kargs.ptr_cu_seqlens[i_b + 1];
+        if (seq_bos < 0 || eos <= seq_bos || eos > kargs.T)
+            return;
+        bos = seq_bos;
+        seq_len = eos - seq_bos;
+        if (i_t >= ceil_div(seq_len, BT))
+            return;
+    } else {
+        bos = static_cast<int64_t>(i_b) * kargs.T;
+        seq_len = kargs.T;
+    }
+    if (chunk_start >= seq_len)
         return;
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
-    const int64_t global_token_base =
-        static_cast<int64_t>(i_b) * kargs.T + chunk_start;
+    const int64_t global_token_base = bos + chunk_start;
     const int64_t global_head_base =
         global_token_base * kargs.H + i_h;
     // k is the only key-head input; g/beta/g_cumsum/C stay value-head indexed.
@@ -109,12 +155,12 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
 
     for (int row = tid; row < BT; row += BS) {
         const int token = chunk_start + row;
-        s_beta[row] = token < kargs.T ? beta_base[row * kargs.H] : 0.0f;
+        s_beta[row] = token < seq_len ? beta_base[row * kargs.H] : 0.0f;
     }
 
     if (warp_id == 0) {
         const int token = chunk_start + lane_id;
-        float value = token < kargs.T ? g_base[lane_id * kargs.H] : 0.0f;
+        float value = token < seq_len ? g_base[lane_id * kargs.H] : 0.0f;
 #pragma unroll
         for (int offset = 1; offset < BT; offset <<= 1) {
             const float upper = __shfl_up(value, offset, BT);
@@ -133,7 +179,7 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
         + global_head_base;
     for (int row = tid; row < BT; row += BS) {
         const int token = chunk_start + row;
-        if (token < kargs.T)
+        if (token < seq_len)
             g_cumsum_base[row * kargs.H] = s_g[row];
     }
 
@@ -149,7 +195,7 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
         const int col = (i % K_VECS_PER_ROW) * 8;
         const int token = chunk_start + row;
         v8bf16_t value{};
-        if (token < kargs.T) {
+        if (token < seq_len) {
             value = *reinterpret_cast<const v8bf16_t*>(
                 &k_base[row * k_token_stride + col]);
         }
@@ -447,7 +493,7 @@ gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs kargs) {
     for (int i = tid; i < BT * C_VECS_PER_ROW; i += BS) {
         const int row = i / C_VECS_PER_ROW;
         const int col = (i % C_VECS_PER_ROW) * 8;
-        if (chunk_start + row < kargs.T) {
+        if (chunk_start + row < seq_len) {
             const int offset = row * A_STRIDE + col;
             const v8bf16_t value = {
                 static_cast<__bf16>(s_A[offset]),

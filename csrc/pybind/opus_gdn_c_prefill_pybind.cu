@@ -9,7 +9,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "_opus_gdn_c_prefill_fwd",
         &opus_gdn_c_prefill_fwd,
-        "Dense gfx942 C-input GDN prefill forward",
+        "gfx942 C-input GDN prefill forward (dense or packed varlen)",
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
@@ -19,6 +19,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("scale"),
         py::arg("initial_state"),
         py::arg("final_state"),
+        py::arg("cu_seqlens"),
+        py::arg("chunk_indices"),
+        py::arg("chunk_offsets"),
         py::arg("has_initial_state"),
         py::arg("output_final_state"),
         py::arg("c_mode"),

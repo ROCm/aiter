@@ -7,11 +7,20 @@
 #include "opus_gdn/gdn_k1_bt64_neumann_c_kernel_template.hpp"
 
 #ifndef __HIP_DEVICE_COMPILE__
-
 // hipcc's host pass needs a body from which it can emit the launch stub; the
 // device pass gets the real MFMA implementation from the header above.
-extern "C" __global__ void
-gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs) {}
+template <bool IS_VARLEN>
+__global__ void gdn_k1_neumann_c_kernel(gdn_k1_neumann_c_kargs) {}
+#endif
+
+// Both passes must see these: the device pass emits the code objects and the
+// host pass emits the matching launch stubs.
+template __global__ void gdn_k1_neumann_c_kernel<false>(
+    gdn_k1_neumann_c_kargs);
+template __global__ void gdn_k1_neumann_c_kernel<true>(
+    gdn_k1_neumann_c_kargs);
+
+#ifndef __HIP_DEVICE_COMPILE__
 
 extern "C" hipError_t opus_gdn_k1_c_fwd(
     const void* ptr_k,
@@ -23,6 +32,9 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
     int T,
     int H,
     int Hg,
+    const void* ptr_cu_seqlens,
+    const void* ptr_chunk_indices,
+    int total_chunks,
     hipStream_t stream) {
     if (ptr_k == nullptr || ptr_g == nullptr || ptr_beta == nullptr
         || ptr_c == nullptr || ptr_g_cumsum == nullptr
@@ -32,6 +44,15 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
     }
     // H value heads share Hg key heads; Hg == H is plain MHA.
     if (Hg <= 0 || Hg > H || H % Hg != 0) {
+        return hipErrorInvalidValue;
+    }
+    // Packed batches carry both metadata tensors and a positive chunk count;
+    // dense batches carry neither.
+    const bool is_varlen = ptr_cu_seqlens != nullptr;
+    if (is_varlen != (ptr_chunk_indices != nullptr)) {
+        return hipErrorInvalidValue;
+    }
+    if (is_varlen ? total_chunks <= 0 : total_chunks != 0) {
         return hipErrorInvalidValue;
     }
 
@@ -72,10 +93,30 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
         T,
         H,
         Hg,
-        NT};
+        NT,
+        static_cast<const int32_t*>(ptr_cu_seqlens),
+        static_cast<const int32_t*>(ptr_chunk_indices)};
+
+    if (is_varlen) {
+        // One block per (global chunk, head).  The chunk axis already spans
+        // every sequence, so the head axis alone stays inside the 16-bit
+        // blockIdx.y extent for any supported head count.
+        if (H > 65535) {
+            return hipErrorInvalidValue;
+        }
+        hipLaunchKernelGGL(
+            (gdn_k1_neumann_c_kernel<true>),
+            dim3(static_cast<unsigned int>(total_chunks),
+                 static_cast<unsigned int>(H)),
+            dim3(256),
+            dynamic_smem_bytes,
+            stream,
+            kargs);
+        return hipGetLastError();
+    }
 
     hipLaunchKernelGGL(
-        gdn_k1_neumann_c_kernel,
+        (gdn_k1_neumann_c_kernel<false>),
         dim3(static_cast<unsigned int>(NT), static_cast<unsigned int>(bh)),
         dim3(256),
         dynamic_smem_bytes,

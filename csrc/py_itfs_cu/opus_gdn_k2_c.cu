@@ -71,6 +71,26 @@ using gdn_k2_c_bt64_split_scan_traits =
                     false, true, false, 2, false, true, true,
                     (BV == 64), true, true, true, false, true, 2, true>;
 
+// Packed varlen C-input kernels.  This family emits no token-tail predicate at
+// all, so a packed batch only needs the metadata addressing and the host
+// guarantees BT divides every sequence; that is why there is no separate
+// aligned/ragged pair the way the W/U fused kernel has.  Only the measured
+// default fused variant is packed-aware, matching the split scan's BV sweep.
+using gdn_k2_c_bt64_varlen_fused_traits = gdn_varlen_traits<
+    gdn_k2_c_bt64_low_lds_wave_owned_fused_prefetch_d2_traits>;
+template <int BV>
+using gdn_k2_c_bt64_varlen_split_scan_traits =
+    gdn_varlen_traits<gdn_k2_c_bt64_split_scan_traits<BV>>;
+
+// Packed varlen K6 for the split C path.  Both forms are already instantiated
+// by opus_gdn_k2_out.cu, which this module also compiles.  Aligned is the
+// default because a packed C batch is BT-aligned by contract; the predicated
+// generic form stays available as the runtime rollback.
+using gdn_k2_c_varlen_out_aligned_traits = gdn_varlen_aligned_traits<
+    gdn_k2_out_traits<gdn_k2_traits<64, 128, 128, 128, 8>, true, false>>;
+using gdn_k2_c_varlen_out_generic_traits = gdn_varlen_traits<
+    gdn_k2_out_traits<gdn_k2_traits<64, 128, 128, 128, 8>>>;
+
 template __global__ void
 gdn_k2_c_kernel<gdn_k2_c_bt64_traits>(gdn_k2_c_kargs);
 template __global__ void
@@ -115,6 +135,14 @@ template __global__ void
 gdn_k2_c_kernel<gdn_k2_c_bt64_split_scan_traits<32>>(gdn_k2_c_kargs);
 template __global__ void
 gdn_k2_c_kernel<gdn_k2_c_bt64_split_scan_traits<64>>(gdn_k2_c_kargs);
+template __global__ void
+gdn_k2_c_kernel<gdn_k2_c_bt64_varlen_fused_traits>(gdn_k2_c_kargs);
+template __global__ void
+gdn_k2_c_kernel<gdn_k2_c_bt64_varlen_split_scan_traits<16>>(gdn_k2_c_kargs);
+template __global__ void
+gdn_k2_c_kernel<gdn_k2_c_bt64_varlen_split_scan_traits<32>>(gdn_k2_c_kargs);
+template __global__ void
+gdn_k2_c_kernel<gdn_k2_c_bt64_varlen_split_scan_traits<64>>(gdn_k2_c_kargs);
 
 namespace {
 
@@ -156,6 +184,29 @@ void check_bth_scalar(const torch::Tensor& tensor,
                 name, " has an unexpected shape");
 }
 
+dim3 flat_y_grid(unsigned int x, int64_t logical_y) {
+    // gfx942 exposes only a 16-bit blockIdx.y/z.  A packed batch can hold far
+    // more (sequence, head) pairs than that, so keep the dense grid exactly and
+    // slice any larger logical extent across z.
+    constexpr int64_t SAFE_GRID_Y = 65535;
+    TORCH_CHECK(logical_y > 0 && logical_y <= std::numeric_limits<int>::max(),
+                "logical grid y must be positive and fit in int, got ",
+                logical_y);
+    const auto y = static_cast<unsigned int>(
+        logical_y < SAFE_GRID_Y ? logical_y : SAFE_GRID_Y);
+    const auto z = static_cast<unsigned int>(
+        logical_y / y + (logical_y % y != 0));
+    TORCH_CHECK(z <= SAFE_GRID_Y,
+                "logical grid y requires too many z slices: ", z);
+    return dim3(x, y, z);
+}
+
+void check_varlen_metadata(const torch::Tensor& tensor,
+                           const char* name,
+                           const c10::Device& device) {
+    check_cuda_contiguous(tensor, name, at::kInt, device);
+}
+
 void check_state(const torch::Tensor& tensor,
                  const char* name,
                  const c10::Device& device,
@@ -170,9 +221,11 @@ void check_state(const torch::Tensor& tensor,
 
 } // namespace
 
-// Internal dense ABI for the C-input backend.  The public launcher resolves
-// auto into an explicit mode before entering this translation unit:
+// Internal ABI for the C-input backend.  The public launcher resolves auto into
+// an explicit mode before entering this translation unit:
 //   1 = CF (fused recurrence/output), 2 = CS (split scan + shared K6).
+// An empty cu_seqlens selects the dense layout; otherwise q/k/v are packed as
+// [1, total_tokens, ...] and B below counts sequences.
 void opus_gdn_k2_c_fwd(torch::Tensor q,
                        torch::Tensor k,
                        torch::Tensor v,
@@ -182,6 +235,9 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
                        torch::Tensor o,
                        torch::Tensor initial_state,
                        torch::Tensor final_state,
+                       torch::Tensor cu_seqlens,
+                       torch::Tensor chunk_indices,
+                       torch::Tensor chunk_offsets,
                        bool has_initial_state,
                        bool output_final_state,
                        float scale,
@@ -220,8 +276,46 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
                 "B * H must fit in a signed kernel grid index");
     TORCH_CHECK(H <= std::numeric_limits<int>::max() / (64 * 128),
                 "one BT64 HBM tile stride must fit in int");
-    const int64_t bh64 = B * H;
-    const unsigned int grid_bh = static_cast<unsigned int>(bh64);
+
+    // Packed batches replace the batch axis with a sequence axis.  The C-input
+    // kernels carry no token-tail predicate, so a packed batch is only
+    // supported when BT divides every sequence; total_chunks * BT == T is
+    // exactly that condition.
+    const bool is_varlen = cu_seqlens.defined() && cu_seqlens.numel() != 0;
+    int64_t num_sequences = B;
+    int64_t total_chunks = T / 64;
+    if (is_varlen) {
+        TORCH_CHECK(B == 1,
+                    "packed varlen expects q/k/v batch dimension B=1, got ", B);
+        check_varlen_metadata(cu_seqlens, "cu_seqlens", device);
+        check_varlen_metadata(chunk_indices, "chunk_indices", device);
+        check_varlen_metadata(chunk_offsets, "chunk_offsets", device);
+        TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2,
+                    "cu_seqlens must have shape [N + 1]");
+        num_sequences = cu_seqlens.numel() - 1;
+        TORCH_CHECK(chunk_offsets.dim() == 1 &&
+                        chunk_offsets.numel() == num_sequences + 1,
+                    "chunk_offsets must have shape [N + 1]");
+        TORCH_CHECK(chunk_indices.dim() == 2 && chunk_indices.size(1) == 2 &&
+                        chunk_indices.size(0) > 0,
+                    "chunk_indices must have shape [total_chunks, 2]");
+        total_chunks = chunk_indices.size(0);
+        TORCH_CHECK(total_chunks * 64 == T,
+                    "the C-input packed path requires every sequence length to "
+                    "be a multiple of BT=64; got total_tokens=", T,
+                    " for ", total_chunks, " chunks");
+        TORCH_CHECK(num_sequences <= std::numeric_limits<int>::max() / H,
+                    "N * H must fit in a signed kernel grid index");
+    } else {
+        TORCH_CHECK(!chunk_indices.defined() || chunk_indices.numel() == 0,
+                    "chunk_indices must be empty for dense input");
+        TORCH_CHECK(!chunk_offsets.defined() || chunk_offsets.numel() == 0,
+                    "chunk_offsets must be empty for dense input");
+    }
+    // Every grid and buffer below is indexed by the logical sequence axis,
+    // which is the batch axis for dense input and N for a packed batch.
+    const int64_t nh64 = num_sequences * H;
+    const unsigned int grid_bh = static_cast<unsigned int>(nh64);
 
     check_bth(k, "k", at::kBFloat16, device, B, T, Hg, 128);
     check_bth(v, "v", at::kBFloat16, device, B, T, H, 128);
@@ -230,11 +324,12 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
     check_bth_scalar(g, "g", device, B, T, H);
     check_bth(o, "o", at::kBFloat16, device, B, T, H, 128);
 
+    // State is per sequence, so a packed batch carries N entries rather than B.
     if (has_initial_state) {
-        check_state(initial_state, "initial_state", device, B, H);
+        check_state(initial_state, "initial_state", device, num_sequences, H);
     }
     if (output_final_state) {
-        check_state(final_state, "final_state", device, B, H);
+        check_state(final_state, "final_state", device, num_sequences, H);
     }
 
     const int NT = static_cast<int>(T / 64);
@@ -252,7 +347,9 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         output_final_state
             ? reinterpret_cast<float*>(final_state.data_ptr())
             : nullptr,
-        static_cast<int>(B),
+        // The kernel derives (sequence, head) from this extent, so a packed
+        // batch reports its sequence count here instead of the B=1 token axis.
+        static_cast<int>(num_sequences),
         static_cast<int>(T),
         static_cast<int>(H),
         static_cast<int>(Hg),
@@ -262,6 +359,8 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         scale,
         nullptr,
         nullptr,
+        is_varlen ? cu_seqlens.data_ptr<int32_t>() : nullptr,
+        is_varlen ? chunk_offsets.data_ptr<int32_t>() : nullptr,
     };
 
     const dim3 block(256);
@@ -273,7 +372,11 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
     const bool split_scan = c_mode == 2;
     if (split_scan) {
         auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-        auto h_snap = torch::empty({B, NT, H, 128, 128}, opts_bf16);
+        // Dense snapshots are indexed per batch chunk; packed snapshots are a
+        // flat run over every sequence's chunks, which chunk_offsets indexes.
+        auto h_snap = is_varlen
+            ? torch::empty({1, total_chunks, H, 128, 128}, opts_bf16)
+            : torch::empty({B, NT, H, 128, 128}, opts_bf16);
         args.ptr_h_snap = h_snap.data_ptr();
         // The split scan writes corrected values into the final output.  K6
         // reads its complete CTA tile before replacing it in place.
@@ -282,7 +385,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         // On the local 80-CU gfx942, BV16 wins through roughly 20
         // chunk-head chains; above that point BV64 avoids redundant C/K/V
         // traffic and wins the measured BV16/32/64 sweep.
-        int scan_bv = bh64 <= 20 ? 16 : 64;
+        int scan_bv = nh64 <= 20 ? 16 : 64;
         if (use_env_overrides) {
             if (const char* env = std::getenv("OPUS_GDN_K2C_SCAN_BV")) {
                 scan_bv = std::atoi(env);
@@ -290,7 +393,11 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         }
         TORCH_CHECK(scan_bv == 16 || scan_bv == 32 || scan_bv == 64,
                     "OPUS_GDN_K2C_SCAN_BV must be 16, 32, or 64");
-        int out_bv = static_cast<int64_t>(NT) * bh64 >= 128 ? 128 : 64;
+        // The packed K6 spends blockIdx.x on the flattened chunk axis, so it has
+        // no V-tile axis left and needs one full-width tile.
+        int out_bv = is_varlen
+            ? 128
+            : (static_cast<int64_t>(NT) * nh64 >= 128 ? 128 : 64);
         if (use_env_overrides) {
             if (const char* env = std::getenv("OPUS_GDN_K2C_OUT_BV")) {
                 out_bv = std::atoi(env);
@@ -298,6 +405,8 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         }
         TORCH_CHECK(out_bv == 64 || out_bv == 128,
                     "OPUS_GDN_K2C_OUT_BV must be 64 or 128");
+        TORCH_CHECK(!is_varlen || out_bv == 128,
+                    "the packed K6 requires OPUS_GDN_K2C_OUT_BV=128");
         int out_variant = 1;
         if (use_env_overrides) {
             if (const char* env = std::getenv("OPUS_GDN_OUT_VARIANT")) {
@@ -307,6 +416,10 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         TORCH_CHECK(out_variant >= 0 && out_variant <= 2,
                     "OPUS_GDN_OUT_VARIANT must be 0 (generic), "
                     "1 (dense forward), or 2 (dense reverse)");
+        // Reverse chunk scheduling is a dense-only K6 specialization.
+        TORCH_CHECK(!is_varlen || out_variant != 2,
+                    "the packed K6 accepts OPUS_GDN_OUT_VARIANT 0 (generic) "
+                    "or 1 (aligned), not 2 (dense reverse)");
         if (out_variant != 0) {
             // T%64 is already a contract of this C-input launcher; keep the
             // value-tile condition next to the specialization dispatch.
@@ -314,14 +427,23 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
                         "dense K6 requires complete BT64 and BV tiles");
         }
 
-        #define LAUNCH_C_SCAN(BVP) do { \
-            using ST = gdn_k2_c_bt64_split_scan_traits<BVP>; \
-            const dim3 scan_grid(128 / BVP, grid_bh); \
-            gdn_k2_c_kernel<ST><<<scan_grid, block, ST::smem_size_bytes(), stream>>>(args); \
+        #define LAUNCH_C_SCAN(TY, BVP) do { \
+            const dim3 scan_grid = is_varlen \
+                ? flat_y_grid(128 / BVP, nh64) \
+                : dim3(128 / BVP, grid_bh); \
+            gdn_k2_c_kernel<TY><<<scan_grid, block, TY::smem_size_bytes(), \
+                stream>>>(args); \
         } while (0)
-        if (scan_bv == 16) LAUNCH_C_SCAN(16);
-        else if (scan_bv == 32) LAUNCH_C_SCAN(32);
-        else LAUNCH_C_SCAN(64);
+        #define DISPATCH_C_SCAN(BVP) do { \
+            if (is_varlen) \
+                LAUNCH_C_SCAN(gdn_k2_c_bt64_varlen_split_scan_traits<BVP>, BVP); \
+            else \
+                LAUNCH_C_SCAN(gdn_k2_c_bt64_split_scan_traits<BVP>, BVP); \
+        } while (0)
+        if (scan_bv == 16) DISPATCH_C_SCAN(16);
+        else if (scan_bv == 32) DISPATCH_C_SCAN(32);
+        else DISPATCH_C_SCAN(64);
+        #undef DISPATCH_C_SCAN
         #undef LAUNCH_C_SCAN
 
         gdn_k2_kargs out_args{};
@@ -331,7 +453,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         out_args.ptr_o = o.data_ptr();
         out_args.ptr_h_snap = h_snap.data_ptr();
         out_args.ptr_v_new = o.data_ptr();
-        out_args.B = static_cast<int>(B);
+        out_args.B = static_cast<int>(num_sequences);
         out_args.T = static_cast<int>(T);
         out_args.H = static_cast<int>(H);
         out_args.Hg = static_cast<int>(Hg);
@@ -339,6 +461,11 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         out_args.V = 128;
         out_args.NT = NT;
         out_args.scale = scale;
+        if (is_varlen) {
+            out_args.ptr_cu_seqlens = cu_seqlens.data_ptr<int32_t>();
+            out_args.ptr_chunk_indices = chunk_indices.data_ptr<int32_t>();
+            out_args.ptr_chunk_offsets = chunk_offsets.data_ptr<int32_t>();
+        }
 
         #define LAUNCH_C_OUT(BVP, DENSEP, REVERSEP) do { \
             using OT = gdn_k2_out_traits< \
@@ -348,7 +475,22 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
             gdn_k2_out_kernel<OT><<<out_grid, dim3(OT::BLOCK_SIZE), \
                 OT::smem_out_bytes(), stream>>>(out_args); \
         } while (0)
-        if (out_bv == 64) {
+        // The packed K6 owns one (global chunk, head) pair, so chunk_indices
+        // replaces the dense (chunk, batch*head) grid axes entirely.
+        #define LAUNCH_C_OUT_VARLEN(TY) do { \
+            using OT = TY; \
+            const dim3 out_grid = flat_y_grid( \
+                static_cast<unsigned int>(total_chunks), H); \
+            gdn_k2_out_kernel<OT><<<out_grid, dim3(OT::BLOCK_SIZE), \
+                OT::smem_out_bytes(), stream>>>(out_args); \
+        } while (0)
+        if (is_varlen) {
+            if (out_variant == 1) {
+                LAUNCH_C_OUT_VARLEN(gdn_k2_c_varlen_out_aligned_traits);
+            } else {
+                LAUNCH_C_OUT_VARLEN(gdn_k2_c_varlen_out_generic_traits);
+            }
+        } else if (out_bv == 64) {
             if (out_variant == 1) LAUNCH_C_OUT(64, true, false);
             else if (out_variant == 2) LAUNCH_C_OUT(64, true, true);
             else LAUNCH_C_OUT(64, false, false);
@@ -357,6 +499,7 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
             else if (out_variant == 2) LAUNCH_C_OUT(128, true, true);
             else LAUNCH_C_OUT(128, false, false);
         }
+        #undef LAUNCH_C_OUT_VARLEN
         #undef LAUNCH_C_OUT
 
         const hipError_t split_status = hipGetLastError();
@@ -366,7 +509,8 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         return;
     }
 
-    const dim3 grid(128 / 64, grid_bh);
+    const dim3 grid = is_varlen ? flat_y_grid(128 / 64, nh64)
+                                : dim3(128 / 64, grid_bh);
     // The two-pack Phase-D candidate is the validated default.  Keep the
     // environment override so variants 0-15 remain available for rollback
     // and controlled ceiling studies.
@@ -375,6 +519,21 @@ void opus_gdn_k2_c_fwd(torch::Tensor q,
         if (const char* env = std::getenv("OPUS_GDN_K2C_VARIANT")) {
             variant = std::atoi(env);
         }
+    }
+    if (is_varlen) {
+        // Only the measured default carries the packed addressing; the rollback
+        // variants stay dense so a packed request cannot silently pick one.
+        TORCH_CHECK(variant == 16,
+                    "packed varlen fused C-input requires "
+                    "OPUS_GDN_K2C_VARIANT=16, got ", variant);
+        using VT = gdn_k2_c_bt64_varlen_fused_traits;
+        gdn_k2_c_kernel<VT>
+            <<<grid, block, VT::smem_size_bytes(), stream>>>(args);
+        const hipError_t varlen_status = hipGetLastError();
+        TORCH_CHECK(varlen_status == hipSuccess,
+                    "packed gdn_k2_c_kernel launch failed: ",
+                    hipGetErrorString(varlen_status));
+        return;
     }
     if (variant == 16) {
         gdn_k2_c_kernel<gdn_k2_c_bt64_low_lds_wave_owned_fused_prefetch_d2_traits>

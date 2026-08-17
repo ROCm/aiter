@@ -82,8 +82,22 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
                       O_E_M == 1 && O_E_N == BV / W,
                   "the hand-written layout assumes the fixed 4-wave tiling");
 
+    constexpr bool IS_VARLEN = T::IS_VARLEN;
+
     const int i_v = blockIdx.x;
-    const int i_nh = blockIdx.y;
+    // A packed batch can hold far more sequences than blockIdx.y alone can
+    // address, so varlen slices the logical (sequence, head) extent across y
+    // and z the way K1 and K6 already do.
+    int i_nh;
+    if constexpr (IS_VARLEN) {
+        const int64_t flat_nh =
+            static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+        if (flat_nh >= static_cast<int64_t>(kargs.B) * kargs.H)
+            return;
+        i_nh = static_cast<int>(flat_nh);
+    } else {
+        i_nh = blockIdx.y;
+    }
     const int i_n = i_nh / kargs.H;
     const int i_h = i_nh % kargs.H;
     const int tid = threadIdx.x;
@@ -103,14 +117,31 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
     const int stride_v = H * V;
     const int stride_c = H * BT;
     const int stride_g = H;
+
+    // This CTA scans one sequence.  Dense sequences all start at i_n * T and
+    // share the uniform chunk count; a packed sequence starts at its own bos
+    // and stops after its own chunks.  The kernel emits no token-tail
+    // predicate, so the host guarantees BT divides every packed sequence and
+    // the chunk count below is exact rather than rounded up.
+    int num_chunks = NT;
+    int64_t token_row_base = static_cast<int64_t>(i_n) * kargs.T;
+    int64_t snapshot_chunk_base = static_cast<int64_t>(i_n) * NT;
+    if constexpr (IS_VARLEN) {
+        const int bos = kargs.ptr_cu_seqlens[i_n];
+        num_chunks = (kargs.ptr_cu_seqlens[i_n + 1] - bos) / BT;
+        token_row_base = bos;
+        // Packed snapshots are a flat run over every sequence's chunks, which
+        // is exactly what chunk_offsets records.
+        snapshot_chunk_base = kargs.ptr_chunk_offsets[i_n];
+    }
+
     // Form the batch/token/head and state/head bases in 64-bit before any
     // dimension products.  Pointer addition cannot recover an offset that
     // has already overflowed a signed 32-bit intermediate.
-    const int64_t token_head_base =
-        (static_cast<int64_t>(i_n) * kargs.T) * H + i_h;
+    const int64_t token_head_base = token_row_base * H + i_h;
     const int64_t token_key_head_base = (Hg == H)
         ? token_head_base
-        : (static_cast<int64_t>(i_n) * kargs.T) * Hg + i_h / (H / Hg);
+        : token_row_base * Hg + i_h / (H / Hg);
     const int64_t state_head_base = static_cast<int64_t>(i_n) * H + i_h;
 
     const int h_m_base = (warp_id / H_T_N) * W;
@@ -179,7 +210,7 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
     constexpr int KV_NVEC = BK_SUB / VEC;
 
     // Each CTA owns one V tile and must scan chunks in order for its state tile.
-    for (int i_t = 0; i_t < NT; ++i_t) {
+    for (int i_t = 0; i_t < num_chunks; ++i_t) {
         D_ACC* s_g = s_g_base
             + (T::RELAX_BARRIERS ? (i_t & 1) * BT : 0);
         const int t0 = i_t * BT;
@@ -251,8 +282,7 @@ __device__ void gdn_k2_c_kernel_impl(gdn_k2_c_kargs kargs) {
                 // already in the desired [V,K] orientation, so copy it with
                 // contiguous bf16x4 global stores while it feeds K@H.
                 D_ATTN* h_snap_ch = h_snap_hbm
-                    + ((static_cast<int64_t>(i_n) * NT + i_t) * H + i_h)
-                        * V * K;
+                    + ((snapshot_chunk_base + i_t) * H + i_h) * V * K;
                 constexpr int H_NVEC = BK_SUB / VEC;
                 for (int i = tid; i < BV * H_NVEC; i += BS) {
                     const int row = i / H_NVEC;

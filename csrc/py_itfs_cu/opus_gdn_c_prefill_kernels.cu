@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include "opus_gdn_c_prefill.h"
 
@@ -24,6 +25,9 @@ extern "C" hipError_t opus_gdn_k1_c_fwd(
     int T,
     int H,
     int Hg,
+    const void* ptr_cu_seqlens,
+    const void* ptr_chunk_indices,
+    int total_chunks,
     hipStream_t stream);
 
 void opus_gdn_k2_c_fwd(
@@ -36,6 +40,9 @@ void opus_gdn_k2_c_fwd(
     torch::Tensor o,
     torch::Tensor initial_state,
     torch::Tensor final_state,
+    torch::Tensor cu_seqlens,
+    torch::Tensor chunk_indices,
+    torch::Tensor chunk_offsets,
     bool has_initial_state,
     bool output_final_state,
     float scale,
@@ -163,6 +170,9 @@ void opus_gdn_c_prefill_fwd(
     float scale,
     torch::Tensor initial_state,
     torch::Tensor final_state,
+    torch::Tensor cu_seqlens,
+    torch::Tensor chunk_indices,
+    torch::Tensor chunk_offsets,
     bool has_initial_state,
     bool output_final_state,
     int c_mode,
@@ -208,14 +218,47 @@ void opus_gdn_c_prefill_fwd(
     TORCH_CHECK(!o.is_alias_of(v), "out must not alias v storage");
     check_bth(g, "g", device, B, T, H);
     check_bth(beta, "beta", device, B, T, H);
+
+    // A packed batch folds every sequence into the token axis, so the state and
+    // the auto policy below are sized by the sequence count rather than by B.
+    // The C-input kernels emit no token-tail predicate, hence the BT-multiple
+    // requirement that total_chunks * 64 == T expresses.
+    const bool is_varlen = cu_seqlens.defined() && cu_seqlens.numel() != 0;
+    int64_t num_sequences = B;
+    if (is_varlen) {
+        TORCH_CHECK(B == 1, "packed varlen expects B=1, got ", B);
+        for (const auto& item : {
+                 std::pair<const char*, torch::Tensor>("cu_seqlens", cu_seqlens),
+                 std::pair<const char*, torch::Tensor>(
+                     "chunk_indices", chunk_indices),
+                 std::pair<const char*, torch::Tensor>(
+                     "chunk_offsets", chunk_offsets)}) {
+            check_tensor(item.second, item.first, at::kInt, device);
+        }
+        TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2,
+                    "cu_seqlens must have shape [N + 1]");
+        num_sequences = cu_seqlens.numel() - 1;
+        TORCH_CHECK(chunk_indices.dim() == 2 && chunk_indices.size(1) == 2 &&
+                        chunk_indices.size(0) > 0,
+                    "chunk_indices must have shape [total_chunks, 2]");
+        TORCH_CHECK(chunk_indices.size(0) * 64 == T,
+                    "the C-input packed path requires every sequence length to "
+                    "be a multiple of BT=64");
+    }
     if (has_initial_state) {
-        check_state(initial_state, "initial_state", device, B, H);
+        check_state(initial_state, "initial_state", device, num_sequences, H);
     }
     if (output_final_state) {
-        check_state(final_state, "final_state", device, B, H);
+        check_state(final_state, "final_state", device, num_sequences, H);
     }
 
-    const int resolved_mode = resolve_c_mode(c_mode, T, B * H);
+    const int64_t total_chunks = is_varlen ? chunk_indices.size(0) : T / 64;
+    // The CS auto region is a dense grid-starvation policy keyed on a per-batch
+    // T, which a packed token total does not describe, so auto takes the
+    // family's general-purpose CF path and only an explicit c_mode picks CS.
+    const int resolved_mode = (is_varlen && c_mode == kCModeAuto)
+        ? kCModeFused
+        : resolve_c_mode(c_mode, T, num_sequences * H);
     auto bf16_options =
         torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     auto fp32_options =
@@ -233,10 +276,15 @@ void opus_gdn_c_prefill_fwd(
         beta.data_ptr(),
         c.data_ptr(),
         g_cumsum.data_ptr(),
-        static_cast<int>(B),
+        // K1 resolves the sequence from chunk_indices when packed, so it takes
+        // the sequence count here for the same reason K2 does.
+        static_cast<int>(num_sequences),
         static_cast<int>(T),
         static_cast<int>(H),
         static_cast<int>(Hg),
+        is_varlen ? cu_seqlens.data_ptr() : nullptr,
+        is_varlen ? chunk_indices.data_ptr() : nullptr,
+        is_varlen ? static_cast<int>(total_chunks) : 0,
         stream);
     TORCH_CHECK(
         k1_status == hipSuccess,
@@ -253,6 +301,9 @@ void opus_gdn_c_prefill_fwd(
         o,
         initial_state,
         final_state,
+        cu_seqlens,
+        chunk_indices,
+        chunk_offsets,
         has_initial_state,
         output_final_state,
         scale,
