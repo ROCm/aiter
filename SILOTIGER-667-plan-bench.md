@@ -283,15 +283,25 @@ the FlyDSL cold harness.
       scale) and output dtype (bf16). Flag any epilogue/scale difference; if the math differs,
       the pair is not comparable and is marked n/a.
 
-#### D5 — capture environment/provenance + run-to-run variance  [ ]
-- [ ] `compare.py` header records GPU model, ROCm version, arch, locked clocks, CK commit
-      (`62e30c9098`), and the aiter commit.
-- [ ] Run each config N times; report spread (CV or min/median/max) and flag noisy rows.
-      **This is now the primary defense against clock drift** (clocks can't be pinned on this
-      gfx950 — see D1): warm to steady-state boost before timing, sample the effective SCLK
-      during the sweep and record min/median/max in provenance, and flag any cell whose spread
-      exceeds a threshold as noisy. MCLK is fixed (2000) and SCLK is empirically stable
-      (~1789 under load), so expected spread is modest; N-repeat quantifies it.
+#### D5 — capture environment/provenance + run-to-run variance  [x]
+- [x] `compare.py` header records arch (`get_gfx()`), aiter commit, CK worktree commit
+      (`62e30c9098`), CK provenance line, iters/cold/timing/method/**repeats**, and the
+      effective loaded-SCLK min/median/max sampled during the run. (Full ROCm-version string
+      still available via `rocm-smi` if wanted; the header covers the perf-relevant provenance.)
+- [x] **N-repeat variance + effective-SCLK sampling (primary defense against clock drift,
+      since clocks can't be pinned on this gfx950 — see D1).** `--repeats N` (default 3) reruns
+      each full sweep; the headline `flydsl_us`/`ck_us` is the per-cell **median** and new
+      `fly_spr%`/`ck_spr%` columns report `100*(max-min)/median`. A cell is flagged **noisy**
+      (`--noise-pct`, default 5%) when either side's spread exceeds the threshold. A background
+      `ClockSampler` polls `rocm-smi --showgpuclocks` SCLK every 0.25s across the whole run and
+      records loaded (`≥400 MHz`) min/median/max into the provenance header.
+- [x] **Observed (2026-08-17, repeats=3, GPU 6):** under sustained load the GPU boosts to
+      **loaded SCLK median ~2391 MHz** (max 2404) — i.e. near the top {2400} DPM level, *higher*
+      than the ~1789 seen under a pure-matmul probe; the decode sweep keeps it pinned high.
+      Per-cell spread is **<1% for almost all cells**; CK is extremely stable (mostly <0.5%).
+      The only noisy (>5%) cells are the small/fast `down` cells (e.g. deepseek down fp4 B=1
+      ~7%, minimax down fp8 B=1/B=2 ~6–7%) — exactly the under-converged fast-cell regime D1
+      warned about. Artifact regenerated: `tickets/667/g9_compare_postroute.{md,csv}`.
 - [x] `%peak>100%` resolved (2026-08-17): was the shared-expert routing bug (FlyDSL read
       TOPK vs CK's B*TOPK per launch); after the distinct-per-token fix all cells are
       `%peak≤100%` (post-route table). `_HBM_PEAK_TBS=8.0` confirmed reasonable for gfx950.
@@ -423,6 +433,16 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   `auto`. Decided to keep `auto` and control variance in D5 (warm-to-steady + effective-SCLK
   sampling + N-repeat spread). Post-route numbers stand as-is (auto clocks); of-record run
   just needs the D5 variance capture, not a clock lock.
+- 2026-08-17 — **D5 variance capture DONE.** `compare.py` gained `--repeats N` (default 3;
+  headline us = per-cell median, new `fly_spr%`/`ck_spr%` = 100·(max−min)/median), a
+  `--noise-pct` (default 5%) noisy-cell flag, and a background `ClockSampler` that polls
+  `rocm-smi --showgpuclocks` SCLK @0.25s and folds loaded (≥400 MHz) min/median/max +
+  repeats into the provenance header. Regenerated `g9_compare_postroute.{md,csv}` (repeats=3):
+  effective **loaded SCLK median ~2391 MHz** under sustained load (near the top {2400} DPM
+  level — the decode sweep pins it higher than the ~1789 matmul probe). Spread is **<1% for
+  almost every cell**; CK is rock-steady (<0.5%). Only the small/fast `down` cells trip the
+  5% flag (deepseek down fp4 B=1 ~7%, minimax down fp8 B=1/B=2 ~6–7%), matching D1's
+  under-converged fast-cell caveat. ruff/py_compile clean.
 - 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
   measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
   entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in
