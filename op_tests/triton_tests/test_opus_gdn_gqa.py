@@ -7,8 +7,9 @@ v/g/beta/o/state carry ``H`` value heads, and ``H / Hg`` value heads share one
 key head. Every case is validated against the same problem expanded back to MHA
 with ``repeat_interleave``, which the Triton reference already supports.
 
-The W/U families (WS, WF) cover gfx942/gfx950; the C families (CF, CS) are
-gfx942-only and dense-only, matching their launcher.
+The W/U families (WS, WF) cover gfx942/gfx950 for both dense and packed input.
+The C families (CF, CS) are gfx942-only, and their packed support is restricted
+to BT-aligned sequences because those kernels carry no token-tail predicate.
 """
 
 from __future__ import annotations
@@ -364,6 +365,66 @@ def test_gqa_fused_wu_variants(
     )
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+
+
+@pytest.mark.parametrize("c_mode", (1, 2), ids=("cf", "cs"))
+@pytest.mark.parametrize(
+    ("lens", "key_heads", "value_heads"),
+    (
+        pytest.param([64], 1, 4, id="single-chunk"),
+        pytest.param([64, 128, 256], 2, 8, id="aligned-packed"),
+        pytest.param([128, 64], 1, 8, id="single-key-head"),
+        pytest.param([64, 64, 64], 4, 4, id="mha-baseline"),
+    ),
+)
+def test_packed_gqa_c_input_paths(
+    c_mode: int,
+    lens: list[int],
+    key_heads: int,
+    value_heads: int,
+) -> None:
+    """Packed C-input runs must resolve key heads per sequence, not per batch.
+
+    The packed path is BT-aligned only, so every length here is a multiple of
+    64; ragged coverage lives with the W/U families.
+    """
+    _require_c_device()
+    cu_seqlens = _cu_from_lens(lens)
+    q, k, v, g, beta, state = _make_inputs(
+        1,
+        sum(lens),
+        key_heads,
+        value_heads,
+        len(lens),
+        seed=20260817 + sum(lens) + value_heads,
+    )
+
+    actual, actual_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        c_mode=c_mode,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+    expected, expected_final = _expanded_mha_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    assert tuple(actual_final.shape) == (len(lens), value_heads, _D, _D)
     torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
 
 

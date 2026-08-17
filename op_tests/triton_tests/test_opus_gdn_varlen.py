@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 import aiter.ops.gdn_prefill as adapter
 import aiter.ops.opus_gdn_wu_prefill as opus_wu
+from aiter.ops.opus_gdn_c_prefill import opus_gdn_c_prefill_fwd
 from aiter.ops.opus_gdn_wu_prefill import (
     _prepare_opus_gdn_varlen_metadata,
     opus_gdn_wu_prefill_fwd,
@@ -29,6 +30,15 @@ def _require_opus_device() -> None:
     gfx = properties.gcnArchName.split(":", 1)[0]
     if gfx not in ("gfx942", "gfx950"):
         pytest.skip(f"Opus W/U kernels require gfx942/gfx950, got {gfx}")
+
+
+def _require_c_device() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("Opus GDN varlen requires a ROCm GPU")
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    gfx = properties.gcnArchName.split(":", 1)[0]
+    if gfx != "gfx942":
+        pytest.skip(f"Opus C-input kernels require gfx942, got {gfx}")
 
 
 def _cu_from_lens(lens: list[int]) -> torch.Tensor:
@@ -452,6 +462,262 @@ def test_opus_gdn_varlen_fused_matches_independent_dense_sequences() -> None:
     torch.testing.assert_close(
         packed_final, torch.cat(dense_finals, dim=0), rtol=1e-2, atol=2e-3
     )
+
+
+_C_ALIGNED_CASES = (
+    pytest.param([64], 1, id="single-chunk"),
+    pytest.param([64, 128, 256], 4, id="aligned-packed"),
+    pytest.param([128, 64], 2, id="descending"),
+    pytest.param([64, 64, 64, 64, 64, 64], 2, id="aligned-many-sequences"),
+    pytest.param([512], 8, id="long-single-sequence"),
+)
+
+
+@pytest.mark.parametrize("c_mode", (1, 2), ids=("cf", "cs"))
+@pytest.mark.parametrize(("lens", "heads"), _C_ALIGNED_CASES)
+@pytest.mark.parametrize(
+    ("with_initial_state", "output_final_state"),
+    (
+        pytest.param(False, False, id="stateless"),
+        pytest.param(True, True, id="state-io"),
+    ),
+)
+def test_opus_gdn_varlen_c_matches_triton(
+    c_mode: int,
+    lens: list[int],
+    heads: int,
+    with_initial_state: bool,
+    output_final_state: bool,
+) -> None:
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(
+        lens, heads, seed=20260817 + sum(lens) + heads
+    )
+    initial_state = state if with_initial_state else None
+
+    actual, actual_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        c_mode=c_mode,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+    expected, expected_final = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    if output_final_state:
+        assert actual_final is not None and expected_final is not None
+        assert actual_final.dtype == torch.float32
+        assert tuple(actual_final.shape) == (len(lens), heads, _D, _D)
+        torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+    else:
+        assert actual_final is None
+
+
+@pytest.mark.parametrize("c_mode", (0, 1, 2), ids=("auto", "cf", "cs"))
+@pytest.mark.parametrize("lens", ([15, 65], [64, 65], [1], [64, 63, 64]))
+def test_opus_gdn_varlen_c_rejects_ragged_sequences(
+    c_mode: int,
+    lens: list[int],
+) -> None:
+    # Every C-input kernel writes full BT tiles, so a ragged tail has to be
+    # rejected rather than silently padded into a neighbouring sequence.
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs(lens, 2, seed=90)
+
+    with pytest.raises(ValueError, match="multiple of 64"):
+        opus_gdn_c_prefill_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            c_mode=c_mode,
+            use_env_overrides=False,
+            cu_seqlens=cu_seqlens,
+        )
+
+
+@pytest.mark.parametrize("c_mode", (1, 2), ids=("cf", "cs"))
+def test_opus_gdn_varlen_c_matches_independent_dense_sequences(c_mode: int) -> None:
+    # The packed run must reproduce, sequence by sequence, what the dense kernel
+    # produces for that sequence alone: this is what proves the recurrence is
+    # reset at every bos instead of carrying state across the packed boundary.
+    _require_c_device()
+    lens = [64, 128, 192]
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(lens, 3, seed=91)
+
+    packed, packed_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        c_mode=c_mode,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    offset = 0
+    for sequence_id, length in enumerate(lens):
+        window = slice(offset, offset + length)
+        dense, dense_final = opus_gdn_c_prefill_fwd(
+            q[:, window].contiguous(),
+            k[:, window].contiguous(),
+            v[:, window].contiguous(),
+            g[:, window].contiguous(),
+            beta[:, window].contiguous(),
+            initial_state=state[sequence_id : sequence_id + 1],
+            output_final_state=True,
+            c_mode=c_mode,
+            use_env_overrides=False,
+        )
+        torch.testing.assert_close(packed[:, window], dense, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(
+            packed_final[sequence_id : sequence_id + 1],
+            dense_final,
+            rtol=1e-2,
+            atol=2e-3,
+        )
+        offset += length
+
+
+@pytest.mark.parametrize("scan_bv", ("16", "32", "64"))
+@pytest.mark.parametrize("out_variant", ("0", "1"))
+def test_opus_gdn_varlen_c_split_scan_and_output_variants(
+    scan_bv: str,
+    out_variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_c_device()
+    lens = [64, 192]
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(lens, 3, seed=92)
+    expected, expected_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        c_mode=1,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    monkeypatch.setenv("OPUS_GDN_K2C_SCAN_BV", scan_bv)
+    monkeypatch.setenv("OPUS_GDN_OUT_VARIANT", out_variant)
+    actual, actual_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        c_mode=2,
+        use_env_overrides=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_final, expected_final, rtol=1e-2, atol=2e-3)
+
+
+def test_opus_gdn_varlen_c_split_rejects_narrow_output_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The packed K6 spends blockIdx.x on the flattened chunk axis, so it has no
+    # V-tile axis left and only the full-width tile is valid.
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 64], 2, seed=93)
+    monkeypatch.setenv("OPUS_GDN_K2C_OUT_BV", "64")
+
+    with pytest.raises(RuntimeError, match="OPUS_GDN_K2C_OUT_BV=128"):
+        opus_gdn_c_prefill_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            c_mode=2,
+            use_env_overrides=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+
+def test_opus_gdn_varlen_c_fused_rejects_rollback_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only the measured default fused C kernel carries the packed addressing.
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 64], 2, seed=94)
+    monkeypatch.setenv("OPUS_GDN_K2C_VARIANT", "12")
+
+    with pytest.raises(RuntimeError, match="OPUS_GDN_K2C_VARIANT=16"):
+        opus_gdn_c_prefill_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            c_mode=1,
+            use_env_overrides=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+
+@pytest.mark.parametrize("path", ("cf", "cs"))
+def test_gdn_prefill_explicit_c_paths_run_packed_kernels(path: str) -> None:
+    _require_c_device()
+    lens = [64, 128, 64]
+    q, k, v, g, beta, cu_seqlens, state = _make_inputs(lens, 2, seed=95)
+    expected, expected_final = opus_gdn_c_prefill_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        c_mode=1 if path == "cf" else 2,
+        use_env_overrides=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    out = torch.empty_like(v)
+    actual, actual_final = adapter.gdn_prefill(
+        q,
+        k,
+        v,
+        o=out,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        path=path,
+    )
+
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_final, expected_final)
 
 
 def test_opus_gdn_varlen_metadata_cache_tracks_inplace_mutation() -> None:
@@ -930,12 +1196,19 @@ def test_varlen_explicit_wf_path_selects_wf(
     )
 
 
-@pytest.mark.parametrize("path", ("c", "cf", "cs"))
-def test_varlen_rejects_explicit_c_paths(path: str) -> None:
-    _require_opus_device()
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    (
+        pytest.param("c", "cf", id="c-resolves-to-cf"),
+        pytest.param("cf", "cf", id="cf"),
+        pytest.param("cs", "cs", id="cs"),
+    ),
+)
+def test_varlen_explicit_c_paths_select_c_family(path: str, expected: str) -> None:
+    _require_c_device()
     q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 64], 1, seed=63)
 
-    with pytest.raises(ValueError, match="W/U families only"):
+    assert (
         adapter.select_gdn_prefill_path(
             q,
             k,
@@ -945,6 +1218,45 @@ def test_varlen_rejects_explicit_c_paths(path: str) -> None:
             cu_seqlens=cu_seqlens,
             path=path,
         )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("path", ("c", "cf", "cs"))
+def test_varlen_rejects_explicit_c_paths_on_ragged_input(path: str) -> None:
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 65], 1, seed=63)
+
+    with pytest.raises(ValueError, match="multiple of 64"):
+        adapter.select_gdn_prefill_path(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            path=path,
+        )
+
+
+def test_varlen_auto_stays_on_ws_for_aligned_c_eligible_input() -> None:
+    # An aligned packed batch is addressable by the C families, but WS remains
+    # the measured packed family, so only an explicit request leaves it.
+    _require_c_device()
+    q, k, v, g, beta, cu_seqlens, _ = _make_inputs([64, 128], 1, seed=65)
+
+    assert (
+        adapter.select_gdn_prefill_path(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            path="auto",
+        )
+        == "ws"
+    )
 
 
 def test_gdn_prefill_explicit_wf_runs_packed_fused_kernel() -> None:

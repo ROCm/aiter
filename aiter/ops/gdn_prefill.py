@@ -284,13 +284,6 @@ def select_gdn_prefill_path(
         return "triton"
 
     is_varlen = cu_seqlens is not None
-    if is_varlen and normalized_path in ("c", "cf", "cs"):
-        if explicit:
-            raise ValueError(
-                f"path={normalized_path!r} is unavailable: packed varlen "
-                "currently supports the W/U families only"
-            )
-        return "triton"
 
     if gqa:
         gqa_gfx, _ = _runtime_target(q)
@@ -327,7 +320,7 @@ def select_gdn_prefill_path(
         # are metadata-aware, so an explicit 'wf' is honored.
         assert cu_seqlens is not None
         try:
-            total_tokens, _, _, _, _ = _prepare_opus_gdn_varlen_metadata(
+            total_tokens, _, chunk_indices, _, _ = _prepare_opus_gdn_varlen_metadata(
                 cu_seqlens, _DENSE_BT
             )
             if total_tokens != T:
@@ -338,6 +331,18 @@ def select_gdn_prefill_path(
                     f"path={normalized_path!r} is unavailable: {exc}"
                 ) from exc
             return "triton"
+        if normalized_path in ("c", "cf", "cs"):
+            # One chunk per BT tokens holds exactly when no sequence has a
+            # ragged tail, and the C-input kernels have no token-tail predicate
+            # with which to mask one.  Auto never lands here: the measured
+            # packed family is WS.
+            if chunk_indices.shape[0] * _DENSE_BT != total_tokens:
+                raise ValueError(
+                    f"path={normalized_path!r} is unavailable: the C-input "
+                    "packed path requires every sequence length to be a "
+                    f"multiple of {_DENSE_BT}"
+                )
+            return "cs" if normalized_path == "cs" else "cf"
         return "wf" if normalized_path == "wf" else "ws"
     padded_T = ((T + _DENSE_BT - 1) // _DENSE_BT) * _DENSE_BT
     with_state_io = initial_state is not None or output_final_state
@@ -458,6 +463,7 @@ def gdn_prefill(
             c_mode=(OPUS_GDN_C_FUSED if selected == "cf" else OPUS_GDN_C_SPLIT),
             out=o,
             use_env_overrides=False,
+            cu_seqlens=cu_seqlens,
         )
 
     return opus_gdn_wu_prefill_fwd(

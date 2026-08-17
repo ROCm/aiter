@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Standalone dense C-input Gated DeltaNet prefill backend."""
+"""Standalone C-input Gated DeltaNet prefill backend (dense or packed varlen)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from ..jit.core import compile_ops
+from .opus_gdn_wu_prefill import _prepare_opus_gdn_varlen_metadata
 
 OPUS_GDN_C_AUTO = 0
 OPUS_GDN_C_FUSED = 1
@@ -37,6 +38,9 @@ def _opus_gdn_c_prefill_fwd(
     scale: float,
     initial_state: torch.Tensor,
     final_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    chunk_offsets: torch.Tensor,
     has_initial_state: bool,
     output_final_state: bool,
     c_mode: int,
@@ -56,17 +60,20 @@ def opus_gdn_c_prefill_fwd(
     c_mode: int = OPUS_GDN_C_AUTO,
     out: torch.Tensor | None = None,
     use_env_overrides: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the gfx942 dense C-input GDN prefill implementation.
+    """Run the gfx942 C-input GDN prefill implementation.
 
     This backend is fixed to BT=64 and K=V=128. It exposes the two production
     paths directly:
 
     * c_mode=1: CF, fused recurrence and output.
-    * c_mode=2: CS, split recurrence followed by shared dense K6.
+    * c_mode=2: CS, split recurrence followed by the shared K6.
     * c_mode=0: a conservative policy measured on an 80-CU gfx942. CS is
       selected for T_padded >= 256 and B*H <= 20 or
-      T_padded >= 128 and B*H <= 8; every other shape uses CF.
+      T_padded >= 128 and B*H <= 8; every other shape uses CF. That envelope
+      is keyed on a per-batch T, so packed varlen resolves auto to CF and
+      leaves CS to an explicit c_mode=2.
 
     Explicit mode 1 or 2 is recommended when the model layer already owns a
     workload-specific dispatcher. Auto deliberately does not extrapolate the
@@ -90,6 +97,12 @@ def opus_gdn_c_prefill_fwd(
         use_env_overrides: Honor low-level kernel tuning environment variables
             when true. Production dispatchers should pass false to use the
             published kernel defaults regardless of process environment.
+        cu_seqlens: Optional cumulative sequence lengths [N + 1]. When present,
+            q/k/v use the packed [1, total_tokens, H, 128] layout, the state
+            carries N entries, and the kernels reset the recurrence at every
+            sequence. Every sequence length must be a multiple of 64: the
+            C-input kernels carry no token-tail predicate, so a ragged tail
+            cannot be masked and is rejected instead of silently padded.
 
     Returns:
         A pair (output, final_state). Output has the original unpadded
@@ -162,6 +175,38 @@ def opus_gdn_c_prefill_fwd(
     if scale is None:
         scale = K**-0.5
 
+    is_varlen = cu_seqlens is not None
+    empty_meta = torch.empty(0, device=q.device, dtype=torch.int32)
+    if is_varlen:
+        if B != 1:
+            raise ValueError("packed varlen expects q/k/v batch dimension B=1")
+        if cu_seqlens.device != q.device:
+            raise ValueError("cu_seqlens must be on the same device as q")
+        (
+            total_tokens,
+            cu_seqlens_i32,
+            chunk_indices,
+            chunk_offsets,
+            _max_chunks,
+        ) = _prepare_opus_gdn_varlen_metadata(cu_seqlens, _DENSE_CHUNK_SIZE)
+        if total_tokens != T:
+            raise ValueError(
+                f"cu_seqlens describes {total_tokens} tokens but q/k/v carry {T}"
+            )
+        # One chunk per BT tokens holds exactly when no sequence has a ragged
+        # tail.  The C-input kernels have no token-tail predicate to mask one.
+        if chunk_indices.shape[0] * _DENSE_CHUNK_SIZE != total_tokens:
+            raise ValueError(
+                "the C-input packed path requires every sequence length to be "
+                f"a multiple of {_DENSE_CHUNK_SIZE}"
+            )
+        num_sequences = cu_seqlens.numel() - 1
+    else:
+        cu_seqlens_i32 = empty_meta
+        chunk_indices = empty_meta
+        chunk_offsets = empty_meta
+        num_sequences = B
+
     pad_len = (-T) % _DENSE_CHUNK_SIZE
     if out is not None:
         if pad_len:
@@ -209,7 +254,8 @@ def opus_gdn_c_prefill_fwd(
     )
     has_initial_state = initial_state is not None
     if has_initial_state:
-        expected_state_shape = (B, H, 128, 128)
+        # State is per sequence, so a packed batch carries N entries.
+        expected_state_shape = (num_sequences, H, 128, 128)
         if tuple(initial_state.shape) != expected_state_shape:
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, got "
@@ -222,7 +268,7 @@ def opus_gdn_c_prefill_fwd(
         initial = torch.empty(0, dtype=torch.float32, device=q.device)
 
     final = (
-        torch.empty((B, H, 128, 128), dtype=torch.float32, device=q.device)
+        torch.empty((num_sequences, H, 128, 128), dtype=torch.float32, device=q.device)
         if output_final_state
         else torch.empty(0, dtype=torch.float32, device=q.device)
     )
@@ -236,6 +282,9 @@ def opus_gdn_c_prefill_fwd(
         float(scale),
         initial,
         final,
+        cu_seqlens_i32,
+        chunk_indices,
+        chunk_offsets,
         has_initial_state,
         output_final_state,
         c_mode,

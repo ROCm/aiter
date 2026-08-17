@@ -30,8 +30,8 @@ o, final_state = gdn_prefill(
 
 ## Packed varlen
 
-W/U split（WS）现已支持不补齐的 packed 输入。公开布局与
-`chunk_gated_delta_rule_opt_vk` 一致：
+四个 family 都支持不补齐的 packed 输入：WS/WF 接受任意 sequence 长度，CF/CS
+只接受 64 对齐的 sequence。公开布局与 `chunk_gated_delta_rule_opt_vk` 一致：
 
 - `q/k/v`: `[1, total_tokens, H, 128]` BF16；
 - `g/beta`: `[1, total_tokens, H]` BF16 或 FP32；
@@ -43,7 +43,10 @@ W/U split（WS）现已支持不补齐的 packed 输入。公开布局与
 每条序列及其最后一个非 64 对齐 chunk 都直接在 native kernel 中处理，不会
 把序列 padding 后再调用 dense kernel。K1 和 K6 使用紧凑的全局 chunk 网格，
 由 `(cu_seqlens, chunk_indices, chunk_offsets)` 映射到 sequence-local chunk；
-K5 则由每个 workgroup 串行扫描一条序列。因此 gate cumsum、hidden state 和
+K5 则由每个 workgroup 串行扫描一条序列。C 家族用同一套 metadata：K1-C 走
+全局 chunk 网格，C K2（CF 的融合核与 CS 的 scan）每个 workgroup 串行扫描一条
+序列并用 `chunk_offsets` 定位它在扁平 snapshot 中的起点，CS 之后复用 W/U 的
+packed K6。因此 gate cumsum、hidden state 和
 chunk snapshot 均不会跨序列泄漏。由 `cu_seqlens` 派生的 int32 metadata 按
 Tensor identity、mutation version 和 chunk size 缓存；同一个 Tensor 原地更新
 后会重新校验和生成，不会复用旧的 snapshot offset。PyTorch inference tensor
@@ -64,9 +67,13 @@ sequence 都 64 对齐时，K6 保留 varlen metadata 寻址但移除 token-tail
 低 head、高度偏斜的 ragged batch 让最长 sequence 的 state scan 欠占用。
 
 `path="auto"` 在已验证的 gfx942/80-CU 环境选择 WS；`path="wu"` 和
-`path="ws"` 可显式选择该路径（gfx942/gfx950）。packed varlen 暂不支持
-CF/CS/WF，显式请求会报错；auto 遇到 BF16 state、decode prefix、kernel 内
-Q/K L2Norm、`use_exp2=False` 或其他未支持条件时仍原样回退 Triton。GQA/MQA
+`path="ws"` 可显式选择该路径（gfx942/gfx950）。四个 family 现在都能处理
+packed 输入，但只有 WS 的 packed 包络被实测过，所以 auto 始终选 WS，WF/CF/CS
+要显式指定。CF/CS 额外要求每条 sequence 长度都是 64 的倍数：C 家族的 kernel
+不带 token-tail predicate，ragged tail 无法 mask，因此会直接报错而不是静默
+补齐（W/U 两条路径则接受任意长度）。auto 遇到 BF16 state、decode prefix、
+kernel 内 Q/K L2Norm、`use_exp2=False` 或其他未支持条件时仍原样回退
+Triton。GQA/MQA
 不会回退（Triton fallback 会按 value head 数读 q/k，结果是错的而不只是更慢）：
 auto 固定选 WS，因为 dense winner table 是在等 head 数上测的；显式指定家族
 时 WF/CF/CS 也都按 key head 寻址 q/k。
@@ -175,8 +182,11 @@ shape 静默插值。
 ## 当前边界
 
 Dense 非 64 对齐输入仅在显式 Opus 路径中由 wrapper padding；dense auto 仍只
-进入已验证的 64 对齐范围。Packed varlen 当前固定为 BT64 Neumann K1 + WS，
-只支持 FP32 state；BF16 state、内核内 Q/K L2Norm 和 decode prefix 仍走现有
-实现。GQA/MQA 需要 BT=64 + `k1_algo=1`（只有 BT64 Neumann K1 按 key head
-读 k），dense 与 packed varlen 都可用；WS 的 GQA 走 reference state scan。
+进入已验证的 64 对齐范围。Packed varlen 固定使用 BT64 Neumann K1 且只支持
+FP32 state；BF16 state、内核内 Q/K L2Norm 和 decode prefix 仍走现有实现。
+W/U 两条路径（WS/WF）接受任意 sequence 长度；C 两条路径（CF/CS）只接受 64
+对齐的 sequence，且 packed CS 的 K6 需要整宽 V tile（`OPUS_GDN_K2C_OUT_BV=128`）。
+Packed CF 只有实测默认变体带 packed 寻址，rollback 变体仍是 dense-only。
+GQA/MQA 需要 BT=64 + `k1_algo=1`（只有 BT64 Neumann K1 按 key head 读 k），
+dense 与 packed varlen 都可用；WS 的 GQA 走 reference state scan。
 显式 Opus 路径若输入不受支持会直接报错，不会悄悄换成另一条实现。

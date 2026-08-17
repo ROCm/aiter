@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "opus_gdn/gdn_defs.h"  // bf16_t only; existing K2 ABI is untouched.
 
@@ -34,6 +35,14 @@ struct gdn_k2_c_kargs {
     // stay unchanged; fused variants leave both pointers null.
     void* __restrict__ ptr_h_snap;         // [B, NT, H, V, K] bf16
     void* __restrict__ ptr_v_new;          // [B, T, H, V]     bf16
+    // Packed varlen metadata, also appended to keep the dense offsets stable.
+    // When present, every token-major pointer above uses the packed
+    // [1, total_tokens, ...] layout, B counts sequences, and h_snap is a flat
+    // [1, total_chunks, H, V, K] run that chunk_offsets indexes.  This kernel
+    // carries no token-tail predicates, so the host must guarantee that every
+    // sequence length is a multiple of BT.
+    const int32_t* __restrict__ ptr_cu_seqlens;    // [N + 1]
+    const int32_t* __restrict__ ptr_chunk_offsets; // [N + 1]
 };
 // This prototype is deliberately fixed to the requested launch geometry.  The
 // trait is still a template so a future standalone launcher can instantiate a
@@ -83,6 +92,10 @@ struct gdn_k2_c_traits {
         : PREFETCH_D_K0_PACKS_;
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    // Dense by default.  gdn_varlen_traits flips this for the packed
+    // specializations; it also sets DENSE_ALIGNED, which this family ignores
+    // because it never emits token-tail predicates in the first place.
+    static constexpr bool IS_VARLEN = false;
     static constexpr int BK_SUB = 64;
     static constexpr int N_K = K / BK_SUB;
     static constexpr int SMEM_PAD = 4;
