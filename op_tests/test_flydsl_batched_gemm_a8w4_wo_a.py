@@ -70,9 +70,9 @@ def _ref_quant_n32k4_mbn(o_mbn: torch.Tensor):
 
 def run_torch_wo_a(o_mbn: torch.Tensor, w_bnk: torch.Tensor, dtype=dtypes.bf16):
     """BF16 reference: y[m,b,n] = sum_k o[m,b,k] * w[b,n,k]. Not timed."""
-    return torch.einsum("mbk,bnk->mbn", o_mbn.to(dtypes.fp32), w_bnk.to(dtypes.fp32)).to(
-        dtype
-    )
+    return torch.einsum(
+        "mbk,bnk->mbn", o_mbn.to(dtypes.fp32), w_bnk.to(dtypes.fp32)
+    ).to(dtype)
 
 
 @benchmark()
