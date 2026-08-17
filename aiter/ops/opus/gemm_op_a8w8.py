@@ -2,7 +2,11 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Private OPUS A8W8 exact-kid launch APIs."""
 
-from __future__ import annotations
+# Keep annotations eager in this binding module.  ``torch_compile_guard`` uses
+# the first parameter's concrete ``torch.Tensor`` identity to decide whether a
+# custom op already has a Tensor dispatch key.  Postponed string annotations
+# make it add a dummy CUDA Tensor to every raw launch, which is observable host
+# overhead on short BMM kernels.
 
 import functools
 
@@ -470,6 +474,27 @@ def _validate_a8w8_mxscale_bmm_tensors(
     return M, batch, N, K
 
 
+def _mxscale_bmm_shape_for_plan(
+    XQ: Tensor,
+    WQ: Tensor,
+) -> tuple[int, int, int, int]:
+    """Read only the four dimensions needed by the immutable launch plan.
+
+    The checked C++ BMM entry owns the dynamic Tensor contract (dtype, shape,
+    device and stride).  Python still needs these dimensions before launch to
+    resolve the exact-kid workspace plan.  Keep malformed-rank handling here,
+    but do not repeat the full C++ contract on the valid eager hot path.
+    """
+    try:
+        M, batch, K = map(int, XQ.shape)
+        _w_batch, N, _w_K = map(int, WQ.shape)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "opus_gemm_a8w8_mxscale_bmm_launch: XQ and WQ must be 3D"
+        ) from exc
+    return M, batch, N, K
+
+
 @functools.lru_cache(maxsize=4096)
 def _cached_a8w8_mxscale_bmm_plan(
     arch: str,
@@ -536,9 +561,7 @@ def _launch_a8w8_mxscale_bmm(
     workspace: Tensor | None,
 ) -> Tensor:
     """Launch one registered gfx950 MXFP8 BMM kid."""
-    M, batch, N, K = _validate_a8w8_mxscale_bmm_tensors(
-        XQ, WQ, Y, x_scale, w_scale
-    )
+    M, batch, N, K = _mxscale_bmm_shape_for_plan(XQ, WQ)
     arch = _device_arch(XQ.device)
     resolved = _require_registered_kid(
         arch=arch,
@@ -552,6 +575,11 @@ def _launch_a8w8_mxscale_bmm(
 
     launch_workspace = workspace
     if required_numel:
+        # Automatic allocation must not use untrusted shape metadata.  The
+        # common split_k=1/no-workspace path skips this duplicate Python check;
+        # workspace launches retain it until sizing moves behind the checked
+        # C++ boundary as well.
+        _validate_a8w8_mxscale_bmm_tensors(XQ, WQ, Y, x_scale, w_scale)
         if launch_workspace is None:
             launch_workspace = torch.empty(
                 required_numel, dtype=torch.float32, device=XQ.device

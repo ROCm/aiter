@@ -344,6 +344,147 @@ def test_tuned_adapter_passes_resolved_final_kid_to_public(monkeypatch):
     ]
 
 
+def test_mxscale_bmm_final_launch_plan_is_scalar_cached(monkeypatch):
+    batched = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+    lookups = []
+    row = {"libtype": "opus", "kernelId": 8311, "splitK": 1}
+
+    monkeypatch.setattr(
+        batched,
+        "lookup_mxscale_bmm_config",
+        lambda *shape: lookups.append(shape) or row,
+    )
+    monkeypatch.setattr(
+        batched,
+        "_mxscale_bmm_kid_runs_m",
+        lambda kid, m: (kid, m) == (8311, 1),
+    )
+    batched._resolve_mxscale_bmm_launch.cache_clear()
+
+    assert batched._resolve_mxscale_bmm_launch(2, 1, 1024, 4096) == (8311, 1)
+    assert batched._resolve_mxscale_bmm_launch(2, 1, 1024, 4096) == (8311, 1)
+    assert lookups == [(2, 1, 1024, 4096)]
+    assert batched._resolve_mxscale_bmm_launch.cache_info().hits == 1
+    assert batched._resolve_mxscale_bmm_launch.cache_info().maxsize == 1024
+    batched._resolve_mxscale_bmm_launch.cache_clear()
+
+
+def test_mxscale_bmm_high_level_split1_uses_checked_raw_launcher(monkeypatch):
+    batched = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((1, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    x_scale = torch.empty((1, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    raw_calls = []
+    public_calls = []
+
+    def fake_raw(*args):
+        raw_calls.append(args)
+
+    def fake_public(*args, **kwargs):
+        public_calls.append((args, kwargs))
+        return args[2]
+
+    monkeypatch.setattr(
+        batched, "_get_mxscale_bmm_launchers", lambda: (fake_raw, fake_public)
+    )
+    monkeypatch.setattr(
+        batched, "_resolve_mxscale_bmm_launch", lambda *_shape: (8311, 1)
+    )
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+    Y = batched._batched_gemm_a8w8_mxscale_impl(
+        XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+    )
+    assert Y.shape == (1, 2, 128)
+    assert raw_calls == [(XQ, WQ, Y, x_scale, w_scale, None, 8311, 1)]
+    assert public_calls == []
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+
+def test_mxscale_bmm_high_level_workspace_keeps_unified_planner(monkeypatch):
+    batched = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((17, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    x_scale = torch.empty((17, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    raw_calls = []
+    public_calls = []
+
+    def fake_public(*args, **kwargs):
+        public_calls.append((args, kwargs))
+        return args[2]
+
+    monkeypatch.setattr(
+        batched,
+        "_get_mxscale_bmm_launchers",
+        lambda: (lambda *args: raw_calls.append(args), fake_public),
+    )
+    monkeypatch.setattr(
+        batched, "_resolve_mxscale_bmm_launch", lambda *_shape: (8000, 2)
+    )
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+    Y = batched._batched_gemm_a8w8_mxscale_impl(
+        XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+    )
+    assert raw_calls == []
+    assert public_calls == [
+        (
+            (XQ, WQ, Y),
+            {
+                "kid": 8000,
+                "layout": "mxscale_bmm",
+                "x_scale": x_scale,
+                "w_scale": w_scale,
+                "split_k": 2,
+            },
+        )
+    ]
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+
+def test_mxscale_bmm_high_level_reuses_one_scalar_launch_plan(monkeypatch):
+    batched = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((1, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    x_scale = torch.empty((1, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    launcher_lookups = []
+    plan_lookups = []
+    raw_calls = []
+
+    monkeypatch.setattr(
+        batched,
+        "_get_mxscale_bmm_launchers",
+        lambda: launcher_lookups.append(True)
+        or (lambda *args: raw_calls.append(args), lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        batched,
+        "_resolve_mxscale_bmm_launch",
+        lambda *shape: plan_lookups.append(shape) or (8311, 1),
+    )
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+    first = batched._batched_gemm_a8w8_mxscale_impl(
+        XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+    )
+    second = batched._batched_gemm_a8w8_mxscale_impl(
+        XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+    )
+
+    assert first is not second
+    assert launcher_lookups == [True]
+    assert plan_lookups == [(2, 1, 128, 128)]
+    assert len(raw_calls) == 2
+    assert all(call[5:] == (None, 8311, 1) for call in raw_calls)
+    batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+
 @pytest.mark.parametrize(
     ("gfx", "bias", "expected_backend"),
     [
@@ -451,6 +592,37 @@ def test_unified_dispatch_routes_a16_by_final_kid(monkeypatch):
     assert calls == [(XQ, WQ, Y, bias, 200, 2, None)]
 
 
+def test_unified_gfx950_a16_caller_workspace_uses_checked_cabi(monkeypatch):
+    opus = importlib.import_module("aiter.ops.opus")
+    a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    calls = []
+
+    def fail_private(*_args, **_kwargs):
+        raise AssertionError("caller-workspace fast path re-entered planner")
+
+    def fake_raw(XQ, WQ, Y, bias, workspace, kid, split_k):
+        calls.append((XQ, WQ, Y, bias, workspace, kid, split_k))
+
+    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
+    monkeypatch.setattr(a16, "_launch_a16w16", fail_private)
+    monkeypatch.setattr(a16, "_opus_gemm_a16w16_launch_ctypes_raw", fake_raw)
+    a16._cached_explicit_a16w16_plan.cache_clear()
+
+    XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    Y = torch.empty((1, 64, 64), dtype=torch.float32)
+    workspace = torch.empty((2, 1, 64, 64), dtype=torch.float32)
+    assert opus.opus_gemm(
+        XQ,
+        WQ,
+        Y,
+        kid=200,
+        split_k=2,
+        workspace=workspace,
+    ) is Y
+    assert calls == [(XQ, WQ, Y, None, workspace, 200, 2)]
+
+
 def test_explicit_public_a16_kid_bypasses_tuned_and_heuristic_policy(monkeypatch):
     opus = importlib.import_module("aiter.ops.opus")
     a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
@@ -502,21 +674,27 @@ def test_public_contract_cache_is_scalar_only(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("kid", "arch", "family", "layout", "with_scale"),
+    ("kid", "arch", "raw_name", "layout", "with_scale"),
     [
-        (2, "gfx950", "_launch_a8w8", "plain", False),
-        (1, "gfx950", "_launch_a8w8_blockscale", "plain", True),
+        (2, "gfx950", "_opus_gemm_a8w8_launch_raw", "plain", False),
+        (
+            1,
+            "gfx950",
+            "_opus_gemm_a8w8_blockscale_launch_raw",
+            "plain",
+            True,
+        ),
         (
             11000,
             "gfx942",
-            "_launch_a8w8_blockscale_bpreshuffle",
+            "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw",
             "bpreshuffle",
             True,
         ),
     ],
 )
 def test_unified_dispatch_routes_a8_by_final_kid(
-    monkeypatch, kid, arch, family, layout, with_scale
+    monkeypatch, kid, arch, raw_name, layout, with_scale
 ):
     opus = importlib.import_module("aiter.ops.opus")
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
@@ -524,9 +702,9 @@ def test_unified_dispatch_routes_a8_by_final_kid(
 
     def fake(*args, **kwargs):
         calls.append((args, kwargs))
-        return args[2] if family != "_launch_a8w8_blockscale_bpreshuffle" else args[4]
 
-    monkeypatch.setattr(a8, family, fake)
+    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
+    monkeypatch.setattr(a8, raw_name, fake)
     fp8 = getattr(torch, "float8_e4m3fnuz")
     XQ = torch.empty((1, 128, 256), dtype=fp8)
     WQ = torch.empty((1, 128, 256), dtype=fp8)
@@ -553,6 +731,7 @@ def test_unified_dispatch_routes_mxscale_bmm_by_global_exact_kid(monkeypatch):
         calls.append((XQ, WQ, Y, x_scale, w_scale, kwargs))
         return Y
 
+    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
     monkeypatch.setattr(a8, "_launch_a8w8_mxscale_bmm", fake)
     fp8 = getattr(torch, "float8_e4m3fnuz")
     XQ = torch.empty((17, 2, 256), dtype=fp8)
@@ -582,6 +761,44 @@ def test_unified_dispatch_routes_mxscale_bmm_by_global_exact_kid(monkeypatch):
     ]
 
 
+def test_unified_dispatch_uses_checked_raw_mxscale_bmm_split1_hot_path(
+    monkeypatch,
+):
+    opus = importlib.import_module("aiter.ops.opus")
+    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((1, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    Y = torch.empty((1, 2, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((1, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    calls = []
+
+    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
+    monkeypatch.setattr(
+        a8,
+        "_opus_gemm_a8w8_mxscale_bmm_launch_raw",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        a8,
+        "_launch_a8w8_mxscale_bmm",
+        lambda *_args, **_kwargs: pytest.fail("split_k=1 repeated private planning"),
+    )
+
+    assert opus.opus_gemm(
+        XQ,
+        WQ,
+        Y,
+        kid=8311,
+        layout="mxscale_bmm",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        split_k=1,
+    ) is Y
+    assert calls == [(XQ, WQ, Y, x_scale, w_scale, None, 8311, 1)]
+
+
 def test_mxscale_bmm_plan_uses_registry_and_torch_workspace_sizes():
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
     a8._cached_a8w8_mxscale_bmm_plan.cache_clear()
@@ -600,6 +817,97 @@ def test_mxscale_bmm_plan_uses_registry_and_torch_workspace_sizes():
         )
     assert a8._cached_a8w8_mxscale_bmm_plan.cache_info().maxsize == 4096
     a8._cached_a8w8_mxscale_bmm_plan.cache_clear()
+
+
+def test_mxscale_bmm_split1_hot_path_defers_tensor_contract_to_cpp(monkeypatch):
+    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((1, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    Y = torch.empty((1, 2, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((1, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    calls = []
+
+    def fail_duplicate_python_validation(*_args, **_kwargs):
+        raise AssertionError("split_k=1 hot path repeated the C++ Tensor contract")
+
+    def fake_raw(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(a8, "_device_arch", lambda _device: "gfx950")
+    monkeypatch.setattr(
+        a8,
+        "_validate_a8w8_mxscale_bmm_tensors",
+        fail_duplicate_python_validation,
+    )
+    monkeypatch.setattr(a8, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", fake_raw)
+
+    assert a8._launch_a8w8_mxscale_bmm(
+        XQ,
+        WQ,
+        Y,
+        x_scale,
+        w_scale,
+        kid=8311,
+        split_k=1,
+        workspace=None,
+    ) is Y
+    assert calls == [(XQ, WQ, Y, x_scale, w_scale, None, 8311, 1)]
+
+
+def test_mxscale_bmm_workspace_path_retains_python_contract_validation(monkeypatch):
+    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+    XQ = torch.empty((17, 2, 128), dtype=fp8)
+    WQ = torch.empty((2, 128, 128), dtype=fp8)
+    Y = torch.empty((17, 2, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((17, 2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
+    validation_calls = []
+    raw_calls = []
+    validate = a8._validate_a8w8_mxscale_bmm_tensors
+
+    def tracking_validation(*args):
+        validation_calls.append(args)
+        return validate(*args)
+
+    monkeypatch.setattr(a8, "_device_arch", lambda _device: "gfx950")
+    monkeypatch.setattr(
+        a8,
+        "_validate_a8w8_mxscale_bmm_tensors",
+        tracking_validation,
+    )
+    monkeypatch.setattr(
+        a8,
+        "_opus_gemm_a8w8_mxscale_bmm_launch_raw",
+        lambda *args: raw_calls.append(args),
+    )
+
+    assert a8._launch_a8w8_mxscale_bmm(
+        XQ,
+        WQ,
+        Y,
+        x_scale,
+        w_scale,
+        kid=8000,
+        split_k=2,
+        workspace=None,
+    ) is Y
+    assert validation_calls == [(XQ, WQ, Y, x_scale, w_scale)]
+    assert len(raw_calls) == 1
+    workspace = raw_calls[0][5]
+    assert workspace.dtype == torch.float32
+    assert workspace.numel() == 2 * 2 * 32 * 128
+
+
+def test_mxscale_bmm_malformed_input_rank_still_fails_before_plan():
+    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    with pytest.raises(ValueError, match="XQ and WQ must be 3D"):
+        a8._mxscale_bmm_shape_for_plan(
+            torch.empty((2, 128)),
+            torch.empty((2, 128, 128)),
+        )
 
 
 def test_unified_dispatch_rejects_contract_mismatches_before_launch(monkeypatch):

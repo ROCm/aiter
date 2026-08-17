@@ -72,6 +72,14 @@ def _require_tensor(name: str, value: object) -> Tensor:
     return value
 
 
+def _require_gpu_tensor(tensor: Tensor) -> None:
+    """Reject an all-CPU call before entering a GPU-only raw launcher."""
+    if tensor.device.type != "cuda":
+        raise RuntimeError(
+            f"OPUS GEMM requires a GPU tensor; got device {tensor.device}"
+        )
+
+
 @lru_cache(maxsize=4096)
 def _cached_public_contract(
     kid: int,
@@ -84,17 +92,17 @@ def _cached_public_contract(
     has_bias: bool,
     has_workspace: bool,
     split_k: int,
-) -> tuple[str, str, object]:
-    """Validate/cache immutable routing and option-presence scalars only."""
+) -> tuple[str, str, object, object]:
+    """Validate/cache immutable routing and its lazily imported family module."""
     instance = kernels_list.get(kid)
     if instance is None:
         raise ValueError(f"unknown OPUS kid {kid}")
 
     route_arch = (instance.arch_prefix or "gfx950").lower()
     if instance.kernel_tag.startswith("a16w16"):
-        from .gemm_op_a16w16 import _validate_a16w16_public_contract
+        from . import gemm_op_a16w16 as family_module
 
-        _validate_a16w16_public_contract(
+        family_module._validate_a16w16_public_contract(
             kid=kid,
             instance=instance,
             input_dtype=input_dtype,
@@ -104,11 +112,11 @@ def _cached_public_contract(
             has_x_scale=has_x_scale,
             has_w_scale=has_w_scale,
         )
-        return route_arch, "a16w16", instance
+        return route_arch, "a16w16", instance, family_module
 
-    from .gemm_op_a8w8 import _validate_a8w8_public_contract
+    from . import gemm_op_a8w8 as family_module
 
-    family = _validate_a8w8_public_contract(
+    family = family_module._validate_a8w8_public_contract(
         kernel_tag=instance.kernel_tag,
         kid=kid,
         input_dtype=input_dtype,
@@ -121,7 +129,7 @@ def _cached_public_contract(
         has_workspace=has_workspace,
         split_k=split_k,
     )
-    return route_arch, family, instance
+    return route_arch, family, instance, family_module
 
 
 def opus_gemm(
@@ -170,7 +178,7 @@ def opus_gemm(
 
     has_x_scale = x_scale is not None
     has_w_scale = w_scale is not None
-    _route_arch, family, _instance = _cached_public_contract(
+    route_arch, family, instance, family_module = _cached_public_contract(
         resolved_kid,
         XQ.dtype,
         WQ.dtype,
@@ -184,9 +192,54 @@ def opus_gemm(
     )
 
     if family == "a16w16":
-        from .gemm_op_a16w16 import _launch_a16w16
-
-        return _launch_a16w16(
+        if (
+            route_arch == "gfx950"
+            and workspace is not None
+            and resolved_split_k > 0
+            and instance.splitk_workspace_dtype is not None
+        ):
+            # A caller-owned gfx950 workspace already gives this exact-kid
+            # path everything it needs to launch.  Preserve the dynamic
+            # shape/stride contract and the cached exact-plan validation, but
+            # avoid re-reading device metadata and re-entering the generic
+            # workspace planner on every short public call.  The existing C
+            # ABI remains the final checked boundary (device/stream guard,
+            # tensor/workspace checks and exact-kid dispatch).
+            _require_gpu_tensor(XQ)
+            family_module._check_a16w16_launch_layout(XQ, WQ, Y)
+            batch, M, K = XQ.shape
+            N = Y.shape[2]
+            actual_kid, launch_split_k, workspace_plan = (
+                family_module._cached_explicit_a16w16_plan(
+                    route_arch,
+                    M,
+                    N,
+                    K,
+                    batch,
+                    1,  # CU count is not consulted by explicit gfx950 plans.
+                    bias is not None,
+                    XQ.dtype,
+                    Y.dtype,
+                    resolved_kid,
+                    resolved_split_k,
+                )
+            )
+            if workspace_plan is None:
+                raise RuntimeError(
+                    f"OPUS gfx950 kid {actual_kid} unexpectedly has no "
+                    "caller-workspace plan"
+                )
+            family_module._opus_gemm_a16w16_launch_ctypes_raw(
+                XQ,
+                WQ,
+                Y,
+                bias,
+                workspace,
+                actual_kid,
+                launch_split_k,
+            )
+            return Y
+        return family_module._launch_a16w16(
             XQ,
             WQ,
             Y,
@@ -196,36 +249,42 @@ def opus_gemm(
             workspace=workspace,
         )
 
-    from .gemm_op_a8w8 import (
-        _launch_a8w8,
-        _launch_a8w8_blockscale,
-        _launch_a8w8_blockscale_bpreshuffle,
-        _launch_a8w8_mxscale_bmm,
-    )
+    # The A8 raw entries are checked C++ launchers: they validate device,
+    # dtype, shape/stride, architecture and exact kid before dispatch.  The
+    # cached public contract above already owns immutable Python routing and
+    # option-presence checks, so repeating the private family registry/device
+    # walk here only adds host latency.  Keep the private adapters unchanged
+    # for direct callers and for BMM workspace planning.
+    _require_gpu_tensor(XQ)
 
     if family == "a8w8":
-        return _launch_a8w8(XQ, WQ, Y, kid=resolved_kid)
+        family_module._opus_gemm_a8w8_launch_raw(XQ, WQ, Y, resolved_kid)
+        return Y
     assert x_scale is not None and w_scale is not None
     if family == "a8w8_blockscale":
-        return _launch_a8w8_blockscale(
-            XQ,
-            WQ,
-            Y,
-            x_scale,
-            w_scale,
-            kid=resolved_kid,
+        family_module._opus_gemm_a8w8_blockscale_launch_raw(
+            XQ, WQ, Y, x_scale, w_scale, resolved_kid
         )
+        return Y
     if family == "a8w8_blockscale_bpreshuffle":
-        return _launch_a8w8_blockscale_bpreshuffle(
-            XQ,
-            WQ,
-            x_scale,
-            w_scale,
-            Y,
-            kid=resolved_kid,
+        family_module._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+            XQ, WQ, x_scale, w_scale, Y, resolved_kid
         )
+        return Y
     if family == "a8w8_mxscale_bmm":
-        return _launch_a8w8_mxscale_bmm(
+        if workspace is None and resolved_split_k <= 1:
+            family_module._opus_gemm_a8w8_mxscale_bmm_launch_raw(
+                XQ,
+                WQ,
+                Y,
+                x_scale,
+                w_scale,
+                None,
+                resolved_kid,
+                max(1, resolved_split_k),
+            )
+            return Y
+        return family_module._launch_a8w8_mxscale_bmm(
             XQ,
             WQ,
             Y,

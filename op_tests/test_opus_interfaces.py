@@ -260,9 +260,10 @@ def test_public_module_uses_lazy_family_imports():
         and node.name == "_cached_public_contract"
     )
     contract_imports = {
-        node.module
+        alias.name
         for node in ast.walk(contract_function)
-        if isinstance(node, ast.ImportFrom)
+        if isinstance(node, ast.ImportFrom) and node.module is None
+        for alias in node.names
     }
     assert contract_imports == {"gemm_op_a16w16", "gemm_op_a8w8"}
 
@@ -276,10 +277,11 @@ def test_public_module_uses_lazy_family_imports():
         for node in ast.walk(public_function)
         if isinstance(node, ast.ImportFrom)
     }
-    assert launch_imports == {"gemm_op_a16w16", "gemm_op_a8w8"}
+    assert launch_imports == set()
 
     assert "kernels_list.get(kid)" in public_source
     assert "get_kernel_route" not in public_source
+    assert "_opus_gemm_a8w8_mxscale_bmm_launch_raw" in public_source
     assert "_FP8_DTYPES" not in public_source
     assert "_A8W8_FAMILY_LAYOUT" not in public_source
     assert "def _validate_a16w16_public_contract(" in (
@@ -322,6 +324,21 @@ def test_production_callers_use_unified_entry_not_family_wrappers():
 
     deepgemm = (_ROOT / "aiter/ops/deepgemm.py").read_text()
     assert "opus_gemm_a16w16_tune" not in deepgemm
+
+
+def test_a8_raw_bindings_do_not_register_dummy_tensor_arguments():
+    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    raw_names = (
+        "_opus_gemm_a8w8_launch_raw",
+        "_opus_gemm_a8w8_blockscale_launch_raw",
+        "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw",
+        "_opus_gemm_a8w8_mxscale_bmm_launch_raw",
+    )
+
+    for name in raw_names:
+        assert getattr(a8, name) is not None
+        schema = str(getattr(torch.ops.aiter, name).default._schema)
+        assert "Tensor dummy" not in schema
 
 
 def test_device_info_cache_is_scoped_by_explicit_device(monkeypatch):

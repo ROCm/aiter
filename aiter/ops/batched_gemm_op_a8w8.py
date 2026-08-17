@@ -314,17 +314,29 @@ def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
     return 8000
 
 
-def _batched_gemm_a8w8_mxscale_impl(
-    x: Tensor,
-    wo_a: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> Tensor:
+@functools.cache
+def _get_mxscale_bmm_launchers():
+    """Resolve the checked split-1 launcher and workspace planner once."""
     from .opus import opus_gemm
+    from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 
-    m, g, k = map(int, x.shape)
-    n = int(wo_a.shape[1])
+    return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_gemm
+
+
+# Steady-state high-level calls must still allocate a fresh output and enter the
+# checked C++ launcher, but their immutable shape-to-kid decision and the two
+# lazy launcher imports do not need to cross separate cache wrappers every
+# time.  Populate this table on the first call for a shape, then use one direct
+# dict lookup on the short-kernel hot path.  Values deliberately contain only
+# functions and scalar launch metadata -- never Tensor objects.
+_MXSCALE_BMM_LAUNCH_PLANS: dict[tuple[int, int, int, int], tuple[object, object, int, int]] = {}
+
+
+@functools.lru_cache(maxsize=1024)
+def _resolve_mxscale_bmm_launch(
+    g: int, m: int, n: int, k: int
+) -> tuple[int, int]:
+    """Cache the final global kid/split pair for one immutable shape."""
     config = lookup_mxscale_bmm_config(g, m, n, k)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
@@ -337,8 +349,52 @@ def _batched_gemm_a8w8_mxscale_impl(
     if kid is None or not _mxscale_bmm_kid_runs_m(kid, m):
         kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
         split_k = 1
+    return kid, split_k
+
+
+def _batched_gemm_a8w8_mxscale_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    # This body executes behind the public custom-op boundary, so real eager
+    # tensors carry concrete integer dimensions here.  Avoid four redundant
+    # Python int() conversions on every short BMM launch.
+    m, g, k = x.shape
+    n = wo_a.shape[1]
+    plan_key = (g, m, n, k)
+    try:
+        raw_launch, opus_gemm, kid, split_k = _MXSCALE_BMM_LAUNCH_PLANS[plan_key]
+    except KeyError:
+        raw_launch, opus_gemm = _get_mxscale_bmm_launchers()
+        kid, split_k = _resolve_mxscale_bmm_launch(g, m, n, k)
+        _MXSCALE_BMM_LAUNCH_PLANS[plan_key] = (
+            raw_launch,
+            opus_gemm,
+            kid,
+            split_k,
+        )
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
+    if split_k <= 1:
+        # The shape resolver already returns a final canonical global kid.
+        # Enter the checked C++ launcher directly for the common no-workspace
+        # path instead of repeating the unified public routing contract.  The
+        # C++ boundary still validates dtype, shape, device, stride, arch and
+        # exact kid.  Workspace cases retain the unified Python planner below.
+        raw_launch(
+            x,
+            wo_a,
+            Y,
+            x_scale,
+            w_scale,
+            None,
+            kid,
+            max(1, split_k),
+        )
+        return Y
     return opus_gemm(
         x,
         wo_a,
