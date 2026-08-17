@@ -57,7 +57,6 @@ def addr_keepalive(*base_indices):
     side-effect marker reach the allocator. Assumes VGPR headroom (occupancy
     already at the floor and no spills).
     """
-    return
     ops = [_raw(arith.index_cast(T.i32, ArithValue(base))) for base in base_indices]
     vgpr_keepalive(*ops)
 
@@ -79,7 +78,6 @@ def vgpr_keepalive(*raw_vals):
     Args:
         *raw_vals: raw ``ir.Value`` operands (e.g. ``vec<4xi32>`` store data).
     """
-    return
     vals = [_raw(v) for v in raw_vals]
     if not vals:
         return
