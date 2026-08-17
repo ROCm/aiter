@@ -72,12 +72,18 @@ jobs:
           name: documentation
           path: ./html
 
+      - name: Verify documentation artifact
+        run: |
+          test -f ./html/index.html \
+            || { echo "::error::documentation artifact is missing index.html"; exit 1; }
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
           publish_dir: ./html
-          cname: doc.aiter.amd.com  # Custom domain
+          force_orphan: true
           commit_message: 'docs: deploy documentation'
 
   # Alternative: Deploy to AMD servers via SSH
