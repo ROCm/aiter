@@ -537,11 +537,11 @@ def compile_chunk_gated_delta_h_gfx942(
         def _nr_v(nr_local):
             """V-offset (elements) of this wave's local column tile ``nr_local``.
 
-            Global tile index is ``wid_n * N_REPEAT_LOCAL + nr_local``, times 16.
+            The global tile index is ``nr_local * NR_SPLIT + wid_n``, times 16.
             """
             if const_expr(NR_SPLIT == 1):
                 return fx.Int32(nr_local * 16)
-            return wid_n * fx.Int32(N_REPEAT_LOCAL * 16) + fx.Int32(nr_local * 16)
+            return (fx.Int32(nr_local * NR_SPLIT) + wid_n) * fx.Int32(16)
 
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
         u_ = GTensor(u_tensor, dtype=T.bf16, shape=(-1,))
@@ -574,6 +574,16 @@ def compile_chunk_gated_delta_h_gfx942(
         )
         single_tile_layout = fx.make_layout((1, 1, 1), (0, 0, 0))
         single_tile_mma = fx.make_tiled_mma(mma_atom_bf16_16x16x16, single_tile_layout)
+
+        # -- GEMM1 --
+        # The wave grid is (M_WAVES over BT, NR_SPLIT over BV, 1 over K),
+        # with wave numbering wave = wid_m + M_WAVES*wid_n -> stride = (1, M_WAVES, 0). 
+        gemm1_mma = fx.make_tiled_mma(
+            mma_atom_bf16_16x16x16,
+            fx.make_layout((M_WAVES, NR_SPLIT, 1), (1, M_WAVES, 0)),
+        )
+        # LDS -> register copy atom for the native s2r reads (4 bf16 = one b64).
+        cp_lds_x4 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
 
         # -- LDS views --
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -617,11 +627,21 @@ def compile_chunk_gated_delta_h_gfx942(
         # 4 bf16 = 8 B: one ds_read_b64 / ds_write_b64, and one MFMA A/B fragment.
         v4bf16_type = T.vec(4, T.bf16)
 
+        # Single-XOR variant for lds_w / lds_h.
+        def _single_xor_swz(cols, ng):
+            return fx.SwizzleType.get(
+                int(math.log2(ng)), 2, int(math.log2(cols)) - 2
+            )
+
+        def _grp_idx_single(row, grp, cols, ng):
+            mask = row & fx.Int32(ng - 1)
+            return row * fx.Int32(cols) + ((grp ^ mask) * fx.Int32(4))
+
         def _lds_h_idx(v_local, k_grp):
-            return _grp_idx(v_local, k_grp, K, LDS_H_NG)
+            return _grp_idx_single(v_local, k_grp, K, LDS_H_NG)
 
         def _lds_w_idx(bt_row, k_grp):
-            return _grp_idx(bt_row, k_grp, K, LDS_W_NG)
+            return _grp_idx_single(bt_row, k_grp, K, LDS_W_NG)
 
         def _lds_kt_idx(k_row, bt_grp):
             return _grp_idx(k_row, bt_grp, BT, LDS_KT_NG)
@@ -955,40 +975,50 @@ def compile_chunk_gated_delta_h_gfx942(
             u_prefetch = gu_all[N_GATE_G + N_GATE_GK :]
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
-            # A-frag (w): lane holds w[m=BT row, k]; plain read of lds_w.
-            # B-frag (h): lane holds h[k, n=V]; read from lds_h[v, k] with the
-            #   transposed access = 4 contiguous k for fixed v (since lds_h is
-            #   [v, k] with k contiguous, a run over k IS contiguous).
-            bv_accs = [fx.make_rmem_tensor(4, fx.Float32) for _ in fx.range_constexpr(N_REPEAT_LOCAL)]
-            for frag in bv_accs:
-                frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
+            sW = fx.make_view(
+                lds_w_ptr,
+                fx.make_composed_layout(
+                    fx.static(_single_xor_swz(K, LDS_W_NG)),
+                    fx.make_ordered_layout((BT, K), (1, 0)),
+                ),
+            )
+            sH = fx.make_view(
+                lds_h_ptr,
+                fx.make_composed_layout(
+                    fx.static(_single_xor_swz(K, LDS_H_NG)),
+                    fx.make_ordered_layout((BV, K), (1, 0)),
+                ),
+            )
+            g1_cp_a = fx.make_tiled_copy_A(cp_lds_x4, gemm1_mma).get_slice(tid)
+            g1_cp_b = fx.make_tiled_copy_B(cp_lds_x4, gemm1_mma).get_slice(tid)
+            g1_pS_w = g1_cp_a.partition_S(sW)
+            g1_pS_h = g1_cp_b.partition_S(sH)
+            g1_fw = gemm1_mma.make_fragment_A(sW)
+            g1_fh = gemm1_mma.make_fragment_B(sH)
+            g1_fw_rt = g1_cp_a.retile(g1_fw)
+            g1_fh_rt = g1_cp_b.retile(g1_fh)
+            frag_bv = fx.make_rmem_tensor(
+                fx.tiled_mma_partition_shape(fx.MmaOperand.C, gemm1_mma, (BT, BV)),
+                fx.Float32,
+            )
+            frag_bv.fill(0.0)
 
-            a_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
-            b_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    # w A-frag: 4 bf16 K-elems for this lane's BT row.
-                    # A[m=BT row=wid*16+lane_n, k=kb*64+ks*16 + lane_m_base*4 + e]
-                    w_row = wid_m * fx.Int32(16) + lane_n
-                    w_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
-                    a_frag_vec = fx.ptr_load(
-                        lds_w_ptr + _lds_w_idx(w_row, w_g), result_type=v4bf16_type
-                    )
-                    a_frag_t.store(a_frag_vec)
+            K_TILES = K // MFMA_K
+            for kt in range_constexpr(K_TILES):
+                fx.copy(cp_lds_x4, g1_pS_w[None, None, kt], g1_fw_rt[None, None, kt])
+                fx.copy(cp_lds_x4, g1_pS_h[None, None, kt], g1_fh_rt[None, None, kt])
+                fx.gemm(
+                    gemm1_mma, frag_bv,
+                    g1_fw[None, None, kt], g1_fh[None, None, kt], frag_bv,
+                )
 
-                    for nr in range_constexpr(N_REPEAT_LOCAL):
-                        # h B-frag: B[k=kb*64+ks*16 + lane_m_base*4 + e, n=V=nr*16+lane_n]
-                        # The 4 k-elements are exactly one k-group, so the whole
-                        # fragment is a single ds_read_b64.
-                        h_v = _nr_v(nr) + lane_n
-                        h_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
-                        b_frag_vec = fx.ptr_load(
-                            lds_h_ptr + _lds_h_idx(h_v, h_g), result_type=v4bf16_type
-                        )
-                        b_frag_t.store(b_frag_vec)
-                        fx.gemm(
-                            single_tile_mma, bv_accs[nr], a_frag_t, b_frag_t, bv_accs[nr]
-                        )
+            # Bridge native frag_bv -> the per-N_REPEAT_LOCAL bv_accs list the
+            # v_new consumer indexes. frag_bv C-shape is ((4,1), 1, N_REPEAT_LOCAL).
+            bv_accs = []
+            for nr in range_constexpr(N_REPEAT_LOCAL):
+                acc = fx.make_rmem_tensor(4, fx.Float32)
+                acc.store(fx.Vector(frag_bv[None, None, nr].load(), (4,), fx.Float32))
+                bv_accs.append(acc)
 
             # -- v_new = u - bv --
             vn_frags = []
@@ -1186,6 +1216,8 @@ def compile_chunk_gated_delta_h_gfx942(
             # is [K, V]. So MFMA "m" = the K output row and the contraction is
             # BT, and the A-frag is 4 contiguous BT at fixed k -- exactly one
             # group of lds_kt[k, bt].
+            a_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
+            b_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
                     # A-frag k: m = K row = kb*64 + wid*16 + lane_n,
