@@ -750,18 +750,28 @@ def compile_chunk_gated_delta_h_gfx942(
         lane_n = lane % fx.Int32(16)
         lane_m_base = lane // fx.Int32(16)
 
-        # -- Initialize h accumulators --
-        h_accs = [
-            fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(NUM_H_ACCS)
+        # -- Initialize h accumulators  --
+        h_accs_c = [
+            fx.make_rmem_tensor(
+                fx.tiled_mma_partition_shape(fx.MmaOperand.C, mma_16x16x16_mnk, (64, BV)),
+                fx.Float32,
+            )
+            for _ in range_constexpr(NUM_K_BLOCKS)
         ]
-        for frag in h_accs:
-            frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
+        for frag in h_accs_c:
+            frag.store(fx.Vector.filled(N_REPEAT_LOCAL * 4, 0.0, fx.Float32))
+
 
         # -- Load initial state if provided --
         # h_accs[kb][nr] element e = h[v = i_v*BV + nr*16 + lane_n,
         #                              k = kb*64 + wid*16 + lane_m_base*4 + e]
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
+                # Assemble the whole ((4,1),1,NRL) initial-state add into one vector
+                # (the h0 loads are per-V-tile, but the accumulator update is a
+                # single whole-fragment store -> no per-slice write for the pass).
+                cur = fx.Vector(h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32)
+                add_elems = []
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     h0_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     h0_row_base = (
@@ -773,8 +783,10 @@ def compile_chunk_gated_delta_h_gfx942(
                     loaded_vec = h0_.vec_load((fx.Int64(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
-                    acc_idx = kb * N_REPEAT_LOCAL + nr
-                    h_accs[acc_idx].store(h_accs[acc_idx].load() + loaded_vec)
+                    for e in range_constexpr(4):
+                        add_elems.append(loaded_vec[e])
+                add_whole = fx.Vector.from_elements(add_elems, dtype=fx.Float32)
+                h_accs_c[kb].store(cur + add_whole)
 
         NUM_W_LOADS = W_LOADS_PER_THREAD
 
@@ -865,9 +877,14 @@ def compile_chunk_gated_delta_h_gfx942(
             # k-group, so the whole f32x4 accumulator packs into a single bf16x4
             # (one ds_write_b64) instead of 4 scalar ds_write_b16.
             for kb in range_constexpr(NUM_K_BLOCKS):
+                acc_whole = fx.Vector(
+                    h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
+                )
                 for nr in range_constexpr(N_REPEAT_LOCAL):
-                    acc_idx = kb * N_REPEAT_LOCAL + nr
-                    acc_val = h_accs[acc_idx].load()
+                    acc_val = fx.Vector.from_elements(
+                        [acc_whole[nr * 4 + e] for e in range_constexpr(4)],
+                        dtype=fx.Float32,
+                    )
                     lds_h_v = _nr_v(nr) + lane_n
                     lds_h_g = fx.Int32(kb * 16) + wid_m * fx.Int32(4) + lane_m_base
                     fx.ptr_store(
@@ -1111,29 +1128,33 @@ def compile_chunk_gated_delta_h_gfx942(
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
-                exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
+                # Whole-fragment gate: exp_g_last is uniform across V-tiles.
+                exp_g_last_vec = fx.full(
+                    N_REPEAT_LOCAL * 4, fx.Float32(exp_g_last), fx.Float32
+                )
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    for nr in range_constexpr(N_REPEAT_LOCAL):
-                        acc_idx = kb * N_REPEAT_LOCAL + nr
-                        h_accs[acc_idx].store(
-                            h_accs[acc_idx].load() * exp_g_last_vec
-                        )
+                    cur = fx.Vector(
+                        h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
+                    )
+                    h_accs_c[kb].store(cur * exp_g_last_vec)
 
             if const_expr(USE_GK):
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     # exp() applied here, not at load time, so the prefetch has
                     # no arithmetic depending on the loads.
                     gk_q = fx.Vector(as_ir_value(gk_quads[kb]))
+                    # gk_vec is per-kb, same across V-tiles: tile it to whole width.
                     gk_vec = fx.Vector.from_elements(
                         [
-                            _fast_exp(gk_q[elem_i])
-                            for elem_i in range_constexpr(4)
+                            _fast_exp(gk_q[elem_i % 4])
+                            for elem_i in range_constexpr(N_REPEAT_LOCAL * 4)
                         ],
                         dtype=fx.Float32,
                     )
-                    for nr in range_constexpr(N_REPEAT_LOCAL):
-                        acc_idx = kb * N_REPEAT_LOCAL + nr
-                        h_accs[acc_idx].store(h_accs[acc_idx].load() * gk_vec)
+                    cur = fx.Vector(
+                        h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
+                    )
+                    h_accs_c[kb].store(cur * gk_vec)
 
             # -- 4. State update: h += k^T @ v_new_gated --
             # Store gated v_new transposed as [V, BT] so GEMM2 B-frag (run over
@@ -1249,19 +1270,6 @@ def compile_chunk_gated_delta_h_gfx942(
             g2_fk = mma_16x16x16_mnk.make_fragment_A(sKT_shape)
             BT_TILES = BT // MFMA_K
             for kb in range_constexpr(NUM_K_BLOCKS):
-                # Seed C with current h (per-N_REPEAT_LOCAL slice) for the +=.
-                frag_h = fx.make_rmem_tensor(
-                    fx.tiled_mma_partition_shape(
-                        fx.MmaOperand.C, mma_16x16x16_mnk, (64, BV)
-                    ),
-                    fx.Float32,
-                )
-                for nr in range_constexpr(N_REPEAT_LOCAL):
-                    frag_h[None, None, nr].store(
-                        fx.Vector(
-                            h_accs[kb * N_REPEAT_LOCAL + nr].load(), (4,), fx.Float32
-                        )
-                    )
                 for bt_s in range_constexpr(BT_TILES):
                     # A (k^T) via nested double-XOR address; row = K-row within the
                     # block (wid_m*16+lane_n), col-group = bt_s*4 + lane_m_base.
@@ -1275,13 +1283,8 @@ def compile_chunk_gated_delta_h_gfx942(
                     )
                     fx.copy(cp_lds_x4, g2_pS_v[None, None, bt_s], g2_fv_rt[None, None, bt_s])
                     fx.gemm(
-                        mma_16x16x16_mnk, frag_h,
-                        g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], frag_h,
-                    )
-                # Write the updated h back into the per-slot h_accs list.
-                for nr in range_constexpr(N_REPEAT_LOCAL):
-                    h_accs[kb * N_REPEAT_LOCAL + nr].store(
-                        fx.Vector(frag_h[None, None, nr].load(), (4,), fx.Float32)
+                        mma_16x16x16_mnk, h_accs_c[kb],
+                        g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], h_accs_c[kb],
                     )
 
 
@@ -1539,9 +1542,14 @@ def compile_chunk_gated_delta_h_gfx942(
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
+                acc_whole = fx.Vector(
+                    h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
+                )
                 for nr in range_constexpr(N_REPEAT_LOCAL):
-                    acc_idx = kb * N_REPEAT_LOCAL + nr
-                    acc_val = h_accs[acc_idx].load()
+                    acc_val = fx.Vector.from_elements(
+                        [acc_whole[nr * 4 + e] for e in range_constexpr(4)],
+                        dtype=fx.Float32,
+                    )
                     ht_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     ht_row_base = (
                         fx.Int32(kb * 64)
