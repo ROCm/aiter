@@ -184,11 +184,16 @@ Let `padded_M=ceil_div(M,B_M)*B_M` and
 | gfx950 two-stage | `[allocation_split_k,batch,padded_M,padded_N]` | FP32 |
 | gfx942 two-stage | `[allocation_split_k,batch,padded_M,padded_N]` | exact BF16/FP32 dtype |
 | gfx1250 two-stage | `[allocation_split_k,padded_M,padded_N]` | BF16 |
-| gfx1250 fused | `[tiles_m,tiles_n,fuse_split_k-1,B_M,B_N]` | exact BF16/FP32 dtype |
+| gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
 An explicit workspace must be on the XQ device, contiguous, 16-byte aligned,
 of the exact instance dtype, and large enough for the final split. A direct
 kid requires `workspace=None`.
+
+gfx1250 clusterlaunch exact kids round the physical launch grid up to complete
+clusters; tile-less workgroups exit inside the pipeline. This does not change
+the logical workspace shape above. The experimental fused family is disabled,
+so no kid in `[21000,30000)` can be resolved through the public registry.
 
 gfx942 BF16-workspace kids `10210`, `10213`, and `10216` are exact ids. Their
 registered exact-N contract is `{64,128,256,384,512,1024,2048}`. A different N

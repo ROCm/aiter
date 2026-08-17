@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import importlib
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
     SPLITK_KIDS,
+    GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
     GFX1250_SPLITK_FUSE_KIDS,
     gfx1250_clusterlaunch_kernels_list,
@@ -101,35 +101,19 @@ def test_gfx1250_two_stage_registry_matches_pr4246_bf16_contract():
     } == {"bf16_t"}
 
 
-def test_gfx1250_fused_registry_matches_pr4246_exact_dtype_contract():
-    assert len(gfx1250_splitk_fuse_kernels_list) == 1378
-    assert len(GFX1250_SPLITK_FUSE_KIDS) == 1378
-    assert (min(GFX1250_SPLITK_FUSE_KIDS), max(GFX1250_SPLITK_FUSE_KIDS)) == (
-        21000,
-        22377,
-    )
-    assert GFX1250_SPLITK_FUSE_KIDS <= SPLITK_KIDS
-    assert Counter(
-        instance.splitk_workspace_dtype
-        for instance in gfx1250_splitk_fuse_kernels_list.values()
-    ) == {"bf16_t": 780, "fp32_t": 598}
-    assert {
-        instance.kernel_tag
-        for instance in gfx1250_splitk_fuse_kernels_list.values()
-    } == {"a16w16_clusterlaunch_tdm_splitk_fuse"}
-    # Dtype is projected onto the shared exact-kid field; do not revive the
-    # old fuse_ws_dtype second source of truth.
-    assert all(
-        not hasattr(instance, "fuse_ws_dtype")
-        for instance in gfx1250_splitk_fuse_kernels_list.values()
-    )
+def test_gfx1250_fused_family_is_present_but_unregistered():
+    assert not GFX1250_SPLITK_FUSE_ENABLED
+    assert not gfx1250_splitk_fuse_kernels_list
+    assert not GFX1250_SPLITK_FUSE_KIDS
+    assert not GFX1250_SPLITK_FUSE_KID_OF
+    assert not (set(range(21000, 30000)) & kernels_list.keys())
 
 
 @pytest.mark.parametrize(
     ("workspace_dtype", "aiter_dtype", "reduce_vec", "workspace_cpp_type"),
     [
         ("bf16_t", "AITER_DTYPE_bf16", 8, "__bf16"),
-        ("fp32_t", "AITER_DTYPE_fp32", 16, "float"),
+        ("fp32_t", "AITER_DTYPE_fp32", 8, "float"),
     ],
 )
 def test_gfx1250_codegen_uses_exact_kid_workspace_dtype(
@@ -180,12 +164,63 @@ def test_gfx1250_codegen_uses_exact_kid_workspace_dtype(
     host_tu = (
         full_codegen_path / "instances" / "all_instances_host_gfx1250.cu"
     ).read_text()
-    assert "bool HAS_OOB_, typename D_WS_>" in host_tu
+    assert "bool HAS_OOB_, int SPLIT_K_, typename D_WS_>" in host_tu
     reduce_tu = (
         full_codegen_path / "instances" / "splitk_reduce_gfx1250.device.cu"
     ).read_text()
-    assert "16, 64, __bf16, true, float, true, float>" in reduce_tu
-    assert "8, 128, __bf16, true, float, true, __bf16>" in reduce_tu
+    assert "8, 128, __bf16, true, float, true, 0, __bf16>" in reduce_tu
+    assert "8, 128, __bf16, true, float, true, 16, float>" in reduce_tu
+
+
+def test_gfx1250_clusterlaunch_rounds_only_the_physical_grid(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
+    )
+    from codegen.gen_instances_gfx1250 import (
+        KARGS_NAME_MAP,
+        KERNEL_FUNC_MAP,
+        PIPELINE_HEADER_MAP,
+        TRAITS_HEADER_MAP,
+        TRAITS_NAME_MAP,
+        gen_cluster_tdm_splitk_ws_instance,
+    )
+
+    instance = gfx1250_clusterlaunch_kernels_list[20100]
+    codegen = SimpleNamespace(
+        impl_path=str(tmp_path),
+        _host_instantiations=[],
+        _device_instantiations=[],
+    )
+    tag = instance.kernel_tag
+    gen_cluster_tdm_splitk_ws_instance(
+        codegen,
+        instance,
+        PIPELINE_HEADER_MAP[tag],
+        TRAITS_HEADER_MAP[tag],
+        KERNEL_FUNC_MAP[tag],
+        "bf16_t",
+        "bf16_t",
+        TRAITS_NAME_MAP[tag],
+        KARGS_NAME_MAP[tag],
+    )
+    generated = (tmp_path / f"{instance.name}.cuh").read_text()
+    assert "int grid_tiles_m =" in generated
+    assert "int grid_tiles_n =" in generated
+    assert "dim3 grid_main(grid_tiles_m, grid_tiles_n, split_k);" in generated
+    assert "must both fill the cluster" not in generated
+    assert "kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);" in generated
+
+    pipeline = (
+        Path(__file__).resolve().parents[1]
+        / "csrc"
+        / "opus_gemm"
+        / "include"
+        / "gfx1250"
+        / "opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_ws_gfx1250.cuh"
+    ).read_text()
+    assert "const bool tile_oob" in pipeline
+    assert "if (tile_oob) return;" in pipeline
+    assert "defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)" in pipeline
 
 
 def test_gfx1250_fused_codegen_validates_tile_major_exact_dtype_workspace(
@@ -203,16 +238,17 @@ def test_gfx1250_fused_codegen_validates_tile_major_exact_dtype_workspace(
         gen_splitk_fuse_instance,
     )
     from gen_instances import opus_gemm_codegen
+    from opus_gemm_common import _a16w16_splitk_fuse_gfx1250
 
     selected = {}
-    for workspace_dtype, expected_aiter_dtype, expected_cpp_type in (
+    for synthetic_kid, (workspace_dtype, expected_aiter_dtype, expected_cpp_type) in enumerate((
         ("bf16_t", "AITER_DTYPE_bf16", "__bf16"),
         ("fp32_t", "AITER_DTYPE_fp32", "float"),
-    ):
-        kid = GFX1250_SPLITK_FUSE_KID_OF[
-            (16, 32, 128, "tileN", 5, 1, workspace_dtype)
-        ]
-        instance = gfx1250_splitk_fuse_kernels_list[kid]
+    ), start=21000):
+        instance = _a16w16_splitk_fuse_gfx1250(
+            16, 32, 128, "tileN", 5, 1, workspace_dtype
+        )
+        kid = synthetic_kid
         selected[kid] = instance
         impl_dir = tmp_path / workspace_dtype
         impl_dir.mkdir()
@@ -262,8 +298,8 @@ def test_gfx1250_fused_codegen_validates_tile_major_exact_dtype_workspace(
         / "gfx1250"
         / "opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_fuse_gfx1250.cuh"
     ).read_text()
-    assert "opus::tdm_window" in pipeline
-    assert "opus::make_tdm" not in pipeline
+    assert "opus::tdm<" in pipeline
+    assert "opus::make_tdm" in pipeline
 
 
 def test_gfx1250_bf16_workspace_kid_accepts_fp32_output():
@@ -351,105 +387,16 @@ def test_a16w16_workspace_init_uses_actual_kid_tile_and_dtype(
     assert workspace.data_ptr() % 16 == 0
 
 
-@pytest.mark.parametrize(
-    ("workspace_dtype", "compile_split_k", "runtime_split_k", "torch_dtype"),
-    [
-        ("bf16_t", 5, 1, torch.bfloat16),
-        ("fp32_t", 4, 16, torch.float32),
-    ],
-)
-def test_gfx1250_fused_workspace_uses_tile_major_compile_time_layout(
-    workspace_dtype, compile_split_k, runtime_split_k, torch_dtype
-):
-    kid = GFX1250_SPLITK_FUSE_KID_OF[
-        (16, 32, 128, "tileN", compile_split_k, 1, workspace_dtype)
-    ]
-    workspace = _init_workspace(
-        "gfx1250",
-        kid,
-        M=17,
-        N=64,
-        K=1024,
-        batch=1,
-        split_k=runtime_split_k,
-    )
-    assert workspace is not None
-    assert workspace.shape == (2, 2, compile_split_k - 1, 16, 32)
-    assert workspace.dtype == torch_dtype
-    assert workspace.data_ptr() % 16 == 0
-    # This is intentionally not the two-stage [split_k, padded_M, padded_N]
-    # shape, and runtime_split_k cannot alter fused capacity.
-    assert workspace.shape != (runtime_split_k, 32, 64)
-
-
-def test_gfx1250_fused_exact_kid_uses_baked_split_k_not_runtime_value():
-    kid = GFX1250_SPLITK_FUSE_KID_OF[
-        (16, 32, 128, "tileN", 5, 1, "bf16_t")
-    ]
-    config = _resolve_exact_a16w16_config(
-        arch="gfx1250",
-        M=17,
-        N=64,
-        K=1024,
-        batch=1,
-        cu_num=256,
-        has_bias=False,
-        input_dtype=torch.bfloat16,
-        output_dtype=torch.float32,
-        kid=kid,
-        split_k=2,
-    )
-    assert config.allocation_split_k == 5
-    assert config.launch_split_k == 5
-
-
-def test_gfx1250_fused_exact_kid_rejects_unrepresentable_public_bias_contract():
-    kid = GFX1250_SPLITK_FUSE_KID_OF[
-        (16, 32, 128, "tileN", 5, 1, "bf16_t")
-    ]
-    with pytest.raises(ValueError, match=r"narrower bf16 \[N\] bias contract"):
-        _resolve_exact_a16w16_config(
-            arch="gfx1250",
-            M=17,
-            N=64,
-            K=1024,
-            batch=1,
-            cu_num=256,
-            has_bias=True,
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            kid=kid,
-            split_k=5,
-        )
-
-
-def test_gfx1250_tuner_omits_fused_kids_for_boolean_bias_rows(
-    monkeypatch,
-):
+def test_gfx1250_tuner_cannot_select_the_disabled_fused_family(monkeypatch):
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
     )
-    from opus_gemm_tune import _gfx1250_select_candidates, kid_rejects_bias
-
-    fused_instance = next(iter(gfx1250_splitk_fuse_kernels_list.values()))
-    two_stage_instance = next(iter(gfx1250_kernels_list.values()))
-    assert kid_rejects_bias(fused_instance, True)
-    assert not kid_rejects_bias(two_stage_instance, True)
-
-    candidates = _gfx1250_select_candidates(
-        64, 128, 4096, 256, include_fused=False
+    from opus_gemm_tune import (
+        _gfx1250_fuse_kids_for_tile,
+        _gfx1250_select_candidates,
     )
-    assert candidates
-    assert candidates.isdisjoint(GFX1250_SPLITK_FUSE_KIDS)
 
-
-def test_gfx1250_fused_tuner_selects_splitk_per_workspace_dtype(monkeypatch):
-    monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
-    )
-    from opus_gemm_tune import _gfx1250_fuse_kids_for_tile
-
-    candidates = _gfx1250_fuse_kids_for_tile(
+    fused = _gfx1250_fuse_kids_for_tile(
         M=16,
         N=32,
         K=4096,
@@ -458,26 +405,14 @@ def test_gfx1250_fused_tuner_selects_splitk_per_workspace_dtype(monkeypatch):
         bn=32,
         bk=128,
     )
-    selected = [gfx1250_splitk_fuse_kernels_list[kid] for kid in candidates]
-    split_k_by_dtype = {
-        workspace_dtype: {
-            instance.fuse_split_k
-            for instance in selected
-            if instance.splitk_workspace_dtype == workspace_dtype
-        }
-        for workspace_dtype in ("bf16_t", "fp32_t")
-    }
-
-    # All SplitK values underfill this synthetic 256-CU shape, so each dtype
-    # should retain its own three largest (and therefore closest) values.
-    assert split_k_by_dtype == {
-        "bf16_t": {13, 14, 15},
-        "fp32_t": {6, 7, 8},
-    }
-    assert all(
-        instance.fuse_split_k * instance.fuse_m_cluster <= 16
-        for instance in selected
+    with_fused = _gfx1250_select_candidates(64, 128, 4096, 256)
+    without_fused = _gfx1250_select_candidates(
+        64, 128, 4096, 256, include_fused=False
     )
+    assert fused == []
+    assert with_fused == without_fused
+    assert with_fused
+    assert with_fused.isdisjoint(range(21000, 30000))
 
 
 @pytest.mark.parametrize(

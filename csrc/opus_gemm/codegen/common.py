@@ -40,8 +40,8 @@ _A16W16_TAGS = (
     "a16w16_cluster_tdm_splitk_ws",
     # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (typed workspace + reduce).
     "a16w16_clusterlaunch_tdm_splitk_ws",
-    # gfx1250 fused in-cluster reduction. It still consumes a caller-owned
-    # exact-kid typed workspace, but does not launch a second reduce kernel.
+    # gfx1250 fused in-cluster reduction source (currently unregistered). When
+    # enabled it consumes caller-owned typed workspace without a second reduce.
     "a16w16_clusterlaunch_tdm_splitk_fuse",
 ) + _GFX942_A16W16_TAGS
 

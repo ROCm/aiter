@@ -50,37 +50,21 @@ _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
 
 
 def splitk_reduce_extra_device_instantiations():
-    # The generic baseline TU emits the fp32-workspace variants. Emit the full
-    # bf16-workspace matrix used by #4246 here, including its gfx1250-only
-    # fp32-bias + bf16-output combination. The same mixed bias/output case is
-    # not in the generic fp32 baseline matrix, so retain that fp32-workspace
-    # specialization too. VEC=8/BLOCK=128 matches the bf16 path's half-width
-    # workspace transaction geometry.
-    configs = (
-        ("__bf16", "true", "__bf16"),
-        ("__bf16", "false", "__bf16"),
-        ("float", "true", "float"),
-        ("float", "false", "float"),
-        ("__bf16", "true", "float"),
-    )
-    out = "// gfx1250 exact-workspace reduce variants not in the baseline matrix\n"
+    # The shared generator emits matched output/bias combinations for both
+    # physical workspace types and every split_k specialization. gfx1250 also
+    # accepts fp32 bias with bf16 output, so add that mixed combination here.
+    out = "// gfx1250 fp32-bias + bf16-output reduce variants\n"
     for has_oob in ("true", "false"):
-        out += (
-            "template __global__ void "
-            "splitk_reduce_kernel_gfx1250<"
-            f"16, 64, __bf16, true, float, {has_oob}, float>(\n"
-            "    const void*, __bf16*, int, int, int, int, int, int,\n"
-            "    const float*, int);\n"
-        )
-        for out_type, has_bias, bias_type in configs:
-            out += (
-                "template __global__ void "
-                "splitk_reduce_kernel_gfx1250<"
-                f"8, 128, {out_type}, {has_bias}, {bias_type}, "
-                f"{has_oob}, __bf16>(\n"
-                f"    const void*, {out_type}*, int, int, int, int, int, int,\n"
-                f"    const {bias_type}*, int);\n"
-            )
+        for split_k in range(17):
+            for workspace_type in ("__bf16", "float"):
+                out += (
+                    "template __global__ void "
+                    "splitk_reduce_kernel_gfx1250<"
+                    f"8, 128, __bf16, true, float, {has_oob}, "
+                    f"{split_k}, {workspace_type}>(\n"
+                    "    const void*, __bf16*, int, int, int, int, int, int,\n"
+                    "    const float*, int);\n"
+                )
     return out
 
 
@@ -119,9 +103,9 @@ def gen_cluster_tdm_splitk_ws_instance(
     workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = (
         splitk_workspace_type(k)
     )
-    reduce_vec, reduce_bs = (
-        (8, 128) if workspace_dtype == "bf16_t" else (16, 64)
-    )
+    # The final #4246 reducer uses the same coalesced VEC=8/BLOCK=128 geometry
+    # for either physical workspace type.
+    reduce_vec, reduce_bs = 8, 128
     layout_int = _LAYOUT_INT[getattr(k, "ctdm_layout", "tileN")]
     has_oob_str = "true" if k.has_oob else "false"
     enable_bias_str = "true" if getattr(k, "enable_bias", False) else "false"
@@ -154,22 +138,15 @@ def gen_cluster_tdm_splitk_ws_instance(
         if is_clusterlaunch
         else ""
     )
-    # Cluster round-up emitted before the grid launch: the runtime rejects a grid
-    # that is not a whole number of clusters. The surplus workgroups own no tile and
-    # return right after their one cluster-barrier arrival (tile_oob in the pipeline),
-    # so any (M, N) is launchable with any cluster dims -- no exact-fill assert.
+    # A cluster launch grid must contain whole clusters. Round only the physical
+    # launch grid up; logical tile counts and workspace strides remain unrounded.
     cluster_grid_roundup = ""
     grid_m_expr, grid_n_expr = "num_tiles_m", "num_tiles_n"
     if is_clusterlaunch:
         cluster_grid_roundup = (
-            f"    // CLUSTER-LAUNCH: the grid must be a whole number of "
-            f"{cwm}x{cwn} clusters, so\n"
-            f"    // round the tile counts up. The surplus workgroups have no tile and "
-            f"leave at\n"
-            f"    // the pipeline's tile_oob exit; the workspace strides below stay on "
-            f"the\n"
-            f"    // UNROUNDED counts, so the reduce kernel is unaffected by the "
-            f"padding.\n"
+            f"    // Round the physical grid to complete {cwm}x{cwn} clusters.\n"
+            f"    // Surplus WGs take the pipeline tile_oob exit; workspace layout\n"
+            f"    // continues to use the unrounded logical tile counts.\n"
             f"    int grid_tiles_m = (num_tiles_m + {cwm} - 1) / {cwm} * {cwm};\n"
             f"    int grid_tiles_n = (num_tiles_n + {cwn} - 1) / {cwn} * {cwn};\n"
         )
@@ -247,17 +224,9 @@ __global__ __launch_bounds__(128, 1)
 #endif
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-// Reduce kernel forward declaration (the distinct gfx1250 name keeps it from
-// colliding with gfx950's splitk_reduce_kernel).
-// The definition lives in gfx1250/splitk_reduce_gfx1250.cuh; the explicit
-// instantiations live in the dedicated splitk_reduce_gfx1250.device.cu TU.
-template<int VEC_, int BLOCK_, typename D_OUT,
-         bool HAS_BIAS_, typename D_BIAS_, bool HAS_OOB_, typename D_WS_>
-__global__ void splitk_reduce_kernel_gfx1250(
-    const void* ws_ptr, D_OUT* c_out,
-    int split_k, int M, int N, int batch,
-    int padded_M, int padded_N,
-    const D_BIAS_* bias, int stride_bias_batch);
+// Host launch helper dispatches runtime split_k to the matching compile-time
+// reducer specialization. The device definitions remain in the per-arch TU.
+#include "gfx1250/splitk_reduce_launch_gfx1250.cuh"
 
 template <typename D_C>
 void
@@ -331,7 +300,7 @@ void
         workspace, XQ, {workspace_aiter_dtype}, required_numel, 16, "{k.name}");
     auto stream = aiter::getCurrentHIPStream();
 
-{cluster_fill_check}    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
+{cluster_grid_roundup}    dim3 grid_main({grid_m_expr}, {grid_n_expr}, split_k);
     dim3 block_main({k.BLOCK_SIZE});
 
     constexpr int REDUCE_VEC = {reduce_vec};
@@ -371,31 +340,31 @@ void
         if (ptr_bias_ && bias_is_fp32_) {{{{
             // fp32 bias + bf16 output: fold the exact fp32 bias in the
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
-            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, {workspace_ptr_type}>
-                <<<grid_reduce, block_reduce, 0, stream>>>(
-                    workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                    reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, {workspace_ptr_type}>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else if (ptr_bias_) {{{{
-            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, {workspace_ptr_type}>
-                <<<grid_reduce, block_reduce, 0, stream>>>(
-                    workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                    reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, {workspace_ptr_type}>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, {workspace_ptr_type}>
-                <<<grid_reduce, block_reduce, 0, stream>>>(
-                    workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, {workspace_ptr_type}>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}} else {{{{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
         if (ptr_bias_) {{{{
-            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, {workspace_ptr_type}>
-                <<<grid_reduce, block_reduce, 0, stream>>>(
-                    workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                    reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, {workspace_ptr_type}>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, {workspace_ptr_type}>
-                <<<grid_reduce, block_reduce, 0, stream>>>(
-                    workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, {workspace_ptr_type}>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}}
 }}}}
@@ -629,7 +598,7 @@ register_emit(
     "gfx1250", "a16w16_clusterlaunch_tdm_splitk_fuse", gen_splitk_fuse_instance
 )
 # CLUSTER-LAUNCH variant shares the same emit (it branches on k.kernel_tag to add
-# __cluster_dims__, the cluster-fill check, and the CLUSTER_WG_M/N traits args).
+# __cluster_dims__, physical-grid round-up, and the CLUSTER_WG_M/N traits args).
 register_emit(
     "gfx1250", "a16w16_clusterlaunch_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
 )

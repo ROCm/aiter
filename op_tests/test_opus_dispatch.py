@@ -40,7 +40,7 @@ def _a16_config(arch: str, kid: int, *, N=128, K=4096, split_k=2, batch=1):
 
 
 def test_final_registry_preserves_unique_arch_kid_bands_and_direct_lookup():
-    assert len(kernels_list) == len(set(kernels_list)) == 2084
+    assert len(kernels_list) == len(set(kernels_list)) == 706
     kids_by_arch = {
         arch: {
             kid

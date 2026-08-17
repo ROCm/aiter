@@ -88,14 +88,14 @@ build and remains private for parity and performance A/B tests.
 
 | Family | gfx942 | gfx950 | gfx1250 |
 |---|---|---|---|
-| `a16w16` | direct + two-stage | direct + two-stage | two-stage + fused |
+| `a16w16` | direct + two-stage | direct + two-stage | two-stage; fused source retained but unregistered |
 | `a8w8` | empty | kid 2, FP32 Y | empty |
 | `a8w8_blockscale` | empty | kid 1, FP32 Y | empty |
 | `a8w8_blockscale_bpreshuffle` | kid 11000, BF16 Y | empty | empty |
 | `a8w8_mxscale_bmm` | empty | 45 exact ids in 8000--8653, BF16/FP32 Y | empty |
 
 Empty tables are explicit capability states. The merged registry currently
-contains 2084 final ids. The MXFP8 BMM ids are
+contains 706 final ids. The MXFP8 BMM ids are
 `8000 + family_local_kid`, which places them in an unused global band while
 preserving family-local tuning/debug correlation. Historical child-dictionary
 collisions are resolved by the final merge; runtime routing always follows the
@@ -124,7 +124,7 @@ Full canonical A16 counts are:
 |---|---:|---:|---:|
 | gfx942 | 14 | 1 | 8 |
 | gfx950 | 92 | 92 | 48 |
-| gfx1250 | 0 | 0 | 1874 |
+| gfx1250 | 0 | 0 | 496 |
 
 `gen_instances.py` treats tuned CSV ids, the sidecar, the per-architecture
 default compile floor, and mandatory A8 ids as build availability. It emits no
@@ -144,9 +144,21 @@ launch inputs after architecture-specific split resolution:
 - sufficient capacity for the final effective split;
 - exact-kid bias support.
 
-Two-stage layouts are split-major. gfx1250 fused instances use tile-major
-`[tiles_m,tiles_n,fuse_split_k-1,B_M,B_N]` storage and their compile-time split.
-C++ never owns or retains a Tensor or pointer.
+Two-stage layouts are split-major. gfx1250 exact kids currently use BF16
+workspace storage; the generated launcher/reducer ABI remains typed for either
+BF16 or FP32. C++ never owns or retains a Tensor or pointer.
+
+The gfx1250 TDM pipelines use the policy-tag, element-unit API. Clusterlaunch
+rounds only the physical grid to `(cluster_wg_m, cluster_wg_n)` multiples;
+surplus workgroups arrive at the required cluster barrier and leave through the
+uniform `tile_oob` path. Logical tile counts and workspace strides remain
+unrounded. The separate reducer dispatches runtime split-K to compile-time
+specializations `SPLIT_K_=1..16`, with `SPLIT_K_=0` as the runtime fallback,
+using the VEC=8/BLOCK=128 geometry.
+
+The fused gfx1250 factory, emitter and device pipeline remain in-tree for repair,
+but `GFX1250_SPLITK_FUSE_ENABLED` is `False`. No fused kid is registered, the
+unified capability tables cannot return one, and `[21000, 30000)` is unclaimed.
 
 gfx942 continues to wave-uniformize both halves of the direct 64-bit workspace
 pointer with `__builtin_amdgcn_readfirstlane` in main and reduce kernels.

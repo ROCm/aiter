@@ -402,11 +402,11 @@ def test_failed_a8_registry_lookup_is_not_cached(monkeypatch):
 
 
 def test_registry_counts_routes_and_a8_contracts_are_stable():
-    assert len(kernels_list) == 2084
+    assert len(kernels_list) == 706
     assert Counter(_instance_arch(instance) for instance in kernels_list.values()) == {
         "gfx950": 187,
         "gfx942": 23,
-        "gfx1250": 1874,
+        "gfx1250": 496,
     }
     assert {
         "gfx950_plain_scale": len(a8w8_scale_kernels_list),
@@ -425,7 +425,7 @@ def test_registry_counts_routes_and_a8_contracts_are_stable():
         "gfx942_bpreshuffle": 1,
         "gfx1250_plain": 28,
         "gfx1250_cluster": 468,
-        "gfx1250_fused": 1378,
+        "gfx1250_fused": 0,
     }
     assert kernels_list[1] is a8w8_scale_kernels_list[1]
     assert kernels_list[2] is a8w8_kernels_list[2]

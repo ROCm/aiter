@@ -87,8 +87,8 @@ SPLITK_REDUCE_ABI_MAP = {
     },
     "gfx1250": {
         # gfx1250 cluster/TDM split-K: exact-kid bf16/fp32 workspace + separate
-        # reduce kernel. The baseline matrix below is the fp32-storage half;
-        # gen_instances_gfx1250.py contributes the bf16-storage half.
+        # compile-time-split reduce kernel. The shared generator emits both
+        # workspace types; gen_instances_gfx1250.py adds mixed fp32-bias/bf16-Y.
         # Distinct kernel NAME (splitk_reduce_kernel_gfx1250) keeps it from
         # colliding with gfx950 in a multi-arch build.
         "forward_decl_include": '#include "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh"\n',
@@ -96,8 +96,7 @@ SPLITK_REDUCE_ABI_MAP = {
         "ws_arg": "const void* ws_ptr",
         "ws_type": "const void*",
         "baseline_has_oob": (True, False),
-        "baseline_extra_template_args": ", float",
-        "forward_decl_extra_template_params": ", typename D_WS_",
+        "forward_decl_extra_template_params": ", int SPLIT_K_, typename D_WS_",
     },
 }
 
@@ -105,25 +104,55 @@ SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
 LEGACY_OPUS_ARCH = "gfx950"
 
 
+def _kid_name_arch(kid_name):
+    """Resolve a generated symbol's owning architecture."""
+    for arch_prefix in SPLITK_REDUCE_ARCHES:
+        if kid_name.startswith(f"opus_gemm_{arch_prefix}_"):
+            return arch_prefix
+    return LEGACY_OPUS_ARCH
+
+
+def _own_arch_device_pass_guard(arch):
+    """Admit the host pass and only this kid's owning device pass."""
+    return (
+        f"#if !defined(__HIP_DEVICE_COMPILE__) || defined(__{arch}__)\n",
+        f"#endif // host pass or {arch} device pass\n",
+    )
+
+
 def _splitk_reduce_baseline_instantiations(
-    reduce_kernel, ws_ptr_type, has_oob, extra_template_args=""
+    reduce_kernel,
+    ws_ptr_type,
+    has_oob,
+    vec=16,
+    block=64,
+    split_ks=(None,),
+    workspace_types=(None,),
 ):
     has_oob_str = "true" if has_oob else "false"
-    return (
-        f"// HAS_OOB={has_oob_str} variants\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, {has_oob_str}{extra_template_args}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, {has_oob_str}{extra_template_args}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  {has_oob_str}{extra_template_args}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  {has_oob_str}{extra_template_args}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
+    configs = (
+        ("__bf16", "true", "__bf16"),
+        ("__bf16", "false", "__bf16"),
+        ("float", "true", "float"),
+        ("float", "false", "float"),
     )
+    out = f"// HAS_OOB={has_oob_str} variants\n"
+    for split_k in split_ks:
+        for workspace_type in workspace_types:
+            tail = (
+                ""
+                if split_k is None
+                else f", {split_k}, {workspace_type}"
+            )
+            for out_type, has_bias, bias_type in configs:
+                out += (
+                    f"template __global__ void {reduce_kernel}<"
+                    f"{vec}, {block}, {out_type}, {has_bias}, {bias_type}, "
+                    f"{has_oob_str}{tail}>(\n"
+                    f"    {ws_ptr_type}, {out_type}*, int, int, int, int, int, int,\n"
+                    f"    const {bias_type}*, int);\n"
+                )
+    return out
 
 
 # Arches that own an opus_gemm_arch_*.cuh dispatch header, i.e. one set of
@@ -869,6 +898,7 @@ void
         This TU needs no arch guard: it is host-pass only, so a mixed
         build's device passes already see nothing here.
         """
+
         host_by_arch = {}
         for row in self._host_instantiations:
             arch = _kid_name_arch(row["kid_name"])
@@ -937,7 +967,9 @@ void
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
-            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
+            guard_open, guard_close = _own_arch_device_pass_guard(
+                _kid_name_arch(name)
+            )
             # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
             # OPUS_FUSED_HOST_TU is NOT defined here) an...
             contents = (
@@ -1012,17 +1044,14 @@ void
             reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
             ws_ptr_type = reduce_abi["ws_type"]
             reduce_kernel = reduce_abi["kernel"]
-            # gfx1250 reduce: VEC=8/BLOCK=128 + bf16 workspace + compile-time split_k
-            # (SPLIT_K_ = 0..16, matching the launch-helper switch). Other arches keep
-            # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
             if reduce_arch == "gfx1250":
                 reduce_vec, reduce_block = 8, 128
-                reduce_split_ks = tuple(range(17))  # 0 (runtime) + 1..16 (unrolled)
-                reduce_d_ws = "__bf16"
+                reduce_split_ks = tuple(range(17))
+                reduce_workspace_types = ("__bf16", "float")
             else:
                 reduce_vec, reduce_block = 16, 64
                 reduce_split_ks = (None,)
-                reduce_d_ws = None
+                reduce_workspace_types = (None,)
             guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
@@ -1039,7 +1068,10 @@ void
                         reduce_kernel,
                         ws_ptr_type,
                         has_oob,
-                        reduce_abi.get("baseline_extra_template_args", ""),
+                        reduce_vec,
+                        reduce_block,
+                        reduce_split_ks,
+                        reduce_workspace_types,
                     )
                     for has_oob in reduce_abi["baseline_has_oob"]
                 )

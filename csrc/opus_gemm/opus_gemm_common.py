@@ -1216,9 +1216,9 @@ GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
 # (cluster_wg_m x cluster_wg_n x 1) workgroup CLUSTER: peers co-reside and share
 # A/B TDM loads via CLUSTER_LOAD_ASYNC multicast (named-barrier producer/consumer
 # handshake, same as the plain base). The host launcher rounds the grid up to the
-# cluster dims; the workgroups that round-up adds own no tile and return at their
-# cluster-barrier arrival, so no shape needs an exact cluster fill. Distinct kid
-# band (20100+) so it never collides with the no-cluster base kids (20000..20099).
+# cluster dims; surplus workgroups take the pipeline's uniform tile_oob exit.
+# Logical workspace strides remain based on the unrounded tile counts. Distinct kid
+# band (20500+) so it never collides with the no-cluster base kids (20000..20087).
 def _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
     bm, bn, bk, layout, cwm, cwn, num_slots=3, wg_per_cu=2
 ):
@@ -1320,6 +1320,10 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 # external-workspace family. Workspace is tile-major:
 #   [num_tiles_m, num_tiles_n, SplitK-1, B_M, B_N]
 # SplitK and the N-peer count are compile-time properties of each exact kid.
+#
+# The final #4246 decision leaves this family unregistered until its pipeline
+# is fixed. The factory, emitter, and device source remain available, but no kid
+# is visible to exact dispatch/capability queries and [21000, 30000) is free.
 def _a16w16_splitk_fuse_gfx1250(
     bm,
     bn,
@@ -1349,6 +1353,8 @@ def _a16w16_splitk_fuse_gfx1250(
     )
 
 
+GFX1250_SPLITK_FUSE_ENABLED = False
+
 gfx1250_splitk_fuse_kernels_list = {}
 GFX1250_SPLITK_FUSE_KID_BASE = 21000
 GFX1250_SPLITK_FUSE_KID_OF = {}
@@ -1375,7 +1381,8 @@ def _fuse_ring_lds_ok(bm, bn, bk, wg, ws_bytes):
 _FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))
 _FUSE_MAX_NCLUSTER = 5
 _fuse_tiles_seen = set()
-for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
+_fuse_tiles = _GFX1250_CLUSTERLAUNCH_TILES if GFX1250_SPLITK_FUSE_ENABLED else ()
+for _bm, _bn, _bk, _wg in _fuse_tiles:
     if (_bm, _bn, _bk) in _fuse_tiles_seen:
         continue
     _fuse_tiles_seen.add((_bm, _bn, _bk))
@@ -1404,20 +1411,12 @@ for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
                 ] = _sf_kid
                 _sf_kid += 1
 
-assert _sf_kid == 22378, (
-    "#4246 fused registry drift: expected kids 21000..22377, "
+assert _sf_kid <= 30000, (
+    "splitk_fuse gfx1250 kids overflow [21000,30000): "
     f"ended at {_sf_kid - 1}"
 )
 GFX1250_SPLITK_FUSE_KIDS = frozenset(gfx1250_splitk_fuse_kernels_list.keys())
-assert len(GFX1250_SPLITK_FUSE_KIDS) == 1378
-assert sum(
-    kernels.splitk_workspace_dtype == "bf16_t"
-    for kernels in gfx1250_splitk_fuse_kernels_list.values()
-) == 780
-assert sum(
-    kernels.splitk_workspace_dtype == "fp32_t"
-    for kernels in gfx1250_splitk_fuse_kernels_list.values()
-) == 598
+assert bool(GFX1250_SPLITK_FUSE_KIDS) == GFX1250_SPLITK_FUSE_ENABLED
 
 # Flatten the eight BMM launcher tags into the same canonical exact-kid
 # registry used by every other OPUS family.
@@ -1762,8 +1761,9 @@ def kernel_needs_external_workspace(arch: str, family: str, kid: int) -> bool:
     kid as a non-workspace kernel would let a caller launch it without the
     allocation required for memory safety.  Capability comes from the existing
     ``SPLITK_KIDS`` registry, never from a numeric kid range or tag substring.
-    The registry includes two-stage reducers and gfx1250 fused in-cluster
-    reduction, whose first SplitK-1 WGs still publish external partial tiles.
+    The registry includes all enabled two-stage reducers. If the experimental
+    gfx1250 fused family is re-enabled, its first SplitK-1 WGs also publish
+    external partial tiles and therefore enter this same capability set.
     """
     instance = get_kernel_instance(arch, family, kid)
     if instance is None:
