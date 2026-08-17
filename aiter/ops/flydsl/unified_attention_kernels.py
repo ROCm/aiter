@@ -366,11 +366,27 @@ def _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
 
 def _descales_ok(q_descale, k_descale, v_descale) -> bool:
     """Per-tensor fp8 descales are mandatory: the kernel reads all three to form
-    c_logit_scale and the V dequant."""
+    c_logit_scale and the V dequant. numel()==1 admits both a 1-D [1] tensor and
+    a 0-dim scalar; _as_1d_descale normalizes the latter before it reaches the
+    kernel (see flydsl_unified_attention)."""
     return all(
         d is not None and d.dtype == torch.float32 and d.numel() == 1
         for d in (q_descale, k_descale, v_descale)
     )
+
+
+def _as_1d_descale(d):
+    """Normalize a 0-dim scalar descale to a 1-element 1-D tensor.
+
+    vLLM passes per-tensor fp8 descales as 0-dim scalars (shape ()). FlyDSL's
+    from_dlpack rejects those -- a scalar has no stride-1 axis to auto-mark
+    layout-dynamic -- so widen to [1] here. reshape on a 0-dim tensor is a view,
+    not a copy, and numel is unchanged so _descales_ok still passes and
+    _scaled_q_descale's elementwise multiply stays shape-correct. Passes None
+    and already-1-D descales through untouched."""
+    if d is not None and d.ndim == 0:
+        return d.reshape(1)
+    return d
 
 
 def _geometry_ok(
@@ -617,6 +633,13 @@ def flydsl_unified_attention(
     Returns ``out`` (written in place) if this configuration is supported, or
     ``None`` so the caller falls through to Triton.
     """
+    # Widen 0-dim scalar descales to [1] before the gate, the recursion, and the
+    # kernel see them (vLLM passes per-tensor descales as scalars; FlyDSL's
+    # from_dlpack rejects a shape-() tensor). A view, not a copy.
+    q_descale = _as_1d_descale(q_descale)
+    k_descale = _as_1d_descale(k_descale)
+    v_descale = _as_1d_descale(v_descale)
+
     if not _supported(
         q,
         k,
