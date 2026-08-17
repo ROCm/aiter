@@ -127,7 +127,12 @@ def gemm_a16w16_(
         N, _ = w.shape
 
         if config is None:
-            config, _ = get_gemm_config("GEMM-A16W16-PERSISTENT", M, N, K)
+            # backend-scoped: the two backends need different config formats
+            # (triton BLOCK_SIZE_*, gluon BLOCK_*), and on gfx1250 the flat
+            # config file only carries the gluon keys.
+            config, _ = get_gemm_config(
+                "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
+            )
             if backend == "triton":
                 config = compute_splitk_params(config, K)
 
@@ -318,7 +323,7 @@ def gemm_a16w16_(
         N, _ = w.shape
 
         if config is None:
-            config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
 
         kernel_type_from_config = config.pop("kernel_type", None)
         if kernel_type_from_config is not None:
@@ -381,7 +386,6 @@ def gemm_a16w16_(
         _LOGGER.info(
             f"GEMM_A16W16 [gluon, non-persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
         )
-        print("non-persistent")
 
         _KERNEL_MAP[kernel_type][grid](
             x,
