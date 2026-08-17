@@ -509,5 +509,3 @@ def gemm_a6w6(
     if padM != M or padN != N:
         return out[:M, :N]
     return out
-
-
