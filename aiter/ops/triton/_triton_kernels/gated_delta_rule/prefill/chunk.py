@@ -292,7 +292,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             preferred path when multiple layers process the same batch.
         initial_state_indices: Optional ``[N]`` state-pool slot indices. When
             provided, K5 gathers from and writes back to ``initial_state`` in
-            place. Supported by every K5 path (HIP, FlyDSL, Triton VK).
+            place; this requires ``output_final_state=True``. Supported by
+            every K5 path (HIP, FlyDSL, Triton VK).
         inplace_final_state: Controls in-place K5 state-pool write-back. It
             defaults to ``True`` when ``initial_state_indices`` is provided.
         snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or

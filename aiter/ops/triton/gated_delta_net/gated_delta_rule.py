@@ -544,6 +544,11 @@ def chunk_gated_delta_rule_opt_vk(
                 f"prefill sequences, i.e. {n_prefill} rather than "
                 f"{initial_state_indices.numel()}."
             )
+        if not output_final_state:
+            raise ValueError(
+                "`initial_state_indices` requires `output_final_state=True` "
+                "(the indexed path writes the final state back into the pool)."
+            )
     elif initial_state is not None and initial_state.shape[0] != n_prefill:
         raise ValueError(
             f"The number of initial states is expected to be equal to the number of input sequences, "

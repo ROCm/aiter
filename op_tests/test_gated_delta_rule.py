@@ -17,6 +17,7 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
 )
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -1183,6 +1184,68 @@ def test_chunk_opt_vk_indice(
     assert torch.equal(
         pool[untouched], pool_before[untouched]
     ), "non-indexed pool slots were modified by the kernel"
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+        pytest.param(
+            "flydsl",
+            id="flydsl",
+            marks=pytest.mark.skipif(
+                not is_flydsl_available(),
+                reason="FlyDSL backend requires flydsl",
+            ),
+        ),
+    ],
+)
+def test_chunk_opt_vk_indexed_state_pool_requires_output_final_state(backend: str):
+    """Indexed pool write-back requires ``output_final_state=True`` on every backend."""
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        extra_kwargs = {"g_head_major": True}
+    elif backend == "flydsl":
+        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    B, T, H, D = 1, 128, 2, 128
+    cu_seqlens = torch.tensor([0, 64, 128], device=device, dtype=torch.int32)
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    pool = torch.randn(7, H, D, D, dtype=torch.float32, device=device)
+    indices = torch.tensor([3, 1], dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match="output_final_state=True"):
+        fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=pool,
+            initial_state_indices=indices,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            **extra_kwargs,
+        )
 
 
 @pytest.mark.parametrize(

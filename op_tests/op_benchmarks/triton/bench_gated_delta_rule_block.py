@@ -56,6 +56,10 @@ python bench_gated_delta_rule_block.py --without-metadata
 # Quantify what the indexed state pool costs against the dense states
 python bench_gated_delta_rule_block.py --with-state-pool
 
+# Also time the per-step indices re-validation a serving loop pays after
+# rewriting the slot mapping in place (cache cold on every layer call)
+python bench_gated_delta_rule_block.py --with-state-pool --with-state-pool-cold-check
+
 # Per-kernel breakdown behind the stage buckets
 python bench_gated_delta_rule_block.py --show-kernels
 """
@@ -229,7 +233,14 @@ def _build_inputs(case, seed, with_state_pool=False):
 
 
 def _make_callable(
-    tensors, case, backend, snapshot_dtype, prefill_metadata, state_indices=None
+    tensors,
+    case,
+    backend,
+    snapshot_dtype,
+    prefill_metadata,
+    state_indices=None,
+    *,
+    cold_indices_check=False,
 ):
     # The indexed path reads and writes the pool, so the states it walks are
     # the ones the previous iteration wrote back. The gates decay, so the
@@ -237,8 +248,17 @@ def _make_callable(
     initial_state = (
         tensors["state_pool"] if state_indices is not None else tensors["initial_state"]
     )
+    pool_size = initial_state.shape[0] if state_indices is not None else 0
 
     def run():
+        if cold_indices_check and state_indices is not None:
+            # Serving rewrites the slot mapping in place each step. FlyDSL no
+            # longer re-validates index values on the host (HIP parity), so
+            # this mainly exercises any copy/narrow cost from ``.to(int32)``.
+            new_slots = torch.randperm(pool_size, device=state_indices.device)[
+                : state_indices.numel()
+            ]
+            state_indices.copy_(new_slots.to(dtype=state_indices.dtype))
         return chunk_gated_delta_rule_opt_vk(
             q=tensors["q"],
             k=tensors["k"],
@@ -430,6 +450,8 @@ def _run_case(case_id, case, args):
     state_variants = [("", None)]
     if with_pool:
         state_variants.append(("pool", tensors["state_indices"]))
+        if args.with_state_pool_cold_check:
+            state_variants.append(("pool-cold", tensors["state_indices"]))
 
     records = []
     labels, rows, per_kernel_rows = [], {}, {}
@@ -450,6 +472,7 @@ def _run_case(case_id, case, args):
                         snapshot_dtype,
                         prefill_metadata=metadata,
                         state_indices=state_indices,
+                        cold_indices_check=state_name == "pool-cold",
                     )
                     parts = (backend, snapshot_name, meta_name, state_name)
                     label = " ".join(part for part in parts if part)
@@ -535,6 +558,13 @@ def main() -> None:
         "gathers each sequence's slot from an index array and writes the "
         "final state back in place. Cases without a final state keep the "
         "dense states only.",
+    )
+    parser.add_argument(
+        "--with-state-pool-cold-check",
+        action="store_true",
+        help="When ``--with-state-pool`` is set, also time a variant that "
+        "rewrites ``initial_state_indices`` in place before every call, "
+        "matching a serving loop that updates the slot mapping each step.",
     )
     parser.add_argument(
         "--show-kernels",

@@ -1618,35 +1618,6 @@ class TestCorrectness:
         assert torch.isposinf(converted[2]), "portable RNE did not preserve +Inf"
         assert torch.isneginf(converted[3]), "portable RNE did not preserve -Inf"
 
-    @pytest.mark.parametrize(
-        "indices,index_dtype,match",
-        [
-            ([-1, 0], torch.int32, "out of range"),
-            ([0, 3], torch.int64, "out of range"),
-            ([1, 1], torch.int64, "duplicate initial_state_indices"),
-            ([2**32, 1], torch.int64, "out of range"),
-            ([0.0, 1.0], torch.float32, "must be int32 or int64"),
-        ],
-    )
-    def test_initial_state_indices_validation(self, indices, index_dtype, match):
-        """Indexed state-pool access validates before narrowing to int32."""
-        k, w, u = self._minimal_inputs()
-        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
-        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
-        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
-        state_indices = torch.tensor(indices, dtype=index_dtype, device="cuda")
-
-        with pytest.raises(ValueError, match=match):
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-                k,
-                w,
-                u,
-                initial_state=h0_pool,
-                output_final_state=True,
-                cu_seqlens=cu,
-                initial_state_indices=state_indices,
-            )
-
     def test_initial_state_indices_rank_and_device_validation(self):
         """Indexed state-pool indices must be 1-D and colocated with the pool."""
         k, w, u = self._minimal_inputs()
@@ -1681,7 +1652,7 @@ class TestCorrectness:
             )
 
     def test_valid_int64_initial_state_indices(self):
-        """Validated int64 indices narrow safely and execute the int32 kernel ABI."""
+        """int64 indices narrow to the int32 kernel ABI, matching the HIP wrapper."""
         k, w, u = self._minimal_inputs()
         H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
         h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
@@ -1701,6 +1672,75 @@ class TestCorrectness:
         assert torch.count_nonzero(h) == 0
         assert torch.count_nonzero(v_new) == 0
         assert torch.count_nonzero(final_state) == 0
+
+    def test_initial_state_indices_under_inference_mode(self):
+        """Indexed pool access works under ``torch.inference_mode()``."""
+        with torch.inference_mode():
+            indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+            k, w, u = self._minimal_inputs()
+            H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+            h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+            cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+            h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=h0_pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                initial_state_indices=indices,
+            )
+        assert final_state.data_ptr() == h0_pool.data_ptr()
+        assert torch.count_nonzero(h) == 0
+        assert torch.count_nonzero(v_new) == 0
+        assert torch.count_nonzero(final_state) == 0
+
+    def test_indexed_state_pool_requires_output_final_state(self):
+        """Indexed pool write-back requires ``output_final_state=True``."""
+        k, w, u = self._minimal_inputs()
+        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+        indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+        with pytest.raises(ValueError, match="output_final_state=True"):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=pool,
+                initial_state_indices=indices,
+                output_final_state=False,
+                cu_seqlens=cu,
+            )
+
+    def test_initial_state_indices_cuda_graph_capture(self):
+        """Indexed pool K5 remains graph-capturable without host-side index checks."""
+        k, w, u = self._minimal_inputs()
+        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+        def run():
+            return chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=h0_pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                initial_state_indices=indices,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+        torch.cuda.synchronize()
 
     @pytest.mark.parametrize(
         "case,match",
