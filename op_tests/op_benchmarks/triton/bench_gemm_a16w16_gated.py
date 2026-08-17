@@ -1,25 +1,27 @@
+import math
+
 import torch
 import triton
-import math
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
-    generate_gemm_a16w16_gated_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
+    generate_gemm_a16w16_gated_inputs,
 )
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, activation: str = None
+    M: int, N: int, K: int, metric: str, layout: str, activation: str | None = None
 ):
     c_dtype = torch.bfloat16
     x, w, _, y = generate_gemm_a16w16_gated_inputs(
@@ -110,7 +112,7 @@ def main(args=None):
     parsed_args, defaults = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args, defaults)

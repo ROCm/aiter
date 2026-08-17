@@ -5,7 +5,7 @@
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 
 
 def get_if_str(idx, total, last_else=True):
@@ -320,7 +320,7 @@ bool binary_op_dispatch(const std::string& op_type,
     class h_instance:
         F_op_type: str
         F_dtype_pair: str  # "in0_type,in1_type"
-        instance_list: List[Any]
+        instance_list: list[Any]
 
         @property
         def name(self) -> str:

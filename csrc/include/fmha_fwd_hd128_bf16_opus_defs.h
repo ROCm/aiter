@@ -10,7 +10,8 @@ struct opus_gqa_kargs {
     const void* __restrict__ ptr_v;  // [B, N, H_KV, D]
     void* __restrict__ ptr_o;        // [B, N, H, D]
     int B;
-    int N;
+    int N;      // seqlen_q
+    int N_KV;   // seqlen_kv
     int H;
     int H_KV;
     int D;
@@ -77,6 +78,7 @@ struct opus_gqa_traits {
     static constexpr int VEC_KV   = 8;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
+    static constexpr int VEC_O_X4 = 16 / sizeof(D_ATTN);   // 8
 
     // Minimal compact pixels for async copy for one wave
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
@@ -85,6 +87,9 @@ struct opus_gqa_traits {
     static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
     static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
     static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
+    // Whole-WG Q block (NUM_WARPS * Q_TILE) staged through LDS in the async-Q path.
+    static constexpr int Q_TOTAL_TILE_SIZE = Q_TILE_SIZE * NUM_WARPS;
+    static constexpr int smem_n_q_rpt = Q_TOTAL_TILE_SIZE / smem_n_per_wave;
 
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
@@ -97,16 +102,32 @@ struct opus_gqa_traits {
     static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_v_padding);
     static constexpr int smem_buffer_elems = smem_k_tile_elems + smem_v_tile_elems;
 
+    // Q shared-tile geometry for the async-Q-via-LDS path (Q has same head dim as K, so
+    // reuses smem_d_rpt / 16B padding). Q aliases the double-buffered V region.
+    static constexpr int smem_q_padding = smem_padding_16B;
+    static constexpr int smem_q_tile_elems = smem_n_q_rpt * smem_d_rpt * (smem_linear_wave + smem_q_padding);
+    // Layout: K double-buffered (2*K) + a shared region max(Q, 2*V) (Q consumed in the
+    // prologue before V0 overwrites it).
+    static constexpr int smem_buffer_elems_qlds = smem_k_tile_elems * 2
+        + (smem_q_tile_elems > smem_v_tile_elems * 2 ? smem_q_tile_elems : smem_v_tile_elems * 2);
+
     static constexpr int k_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+    // Rolling-vmcnt keep-count for the async-prefetch main loop: how many in-flight vmem
+    // loads to leave un-waited at each mem-stage s_waitcnt_vmcnt.
+    static constexpr int KEEP_VMCNT = k_buffer_load_insts + v_buffer_load_insts;
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
     static constexpr size_t smem_size_bytes() {
-        return 2 * smem_buffer_elems * sizeof(D_ATTN);
+        // Q-in-LDS layout (K double-buffered + Q/V aliased shared region).
+        return (size_t)smem_buffer_elems_qlds * sizeof(D_ATTN);
     }
 };
 
+#ifndef OPUS_FMHA_FWD_CEIL_DIV
+#define OPUS_FMHA_FWD_CEIL_DIV
 __host__ __device__ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
+#endif

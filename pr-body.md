@@ -8,25 +8,25 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `99`
-- with samples: `97`
-- added: `3`
-- updated: `72`
-- unchanged: `24`
-- defaulted (no history): `2`
-- removed stale entries: `0`
-- defaulted files list: `op_tests/test_flydsl_pa_mqa_logits_fp4.py, op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py`
-
-### Triton
-- runs used: `10`
-- discovered files: `102`
-- with samples: `102`
-- added: `2`
-- updated: `83`
-- unchanged: `17`
+- discovered files: `113`
+- with samples: `113`
+- added: `5`
+- updated: `67`
+- unchanged: `41`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`
+
+### Triton
+- runs used: `10`
+- discovered files: `108`
+- with samples: `107`
+- added: `3`
+- updated: `85`
+- unchanged: `20`
+- defaulted (no history): `1`
+- removed stale entries: `0`
+- defaulted files list: `op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py`
 
 ## Test plan
 - [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run

@@ -3,13 +3,15 @@
 
 
 import os
+
 import torch
 from torch.distributed import ProcessGroup
 
-from aiter import logger, get_hip_quant
+from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
@@ -20,10 +22,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
-    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", "-1"))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
-        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
     )
 
     def __init__(
@@ -60,7 +62,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group=self.cpu_group,
                     device=self.device,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to initialize PyNcclCommunicator for group "
                     f"{self.unique_name}. Exception: {e}"
@@ -527,7 +529,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else:
                         out, res_out, scale_out = result
                     fused_ok = True
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
@@ -777,19 +779,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # Convert negative dim to positive.
                 dim += input_.dim()
 
-            # Note: This will produce an incorrect answer if we don't make
-            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-            input_tensor = input_.movedim(0, dim).contiguous()
+            # pynccl scatters axis 0, so bring the scattered axis there first.
+            # NOTE: this must be movedim(dim, 0) -- movedim(0, dim) moves the
+            # wrong axis for dim >= 2 (it only happens to coincide when dim == 1
+            # for a 3-D tensor). contiguous() is required or the collective reads
+            # a wrong layout.
+            input_tensor = input_.movedim(dim, 0).contiguous()
 
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
-            output_shape = (chunk_size,) + input_tensor.shape[1:]
-            output_.reshape(output_shape)
+            tmp_shape = (chunk_size,) + input_tensor.shape[1:]
+            # pynccl writes the scattered result with the split axis at 0, so it
+            # needs its own [chunk, ...] buffer -- output_ has the caller's layout
+            # ([..., dim/world_size, ...]) and a different element order. Writing
+            # straight into output_ (as the old code's discarded reshape/movedim
+            # did) produced a transposed, garbage result.
+            tmp = torch.empty(
+                tmp_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            pynccl_comm.reduce_scatter(tmp, input_tensor)
 
-            pynccl_comm.reduce_scatter(output_, input_tensor)
-
-            # Reshape before returning
-            output_.movedim(0, dim).contiguous()
+            # Move the split axis back to `dim` and copy into the caller's
+            # pre-allocated output_ (element-wise copy handles the permuted,
+            # non-contiguous view).
+            output_.copy_(tmp.movedim(0, dim))
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -801,9 +814,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        # Bring the scattered axis to 0 for the collective. Must be
+        # movedim(dim, 0), not movedim(0, dim) -- the latter moves the wrong axis
+        # for dim >= 2 (it only coincides at dim == 1 for a 3-D tensor).
+        # contiguous() is required or the collective reads a wrong layout.
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
             assert len(sizes) == world_size
