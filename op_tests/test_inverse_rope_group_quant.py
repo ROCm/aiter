@@ -38,7 +38,7 @@ torch.set_default_device("cuda")
 # instantiate whenever THREADS_PER_GROUP >= 32, i.e. the s <= 4 tier
 # (THREAD_DATA_SIZE=2 -> 64 lanes per group), so the module does not build on
 # gfx942 today.
-SUPPORTED_GFX = ["gfx950"]
+SUPPORTED_GFX = ["gfx950", "gfx1250", "gfx1201"]
 
 # Positions stay unique for every swept s, so cos/sin rows are not reused across
 # tokens -- reuse would inflate the L2 hit rate versus a real decode batch spread
@@ -433,6 +433,9 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     scale_match = torch.equal(graph_scale, _scale_bytes(eager_scale))
     # Mirrors the host dispatch in csrc/kernels/inverse_rope_group_quant.cu.
     tds = 2 if s <= 4 else (4 if s <= 128 else 8)
+    wave_size = torch.cuda.get_device_properties(o.device).warp_size
+    while group_size // tds > wave_size:
+        tds *= 2
     kpb = 1 if s <= 128 else (2 if s <= 512 else 4)
     aiter.logger.info(
         "graph s=%-6d h=%d g=%d gs=%-3d %s tier(TDS=%d,KPB=%d)  "
@@ -502,9 +505,10 @@ def main():
         "--tokens",
         type=int,
         nargs="*",
-        # Spans all three dispatch tiers of the HIP kernel: s<=4 picks
-        # THREAD_DATA_SIZE=2, s<=128 picks 4, above that 8; K_PER_BLOCK steps
-        # 1 -> 2 -> 4 at s>128 and s>512.
+        # Spans all three dispatch tiers of the HIP kernel: s<=4 starts at
+        # THREAD_DATA_SIZE=2, s<=128 at 4, above that 8. Wave32 targets raise
+        # TDS as needed to keep a quant group within one hardware wave.
+        # K_PER_BLOCK steps 1 -> 2 -> 4 at s>128 and s>512.
         default=[1, 8, 32, 128, 512, 1024, 2048, 4096, 8192, 16384],
         help="""Number of tokens s.
         e.g.: -s 1 128 8192""",

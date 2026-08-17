@@ -41,7 +41,6 @@ template <typename scalar_t,
           int RD,
           int GROUP_SIZE,
           int THREAD_DATA_SIZE,
-          int BLOCK_M,
           int K_PER_BLOCK>
 __global__ void inverse_rope_group_quant_kernel(
     const scalar_t* __restrict__ o,
@@ -64,7 +63,6 @@ __global__ void inverse_rope_group_quant_kernel(
     int max_position)
 {
     constexpr int THREADS_PER_GROUP = GROUP_SIZE / THREAD_DATA_SIZE;
-    constexpr int BLOCK_SIZE = BLOCK_M * THREADS_PER_GROUP;
     static_assert(HEAD_DIM > 0 && RD > 0 && RD <= HEAD_DIM && (RD % 2) == 0);
     static_assert(GROUP_SIZE == 32 || GROUP_SIZE == 64 || GROUP_SIZE == 128);
     static_assert(HEAD_DIM % GROUP_SIZE == 0);
@@ -76,7 +74,8 @@ __global__ void inverse_rope_group_quant_kernel(
     const int tid = threadIdx.x;
     const int row_in_tile = tid / THREADS_PER_GROUP;
     const int lane_in_group = tid - row_in_tile * THREADS_PER_GROUP;
-    const int row = static_cast<int>(blockIdx.y) * BLOCK_M + row_in_tile;
+    const int rows_per_block = static_cast<int>(blockDim.x) / THREADS_PER_GROUP;
+    const int row = static_cast<int>(blockIdx.y) * rows_per_block + row_in_tile;
     const int k_group_base = static_cast<int>(blockIdx.x) * K_PER_BLOCK;
     if(row >= S * G || k_group_base >= scale_n)
     {
@@ -223,9 +222,30 @@ __global__ void inverse_rope_group_quant_kernel(
         }
         if constexpr(THREADS_PER_GROUP > 1)
         {
+#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__GFX9__)
+            amax = multithread_reduce_max_dpp<THREADS_PER_GROUP>(amax);
+#else
+            // Non-GFX9 host dispatch never launches a specialization wider
+            // than its supported 32-lane DPP reduction, but all switch arms
+            // are still instantiated. Keep the generic fallback compileable
+            // for the unreachable 64-lane specialization.
+            if constexpr(THREADS_PER_GROUP <= 32)
+            {
+                amax = multithread_reduce_max_dpp<THREADS_PER_GROUP>(amax);
+            }
+            else
+            {
+                auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
+                amax = wave_reduce<float, decltype(fmax_op), THREADS_PER_GROUP>(
+                    amax, fmax_op);
+            }
+#endif
+#else
             auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
             amax = wave_reduce<float, decltype(fmax_op), THREADS_PER_GROUP>(
                 amax, fmax_op);
+#endif
         }
 
         // --- E8M0 block scale ---
@@ -358,12 +378,11 @@ void inverse_rope_group_quant(
     HipDeviceGuard device_guard(o.device_id);
     const hipStream_t stream = getCurrentHIPStream();
 
-    constexpr int BLOCK_M = 16;
-
     const int Ks_pad = scale_shuffle ? ((scale_n + 7) / 8) * 8 : scale_n;
     const int S_pad = scale_shuffle ? ((S + 31) / 32) * 32 : S;
+    const int wave_size = static_cast<int>(get_warp_size_func());
 
-    auto launch = [&](auto group_tag, auto tds_tag, auto kpb_tag)
+    auto launch = [&](auto group_tag, auto tds_tag, auto kpb_tag, int block_m)
     {
         constexpr int GS = decltype(group_tag)::value;
         constexpr int HEAD_DIM_T = 512;
@@ -371,21 +390,22 @@ void inverse_rope_group_quant(
         constexpr int TDS = decltype(tds_tag)::value;
         constexpr int THREADS_PER_GROUP = GS / TDS;
         constexpr int KPB = decltype(kpb_tag)::value;
-        constexpr int BLOCK_SIZE = BLOCK_M * THREADS_PER_GROUP;
-        if constexpr(BLOCK_SIZE > 1024 || THREADS_PER_GROUP < 1)
+        if constexpr(THREADS_PER_GROUP < 1)
         {
-            AITER_CHECK(false, "invalid THREAD_DATA_SIZE/BLOCK_M combination");
+            AITER_CHECK(false, "invalid THREAD_DATA_SIZE/GROUP_SIZE combination");
         }
         else
         {
-            const dim3 grid(scale_n / KPB, (S * G + BLOCK_M - 1) / BLOCK_M);
-            const dim3 block(BLOCK_SIZE);
+            const int block_size = block_m * THREADS_PER_GROUP;
+            AITER_CHECK(block_size <= 1024, "block size exceeds 1024 threads");
+            const dim3 grid(scale_n / KPB, (S * G + block_m - 1) / block_m);
+            const dim3 block(block_size);
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 o.dtype(), "inverse_rope_group_quant", [&]
             {
                 using scalar_opus_t = typename hip2opus<scalar_t>::type;
                 inverse_rope_group_quant_kernel<
-                    scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, BLOCK_M, KPB>
+                    scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPB>
                     <<<grid, block, 0, stream>>>(
                         reinterpret_cast<const scalar_opus_t*>(o.data_ptr()),
                         reinterpret_cast<opus::fp8_t*>(x_fp8.data_ptr()),
@@ -401,22 +421,40 @@ void inverse_rope_group_quant(
         }
     };
 
-    auto dispatch_kpb = [&](auto group_tag, auto tds_tag, int kpb)
+    auto dispatch_kpb = [&](auto group_tag, auto tds_tag, int kpb, int block_m)
     {
         switch(kpb)
         {
-            case 2: launch(group_tag, tds_tag, ic<2>{}); break;
-            case 4: launch(group_tag, tds_tag, ic<4>{}); break;
-            default: launch(group_tag, tds_tag, ic<1>{}); break;
+            case 2: launch(group_tag, tds_tag, ic<2>{}, block_m); break;
+            case 4: launch(group_tag, tds_tag, ic<4>{}, block_m); break;
+            default: launch(group_tag, tds_tag, ic<1>{}, block_m); break;
         }
     };
 
     auto dispatch = [&](auto group_tag)
     {
+        constexpr int GS = decltype(group_tag)::value;
+
         // Dispatch tiers from TDS x KPB sweep on MI355X (gfx950):
         // Small S: few rows -> keep one group per block (KPB=1).
         // Large S: bandwidth bound -> multiple loads in flight (KPB=4).
-        const int tds = (S <= 4) ? 2 : (S <= 128 ? 4 : 8);
+        int tds = (S <= 4) ? 2 : (S <= 128 ? 4 : 8);
+        // A logical quant group must fit wholly within one hardware wave.
+        while(GS / tds > wave_size)
+        {
+            tds <<= 1;
+        }
+
+        const int threads_per_group = GS / tds;
+        AITER_CHECK(wave_size % threads_per_group == 0,
+                    "threads per quant group must divide wave size");
+
+        // Preserve the tuned wave64 launch. On wave32, aim for four physical
+        // waves per block. BLOCK_M is a runtime launch choice and does not
+        // multiply the number of kernel template instantiations.
+        const int block_m =
+            wave_size == 64 ? 16 : std::min(32, 4 * wave_size / threads_per_group);
+
         int kpb = (S <= 128) ? 1 : (S <= 512 ? 2 : 4);
         while(kpb > 1 && scale_n % kpb != 0)
         {
@@ -424,9 +462,9 @@ void inverse_rope_group_quant(
         }
         switch(tds)
         {
-            case 2: dispatch_kpb(group_tag, ic<2>{}, kpb); break;
-            case 4: dispatch_kpb(group_tag, ic<4>{}, kpb); break;
-            default: dispatch_kpb(group_tag, ic<8>{}, kpb); break;
+            case 2: dispatch_kpb(group_tag, ic<2>{}, kpb, block_m); break;
+            case 4: dispatch_kpb(group_tag, ic<4>{}, kpb, block_m); break;
+            default: dispatch_kpb(group_tag, ic<8>{}, kpb, block_m); break;
         }
     };
 
