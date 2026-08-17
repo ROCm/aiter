@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Helpers for the SGLang MI355X disaggregation workflow.
 
 The workflow intentionally reuses SGLang's launcher from the upstream PR and
@@ -129,6 +128,20 @@ fi""",
         text,
         '-C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
         '-C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+    )
+    text = replace_once(
+        text,
+        "tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git/config' \\\n"
+        '        -C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+        "tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' \\\n"
+        '        -C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+    )
+    text = replace_once(
+        text,
+        "tar --exclude='__pycache__' --exclude='*.pyc' \\\n"
+        '  -C "$CHECKOUT_SRC" -cf - . | tar -C "$RUNTIME_CHECKOUT" -xf -',
+        "tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' \\\n"
+        '  -C "$CHECKOUT_SRC" -cf - . | tar -C "$RUNTIME_CHECKOUT" -xf -',
     )
     text = replace_once(
         text,
