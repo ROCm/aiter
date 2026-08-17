@@ -194,21 +194,6 @@ def _to_bf16_fast(val, n=1):
     return cast(bf16_ty, narrowed)
 
 
-def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
-    """Single ``mfma_f32_16x16x16bf16_1k`` (gfx942 bf16 K=16 MFMA).
-
-    The MFMA fragment ABI:
-    * A operand (16x16x16): lane holds bf16x4 with element e = A[m=lane_n, k=grp*4+e],
-        where grp = lane_m_base (lane//16).
-    * B operand: lane holds bf16x4 with element e = B[k=grp*4+e, n=lane_n].
-    * C/D accumulator: lane holds f32x4 with element e = C[m=grp*4+e, n=lane_n].
-    
-    Operands are bitcast bf16x4 -> vec<4xi16> (the intrinsic's operand type).
-    """
-    a_i16 = _vector.bitcast(T.vec(4, T.i16), as_ir_value(a_bf16x4))
-    b_i16 = _vector.bitcast(T.vec(4, T.i16), as_ir_value(b_bf16x4))
-    return rocdl.mfma_f32_16x16x16bf16_1k(T.f32x4, [a_i16, b_i16, acc_f32x4, 0, 0, 0])
-
 def compile_chunk_gated_delta_h_gfx942(
     *,
     K: int,
@@ -273,9 +258,10 @@ def compile_chunk_gated_delta_h_gfx942(
 
     WARP_SIZE = 64
 
-    WMMA_N = 16
-    WMMA_K = 16  # gfx942: K=16
-    N_REPEAT = BV // WMMA_N
+    MFMA_M = 16
+    MFMA_N = 16
+    MFMA_K = 16  # gfx942: K=16
+    N_REPEAT = BV // MFMA_N
 
     # -- Wave decomposition (NR_SPLIT: the "wave widening" axis) --
     # A wave is (wid_m, wid_n):
@@ -307,11 +293,11 @@ def compile_chunk_gated_delta_h_gfx942(
     # wave recompute all of A, each owns BT_STEPS_LOCAL of the BT // WMMA_K
     # key-column tiles and writes its slice into the shared lds_A.
     if COMPUTE_OUTPUT:
-        assert (BT // WMMA_K) % NR_SPLIT == 0, (
-            f"NR_SPLIT={NR_SPLIT} must divide BT_STEPS={BT // WMMA_K} to split "
+        assert (BT // MFMA_K) % NR_SPLIT == 0, (
+            f"NR_SPLIT={NR_SPLIT} must divide BT_STEPS={BT // MFMA_K} to split "
             f"b_A across the V-split waves"
         )
-    BT_STEPS_LOCAL = (BT // WMMA_K) // NR_SPLIT
+    BT_STEPS_LOCAL = (BT // MFMA_K) // NR_SPLIT
 
     # Per-wave accumulators: only this wave's slice of the N_REPEAT axis.
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
@@ -326,8 +312,6 @@ def compile_chunk_gated_delta_h_gfx942(
     # elements are consecutive k and -- unlike g_row -- carry no per-element
     # clamp, so the quad is contiguous and 16 B aligned by construction.
     N_GATE_GK = NUM_K_BLOCKS if USE_GK else 0  # entries, each an f32x4
-    N_U = N_REPEAT_LOCAL * 4
-    N_GU = N_GATE_G + N_GATE_GK + N_U
 
     # -- LDS layout --
     # Every buffer uses the same GROUP-MAJOR + XOR scheme (see _grp_idx): a
@@ -449,8 +433,8 @@ def compile_chunk_gated_delta_h_gfx942(
         NUM_K_BLOCKS * NUM_LOAD_BATCHES_64 if W_BATCHED else W_SLOTS // BLOCK_THREADS
     )
 
-    K_STEPS_PER_BLOCK = 64 // WMMA_K  # 4
-    BT_STEPS = BT // WMMA_K  # 4
+    K_STEPS_PER_BLOCK = 64 // MFMA_K  # 4
+    BT_STEPS = BT // MFMA_K  # 4
 
     # -- k store-transpose decomposition --
     # k arrives from HBM as runs along K but lds_kt wants runs along BT, so the
@@ -582,6 +566,29 @@ def compile_chunk_gated_delta_h_gfx942(
         if const_expr(IS_VARLEN):
             cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
             co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
+
+        # -- MMA atom --
+        # One 16x16x16 bf16 MFMA per wave, replicated 1x1x1 (this kernel does its
+        # own wave decomposition via wid_m/wid_n, so the tiled_mma stays a single
+        # atom and the per-wave tile offsets remain explicit below).
+        #
+        # Every MFMA in this kernel goes through fx.gemm on register-tensor
+        # fragments. The operands are still loaded by hand from LDS at
+        # XOR-swizzled addresses (_lds_*_idx) and pushed into the fragments with
+        # .store(); only the MFMA itself is expressed at the atom level. fly.gemm
+        # requires all of d/a/b/c to be !fly.memref, which is why the raw
+        # vector<4xbf16> from fx.ptr_load cannot be passed directly.
+        #
+        # The fragments do not survive to codegen: fly.gemm expands to
+        # fly.mma_atom_call, fly-convert-atom-call-to-ssa-form rewrites that to
+        # mma_atom_call_ssa, and the register allocas are promoted to SSA
+        # vectors. The emitted ISA is identical to the hand-written
+        # rocdl.mfma_f32_16x16x16bf16_1k form this replaced.
+        mma_atom_bf16_16x16x16 = fx.make_mma_atom(
+            fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16)
+        )
+        single_tile_layout = fx.make_layout((1, 1, 1), (0, 0, 0))
+        single_tile_mma = fx.make_tiled_mma(mma_atom_bf16_16x16x16, single_tile_layout)
 
         # -- LDS views --
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -733,11 +740,17 @@ def compile_chunk_gated_delta_h_gfx942(
         lane_m_base = lane // fx.Int32(16)
 
         # -- Initialize h accumulators --
-        acc_zero = fx.full(4, 0.0, fx.Float32)
-        h_accs = []
-        for _kb in range_constexpr(NUM_K_BLOCKS):
-            for _nr in range_constexpr(N_REPEAT_LOCAL):
-                h_accs.append(acc_zero)
+        # The h accumulators are register tensors that live ACROSS the serial
+        # chunk loop. They are deliberately NOT part of the loop's explicit
+        # init/yield state: fly-promote-reg-mem-to-vector-ssa collects register
+        # allocas touched inside an scf.for and threads them as iter_args itself
+        # (PromoteRegMemToVectorSSA.cpp:466-516), which is the same SSA form the
+        # hand-written carry produced -- with none of the plumbing.
+        h_accs = [
+            fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(NUM_H_ACCS)
+        ]
+        for frag in h_accs:
+            frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
 
         # -- Load initial state if provided --
         # h_accs[kb][nr] element e = h[v = i_v*BV + nr*16 + lane_n,
@@ -756,7 +769,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
                     acc_idx = kb * N_REPEAT_LOCAL + nr
-                    h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
+                    h_accs[acc_idx].store(h_accs[acc_idx].load() + loaded_vec)
 
         NUM_W_LOADS = W_LOADS_PER_THREAD
 
@@ -818,19 +831,16 @@ def compile_chunk_gated_delta_h_gfx942(
 
         gu_prefetch_init = _load_gate_u(i_t0_i32)
 
-        init_state = (
-            [_to_raw(v) for v in h_accs]
-            + [_to_raw(v) for v in w_prefetch_init]
-            + [_to_raw(v) for v in gu_prefetch_init]
-        )
+        init_state = [_to_raw(v) for v in w_prefetch_init] + [
+            _to_raw(v) for v in gu_prefetch_init
+        ]
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
-            h_accs_in = list(state[:NUM_H_ACCS])
-            w_prefetch_all = list(state[NUM_H_ACCS : NUM_H_ACCS + NUM_W_LOADS])
-            gu_prefetch_all = list(state[NUM_H_ACCS + NUM_W_LOADS :])
+            w_prefetch_all = list(state[:NUM_W_LOADS])
+            gu_prefetch_all = list(state[NUM_W_LOADS:])
             i_t_i32 = fx.Int32(i_t)
 
             # -- w LDS write offsets (group-major [BT][K/4][4] + XOR) --
@@ -854,7 +864,7 @@ def compile_chunk_gated_delta_h_gfx942(
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     acc_idx = kb * N_REPEAT_LOCAL + nr
-                    acc_val = h_accs_in[acc_idx]
+                    acc_val = h_accs[acc_idx].load()
                     lds_h_v = _nr_v(nr) + lane_n
                     lds_h_g = fx.Int32(kb * 16) + wid_m * fx.Int32(4) + lane_m_base
                     fx.ptr_store(
@@ -972,35 +982,41 @@ def compile_chunk_gated_delta_h_gfx942(
             # B-frag (h): lane holds h[k, n=V]; read from lds_h[v, k] with the
             #   transposed access = 4 contiguous k for fixed v (since lds_h is
             #   [v, k] with k contiguous, a run over k IS contiguous).
-            bv_accs = []
-            for _nr in range_constexpr(N_REPEAT_LOCAL):
-                bv_accs.append(fx.full(4, 0.0, fx.Float32))
+            bv_accs = [fx.make_rmem_tensor(4, fx.Float32) for _ in fx.range_constexpr(N_REPEAT_LOCAL)]
+            for frag in bv_accs:
+                frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
 
+            a_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
+            b_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
                     # w A-frag: 4 bf16 K-elems for this lane's BT row.
                     # A[m=BT row=wid*16+lane_n, k=kb*64+ks*16 + lane_m_base*4 + e]
                     w_row = wid_m * fx.Int32(16) + lane_n
-                    w_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
-                    a_frag = fx.ptr_load(
+                    w_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
+                    a_frag_vec = fx.ptr_load(
                         lds_w_ptr + _lds_w_idx(w_row, w_g), result_type=v4bf16_type
                     )
+                    a_frag_t.store(a_frag_vec)
 
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         # h B-frag: B[k=kb*64+ks*16 + lane_m_base*4 + e, n=V=nr*16+lane_n]
                         # The 4 k-elements are exactly one k-group, so the whole
                         # fragment is a single ds_read_b64.
                         h_v = _nr_v(nr) + lane_n
-                        h_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
-                        b_frag = fx.ptr_load(
+                        h_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
+                        b_frag_vec = fx.ptr_load(
                             lds_h_ptr + _lds_h_idx(h_v, h_g), result_type=v4bf16_type
                         )
-                        bv_accs[nr] = _mfma_bf16_16x16x16(a_frag, b_frag, bv_accs[nr])
+                        b_frag_t.store(b_frag_vec)
+                        fx.gemm(
+                            single_tile_mma, bv_accs[nr], a_frag_t, b_frag_t, bv_accs[nr]
+                        )
 
             # -- v_new = u - bv --
             vn_frags = []
             for nr in range_constexpr(N_REPEAT_LOCAL):
-                bv_val = bv_accs[nr]
+                bv_val = bv_accs[nr].load()
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
                     u_bf16 = fx.BFloat16(u_prefetch[nr * 4 + elem_i])
@@ -1086,7 +1102,9 @@ def compile_chunk_gated_delta_h_gfx942(
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         acc_idx = kb * N_REPEAT_LOCAL + nr
-                        h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_vec
+                        h_accs[acc_idx].store(
+                            h_accs[acc_idx].load() * exp_g_last_vec
+                        )
 
             if const_expr(USE_GK):
                 for kb in range_constexpr(NUM_K_BLOCKS):
@@ -1102,7 +1120,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     )
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         acc_idx = kb * N_REPEAT_LOCAL + nr
-                        h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
+                        h_accs[acc_idx].store(h_accs[acc_idx].load() * gk_vec)
 
             # -- 4. State update: h += k^T @ v_new_gated --
             # Store gated v_new transposed as [V, BT] so GEMM2 B-frag (run over
@@ -1196,28 +1214,36 @@ def compile_chunk_gated_delta_h_gfx942(
                     # A-frag k: m = K row = kb*64 + wid*16 + lane_n,
                     #           contraction bt = bt_s*16 + lane_m_base*4 + e
                     k_m = fx.Int32(kb * 64) + wid_m * fx.Int32(16) + lane_n
-                    k_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
-                    k_a_frag = fx.ptr_load(
+                    k_g = fx.Int32(bt_s * (MFMA_K // 4)) + lane_m_base
+                    k_a_frag_vec = fx.ptr_load(
                         lds_kt_ptr + _lds_kt_idx(k_m, k_g), result_type=v4bf16_type
                     )
+                    a_frag_t.store(k_a_frag_vec)
 
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         # B-frag v_new: n = V = nr*16 + lane_n,
                         #               contraction bt = bt_s*16 + lane_m_base*4 + e
                         vn_v = _nr_v(nr) + lane_n
-                        vn_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
-                        vn_b_frag = fx.ptr_load(
+                        vn_g = fx.Int32(bt_s * (MFMA_K // 4)) + lane_m_base
+                        vn_b_frag_vec = fx.ptr_load(
                             lds_vnt_ptr + _lds_vnt_idx(vn_v, vn_g),
                             result_type=v4bf16_type,
                         )
+                        b_frag_t.store(vn_b_frag_vec)
+
                         acc_idx = kb * N_REPEAT_LOCAL + nr
-                        h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
-                            k_a_frag, vn_b_frag, h_accs_in[acc_idx]
+                        fx.gemm(
+                            single_tile_mma,
+                            h_accs[acc_idx],
+                            a_frag_t,
+                            b_frag_t,
+                            h_accs[acc_idx],
                         )
+
 
             # =============================================================== #
             # K6 output stage. h[t] is still resident in lds_h (the snapshot,
-            # NOT the GEMM2-updated h_accs_in); lds_kt holds k^T; lds_vnt holds
+            # NOT the GEMM2-updated h_accs); lds_kt holds k^T; lds_vnt holds
             # the gated v_new -- exactly the operands GEMM3/GEMM4 need.
             # =============================================================== #
             if const_expr(COMPUTE_OUTPUT):
@@ -1243,26 +1269,35 @@ def compile_chunk_gated_delta_h_gfx942(
                 # lds_A; that is what lets lds_A alias the now-dead lds_h. Same
                 # fragment structure as GEMM1: A-frag = q, B-frag = h. Output
                 # o_accs[nr][e] = o[m=wid_m*16+lane_m_base*4+e, n=nr*16+lane_n].
-                o_accs = []
-                for _nr in range_constexpr(N_REPEAT_LOCAL):
-                    o_accs.append(fx.full(4, 0.0, fx.Float32))
+                o_accs = [
+                    fx.make_rmem_tensor(4, fx.Float32)
+                    for _ in fx.range_constexpr(N_REPEAT_LOCAL)
+                ]
+                # make_rmem_tensor does NOT zero: the K-loop below accumulates
+                # into these, so they must be cleared first (fx.full did this
+                # implicitly in the pre-atom version).
+                for frag in o_accs:
+                    frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
+
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for ks in range_constexpr(K_STEPS_PER_BLOCK):
                         q_row = wid_m * fx.Int32(16) + lane_n
-                        q_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
-                        qa_frag = fx.ptr_load(
+                        q_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
+                        q_a_frag_vec = fx.ptr_load(
                             lds_q_ptr + _lds_w_idx(q_row, q_g),
                             result_type=v4bf16_type,
                         )
+                        a_frag_t.store(q_a_frag_vec)
                         for nr in range_constexpr(N_REPEAT_LOCAL):
                             h_v = _nr_v(nr) + lane_n
-                            h_g = fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
-                            hb_frag = fx.ptr_load(
+                            h_g = fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
+                            h_b_frag_vec = fx.ptr_load(
                                 lds_h_ptr + _lds_h_idx(h_v, h_g),
                                 result_type=v4bf16_type,
                             )
-                            o_accs[nr] = _mfma_bf16_16x16x16(
-                                qa_frag, hb_frag, o_accs[nr]
+                            b_frag_t.store(h_b_frag_vec)
+                            fx.gemm(
+                                single_tile_mma, o_accs[nr], a_frag_t, b_frag_t, o_accs[nr]
                             )
 
                 # When lds_A aliases lds_h, all waves must finish reading lds_h
@@ -1291,8 +1326,9 @@ def compile_chunk_gated_delta_h_gfx942(
                         result_type=T.bf16,
                     )
 
+                a_acc_t = fx.make_rmem_tensor(4, fx.Float32)
                 for bt_l in range_constexpr(BT_STEPS_LOCAL):
-                    a_acc = fx.full(4, 0.0, fx.Float32)
+                    a_acc_t.store(fx.Vector.filled(4, 0.0, fx.Float32))
                     # Runtime key-tile index for this wave (compile-time when
                     # NR_SPLIT==1, since wid_n is then identically 0).
                     if const_expr(NR_SPLIT == 1):
@@ -1307,30 +1343,42 @@ def compile_chunk_gated_delta_h_gfx942(
                         for ks in range_constexpr(K_STEPS_PER_BLOCK):
                             q_row = wid_m * fx.Int32(16) + lane_n
                             q_g = (
-                                fx.Int32(kb * 16 + ks * (WMMA_K // 4)) + lane_m_base
+                                fx.Int32(kb * 16 + ks * (MFMA_K // 4)) + lane_m_base
                             )
-                            qa_frag = fx.ptr_load(
-                                lds_q_ptr + _lds_w_idx(q_row, q_g),
-                                result_type=v4bf16_type,
+                            a_frag_t.store(
+                                fx.ptr_load(
+                                    lds_q_ptr + _lds_w_idx(q_row, q_g),
+                                    result_type=v4bf16_type,
+                                )
                             )
-                            kb_frag = fx.Vector.from_elements(
-                                [
-                                    _kt_scalar(
-                                        fx.Int32(kb * 64 + ks * 16)
-                                        + lane_m_base * fx.Int32(4)
-                                        + fx.Int32(e),
-                                        bt_col,
-                                    )
-                                    for e in range_constexpr(4)
-                                ],
-                                dtype=fx.BFloat16,
+                            # Bridge style: the B operand is a 4-scalar gather
+                            # (lds_kt is [K, BT], so the 4 contraction elements
+                            # are one row apart), which no copy atom expresses.
+                            # Assemble the vector by hand, then store it into the
+                            # fragment.
+                            b_frag_t.store(
+                                fx.Vector.from_elements(
+                                    [
+                                        _kt_scalar(
+                                            fx.Int32(kb * 64 + ks * 16)
+                                            + lane_m_base * fx.Int32(4)
+                                            + fx.Int32(e),
+                                            bt_col,
+                                        )
+                                        for e in range_constexpr(4)
+                                    ],
+                                    dtype=fx.BFloat16,
+                                )
                             )
-                            a_acc = _mfma_bf16_16x16x16(qa_frag, kb_frag, a_acc)
+                            fx.gemm(
+                                single_tile_mma, a_acc_t, a_frag_t, b_frag_t, a_acc_t
+                            )
 
                     # Causal mask only (no per-column gate) -- see the gating
                     # note above for why the column decay cancels. acc element e
                     # is query row i = wid_m*16+lane_m_base*4+e; column j=bt_col.
                     col_abs = i_t_i32 * fx.Int32(BT) + bt_col
+                    a_acc = a_acc_t.load()
                     for e in range_constexpr(4):
                         row_tok = (
                             wid_m * fx.Int32(16)
@@ -1362,24 +1410,36 @@ def compile_chunk_gated_delta_h_gfx942(
                 # BT, n=V] from lds_vnt. The intra term accumulates separately so
                 # it can take the per-query-row factor exp(g_i - g_last) at store
                 # time while the inter term takes exp(g_i).
-                o_intra_accs = []
-                for _nr in range_constexpr(N_REPEAT_LOCAL):
-                    o_intra_accs.append(fx.full(4, 0.0, fx.Float32))
+                o_intra_accs = [
+                    fx.make_rmem_tensor(4, fx.Float32)
+                    for _ in range_constexpr(N_REPEAT_LOCAL)
+                ]
+                for frag in o_intra_accs:
+                    frag.store(fx.Vector.filled(4, 0.0, fx.Float32))
+
                 for bt_s in range_constexpr(BT_STEPS):
                     a_m = wid_m * fx.Int32(16) + lane_n
-                    a_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
-                    a_frag = fx.ptr_load(
-                        lds_A_ptr + _lds_A_idx(a_m, a_g), result_type=v4bf16_type
+                    a_g = fx.Int32(bt_s * (MFMA_K // 4)) + lane_m_base
+                    a_frag_t.store(
+                        fx.ptr_load(
+                            lds_A_ptr + _lds_A_idx(a_m, a_g), result_type=v4bf16_type
+                        )
                     )
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         vn_v = _nr_v(nr) + lane_n
-                        vn_g = fx.Int32(bt_s * (WMMA_K // 4)) + lane_m_base
-                        vn_b_frag = fx.ptr_load(
-                            lds_vnt_ptr + _lds_vnt_idx(vn_v, vn_g),
-                            result_type=v4bf16_type,
+                        vn_g = fx.Int32(bt_s * (MFMA_K // 4)) + lane_m_base
+                        b_frag_t.store(
+                            fx.ptr_load(
+                                lds_vnt_ptr + _lds_vnt_idx(vn_v, vn_g),
+                                result_type=v4bf16_type,
+                            )
                         )
-                        o_intra_accs[nr] = _mfma_bf16_16x16x16(
-                            a_frag, vn_b_frag, o_intra_accs[nr]
+                        fx.gemm(
+                            single_tile_mma,
+                            o_intra_accs[nr],
+                            a_frag_t,
+                            b_frag_t,
+                            o_intra_accs[nr],
                         )
 
                 # -- Combine inter + intra with their per-query-row gates --
@@ -1398,13 +1458,15 @@ def compile_chunk_gated_delta_h_gfx942(
                         exp_gi_gl, dtype=fx.Float32
                     )
                     for nr in range_constexpr(N_REPEAT_LOCAL):
+                        # Both accumulators are register tensors (GEMM3/GEMM4b);
+                        # .load() yields the f32x4 the arithmetic below expects.
                         o_accs[nr] = (
-                            o_accs[nr] * exp_gi_vec
-                            + o_intra_accs[nr] * exp_gi_gl_vec
+                            o_accs[nr].load() * exp_gi_vec
+                            + o_intra_accs[nr].load() * exp_gi_gl_vec
                         )
                 else:
                     for nr in range_constexpr(N_REPEAT_LOCAL):
-                        o_accs[nr] = o_accs[nr] + o_intra_accs[nr]
+                        o_accs[nr] = o_accs[nr].load() + o_intra_accs[nr].load()
 
                 # -- Scale and store o -> HBM [T_flat, H, V] token-major --
                 # The store must go through a helper: a bare ``o_[off] = ...``
@@ -1430,20 +1492,16 @@ def compile_chunk_gated_delta_h_gfx942(
 
                 w_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
 
-            results = (
-                yield [_to_raw(v) for v in h_accs_in]
-                + [_to_raw(v) for v in w_next_prefetch]
-                + [_to_raw(v) for v in gu_next_prefetch]
-            )
-
-        h_accs_final = list(results[:NUM_H_ACCS])
+            yield [_to_raw(v) for v in w_next_prefetch] + [
+                _to_raw(v) for v in gu_next_prefetch
+            ]
 
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     acc_idx = kb * N_REPEAT_LOCAL + nr
-                    acc_val = h_accs_final[acc_idx]
+                    acc_val = h_accs[acc_idx].load()
                     ht_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     ht_row_base = (
                         fx.Int32(kb * 64)
