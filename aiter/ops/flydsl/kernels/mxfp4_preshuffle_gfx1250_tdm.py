@@ -182,6 +182,11 @@ def launch_gemm_a8w4_tdm(
     # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     WN_PER_MX_BLOCK = 4
+    assert N % tile_n == 0, "tile_n must divide N for unmasked B/SB TDM loads"
+    if stage1_quant_out and stage1_act:
+        assert (
+            wmma_n_rep % WN_PER_MX_BLOCK == 0
+        ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
     _act = f"_act{stage1_act}" if stage1_act else ""
