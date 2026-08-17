@@ -184,6 +184,11 @@ def gemm_a16w16_(
                 [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
             )
 
+            warp_bases = tuple(
+                (0, 1) if i == 0 else (1 << (i - 1), 0)
+                for i in range(num_warps.bit_length() - 1)
+            )
+
             # Persistent, NUM_WGS processes num_tiles
             NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
             num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
@@ -210,6 +215,7 @@ def gemm_a16w16_(
                 NUM_BUFFERS=NUM_BUFFERS,
                 SHARED_LAYOUT_A=shared_a,
                 SHARED_LAYOUT_B=shared_b,
+                WARP_BASES=warp_bases,
                 activation=_get_activation_from_str(activation) if activation else None,
                 USE_ACTIVATION=activation is not None,
                 ADD_BIAS=(bias is not None),

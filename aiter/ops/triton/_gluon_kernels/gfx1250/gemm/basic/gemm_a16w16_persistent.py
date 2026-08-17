@@ -20,7 +20,6 @@ _GLUON_REPR_KEYS = [
     "USE_ACTIVATION",
     "ADD_BIAS",
     "NUM_WGS",
-    "num_warps",
 ]
 
 _gemm_a16w16_persistent_repr = make_kernel_repr(
@@ -52,22 +51,17 @@ def gemm_a16w16_persistent_kernel_(
     NUM_BUFFERS: gl.constexpr,
     SHARED_LAYOUT_A: gl.constexpr,
     SHARED_LAYOUT_B: gl.constexpr,
+    WARP_BASES: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     NUM_WGS: gl.constexpr,
-    num_warps: gl.constexpr,
 ):
-    """C = A x B, one BLOCK_M x BLOCK_N tile of C per persistent-loop iteration."""
+
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
 
-    warp_bases: gl.constexpr = [
-        [0, 1] if i == 0 else [1 << (i - 1), 0]
-        for i in [0, 1, 2, 3]
-        if (1 << i) < num_warps
-    ]
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+        version=3, transposed=True, warp_bases=WARP_BASES, instr_shape=[16, 16, 32]
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
