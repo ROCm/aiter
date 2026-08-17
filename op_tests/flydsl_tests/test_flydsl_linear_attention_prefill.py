@@ -1809,18 +1809,22 @@ class TestCorrectness:
         device = "cuda"
         context_lens = [64]
         _, cu = _build_cu_seqlens(context_lens, device=device)
-        k, w_orig, u_orig, w_c, u_c, g, h0, _, scheduled_q_lens = _make_inputs(
+        k, _, _, w_c, u_c, g, h0, _, scheduled_q_lens = _make_inputs(
             context_lens, device=device
         )
-        common = dict(
-            g=g,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu,
-            g_head_major=True,
-        )
+        common = {
+            "g": g,
+            "initial_state": h0,
+            "output_final_state": True,
+            "cu_seqlens": cu,
+            "g_head_major": True,
+        }
         h_meta, vn_meta, fs_meta = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-            k, w_c, u_c, prefill_metadata=_build_prefill_metadata(context_lens, cu), **common
+            k,
+            w_c,
+            u_c,
+            prefill_metadata=_build_prefill_metadata(context_lens, cu),
+            **common,
         )
         h_cpu, vn_cpu, fs_cpu = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k, w_c, u_c, seq_lens_cpu=scheduled_q_lens, **common
@@ -1833,8 +1837,9 @@ class TestCorrectness:
         """HIP flat ``[T,H,K]`` / ``[B*T,H,K]`` layouts match token-major ``gk``."""
         k, w, u = self._minimal_inputs()
         gk_token = torch.randn(1, 64, 4, 128, dtype=torch.float32, device="cuda")
-        kwargs = dict(gk=gk_token, output_final_state=True)
-        h_tm, vn_tm, fs_tm = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(k, w, u, **kwargs)
+        h_tm, vn_tm, fs_tm = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k, w, u, gk=gk_token, output_final_state=True
+        )
         gk_flat = gk_token.reshape(64, 4, 128).contiguous()
         h_flat, vn_flat, fs_flat = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k, w, u, gk=gk_flat, output_final_state=True
@@ -1846,15 +1851,15 @@ class TestCorrectness:
     def test_mfma16_accepts_noncontiguous_kwu(self):
         """Non-contiguous k/w/u are silently copied, matching the HIP wrapper."""
         k, w, u = self._minimal_inputs()
-        k_nc = torch.cat([k, torch.zeros(1, 64, 2, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
-            ..., :128
-        ]
-        w_nc = torch.cat([w, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
-            ..., :128
-        ]
-        u_nc = torch.cat([u, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1)[
-            ..., :128
-        ]
+        k_nc = torch.cat(
+            [k, torch.zeros(1, 64, 2, 1, device="cuda", dtype=torch.bfloat16)], dim=-1
+        )[..., :128]
+        w_nc = torch.cat(
+            [w, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1
+        )[..., :128]
+        u_nc = torch.cat(
+            [u, torch.zeros(1, 4, 64, 1, device="cuda", dtype=torch.bfloat16)], dim=-1
+        )[..., :128]
         assert k_nc.shape == k.shape and w_nc.shape == w.shape and u_nc.shape == u.shape
         assert not k_nc.is_contiguous()
         assert not w_nc.is_contiguous()
