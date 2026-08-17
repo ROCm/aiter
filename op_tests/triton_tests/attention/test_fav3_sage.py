@@ -207,7 +207,6 @@ def input_helper(
     dtype,
     layout,
 ):
-    # Generate base inputs in BHSD layout which is the layout used in wan model.
     # Set up tensor shapes based on layout
     if layout == "bhsd":
         q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)

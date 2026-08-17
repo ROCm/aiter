@@ -333,7 +333,7 @@ def generate_test_tensors(
         # different query-row blocks) disagree on which tiles to skip. The
         # shared-VALU lockstep barrier then eats the saving while the extra
         # underflow compare is still paid on every no-mask tile -> net slowdown,
-        # matching the real-Wan result.
+        # matching the observed model-level result.
         #
         # Tunables (env):
         #   AITER_UNDERFLOW_GAP    max hotspot logit in nats (default 16.0)
@@ -2338,7 +2338,7 @@ def parse_args() -> argparse.Namespace:
         type=lambda v: bool(int(v)),
         default=True,
         help=(
-            "Use xDiT production Q/K Hadamard preprocessing. Set to 0 only for "
+            "Use production AITER Q/K Hadamard preprocessing. Set to 0 only for "
             "raw kernel-domain diagnostics; ignored by BF16 and i8fp8"
         ),
     )

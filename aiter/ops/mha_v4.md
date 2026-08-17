@@ -5,8 +5,8 @@
 
 ## Current Status
 
-Dense BF16-output MHA v4 and the xDiT integration are implemented and validated on gfx950. A
-gfx942 signed INT8/FP8 row is also preserved under v4.
+Dense BF16-output MHA v4 is implemented and validated on gfx950. A gfx942 signed INT8/FP8 row is
+also preserved under v4.
 
 The public raw and packed APIs support six dense combinations:
 
@@ -59,21 +59,18 @@ subpackage split is not part of the design. It exports:
 - Host launcher: `csrc/py_itfs_cu/asm_mha_v4_fwd.cu`.
 - Manifests and binaries: `hsa/<arch>/fmha_v4_fwd/`.
 - Benchmark integration: `op_tests/op_benchmarks/triton/bench_sage.py`.
-- Compile-safe distributed integration: `/app/xDiT/xfuser/core/distributed/attention_backend.py`.
-- Canonical PyISA sources: `/workspace/diffusion-models-inference-private/asm/fmha_sage_fwd/gfx950/`.
 
 ## Validated Baseline
 
 Dense extraction, dedicated dispatch, six raw preprocessing paths, packed launch, benchmark
-migration, and xDiT migration are complete. Production callers now delegate quantization, MX Q
-scaling, scale recipes, and packed views to MHA v4 while retaining separate xDiT Q/K/V custom ops
-for Ulysses overlap.
+migration, and distributed integration are complete. Callers can delegate quantization, MX Q
+scaling, scale recipes, and packed views to MHA v4 while retaining separate Q/K/V custom ops for
+communication overlap.
 
 Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
 finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
-unaligned and unequal sequence lengths, retained Wan captures, and balanced multi-GPU target-shape
-benchmarks. Focused coverage lives in `op_tests/test_mha_v4.py` and xDiT
-`tests/test_aiter_mixed_attention.py`.
+unaligned and unequal sequence lengths, retained model captures, and balanced multi-GPU target-shape
+benchmarks. Focused coverage lives in `op_tests/test_mha_v4.py`.
 
 Still deferred:
 
@@ -158,7 +155,7 @@ the complete recipe plus dtype, shape, and layout before launching. Call
 
 MX Q/K/V producers return contiguous raw buffers where the ASM layout is not an ordinary tensor
 layout. `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` reconstruct logical views. Raw buffers,
-not exotic strided views, cross custom-op boundaries; final xDiT launch ops rebuild the views.
+not exotic strided views, cross custom-op boundaries; final launch ops rebuild the views.
 
 ### MXFP4 V Contract
 
@@ -179,7 +176,7 @@ prefetch at the PV tail because earlier placement was flat in balanced eight-GPU
 Any producer dtype, shape, or layout change requires a versioned custom-op name. Promotion requires
 byte equality against the independent Torch payload/scale reference at sequences
 `1, 127, 128, 129, 257`, deterministic output, zero slack, eager/fullgraph parity, allocator churn,
-both focused suites, and repeated retained Wan captures. At
+focused coverage, and repeated retained model captures. At
 `b=1,hq=hk=5,sq=sk=65536,d=dv=128`, final eight-GPU e2e medians were
 `3574.8 TFLOP/s` for F4F4 versus `3459.0` for F4F8, and `3351.2 TFLOP/s` for F6F4 versus
 `3205.1` for F6F8. The deployed code-object SHA256 values are
@@ -318,12 +315,12 @@ silent redirect from a dense request.
 
 AITER VSA supplies delta-encoded fixed-capacity rows plus counts at 128-query-token granularity;
 the proposed MHA v4 descriptor uses flat absolute indices and explicit start/count. Encoding
-conversion is cheap, but geometry is not: current 256x128 PyISA workgroups share one KV list across
+conversion is cheap, but geometry is not: current 256x128 ASM workgroups share one KV list across
 two 128-row halves, while adjacent VSA rows may differ. Exact support therefore follows:
 
 1. Directly use an existing 256x128 sparse kernel when adjacent 128-query VSA rows are identical or
-    when the policy natively emits 256-query rows, as current xDiT Sparge recipes do.
-2. Add a manifest-selected 128x128 PyISA sparse kernel for arbitrary VSA rows. This is the primary
+    when the policy natively emits 256-query rows.
+2. Add a manifest-selected 128x128 ASM sparse kernel for arbitrary VSA rows. This is the primary
     exact compatibility path and must be benchmarked because reducing the query tile changes the
     eight-wave load/compute balance.
 3. Optionally add a 256x128 union kernel carrying per-half membership bits if VSA masks have enough

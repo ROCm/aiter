@@ -813,7 +813,7 @@ def quantize_fp6_k_lds_order_torch(
 ):
     """Graph-friendly (pure-torch) port of quantize_fp6_k_lds_order_triton (identical 17408B/tile
     ABI: 12288B compact fp6 K data + 4096B unused + 1024B lane-major E8M0 K-scale tail). Traceable by
-    Inductor (torch pack + index-gathers + cat) so the K pack can overlap the Ulysses all-to-all.
+    Inductor (torch pack + index-gathers + cat) so K packing can overlap distributed communication.
     Byte-identical to the Triton packer (reuses the exact LDS gather / scale-tail index tables).
 
     k_thd float K [b, sk, h, 128] -> (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a
