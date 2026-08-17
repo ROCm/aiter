@@ -9,8 +9,8 @@
 //   "softmax"       -> softmax(x)          - DeepSeek V3 / classic MoE
 //
 // Kernel variants:
-//   topk_softplus_kernel_opt  - register-only, sort+merge (64/128/256/384 experts)
-//   topk_softplus_kernel      - shared-memory fallback (any expert count)
+//   topk_gating_kernel_opt  - register-only, sort+merge (64/128/256/384 experts)
+//   topk_gating_kernel      - shared-memory fallback (any expert count)
 //
 // Instantiated by the TUs under csrc/kernels/topk_gating/, one per score function
 // so they build in parallel; each ends with AITER_TOPK_GATING_INSTANTIATE.
@@ -227,7 +227,7 @@ __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int*
 
 template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
           bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS>
-__global__ void topk_softplus_kernel_opt(
+__global__ void topk_gating_kernel_opt(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -328,7 +328,7 @@ __global__ void topk_softplus_kernel_opt(
 
 template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS, int WAVES_PER_TOKEN,
           bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS>
-__global__ void topk_softplus_kernel_opt_multiwave(
+__global__ void topk_gating_kernel_opt_multiwave(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -502,7 +502,7 @@ __device__ __forceinline__ void subwarpArgmax(float& val, float& orig, int& idx)
 
 template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
           bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int TPW = 2>
-__global__ void topk_softplus_kernel_opt_n(
+__global__ void topk_gating_kernel_opt_n(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -613,7 +613,7 @@ __global__ void topk_softplus_kernel_opt_n(
 template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
           bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int TPW = 2>
 __global__ __launch_bounds__(64)
-void topk_softplus_kernel_prefill(
+void topk_gating_kernel_prefill(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -808,7 +808,7 @@ void topk_softplus_kernel_prefill(
 
 template <typename DTYPE_I, typename DTYPE_B, typename f32vec, bool need_renorm,
           int SCORE_FUNC = SCORE_SQRTSOFTPLUS>
-__global__ void topk_softplus_kernel(
+__global__ void topk_gating_kernel(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -964,7 +964,7 @@ __global__ void topk_softplus_kernel(
 
 template <typename DTYPE_I, typename DTYPE_B, typename f32vec, bool need_renorm,
           int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int RPW = 2>
-__global__ void topk_softplus_kernel_smem_n(
+__global__ void topk_gating_kernel_smem_n(
     const DTYPE_I* __restrict__ gating_output,
     const DTYPE_B* __restrict__ correction_bias,
     float* __restrict__ topk_weights,
@@ -1139,7 +1139,7 @@ __global__ void topk_softplus_kernel_smem_n(
 
 #define LAUNCH_TOPK_KERNEL(VEC_F, RENORM, SF)                                                    \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel<scalar_t, bias_scalar_t, VEC_F, RENORM, SF>),               \
+        (aiter::topk_gating_kernel<scalar_t, bias_scalar_t, VEC_F, RENORM, SF>),                 \
         dim3(grid), dim3(block), shared_mem_size, stream,                                        \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
@@ -1149,7 +1149,7 @@ __global__ void topk_softplus_kernel_smem_n(
 
 #define LAUNCH_TOPK_KERNEL_OPT(NE, RENORM, SF)                                                  \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel_opt<scalar_t, bias_scalar_t, NE, RENORM, SF>),              \
+        (aiter::topk_gating_kernel_opt<scalar_t, bias_scalar_t, NE, RENORM, SF>),                \
         dim3(grid), dim3(block), 0, stream,                                                      \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
@@ -1159,7 +1159,7 @@ __global__ void topk_softplus_kernel_smem_n(
 
 #define LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, RENORM, SF)                                   \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel_opt_multiwave<scalar_t, bias_scalar_t, NE, WPT, RENORM, SF>), \
+        (aiter::topk_gating_kernel_opt_multiwave<scalar_t, bias_scalar_t, NE, WPT, RENORM, SF>),   \
         dim3(grid), dim3((WPT) * block.x), 0, stream,                                            \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
@@ -1170,7 +1170,7 @@ __global__ void topk_softplus_kernel_smem_n(
 // opt_n: register-only prefill kernel with TOKENS_PER_WARP=TPW.
 #define LAUNCH_TOPK_KERNEL_OPT_N(NE, RENORM, SF, TPW)                                           \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel_opt_n<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),       \
+        (aiter::topk_gating_kernel_opt_n<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),         \
         dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
@@ -1180,7 +1180,7 @@ __global__ void topk_softplus_kernel_smem_n(
 // smem_n: ROWS_PER_WARP=RPW shared-memory kernel; smem = RPW * num_experts floats.
 #define LAUNCH_TOPK_KERNEL_SMEM_N(VEC_F, RENORM, SF, RPW)                                       \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel_smem_n<scalar_t, bias_scalar_t, VEC_F, RENORM, SF, RPW>),   \
+        (aiter::topk_gating_kernel_smem_n<scalar_t, bias_scalar_t, VEC_F, RENORM, SF, RPW>),     \
         dim3((num_tokens + (RPW) - 1) / (RPW)), dim3(block), (RPW) * shared_mem_size, stream,   \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
@@ -1190,7 +1190,7 @@ __global__ void topk_softplus_kernel_smem_n(
 // prefill: vectorized-load scan+invalidate kernel, templatized TPW.
 #define LAUNCH_TOPK_KERNEL_PREFILL_N(NE, RENORM, SF, TPW)                                       \
     hipLaunchKernelGGL(                                                                          \
-        (aiter::topk_softplus_kernel_prefill<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),     \
+        (aiter::topk_gating_kernel_prefill<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),       \
         dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \

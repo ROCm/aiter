@@ -34,13 +34,13 @@ static inline int parse_score_func(const std::string& s)
     return SCORE_SQRTSOFTPLUS;  // unreachable
 }
 
-void topk_softplus(aiter_tensor_t& topk_weights,
-                   aiter_tensor_t& topk_indices,
-                   aiter_tensor_t& gating_output,
-                   aiter_tensor_t& correction_bias,
-                   bool need_renorm,
-                   float routed_scaling_factor,
-                   const std::string& score_func)
+void topk_gating(aiter_tensor_t& topk_weights,
+                 aiter_tensor_t& topk_indices,
+                 aiter_tensor_t& gating_output,
+                 aiter_tensor_t& correction_bias,
+                 bool need_renorm,
+                 float routed_scaling_factor,
+                 const std::string& score_func)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be float32");

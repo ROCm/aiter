@@ -12,14 +12,10 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
-# DEPRECATED: low-level binding kept for backward compatibility only.
-# Will be removed once all callers have migrated to topk_gating() below.
-# New code should use topk_gating(), which:
-#   - accepts an Optional[Tensor] correction_bias (None => no bias)
-#   - validates score_func string
-#   - exposes the same C++ kernel under a more accurate name
-@compile_ops("module_moe_topk", develop=True)
-def topk_softplus(
+# Raw binding: no argument validation, correction_bias must be a real tensor.
+# Callers should use topk_gating() below.
+@compile_ops("module_moe_topk", fc_name="topk_gating", develop=True)
+def topk_gating_fwd(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
@@ -74,7 +70,7 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    topk_softplus(
+    topk_gating_fwd(
         topk_weights,
         topk_indices,
         gating_output,
@@ -83,6 +79,11 @@ def topk_gating(
         routed_scaling_factor,
         score_func,
     )
+
+
+# DEPRECATED: the kernel routes sigmoid and softmax as well, so the name is now
+# topk_gating.  Kept until callers migrate.
+topk_softplus = topk_gating
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True)
