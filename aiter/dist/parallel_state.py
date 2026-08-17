@@ -671,7 +671,7 @@ class GroupCoordinator:
         out-of-place.
         """
         # Bypass the function if we are using only 1 GPU.
-        if self.world_size == 1:
+        if len(self.ranks) == 1:
             return input_
 
         return all_reduce_(
@@ -1007,7 +1007,7 @@ class GroupCoordinator:
         dim: int = 0,
     ):
         # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
-        world_size = self.world_size
+        world_size = len(self.ranks)
         assert world_size > 1, "error! world_size = 1"
         ndim = input_.dim()
         assert (
@@ -1052,7 +1052,7 @@ class GroupCoordinator:
         return output_
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        if self.world_size == 1:
+        if len(self.ranks) == 1:
             return input_
         return self.reduce_scatter_tensor(input_, dim=dim)
 
@@ -1062,7 +1062,7 @@ class GroupCoordinator:
         use_custom: bool = False,
         dim: int = -1,
     ) -> torch.Tensor:
-        world_size = self.world_size
+        world_size = len(self.ranks)
         if world_size == 1:
             return input_
         assert (
@@ -1103,7 +1103,7 @@ class GroupCoordinator:
         all the ranks.
         NOTE: `dst` is the local rank of the destination rank.
         """
-        world_size = self.world_size
+        world_size = len(self.ranks)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
@@ -1135,7 +1135,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         # Bypass the function if we are using only 1 GPU.
-        if self.world_size == 1:
+        if len(self.ranks) == 1:
             return input_
         # Broadcast.
         torch.distributed.broadcast(
@@ -1150,7 +1150,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         # Bypass the function if we are using only 1 GPU.
-        if self.world_size == 1:
+        if len(self.ranks) == 1:
             return obj
         if self.mq_broadcaster is not None:
             assert src == 0, "Message queue broadcaster only supports src=0"
@@ -1176,7 +1176,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         # Bypass the function if we are using only 1 GPU.
-        if self.world_size == 1:
+        if len(self.ranks) == 1:
             return obj_list
         # Broadcast.
         torch.distributed.broadcast_object_list(
@@ -1256,7 +1256,7 @@ class GroupCoordinator:
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not torch.distributed.is_initialized() or len(self.ranks) == 1:
             return tensor_dict
 
         group = self.device_group
@@ -1337,7 +1337,7 @@ class GroupCoordinator:
         NOTE: `dst` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not torch.distributed.is_initialized() or len(self.ranks) == 1:
             return tensor_dict
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
@@ -1389,7 +1389,7 @@ class GroupCoordinator:
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not torch.distributed.is_initialized() or len(self.ranks) == 1:
             return None
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
