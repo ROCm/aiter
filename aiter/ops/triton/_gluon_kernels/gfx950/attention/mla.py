@@ -141,7 +141,7 @@ def _mla_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # NUM_KV_SPLITS is a launch-time budget only.
+    # NUM_KV_SPLITS is a launch-time budget only. 
     # the partition is derived here from the runtime per-batch KV length.
     # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
     #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
