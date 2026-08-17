@@ -45,6 +45,7 @@ def gemm_a16w16_persistent_kernel_(
     M,
     N,
     K,
+    num_tiles,
     stride_am,
     stride_ak,
     stride_bk,
@@ -83,7 +84,6 @@ def gemm_a16w16_persistent_kernel_(
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_tiles = num_pid_m * num_pid_n * NUM_KSPLIT
 
     # Persistent loop, flattens to main loop
     for tile_id in tl.range(start_pid, num_tiles, NUM_WGS, flatten=True):
