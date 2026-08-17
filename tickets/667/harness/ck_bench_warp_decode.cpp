@@ -5,6 +5,8 @@
 //   gate_bf16_d2     BF16 act  x FP8 weight, dot2  <- primary comparison
 //   gate_up_fp8      FP8  act  x FP8 weight, default
 //   gate_fp8_d2      FP8  act  x FP8 weight, dot2
+//   gate_up_fp4      BF16 act  x FP4 weight, packed (A4; needs the gate_up kernel
+//                    packed-stride fix)
 //   down_h2_d2       FP8 down weight, H2 layout, dot2  (current fp8 best)
 //   down_fp4_h2      FP4 down weight, H2 layout        (best overall)
 //
@@ -106,6 +108,20 @@ using GUProbFP8D2 = WarpDecodeGateUpProblem<fp8_t,
                                             kVec,
                                             true>;
 using GUKernFP8D2 = WarpDecodeGateUpKernel<GUProbFP8D2, WarpDecodePolicy>;
+
+// gate_up BF16-act x FP4-weight (packed pk_fp4_t; PerTensor dummy scale, mirrors
+// down_fp4_h2). NPerWarp=1 + non-dot2 scalar path (dot2/NPerWarp=2 reject packed).
+using GUProbFP4 = WarpDecodeGateUpProblem<bf16_t,
+                                          pk_fp4_t,
+                                          float,
+                                          bf16_t,
+                                          float,
+                                          float,
+                                          XScaleBF16,
+                                          WScalePT,
+                                          element_wise::Silu,
+                                          kVec4>;
+using GUKernFP4 = WarpDecodeGateUpKernel<GUProbFP4, WarpDecodePolicy>;
 
 // down FP8-weight, H2 (2 outputs/wave), dot2
 using DnProbFP8H2D2 = WarpDecodeDownReduceProblem<bf16_t,
@@ -387,6 +403,47 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
                       ms,
                       gu_flops(B, H, I, K),
                       gu_bytes(B, H, I, K, ebytes<fp8_t>(), ebytes<fp8_t>()));
+        }
+    }
+    // gate_up FP4 (packed): separate packed pools (E*I*H/2 bytes each) + PerTensor
+    // dummy scale, mirroring down_fp4_h2. hidden/2 stride is now accepted by the
+    // patched gate_up kernel. Only run when hidden is a multiple of the FP4 tile.
+    if(H % (64 * kVec4) == 0)
+    {
+        DeviceMem w_gate_fp4(static_cast<std::size_t>(E) * I * (H / 2) * sizeof(uint8_t));
+        DeviceMem w_up_fp4(static_cast<std::size_t>(E) * I * (H / 2) * sizeof(uint8_t));
+        DeviceMem w_gu_fp4_sc(sizeof(float));
+        float one = 1.0f;
+        w_gu_fp4_sc.ToDevice(&one, sizeof(float));
+        auto gu4_sc = static_cast<const float*>(w_gu_fp4_sc.GetDeviceBuffer());
+
+        typename GUKernFP4::Kargs a{};
+        a.p_x                 = x_bf16_dev.GetDeviceBuffer();
+        a.p_x_scale           = nullptr;
+        a.p_w_gate            = w_gate_fp4.GetDeviceBuffer();
+        a.p_w_gate_scale      = gu4_sc;
+        a.p_w_up              = w_up_fp4.GetDeviceBuffer();
+        a.p_w_up_scale        = gu4_sc;
+        a.p_router_ids        = rids_ptr;
+        a.p_intermediate      = inter_ptr;
+        a.b                   = B;
+        a.hidden              = H;
+        a.inter               = I;
+        a.top_k               = K;
+        a.e                   = E;
+        a.stride_x            = H;
+        a.stride_w_gate       = H / 2;
+        a.stride_w_up         = H / 2;
+        a.stride_intermediate = I;
+        if(GUKernFP4::IsSupportedArgument(a))
+        {
+            float ms = bench_cold<GUKernFP4>(a, rids_ptr, rotate, bk, cold, iters);
+            print_row(sh,
+                      B,
+                      "gate_up_fp4",
+                      ms,
+                      gu_flops(B, H, I, K),
+                      gu_bytes(B, H, I, K, ebytes<bf16_t>(), ebytes<pk_fp4_t>()));
         }
     }
     // gate/up weights go out of scope here -- freed before down weights arrive.
