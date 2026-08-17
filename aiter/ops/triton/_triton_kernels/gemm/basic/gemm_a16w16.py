@@ -183,5 +183,8 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
+    # backend="triton" so archs whose flat GEMM-A16W16 config is gluon-format
+    # (gfx1250) resolve the triton-format one instead of the gluon keys, which
+    # lack BLOCK_SIZE_* and would KeyError in the EVEN_K/EVEN_MN heuristics.
+    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
     return compute_splitk_params(config, K), is_tunned
