@@ -36,10 +36,14 @@ NOT ds_read_b64_tr_b8 (linear-welded) and NOT the welded coalesced V loaders.
 
 Cache layout: ``kv_cache_layout`` selects the linear 4D paged pool ("linear")
 or the 5D shuffled vLLM-v1 layout ("vectorized"). The K and V *LDS* tile
-layouts -- and thus every LDS->operand read and the whole compute core -- are
-cache-layout-independent;
-ONLY the global->LDS load addressing differs between the two. That invariant is
-what makes 1b a purely additive change over 1a.
+layouts -- and the whole compute core -- are cache-layout-independent; ONLY the
+global->LDS load addressing differs, which makes the shuffled path a purely
+additive change over the linear one. Perf: the shuffled V is pre-transposed and
+read straight from global (no LDS V tile), while the linear path
+transpose-scatters V into LDS per page (slower). Shuffled is the
+production/performance layout; linear is the correctness/reference layout --
+vectorizing its V transpose is deferred unless production is confirmed to serve
+a linear KV cache at scale.
 """
 
 import math as _math
