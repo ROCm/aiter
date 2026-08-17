@@ -103,7 +103,8 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
-    WMMA_M = WMMA_N = 16
+    WMMA_M = 16
+    WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
     WAVE = 32
     PACK_TK = tile_k // 2
@@ -136,12 +137,7 @@ def launch_gemm_a8w4_tdm(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
-    assert not a_is_fp4 or wmma_n_rep % 2 == 0
-    # The dedicated FP4 instruction consumes two adjacent 16-column weight
-    # fragments and produces a 32-column result.  Keep the epilogue's existing
-    # 16-column view by splitting each vec16 accumulator after the K loop.
-    mma_n_rep = wmma_n_rep // 2 if a_is_fp4 else wmma_n_rep
-    mma_n_acc = wmma_m_rep * mma_n_rep
+    output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
 
@@ -182,10 +178,9 @@ def launch_gemm_a8w4_tdm(
     # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     WN_PER_MX_BLOCK = 4
-    assert N % tile_n == 0, "tile_n must divide N for unmasked B/SB TDM loads"
     if stage1_quant_out and stage1_act:
         assert (
-            wmma_n_rep % WN_PER_MX_BLOCK == 0
+            output_n_rep % WN_PER_MX_BLOCK == 0
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
@@ -348,7 +343,6 @@ def launch_gemm_a8w4_tdm(
         a_off0 = blk_m64 * A_KROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
-
         assert num_waves_per_tensor_tdm in (
             1,
             2,
@@ -599,6 +593,7 @@ def launch_gemm_a8w4_tdm(
 
         def load_b(buf, wn, ksl):
             base = lds_b_base(buf)
+
             def load_half(half):
                 off = half * B_LDS_ROW + ksl * 1024
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
@@ -606,9 +601,7 @@ def launch_gemm_a8w4_tdm(
                 )
 
             if const_expr(a_is_fp4):
-                return load_half(wn * 2).shuffle(
-                    load_half(wn * 2 + 1), list(range(16))
-                )
+                return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
             return load_half(wn)
 
         def load_sa(buf, sm, ksl):
@@ -619,31 +612,35 @@ def launch_gemm_a8w4_tdm(
             off = (sn * SC_INNER + ksl * 32) * 4
             return lds_load_b32(lds_sb_base(buf), fx.Int32(off))[0]
 
-        wmma_atoms = [
-            [
-                fx.make_mma_atom(
-                    fx.rocdl.WMMAScale(
-                        WMMA_M,
-                        WMMA_N,
-                        WMMA_K,
-                        fx.Float4E2M1FN,
-                        ACT_ELEM,
-                        fx.Float32,
-                        opsel_a=sb_sel,
-                        opsel_b=sa_sel,
+        wmma_atoms = (
+            []
+            if a_is_fp4
+            else [
+                [
+                    fx.make_mma_atom(
+                        fx.rocdl.WMMAScale(
+                            WMMA_M,
+                            WMMA_N,
+                            WMMA_K,
+                            fx.Float4E2M1FN,
+                            ACT_ELEM,
+                            fx.Float32,
+                            opsel_a=sb_sel,
+                            opsel_b=sa_sel,
+                        )
                     )
-                )
-                for sa_sel in range_constexpr(2)
+                    for sa_sel in range_constexpr(2)
+                ]
+                for sb_sel in range_constexpr(2)
             ]
-            for sb_sel in range_constexpr(2)
-        ]
-        c_width = 16 if a_is_fp4 else 8
+        )
+        WMMA_VECTOR_DWORDS = WMMA_N // 2
         c_frags = [
-            fx.make_rmem_tensor(c_width, fx.Float32)
-            for _ in range_constexpr(mma_n_acc)
+            fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
+            for _ in range_constexpr(n_acc)
         ]
         for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(c_width, T.f32)))
+            cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -659,9 +656,9 @@ def launch_gemm_a8w4_tdm(
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
-                for wn_raw in range_constexpr(mma_n_rep):
-                    wn = (mma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
-                    idx = wm * mma_n_rep + wn
+                for wn_raw in range_constexpr(wmma_n_rep):
+                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                    idx = wm * wmma_n_rep + wn
                     if const_expr(a_is_fp4):
                         c_frags[idx].store(
                             rocdl.wmma_scale_f32_32x16x128_f4(
@@ -688,7 +685,7 @@ def launch_gemm_a8w4_tdm(
 
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
-        sb_pairs = wmma_n_rep // 2
+        sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
         BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
         STATE_DS = wmma_m_rep * DS_A + BS_DS
@@ -710,8 +707,8 @@ def launch_gemm_a8w4_tdm(
                     for _ in range_constexpr(wmma_m_rep)
                 ],
                 b=[
-                    fx.make_rmem_tensor(16 if a_is_fp4 else 8, fx.Int32)
-                    for _ in range_constexpr(mma_n_rep)
+                    fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                    for _ in range_constexpr(wmma_n_rep)
                 ],
                 sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
                 sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
@@ -727,7 +724,7 @@ def launch_gemm_a8w4_tdm(
             sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            for wn in range_constexpr(mma_n_rep):
+            for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
                 slot.a[wm].store(load_a(buf, wm, ksl))
@@ -813,9 +810,7 @@ def launch_gemm_a8w4_tdm(
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
-                # FRONT and BACK together cover wmma_m_rep.  A4W4 covers two
-                # logical N fragments per instruction, so use the physical count.
-                mma_total = mma_n_acc - tail_mfma
+                mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
@@ -988,26 +983,17 @@ def launch_gemm_a8w4_tdm(
                         ),
                     )
 
-            if const_expr(a_is_fp4):
-                accs = []
-                for wm in range_constexpr(wmma_m_rep):
-                    for wn in range_constexpr(mma_n_rep):
-                        acc = Vec(c_frags[wm * mma_n_rep + wn].load())
-                        for half in range_constexpr(2):
-                            accs.append(
-                                Vec.from_elements(
-                                    [
-                                        acc[half * 8 + i]
-                                        for i in range_constexpr(8)
-                                    ],
-                                    fx.Float32,
-                                ).ir_value()
-                            )
-            else:
-                accs = [
-                    c_frags[idx].load().ir_value()
-                    for idx in range_constexpr(n_acc)
-                ]
+            accs = []
+            output_fragments_per_acc = WMMA_N // 16
+            for idx in range_constexpr(n_acc):
+                acc = Vec(c_frags[idx].load())
+                for fragment in range_constexpr(output_fragments_per_acc):
+                    accs.append(
+                        Vec.from_elements(
+                            [acc[fragment * 8 + i] for i in range_constexpr(8)],
+                            fx.Float32,
+                        ).ir_value()
+                    )
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
@@ -1045,7 +1031,7 @@ def launch_gemm_a8w4_tdm(
 
                 v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
-                N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
+                N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
                 # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
@@ -1067,7 +1053,7 @@ def launch_gemm_a8w4_tdm(
                             pairs = []
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * wmma_n_rep + wn])
+                                acc = Vec(accs[wm * output_n_rep + wn])
                                 for p in range_constexpr(4):
                                     pairs.append((acc[2 * p], acc[2 * p + 1]))
 
@@ -1149,9 +1135,9 @@ def launch_gemm_a8w4_tdm(
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     cur_hv_raws = []
-                    for wn in range_constexpr(wmma_n_rep):
+                    for wn in range_constexpr(output_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
-                        acc = Vec(accs[wm * wmma_n_rep + wn])
+                        acc = Vec(accs[wm * output_n_rep + wn])
                         if const_expr(has_bias):
                             acc = acc + Vec(
                                 fx.ptr_load(
