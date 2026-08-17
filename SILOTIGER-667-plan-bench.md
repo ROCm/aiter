@@ -121,6 +121,22 @@ the FlyDSL cold harness.
       Note the Block2D<128,128> scale-byte traffic is genuinely tiny for FP8 (≪ FP4 e8m0
       (1,32)), so `compute_metrics(weight_stream)` FP8 byte accounting is left unchanged
       (preserves the B3 byte-for-byte invariant); only the FP4 e8m0 term is carried there.
+- [x] **Measured block2d-vs-pertensor cost (A/B, same weights, iters=1000, 2026-08-17):**
+      the per-block scale work lands entirely on **`down`**, not `gate_up`:
+      | shape | B | down Δ | gate_up Δ |
+      |---|---|---|---|
+      | minimax | 1 | **+38.5%** | −1.6% |
+      | minimax | 32 | **+14.0%** | −1.1% |
+      | qwen3next | 1 | **+10.5%** | −0.8% |
+      | qwen3next | 32 | **+11.1%** | +2.2% |
+      `gate_up` amortizes the scale load across its much larger grid (neutral, within noise);
+      the `down` inner loop pays a real **~10–38%** penalty for the per-(128,128)-block scale
+      reload+multiply vs a single pertensor broadcast (worst at small B). This is the correct
+      fairness adjustment (CK's recommended `down_h2_d2` already runs Block2D<128,128>, so
+      pre-B1 FlyDSL down FP8 under-counted scale work); it moved the down-FP8 `flydsl/ck`
+      ratios modestly toward CK. Cross-checks compare.py (minimax B=1 down FP8 = 11.98 A/B vs
+      11.16 in-sweep). **Optimization lead:** FlyDSL's block2d scale handling in the `down`
+      kernel is a candidate to reclaim that 10–38%.
 - [ ] FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
       (1,32). **Not perf-negligible (corrected 2026-08-14):** FlyDSL's e8m0 stream is
       `TOPK·H·(I/32)` ≈ 0.33 MB vs the `TOPK·H·I/2` ≈ 5.24 MB FP4 weight stream at Qwen
@@ -240,6 +256,11 @@ the FlyDSL cold harness.
       `gate_bf16_d2`), noting CK has no single runtime "default" (disclose the mild asymmetry).
 - [ ] Keep tuned upside as a footnote row where a knob is the documented recommendation
       (e.g. `prefetch=True` for B≤2 FP4 down, ~5%); headline stays default.
+- [ ] **FP8 scale-granularity caveat (B1):** the headline pins FlyDSL FP8 to `block2d(128,128)`
+      to match CK, which costs `down` **~10–38%** vs pertensor (measured; gate_up neutral).
+      So the down-FP8 `flydsl/ck` ratio is a **conservative (CK-favored) lower bound** on
+      FlyDSL's advantage — a model tolerating a coarser scale could reclaim that 10–38%. Note
+      this next to the FP8 down rows.
 
 #### D4 — confirm functional equivalence between the harnesses  [ ]
 - [ ] Verify (with code refs) both compute the same work: SiLU on both; same `silu(gate)·up`
@@ -349,6 +370,12 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   `fp8_cos=1.0000` on minimax & qwen3next (DeepSeek FP8 still gated on B5). ruff/py_compile
   clean. `compute_metrics` FP8 byte accounting unchanged (Block2D<128,128> scale bytes are
   negligible; keeps the B3 invariant).
+- 2026-08-17 — **B1 A/B measured.** PerTensor-vs-Block2D<128,128> FP8 (same weights,
+  iters=1000): the scale cost is entirely on `down` (+10–38%, worst minimax B=1); `gate_up`
+  neutral (−1.6%..+2.2%). Recorded in B1 + a D3 conservative-lower-bound caveat. Also
+  regenerated the full post-B1 compare table (`tickets/667/g9_compare_postB1.{md,csv}`): all
+  `cos=1.0000`, FP8 cells populated for minimax/qwen; flagged several `%peak>100%` on small
+  FP8/large-B cells as a coldness/peak-constant caveat for D1/D5 (not a B1 regression).
 - 2026-08-14 — **B1/D7 refined.** Corrected B1's FP4 scale note from "perf-negligible" to a
   measured **~6% CK-favored** bias (CK PerTensor vs FlyDSL e8m0 `(1,32)`); added the risk
   entry and the exact-match-needs-kernel-work caveat. Documented the CK-real-weights steps in
