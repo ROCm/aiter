@@ -5,6 +5,9 @@ import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.gemm.basic.gemm_a16w16_persistent import (
+    gemm_a16w16_persistent,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -31,6 +34,7 @@ def bench_gemm_fn(
     atomic: bool = False,
     activation: str | None = None,
     cudagraph: bool = False,
+    persistent: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -61,6 +65,18 @@ def bench_gemm_fn(
         y = y.to(torch.float32).zero_()
         ms = bench_fn(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+            **bench_kwargs,
+        )
+    elif persistent:
+        assert not (backend == "gluon" and layout != "TT"), (
+            f"--persistent with --backend gluon requires --layout TT, got "
+            f"'{layout}' (the gluon persistent kernel has no transposed-operand "
+            f"switch)"
+        )
+        ms = bench_fn(
+            lambda: gemm_a16w16_persistent(
+                x, w, bias, c_dtype, y, activation=activation, backend=backend
+            ),
             **bench_kwargs,
         )
     else:
@@ -126,6 +142,7 @@ def run_model_benchmark(args, backend):
             atomic=args.atomic,
             activation=args.activation,
             cudagraph=args.cudagraph,
+            persistent=args.persistent,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -150,6 +167,7 @@ def run_shape_benchmark(args, backend):
             backend,
             atomic=args.atomic,
             cudagraph=args.cudagraph,
+            persistent=args.persistent,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -206,6 +224,13 @@ def parse_args(args: list[str] | None = None):
         choices=["triton", "gluon"],
         default=None,
         help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
+    )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        default=False,
+        help="Use the persistent kernel (gemm_a16w16_persistent) instead of the standard "
+        "a16w16 kernel",
     )
     parser.add_argument(
         "--cudagraph",
