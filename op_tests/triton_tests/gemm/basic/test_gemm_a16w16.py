@@ -217,3 +217,34 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, output, backend):
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    if backend == "triton":
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+        if "gfx1250" in (get_arch() or ""):
+            pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
+    torch.cuda.empty_cache()
+
+    # TT: the gluon persistent kernel has no transposed-operand switch
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout="TT", output=output
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+
+    if output:
+        triton_out = gemm_a16w16_persistent(
+            x, w, None, torch.bfloat16, y, backend=backend
+        )
+    else:
+        triton_out = gemm_a16w16_persistent(
+            x, w, dtype=torch.bfloat16, backend=backend
+        )
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
