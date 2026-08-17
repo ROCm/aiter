@@ -274,17 +274,26 @@ the FlyDSL cold harness.
 - [x] **G9 completion gate:** closes when every non-blocked cell has a FlyDSL+CK pair. Two
       holes remain — DeepSeek FP8 (→ **B5**) and gate_up FP8-act (→ **B4**); see §3.
 
-#### D3 — decide + document the FlyDSL config policy (default-vs-default)  [ ]
-- [ ] Pin the exact config per side next to the table: FlyDSL default (prefetch off, `kh`
-      auto=2, serialize on); CK = the maintainer-intended recommended variant (`down_h2_d2`,
-      `gate_bf16_d2`), noting CK has no single runtime "default" (disclose the mild asymmetry).
-- [ ] Keep tuned upside as a footnote row where a knob is the documented recommendation
-      (e.g. `prefetch=True` for B≤2 FP4 down, ~5%); headline stays default.
-- [ ] **FP8 scale-granularity caveat (B1):** the headline pins FlyDSL FP8 to `block2d(128,128)`
+#### D3 — decide + document the FlyDSL config policy (default-vs-default)  [x]
+- [x] **Pinned the exact config per side in the artifact provenance header** (verified from
+      `aiter/ops/flydsl/warp_decode_moe.py`; the benches pass no overrides, so these are the
+      library defaults):
+      - **FlyDSL:** `serialize_dot2=True`, `kh_per_warp=auto` (→2 when HIDDEN even),
+        `prefetch=False`, `kvector=auto`. `down_fp4` `dot2_acc=4`; `gate_up_fp4` `dot2_acc=1`
+        (G7: acc>1 ~4% slower for gate_up); `down_fp8` `split_k=1`. FP8 legs use
+        `w_scale_mode=block2d(128,128)` to match CK.
+      - **CK:** the maintainer-recommended variant per op (`down_h2_d2`, `down_fp4_h2`,
+        `gate_bf16_d2`, and the new `gate_up_fp4` non-dot2/NPerWarp=1). CK exposes no single
+        runtime "default" (variant is chosen at instantiation), so the pairing is a **mild
+        asymmetry** — disclosed in-header rather than hidden.
+- [x] Tuned upside stays a footnote, not the headline: e.g. `prefetch=True` is a documented
+      A/B lever for B≤2 FP4 `down` (~5%) but the of-record table uses `prefetch=False`.
+- [x] **FP8 scale-granularity caveat (B1):** the headline pins FlyDSL FP8 to `block2d(128,128)`
       to match CK, which costs `down` **~10–38%** vs pertensor (measured; gate_up neutral).
       So the down-FP8 `flydsl/ck` ratio is a **conservative (CK-favored) lower bound** on
-      FlyDSL's advantage — a model tolerating a coarser scale could reclaim that 10–38%. Note
-      this next to the FP8 down rows.
+      FlyDSL's advantage — a model tolerating a coarser scale could reclaim that 10–38%.
+      Also noted: FP4 rows carry a ~6% CK-favored scale-traffic bias (CK dummy PerTensor vs
+      FlyDSL e8m0 `(1,32)`). Both caveats are in the artifact header (D3 line).
 
 #### D4 — confirm functional equivalence between the harnesses  [ ]
 - [ ] Verify (with code refs) both compute the same work: SiLU on both; same `silu(gate)·up`
@@ -407,6 +416,14 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **D3 config policy DONE.** Verified the FlyDSL defaults the benches actually
+  use (no overrides in `bench_*_cold`): `serialize_dot2=True`, `kh_per_warp=auto(2)`,
+  `prefetch=False`, `down_fp4 dot2_acc=4`, `gate_up_fp4 dot2_acc=1`, `down_fp8 split_k=1`, FP8
+  `block2d(128,128)`. Expanded `compare.py`'s provenance header to enumerate both sides'
+  config (FlyDSL defaults vs CK recommended variant, with the CK no-single-default asymmetry)
+  and both fairness caveats (FP8-down CK-favored lower bound ~10-38%; FP4 ~6% scale-traffic
+  bias). Regenerated `tickets/667/g9_compare.{md,csv}` so the of-record artifact is
+  self-describing. ruff/py_compile clean.
 - 2026-08-17 — **D2 coverage matrix DONE.** Reconciled §3 against the of-record artifact:
   **9/15 op×dtype×shape cells complete** (×5 batches = 45 paired points) — all FP4 legs, all
   MiniMax/Qwen FP8 legs. Two holes gate G9 completion: DeepSeek FP8 (down + gate_up bf16-act)

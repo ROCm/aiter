@@ -535,8 +535,15 @@ def main() -> int:
         f"CK provenance: {ck_prov}",
         f"clocks: auto (unpinnable on this gfx950; D1) -- effective {clk_summary} on GPU "
         f"{gpu}; per-cell spread%% + noisy flag (>{args.noise_pct:.0f}%) capture drift (D5).",
-        "config policy: default-vs-default (D3); "
-        "treat under-converged fast cells as noisy (D1).",
+        "config policy (D3): default-vs-default. FlyDSL = library defaults, no overrides: "
+        "serialize_dot2=True, kh_per_warp=auto(2 when HIDDEN even), prefetch=False; "
+        "down_fp4 dot2_acc=4, gate_up_fp4 dot2_acc=1 (G7: acc>1 ~4% slower for gate_up); "
+        "down_fp8 split_k=1; FP8 w_scale=block2d(128,128) to match CK. "
+        "CK = maintainer-recommended variant per op (down_h2_d2, down_fp4_h2, gate_bf16_d2, "
+        "gate_up_fp4 non-dot2/NPerWarp=1); CK has no single runtime default (mild asymmetry). "
+        "FP8-down ratio is a CK-favored lower bound: block2d(128,128) costs FlyDSL ~10-38% vs "
+        "pertensor (B1); FP4 rows carry a ~6% CK-favored scale-traffic bias (dummy PerTensor "
+        "vs e8m0(1,32)). Treat under-converged fast cells as noisy (D1).",
     ]
     md = to_markdown(rows, args.method, header_lines)
     print(md)
