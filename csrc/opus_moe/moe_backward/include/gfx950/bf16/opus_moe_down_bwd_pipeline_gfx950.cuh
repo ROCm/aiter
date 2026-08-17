@@ -383,6 +383,11 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
     int expert_end_row = kargs.route.num_valid_ids[0];
     constexpr bool compact_group_grid =
         T::COMPACT_ROUTE_GROUP_GRID && RouteTiles > 1;
+    constexpr bool sparse_compact_owner = []() constexpr {
+        if constexpr(requires { T::SPARSE_COMPACT_OWNER; })
+            return T::SPARSE_COMPACT_OWNER && compact_group_grid;
+        return false;
+    }();
     if constexpr(compact_group_grid)
     {
         static_assert(T::ROUTE_COHORT_TILES % RouteTiles == 0);
@@ -394,23 +399,61 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
         const int compact_group =
             cohort_id * cohort + within_cohort % cohort;
 
-        int group_prefix = 0;
-        for(int expert = 0; expert < kargs.route.num_experts; ++expert)
+        if constexpr(sparse_compact_owner)
         {
-            const int first_row = kargs.route.expert_offsets[expert];
-            const int end_row = kargs.route.expert_offsets[expert + 1];
-            const int expert_tiles = (end_row - first_row) / ROUTE_M;
-            const int expert_groups =
-                (expert_tiles + RouteTiles - 1) / RouteTiles;
-            if(compact_group < group_prefix + expert_groups)
+            int lo = 0;
+            int hi = kargs.route.num_experts;
+            while(lo < hi)
             {
-                expert_id = expert;
-                route_tile = first_row / ROUTE_M +
-                             (compact_group - group_prefix) * RouteTiles;
-                expert_end_row = end_row;
-                break;
+                const int mid = (lo + hi) / 2;
+                const int first_tile =
+                    kargs.route.expert_offsets[mid] / ROUTE_M;
+                const int first_group = first_tile / RouteTiles + mid;
+                if(first_group <= compact_group)
+                    lo = mid + 1;
+                else
+                    hi = mid;
             }
-            group_prefix += expert_groups;
+            expert_id = lo - 1;
+            if(expert_id >= 0)
+            {
+                const int first_row =
+                    kargs.route.expert_offsets[expert_id];
+                expert_end_row =
+                    kargs.route.expert_offsets[expert_id + 1];
+                const int first_tile = first_row / ROUTE_M;
+                const int expert_tiles =
+                    (expert_end_row - first_row) / ROUTE_M;
+                const int local_group =
+                    compact_group - (first_tile / RouteTiles + expert_id);
+                const int expert_groups =
+                    (expert_tiles + RouteTiles - 1) / RouteTiles;
+                if(local_group < 0 || local_group >= expert_groups)
+                    expert_id = -1;
+                else
+                    route_tile = first_tile + local_group * RouteTiles;
+            }
+        }
+        else
+        {
+            int group_prefix = 0;
+            for(int expert = 0; expert < kargs.route.num_experts; ++expert)
+            {
+                const int first_row = kargs.route.expert_offsets[expert];
+                const int end_row = kargs.route.expert_offsets[expert + 1];
+                const int expert_tiles = (end_row - first_row) / ROUTE_M;
+                const int expert_groups =
+                    (expert_tiles + RouteTiles - 1) / RouteTiles;
+                if(compact_group < group_prefix + expert_groups)
+                {
+                    expert_id = expert;
+                    route_tile = first_row / ROUTE_M +
+                                 (compact_group - group_prefix) * RouteTiles;
+                    expert_end_row = end_row;
+                    break;
+                }
+                group_prefix += expert_groups;
+            }
         }
         if(expert_id < 0)
             return;

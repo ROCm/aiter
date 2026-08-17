@@ -318,7 +318,7 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15, 17, 18, 19, 20, 21, 22):
+    if int(kernel_id) in (14, 15, 17, 18, 19, 20, 21, 22, 23):
         raise ValueError(
             "direct sorted-X K4 kernel_id requires saved_x_sorted"
         )
@@ -348,7 +348,7 @@ def _select_blocked_g2_full_pipeline(
     # Other blocked-K2-compatible D tiles retain the general sorted-route
     # reducer rather than constraining the whole cache ABI to one width.
     route_reduce_kernel_id_selected = 3 if model_dim % 2048 == 0 else 1
-    selected = (17, 20, route_reduce_kernel_id_selected, 21)
+    selected = (18, 20, route_reduce_kernel_id_selected, 23)
     requested = (
         int(down_kernel_id),
         int(route_dx_kernel_id),
@@ -362,18 +362,25 @@ def _select_blocked_g2_full_pipeline(
         "dw1_kernel_id",
     )
     for name, value, expected in zip(names[:3], requested[:3], selected[:3]):
+        if name == "down_kernel_id" and value in (17, 18):
+            continue
         if value not in (-1, expected):
             raise ValueError(
                 f"blocked-G2 full pipeline requires {name}={expected}, "
                 f"got {value}"
             )
     requested_dw1 = requested[3]
-    if requested_dw1 not in (-1, 21, 22):
+    if requested_dw1 not in (-1, 21, 22, 23):
         raise ValueError(
-            "blocked-G2 full pipeline requires dw1_kernel_id=21 or 22, "
+            "blocked-G2 full pipeline requires dw1_kernel_id=21, 22, or 23, "
             f"got {requested_dw1}"
         )
-    return selected[:3] + (22 if requested_dw1 == 22 else 21,)
+    selected_down = (
+        requested[0] if requested[0] in (17, 18) else selected[0]
+    )
+    return (selected_down, selected[1], selected[2]) + (
+        requested_dw1 if requested_dw1 in (21, 22, 23) else selected[3],
+    )
 
 
 @dataclass(frozen=True)

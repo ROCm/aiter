@@ -217,6 +217,15 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZBlockedDzG2
     static constexpr bool BLOCKED_DZ_G2 = true;
 };
 
+// The compact launch already reserves one sparse key per expert.  Recover the
+// owning expert with an upper_bound over those keys instead of scanning every
+// earlier expert and accumulating its ceil-divided group count.
+struct DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2SparseOwner
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZBlockedDzG2
+{
+    static constexpr bool SPARSE_COMPACT_OWNER = true;
+};
+
 // K2: gathered dZ x W1, retaining Triton's 32x128x64 two-stage geometry.
 struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     : Bf16Traits<Family::RouteDx, 32, 128, 64, 256, 2, false>
@@ -804,6 +813,12 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlo
     static constexpr bool COMPACT_OUTPUT_N_FAST = true;
 };
 
+struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2NFastGrid3D
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2NFast
+{
+    static constexpr bool COHORT_NFAST_GRID_3D = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
@@ -1131,6 +1146,13 @@ struct Dw2Bf16Gfx950Bm128Bn256Bk32Cohort4NativeB32ZeroPadTripleLds
     static constexpr bool STAGGER_REDUCTION_AB_BY_WAVE_N = true;
     static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+};
+
+struct Dw2Bf16Gfx950Bm128Bn256Bk32Cohort4Grid3D
+    : Dw2Bf16Gfx950Bm128Bn256Bk32Cohort4NativeB32ZeroPadTripleLds
+{
+    static constexpr bool COMPACT_OUTPUT_N_FAST = false;
+    static constexpr bool COHORT_MFAST_GRID_3D = true;
 };
 
 struct Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledRouteLe30720

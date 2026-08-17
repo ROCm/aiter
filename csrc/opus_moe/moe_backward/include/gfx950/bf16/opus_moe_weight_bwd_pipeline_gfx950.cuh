@@ -380,16 +380,58 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         // while it is still in L2.  Interleaving a few experts retains load
         // balance when routing counts differ.
         constexpr int cohort = T::EXPERT_COHORT;
+        constexpr bool cohort_nfast_grid_3d = []() constexpr {
+            if constexpr(requires { T::COHORT_NFAST_GRID_3D; })
+                return T::COHORT_NFAST_GRID_3D;
+            return false;
+        }();
+        constexpr bool cohort_mfast_grid_3d = []() constexpr {
+            if constexpr(requires { T::COHORT_MFAST_GRID_3D; })
+                return T::COHORT_MFAST_GRID_3D;
+            return false;
+        }();
+        static_assert(!(cohort_nfast_grid_3d && cohort_mfast_grid_3d));
         const int m_tiles = kargs.output_m / BM;
         const int n_tiles = kargs.output_n / BN;
-        const int tiles_per_expert = m_tiles * n_tiles;
-        const int blocks_per_cohort = cohort * tiles_per_expert;
-        const int linear_block = static_cast<int>(blockIdx.x);
-        const int cohort_id = linear_block / blocks_per_cohort;
-        const int within_cohort = linear_block % blocks_per_cohort;
-        const int output_tile = within_cohort / cohort;
-        const int scheduled_expert =
-            cohort_id * cohort + within_cohort % cohort;
+        int scheduled_expert;
+        int output_tile = 0;
+        if constexpr(cohort_nfast_grid_3d)
+        {
+            static_assert(T::COMPACT_OUTPUT_N_FAST);
+            // The launch encodes the existing flattened order directly as
+            //   x = expert-in-cohort + cohort * output-N,
+            //   y = output-M, z = expert cohort.
+            // This preserves N-fast cache locality while removing all dynamic
+            // cohort/output-tile divisions from every compute-heavy CTA.
+            const int x = static_cast<int>(blockIdx.x);
+            scheduled_expert =
+                static_cast<int>(blockIdx.z) * cohort + x % cohort;
+            output_m_base = static_cast<int>(blockIdx.y) * BM;
+            output_n_base = (x / cohort) * BN;
+        }
+        else if constexpr(cohort_mfast_grid_3d)
+        {
+            static_assert(!T::COMPACT_OUTPUT_N_FAST);
+            // Encode the original M-fast order as
+            //   x = expert-in-cohort + cohort * output-M,
+            //   y = output-N, z = expert cohort.
+            const int x = static_cast<int>(blockIdx.x);
+            scheduled_expert =
+                static_cast<int>(blockIdx.z) * cohort + x % cohort;
+            output_m_base = (x / cohort) * BM;
+            output_n_base = static_cast<int>(blockIdx.y) * BN;
+        }
+        else
+        {
+            const int tiles_per_expert = m_tiles * n_tiles;
+            const int blocks_per_cohort = cohort * tiles_per_expert;
+            const int linear_block = static_cast<int>(blockIdx.x);
+            const int cohort_id = linear_block / blocks_per_cohort;
+            const int within_cohort = linear_block % blocks_per_cohort;
+            output_tile = within_cohort / cohort;
+            scheduled_expert =
+                cohort_id * cohort + within_cohort % cohort;
+        }
         if(scheduled_expert >= kargs.route.num_experts)
             return;
         if constexpr(requires { T::REVERSE_EXPERT_ORDER; })
@@ -406,12 +448,15 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                 return T::COMPACT_OUTPUT_N_FAST;
             return false;
         }();
-        output_m_base =
-            (output_n_fast ? output_tile / n_tiles
-                           : output_tile % m_tiles) * BM;
-        output_n_base =
-            (output_n_fast ? output_tile % n_tiles
-                           : output_tile / m_tiles) * BN;
+        if constexpr(!cohort_nfast_grid_3d && !cohort_mfast_grid_3d)
+        {
+            output_m_base =
+                (output_n_fast ? output_tile / n_tiles
+                               : output_tile % m_tiles) * BM;
+            output_n_base =
+                (output_n_fast ? output_tile % n_tiles
+                               : output_tile / m_tiles) * BN;
+        }
     }
     else
     {
@@ -1944,9 +1989,23 @@ inline void dw1_launch_gfx950(const Dw1Kargs& kargs, hipStream_t stream)
         constexpr int cohort = T::EXPERT_COHORT;
         const int padded_experts =
             ((kargs.route.num_experts + cohort - 1) / cohort) * cohort;
-        const int output_tiles = (args.output_m / T::B_M) *
-                                 (args.output_n / T::B_N);
-        grid = dim3(static_cast<unsigned int>(padded_experts * output_tiles));
+        if constexpr(requires { T::COHORT_NFAST_GRID_3D; })
+        {
+            static_assert(T::COHORT_NFAST_GRID_3D &&
+                          T::COMPACT_OUTPUT_N_FAST);
+            grid = dim3(
+                static_cast<unsigned int>(
+                    cohort * (args.output_n / T::B_N)),
+                static_cast<unsigned int>(args.output_m / T::B_M),
+                static_cast<unsigned int>(padded_experts / cohort));
+        }
+        else
+        {
+            const int output_tiles = (args.output_m / T::B_M) *
+                                     (args.output_n / T::B_N);
+            grid = dim3(
+                static_cast<unsigned int>(padded_experts * output_tiles));
+        }
     }
     else
     {
@@ -2000,9 +2059,23 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
         constexpr int cohort = T::EXPERT_COHORT;
         const int padded_experts =
             ((kargs.route.num_experts + cohort - 1) / cohort) * cohort;
-        const int output_tiles = (args.output_m / T::B_M) *
-                                 (args.output_n / T::B_N);
-        grid = dim3(static_cast<unsigned int>(padded_experts * output_tiles));
+        if constexpr(requires { T::COHORT_MFAST_GRID_3D; })
+        {
+            static_assert(T::COHORT_MFAST_GRID_3D &&
+                          !T::COMPACT_OUTPUT_N_FAST);
+            grid = dim3(
+                static_cast<unsigned int>(
+                    cohort * (args.output_m / T::B_M)),
+                static_cast<unsigned int>(args.output_n / T::B_N),
+                static_cast<unsigned int>(padded_experts / cohort));
+        }
+        else
+        {
+            const int output_tiles = (args.output_m / T::B_M) *
+                                     (args.output_n / T::B_N);
+            grid = dim3(
+                static_cast<unsigned int>(padded_experts * output_tiles));
+        }
     }
     else
     {

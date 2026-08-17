@@ -310,7 +310,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
     constexpr int bm256x128_k32_triple_lds_kid = 12;
     constexpr int bm256x128_k32_prefetch_ab_triple_lds_kid = 13;
     constexpr int bm256x128_k32_native_b32_zero_pad_kid = 16;
-    constexpr int bm128x256_k32_native_b32_zero_pad_kid = 17;
+    constexpr int bm128x256_k32_native_b32_zero_pad_grid3d_kid = 18;
     if(kargs.route.num_experts < 4)
         return legacy_kid;
     // A wide output grid amortizes the larger output tile.  Require at least
@@ -369,7 +369,7 @@ inline int select_fixed_dw2_kernel_id(const Dw2Kargs& kargs,
             // cache can support the native BN256 operand layout.
             if(average_padded_routes >= k32_min_average_routes &&
                kargs.a_scaled_padding_zero && kargs.inter_dim % 256 == 0)
-                return bm128x256_k32_native_b32_zero_pad_kid;
+                return bm128x256_k32_native_b32_zero_pad_grid3d_kid;
             if(average_padded_routes >=
                k32_prefetch_ab_min_average_routes)
                 return kargs.a_scaled_padding_zero
@@ -618,7 +618,8 @@ void launch_dw2_bf16(const Dw2Kargs& kargs,
     detail::check_gfx950_or_fail();
     const int selected_kernel_id =
         detail::select_fixed_dw2_kernel_id(kargs, kernel_id);
-    AITER_CHECK((selected_kernel_id != 16 && selected_kernel_id != 17) ||
+    AITER_CHECK((selected_kernel_id != 16 && selected_kernel_id != 17 &&
+                 selected_kernel_id != 18) ||
                     kargs.a_scaled_padding_zero,
                 "dw2: native-B K32 kernels require exact-zero a_scaled "
                 "padding from the full K1--K5 cache contract");
@@ -667,21 +668,27 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
 {
     check_gfx950_or_fail();
     constexpr int blocked_down_kid = 17;
+    constexpr int blocked_down_sparse_owner_kid = 18;
     constexpr int blocked_route_dx_kid = 20;
     constexpr int blocked_dw1_kid = 20;
     constexpr int blocked_dw1_blocked_x_kid = 21;
     constexpr int blocked_dw1_blocked_x_n_fast_kid = 22;
-    const bool blocked_down = down_kernel_id == blocked_down_kid;
+    constexpr int blocked_dw1_blocked_x_n_fast_grid3d_kid = 23;
+    const bool blocked_down = down_kernel_id == blocked_down_kid ||
+                              down_kernel_id == blocked_down_sparse_owner_kid;
     const bool blocked_route_dx = route_dx_kernel_id == blocked_route_dx_kid;
     const bool blocked_dw1 =
         dw1_kernel_id == blocked_dw1_kid ||
         dw1_kernel_id == blocked_dw1_blocked_x_kid ||
-        dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid;
+        dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid ||
+        dw1_kernel_id == blocked_dw1_blocked_x_n_fast_grid3d_kid;
     AITER_CHECK(x_dw1_blocked_g2 ==
                     (dw1_kernel_id == blocked_dw1_blocked_x_kid ||
-                     dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid),
+                     dw1_kernel_id == blocked_dw1_blocked_x_n_fast_kid ||
+                     dw1_kernel_id ==
+                         blocked_dw1_blocked_x_n_fast_grid3d_kid),
                 "fixed full pipeline: blocked-G2 sorted-X layout must be "
-                "selected if and only if K4 kernel 21 or 22 is selected");
+                "selected if and only if K4 kernel 21, 22, or 23 is selected");
     const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
     AITER_CHECK(!any_blocked_dz ||
                     (blocked_down && blocked_route_dx && blocked_dw1),
@@ -818,7 +825,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
         static_cast<uint64_t>(2 * down.inter_dim) * sizeof(hip_bfloat16);
     const bool uses_saved_a_and_sorted_x =
         (down_kernel_id == 14 || down_kernel_id == 15 ||
-         down_kernel_id == 16 || down_kernel_id == blocked_down_kid) &&
+         down_kernel_id == 16 || down_kernel_id == blocked_down_kid ||
+         down_kernel_id == blocked_down_sparse_owner_kid) &&
         (dw1_kernel_id == 15 || dw1_kernel_id == 17 ||
          dw1_kernel_id == 18 || dw1_kernel_id == 19 ||
          blocked_dw1);
@@ -1517,7 +1525,7 @@ void opus_moe_down_bwd(aiter_tensor_t& d_out,
     const bool use_bn256 =
         kernel_id == 11 || kernel_id == 12 ||
         kernel_id == 13 || kernel_id == 14 || kernel_id == 15 ||
-        kernel_id == 16 || kernel_id == 17 ||
+        kernel_id == 16 || kernel_id == 17 || kernel_id == 18 ||
         (kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              geometry));
@@ -2417,7 +2425,7 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
         down_kernel_id == 11 || down_kernel_id == 12 ||
             down_kernel_id == 13 || down_kernel_id == 14 ||
             down_kernel_id == 15 || down_kernel_id == 16 ||
-            down_kernel_id == 17 ||
+            down_kernel_id == 17 || down_kernel_id == 18 ||
         (down_kernel_id == opus_moe_backward::kKernelAuto &&
          opus_moe_backward::detail::select_fixed_down_bn256_geometry(
              down_geometry));
@@ -2450,7 +2458,8 @@ void opus_moe_full_bwd_impl(aiter_tensor_t& d_out,
             dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
             dw1_kernel_id == 17 || dw1_kernel_id == 18 ||
             dw1_kernel_id == 19 || dw1_kernel_id == 20 ||
-            dw1_kernel_id == 21 || dw1_kernel_id == 22;
+            dw1_kernel_id == 21 || dw1_kernel_id == 22 ||
+            dw1_kernel_id == 23;
         AITER_CHECK(x_dw1.size(0) ==
                             (uses_sorted_x ? sorted_capacity : token_num) &&
                         x_dw1.size(1) == model_dim,
