@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Generate Opus MoE dispatch headers.
+"""Generate Opus MoE dispatch headers and device-instantiation shards.
 
 This is intentionally smaller than ``csrc/opus_gemm/gen_instances.py`` today:
 several kernels still live in hand-written headers, but the generated
@@ -10,9 +10,7 @@ manifests are the single source of truth for kid -> launcher mapping.
 from __future__ import annotations
 
 import argparse
-import csv
-import glob
-import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -21,20 +19,17 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from opus_moe_common import (
-    OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS,
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
-    OPUS_A8W4_OUT_MODE_ATOMIC,
     OPUS_A8W4_ROUTE_REDUCE_INSTANCES,
     OPUS_A8W4_STAGE1_MFMA_K,
     OPUS_A8W4_STAGE1_SCALE_GROUP_LOGICAL_K,
     STAGE1_A8W4_KERNELS,
     STAGE2_A8W4_KERNELS,
     STAGE2_BF16_KERNELS,
-    opus_a8w4_decode_kid,
     opus_a8w4_stage1_shape_requirements,
 )
 
-MANIFEST_HEADER = """#pragma once
+BF16_MANIFEST_HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -105,22 +100,17 @@ STAGE1_A8W4_MANIFEST_HEADER = """#pragma once
 
 
 def _emit_bf16_manifest_header() -> str:
-    lines = [MANIFEST_HEADER]
+    lines = [BF16_MANIFEST_HEADER]
     bf16_kernels = [STAGE2_BF16_KERNELS[kid] for kid in sorted(STAGE2_BF16_KERNELS)]
 
-    lines.append(f"#define OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP_SIZE {len(bf16_kernels)}\n")
     if not bf16_kernels:
-        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP\n\n")
+        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_DISPATCH_CASES\n\n")
     else:
-        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP \\\n")
+        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_DISPATCH_CASES \\\n")
         for idx, inst in enumerate(bf16_kernels):
             suffix = " \\\n" if idx != len(bf16_kernels) - 1 else "\n"
             lines.append(
-                "    {"
-                f"{inst.kid}, "
-                f"&{inst.launcher}<"
-                f"{inst.trait}>"
-                "}," + suffix
+                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}>;" + suffix
             )
     lines.append("\n")
 
@@ -146,104 +136,41 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
-def _cpp_effective_contract_alias(effective_inter_dim: int) -> str:
-    return f"OpusMoeStage2A8W4Eff{effective_inter_dim}Contract"
+def _stage2_a8w4_traits_alias(kid: int) -> str:
+    return f"OpusMoeStage2A8W4DecodeKid{int(kid)}Traits"
 
 
-def _expand_tune_paths(spec: str | None) -> list[Path]:
-    if spec:
-        patterns = [pattern.strip() for pattern in str(spec).split(os.pathsep)]
-    else:
-        configs_dir = THIS_DIR.parents[1] / "aiter" / "configs"
-        patterns = [
-            str(configs_dir / "tuned_fmoe.csv"),
-            str(configs_dir / "model_configs" / "*tuned_fmoe*.csv"),
-        ]
-    out: list[Path] = []
-    seen: set[Path] = set()
-    for pattern in patterns:
-        if not pattern:
-            continue
-        for raw_path in sorted(glob.glob(pattern)):
-            path = Path(raw_path)
-            if "untuned" in path.name or path in seen:
-                continue
-            seen.add(path)
-            out.append(path)
-    return out
-
-
-def _is_a8w4_tuned_row(row: dict[str, str]) -> bool:
+def _stage2_a8w4_traits_type(inst) -> str:
     return (
-        (row.get("q_dtype_a") or "").strip() == "torch.float8_e4m3fn"
-        and (row.get("q_dtype_w") or "").strip() == "torch.float4_e2m1fn_x2"
-        and (row.get("q_type") or "").strip() == "QuantType.per_1x32"
+        "OpusMoeStage2A8W4DecodeShape<"
+        f"{inst.block_m}, "
+        f"{inst.block_n}, "
+        f"{_cpp_bool(inst.direct_atomic)}, "
+        f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
+        f"{inst.block_threads}, "
+        f"{inst.min_blocks_per_cu}, "
+        f"{inst.cachectl_b}, "
+        f"{inst.cachectl_wscale}, "
+        f"{inst.pair_slots}, "
+        f"{inst.steady_pair_slots}"
+        ">"
     )
 
 
-def _validate_effective_inter_dims(effective_inter_dims: set[int]) -> tuple[int, ...]:
-    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
-    if k.bk_logical % k.fp4_values_per_byte != 0:
-        raise ValueError(
-            "Opus A8W4 kernel contract requires bk_logical divisible by "
-            "fp4_values_per_byte"
-        )
-    k_step_packed = k.bk_logical // k.fp4_values_per_byte
-    dims = tuple(sorted({int(dim) for dim in effective_inter_dims}))
-    for dim in dims:
-        if dim <= 0 or dim % k_step_packed != 0:
-            raise ValueError(
-                "Opus A8W4 effective inter dims must be positive and divisible "
-                f"by K_STEP_PACKED={k_step_packed}, got {dim}"
-            )
-    return dims
-
-
-def _collect_a8w4_effective_inter_dims(tune_files: str | None) -> tuple[int, ...]:
-    effective_inter_dims = set(OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS)
-    for path in _expand_tune_paths(tune_files):
-        with path.open(newline="") as f:
-            for row in csv.DictReader(f):
-                if _is_a8w4_tuned_row(row):
-                    effective_inter_dims.add(int(row["inter_dim"]))
-    return _validate_effective_inter_dims(effective_inter_dims)
+def _stage1_a8w4_traits_alias(kid: int) -> str:
+    return f"OpusMoeStage1A8W4Kid{int(kid)}Traits"
 
 
 # ---- A8W4 stage2 metadata and dispatch manifests ---------------------------
 
 
-def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
+def _emit_stage2_a8w4_meta_header() -> str:
     lines = [A8W4_META_HEADER]
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
     block_ms = sorted({inst.block_m for inst in a8w4_kernels})
-    sort_block_ms = sorted({inst.sort_block_m for inst in a8w4_kernels})
     block_ns = sorted({inst.block_n for inst in a8w4_kernels})
 
-    lines.extend(
-        [
-            "template<int EffectiveInterDim>\n",
-            "struct OpusMoeStage2A8W4DecodeContract\n{\n",
-            "    static constexpr int DECODE_LOGICAL_INTER_DIM = EffectiveInterDim;\n",
-            "    static constexpr int DECODE_INTER_DIM_PAD = 0;\n",
-            "    static constexpr int DECODE_EFFECTIVE_INTER_DIM = EffectiveInterDim;\n",
-            "};\n\n",
-        ]
-    )
-    for effective_inter_dim in effective_inter_dims:
-        lines.append(
-            f"using {_cpp_effective_contract_alias(effective_inter_dim)} = "
-            "OpusMoeStage2A8W4DecodeContract<"
-            f"{effective_inter_dim}>;\n"
-        )
-    lines.extend(
-        [
-            (
-                "using OpusMoeStage2A8W4DefaultContract = "
-                f"{_cpp_effective_contract_alias(effective_inter_dims[0])};\n\n"
-            ),
-        ]
-    )
     for block_m in block_ms:
         lines.append(f"constexpr int kStage2A8W4DecodeBlockM{block_m} = {block_m};\n")
     for block_n in block_ns:
@@ -265,10 +192,6 @@ def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
             f"constexpr int kStage2A8W4DecodeMfmaK = {k.mfma_k};\n",
             f"constexpr int kStage2A8W4DecodeFp4ValuesPerByte = {k.fp4_values_per_byte};\n",
             f"constexpr int kStage2A8W4DecodeVectorBytes = {k.vector_bytes};\n",
-            (
-                "constexpr int kStage2A8W4DecodeScaleGroupLogicalK = "
-                f"{k.scale_group_logical_k};\n"
-            ),
             (
                 "constexpr int kStage2A8W4DecodeScaleGroupsPerRowPack = "
                 f"{k.scale_groups_per_row_pack};\n"
@@ -314,20 +237,11 @@ def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines.append("\n")
 
     lines.append(
-        "constexpr int stage2_a8w4_route_reduce_auto_block_n(int model_dim)\n{\n    switch(model_dim)\n    {\n"
+        "constexpr int stage2_a8w4_kid_sort_block_m(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
     )
-    for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES:
-        suffix = _cpp_name_suffix(inst.name)
-        for auto_model_dim in inst.auto_model_dims:
-            model_dim = (
-                f"kStage2A8W4RouteReduce{suffix}BlockN"
-                if auto_model_dim == inst.block_n
-                else str(auto_model_dim)
-            )
-            lines.append(
-                f"    case {model_dim}: "
-                f"return kStage2A8W4RouteReduce{suffix}BlockN;\n"
-            )
+    for inst in a8w4_kernels:
+        lines.append(f"    case {inst.kid}: return {inst.sort_block_m};\n")
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
@@ -338,20 +252,6 @@ def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr int stage2_a8w4_kid_block_m(int kid)\n{\n    switch(kid)\n    {\n"
-    )
-    for inst in a8w4_kernels:
-        lines.append(f"    case {inst.kid}: return {inst.block_m};\n")
-    lines.append("    default: return -1;\n    }\n}\n\n")
-
-    lines.append(
-        "constexpr int stage2_a8w4_kid_sort_block_m(int kid)\n{\n    switch(kid)\n    {\n"
-    )
-    for inst in a8w4_kernels:
-        lines.append(f"    case {inst.kid}: return {inst.sort_block_m};\n")
-    lines.append("    default: return -1;\n    }\n}\n\n")
-
-    lines.append(
         "constexpr int stage2_a8w4_kid_block_n(int kid)\n{\n    switch(kid)\n    {\n"
     )
     for inst in a8w4_kernels:
@@ -359,12 +259,15 @@ def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr bool stage2_a8w4_effective_inter_dim_is_supported(int effective_inter_dim)\n"
-        "{\n    switch(effective_inter_dim)\n    {\n"
+        "constexpr bool stage2_a8w4_effective_inter_dim_is_supported(\n"
+        "    int effective_inter_dim)\n"
+        "{\n"
+        "    constexpr int kStepPacked =\n"
+        "        kStage2A8W4DecodeBKLogical / kStage2A8W4DecodeFp4ValuesPerByte;\n"
+        "    return effective_inter_dim >= 2 * kStepPacked &&\n"
+        "           effective_inter_dim % kStepPacked == 0;\n"
+        "}\n\n"
     )
-    for effective_inter_dim in effective_inter_dims:
-        lines.append(f"    case {effective_inter_dim}:\n")
-    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
 
     lines.append(
         "constexpr bool stage2_a8w4_kid_uses_route_out(int kid)\n{\n    switch(kid)\n    {\n"
@@ -388,34 +291,22 @@ def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines.append('    default: return "unknown";\n    }\n}\n\n')
 
     lines.append(
-        "constexpr int stage2_a8w4_auto_direct_atomic_kid("
-        "int effective_inter_dim, int block_m)\n{\n"
-        "    if(!stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim))\n"
-        "        return -1;\n"
+        "constexpr int stage2_a8w4_auto_direct_atomic_kid(int block_m)\n{\n"
         "    switch(block_m)\n"
         "    {\n"
     )
-    for block_m in sort_block_ms:
-        try:
-            kid = opus_a8w4_decode_kid(
-                OPUS_A8W4_OUT_MODE_ATOMIC,
-                block_m,
-            )
-        except ValueError:
-            continue
-        lines.append(f"    case {block_m}: return {kid};\n")
+    for inst in a8w4_kernels:
+        if inst.direct_atomic and inst.mode_default:
+            lines.append(f"    case {inst.sort_block_m}: return {inst.kid};\n")
     lines.append("    default: return -1;\n    }\n}\n")
     lines.append(A8W4_META_FOOTER)
     return "".join(lines)
 
 
-def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
+def _emit_stage2_a8w4_manifest_header() -> str:
     lines = [A8W4_MANIFEST_HEADER]
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
 
-    lines.append(
-        f"#define OPUS_MOE_STAGE2_A8W4_DECODE_LOOKUP_SIZE {len(a8w4_kernels)}\n"
-    )
     if not a8w4_kernels:
         lines.append("#define GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES\n")
         return "".join(lines)
@@ -423,29 +314,10 @@ def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> 
     lines.append("#define GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES \\\n")
     for idx, inst in enumerate(a8w4_kernels):
         suffix = " \\\n" if idx != len(a8w4_kernels) - 1 else "\n"
-        contract_cases = []
-        for effective_dim in effective_inter_dims:
-            contract_cases.append(
-                f"case {effective_dim}: "
-                "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
-                "OpusMoeStage2A8W4DecodeShape<"
-                f"opus_moe::{_cpp_effective_contract_alias(effective_dim)}, "
-                f"{inst.block_m}, "
-                f"{inst.block_n}, "
-                f"{inst.sort_block_m}, "
-                f"{_cpp_bool(inst.direct_atomic)}, "
-                f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
-                f"{inst.block_threads}, "
-                f"{inst.min_blocks_per_cu}, "
-                f"{inst.cachectl_b}, "
-                f"{inst.cachectl_wscale}"
-                ">>(kargs, stream);"
-            )
         lines.append(
-            f"    case {inst.kid}: switch(effective_inter_dim) {{ "
-            + " ".join(contract_cases)
-            + " default: break; } break;"
-            + suffix
+            f"    case {inst.kid}: "
+            "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
+            f"{_stage2_a8w4_traits_type(inst)}>(kargs, stream);" + suffix
         )
     lines.append("\n")
     return "".join(lines)
@@ -586,45 +458,176 @@ def _emit_stage1_a8w4_manifest_header() -> str:
         suffix = " \\\n" if idx != len(kernels) - 1 else "\n"
         lines.append(
             f"    case {inst.kid}: "
-            f"return launch<{_stage1_cpp_shape(inst)}>("
+            f"return launch_gfx950<{_stage1_cpp_shape(inst)}>("
             "effective_inter_dim, sorted_blocks, kargs, stream);" + suffix
         )
     lines.append("\n")
     return "".join(lines)
 
 
+# ---- Device translation-unit generation -----------------------------------
+
+
+def _route_reduce_instantiation_rows() -> list[tuple[int, int]]:
+    rows = [
+        (2048, 256),
+        (4096, 256),
+        *(
+            (int(inst.block_n), int(inst.threads))
+            for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES
+        ),
+    ]
+    return list(dict.fromkeys(rows))
+
+
+class OpusMoeDeviceCodegen:
+    """Emit independently compilable device-instantiation shards."""
+
+    def __init__(self, working_path: Path):
+        self.instances_path = working_path / "instances"
+
+    def _prepare_dirs(self) -> None:
+        if self.instances_path.exists():
+            shutil.rmtree(self.instances_path)
+        self.instances_path.mkdir(parents=True, exist_ok=True)
+
+    def _emit_stage2_device_tus(self) -> None:
+        lines = [
+            "// SPDX-License-Identifier: MIT\n",
+            "// Auto-generated runtime-K A8W4 stage2 device shard; do not edit.\n",
+            '#include "gfx950/a8w4/opus_moe_pipeline_stage2_a8w4_decode_main_gfx950.cuh"\n',
+        ]
+        seen_traits: set[str] = set()
+        for inst in (STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)):
+            traits_type = _stage2_a8w4_traits_type(inst)
+            if traits_type in seen_traits:
+                continue
+            seen_traits.add(traits_type)
+            alias = _stage2_a8w4_traits_alias(inst.kid)
+            lines.extend(
+                [
+                    f"using {alias} = {traits_type};\n",
+                    "template __global__ void opus_moe_stage2_a8w4_decode_kernel_gfx950<",
+                    f"{alias}>(opus_moe_stage2_a8w4_kargs);\n",
+                ]
+            )
+        (self.instances_path / "opus_moe_stage2_a8w4.device.cu").write_text(
+            "".join(lines), encoding="utf-8"
+        )
+
+    def _emit_stage1_device_tus(self) -> None:
+        families = (
+            (
+                True,
+                "group_split",
+                "opus_moe_stage1_a8w4_pipeline_group_split_gfx950.cuh",
+                "opus_moe_stage1_a8w4_kernel_group_split_gfx950",
+            ),
+            (
+                False,
+                "pair_kwave",
+                "opus_moe_stage1_a8w4_pipeline_pair_kwave_gfx950.cuh",
+                "opus_moe_stage1_a8w4_kernel_pair_kwave_gfx950",
+            ),
+        )
+        for group_split, namespace, header, kernel in families:
+            instances = [
+                STAGE1_A8W4_KERNELS[kid]
+                for kid in sorted(STAGE1_A8W4_KERNELS)
+                if bool(STAGE1_A8W4_KERNELS[kid].gate_up_group_split) == group_split
+            ]
+            if not instances:
+                continue
+            lines = [
+                "// SPDX-License-Identifier: MIT\n",
+                "// Auto-generated A8W4 stage1 device shard; do not edit.\n",
+                f'#include "gfx950/a8w4/stage1/{header}"\n',
+                "namespace opus_moe\n{\nnamespace stage1_a8w4\n{\n",
+            ]
+            for inst in instances:
+                lines.append(
+                    f"using {_stage1_a8w4_traits_alias(inst.kid)} = {_stage1_cpp_shape(inst)};\n"
+                )
+            lines.append(f"namespace pipeline_{namespace}\n{{\n")
+            for inst in instances:
+                alias = _stage1_a8w4_traits_alias(inst.kid)
+                lines.extend(
+                    [
+                        f"template __global__ void {kernel}<",
+                        f"{alias}>(OpusMoeStage1A8W4Kargs);\n",
+                    ]
+                )
+            lines.extend(
+                [
+                    f"}} // namespace pipeline_{namespace}\n",
+                    "} // namespace stage1_a8w4\n",
+                    "} // namespace opus_moe\n",
+                ]
+            )
+            path = self.instances_path / f"opus_moe_stage1_a8w4_{namespace}.device.cu"
+            path.write_text("".join(lines), encoding="utf-8")
+
+    def _emit_route_reduce_device_tus(self) -> None:
+        for topk in (0, 4, 6, 8):
+            lines = [
+                "// SPDX-License-Identifier: MIT\n",
+                "// Auto-generated route-reduce device shard; do not edit.\n",
+                "#define OPUS_MOE_ROUTE_REDUCE_DEVICE_TU 1\n",
+                '#include "gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh"\n',
+            ]
+            for block_n, threads in _route_reduce_instantiation_rows():
+                for route_fp8 in (False, True):
+                    lines.extend(
+                        [
+                            "template __global__ void ",
+                            "opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950<",
+                            f"{block_n}, {threads}, {topk}, {_cpp_bool(route_fp8)}>(",
+                            "opus_moe_stage2_route_reduce_kargs);\n",
+                        ]
+                    )
+            path = self.instances_path / f"opus_moe_route_reduce_topk_{topk}.device.cu"
+            path.write_text("".join(lines), encoding="utf-8")
+
+    def _emit_bf16_device_tu(self) -> None:
+        lines = [
+            "// SPDX-License-Identifier: MIT\n",
+            "// Auto-generated BF16 stage2 device shard; do not edit.\n",
+            '#include "gfx950/a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh"\n',
+        ]
+        for inst in (STAGE2_BF16_KERNELS[kid] for kid in sorted(STAGE2_BF16_KERNELS)):
+            lines.extend(
+                [
+                    "template __global__ void opus_moe_stage2_gemmstyle_kernel_gfx950<",
+                    f"{inst.trait}>(opus_moe_stage2_bf16_kargs);\n",
+                ]
+            )
+        (self.instances_path / "opus_moe_stage2_bf16.device.cu").write_text(
+            "".join(lines), encoding="utf-8"
+        )
+
+    def gen_instances(self) -> None:
+        self._prepare_dirs()
+        self._emit_stage2_device_tus()
+        self._emit_stage1_device_tus()
+        self._emit_route_reduce_device_tus()
+        self._emit_bf16_device_tu()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Opus MoE dispatch headers")
     parser.add_argument("--working_path", required=True)
-    parser.add_argument(
-        "--tune_files", default="", help="Accepted for JIT compatibility."
-    )
-    parser.add_argument(
-        "--tune_file", default=None, help="Deprecated alias for --tune_files."
-    )
-    parser.add_argument(
-        "--arch", default=None, help="Optional arch filter, e.g. gfx950"
-    )
-    parser.add_argument(
-        "--cu-num", type=int, default=None, help="Optional CU-count filter"
-    )
     args = parser.parse_args()
-    if not args.tune_files and args.tune_file:
-        args.tune_files = args.tune_file
 
     out_dir = Path(args.working_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    effective_inter_dims = _collect_a8w4_effective_inter_dims(args.tune_files)
 
     bf16_manifest_path = out_dir / "opus_moe_stage2_manifest.h"
     bf16_manifest_path.write_text(_emit_bf16_manifest_header(), encoding="utf-8")
     stage2_a8w4_meta_path = out_dir / "opus_moe_stage2_a8w4_meta.h"
-    stage2_a8w4_meta_path.write_text(
-        _emit_stage2_a8w4_meta_header(effective_inter_dims), encoding="utf-8"
-    )
+    stage2_a8w4_meta_path.write_text(_emit_stage2_a8w4_meta_header(), encoding="utf-8")
     stage2_a8w4_manifest_path = out_dir / "opus_moe_stage2_a8w4_manifest.h"
     stage2_a8w4_manifest_path.write_text(
-        _emit_stage2_a8w4_manifest_header(effective_inter_dims), encoding="utf-8"
+        _emit_stage2_a8w4_manifest_header(), encoding="utf-8"
     )
     stage1_a8w4_meta_path = out_dir / "opus_moe_stage1_a8w4_meta.h"
     stage1_a8w4_meta_path.write_text(_emit_stage1_a8w4_meta_header(), encoding="utf-8")
@@ -632,6 +635,7 @@ def main() -> None:
     stage1_a8w4_manifest_path.write_text(
         _emit_stage1_a8w4_manifest_header(), encoding="utf-8"
     )
+    OpusMoeDeviceCodegen(out_dir).gen_instances()
 
     print(
         f"[opus_moe gen_instances] wrote {bf16_manifest_path} with "
@@ -639,8 +643,7 @@ def main() -> None:
     )
     print(
         f"[opus_moe gen_instances] wrote {stage2_a8w4_manifest_path} with "
-        f"{len(STAGE2_A8W4_KERNELS)} A8W4 stage2 kid(s), "
-        f"effective_inter_dims={effective_inter_dims}"
+        f"{len(STAGE2_A8W4_KERNELS)} runtime-K A8W4 stage2 kid(s)"
     )
     print(f"[opus_moe gen_instances] wrote {stage2_a8w4_meta_path}")
     print(
@@ -648,6 +651,10 @@ def main() -> None:
         f"{len(STAGE1_A8W4_KERNELS)} A8W4 stage1 kid(s)"
     )
     print(f"[opus_moe gen_instances] wrote {stage1_a8w4_meta_path}")
+    print(
+        "[opus_moe gen_instances] wrote 1 runtime-K stage2 device shard, "
+        "2 stage1 shard(s), 4 route-reduce shard(s), and 1 BF16 shard"
+    )
 
 
 if __name__ == "__main__":
