@@ -7,9 +7,6 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from aiter.ops.triton.gemm.basic.gemm_a16w16_persistent import (
-    gemm_a16w16_persistent,
-)
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -239,12 +236,12 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, output, backend):
     torch_out = F.linear(x, w, bias=None)
 
     if output:
-        triton_out = gemm_a16w16_persistent(
-            x, w, None, torch.bfloat16, y, backend=backend
+        triton_out = gemm_a16w16(
+            x, w, None, torch.bfloat16, y, backend=backend, persistent=True
         )
     else:
-        triton_out = gemm_a16w16_persistent(
-            x, w, dtype=torch.bfloat16, backend=backend
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, backend=backend, persistent=True
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)

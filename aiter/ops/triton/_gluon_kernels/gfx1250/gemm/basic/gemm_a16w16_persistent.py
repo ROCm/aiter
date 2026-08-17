@@ -37,6 +37,7 @@ def gemm_a16w16_persistent_kernel_(
     M,
     N,
     K,
+    num_tiles,
     stride_am,
     stride_ak,
     stride_bk,
@@ -78,13 +79,13 @@ def gemm_a16w16_persistent_kernel_(
     start_pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
 
     a_buffer = gl.allocate_shared_memory(
         a_ptr.type.element_ty,
         shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
         layout=SHARED_LAYOUT_A,
     )
+    
     b_buffer = gl.allocate_shared_memory(
         b_ptr.type.element_ty,
         shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
@@ -98,6 +99,7 @@ def gemm_a16w16_persistent_kernel_(
         block_shape=(BLOCK_M, BLOCK_K),
         layout=SHARED_LAYOUT_A,
     )
+
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=b_ptr,
         shape=(K, N),

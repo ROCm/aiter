@@ -5,9 +5,6 @@ import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from aiter.ops.triton.gemm.basic.gemm_a16w16_persistent import (
-    gemm_a16w16_persistent,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -74,8 +71,15 @@ def bench_gemm_fn(
             f"switch)"
         )
         ms = bench_fn(
-            lambda: gemm_a16w16_persistent(
-                x, w, bias, c_dtype, y, activation=activation, backend=backend
+            lambda: gemm_a16w16(
+                x,
+                w,
+                bias,
+                c_dtype,
+                y,
+                activation=activation,
+                backend=backend,
+                persistent=True,
             ),
             **bench_kwargs,
         )
@@ -229,8 +233,8 @@ def parse_args(args: list[str] | None = None):
         "--persistent",
         action="store_true",
         default=False,
-        help="Use the persistent kernel (gemm_a16w16_persistent) instead of the standard "
-        "a16w16 kernel",
+        help="Use the persistent kernel (gemm_a16w16(..., persistent=True)) instead of "
+        "the standard a16w16 kernel",
     )
     parser.add_argument(
         "--cudagraph",

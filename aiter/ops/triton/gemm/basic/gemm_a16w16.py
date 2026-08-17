@@ -15,9 +15,15 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
     _get_config as _get_triton_config,
 )
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
+    gemm_a16w16_persistent_kernel_ as _triton_persistent_kernel,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -44,6 +50,7 @@ def gemm_a16w16_fake_tensor(
     skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
+    persistent: bool = False,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -70,6 +77,7 @@ def gemm_a16w16_(
     skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
+    persistent: bool = False,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -89,7 +97,12 @@ def gemm_a16w16_(
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
         kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
+            Ignored when persistent=True; the persistent kernels have one variant.
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
+        persistent (bool): Use the persistent kernel, which launches one workgroup
+            per CU and walks a strided subset of the output tiles, instead of one
+            workgroup per tile. Reads the GEMM-A16W16-PERSISTENT config family and
+            does not support split-K (so it is incompatible with skip_reduce).
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -103,6 +116,148 @@ def gemm_a16w16_(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if persistent:
+        assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+        assert not skip_reduce, (
+            "persistent=True does not support skip_reduce; the persistent kernels "
+            "have no split-K path to leave unreduced"
+        )
+        M, K = x.shape
+        N, _ = w.shape
+
+        if config is None:
+            config, _ = get_gemm_config("GEMM-A16W16-PERSISTENT", M, N, K)
+            if backend == "triton":
+                # fills in SPLITK_BLOCK_SIZE / cache_modifier defaults and clamps
+                # BLOCK_SIZE_K, which the triton kernel needs; the gluon kernel does not
+                config = compute_splitk_params(config, K)
+
+        assert config.get("NUM_KSPLIT", 1) == 1, (
+            f"persistent=True does not support split-K yet (got NUM_KSPLIT="
+            f"{config.get('NUM_KSPLIT')}); call without persistent=True instead"
+        )
+
+        if backend == "gluon":
+            assert (
+                _is_gluon_available()
+            ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+            import triton.experimental.gluon.language as gl
+
+            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_persistent import (
+                gemm_a16w16_persistent_kernel_ as _gluon_persistent_kernel,
+            )
+
+            _LOGGER.info(
+                f"GEMM_A16W16 [gluon/gfx1250, persistent]: x={tuple(x.shape)} "
+                f"w={tuple(w.shape)}"
+            )
+            assert x.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
+            assert w.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+
+            BLOCK_M = config["BLOCK_M"]
+            BLOCK_N = config["BLOCK_N"]
+            BLOCK_K = config["BLOCK_K"]
+            NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
+            GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
+            num_warps = config["num_warps"]
+
+            w = w.T
+
+            # Clamp the pipeline depth
+            num_k_tiles = triton.cdiv(K, BLOCK_K)
+            NUM_BUFFERS = max(2, min(NUM_BUFFERS, num_k_tiles + 1))
+
+            if y is None:
+                y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+            shared_a = gl.PaddedSharedLayout.with_identity_for(
+                [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+            )
+            shared_b = gl.PaddedSharedLayout.with_identity_for(
+                [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            )
+
+            # Persistent, NUM_WGS processes num_tiles
+            NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
+            num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+
+            _gluon_persistent_kernel[(min(NUM_WGS, num_tiles),)](
+                x,
+                w,
+                bias,
+                y,
+                M,
+                N,
+                K,
+                num_tiles,
+                x.stride(0),
+                x.stride(1),
+                w.stride(0),
+                w.stride(1),
+                y.stride(0),
+                y.stride(1),
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+                GROUP_SIZE_M=GROUP_SIZE_M,
+                NUM_BUFFERS=NUM_BUFFERS,
+                SHARED_LAYOUT_A=shared_a,
+                SHARED_LAYOUT_B=shared_b,
+                activation=_get_activation_from_str(activation) if activation else None,
+                USE_ACTIVATION=activation is not None,
+                ADD_BIAS=(bias is not None),
+                NUM_WGS=NUM_WGS,
+                num_warps=num_warps,
+            )
+
+            return y
+
+        _LOGGER.info(
+            f"GEMM_A16W16 [triton, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+        )
+
+        w = w.T
+
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+        # Persistent, one WG per CU
+        NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
+        num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
+            N, config["BLOCK_SIZE_N"]
+        )
+        _triton_persistent_kernel[(min(NUM_WGS, num_tiles),)](
+            x,
+            w,
+            bias,
+            y,
+            M,
+            N,
+            K,
+            num_tiles,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0,  # stride_ck
+            y.stride(0),
+            y.stride(1),
+            activation=_get_activation_from_str(activation) if activation else "",
+            use_activation=activation is not None,
+            ADD_BIAS=(bias is not None),
+            SKIP_REDUCE=False,
+            NUM_WGS=NUM_WGS,
+            **config,
+        )
+
+        return y
 
     if backend == "gluon":
         assert (
@@ -352,6 +507,7 @@ def gemm_a16w16(
     skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
+    persistent: bool = False,
 ):
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -377,4 +533,5 @@ def gemm_a16w16(
         skip_reduce,
         kernel_type,
         backend,
+        persistent,
     )
