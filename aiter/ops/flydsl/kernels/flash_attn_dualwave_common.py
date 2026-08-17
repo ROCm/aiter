@@ -879,7 +879,8 @@ def _make_dualwave_swp_fp8_traits(
             f"block_m={block_m} must be divisible by gqa_group_size="
             f"{gqa_group_size} to pack the group into M"
         )
-        # PROTOTYPE (packed + split-K): the split-K partial store used to index
+        # Packed + split-K: live for single-seq GQA-prefill underfill split-K
+        # and for non-16:1 GQA decode. The split-K partial store used to index
         # the workspace by a SCALAR q_head_idx, which does not exist under
         # packing where the head varies per M row. store_splitk_partial_o /
         # store_empty_split are now head-aware (they key by the per-M-row

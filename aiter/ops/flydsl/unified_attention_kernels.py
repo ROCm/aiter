@@ -130,8 +130,8 @@ _FP8_DTYPE = torch.float8_e4m3fn
 # split (below) is taken. Below this the decode half's split-K does not amortize
 # the split's two-launch + partition-sync overhead, so the split regresses vs the
 # single call (chunk=256 was 0.87x at ctx=4096); at/above this every sampled
-# chunk size wins (1.01-1.93x). Set from a gfx950 ctx sweep at chunks 256/512/4023
-# (SILOTIGER-877): the crossover is chunk-independent and lands in (5632, 6144];
+# chunk size wins (1.01-1.93x). Set from a gfx950 ctx sweep at chunks 256/512/4023:
+# the crossover is chunk-independent and lands in (5632, 6144];
 # 6144 (96 pages) is the lowest depth where all sampled chunks win noise-robustly.
 _SPLIT_MIN_DECODE_KV = 6144
 
@@ -141,8 +141,8 @@ _SPLIT_MIN_DECODE_KV = 6144
 # per-tile compute is exposed at 1 WG/CU (the 97 KB BLOCK_N-based LDS ring pins
 # occupancy). Above this KV-read-volume quantum the exposure dominates and Triton
 # wins ~2x; split-K does not recover it (monotonic-worse at full fill). Boundary
-# from a gfx950 A/B grid (SILOTIGER-877): every winning cell has b*ctx <= 65536,
-# every losing cell >= 98304. See the decode-regression vault doc.
+# from a gfx950 A/B grid: every winning cell has b*ctx <= 65536,
+# every losing cell >= 98304.
 #
 # NOTE: this gates the LEGACY prefill-body decode path only (non-16:1 GQA the
 # decode kernel declines). The decode-specialized kernel's own cede lives in the
@@ -242,9 +242,9 @@ def _get_kernel(
 
 
 # ===========================================================================
-# Decode dispatch gates (SILOTIGER-877 Stage 4). All decode routing/cede
-# thresholds live here so retuning is a one-line edit. See
-# _decode_dispatch_action for how they combine.
+# Decode dispatch gates. All decode routing/cede thresholds live here so
+# retuning is a one-line edit. See _decode_dispatch_action for how they
+# combine.
 # ===========================================================================
 # GQA group size the decode-specialized kernel is built for (BLOCK_M=16).
 _DECODE_GQA = 16
@@ -353,12 +353,18 @@ def _route_decode_kernel(
 
     Host-computes the fill-aware split S (``plan_num_kv_splits``), builds/caches
     the matching binary, and forwards through the kernel's own ``mod`` wrapper
-    (which allocates the split-K workspace internally). K/V are the contiguous
-    paged pool flattened to 1-D (the kernel flat-addresses via
-    ``page_id * PAGE_REGION``, matching the validated Stage-1..3 layout);
-    q_descale folds the softmax scale exactly as the prefill path does. Returns
-    ``out`` written in place.
+    (which allocates the split-K workspace internally). K/V are passed as raw
+    base pointers into the contiguous paged pool; the kernel rebases a
+    per-page BufferDesc from the block table and indexes only within that page
+    (see the "Per-page buffer rebasing" comment in the kernel launch below),
+    since a >= 2**31-element production pool cannot be addressed as one
+    whole-pool memref with a flat ``page_id * PAGE_REGION`` offset. q_descale
+    folds the softmax scale exactly as the prefill path does. Returns ``out``
+    written in place.
     """
+    assert (
+        k.is_contiguous() and v.is_contiguous()
+    ), "decode route requires contiguous K/V"
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
     npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
@@ -840,7 +846,7 @@ def flydsl_unified_attention(
     ):
         return None
 
-    # Decode-specialized kernel (Stage 4): the all-decode region routes to the
+    # Decode-specialized kernel: the all-decode region routes to the
     # BLOCK_M=16 multi-wave + register-V + split-K decode body. All gates and
     # thresholds live in _decode_dispatch_action (see that block).
     _decode_action = _decode_dispatch_action(

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx950 decode-specialized fp8 flash attention (SILOTIGER-877, Stage 1).
+"""gfx950 decode-specialized fp8 flash attention.
 
 A single-pass, single-wave-per-(batch, kv-head) decode kernel. The GQA group is
 the MMA M-dim: BLOCK_M=16 (16 q-heads ride in M for one kv-head), so one wave
@@ -16,7 +16,7 @@ const_expr branches of the prefill kernel. It is deliberately decode-local and
 does NOT call the welded dualwave loaders (which are hardwired to
 num_waves=8 / rows_per_wave=32); it carries its own small decode traits.
 
-Proven cores lifted verbatim from the Stage-0 probes
+Proven cores lifted verbatim from the probes
 (``scripts/stage0_probe_qkpv.py``, ``scripts/stage0_probe_blayout.py``):
 
 - QK = mma(A=K, B=Q) -> S^T[n_kv, m_q]. C-output packing: value v in {0..3} of
@@ -34,10 +34,10 @@ stored [n_kv, d] (d contiguous); we scatter it into LDS as [d, n_kv] (n_kv
 contiguous) so a plain 8-fp8 register read lands n_kv on the MMA K axis. This is
 NOT ds_read_b64_tr_b8 (linear-welded) and NOT the welded coalesced V loaders.
 
-Cache layout (Stage 1 deliverable): ``kv_cache_layout`` selects the linear 4D
-paged pool ("linear", milestone 1a) or the 5D shuffled vLLM-v1 layout
-("vectorized", milestone 1b). The K and V *LDS* tile layouts -- and thus every
-LDS->operand read and the whole compute core -- are cache-layout-independent;
+Cache layout: ``kv_cache_layout`` selects the linear 4D paged pool ("linear")
+or the 5D shuffled vLLM-v1 layout ("vectorized"). The K and V *LDS* tile
+layouts -- and thus every LDS->operand read and the whole compute core -- are
+cache-layout-independent;
 ONLY the global->LDS load addressing differs between the two. That invariant is
 what makes 1b a purely additive change over 1a.
 """
@@ -55,7 +55,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, ptr_arg
 
 FP8 = fx.Float8E4M3FN
 WARP = 64
-MAXFP8 = 448.0
 PAGE = 64  # block/page size, structural (matches the 5D shuffled cache)
 HEAD_DIM = 128
 BLOCK_M = 16  # one GQA group = MMA M-dim
@@ -94,12 +93,12 @@ def build_flash_attn_fp8_decode_module(
     paged=True,
     kv_cache_layout="linear",
     num_waves=8,  # tuned for full-machine b=64 (8 waves/CU, matches the asm ref)
-    num_kv_splits=1,  # Stage-3 inter-workgroup KV split S; host-computed per shape
+    num_kv_splits=1,  # inter-workgroup KV split S; host-computed per shape
 ):
     """Build the gfx950 decode-specialized fp8 flash-attention launcher.
 
     Returns a Python callable ``mod(q, k, v, o, batch, ...)`` that wraps torch
-    tensors and launches the kernel. Stage 1 requires ``paged=True`` and
+    tensors and launches the kernel. This kernel requires ``paged=True`` and
     ``head_dim==128``; ``num_heads // num_kv_heads`` must be ``BLOCK_M`` (16).
     ``kv_cache_layout`` is ``"linear"`` (4D pool) or ``"vectorized"`` (5D
     shuffled). Output ``out_dtype_str`` is ``"bf16"`` or ``"f16"``.
@@ -109,7 +108,7 @@ def build_flash_attn_fp8_decode_module(
     if dtype_str != "fp8":
         raise ValueError(f"decode kernel builds fp8 QKV only, got {dtype_str}")
     if not paged:
-        raise ValueError("Stage 1 decode kernel is paged-only")
+        raise ValueError("decode kernel is paged-only")
     if out_dtype_str not in ("bf16", "f16"):
         raise ValueError(f"decode output supports bf16/f16 only, got {out_dtype_str}")
     if kv_cache_layout not in ("linear", "vectorized"):
@@ -125,7 +124,7 @@ def build_flash_attn_fp8_decode_module(
     OUT = fx.BFloat16 if out_dtype_str == "bf16" else fx.Float16
     SHUF = kv_cache_layout == "vectorized"
     VARLEN = bool(varlen)
-    # Multi-wave cooperative workgroup (Stage-2 occupancy fix): NW waves per
+    # Multi-wave cooperative workgroup (occupancy fix): NW waves per
     # (batch, kv-head) share the 16 query-heads and split the KV page loop
     # (wave w streams pages w, w+NW, ...). Each produces a partial flash-decoding
     # softmax (m_w, l_w, O_w); the NW partials are LSE-merged on-chip via LDS.
@@ -136,10 +135,10 @@ def build_flash_attn_fp8_decode_module(
     NW = int(num_waves)
     BUFSZ = PAGE * HEAD_DIM  # one K (or V) tile in bytes/elements, per wave
     OPART = D * BLOCK_M  # one wave's O^T partial (128*16 f32)
-    # Stage-3 inter-workgroup KV split. S=1 => the Stage-2 kernel (direct O
-    # store, no workspace). S>1 => each (batch, kv-head, split) workgroup writes
-    # an UNNORMALIZED partial (m, l, O) for its contiguous KV sub-range to a
-    # global workspace; a separate combine kernel LSE-merges the S partials.
+    # Inter-workgroup KV split. S=1 => direct O store, no workspace. S>1 =>
+    # each (batch, kv-head, split) workgroup writes an UNNORMALIZED partial
+    # (m, l, O) for its contiguous KV sub-range to a global workspace; a
+    # separate combine kernel LSE-merges the S partials.
     SPLK = int(num_kv_splits)
     SPLITK = SPLK > 1
     # per (b,h,s) workspace row: O[D*BLOCK_M] + m[BLOCK_M] + l[BLOCK_M].
@@ -148,6 +147,8 @@ def build_flash_attn_fp8_decode_module(
     # f16), cache layout, or wave count produce near-identical IR; without a
     # distinct closure value the flydsl disk cache aliases them and serves the
     # wrong binary. Referenced inside launch so it is part of the cache key.
+    # causal is effectively constant for query_len=1 decode; it rides in the
+    # tag only for uniformity with the prefill kernel's cache key shape.
     _cache_tag = (
         f"flash_attn_fp8_decode|out={out_dtype_str}|layout={kv_cache_layout}"
         f"|varlen={int(VARLEN)}|causal={int(bool(causal))}|H={H}|HKV={HKV}"
@@ -168,22 +169,21 @@ def build_flash_attn_fp8_decode_module(
     SHUF_K_DCHUNK_STRIDE = PAGE * VEC  # 1024
     SHUF_V_TCHUNK_STRIDE = D * VEC  # 2048
 
-    # K buffers per wave: KBUFS=2 double-buffers K on the shuffled path so page
-    # p+NW's K DMA overlaps page p compute; the freed V LDS pays for it. Linear
-    # keeps a single K buffer + an LDS V tile (its V cannot be read straight from
-    # global). Byte-typed (Int8): fp8 lowers cleanly through i8 LDS and is bitcast
-    # to fp8 only when building the MMA operand.
-    KBUFS = 1  # Step 1: single K buffer (register-V). Step 2 bumps SHUF to 2.
+    # Single K buffer per wave (no double-buffer: inter-wave parallelism hides
+    # the DMA latency instead). Linear keeps a single K buffer + an LDS V tile
+    # (its V cannot be read straight from global). Byte-typed (Int8): fp8
+    # lowers cleanly through i8 LDS and is bitcast to fp8 only when building
+    # the MMA operand.
     if const_expr(SHUF):
 
         @fx.struct
         class SharedStorage:
-            # K [n_kv,d] (d contiguous), KBUFS buffers per wave. V is NOT in LDS:
+            # K [n_kv,d] (d contiguous), one buffer per wave. V is NOT in LDS:
             # the 5D-shuffled V is already in MMA-operand order, so the V^T
             # fragment is 8 contiguous global bytes (a direct b64 load) -- no
             # transpose, no LDS tile. The K region is reused post-loop as the
             # O-partial combine scratch.
-            k: fx.Array[fx.Int8, KBUFS * NW * PAGE * D]
+            k: fx.Array[fx.Int8, NW * PAGE * D]
             m_part: fx.Array[fx.Float32, NW * BLOCK_M]
             l_part: fx.Array[fx.Float32, NW * BLOCK_M]
 
@@ -208,10 +208,10 @@ def build_flash_attn_fp8_decode_module(
         rocdl.s_waitcnt(val)
 
     def _rmax_q(v):
-        # GENERALIZATION CANDIDATE (post-Stage-4): flash_attn_dualwave_common
-        # softmax reduce helpers (_reduction_pair / permlane32_swap sites) --
-        # unify via a rows_per_wave param (decode uses 16 => XOR shifts {16,32};
-        # prefill uses 32). Those helpers are welded to rows_per_wave=32.
+        # GENERALIZATION CANDIDATE: flash_attn_dualwave_common softmax reduce
+        # helpers (_reduction_pair / permlane32_swap sites) -- unify via a
+        # rows_per_wave param (decode uses 16 => XOR shifts {16,32}; prefill
+        # uses 32). Those helpers are welded to rows_per_wave=32.
         # reduce max over the 4 lane-groups keeping m_q=lane%16 distinct
         for sh in (16, 32):
             v = v.maximumf(v.shuffle_xor(fx.Int32(sh), fx.Int32(64)))
@@ -350,9 +350,9 @@ def build_flash_attn_fp8_decode_module(
         qd = gviewf32(qd_ptr)[0]
         kd = gviewf32(kd_ptr)[0]
         vd = gviewf32(vd_ptr)[0]
-        # GENERALIZATION CANDIDATE (post-Stage-4): DualwaveFp8KernelContext.
-        # init_descale -- unify via a decode-safe (no-sink, no-dequant-buffer)
-        # descale helper; math here is the same rsqrt(d)*log2e*qd*kd fold.
+        # GENERALIZATION CANDIDATE: DualwaveFp8KernelContext.init_descale --
+        # unify via a decode-safe (no-sink, no-dequant-buffer) descale helper;
+        # math here is the same rsqrt(d)*log2e*qd*kd fold.
         c_logit_scale = (fx.Float32(CONST_SCALE) * qd) * kd
 
         # Sequence-local token index (Q/O) and kv length.
@@ -370,9 +370,9 @@ def build_flash_attn_fp8_decode_module(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # 2D [N, 8] views for coalesced b64 operand reads (all operand bases are
         # 8-aligned by construction). Each wave owns a BUFSZ K slice per buffer.
-        lk2 = lds.k.view(fx.make_layout((KBUFS * NW * PAGE * D // 8, 8), (8, 1)))
+        lk2 = lds.k.view(fx.make_layout((NW * PAGE * D // 8, 8), (8, 1)))
         lk_base = fx.Int32(fx.ptrtoint(lds.k.ptr))  # DMA m0 base
-        wave_kv = wave * fx.Int32(KBUFS * BUFSZ)  # this wave's K region byte offset
+        wave_kv = wave * fx.Int32(BUFSZ)  # this wave's K region byte offset
         if const_expr(not SHUF):
             lv2 = lds.v.view(fx.make_layout((NW * PAGE * D // 8, 8), (8, 1)))
             lvf = lds.v.view(fx.make_layout((NW * PAGE * D,), (1,)))  # LDS_V[d,t]
@@ -435,8 +435,9 @@ def build_flash_attn_fp8_decode_module(
             q_frags.append(load_frag8(gq2, base))
 
         def repack_p(p):
-            # QK C-output -> PV B-operand ds_bpermute gather (Stage-0 Correction
-            # 1). p = [d1a[0..3], d1b[0..3]] are the two KV-tile P fragments.
+            # QK C-output -> PV B-operand ds_bpermute gather (see
+            # stage0_probe_qkpv.py). p = [d1a[0..3], d1b[0..3]] are the two
+            # KV-tile P fragments.
             vals8 = []
             for r in range_constexpr(8):
                 sg = (lg % fx.Int32(2)) * 2 + fx.Int32(r // 4)
@@ -477,7 +478,6 @@ def build_flash_attn_fp8_decode_module(
         # NO s_barrier inside this loop: waves have unequal trip counts, so a
         # workgroup-wide barrier here would deadlock. Ordering within a wave (DMA
         # -> LDS read, and read -> next-page overwrite) is a wave-local s_waitcnt.
-        cur_bufoff = wave_kv
         p_start = fx.Int64(sp0 + wave)
         p_stop = fx.Int64(sp1)
         p_step = fx.Int64(NW)
@@ -488,8 +488,8 @@ def build_flash_attn_fp8_decode_module(
             pvi = fx.Int32(pv)
 
             # ---- global -> LDS staging (the ONLY cache-layout-dependent code) ----
-            # GENERALIZATION CANDIDATE (post-Stage-4): DualwaveFp8KvGmemToLdsLoader
-            # addressing -- unify via a num_waves/rows_per_wave param (decode uses
+            # GENERALIZATION CANDIDATE: DualwaveFp8KvGmemToLdsLoader addressing
+            # -- unify via a num_waves/rows_per_wave param (decode uses
             # rows_per_wave=16 and a transposed [d,n_kv] V LDS tile).
             if const_expr(SHUF):
                 page_id = gbt[b * bt_stride + pvi]
@@ -548,10 +548,7 @@ def build_flash_attn_fp8_decode_module(
                     row0 = kv_local + st * 16
                     for c in range_constexpr(4):
                         kbase = (
-                            fx.Int32(row0 + n) * D
-                            + fx.Int32(c * 32)
-                            + lg * 8
-                            + cur_bufoff
+                            fx.Int32(row0 + n) * D + fx.Int32(c * 32) + lg * 8 + wave_kv
                         )
                         kfrag = load_frag8(lk2, kbase)
                         fx.gemm(mma, fc, kfrag, q_frags[c], fc)
@@ -727,7 +724,7 @@ def build_flash_attn_fp8_decode_module(
             stream=stream,
         )
 
-    # GENERALIZATION CANDIDATE (post-Stage-4): DualwaveSplitKCombineContext /
+    # GENERALIZATION CANDIDATE: DualwaveSplitKCombineContext /
     # dualwave_splitk_workspace_elems -- reuse the split-K combine scaffolding
     # once it is de-welded from the prefill traits (num_waves=8/rows_per_wave=32)
     # and the CDNA4 no-cluster (plain global reduction) reality. This decode
