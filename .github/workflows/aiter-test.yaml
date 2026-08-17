@@ -102,6 +102,7 @@ jobs:
 
   check-signal:
     if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    if: github.event_name != 'workflow_dispatch'
     needs: detect_aiter_test_scope
     runs-on: ubuntu-latest
     steps:
