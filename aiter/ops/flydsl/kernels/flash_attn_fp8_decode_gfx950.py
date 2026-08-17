@@ -54,7 +54,10 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import _make_page_view
+from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
+    _make_page_view,
+    waitcnt_vm_n,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, ptr_arg
 
 FP8 = fx.Float8E4M3FN
@@ -204,19 +207,13 @@ def build_flash_attn_fp8_decode_module(
     def _exp2(x):
         return fx.Float32(rocdl.exp2(T.f32, _to_raw(x)))
 
-    def _waitcnt_vm_n(nn):
-        # s_waitcnt vmcnt(nn) only (lgkmcnt=63, expcnt=7); vmcnt retires in issue
-        # order, so nn = "at most nn loads outstanding". Encoding vendored from
-        # flash_attn_dualwave_common.waitcnt_vm_n (byte-identical).
-        val = (nn & 0xF) | 0x3F70 | (((nn >> 4) & 0x3) << 14)
-        rocdl.s_waitcnt(val)
-
     def _rmax_q(v):
-        # GENERALIZATION CANDIDATE: flash_attn_dualwave_common softmax reduce
-        # helpers (_reduction_pair / permlane32_swap sites) -- unify via a
-        # rows_per_wave param (decode uses 16 => XOR shifts {16,32}; prefill
-        # uses 32). Those helpers are welded to rows_per_wave=32.
-        # reduce max over the 4 lane-groups keeping m_q=lane%16 distinct
+        # Reduce max over the 4 lane-groups, keeping m_q=lane%16 distinct.
+        # Not shared with the prefill body's _reduction_pair: that reduces 32
+        # in-register slots then one permlane32_swap across the 32-lane halves,
+        # while decode reduces a per-lane scalar with shuffle_xor at {16,32}
+        # across four lane-groups -- different input shape, primitive, and
+        # depth, so no rows_per_wave parameterization unifies them.
         for sh in (16, 32):
             v = v.maximumf(v.shuffle_xor(fx.Int32(sh), fx.Int32(64)))
         return v
@@ -517,7 +514,7 @@ def build_flash_attn_fp8_decode_module(
                         )
                         vf_step.append(load_frag8(gv2p, voff))
                     v_frags.append(vf_step)
-                _waitcnt_vm_n(0)  # K DMA + all V loads complete (vmcnt)
+                waitcnt_vm_n(0)  # K DMA + all V loads complete (vmcnt)
             else:
                 # Linear (correctness reference): K async DMA into canonical
                 # LDS_K[n_kv, d]; V scatter-transposed per element (its contiguous
