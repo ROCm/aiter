@@ -97,16 +97,21 @@ the FlyDSL cold harness.
       a KB router buffer; verified DeepSeek B=32 earlier).
 - [ ] (C1) Ensure `compare.py` joins on the full B set so every FlyDSL row has a CK peer.
 
-#### A4 — extend the CK cpp with a gate_up FP4 bench  [ ]
-- [ ] Add `GUProbFP4 = WarpDecodeGateUpProblem<bf16_t, pk_fp4_t, ...>` + kernel alias and a
-      bench block mirroring `down_fp4_h2` (env-filterable row `gate_up_fp4`).
-- [ ] Respect the **`NPerWarp=1`** constraint (the kernel static-asserts NPerWarp=2 rejects
-      packed FP4).
-- [ ] Pick a scale layout matching FlyDSL's e8m0 block scale; allocate packed FP4 gate/up
-      pools (`E*I*H/2` bytes each). Rebuild; add to `compare.py`'s join.
-- Context: **not** a CK capability gap — `WarpDecodeGateUpKernel` supports `pk_fp4_t`
-  (`unpack_fp4_nibble`, `is_packed_w`); only the bench cpp never instantiates the alias.
-  Pairs with FlyDSL's `flydsl_warp_decode_gate_up_fp4` (the 1.44–1.65× cold-A/B win).
+#### A4 — extend the CK cpp with a gate_up FP4 bench  [x]
+- [x] Added `GUProbFP4 = WarpDecodeGateUpProblem<bf16_t, pk_fp4_t, …, XScaleBF16, WScalePT,
+      Silu, kVec4>` + `GUKernFP4` alias and a `gate_up_fp4` bench block in the cpp, mirroring
+      `down_fp4_h2` (packed pools `E*I*H/2` bytes each, PerTensor dummy scale, `stride=H/2`).
+- [x] Uses **`NPerWarp=1`** + the non-dot2 scalar path (dot2 / NPerWarp=2 reject packed FP4).
+- [x] **CK kernel patch required (correction to the old "not a capability gap" note).** The
+      gate_up kernel's `IsSupportedArgument` rejected the packed stride `H/2` (`stride_w_gate <
+      hidden`) — the down kernel already had the `pk_fp4_t → hidden/2` exception but gate_up
+      did not. Patched `warp_decode_gate_up_kernel.hpp` to mirror down (`min_w_stride =
+      pk_fp4_t ? hidden/2 : hidden`). **This means the CK worktree source no longer matches
+      pinned `62e30c9098` byte-for-byte** (one-line validator fix; kernel math unchanged). See
+      the provenance note in §5.
+- [x] Rebuilt; `compare.py` join now fills the gate_up FP4 CK column. Ratios (f/c) 0.56–0.84
+      (FlyDSL ~1.2–1.7× faster, matching the expected 1.44–1.65× cold win), all `%peak≤100`,
+      `cos=1.0000`. Pairs with FlyDSL's `flydsl_warp_decode_gate_up_fp4`.
 
 ### Group B — FlyDSL-side changes
 
@@ -212,11 +217,11 @@ the FlyDSL cold harness.
       the FP8 sanity column populates.
 - [x] Canonical map `CK_MAP` (kernel → op/w_dtype/act_dtype/recommended): `gate_bf16_d2 →
       gate_up fp8/bf16-act`; `down_h2_d2 → down fp8`; `down_fp4_h2 → down fp4`; `gate_up_fp4
-      → gate_up fp4` (CK pending A4); `gate_fp8_d2 → gate_up fp8/fp8-act` (FlyDSL pending B4).
+      → gate_up fp4` (CK ✅ A4); `gate_fp8_d2 → gate_up fp8/fp8-act` (FlyDSL pending B4).
 - [x] Joins on `(H,I,E,K,B,op,w_dtype,act_dtype)`; emits `flydsl_us`, `ck_us`, `ratio=f/c`,
       and TB/s + %peak recomputed via the shared `compute_metrics` (`--method
       weight_stream|total_traffic`) applied to both sides. Carries FlyDSL `cos`; CK marked
-      perf-only/uninitialized. n/a cells noted (DeepSeek FP8 → B5; gate_up FP4 CK → A4).
+      perf-only/uninitialized. n/a cells noted (DeepSeek FP8 → B5; gate_up FP4 CK now ✅ A4).
 - [x] Output: markdown ratio table (HTML-comment provenance header: gfx, aiter+CK commits,
       iters/cold/timing/method, CK provenance line, config-policy note) + optional `--csv-out`.
 - **Depends on:** A1 (cold) ✅, A2 (CSV) ✅, B2 (TOPK) ✅, B3 (compute_metrics) ✅.
@@ -350,7 +355,7 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 |---|---|---|---|---|
 | gate_up | BF16-act × FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ | ⏳ |
 | gate_up | FP8-act × FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ B4 | ⏳ B4 |
-| gate_up | FP4-w | ⏳ A4 | ⏳ A4 | ⏳ A4 |
+| gate_up | FP4-w | ✅ (A4) | ✅ (A4) | ✅ (A4) |
 | down | FP8-w | ⛔ FP8 hole (⏳ B5) | ⏳ | ⏳ |
 | down | FP4-w | ⏳ | ⏳ | ⏳ |
 
@@ -361,7 +366,7 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 ## 4. Dependencies (build order)
 - **C1 (`compare.py`)** needs **A1, A2, B2, B3**.
 - **Full FP8 coverage** (DeepSeek) needs **B5**.
-- **gate_up FP4 pair** needs **A4** (FlyDSL side already exists).
+- **gate_up FP4 pair** — ✅ done (A4; needed a one-line CK gate_up kernel packed-stride fix).
 - **gate_up FP8-act pair** needs **B4** (FlyDSL side) — CK already has `gate_fp8_d2`.
 - **Trustworthy ratios** need **A1 (cold), B1 (scale), D1 (timing), D3 (config), D4 (equiv)**.
 
@@ -370,6 +375,11 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
 - **Rotating-buffer OOM:** GB-scale weight pools × `rotating_count_` can OOM at B=32/DeepSeek.
 - **`total_traffic` drift:** pinned to CK commit `62e30c9098`; revisit if CK's byte/FLOP
   formulas change.
+- **CK worktree carries a local patch (A4):** `warp_decode_gate_up_kernel.hpp` has a one-line
+  `IsSupportedArgument` fix so packed-FP4 gate/up rows (`stride=H/2`) are accepted (mirrors the
+  down kernel). The kernel *math* is unchanged, but the worktree no longer matches pinned
+  `62e30c9098` byte-for-byte — `compare.py`'s header still prints that commit. If CK provenance
+  must be pristine, upstream the fix or record the patch alongside the artifact.
 - **Env reconciliation** (shared with the full-MoE track): one env must import FlyDSL +
   aiter; the CK side is a standalone binary so it's driven via subprocess.
 - **Regime honesty:** ratios are only "apples-to-apples" once cold + scale + timing + config
@@ -380,6 +390,15 @@ Qwen3Next-TP1 (H2048/I512/E512/K10). Batches B∈{1,2,4,8,32}.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **A4 gate_up FP4 CK bench DONE.** Added `GUProbFP4`/`GUKernFP4` +
+  `gate_up_fp4` bench block (packed `E*I*H/2` pools, PerTensor dummy scale, `stride=H/2`,
+  NPerWarp=1 scalar path). Discovered the gate_up kernel's `IsSupportedArgument` rejected the
+  packed stride (the down kernel had the `pk_fp4→hidden/2` exception, gate_up didn't); patched
+  `warp_decode_gate_up_kernel.hpp` with the same one-line fix (kernel math unchanged, but the
+  CK worktree now diverges from pinned `62e30c9098` — provenance note added in §5). Rebuilt;
+  the join now fills the gate_up FP4 CK column: ratios 0.56–0.84 (FlyDSL ~1.2–1.7× faster,
+  matching the expected 1.44–1.65× cold win), all `%peak≤100`, `cos=1.0000`. Regenerated
+  `tickets/667/g9_compare.{md,csv}`.
 - 2026-08-14 — plan drafted from `SILOTIGER-667-bench-TODO.txt`; per-stage G9 items folded
   here. Full-MoE / AITER-default track kept separate in the TODO file (deferred).
 - 2026-08-14 — **A1 done.** Discovered the `stream_config` flush/rotate flags are no-ops on
