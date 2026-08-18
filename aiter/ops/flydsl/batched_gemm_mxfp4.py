@@ -4,7 +4,7 @@
 """Thin strided-batched MXFP4/MXFP6/MXFP8 preshuffle GEMM launcher: out[b] =
 dequant(x[b]) @ dequant(w[b]).T, per-1x32 e8m0 scales folded into a scaled 16x16x128
 matrix op. gfx950 uses the wave64 MFMA path (a4w4/a8w4, fp4/fp6/fp8 A); gfx1250 uses the
-wave32 WMMA path (a8w4 only: MXFP8 E4M3 A x MXFP4 B). Operands are preshuffled + laid out
+wave32 WMMA path (MXFP4/MXFP8 A x MXFP4 B). Operands are preshuffled + laid out
 by the caller (once, off the launch path) -- see the arch-specific preshuffle in the tests.
 layout 'bmn' = contiguous [B,M,N], 'mbn' = the deepseek-v4 grouped-output [M,B,N] (returned
 as a non-contiguous [B,M,N] view)."""
@@ -59,8 +59,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     Mirrors the MoE grouped-gemm contiguous-M scheduling: a compact grid over the
     (1, contiguous_m, *) buffers, with a per-M-tile expert id (``tile_expert``)
     selecting the per-expert B / B-scale slab. Only valid M tiles launch.
-      out          (1, contiguous_m, N)  bf16/f16  (or fp8 payload when stage1_quant_out)
-      a            (1, contiguous_m, K)  uint8 (fp8 payload)
+      out          (1, contiguous_m, N) bf16/f16; quantized stage1 output is
+                   uint8 with N//2 bytes for MXFP8 or N//4 bytes for MXFP4
+      a            (1, contiguous_m, K) logical elements in MXFP4/MXFP8 payload
       w            (E, N, K//2) uint8 (moe_shuffle_weight == cat_e shuffle_weight_gfx1250)
       a_scales     grouped A-scale (1, contiguous_m//wmma_rep, (K//32)*wmma_rep) viewed int32
       w_scales     n32k4 B-scale (E, N//32, (K//32)*32) viewed int32
@@ -72,11 +73,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     The betas are runtime kernel arguments, so all SiTUv2 shapes share one
     compiled kernel.
 
-    When ``stage1_quant_out=1`` (fp8), the epilogue fuses the activation + MX
-    fp8 quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives
-    the fp8 payload (uint8, 1 byte/elem) and ``quant_scale`` receives the
-    preshuffled e8m0 scale (uint8).  ``quant_wmma_rep`` is gemm2's
-    ``warp_tile_m // 16``, controlling the scale preshuffle tile geometry.
+    ``stage1_quant_out`` selects the fused activation-quant epilogue: 0 emits
+    bf16/f16, 1 emits MXFP8 (one byte/element), and 2 emits packed MXFP4 (one
+    byte/two elements). ``quant_scale`` receives the preshuffled E8M0 scales.
+    ``quant_wmma_rep`` is gemm2's ``warp_tile_m // 16``, controlling the scale
+    preshuffle tile geometry.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -89,6 +90,15 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
+    if stage1_quant_out not in (0, 1, 2):
+        raise ValueError(
+            f"stage1_quant_out must be 0 (bf16), 1 (fp8), or 2 (fp4), "
+            f"got {stage1_quant_out!r}"
+        )
+    if stage1_quant_out and (not stage1_act or quant_scale is None):
+        raise ValueError(
+            "stage1_quant_out requires an activation epilogue and quant_scale"
+        )
     nb = min(num_buffers, max(1, K // tile_k))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)

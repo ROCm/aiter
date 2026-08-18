@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
+"""Grouped contiguous-M A4W4/A8W4 preshuffle MoE GEMM for gfx1250."""
 
 import math
 from collections import namedtuple
@@ -27,6 +27,7 @@ from .gemm_common_gfx1250 import (
 )
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
+    emit_cvt_scalef32_pk8_fp4_bf16,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
@@ -552,7 +553,12 @@ def launch_gemm_a8w4_tdm(
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
-            STORE_N = (tile_n // 2) if stage1_act else tile_n
+            quant_fp4 = stage1_quant_out == 2
+            STORE_N = (
+                ((tile_n // 4) if quant_fp4 else (tile_n // 2))
+                if stage1_act
+                else tile_n
+            )
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             is_situv2 = stage1_act == 3
@@ -567,7 +573,9 @@ def launch_gemm_a8w4_tdm(
 
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
-                # Fused silu/swiglu -> fp8 quant; stage fp8 payload to LDS, scatter scale to global.
+                # Fused activation -> MX quant. FP8 stores one byte/element;
+                # FP4 packs two elements/byte. Both scatter gemm2's preshuffled
+                # E8M0 scale layout directly from the epilogue.
                 i32_ptr_g = fx.PointerType.get(
                     elem_ty=fx.Int8.ir_type,
                     address_space=fx.AddressSpace.Global,
@@ -617,8 +625,22 @@ def launch_gemm_a8w4_tdm(
                                 range_constexpr=range_constexpr,
                             )
 
+                        if const_expr(quant_fp4):
+                            # Compute the MX scale directly from the f32 activation.
+                            # gfx1250's native FP4 pack consumes bf16, so keep one
+                            # rounded view for that instruction without widening it
+                            # back to f32.
+                            pack_bf16 = Vec.from_elements(all_vals, fx.Float32).to(
+                                fx.BFloat16
+                            )
+                            quant_vals = all_vals
+                            quant_dtype = MxDtype.FP4_E2M1
+                        else:
+                            quant_vals = all_vals
+                            quant_dtype = MxDtype.FP8_E4M3
+
                         scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                            all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
+                            quant_vals, wave_size=WAVE, dtype=quant_dtype
                         )
                         mx_blk_i = (
                             fx.Int32(blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16) >> 6
@@ -626,28 +648,73 @@ def launch_gemm_a8w4_tdm(
                         e8m0_bytes.append(e8m0_byte)
                         mx_blk_is.append(mx_blk_i)
 
-                        for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                            src_f32 = Vec.from_elements(
-                                all_vals[half * 8 : half * 8 + 8],
-                                fx.Float32,
-                            ).ir_value()
-                            packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                            )
-                            for sub in range_constexpr(2):
-                                sub_wn = half * 2 + sub
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                packed_i32 = vector.extract(
-                                    packed_v2i32,
-                                    static_position=[sub],
-                                    dynamic_position=[],
+                        if const_expr(quant_fp4):
+                            # kgrp0 owns activated columns [0:4] of each wn and
+                            # kgrp1 owns [4:8]. Pack each lane's four bf16 values
+                            # into two dwords before exchanging them, halving the
+                            # cross-kgrp shuffles.
+                            packed_bf16 = pack_bf16.bitcast(fx.Int32)
+                            local_bf16_words = []
+                            peer_bf16_words = []
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                begin = sub_wn * 2
+                                local_words = [
+                                    packed_bf16[begin + i] for i in range_constexpr(2)
+                                ]
+                                local_bf16_words.append(local_words)
+                                peer_bf16_words.append(
+                                    [
+                                        word.shuffle_xor(fx.Int32(16), fx.Int32(WAVE))
+                                        for word in local_words
+                                    ]
                                 )
-                                col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                lds_store_b32(
-                                    stC_idx,
-                                    row_rel * STORE_N + col_fp8,
-                                    Vec.from_elements([packed_i32], fx.Int32),
+                            if row_rel < mn_oob and is_kgrp0:
+                                for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                    src_bf16 = (
+                                        Vec.from_elements(
+                                            local_bf16_words[sub_wn]
+                                            + peer_bf16_words[sub_wn],
+                                            fx.Int32,
+                                        )
+                                        .bitcast(fx.BFloat16)
+                                        .ir_value()
+                                    )
+                                    packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                        src_bf16, scale_f32, i32_ty=T.i32
+                                    )
+                                    wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                    col_fp4 = (wnb + wn * 16) // 4
+                                    lds_store_b32(
+                                        stC_idx,
+                                        row_rel * STORE_N + col_fp4,
+                                        Vec.from_elements([packed_i32], fx.Int32),
+                                    )
+                        else:
+                            for half in range_constexpr(WN_PER_MX_BLOCK // 2):
+                                src_f32 = Vec.from_elements(
+                                    quant_vals[half * 8 : half * 8 + 8],
+                                    fx.Float32,
+                                ).ir_value()
+                                packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
+                                    src_f32,
+                                    scale_f32,
+                                    v2i32_ty=v2i32_ty,
+                                    rocdl=rocdl,
                                 )
+                                for sub in range_constexpr(2):
+                                    sub_wn = half * 2 + sub
+                                    wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                    packed_i32 = vector.extract(
+                                        packed_v2i32,
+                                        static_position=[sub],
+                                        dynamic_position=[],
+                                    )
+                                    col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
+                                    lds_store_b32(
+                                        stC_idx,
+                                        row_rel * STORE_N + col_fp8,
+                                        Vec.from_elements([packed_i32], fx.Int32),
+                                    )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                     if row_rel < mn_oob and is_kgrp0:
@@ -719,8 +786,12 @@ def launch_gemm_a8w4_tdm(
             # -- Shared LDS -> TDM store to global --
             workgroup_barrier()
             if const_expr(stage1_act):
-                out_stride = i32_n // 2
-                out_col_off = blk_n64 // 2
+                if const_expr(quant_fp4):
+                    out_stride = i32_n // 4
+                    out_col_off = blk_n64 // 4
+                else:
+                    out_stride = i32_n // 2
+                    out_col_off = blk_n64 // 2
             else:
                 out_stride = c_stride
                 out_col_off = c_inner_off

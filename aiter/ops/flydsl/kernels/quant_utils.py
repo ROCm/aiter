@@ -297,3 +297,19 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
         _raw(src_v8f32),
         _raw(scale_f32),
     )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp4_bf16`` scaled pack.
+
+    Converts eight bf16 values to eight FP4 E2M1 nibbles packed into one i32.
+    ``scale_f32`` carries the forward E8M0 block scale; the instruction divides
+    by it before round-to-nearest-even conversion.
+    """
+    return llvm.inline_asm(
+        i32_ty,
+        [_raw(src_v8bf16), _raw(scale_f32)],
+        "v_cvt_scalef32_pk8_fp4_bf16 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )

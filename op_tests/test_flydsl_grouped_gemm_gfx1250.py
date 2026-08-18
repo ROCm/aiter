@@ -685,9 +685,44 @@ def test_grouped_a4w4_situv2_matches_torch_ref():
     )
 
 
+@pytest.mark.parametrize(
+    "activation",
+    [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2],
+)
+def test_grouped_a4w4_fused_quant_activations_match_torch_ref(activation):
+    # A bias-free GEMM1 writes the packed MXFP4 payload and preshuffled E8M0
+    # scales for GEMM2 directly from its activation epilogue.
+    run_moe(
+        "a4w4",
+        activation=activation,
+        model_dim=512,
+        inter_dim=512,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
+@pytest.mark.parametrize("tile_m", [16, 128])
+def test_grouped_a4w4_situv2_fused_quant_scale_layouts_match_torch_ref(
+    monkeypatch, tile_m
+):
+    # Cover quant_wmma_rep=1 and 8 in addition to the default tile_m=64/rep=4.
+    # Keep both GEMMs on the same M tile so every expert boundary is legal.
+    monkeypatch.setenv("AITER_TDM_TILE_M", str(tile_m))
+    monkeypatch.setenv("AITER_TDM_TILE_M2", str(tile_m))
+    run_moe(
+        "a4w4",
+        activation=ActivationType.Situv2,
+        model_dim=512,
+        inter_dim=512,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
 def test_grouped_a8w4_situv2_matches_torch_ref():
-    # a8w4 takes the fused stage1 quant epilogue (batched activation), which is
-    # a separate code path from a4w4's bf16 intermediate (element-wise).
+    # A8W4 uses the FP8 form of the fused stage1 quant epilogue; A4W4 uses its
+    # packed FP4 form.
     run_moe(
         "a8w4",
         activation=ActivationType.Situv2,
