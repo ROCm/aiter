@@ -29,25 +29,27 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     kernels_list as kernels_list_cktile,
 )
 
+# Both a8w8 bpreshuffle pipelines live in one common and are enumerated through
+# FLYDSL_PIPELINES. The guard that kept a broken 8wave table from disabling
+# preshuffle moved into that module, around the 8wave op-module import; the
+# per-table aliases below are only for the runners and get_kernel_name.
 try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        kernel_instance_estimated_lds_bytes,
-        max_lds_bytes_for_tune,
+        PIPELINES as FLYDSL_PIPELINES,
     )
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         kernels_list as kernels_list_flydsl,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernels_list_8wave as kernels_list_flydsl_8wave,
     )
 except ImportError:
     print(
         "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
     )
+    FLYDSL_PIPELINES = ()
     kernels_list_flydsl = {}
-
-    def kernel_instance_estimated_lds_bytes(_ki):
-        return 0
-
-    def max_lds_bytes_for_tune():
-        return 1 << 30
+    kernels_list_flydsl_8wave = {}
 
 
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -66,17 +68,6 @@ def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
         if actual_ksplit == sk:
             valid.append(sk)
     return valid if valid else [1]
-
-
-def _get_padded_m(M: int) -> int:
-    if M <= 256:
-        return (M + 15) // 16 * 16
-    elif M <= 1024:
-        return (M + 31) // 32 * 32
-    elif M <= 4096:
-        return (M + 63) // 64 * 64
-    else:
-        return (M + 127) // 128 * 128
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -158,6 +149,41 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         ki.enable_scheduler,
     )
     return out
+
+
+def run_gemm_flydsl_8wave(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import flydsl_8wave_gemm_a8
+
+    ki = kernels_list_flydsl_8wave[kernel_id]
+    flydsl_8wave_gemm_a8(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.block_m,
+        ki.block_n,
+        waves_per_eu=ki.waves_per_eu,
+        xcd_swizzle=ki.xcd_swizzle,
+    )
+    return out
+
+
+# Pipeline name -> (runner, is-it-usable-right-now). The availability probe is a
+# callable, and deliberately different per pipeline: preshuffle needs the symbol
+# the is_flydsl_available() gate above binds at import, while 8wave imports its
+# entry point lazily inside its runner.
+_FLYDSL_PIPELINE_RUNNERS = {
+    "preshuffle": (
+        run_gemm_flydsl,
+        lambda: "flydsl_preshuffle_gemm_a8" in globals(),
+    ),
+    "8wave": (run_gemm_flydsl_8wave, is_flydsl_available),
+}
+
+# The tuner speaks torch dtypes, Pipeline.q_dtypes_w speaks names (that module
+# must stay importable without torch).
+_Q_DTYPE_W_NAMES = {dtypes.fp8: "fp8", dtypes.i8: "int8"}
 
 
 def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
@@ -278,9 +304,12 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 return None
             kernelList = kernels_list_cktile
         elif libtype == "flydsl":
-            if kernelId not in kernels_list_flydsl:
-                return None
-            return kernels_list_flydsl[kernelId].name
+            # Several candidate tables share this libtype; their id ranges are
+            # disjoint (see KERNEL_ID_BASE_8WAVE), so ask each in turn.
+            for pipe in FLYDSL_PIPELINES:
+                if kernelId in pipe.kernels_list:
+                    return pipe.kernels_list[kernelId].name
+            return None
         else:
             return None
         return kernelList[kernelId].name
@@ -502,71 +531,60 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
 
         q_dtype_eval = eval(q_dtype_w)
-        if q_dtype_eval == dtypes.fp8 or q_dtype_eval == dtypes.i8:
-            pass
-        else:
+        q_dtype_name = _Q_DTYPE_W_NAMES.get(q_dtype_eval)
+        if q_dtype_name is None:
             print(f"[FlyDSL] unsupported q_dtype_w {q_dtype_w}, skipping")
-            return []
-
-        # Guard FlyDSL task generation on both kernel metadata and actual FlyDSL kernel availability.
-        if (not kernels_list_flydsl) or ("flydsl_preshuffle_gemm_a8" not in globals()):
             return []
 
         gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
         tasks = []
-        lds_limit = max_lds_bytes_for_tune()
-        padded_m = _get_padded_m(M)
-        min_ctas = max(4, min(16, N // 64))
-        for i in sorted(kernels_list_flydsl.keys()):
-            ki = kernels_list_flydsl[i]
-            if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
+        # One pass per pipeline, in PIPELINES order (preshuffle, then 8wave).
+        # Sweeping them under one libtype is what lets a single
+        # ``--libtype flydsl`` run compare them and pick one winner per shape;
+        # only the candidate table, the predicate and the runner differ.
+        for pipe in FLYDSL_PIPELINES:
+            runner_entry = _FLYDSL_PIPELINE_RUNNERS.get(pipe.name)
+            if runner_entry is None:
+                print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
                 continue
-            if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+            runner, is_available = runner_entry
+            if q_dtype_name not in pipe.q_dtypes_w:
                 continue
-            if padded_m % ki.tile_m != 0:
+            if not pipe.kernels_list or not is_available():
                 continue
-            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
-            if num_ctas < min_ctas:
-                continue
-            if ki.tile_m == 16 and ki.tile_n == 512:
-                continue
-            if M >= 8192 and ki.tile_m < 64:
-                continue
-            if M >= 4096 and ki.tile_m < 32:
-                continue
-            if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
-                continue
-            kernel_name = ki.name
-            info = (info_keys, i, 0, kernel_name, "flydsl")
-            tasks.append(
-                (
-                    info,
-                    generate_data,
-                    (M, N, K, seed, dtypes.bf16, q_dtype_eval),
-                    run_gemm_flydsl,
+            for i in sorted(pipe.kernels_list.keys()):
+                ki = pipe.kernels_list[i]
+                if not pipe.fits(ki, M, N, K):
+                    continue
+                tasks.append(
                     (
-                        gemm_flydsl_keys,
-                        i,
-                    ),
-                    {
-                        "num_warmup": args.warmup,
-                        "num_iters": args.iters,
-                    },
-                    run_torch,
-                    (
-                        ref_keys,
-                        dtypes.bf16,
-                    ),
-                    {},
-                    None,
-                    1e-2,
-                    0.01,
-                    None,
-                    None,
-                    ("out",),
+                        (info_keys, i, 0, ki.name, "flydsl"),
+                        generate_data,
+                        (M, N, K, seed, dtypes.bf16, q_dtype_eval),
+                        runner,
+                        (
+                            gemm_flydsl_keys,
+                            i,
+                        ),
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
+                        run_torch,
+                        (
+                            ref_keys,
+                            dtypes.bf16,
+                        ),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                        None,
+                        None,
+                        ("out",),
+                    )
                 )
-            )
         return tasks
 
     def _get_flydsl_tune_task_gfx1250(self, info_keys, seed):

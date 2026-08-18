@@ -8,6 +8,7 @@ import torch
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     moe_gemm_a4w4,
     moe_gemm_torch,
     mxfp4_quant,
@@ -23,8 +24,8 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe, shuffle_weight
 
 # ---------------
 # initialize data
@@ -171,6 +172,7 @@ class Case:
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
+    preshuffle_weights: bool = False
 
 
 @pytest.mark.parametrize(
@@ -195,6 +197,12 @@ class Case:
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(4096, 3072, 3072, 128, 4),
             Case(8192, 7168, 4096, 256, 8),
+            # gfx1250 gluon preshuffled weights
+            Case(16, 4096, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 512, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
+            Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
         ]
     ],
 )
@@ -209,7 +217,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -218,22 +226,37 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    fused_quant,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    preshuffle_weights,
+    backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
+    if not is_fp4_avail():
+        pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
     if hbm_swizzling and (n % 32 != 0 or k % (32 * 8) != 0):
         pytest.skip(
             f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
         )
 
+    if preshuffle_weights:
+        if get_arch() != "gfx1250":
+            pytest.skip("Preshuffling weights is only supported on gfx1250")
+        if backend != "gluon":
+            pytest.skip("Preshuffling weights is only supported on gluon backend")
+        if n % 16 != 0 or (k // 2) % 32 != 0:
+            pytest.skip(
+                f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
+                f"by 32, got n={n}, k//2={k // 2}"
+            )
+
+    # skip gluon backend if not supported
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
+
     torch.manual_seed(0)
 
-    act_mxfp4 = "mxfloat4_e2m1"
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
 
@@ -260,16 +283,30 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = shuffle_scale_moe(
-            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+            )
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
+        else:
+            assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
+    if preshuffle_weights:
+        E, K, N = w_tri.shape
+        w_tri = (
+            shuffle_weight(w_tri, arch="gfx1250")
+            .view(E, N // 16, K * 16)
+            .transpose(-1, -2)
+        )
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
-    x_static_scale = None
     out_dtype = torch.bfloat16
     maxtol = None
     rmstol = None
@@ -277,26 +314,22 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp4 and fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-    else:
-        quant_static_scale = None
+
+    # run kernel
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
         x_mx_scales_tri,
         w_scale_tri,
-        x_static_scale,
-        quant_static_scale,
         bias_tri,
         rdata,
         gindx,
         sindx,
         gammas,
         swizzle_mx_scale,
+        preshuffle_weights,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
-    if not act_mxfp4 and fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
