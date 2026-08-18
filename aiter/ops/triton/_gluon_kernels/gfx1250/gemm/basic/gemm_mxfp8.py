@@ -328,18 +328,26 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # row covers the whole block), hence the min/// rather than a bare divide.
     BS_ROWS_PER_GROUP: gl.constexpr = min(BLOCK_SIZE_N, B_SCALE_N_GROUP)
     BS_N_GROUPS: gl.constexpr = BLOCK_SIZE_N // BS_ROWS_PER_GROUP
-    # ...but only for a SINGLE group. Filling a multi-group slab needs one
-    # descriptor per source row writing its own row slice, and TDM into
-    # `bs_slab.slice(g * rows, rows, dim=0)` does not preserve the swizzled
-    # layout: measured 99.6% mismatch at BLOCK_SIZE_N 256 (two groups), and the
-    # corruption covers the whole slab, not just the second group, so it is the
-    # sliced destination and not the row arithmetic. Every single-group config
-    # passes at the bf16 noise floor. BLOCK_SIZE_N > B_SCALE_N_GROUP therefore
-    # keeps the register-staged global load below -- correct, just not as cheap.
-    # Fixing this properly wants a 3-D (group, row, col) descriptor over a slab
-    # reshaped to 2-D, which is untried.
-    # Feasibility, independent of what the config asks for.
-    B_SCALE_TDM_OK: gl.constexpr = BS_N_GROUPS == 1
+    # A multi-group slab (BLOCK_SIZE_N > 128, i.e. more than one source scale row)
+    # needs one zero-stride descriptor per group, each writing its own slice. Of
+    # the three ways to express that, only one works on this toolchain:
+    #   * `bs_slab.slice(g * rows, rows, dim=0)` on a 2-D allocation -- 99.6%
+    #     mismatch, the sliced destination does not preserve the swizzle;
+    #   * `.index(g)` on a 3-D allocation + `.reshape([BLOCK_SIZE_N, COLS])` for
+    #     the gather -- LLVM assert, reshape derives its own layout and indexes
+    #     order[2] of a rank-2 layout;
+    #   * a rank-3 layout on the 3-D allocation -- async_load rejects it,
+    #     "rank must be equal to or one less than the shape size".
+    # What does work: a 3-D allocation carrying the 2-D layout, so `.index(g)` is
+    # a valid TDM destination (the same addressing the chunk double-buffer uses),
+    # plus an explicit `_reinterpret` for the flat view the gather needs.
+    # _reinterpret succeeds where reshape fails because the layout is given
+    # rather than derived. Verified standalone: two source rows land group-major,
+    # each replicated across its 128 rows, all columns intact.
+    #
+    # Multi-group requires the whole span to fit, because chunking already spends
+    # the leading dim on double buffering and both at once would need rank 4.
+    B_SCALE_TDM_OK: gl.constexpr = BS_N_GROUPS == 1 or B_SCALE_FITS
     # The config knob wins only where it is feasible. Which of the two fills is
     # faster is shape-dependent -- the TDM fill removes the register staging and
     # a barrier, but the global path's load is a plain dwordx4 stream that some
@@ -358,6 +366,16 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     )
     NUM_BS_BUFS: gl.constexpr = 2 if B_SCALE_CHUNKED else 1
     B_SCALE_IN_LDS: gl.constexpr = B_SCALE_FITS or B_SCALE_CHUNKED
+    # Only the multi-group TDM path splits the leading dim by scale row; the
+    # chunked path splits it by buffer, and every other path keeps one slice of
+    # BLOCK_SIZE_N rows exactly as before.
+    B_SCALE_MULTIGROUP: gl.constexpr = USE_B_SCALE_TDM and BS_N_GROUPS > 1
+    BS_SLAB_SLICES: gl.constexpr = (
+        NUM_BS_BUFS if B_SCALE_CHUNKED else (BS_N_GROUPS if B_SCALE_MULTIGROUP else 1)
+    )
+    BS_SLICE_ROWS: gl.constexpr = (
+        BS_ROWS_PER_GROUP if B_SCALE_MULTIGROUP else BLOCK_SIZE_N
+    )
 
     # The wmma instruction shape is [16, 16, 128], so a K tile must be a whole
     # number of k-steps; 128 also keeps K_GROUPS aligned to the 32-element MX
@@ -378,9 +396,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # rather than conservative: K_local is SPLITK_BLOCK_SIZE for NUM_KSPLIT > 1,
     # and equals it for NUM_KSPLIT == 1 too since the wrapper sets
     # SPLITK_BLOCK_SIZE = cdiv(K, 1) = K.
-    STATIC_K_ITER: gl.constexpr = (
-        SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1
-    ) // BLOCK_SIZE_K
+    STATIC_K_ITER: gl.constexpr = (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     STATIC_MAIN_ITERS: gl.constexpr = STATIC_K_ITER - (NUM_BUFFERS - 1)
     UNROLL: gl.constexpr = max(1, min(LOOP_UNROLL_FACTOR, STATIC_MAIN_ITERS))
 
@@ -540,7 +556,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         # gather sites read the same way on both paths.
         bs_slab = gl.allocate_shared_memory(
             b_scale_ptr.dtype.element_ty,
-            shape=[NUM_BS_BUFS, BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
+            shape=[BS_SLAB_SLICES, BS_SLICE_ROWS, B_SCALE_CHUNK_COLS],
             layout=as_shared,
         )
     # Register-staged fallback for the multi-group case TDM cannot fill. Issued
@@ -583,7 +599,26 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     if A_SCALE_IN_LDS:
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_am_tdm], as_slab)
 
-    if USE_B_SCALE_TDM:
+    if B_SCALE_MULTIGROUP:
+        # One descriptor per source scale row, each replicating its row across its
+        # own BS_ROWS_PER_GROUP-row slice. No single kept descriptor here: chunking
+        # is excluded for this path, so nothing later needs to re-issue a load.
+        for g in gl.static_range(BS_N_GROUPS):
+            bs_row_g = gl.minimum(
+                (pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP + g,
+                gl.cdiv(N, B_SCALE_N_GROUP) - 1,
+            )
+            bs_desc_g = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=b_scale_ptr
+                + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
+                + bs_row_g * stride_bsn,
+                shape=(BS_SLICE_ROWS, gl.cdiv(K_local, B_SCALE_K_GROUP)),
+                strides=(0, stride_bsk),
+                block_shape=(BS_SLICE_ROWS, B_SCALE_CHUNK_COLS),
+                layout=as_shared,
+            )
+            gl.amd.gfx1250.tdm.async_load(bs_desc_g, [0, 0], bs_slab.index(g))
+    elif USE_B_SCALE_TDM:
         # The row offset rides in the BASE pointer, not in async_load's offsets:
         # with stride 0 a row offset resolves to the same row and would be a
         # silent no-op. Clamped to the last real scale row so a tail block whose
@@ -632,9 +667,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         gl.barrier()
 
     # ---------------- Main loop ----------------
-    for _ in tl.range(
-        0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL
-    ):
+    for _ in tl.range(0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL):
         # Chunk prefetch: at the first tile of chunk c, start chunk c+1 into the
         # other buffer. Predicated rather than branched so the loop body stays a
         # single basic block -- a branch here would defeat LOOP_UNROLL_FACTOR.
@@ -682,8 +715,18 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             )
         if B_SCALE_IN_LDS:
             bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
+            # Multi-group needs the flat view across slices; reshape() asserts in
+            # LLVM on this allocation, so the layout is supplied explicitly.
+            if B_SCALE_MULTIGROUP:
+                bs_view = bs_slab._reinterpret(
+                    dtype=b_scale_ptr.dtype.element_ty,
+                    shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
+                    layout=as_shared,
+                )
+            else:
+                bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
             cur_bs = _gather_scale_tile(
-                bs_slab.index(bs_chunk % NUM_BS_BUFS),
+                bs_view,
                 num_computes - bs_chunk * BS_TILES_PER_CHUNK,
                 bs_zeros_n,
                 offs_bs_kg,
@@ -760,8 +803,18 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             )
         if B_SCALE_IN_LDS:
             bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
+            # Multi-group needs the flat view across slices; reshape() asserts in
+            # LLVM on this allocation, so the layout is supplied explicitly.
+            if B_SCALE_MULTIGROUP:
+                bs_view = bs_slab._reinterpret(
+                    dtype=b_scale_ptr.dtype.element_ty,
+                    shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
+                    layout=as_shared,
+                )
+            else:
+                bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
             cur_bs = _gather_scale_tile(
-                bs_slab.index(bs_chunk % NUM_BS_BUFS),
+                bs_view,
                 num_computes - bs_chunk * BS_TILES_PER_CHUNK,
                 bs_zeros_n,
                 offs_bs_kg,
@@ -823,8 +876,18 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         )
     if B_SCALE_IN_LDS:
         bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
+        # Multi-group needs the flat view across slices; reshape() asserts in
+        # LLVM on this allocation, so the layout is supplied explicitly.
+        if B_SCALE_MULTIGROUP:
+            bs_view = bs_slab._reinterpret(
+                dtype=b_scale_ptr.dtype.element_ty,
+                shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
+                layout=as_shared,
+            )
+        else:
+            bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
         cur_bs = _gather_scale_tile(
-            bs_slab.index(bs_chunk % NUM_BS_BUFS),
+            bs_view,
             num_computes - bs_chunk * BS_TILES_PER_CHUNK,
             bs_zeros_n,
             offs_bs_kg,
