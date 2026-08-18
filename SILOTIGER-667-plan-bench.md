@@ -182,11 +182,14 @@ the FlyDSL cold harness.
       unchanged); `total_traffic` ≈2× bytes as expected.
 - [x] `total_traffic` docstring **pinned to CK commit `62e30c9098`** with a "revisit if CK's
       byte/FLOP formulas change" note.
-- [ ] **Follow-up (optional, non-blocking):** migrate the *warm* benches `bench_gate_up` /
-      `bench_down` / `bench_down_fp4` to `compute_metrics` for a single source of truth (they
-      still carry inline byte/FLOP accounting, off the `compare.py` path). Use the same
-      exact-equivalence check so their recorded numbers stay unchanged. Deferred from B3 to
-      keep that change tight; tracked here as low-priority tech-debt cleanup.
+- [x] **Follow-up (B3, 2026-08-18):** migrated the *warm* benches `bench_gate_up` /
+      `bench_down` / `bench_down_fp4` to `compute_metrics` (`weight_stream`) so the byte/FLOP
+      model has a single source of truth on the warm path too — all inline `outputs`/`flops`/
+      `wbytes`/`tbs` accounting removed; each now returns `m["TFLOPS"]`/`m["TB/s"]`/`m["%peak"]`.
+      Exact-equivalence re-verified by a standalone numeric check (60k sampled DeepSeek/MiniMax/
+      Qwen shape-cells, all with even & `%32`-divisible `INTER`): **0 mismatches**, so recorded
+      TFLOPS/TB-s/%peak are byte-for-byte unchanged. The only behavioral delta is the `us<=0`
+      edge (old inline returned `0.0`, `compute_metrics` returns `NaN`) — never hit in real runs.
 
 #### B4 — FlyDSL counterpart to CK's `gate_fp8_d2` (FP8-activation gate_up)  [x] DONE (2026-08-18)
 - [x] Added `build_gate_up_fp8_act_module` + public `flydsl_warp_decode_gate_up_fp8act`
@@ -474,6 +477,13 @@ DeepSeek FP8 (`down`+`gate_up bf16-act`) via **B5** (E256 Tier-2 i64 base), and
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-18 — **B3 follow-up done — warm benches migrated to `compute_metrics`.** Dropped the
+  inline `outputs`/`flops`/`wbytes`/`tbs` accounting from `bench_gate_up`, `bench_down`, and
+  `bench_down_fp4`; each now derives TFLOPS/TB-s/%peak from `compute_metrics(..., weight_stream)`,
+  so the byte/FLOP model is single-sourced across cold + warm + `compare.py`. Re-ran the
+  exact-equivalence numeric check (60k sampled shape-cells, even & `%32`-divisible `INTER`):
+  **0 mismatches** — recorded numbers byte-for-byte unchanged (only `us<=0` now yields `NaN`
+  instead of `0.0`, never hit in practice).
 - 2026-08-18 — **B4 done — FP8-activation gate_up (CK `gate_fp8_d2` peer).** Added
   `build_gate_up_fp8_act_module` + `flydsl_warp_decode_gate_up_fp8act` (FP8 e4m3 `x` +
   `Block2D<1,128>` activation scale, FP8 weight `Block2D<128,128>`, dot2; both scales fold
