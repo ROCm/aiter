@@ -255,8 +255,13 @@ void fmha_v4_fwd(const at::Tensor& q,
     TORCH_CHECK(batch > 0 && seqlen_q > 0 && seqlen_k > 0 && nhead_q > 0,
                 "MHA v4 requires non-empty inputs");
     TORCH_CHECK(k.size(0) == batch && v.size(0) == batch, "Q, K, and V batch sizes must match");
-    TORCH_CHECK(nhead_q == nhead_k && v.size(2) == nhead_k,
-                "MHA v4 initially supports MHA only; Q and KV heads must match");
+    TORCH_CHECK(nhead_k > 0 && v.size(2) == nhead_k,
+                "MHA v4 requires matching non-empty K and V head dimensions");
+    TORCH_CHECK(nhead_q % nhead_k == 0,
+                "MHA v4 requires query heads to be divisible by KV heads");
+    const int64_t gqa_ratio = nhead_q / nhead_k;
+    TORCH_CHECK(gqa_ratio <= 16 && (gqa_ratio & (gqa_ratio - 1)) == 0,
+                "MHA v4 supports power-of-two GQA ratios up to 16");
     TORCH_CHECK(k.size(1) == v.size(1), "K and V sequence lengths must match");
     TORCH_CHECK(q.size(3) == packed_width && k.size(3) == packed_width,
                 "Q/K packed width does not match the explicit format");
@@ -341,7 +346,7 @@ void fmha_v4_fwd(const at::Tensor& q,
     args.s_Ts.value          = cfg.ts_qo * q.stride(1);
     args.s_Hs.value          = q.stride(2);
     args.s_Bs.value          = q.stride(0);
-    args.s_gqa.value         = 1; // Initial v4 rows are MHA-only.
+    args.s_gqa.value         = gqa_ratio;
     args.s_k_Seqs.value      = k.stride(1);
     args.s_k_Hs.value        = k.stride(2);
     args.s_k_Bs.value        = k.stride(0);

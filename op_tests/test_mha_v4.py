@@ -625,6 +625,34 @@ def test_mha_v4_zero_inputs_are_finite(q_format):
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
+def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
+    torch.manual_seed(41)
+    q = torch.randn((2, 129, 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 257, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    gqa = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.FP8,
+    )
+    mha = mha_v4(
+        q,
+        k.repeat_interleave(16, dim=2),
+        v.repeat_interleave(16, dim=2),
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.FP8,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gqa, mha)
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
