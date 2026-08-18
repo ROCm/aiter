@@ -10,6 +10,7 @@
         "NUM_BUFFERS": 5,
         "cache_modifier": null,
         "LOOP_UNROLL_FACTOR": 1,
+        "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound"
     },
     "M_LEQ_512": {
@@ -23,6 +24,7 @@
         "NUM_BUFFERS": 4,
         "cache_modifier": null,
         "LOOP_UNROLL_FACTOR": 4,
+        "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound"
     },
     "any": {
@@ -36,6 +38,7 @@
         "NUM_BUFFERS": 3,
         "cache_modifier": null,
         "LOOP_UNROLL_FACTOR": 1,
+        "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound"
     }
 }

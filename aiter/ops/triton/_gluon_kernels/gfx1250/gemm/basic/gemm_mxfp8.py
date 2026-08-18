@@ -31,6 +31,7 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "cache_modifier",
     "NUM_BUFFERS",
     "LOOP_UNROLL_FACTOR",
+    "B_SCALE_TDM",
 ]
 
 _gemm_mxfp8_preshuffle_bandwidth_bound_repr = make_kernel_repr(
@@ -187,6 +188,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     LOOP_UNROLL_FACTOR: gl.constexpr = 1,
+    B_SCALE_TDM: gl.constexpr = True,
     waves_per_eu: gl.constexpr = 0,
 ):
     """
@@ -304,7 +306,58 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # kernel took before -- so the slab is free in occupancy terms. Configs that
     # would exceed it (BLOCK_SIZE_N 256, or a K span past 16384 per split) keep
     # the in-loop global path rather than risk an LDS overflow at launch.
-    B_SCALE_IN_LDS: gl.constexpr = (BLOCK_SIZE_N * B_SCALE_COLS) <= 16384
+    B_SCALE_BUDGET: gl.constexpr = 16384
+    B_SCALE_FITS: gl.constexpr = (BLOCK_SIZE_N * B_SCALE_COLS) <= B_SCALE_BUDGET
+    # When the whole K span does not fit -- K per split past 16384 at
+    # BLOCK_SIZE_N 128 -- the slab is CHUNKED instead of giving up and going back
+    # to a global load per K tile. Two half-budget buffers, and the main loop
+    # prefetches chunk c+1 at the first tile of chunk c, so the DMA has a whole
+    # chunk of iterations to land and the boundary costs no wait. Total LDS is
+    # unchanged: 2 * BLOCK_SIZE_N * (BUDGET/2/BLOCK_SIZE_N) == BUDGET.
+    B_SCALE_CHUNK_COLS: gl.constexpr = (
+        B_SCALE_COLS if B_SCALE_FITS else (B_SCALE_BUDGET // 2) // BLOCK_SIZE_N
+    )
+    BS_TILES_PER_CHUNK: gl.constexpr = (
+        B_SCALE_CHUNK_COLS * B_SCALE_K_GROUP // BLOCK_SIZE_K
+    )
+    # One TDM per distinct source row, each with a ZERO row stride so the DMA
+    # re-reads that row for every block row it writes -- which is how a copy
+    # engine that cannot broadcast still fills a replicated slab. Verified on
+    # gfx1250 that stride 0 replicates rather than reading sequentially or
+    # zero-filling. BLOCK_SIZE_N below 128 still needs one group (a single source
+    # row covers the whole block), hence the min/// rather than a bare divide.
+    BS_ROWS_PER_GROUP: gl.constexpr = min(BLOCK_SIZE_N, B_SCALE_N_GROUP)
+    BS_N_GROUPS: gl.constexpr = BLOCK_SIZE_N // BS_ROWS_PER_GROUP
+    # ...but only for a SINGLE group. Filling a multi-group slab needs one
+    # descriptor per source row writing its own row slice, and TDM into
+    # `bs_slab.slice(g * rows, rows, dim=0)` does not preserve the swizzled
+    # layout: measured 99.6% mismatch at BLOCK_SIZE_N 256 (two groups), and the
+    # corruption covers the whole slab, not just the second group, so it is the
+    # sliced destination and not the row arithmetic. Every single-group config
+    # passes at the bf16 noise floor. BLOCK_SIZE_N > B_SCALE_N_GROUP therefore
+    # keeps the register-staged global load below -- correct, just not as cheap.
+    # Fixing this properly wants a 3-D (group, row, col) descriptor over a slab
+    # reshaped to 2-D, which is untried.
+    # Feasibility, independent of what the config asks for.
+    B_SCALE_TDM_OK: gl.constexpr = BS_N_GROUPS == 1
+    # The config knob wins only where it is feasible. Which of the two fills is
+    # faster is shape-dependent -- the TDM fill removes the register staging and
+    # a barrier, but the global path's load is a plain dwordx4 stream that some
+    # shapes schedule better -- so this is tuned per shape rather than assumed.
+    USE_B_SCALE_TDM: gl.constexpr = B_SCALE_TDM and B_SCALE_TDM_OK
+    # Chunking is TDM-only: the register-staged fallback loads the whole span in
+    # one go and has no chunk index to slide. It also needs the prefetch to have
+    # retired before the chunk that consumes it starts -- the per-iteration
+    # async_wait leaves (NUM_BUFFERS - 2) * 2 ops outstanding, so an op retires
+    # once NUM_BUFFERS - 1 later iterations have each pushed two newer ones behind
+    # it. Requiring a chunk to be at least NUM_BUFFERS tiles wide covers that with
+    # room to spare, and also guarantees a chunk boundary never lands inside the
+    # epilogue without its prefetch having been issued by the main loop.
+    B_SCALE_CHUNKED: gl.constexpr = (
+        USE_B_SCALE_TDM and not B_SCALE_FITS and BS_TILES_PER_CHUNK >= NUM_BUFFERS
+    )
+    NUM_BS_BUFS: gl.constexpr = 2 if B_SCALE_CHUNKED else 1
+    B_SCALE_IN_LDS: gl.constexpr = B_SCALE_FITS or B_SCALE_CHUNKED
 
     # The wmma instruction shape is [16, 16, 128], so a K tile must be a whole
     # number of k-steps; 128 also keeps K_GROUPS aligned to the 32-element MX
@@ -464,12 +517,36 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             as_desc.dtype, shape=[A_SCALE_COLS, BLOCK_SIZE_M], layout=as_shared
         )
 
-    # B-scale slab. Filled by a plain global load rather than TDM: TDM copies,
-    # it does not broadcast, and the slab needs every 128th source row replicated
-    # across 128 rows (see B_SCALE_IN_LDS). The load is issued here, as early as
-    # possible, and consumed after the TDM prologue's async_wait so its latency
-    # sits under the operand fill instead of in front of the main loop.
+    # B-scale slab, TDM'd in like the A slab rather than staged through
+    # registers. TDM cannot broadcast, and the slab needs every source row
+    # replicated across B_SCALE_N_GROUP rows (see B_SCALE_IN_LDS) -- a zero row
+    # stride buys exactly that, since the DMA then resolves every block row to
+    # the same source row. One descriptor per distinct source row, each filling
+    # its own BS_ROWS_PER_GROUP-row slice of the slab, so BLOCK_SIZE_N 256 (two
+    # source rows) would stay correct -- except a sliced TDM destination does not
+    # preserve the swizzle, so that case falls back to the global load (see
+    # B_SCALE_TDM).
+    #
+    # The global load this replaces had to materialise the whole
+    # BLOCK_SIZE_N x B_SCALE_COLS slab in registers before storing it -- 16 KiB
+    # across the CTA at the budget ceiling, ~32 VGPRs per lane at num_warps 2 --
+    # and needed a barrier afterwards because the fill layout spread rows across
+    # waves while the gather reads them in the wmma scale layout. TDM writes LDS
+    # directly, so both the register staging and that barrier go away; the
+    # existing async_wait retires these as the oldest ops on the in-order
+    # tensorcnt, exactly as it already does for the A slab.
     if B_SCALE_IN_LDS:
+        # Always buffer-indexed, even unchunked (NUM_BS_BUFS == 1), so the three
+        # gather sites read the same way on both paths.
+        bs_slab = gl.allocate_shared_memory(
+            b_scale_ptr.dtype.element_ty,
+            shape=[NUM_BS_BUFS, BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
+            layout=as_shared,
+        )
+    # Register-staged fallback for the multi-group case TDM cannot fill. Issued
+    # here, as early as possible, and consumed after the prologue's async_wait so
+    # its latency sits under the operand fill instead of in front of the loop.
+    if B_SCALE_IN_LDS and not USE_B_SCALE_TDM:
         bs_fill_layout: gl.constexpr = gl.BlockedLayout(
             [1, B_SCALE_COLS], [32, 1], [num_warps, 1], [1, 0]
         )
@@ -481,9 +558,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         bs_fill_kg = gl.arange(
             0, B_SCALE_COLS, layout=gl.SliceLayout(0, bs_fill_layout)
         )
-        bs_fill_kg = gl.minimum(
-            bs_fill_kg, gl.cdiv(K_local, B_SCALE_K_GROUP) - 1
-        )
+        bs_fill_kg = gl.minimum(bs_fill_kg, gl.cdiv(K_local, B_SCALE_K_GROUP) - 1)
         bs_fill_n = (
             pid_n * BLOCK_SIZE_N
             + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, bs_fill_layout))
@@ -493,9 +568,6 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
             + ((bs_fill_n // B_SCALE_N_GROUP) * stride_bsn)[:, None]
             + (bs_fill_kg * stride_bsk)[None, :]
-        )
-        bs_slab = gl.allocate_shared_memory(
-            bs_fill.dtype, shape=[BLOCK_SIZE_N, B_SCALE_COLS], layout=as_shared
         )
 
     num_loads = 0
@@ -511,6 +583,32 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     if A_SCALE_IN_LDS:
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_am_tdm], as_slab)
 
+    if USE_B_SCALE_TDM:
+        # The row offset rides in the BASE pointer, not in async_load's offsets:
+        # with stride 0 a row offset resolves to the same row and would be a
+        # silent no-op. Clamped to the last real scale row so a tail block whose
+        # N range runs past the tensor still addresses in bounds -- those rows are
+        # masked out of the C store anyway, the same reasoning the K-column clamp
+        # already relies on.
+        bs_row = gl.minimum(
+            (pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP,
+            gl.cdiv(N, B_SCALE_N_GROUP) - 1,
+        )
+        # One descriptor for every chunk: only the ROW stride is 0, so the K
+        # offset passed to async_load still slides the window. Columns past the
+        # real K extent are zero-filled by the descriptor bounds, and are only
+        # ever gathered for K tiles the loop does not reach.
+        bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_scale_ptr
+            + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
+            + bs_row * stride_bsn,
+            shape=(BLOCK_SIZE_N, gl.cdiv(K_local, B_SCALE_K_GROUP)),
+            strides=(0, stride_bsk),
+            block_shape=(BLOCK_SIZE_N, B_SCALE_CHUNK_COLS),
+            layout=as_shared,
+        )
+        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slab.index(0))
+
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = num_loads % NUM_BUFFERS
         gl.amd.gfx1250.tdm.async_load(
@@ -523,17 +621,35 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # The fill layout spreads rows across waves but the gather reads them in the
-    # wmma scale layout, so a wave reads rows it did not write: the barrier is
-    # required for correctness, not just ordering. It is paid once.
-    if B_SCALE_IN_LDS:
-        bs_slab.store(bs_fill)
+    # Only the register-staged path needs this: the fill layout spreads rows
+    # across waves while the gather reads them in the wmma scale layout, so a
+    # wave reads rows it did not write. The TDM path writes LDS directly and is
+    # retired by the async_wait above, like the A slab.
+    if B_SCALE_IN_LDS and not USE_B_SCALE_TDM:
+        # .index(0): the slab is buffer-indexed even when unchunked, and this
+        # path is never chunked (NUM_BS_BUFS == 1).
+        bs_slab.index(0).store(bs_fill)
         gl.barrier()
 
     # ---------------- Main loop ----------------
     for _ in tl.range(
         0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL
     ):
+        # Chunk prefetch: at the first tile of chunk c, start chunk c+1 into the
+        # other buffer. Predicated rather than branched so the loop body stays a
+        # single basic block -- a branch here would defeat LOOP_UNROLL_FACTOR.
+        # No wait is needed: the DMA has BS_TILES_PER_CHUNK iterations to land,
+        # and the per-iteration async_wait retires it within NUM_BUFFERS - 1 of
+        # them (see B_SCALE_CHUNKED).
+        if B_SCALE_CHUNKED:
+            bs_next = num_computes // BS_TILES_PER_CHUNK + 1
+            gl.amd.gfx1250.tdm.async_load(
+                bs_desc,
+                [0, bs_next * B_SCALE_CHUNK_COLS],
+                bs_slab.index(bs_next % NUM_BS_BUFS),
+                pred=(num_computes % BS_TILES_PER_CHUNK) == 0,
+            )
+
         slot_c = num_computes % NUM_BUFFERS
         cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
         cur_b = depreshuffle_b(
@@ -565,14 +681,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 cache_modifier=cache_modifier,
             )
         if B_SCALE_IN_LDS:
+            bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
             cur_bs = _gather_scale_tile(
-                bs_slab,
-                num_computes,
+                bs_slab.index(bs_chunk % NUM_BS_BUFS),
+                num_computes - bs_chunk * BS_TILES_PER_CHUNK,
                 bs_zeros_n,
                 offs_bs_kg,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 SCALE_K_GROUP=B_SCALE_K_GROUP,
-                SLAB_COLS=B_SCALE_COLS,
+                SLAB_COLS=B_SCALE_CHUNK_COLS,
             )
         else:
             cur_bs = _load_scale_tile(
@@ -642,14 +759,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 cache_modifier=cache_modifier,
             )
         if B_SCALE_IN_LDS:
+            bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
             cur_bs = _gather_scale_tile(
-                bs_slab,
-                num_computes,
+                bs_slab.index(bs_chunk % NUM_BS_BUFS),
+                num_computes - bs_chunk * BS_TILES_PER_CHUNK,
                 bs_zeros_n,
                 offs_bs_kg,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 SCALE_K_GROUP=B_SCALE_K_GROUP,
-                SLAB_COLS=B_SCALE_COLS,
+                SLAB_COLS=B_SCALE_CHUNK_COLS,
             )
         else:
             cur_bs = _load_scale_tile(
@@ -704,14 +822,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             cache_modifier=cache_modifier,
         )
     if B_SCALE_IN_LDS:
+        bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
         cur_bs = _gather_scale_tile(
-            bs_slab,
-            num_computes,
+            bs_slab.index(bs_chunk % NUM_BS_BUFS),
+            num_computes - bs_chunk * BS_TILES_PER_CHUNK,
             bs_zeros_n,
             offs_bs_kg,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             SCALE_K_GROUP=B_SCALE_K_GROUP,
-            SLAB_COLS=B_SCALE_COLS,
+            SLAB_COLS=B_SCALE_CHUNK_COLS,
         )
     else:
         cur_bs = _load_scale_tile(

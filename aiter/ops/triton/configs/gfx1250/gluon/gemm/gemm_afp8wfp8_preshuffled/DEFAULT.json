@@ -9,6 +9,7 @@
         "waves_per_eu": 1,
         "NUM_BUFFERS": 3,
         "cache_modifier": null,
+        "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound",
         "LOOP_UNROLL_FACTOR": 1
     }
