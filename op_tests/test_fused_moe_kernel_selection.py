@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import aiter
-import aiter.fused_moe as fused_moe
+from aiter import fused_moe
 from aiter.fused_moe import _maybe_force_atomic_flydsl_stage2
 
 REDUCE_KERNEL = "flydsl_moe2_afp4_wfp4_bf16_t128x256x128_reduce"
