@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 
 import pandas as pd
 import torch
@@ -13,6 +14,7 @@ from aiter.ops.gemm_op_a6w6 import (
     quant_mxfp6_gemm,
     quant_mxfp6_torch,
 )
+from aiter.jit.core import get_asm_dir
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 torch.set_default_device("cuda")
@@ -35,7 +37,7 @@ def run_torch(x, w, dtype):
 
 
 @benchmark()
-def test_gemm(dtype, M, N, K):
+def test_gemm(dtype, M, N, K, kernel_name=None):
     from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
     if get_gfx() not in ["gfx950"]:
@@ -59,55 +61,98 @@ def test_gemm(dtype, M, N, K):
         M,
         N,
         K,
+        kernelName=kernel_name,
     )
     err = checkAllclose(a, c, msg="unified api", catastrophic_check=True)
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
     ret["err"] = err
+    ret["kernel"] = kernel_name or "auto"
     return ret
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    nargs="*",
-    choices=[dtypes.d_dtypes["bf16"]],
-    metavar="{bf16}",
-    default=[dtypes.d_dtypes["bf16"]],
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-mnk",
-    "--shape",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[
-        (2048, 2048, 2048),
-        (4096, 4096, 4096),
-        (8192, 8192, 8192),
-        (16384, 16384, 16384),
-        # transformer shapes
-        (9450, 13824, 5120),
-        (9450, 5120, 13824),
-    ],
-    help="""Shape of mnk.
-    e.g. -mnk 8192,8192,8192""",
-)
+def _manifest_kernel_names(M, N, K):
+    manifest = os.path.join(
+        get_asm_dir(), "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
+    )
+    configs = pd.read_csv(manifest)
+    padM = (M + 255) // 256 * 256
+    padN = (N + 255) // 256 * 256
+    padK = (K + 127) // 128 * 128
+    compatible = (configs["swizzle_max_K"] <= 0) | (
+        (padK > configs["swizzle_max_K"])
+        | (
+            (padM <= configs["swizzle_max_M"])
+            & (padN <= configs["swizzle_max_N"])
+        )
+    )
+    return configs.loc[compatible, "knl_name"].astype(str).tolist()
 
-args = parser.parse_args()
 
-df = []
-for dtype in args.dtype:
-    for m, n, k in args.shape:
-        ret = test_gemm(dtype, m, n, k)
-        df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("gemm_a6w6 summary (markdown):\n%s", df_md)
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        choices=[dtypes.d_dtypes["bf16"]],
+        metavar="{bf16}",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-mnk",
+        "--shape",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+            (8192, 8192, 8192),
+            (16384, 16384, 16384),
+            # transformer shapes
+            (9450, 13824, 5120),
+            (9450, 5120, 13824),
+        ],
+        help="""Shape of mnk.
+        e.g. -mnk 8192,8192,8192""",
+    )
+    parser.add_argument(
+        "--kernel-name",
+        nargs="*",
+        default=None,
+        help="Explicit registered kernel name(s); default uses tuned dispatch.",
+    )
+    parser.add_argument(
+        "--all-kernels",
+        action="store_true",
+        help="Test every compatible kernel in the gfx950 F6 manifest.",
+    )
+    args = parser.parse_args()
+
+    if args.all_kernels and args.kernel_name:
+        parser.error("--all-kernels and --kernel-name are mutually exclusive")
+    results = []
+    for dtype in args.dtype:
+        for m, n, k in args.shape:
+            kernel_names = (
+                _manifest_kernel_names(m, n, k)
+                if args.all_kernels
+                else (args.kernel_name if args.kernel_name else [None])
+            )
+            for kernel_name in kernel_names:
+                results.append(test_gemm(dtype, m, n, k, kernel_name))
+    frame = pd.DataFrame(results)
+    aiter.logger.info(
+        "gemm_a6w6 summary (markdown):\n%s", frame.to_markdown(index=False)
+    )
+
+
+if __name__ == "__main__":
+    main()
