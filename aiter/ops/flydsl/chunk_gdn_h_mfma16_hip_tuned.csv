@@ -1,19 +1,18 @@
-# Tuned table for the FlyDSL K5 mfma16_hip kernel
-# (chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip). Two consumers:
+# Tuned BV table for the FlyDSL K5 mfma16_hip kernel
+# (chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip). Mirrors the GEMM
+# ``*_tuned_*.csv`` pattern: offline-measured winners only.
 #
+# Consumer:
 #   runtime  _tuned_bv() in linear_attention_prefill_kernels.py looks up BV on
 #            (arch, H, Hg, V, is_varlen, use_h0, store_fs, snapshot_bf16,
 #            state_bf16, total_chunks, max_seq_chunks). A miss falls back to
 #            the _hipeq_select_bv CU/LDS rule, so partial coverage is fine.
-#   build    aiter/aot/flydsl/chunk_gdn_h.py pre-compiles every
-#            (arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)
-#            appearing here, fanned out over all legal BV x snapshot x state x
-#            g_head_major (x state-pool indices where the row allows one), so no
-#            batch shape can hit the JIT.
 #
-# Adding a model means adding its rows here; no code change. Rows whose ``BV``
-# is empty are AOT-only (shape gets pre-compiled, runtime keeps using the rule),
-# which is the way to cover a new model before it has been tuned.
+# AOT compile coverage lives in ``chunk_gdn_h_mfma16_hip_untuned.csv``. Add new
+# model shapes there first, then run
+# ``op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`` and merge the
+# measured rows here after review. Do not append tune output directly to this
+# file; write to /tmp and merge manually (GEMM-style workflow).
 #
 # Columns
 #   model             free-form name, diagnostics only
@@ -29,7 +28,7 @@
 #   T_flat,N          total tokens / number of sequences -- human-readable only
 #   total_chunks      sum over sequences of ceil(seqlen/BT)   <- part of the key
 #   max_seq_chunks    max over sequences of ceil(seqlen/BT)   <- part of the key
-#   BV                measured best value tile; empty = AOT-only row
+#   BV                measured best value tile (required on every row)
 #   us                K5 device time at that BV, for regression tracking
 #
 # Each row is measured by running the shape at every legal BV and keeping the

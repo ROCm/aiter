@@ -675,8 +675,9 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
-# Offline-measured BV table, consulted before the CU/LDS rule below. See the
-# csv header for the schema and how to extend it.
+# Offline-measured BV winners (``chunk_gdn_h_mfma16_hip_tuned.csv``), consulted
+# before the CU/LDS rule below. AOT compile shapes live in the separate untuned
+# table. See the csv headers for the schema and how to extend them.
 _BV_TUNED_CSV = os.path.join(
     os.path.dirname(__file__), "chunk_gdn_h_mfma16_hip_tuned.csv"
 )
@@ -698,7 +699,7 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
             for row in rows:
                 bv = (row.get("BV") or "").strip()
                 if not bv:
-                    continue  # AOT-only row: shape is pre-compiled, BV untuned
+                    continue  # tuned rows must carry a measured BV
                 key = (
                     (row["arch"] or "").strip(),
                     int(row["H"]),

@@ -24,8 +24,9 @@ Two compiled products live behind K5 and this module builds both:
     which is what ``use_chunk_flydsl=True`` in
     ``chunk_gated_delta_rule_fwd_opt_vk`` actually dispatches. Without it the
     first prefill of every process pays ~2.3s of JIT (~0.1-0.3s even with a
-    warm disk cache). Its table is a *runtime BV lookup*, not a compile-config
-    list, so rows collapse to shapes and fan out -- see
+    warm disk cache). AOT reads ``chunk_gdn_h_mfma16_hip_untuned.csv`` (GEMM
+    untuned-style shape list); runtime BV lookup reads
+    ``chunk_gdn_h_mfma16_hip_tuned.csv`` separately. See
     ``parse_csv_mfma16_hip``.
 
 Usage:
@@ -107,12 +108,13 @@ _TORCH_DTYPE = {
 # mfma16_hip fork
 # --------------------------------------------------------------------------
 
-# Tuned table lives next to the kernel host wrapper that reads it at runtime.
+# Untuned shape list for AOT (GEMM-style); runtime BV lookup uses the separate
+# ``chunk_gdn_h_mfma16_hip_tuned.csv`` next to the kernel host wrapper.
 _DEFAULT_CSV_MFMA16_HIP = (
     Path(__file__).resolve().parents[2]
     / "ops"
     / "flydsl"
-    / "chunk_gdn_h_mfma16_hip_tuned.csv"
+    / "chunk_gdn_h_mfma16_hip_untuned.csv"
 )
 DEFAULT_CSVS_MFMA16_HIP = [str(_DEFAULT_CSV_MFMA16_HIP)]
 # Used only when a csv row leaves ``arch`` empty and neither ARCH/GPU_ARCHS nor
@@ -467,28 +469,12 @@ def _resolve_archs(row_arch: str | None) -> list[str]:
 
 
 def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
-    """Expand the mfma16_hip tuned table into unique compile jobs.
+    """Expand the mfma16_hip untuned table into unique compile jobs.
 
     Rows collapse to their distinct ``(arch, dtype, K, V, BT, H, Hg, is_varlen,
-    use_h0, store_fs)`` shapes -- the tuned table has one row per benchmarked
-    batch shape, and ``T_flat``/``N``/``total_chunks`` only steer the host
-    launch grid, not the compiled artifact. Each shape then fans out over every
-    legal BV and both dtype specializations.
-
-    The csv's ``BV`` column is deliberately *not* used to narrow that fan-out:
-    it records the best tile for the batch shapes that were benchmarked, while
-    any other batch shape falls through to the ``_hipeq_select_bv`` rule and can
-    land on a different tile. Pre-compiling only the tuned values would leave
-    those shapes JIT-ing mid-serving. Same reasoning for the other
-    caller-visible knobs: ``snapshot_bf16`` / ``state_bf16`` are caller-selected
-    dtypes, ``g_head_major`` differs between the wrapper default and what
-    chunk.py passes, and ``use_state_indices`` follows whether a state pool is
-    in play. The switches that remain pinned are the ones no caller can reach
-    through the production dispatch (see ``_FIXED_SWITCHES``).
-
-    The fan-out lives here rather than in ``main`` so the wheel build, which
-    reaches this module through ``run_aot`` -> ``parse_csv_mfma16_hip`` only,
-    gets the same coverage as a standalone run.
+    use_h0, store_fs)`` shapes -- the untuned table has one row per AOT-covered
+    compile shape. Each shape then fans out over every legal BV and both dtype
+    specializations.
     """
     shapes: dict[tuple, None] = {}
 
