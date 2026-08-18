@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
@@ -28,6 +29,7 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp6,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
+    native_fp8_format,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
@@ -250,7 +252,10 @@ def test_mha_v4_fp8_quantization_matches_torch():
     assert torch.equal(scale, expected_scale.reshape(1))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rotated FP8 quantization")
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 rotated FP8 quantization",
+)
 def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
     from aiter.ops.quant import rotate_activation
 
@@ -264,6 +269,43 @@ def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
 
     assert torch.equal(actual, expected)
     assert torch.equal(scale, expected_scale)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 FP8 recipe validation",
+)
+def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
+    torch.manual_seed(29)
+    q = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    fp8_format = native_fp8_format()
+
+    q_quantized, q_descale = quantize_fp8_rotated(q)
+    k_quantized, k_descale = quantize_fp8_rotated(k)
+    v_quantized, v_descale = quantize_fp8(v)
+    expected = mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes_for_formats(fp8_format, fp8_format, fp8_format),
+    )
+
+    actual = mha_v4(q, k, v, fp8_format, fp8_format, fp8_format)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, fp8_format, fp8_format, fp8_format
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(compiled, expected)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
@@ -654,16 +696,19 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     assert torch.equal(gqa, mha)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation"
+)
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
     q = torch.randint(-32, 33, (1, 512, 5, 128), device="cuda", dtype=torch.int8)
     k = torch.randint(-32, 33, (1, 512, 5, 128), device="cuda", dtype=torch.int8)
-    v = torch.randn((1, 512, 5, 128), device="cuda").to(torch.float8_e4m3fn)
+    v = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
     q_descale = torch.tensor([0.02], device="cuda")
     k_descale = torch.tensor([0.03], device="cuda")
     v_descale = torch.tensor([0.04], device="cuda")
     scale = 128**-0.5
+    fp8_format = native_fp8_format()
 
     eager = mha_v4_packed(
         q,
@@ -674,7 +719,7 @@ def test_mha_v4_packed_i8fp8_compile_parity():
         v_descale,
         AttentionFormat.INT8,
         AttentionFormat.INT8,
-        AttentionFormat.FP8,
+        fp8_format,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
@@ -689,10 +734,55 @@ def test_mha_v4_packed_i8fp8_compile_parity():
         v_descale,
         AttentionFormat.INT8,
         AttentionFormat.INT8,
-        AttentionFormat.FP8,
+        fp8_format,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=scale,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(eager, compiled)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 FP8 validation"
+)
+def test_mha_v4_packed_fp8_compile_parity():
+    torch.manual_seed(23)
+    q = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    k = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    v = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    q_descale = torch.tensor([0.02], device="cuda")
+    k_descale = torch.tensor([0.03], device="cuda")
+    v_descale = torch.tensor([0.04], device="cuda")
+    fp8_format = native_fp8_format()
+    scale_modes = scale_modes_for_formats(fp8_format, fp8_format, fp8_format)
+    scale = 128**-0.5
+
+    eager = mha_v4_packed(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes,
+        softmax_scale=scale,
+    )
+    compiled = torch.compile(mha_v4_packed, fullgraph=True)(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes,
         softmax_scale=scale,
     )
     torch.cuda.synchronize()
