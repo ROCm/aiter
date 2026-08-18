@@ -97,6 +97,11 @@ on:
         type: boolean
         required: false
         default: false
+      docker_login:
+        description: 'Log in to Docker Hub before pulling the build image'
+        type: boolean
+        required: false
+        default: false
       commit:
         description: 'Git ref, tag, or commit hash to build'
         type: string
@@ -123,7 +128,7 @@ on:
         value: ${{ jobs.collect.outputs.wheel_names }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.artifact_suffix || 'default' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
@@ -155,8 +160,8 @@ jobs:
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
       BUILD_REF: ${{ inputs.commit || github.event.inputs.commit || '' }}
       ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix || '' }}
-      DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && 'DOCKER_PASSWORD' || '' }}
-      DOCKER_USERNAME: ${{ github.event_name == 'workflow_dispatch' && 'rocmshared' || '' }}
+      DOCKER_LOGIN: ${{ inputs.docker_login || false }}
+      DOCKER_USERNAME: rocmshared
 
     steps:
       - name: Checkout aiter repo
@@ -186,10 +191,10 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
-        if: ${{ matrix.build_enabled && env.DOCKER_PASSWORD_SECRET != '' }}
+        if: ${{ matrix.build_enabled && env.DOCKER_LOGIN == 'true' }}
         run: |
           set -ex
-          echo "${{ secrets[env.DOCKER_PASSWORD_SECRET] }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
 
       - name: Generate version with date stamp
         if: ${{ matrix.build_enabled && env.ADD_DATE_STAMP == 'true' }}
