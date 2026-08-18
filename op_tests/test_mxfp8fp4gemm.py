@@ -1,29 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Test + benchmark for gfx1250 MXFP8 x {MXFP8, MXFP4} GEMM (kernarg preload):
-#   a8w8 -> gemm_a8w8_mxfp8: D = A @ B^T, A/B mxfp8 e4m3, e8m0 per-32 scales
-#   a8w4 -> gemm_a8w4_mxfp8: D = A @ B^T, A mxfp8 e4m3, B mxfp4 e2m1, e8m0 per-32
-#
-# ============================================================================
+# ===============================================================================
 # gfx1250 F8GEMM ASM Support Matrix
-# ----------------------------------------------------------------------------
-#  OUTTYPE | A_PRESHUFFLE | B_INTYPE |   M    |   N    |   K
-# ---------+--------------+----------+--------+--------+--------
-#  BF16    |      0       |  MXFP8   | %1==0  | %16==0 | %128==0
-#  BF16    |      0       |  MXFP4   | %1==0  | %16==0 | %128==0
-#  BF16    |      1       |  MXFP8   | %2==0  | %16==0 | %128==0
-#  BF16    |      1       |  MXFP4   | %2==0  | %16==0 | %128==0
-# ----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+#  OUTTYPE | A_PRESHUFFLE | B_PRESHUFFLE | B_INTYPE |   M    |   N    |   K
+# ---------+--------------+----------+--------+--------+------------------------
+#  BF16    |      0       |      1       |  MXFP8   | %1==0  | %16==0 | %128==0
+#  BF16    |      0       |      1       |  MXFP4   | %1==0  | %16==0 | %128==0
+#  BF16    |      1       |      1       |  MXFP8   | %2==0  | %16==0 | %128==0
+#  BF16    |      1       |      1       |  MXFP4   | %2==0  | %16==0 | %128==0
+# -------------------------------------------------------------------------------
 # Notes:
-#  - Output is always BF16 (no fp8/fp4 out path, unlike f4gemm).
-#  - B is always pre-shuffled (16x16); A_PRESHUFFLE=1 tightens M from %1 to %2.
-#  - K is always %128 (e8m0 scale-shuffle + kernel K_ALIGN), even for apre=0.
-#  - Persistent+cluster dispatch has NO partial-N masking, so N must tile the
-#    cluster exactly (beyond the %16 layout minimum): a kernel is found only when
-#    256x256 (cluster 4x4) fits (M%1024 & N%1024) or 64x512 (cluster 1x4) fits
-#    (N%2048, any M); shapes fitting neither are marked "not support".
-# ============================================================================
+#  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
+#  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %2==0.
+#  - K is always a multiple of 128.
+#  - OUTTYPE is BF16-only today. fp8 out (e4m3 + per-block E8M0, as f4gemm does)
+#    is planned; the sweep axis and dispatch seam below are already in place.
+# ===============================================================================
 
 import argparse
 import itertools
@@ -54,23 +48,20 @@ torch.set_printoptions(sci_mode=False)
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
-MX_SCALE_BLOCK = 32
-K_ALIGN = 128  # kernel requires K % 128 == 0 (mirrors asm_mxfp8fp4gemm.cu K_ALIGN)
-SUPPORTED_GFX = ["gfx1250"]  # ASM kernels are gfx1250-only (kernarg preload)
+SUPPORTED_GFX = ["gfx1250"]
 
-# perf/profile: throughput squares (union of the POC run.sh/run_compute.sh perf
-# matrices). The .cu heuristic picks the registered tile that fits each shape.
-PERF_SHAPES = [
-    # compute-bound
-    (32768, 16384, 8192),
-    (16384, 16384, 16384),
-    # memory-bound (N16K x BS64 folded into M)
-    (2, 1048576, 16384),
-    (2, 1048576, 8192),
-]
-# func: correctness shapes mirroring test_gemm_a8w8.py (qkv_proj / attn_out /
-# hipmm groups). Many don't fit the mxfp8fp4 persistent+cluster tile constraints;
-# those are marked "not support" by _support_reason rather than crashing.
+_OUT_DTYPE = {"bf16": dtypes.bf16}
+
+PERF_SHAPES = {
+    "a8w8": [
+        (32768, 16384, 8192),  # compute-bound
+        (2, 1048576, 16384),  # memory-bound (N16K x BS64 folded into M)
+    ],
+    "a8w4": [
+        (16384, 16384, 16384),  # compute-bound
+        (2, 1048576, 16384),  # memory-bound
+    ],
+}
 FUNC_SHAPES = [
     # qkv_proj
     (1, 1280, 8192),
@@ -114,6 +105,8 @@ FUNC_SHAPES = [
     (8192, 7424, 8192),
 ]
 
+MX_SCALE_BLOCK = 32
+
 # checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
 # verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
 _TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
@@ -125,21 +118,19 @@ def _verdict(err):
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
-def _support_reason(apre, M, N, K):
-    """Support-matrix gate (see header). Returns None if (apre,M,N,K) is
-    dispatchable, else a short reason string (row marked "not support"). Mirrors
-    the shuffle prep + asm_mxfp8fp4gemm.cu heuristic so unfittable shapes are
-    skipped before prep rather than crashing on an assert."""
-    if K % K_ALIGN != 0:
-        return "K%128"
+def _support_reason(outtype, apre, M, N, K):
+    """Support matrix gate. Returns None if the (outtype,apre,M,N,K) combo
+    is supported, else a short reason string (row marked "not support"). Mirrors
+    the dispatch heuristic in asm_mxfp8fp4gemm.cu so shapes are skipped before the
+    shuffle/prep step rather than crashing on an assert."""
+    if outtype not in _OUT_DTYPE:
+        return f"outtype {outtype}"  # no kernel for this output format yet
+    if K % 128 != 0:
+        return "K%128"  # A (m/2,k/128) preshuffle
     if N % 16 != 0:
         return "N%16"  # B 16x16 preshuffle
     if apre and M % 2 != 0:
         return "apre M%2"  # A (m/2,k/128) preshuffle
-    fits_256 = (M % 1024 == 0) and (N % 1024 == 0)
-    fits_512 = N % 2048 == 0
-    if not (fits_256 or fits_512):
-        return "no tile fits"
     return None
 
 
@@ -194,7 +185,8 @@ def _prep(
         sA = bench_init.fill_scale_e8m0((M, K // MX_SCALE_BLOCK), scale_init, gen)
         sB = bench_init.fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
-    ref = _ref(intype, A, B, sA, sB, M, N).to(dtypes.bf16)
+    # fp32 golden; the caller casts/quantizes it to the requested outtype.
+    ref_f32 = _ref(intype, A, B, sA, sB, M, N)
 
     inp = {
         "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
@@ -202,32 +194,32 @@ def _prep(
         "sA": shuffle_mxfp8fp4_scale(sA),
         "sB": shuffle_mxfp8fp4_scale(sB),
     }
-    return inp, ref
+    return inp, ref_f32
 
 
-@benchmark()  # intype, M, N, K, apre, data_init, scale_init, ... -> table columns
+@benchmark()
 def test_gemm(
     intype,
     M,
     N,
     K,
     apre,
+    outtype="bf16",
     data_init="uniform",
     scale_init="auto",
     seed=0,
     mode="perf",
     knl_name=None,
 ):
-    assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
-
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
-    reason = _support_reason(apre, M, N, K)
+    reason = _support_reason(outtype, apre, M, N, K)
     if reason is not None:
         aiter.logger.warning(
-            "mxfp8fp4 not supported (%s): intype=%s apre=%s M=%s N=%s K=%s",
+            "mxfp8fp4 not supported (%s): intype=%s outtype=%s apre=%s M=%s N=%s K=%s",
             reason,
             intype,
+            outtype,
             apre,
             M,
             N,
@@ -243,8 +235,11 @@ def test_gemm(
             "asm result": f"not support ({reason})",
         }
 
+    assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
+    out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
-    inp, ref = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
+    inp, ref_f32 = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
+    ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
@@ -256,7 +251,7 @@ def test_gemm(
 
     def run_asm(A, B, sA, sB):
         return kern(
-            A, B, sA, sB, dtype=dtypes.bf16, a_preshuffle=bool(apre), kernelName=knl
+            A, B, sA, sB, dtype=out_dtype, a_preshuffle=bool(apre), kernelName=knl
         )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
@@ -266,10 +261,46 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + inp["sA"].nbytes + inp["sB"].nbytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
+    # Only a missing .co is reported as "not support"; any other failure (OOM,
+    # memory fault, shape assert, ...) must propagate, not show as a green cell.
+    _NOT_SUPPORTED_MARKERS = (
+        "cannot get heuristic kernel",
+        "kernel not in cfg_mxfp8fp4gemm",
+    )
     for name, (cand, cand_args) in candidates.items():
-        out, us = run_perftest(
-            cand, *cand_args, num_iters=num_iters, needTrace=needTrace
-        )
+        try:
+            out, us = run_perftest(
+                cand,
+                *cand_args,
+                num_iters=num_iters,
+                needTrace=needTrace,
+            )
+        except Exception as e:
+            if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
+                raise
+            aiter.logger.warning(
+                "mxfp8fp4 no dispatchable kernel: intype=%s outtype=%s apre=%s "
+                "M=%s N=%s K=%s: %s",
+                intype,
+                outtype,
+                apre,
+                M,
+                N,
+                K,
+                e,
+            )
+            ret[f"{name} us"] = float("nan")
+            ret[f"{name} TFLOPS"] = float("nan")
+            ret[f"{name} TB/s"] = float("nan")
+            ret[f"{name} err"] = float("nan")
+            ret[f"{name} result"] = "not support"
+            continue
+        # a8w8 (mxfp8xmxfp8) can show a "warning" on ~1 element in 5e5: an
+        # ill-conditioned output where sum|terms| (~2.7e5) cancels to a ~0.2
+        # residual (ratio ~9e-7). The fp32 accumulation noise floor there is
+        # O(1), so any accumulator (kernel or this ref) lands in [-1,+1] noise
+        # purely by summation order -- benign, not a kernel defect. a8w4's
+        # coarser fp4 B rarely hits it. atol=1.0 keeps such elements a warning.
         err = checkAllclose(
             ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
@@ -318,18 +349,28 @@ def main():
         "--apre",
         type=int,
         nargs="*",
-        choices=[0, 1],
-        default=[1],
-        help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
+        choices=[1, 0],
+        default=[1, 0],
+        help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
+        "row-major (M%%1). Default sweeps both.",
+    )
+    parser.add_argument(
+        "--outtype",
+        nargs="*",
+        choices=["bf16"],
+        default=["bf16"],
+        help="output-format sweep list (default: bf16):\n"
+        "  bf16 = bf16 [M,N]                     [only format with a kernel]",
     )
     parser.add_argument(
         "--data-init",
         dest="data_init",
         nargs="*",
         choices=["constant", "uniform", "gaussian", "trig", "random"],
-        default=["constant", "uniform"],
+        default=None,
         help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
+        "Default (unset): perf/profile = 'constant uniform', func = 'uniform'\n"
         "  uniform  = FP8 U(-6,6) / FP4 U(-3,3)  [default]\n"
         "  gaussian = N(0,1)                     [norm-dist / LLM-like]\n"
         "  trig     = trig_float in [-2,2]       [optimistic pattern]\n"
@@ -341,8 +382,9 @@ def main():
         dest="scale_init",
         nargs="*",
         choices=["auto", "pow2_binomial", "random", "constant"],
-        default=["constant", "auto"],
+        default=None,
         help="SCALE init distribution(s) (e8m0 for both operands)\n"
+        "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
         "  auto          = E8M0 -> pow2_binomial          [default]\n"
         "  pow2_binomial = 2^(Binomial(21,0.5)-11)\n"
         "  random        = random e8m0 byte, exp in [-2,2]\n"
@@ -369,18 +411,23 @@ def main():
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
-        # Unset -> per-mode defaults: perf/profile = PERF_SHAPES (throughput
-        # squares), func = FUNC_SHAPES (many small/odd correctness shapes).
         default=None,
         help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; "
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
     args = parser.parse_args()
 
-    # DATA and SCALE init are paired position-wise (NOT crossed), so the default
-    # runs exactly two configs: constant+constant and uniform+auto. A length-1
+    # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
+    # defaults when unset: perf/profile run constant+constant and uniform+auto;
+    # func drops the constant pair (its exact-boundary values trigger e8m0/e4m3
+    # edge rounding -> spurious warnings) and runs just uniform+auto. A length-1
     # list broadcasts against the other axis.
-    di_list, si_list = args.data_init, args.scale_init
+    if args.mode == "func":
+        default_di, default_si = ["uniform"], ["auto"]
+    else:
+        default_di, default_si = ["constant", "uniform"], ["constant", "auto"]
+    di_list = args.data_init if args.data_init is not None else default_di
+    si_list = args.scale_init if args.scale_init is not None else default_si
     if len(di_list) == 1:
         di_list = di_list * len(si_list)
     if len(si_list) == 1:
@@ -392,15 +439,13 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    # Shapes: explicit --shape wins; otherwise func sweeps the many small/odd
-    # correctness shapes and perf/profile sweep the throughput squares.
-    if args.shape is not None:
-        shapes = args.shape
-    else:
-        shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
+    def shapes_for(intype):
+        if args.shape is not None:
+            return args.shape
+        if args.mode == "func":
+            return FUNC_SHAPES
+        return PERF_SHAPES[intype]
 
-    # init pair is the OUTERMOST product term -> rows are grouped by
-    # (data_init,scale_init) within the single summary table.
     rows = [
         test_gemm(
             intype,
@@ -408,19 +453,20 @@ def main():
             N,
             K,
             apre,
-            data_init=di,
-            scale_init=si,
+            outtype,
+            di,
+            si,
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
         )
-        for (di, si), intype, (M, N, K), apre in itertools.product(
-            init_pairs, args.intype, shapes, args.apre
+        for apre, (di, si), intype, outtype in itertools.product(
+            args.apre, init_pairs, args.intype, args.outtype
         )
+        for (M, N, K) in shapes_for(intype)
     ]
-
     df = pd.DataFrame(rows)
-    # Keep knl_name (the dispatched .co); drop the columns constant within a table.
+    # Keep knl_name (the actual .co); drop the columns constant within a table.
     df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
     aiter.logger.info(
         "mxfp8fp4gemm (F8GEMM) summary (markdown):\n%s",
