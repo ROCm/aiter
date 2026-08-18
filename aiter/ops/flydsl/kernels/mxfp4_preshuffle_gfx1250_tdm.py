@@ -778,6 +778,7 @@ def launch_gemm_a8w4_tdm(
             ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
             ``prefetch_kt`` is None.
             """
+
             def do_issue():
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
 
@@ -812,9 +813,7 @@ def launch_gemm_a8w4_tdm(
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
-                    TDM_PER
-                    if (prefetch_kt is not None and ksl + 1 == KWS)
-                    else 0,
+                    TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
                     schedule_slots,
                 )
                 for i in range_constexpr(schedule_slots):
@@ -889,9 +888,7 @@ def launch_gemm_a8w4_tdm(
                         s = kt % num_buffers
                         buf = ptr_to_idx(buf_ptr(s))
                         if const_expr(not next_stage_on):
-                            pipeline_fence(
-                                outstanding=TDM_PER * (num_buffers - 1)
-                            )
+                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
                         next_stage_buf = (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                             if const_expr(next_stage_on)
