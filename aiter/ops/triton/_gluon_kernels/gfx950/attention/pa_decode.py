@@ -10,7 +10,6 @@ from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
@@ -294,7 +293,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     FP8_MAX_VALUE: gl.constexpr,
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
-    CDNA_VERSION: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -346,10 +344,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== Constants and Configuration ====================
-    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
-        MFMA_INSTR_K: gl.constexpr = 32
-    else:
-        MFMA_INSTR_K: gl.constexpr = 16
+    # CDNA4 MFMA is K=32 for fp8 and bf16/fp16 alike.
+    MFMA_INSTR_K: gl.constexpr = 32
     QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
 
     if KV_QUANT_MODE >= 0:
@@ -418,7 +414,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
     # QK matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -474,7 +470,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
     # PV matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -1069,7 +1065,6 @@ def paged_attention_decode_sliding_window_head_1(
     IS_CAUSAL: gl.constexpr,
     FP8_MAX_VALUE: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
-    CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
 ):
     """
@@ -1212,7 +1207,7 @@ def paged_attention_decode_sliding_window_head_1(
 
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -1297,7 +1292,7 @@ def paged_attention_decode_sliding_window_head_1(
 
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -2211,7 +2206,6 @@ def paged_attention_decode_sliding_window(
     IS_CAUSAL: gl.constexpr,
     FP8_MAX_VALUE: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
-    CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
 ):
     """
@@ -2336,7 +2330,7 @@ def paged_attention_decode_sliding_window(
 
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -2413,7 +2407,7 @@ def paged_attention_decode_sliding_window(
 
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -3191,7 +3185,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     FP8_MAX_VALUE: gl.constexpr,
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
-    CDNA_VERSION: gl.constexpr = 3,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -3250,10 +3243,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
-    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
-        MFMA_INSTR_K: gl.constexpr = 32
-    else:
-        MFMA_INSTR_K: gl.constexpr = 16
+    # CDNA4 MFMA is K=32 for fp8 and bf16/fp16 alike.
+    MFMA_INSTR_K: gl.constexpr = 32
     QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
 
     if KV_QUANT_MODE >= 0:
@@ -3331,7 +3322,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     DOT_QK_K_WIDTH: gl.constexpr = KV_16B_ELEMENT_COUNT
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -3417,7 +3408,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
+        version=4,
         instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
@@ -4320,7 +4311,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     SLIDING_WINDOW,
     sinks_ptr,
     PS,
-    CDNA_VERSION,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -4412,7 +4402,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             IS_CAUSAL=IS_CAUSAL,
             FP8_MAX_VALUE=FP8_MAX_VALUE,
             SLIDING_WINDOW=SLIDING_WINDOW,
-            CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
         )
         return
@@ -4479,7 +4468,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         FP8_MAX_VALUE=FP8_MAX_VALUE,
         VALUE_TRANSPOSED=VALUE_TRANSPOSED,
         IS_CAUSAL=IS_CAUSAL,
-        CDNA_VERSION=CDNA_VERSION,
         SLIDING_WINDOW=SLIDING_WINDOW,
     )
 
@@ -5321,11 +5309,9 @@ def pa_decode_gluon(
         )
     from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
-    cdna_version = get_cdna_version()
-    assert cdna_version in [
-        3,
-        4,
-    ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
+    assert (
+        arch_info.get_arch() == "gfx950"
+    ), f"this pa_decode kernel is gfx950 (CDNA4) only, but got {arch_info.get_arch()}"
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
@@ -5562,7 +5548,6 @@ def pa_decode_gluon(
         SLIDING_WINDOW=sliding_window,
         sinks_ptr=sinks,
         PS=ps,
-        CDNA_VERSION=cdna_version,
     )
     # output is already reshaped via output_5d view
     if not one_shot:

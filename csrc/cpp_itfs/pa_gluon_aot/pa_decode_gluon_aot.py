@@ -11,6 +11,7 @@ from jinja2 import Template
 
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
@@ -32,19 +33,11 @@ from csrc.cpp_itfs.utils import (
     run_lib,
 )
 
-# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
-# copies are byte-identical today, so this only picks which one is compiled.
+# pa_decode is specialized per arch generation under _gluon_kernels/<arch>/; the
+# AOT source must be the copy matching the arch being compiled for.
 if arch_info.get_arch() == "gfx942":
-    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
-        get_cdna_version,
-    )
-
     _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx942/attention/pa_decode.py"
 else:
-    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
-        get_cdna_version,
-    )
-
     _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode.py"
 
 GLUON_AOT_COMPILE_ENABLED = True
@@ -274,7 +267,6 @@ def compile(
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
-            f"{cdna_version}",
             "0",
         ]
         signature = ",".join(signature_parts)

@@ -8,7 +8,7 @@ import aiter
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
-# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# pa_decode is specialized per arch generation under _gluon_kernels/<arch>/; the
 # copies are byte-identical today, so this only picks which one is compiled.
 if arch_info.get_arch() == "gfx942":
     from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
@@ -318,7 +318,6 @@ def warmup_pa_decode(
         FP8_MAX_VALUE=fp8_max_value,
         VALUE_TRANSPOSED=value_transposed,
         IS_CAUSAL=is_causal,
-        CDNA_VERSION=cdna_version,
         grid=attn_grid,
         num_warps=4,
         waves_per_eu=waves_per_eu,

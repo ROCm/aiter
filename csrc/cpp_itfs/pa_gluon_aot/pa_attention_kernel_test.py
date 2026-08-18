@@ -16,6 +16,7 @@ from jinja2 import Template
 import aiter
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     CompileGluonArgs,
@@ -36,11 +37,10 @@ from op_tests.triton_tests.test_pa_decode_gluon import (
     torch_attention_compute,
 )
 
-# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# pa_decode is specialized per arch generation under _gluon_kernels/<arch>/; the
 # copies are byte-identical today, so this only picks which one is compiled.
 if arch_info.get_arch() == "gfx942":
     from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
-        get_cdna_version,
         paged_attention_decode_v2_gluon_dot_kernel,
         paged_attention_decode_v2_gluon_large_block_dot_kernel,
     )
@@ -48,7 +48,6 @@ if arch_info.get_arch() == "gfx942":
     _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx942/attention/pa_decode.py"
 else:
     from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
-        get_cdna_version,
         paged_attention_decode_v2_gluon_dot_kernel,
         paged_attention_decode_v2_gluon_large_block_dot_kernel,
     )
@@ -286,7 +285,6 @@ def compile_attention_kernel(
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
-            f"{cdna_version}",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -656,7 +654,6 @@ def run_direct_attention_kernel(
         FP8_MAX_VALUE=fp8_max_value,
         VALUE_TRANSPOSED=value_transposed,
         IS_CAUSAL=is_causal,
-        CDNA_VERSION=cdna_version,
         waves_per_eu=waves_per_eu,
         num_stages=1,
     )
