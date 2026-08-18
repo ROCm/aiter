@@ -16,9 +16,6 @@
 //  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
 //  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %2==0.
 //  - K is always a multiple of 128.
-//  - Persistent+cluster dispatch has NO partial-N masking, so N must tile the
-//    cluster exactly: 256x256 (cluster 4x4) needs M%1024 & N%1024; 64x512
-//    (cluster 1x4) needs N%2048 (any M). See get_heuristic_kernel below.
 // ============================================================================
 //
 // gfx1250 MXFP8 x {MXFP8, MXFP4} GEMM ASM dispatch (preload SGPR mode).
@@ -98,27 +95,12 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(cfg.b_intype != b_intype || cfg.a_preshuffle != a_preshuffle)
             continue;
 
-        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
-        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
-
         const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
         if((M % m_align) != 0 || (N % F8GEMM_N_ALIGN) != 0 || (K % F8GEMM_K_ALIGN) != 0)
             continue;
 
-        // Persistent+cluster has no partial-tile masking, so N (and clustered M)
-        // must tile the grid exactly. A cluster_y == 1 tile lets the persistent
-        // scheduler run a partial trailing M-tile bounded by the M kernarg (scale
-        // padded to 32 rows), so small M selects the 64mx1_128nx4 tile.
-        if((N % cfg.tile_n) != 0)
-            continue;
-        if(cl_y > 1 && (M % cfg.tile_m) != 0)
-            continue;
-
         int tg_num_M = (M + cfg.tile_m - 1) / cfg.tile_m; // tiles in M (gdy)
         int tg_num_N = (N + cfg.tile_n - 1) / cfg.tile_n; // tiles in N (gdx)
-
-        if((cl_x > 1 && (tg_num_N % cl_x) != 0) || (cl_y > 1 && (tg_num_M % cl_y) != 0))
-            continue;
 
         uint32_t tg_num      = tg_num_M * tg_num_N;
         uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
@@ -152,8 +134,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
                 N,
                 ", K=",
                 K,
-                " (persistent/cluster tiles require N%tile_n==0 && M%tile_m==0 and "
-                "cluster dims dividing the tile grid)");
+                " (require N%16==0, K%128==0, and M%2==0 when a_preshuffle=1)");
     return std::make_tuple(selectedKernelName, 1);
 }
 
@@ -257,60 +238,30 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    // ----- Launch geometry: cluster + persistent (see POC host) -----
-    const int SUBM       = cfg.tile_m;
-    const int SUBN       = cfg.tile_n;
-    const int cluster_x  = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
-    const int cluster_y  = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
-    const int persistent = 1;
-    const int wg_max     = 256;
+    // ----- Launch geometry: cluster + persistent -----
+    // Every f8gemm .co is a persistent shader, so the launch is fixed-size and
+    // independent of M/N/K: exactly WG_MAX threadgroups, laid out 1D along X with
+    // Y carrying only the cluster_y rows. The tile-walk swizzle (GRID_X/GRID_Y) is
+    // baked into the .co at assemble time, which asserts
+    // (GRID_X*CLUSTER_X) * (GRID_Y*CLUSTER_Y) == WG_MAX -- so the host only has to
+    // ship the right *total* threadgroup count, not the same grid shape.
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co
+    const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    // Logical tile grid (also the launch grid in non-persistent mode).
-    int gdx = (Ndim + SUBN - 1) / SUBN;
-    int gdy = (Mdim + SUBM - 1) / SUBM;
-    int gdz = 1;
+    constexpr int WG_MAX = 256; // must match the .co's WG_MAX
 
-    // Cluster dims must evenly tile the work grid (compile-time per .co).
-    if(cluster_x > 1 || cluster_y > 1)
-    {
-        AITER_CHECK(gdx >= cluster_x && (gdx % cluster_x) == 0,
-                    __func__,
-                    " cluster_x=",
-                    cluster_x,
-                    " requires N tiles (",
-                    gdx,
-                    ") to be a multiple of it; N=",
-                    Ndim,
-                    " must be a multiple of ",
-                    SUBN * cluster_x);
-        AITER_CHECK(gdy >= cluster_y && (gdy % cluster_y) == 0,
-                    __func__,
-                    " cluster_y=",
-                    cluster_y,
-                    " requires M tiles (",
-                    gdy,
-                    ") to be a multiple of it; M=",
-                    Mdim,
-                    " must be a multiple of ",
-                    SUBM * cluster_y);
-    }
+    const int cluster_size = cluster_x * cluster_y;
+    AITER_CHECK((WG_MAX % cluster_size) == 0,
+                __func__,
+                " persistent WG_MAX=",
+                WG_MAX,
+                " not divisible by cluster_x*cluster_y=",
+                cluster_size);
 
-    if(persistent)
-    {
-        // 1D persistent launch of wg_max threadgroups along X; Y carries only the
-        // cluster_y rows. GRID_X = wg_max / (cluster_x*cluster_y), GRID_Y = 1.
-        const int cluster_size = cluster_x * cluster_y;
-        AITER_CHECK(cluster_size > 0 && (wg_max % cluster_size) == 0,
-                    __func__,
-                    " persistent wg_max=",
-                    wg_max,
-                    " not divisible by cluster_x*cluster_y=",
-                    cluster_size);
-        const int grid_x = wg_max / cluster_size;
-        gdx              = grid_x * cluster_x;
-        gdy              = 1 * cluster_y;
-        gdz              = 1;
-    }
+    // HIP gridDim must be a multiple of clusterDim per axis.
+    const int gdx = (WG_MAX / cluster_size) * cluster_x;
+    const int gdy = 1 * cluster_y;
+    const int gdz = 1;
 
     const int bdx = 128; // 4 waves * 32 threads on gfx1250
 
