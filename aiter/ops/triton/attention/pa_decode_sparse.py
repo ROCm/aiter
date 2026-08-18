@@ -590,6 +590,8 @@ def _pa_decode_sparse_gfx950_gluon(
     # per-lane slot vector. Measured best at 32 for every extra >= 128 (-10% at
     # extra=128) and within noise at extra=8.
     gather_tw1 = int(_os.environ.get("AITER_PA_DECODE_TW1", "32"))
+    # AITER_PA_DECODE_LDS_PAD: bf16 elements of padding after each kv_smem row.
+    lds_pad = int(_os.environ.get("AITER_PA_DECODE_LDS_PAD", "8"))
     # AITER_PA_DECODE_NOPE_CHUNK: width of one fp8 dequant piece (0/unset = one shot).
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
@@ -811,6 +813,7 @@ def _pa_decode_sparse_gfx950_gluon(
         MFMA_K=MFMA_K,
         UNIFORM=UNIFORM,
         GATHER_TW1=gather_tw1,
+        LDS_PAD=lds_pad,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         MAIN_SPLITS=main_splits,

@@ -955,6 +955,7 @@ def _pa_decode_sparse(
     MFMA_K: gl.constexpr,
     UNIFORM: gl.constexpr,
     GATHER_TW1: gl.constexpr,
+    LDS_PAD: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows, 1 =
     # columns); >= the tile's extent on that axis means one shot.
     NOPE_CHUNK: gl.constexpr,
@@ -1080,8 +1081,13 @@ def _pa_decode_sparse(
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
+    # LDS pad after every row. Row pitch (512 + LDS_PAD) bf16 sets which banks a
+    # transposed K read (ds_read_b64_tr_b16 walks down a column) lands on:
+    # bank = (row * pitch_dwords) mod 32, so pitch_dwords mod 32 == 4 at PAD=8 means
+    # 32 lanes share 8 banks. Kept as a knob because the conflict share is high
+    # (46%) but a high sub-metric ratio is not proof of a bottleneck.
     kv_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[HEAD_SIZE, 8]], [BLOCK_K, HEAD_SIZE], [1, 0]
+        [[HEAD_SIZE, LDS_PAD]], [BLOCK_K, HEAD_SIZE], [1, 0]
     )
 
     h_off = pid_h * BLOCK_M
