@@ -44,6 +44,8 @@ ctypes_map = {
     str: ctypes.c_char_p,
 }
 
+torch_stream_type = getattr(torch, "Stream", ())
+
 aiter_lib = Library("aiter", "FRAGMENT")
 
 
@@ -56,6 +58,16 @@ def torch_to_c_types(*args):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
         elif isinstance(arg, torch.cuda.Stream):
             c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+        elif isinstance(arg, torch_stream_type):
+            # Dynamo may reconstruct a CUDA stream as the device-agnostic
+            # torch.Stream. Rebuild its CUDA wrapper to recover the raw handle;
+            # stream_id is a pool index, not the handle itself.
+            stream = torch.cuda.Stream(
+                stream_id=arg.stream_id,
+                device_index=arg.device_index,
+                device_type=arg.device_type,
+            )
+            c_args.append(ctypes.cast(stream.cuda_stream, ctypes.c_void_p))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")
