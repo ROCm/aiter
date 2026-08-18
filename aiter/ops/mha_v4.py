@@ -1010,9 +1010,8 @@ def mha_v4(
         q_format,
         AttentionFormat.MXFP6,
     ):
-        quantize_qk = quantize_fp8 if _is_fp8_format(v_format) else quantize_fp8_rotated
-        q_quantized, q_descale = quantize_qk(q)
-        k_quantized, k_descale = quantize_qk(k)
+        q_quantized, q_descale = quantize_fp8_rotated(q)
+        k_quantized, k_descale = quantize_fp8_rotated(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         else:

@@ -1075,6 +1075,16 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
+        if args.e2e and args.hadamard_rotate:
+            return lambda: mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                softmax_scale=softmax_scale,
+            )
 
         def _run_aiter_fp8():
             packed = fp8_quantize(
@@ -1091,9 +1101,9 @@ def make_kernel_runner(
                 *fp8_scale_modes,
                 softmax_scale=softmax_scale,
             )
-
         if args.e2e:
             return _run_aiter_fp8
+
         packed = fp8_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
         return lambda: mha_v4_packed(
             *packed,

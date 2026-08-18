@@ -5,8 +5,8 @@
 
 ## Current Status
 
-Dense BF16-output MHA v4 is implemented and validated on gfx950. A gfx942 signed INT8/FP8 row is
-also preserved under v4.
+Dense BF16-output MHA v4 is implemented and validated on gfx950. Gfx942 native FP8/FP8 and signed
+INT8/FP8 rows are also available under v4.
 
 The public raw and packed APIs support seven dense combinations:
 
@@ -124,6 +124,8 @@ Inputs are contiguous BF16 BSHD tensors. The requested formats select canonical 
 preprocessing and an explicit ASM row; unsupported combinations fail. Q/K must currently match.
 Output is BF16, and a supplied `out` must match Q's shape/device. Q, K, and V preprocessing remain
 separate custom ops so distributed schedulers can overlap each with its input communication.
+The canonical FP8 Q/K recipe applies normalized hd128 Walsh-Hadamard rotation before per-tensor
+quantization on both gfx942 and gfx950; V uses unrotated per-tensor FP8 quantization.
 
 #### Grouped-Query Attention
 
