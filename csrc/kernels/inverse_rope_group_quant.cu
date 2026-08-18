@@ -45,8 +45,8 @@ using ic = std::integral_constant<int, N>;
 template <int N>
 __device__ __forceinline__ float group_reduce_max_dpp(float v)
 {
-    static_assert(N >= 1 && N <= 16 && (N & (N - 1)) == 0,
-                  "N must be a power of two in [1,16]");
+    static_assert(N >= 1 && N <= 64 && (N & (N - 1)) == 0,
+                  "N must be a power of two in [1,64]");
     if constexpr(N > 1) // quad_perm:[1,0,3,2]
         v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0xb1>{}));
     if constexpr(N > 2) // quad_perm:[2,3,0,1]
@@ -55,6 +55,14 @@ __device__ __forceinline__ float group_reduce_max_dpp(float v)
         v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0x141>{}));
     if constexpr(N > 8) // row_mirror
         v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0x140>{}));
+    // Past a 16-lane DPP row the modifier that reaches the next row is
+    // arch-specific (row_bcast on gfx9, permlane on gfx10+), so hand these two
+    // steps to the compiler. Only the small-S tier, where a group is spread
+    // over 32 or 64 lanes to buy blocks, ever gets here.
+    if constexpr(N > 16)
+        v = fmaxf(v, __shfl_xor(v, 16, N));
+    if constexpr(N > 32)
+        v = fmaxf(v, __shfl_xor(v, 32, N));
     return v;
 }
 
@@ -111,7 +119,8 @@ __global__ void inverse_rope_group_quant_kernel(
     int64_t scale_stride_k,
     int S_pad,
     int Ks_pad,
-    int max_position)
+    int max_position,
+    bool contig_k)
 {
     constexpr int THREADS_PER_GROUP = GROUP_SIZE / THREAD_DATA_SIZE;
     static_assert(HEAD_DIM > 0 && RD > 0 && RD <= HEAD_DIM && (RD % 2) == 0);
@@ -129,10 +138,20 @@ __global__ void inverse_rope_group_quant_kernel(
     const int tid = threadIdx.x;
     const int k_slot = tid / THREADS_PER_GROUP;
     const int lane_in_group = tid - k_slot * THREADS_PER_GROUP;
-    // k_slots is the groups covered per pass; K_PER_THREAD passes stride by it
-    // so every pass stays contiguous across the block.
+    // K_PER_THREAD group placement. Two schemes over the block's
+    // `k_slots * K_PER_THREAD` contiguous groups; both cover the same span, so
+    // output/scale (indexed by k_group) stay correct either way:
+    //   interleaved (contig_k=false): pass k strides by k_slots, so within a
+    //     pass the block's k_slots waves hit adjacent groups -> coalesced per
+    //     pass. Tuned on gfx1250 (wave32).
+    //   contiguous  (contig_k=true) : each thread owns K_PER_THREAD ADJACENT
+    //     groups (pass stride 1). Better per-thread locality; recovers the
+    //     wave64 (gfx950) large-tile row regression from the strided loads.
     const int s = static_cast<int>(blockIdx.x);
-    const int k_group0 = static_cast<int>(blockIdx.y) * k_slots * K_PER_THREAD + k_slot;
+    const int k_span_base = static_cast<int>(blockIdx.y) * k_slots * K_PER_THREAD;
+    const int k_group0 =
+        contig_k ? (k_span_base + k_slot * K_PER_THREAD) : (k_span_base + k_slot);
+    const int k_pass_stride = contig_k ? 1 : k_slots;
     const int g = static_cast<int>(blockIdx.z);
     const int row = s * G + g;
     const int group_elem_base = lane_in_group * THREAD_DATA_SIZE;
@@ -162,13 +181,28 @@ __global__ void inverse_rope_group_quant_kernel(
         // measured slower on gfx1250 (s=8192: 25.5us vs 21.9us).
         in_vec[k] = load_vector_nbytes<scalar_t, THREAD_DATA_SIZE, in_chunk_bytes>(
             input_buffer,
-            input_offset0 + static_cast<int64_t>(k) * k_slots * GROUP_SIZE);
+            input_offset0 + static_cast<int64_t>(k) * k_pass_stride * GROUP_SIZE);
     }
 
-    // `s` is block-invariant, so this is one scalar load per block.
-    int64_t pos = positions[s];
-    if(pos < 0) pos = 0;
-    if(max_position > 0 && pos >= max_position) pos = max_position - 1;
+    // Only a tile holding a group that reaches into the rope tail needs the
+    // position. `s` is block-invariant so the load itself is scalar, but on a
+    // pure-nope tile it is still a dependent global read on the critical path,
+    // and at tiny S that fixed cost is most of the kernel.
+    bool any_rope = false;
+#pragma unroll
+    for(int k = 0; k < K_PER_THREAD; ++k)
+    {
+        const int kg = k_group0 + k * k_pass_stride;
+        const int group_head_start = (kg % GROUPS_PER_HEAD) * GROUP_SIZE;
+        any_rope = any_rope || (group_head_start + GROUP_SIZE > ROPE_START);
+    }
+    int64_t pos = 0;
+    if(any_rope)
+    {
+        pos = positions[s];
+        if(pos < 0) pos = 0;
+        if(max_position > 0 && pos >= max_position) pos = max_position - 1;
+    }
 
     // --- Output buffer ---
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
@@ -189,7 +223,7 @@ __global__ void inverse_rope_group_quant_kernel(
 #pragma unroll
     for(int k = 0; k < K_PER_THREAD; ++k)
     {
-        const int k_group = k_group0 + k * k_slots;
+        const int k_group = k_group0 + k * k_pass_stride;
         const int d_base = k_group * GROUP_SIZE + group_elem_base;
 
         float vals[THREAD_DATA_SIZE];
@@ -279,9 +313,7 @@ __global__ void inverse_rope_group_quant_kernel(
         }
         if constexpr(THREADS_PER_GROUP > 1)
         {
-            // At most GROUP_SIZE / 8 lanes share a group, so this stays within
-            // the DPP row every arch supports -- no permlane*_swap widening.
-            static_assert(THREADS_PER_GROUP <= 16);
+            static_assert(THREADS_PER_GROUP <= 64);
 #if defined(__HIP_DEVICE_COMPILE__)
             amax = group_reduce_max_dpp<THREADS_PER_GROUP>(amax);
 #else
@@ -467,7 +499,8 @@ void inverse_rope_group_quant(
                         S, H, G, D, scale_n, k_slots, scale_shuffle,
                         x_scale.stride(0), x_scale.stride(1), x_scale.stride(2),
                         S_pad, Ks_pad,
-                        static_cast<int>(cos_cache.size(0)));
+                        static_cast<int>(cos_cache.size(0)),
+                        /*contig_k=*/wave_size == 64);
             });
         }
     };
@@ -475,24 +508,34 @@ void inverse_rope_group_quant(
     auto dispatch_kpt = [&](auto group_tag, auto tds_tag, int kpt, int k_slots)
     {
         constexpr int TDS = decltype(tds_tag)::value;
-        // Four groups per thread only pairs with the narrowest slice, the one
-        // the wave64 tier uses. On a 64B slice it would hold 128 floats live and
-        // spill to scratch, and no tier asks for that pair -- instantiating it
-        // anyway would only cost compile time.
-        if constexpr(TDS <= 8)
+        // The 4B/8B slices only exist for the wave-starved wave64 tier, where
+        // the block-count backoff always lands on one group per thread anyway.
+        // Pinning KPT here keeps their instantiations to one each.
+        if constexpr(TDS <= 4)
         {
-            if(kpt >= 4)
+            launch(group_tag, tds_tag, ic<1>{}, k_slots);
+        }
+        else
+        {
+            // Four groups per thread only pairs with the narrowest slice, the
+            // one the wave64 tier uses. On a 64B slice it would hold 128 floats
+            // live and spill to scratch, and no tier asks for that pair --
+            // instantiating it anyway would only cost compile time.
+            if constexpr(TDS <= 8)
             {
-                launch(group_tag, tds_tag, ic<4>{}, k_slots);
+                if(kpt >= 4)
+                {
+                    launch(group_tag, tds_tag, ic<4>{}, k_slots);
+                    return;
+                }
+            }
+            if(kpt >= 2)
+            {
+                launch(group_tag, tds_tag, ic<2>{}, k_slots);
                 return;
             }
+            launch(group_tag, tds_tag, ic<1>{}, k_slots);
         }
-        if(kpt >= 2)
-        {
-            launch(group_tag, tds_tag, ic<2>{}, k_slots);
-            return;
-        }
-        launch(group_tag, tds_tag, ic<1>{}, k_slots);
     };
 
     auto dispatch = [&](auto group_tag)
@@ -527,6 +570,26 @@ void inverse_rope_group_quant(
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
         int tds = wave64 ? 8 : (narrow_slice ? 16 : 32);
+        if(wave64 && !scale_shuffle)
+        {
+            // A launch too small to cover the GPU is wave-starved rather than
+            // bandwidth bound, and there the wide slice only concentrates the
+            // work into fewer blocks. A narrower one puts more lanes on each
+            // group and multiplies the wave count by the same factor (S=1,
+            // GS=128: 8 waves at 16B/thread, 32 at 4B), which is worth more
+            // than the load width. Only while the machine is not yet full,
+            // though -- narrowing a shape that already fills it costs ~8%, and
+            // the deficit has to be read off the launch rather than S, since
+            // rows counts S * num_groups.
+            const bool wave_starved =
+                static_cast<int64_t>(rows) * scale_n * (GS / tds) <
+                simds * wave_size;
+            if(wave_starved)
+            {
+                tds = std::min(tds, S <= 4 ? 2 : 4);
+                tds = std::max(tds, GS / wave_size);
+            }
+        }
         if(scale_shuffle)
         {
             // The shuffled scale scatters one byte per 64B of tile, so let a
@@ -544,10 +607,12 @@ void inverse_rope_group_quant(
                     "THREAD_DATA_SIZE must divide the quant group size");
 
         const int threads_per_group = GS / tds;
-        // One wave per block for the row layout: the row-major scale write is
-        // already coalesced, so the narrowest block spreads best. The shuffled
-        // layout instead wants several waves aiming at the same scale tile.
-        const int waves_per_block = scale_shuffle ? 4 : 1;
+        // Row layout: wave32 (gfx1250) was tuned to 1 wave/block -- the
+        // row-major scale write is already coalesced so the narrowest block
+        // spreads best there. wave64 (gfx950) regresses badly with 1-wave
+        // blocks (S*G tiny blocks -> poor occupancy/latency hiding, measured
+        // +10..26% on the row tier), so keep it as wide as the shuffle path.
+        const int waves_per_block = (scale_shuffle || wave64) ? 4 : 1;
         const int k_slots_min =
             std::min(std::max(wave_size / threads_per_group, 1), scale_n);
         int k_slots = std::min(
@@ -578,6 +643,8 @@ void inverse_rope_group_quant(
 
         switch(tds)
         {
+            case 2: dispatch_kpt(group_tag, ic<2>{}, kpt, k_slots); break;
+            case 4: dispatch_kpt(group_tag, ic<4>{}, kpt, k_slots); break;
             case 8: dispatch_kpt(group_tag, ic<8>{}, kpt, k_slots); break;
             case 32: dispatch_kpt(group_tag, ic<32>{}, kpt, k_slots); break;
             default: dispatch_kpt(group_tag, ic<16>{}, kpt, k_slots); break;
