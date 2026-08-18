@@ -32,10 +32,8 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 
-# tdm_scatter is vendored under MegaMoE (self-contained on the stock FlyDSL
-# wheel's low-level TDM intrinsics) so this kernel needs no FlyDSL-side patch.
-# Once the gather/scatter wrappers land upstream, import them from
-# flydsl.expr.rocdl.tdm_ops instead and delete the local shim.
+# Vendored under MegaMoE so this kernel needs no FlyDSL-side patch; once the
+# gather wrappers land upstream, import them from flydsl.expr.rocdl.tdm_ops.
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -77,12 +75,11 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
-    # EP gemm2-fused scatter: when ``enable_ep_scatter`` the (bf16, stage1_act=0)
-    # epilogue does NOT TDM-store arg_c; instead each contiguous output row
-    # (grouped_row = blk_m + row) is P2P-written -- pre-multiplied by its route
-    # weight -- into the origin peer's cco symmetric ``comb_inp[slot]`` (slot =
-    # origin_lid*topk + k). The per-row (dst_packed, f32 weight) map is a
-    # (cap_rows, 2) i32 tensor passed at runtime via ``arg_ep_row_map``.
+    # EP gemm2-fused scatter: with ``enable_ep_scatter`` the (bf16, stage1_act=0)
+    # epilogue does not TDM-store arg_c. Each output row is P2P-written, already
+    # multiplied by its route weight, into the origin peer's cco symmetric
+    # ``comb_inp[slot]``. ``arg_ep_row_map`` is the per-row (dst_packed, f32
+    # weight) map.
     enable_ep_scatter: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
     ep_combine_input_offset: Constexpr[int] = 0,
@@ -118,10 +115,8 @@ def launch_gemm_a8w4_tdm(
     )
     _ = cache_tag
     if enable_ep_scatter:
-        # The fused P2P scatter epilogue scatters each (route-weighted) output row
-        # into peers' symmetric comb_inp via a TDM gather-store; it replaces the
-        # contiguous 2D TDM tensor-store and is only defined for the bf16/f16
-        # down-proj (stage1_act=0, no quant-out).
+        # The scatter epilogue replaces the contiguous 2D TDM tensor-store, so it
+        # is only defined for the bf16/f16 down-proj.
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
@@ -569,15 +564,12 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             if const_expr(enable_ep_scatter):
-                # Build the rowmap (dst_i32, weight_f32) TDM descriptor: a
-                # (tile_m, 2) i32 slice at global row blk_m -> the persistent
-                # rowmap LDS region. The load is ISSUED at the drain tail (below),
-                # where the A/B TDM engine is idle, so it overlaps the last WMMA on
-                # the now-free HBM without perturbing the mainloop's exact
-                # tensor_wait counts. ext=mn_oob clamps to this expert's valid rows
-                # (padding rows are left unloaded and masked in the epilogue). The
-                # mainloop-exit pipeline_fence(0) drains + barriers it before the
-                # epilogue reads dst/weight from LDS.
+                # Rowmap (dst_i32, weight_f32) TDM descriptor: a (tile_m, 2) i32
+                # slice at global row blk_m into the persistent rowmap LDS region.
+                # It is issued at the drain tail below rather than here so it does
+                # not perturb the mainloop's exact tensor_wait counts. ext=mn_oob
+                # clamps to this expert's valid rows; padding rows stay unloaded
+                # and are masked in the epilogue.
                 _rm_i32 = fx.get_iter(arg_ep_row_map)
                 _rm_gt = global_view(
                     _rm_i32, blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
@@ -655,11 +647,9 @@ def launch_gemm_a8w4_tdm(
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             if const_expr(enable_ep_scatter):
-                # EP gemm2-fused scatter: symmetric-heap window for the TDM
-                # gather-store. The rowmap (dst/weight) is read from LDS (prefetched
-                # in the prologue), so no rowmap buffer resource is needed here.
-                # Defined in epilogue scope so it never crosses the dynamic
-                # `if expert < n_experts` / mainloop scf.if boundaries.
+                # Symmetric-heap window for the TDM gather-store, built in epilogue
+                # scope so it never crosses the dynamic `if expert < n_experts` /
+                # mainloop scf.if boundaries.
                 import mori.cco.device.flydsl as _cco
 
                 ep_win = _cco.Window(fx.Int64(ep_arena_handle))
@@ -767,10 +757,9 @@ def launch_gemm_a8w4_tdm(
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
                 if const_expr(enable_ep_scatter):
-                    # Route weight per output row (ep_rowmap[grouped_row].col1, f32,
-                    # byte 4 of the prologue-prefetched 8-byte [dst|weight] slot);
-                    # hoisted out of the wn loop (alias analysis would otherwise
-                    # re-read it for every wn subtile).
+                    # Route weight per output row (byte 4 of the prefetched 8-byte
+                    # [dst|weight] slot), hoisted out of the wn loop -- alias
+                    # analysis would otherwise re-read it for every wn subtile.
                     _wf_rows = [
                         lds_load_b32(rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4)[
                             0
@@ -838,16 +827,13 @@ def launch_gemm_a8w4_tdm(
             # -- Shared LDS -> global --
             workgroup_barrier()
             if const_expr(enable_ep_scatter):
-                # EP gemm2-fused scatter via TDM gather-store, built with this
-                # kernel's own view helpers (global_view / lds_view) and the native
-                # flydsl gather API -- no raw-VA descriptor shim. cco flat symmetric
-                # VA: peer_va = winBase + pe*perRankSize + off. The comb_inp slot is
-                # padded to a pow2 so perRankSize/slot-stride divides
-                # exactly -> fold (pe,slot) into ONE row index = pe*K + slot over a
-                # single base lsa_ptr(0,off) with dim0_stride = wire/elem. Each wave
-                # issues the gather-stores for its row groups (8 rows per 32-bit-
-                # index instruction); dropped/padding rows get an OOB index that the
-                # HW drops. perRankSize is measured in-kernel from the lsa_ptr stride.
+                # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
+                # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
+                # are padded to a pow2 so perRankSize divides by the slot stride
+                # exactly -- which lets (pe, slot) fold into ONE row index
+                # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
+                # measured in-kernel from the lsa_ptr stride. Each wave issues the
+                # gather-stores for its row groups, 8 rows per instruction.
                 elem_bytes = 2
                 _stride_elems = ep_slot_stride_bytes // elem_bytes
                 _GRP = 8
@@ -860,11 +846,8 @@ def launch_gemm_a8w4_tdm(
                 # (world<=256, slot<K); dropped/padding rows use this as their index
                 # so the HW drops them.
                 _oob = _K * fx.Int32(ep_world_size)
-                # comb_inp symmetric arena as an in-kernel global view over the raw
-                # lsa_ptr(0,off) base -- same fx.inttoptr -> make_view idiom the
-                # kernel/felix gemm2 use for arg tiles (global_view above). The
-                # gather descriptor takes its base from this view; the folded
-                # row index + dim0 stride reach every peer.
+                # comb_inp symmetric arena as a global view over the lsa_ptr(0, off)
+                # base; the folded row index + dim0 stride reach every peer from it.
                 _comb_ptr_ty = fx.PointerType.get(
                     T.i16, address_space=fx.AddressSpace.Global, alignment=16
                 )
@@ -875,8 +858,6 @@ def launch_gemm_a8w4_tdm(
                 _comb_view = global_view(
                     _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
                 )
-                # LDS C-tile as a fly view -- the gather API extracts its
-                # aligned LDS pointer symmetrically to the global side.
                 _lds_c = lds_view(
                     fx.recast_iter(oc, base_ptr),
                     (tile_m, LDS_STORE_N),
@@ -890,8 +871,6 @@ def launch_gemm_a8w4_tdm(
                         for i in range_constexpr(_GRP):
                             r = base_row + i
                             if const_expr(r < tile_m):
-                                # dst read from the prologue-prefetched rowmap in LDS
-                                # (byte 0 of the 8-byte [dst|weight] slot).
                                 dstp = fx.Int32(
                                     lds_load_b32(rowmap_lds_idx, arith.index(r * 8))[0]
                                 )
@@ -902,12 +881,10 @@ def launch_gemm_a8w4_tdm(
                                 row_indices.append(keep.select(idxv, _oob))
                             else:
                                 row_indices.append(_oob)
-                        # Pass compile-time geometry explicitly: inside kernel
-                        # tracing the view layout leaves are dynamic IR, so
-                        # deriving row_width/tensor_dim0/stride from the views
-                        # cannot yield the Python ints the descriptor needs
-                        # (row_width << 16, etc.). tensor_dim1 is the runtime OOB
-                        # bound (_oob) as a raw i32.
+                        # Geometry is passed explicitly rather than derived from the
+                        # views: under kernel tracing the layout leaves are dynamic
+                        # IR, not the Python ints the descriptor packs into
+                        # bitfields (row_width << 16, etc.).
                         desc = make_tensor_gather_descriptor(
                             _comb_view,
                             _lds_c,

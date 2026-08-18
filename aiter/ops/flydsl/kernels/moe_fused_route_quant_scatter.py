@@ -614,13 +614,12 @@ def build_moe_fused_route_quant_scatter_module(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
 
-            # EP global->local remap (warp-uniform). Dropped (non-local) routes
+            # EP global->local remap (warp-uniform), replacing the host
+            # cumsum/index/eq/where/masked_fill chain. Dropped (non-local) routes
             # address bucket 0 to keep the atomic in bounds but claim no slot, so
             # masked_m -- and the grouped GEMM's row count with it -- covers only
-            # this rank's own routes; they are tagged with DROPPED_ROUTE_ROW, skip
-            # the quant+scatter below, and their gather weight is zeroed so the
-            # final reduce ignores them.
-            # Replaces the host cumsum/index/eq/where/masked_fill chain.
+            # this rank's own routes. They are tagged with DROPPED_ROUTE_ROW, skip
+            # the quant+scatter below, and get a zero gather weight.
             is_drop = None
             if const_expr(use_g2l):
                 g2l_rsrc = ptr_rsrc(g2l_lut)
@@ -687,8 +686,8 @@ def build_moe_fused_route_quant_scatter_module(
                 token = fx.Uint32(route) // fx.Uint32(c_topk)
 
             # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value).
-            # A dropped route claimed no slot, so the row it computed belongs to the
-            # bucket-0 route holding that slot: store the sentinel instead.
+            # A dropped route claimed no slot, so the row it computed belongs to
+            # the bucket-0 route holding that slot -- store the sentinel instead.
             if const_expr(use_g2l):
                 row_out = arith.select(
                     _raw(is_drop),
@@ -764,10 +763,9 @@ def build_moe_fused_route_quant_scatter_module(
                 _emit_quant_block_loop(c)
 
             if const_expr(use_g2l):
-                # grouped_row is only meaningful for a kept route; scattering a
-                # dropped one would overwrite the payload of the route that owns
-                # that row. is_drop is warp-uniform, so the whole warp branches
-                # together and the in-block amax shuffles stay well defined.
+                # Scattering a dropped route would overwrite the payload of the
+                # route that owns that row. is_drop is warp-uniform, so the whole
+                # warp branches together and the amax shuffles stay well defined.
                 is_kept = le != fx.Uint32(n_buckets)
                 if is_kept:
                     _emit_row_quant_scatter()
@@ -1396,10 +1394,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             )
         route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
         rows_rsrc = ptr_rsrc(topids_to_rows)
-        # An EP route with no grouped row carries moe_route_maps' DROPPED_ROUTE_ROW
-        # (negative) sentinel: there is nothing to gather, and a destination row
-        # derived from it would overwrite a kept route's payload. Dead-tail routes
-        # default to the same sentinel, so one predicate covers both.
+        # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
+        # sentinel: a destination row derived from it would overwrite a kept
+        # route's payload. Dead-tail routes default to the same sentinel, so one
+        # predicate covers both.
         row_raw = fx.Int32(DROPPED_ROUTE_ROW)
         if route_in_range:
             row_raw = fx.Int32(

@@ -386,7 +386,7 @@ def compile_one_config(**job):
     t0 = time.time()
     try:
         # TODO(aot): only the auxiliary (non-GEMM) kernels are precompiled here.
-        # The grouped GEMM itself moved to the felix TDM batched kernel
+        # The grouped GEMM itself moved to the TDM batched kernel
         # (aiter.ops.flydsl.batched_gemm_mxfp4), which has no AOT wiring yet, so
         # it JIT-compiles on first use. Add TDM GEMM jobs here to restore the
         # coverage the deleted moe_grouped_gemm_mxscale path used to provide.
