@@ -703,6 +703,10 @@ if completed != expected:
     )
 print(f"[bench] completed all {completed}/{expected} requests for {path}")
 PY
+      CHECK_RC=\\$?
+      if [ "\\$CHECK_RC" -ne 0 ]; then
+        exit "\\$CHECK_RC"
+      fi
       if [ "\\$BENCH_RC" -ne 0 ]; then
         echo "[bench] ERROR: bench_serving exited with rc=\\$BENCH_RC for concurrency=\\$C"
         exit "\\$BENCH_RC"
