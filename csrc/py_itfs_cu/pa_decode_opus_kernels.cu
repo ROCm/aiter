@@ -179,8 +179,8 @@ void pa_decode_opus_fwd(aiter_tensor_t& q,
     // a second pass to merge the per-split softmax partials. Large batches already
     // fill the machine, so they keep the single-pass path.
     //
-    // The second pass is not free: it costs a workspace allocation, an extra launch
-    // and a round trip through global memory, which measures at roughly 2us. Short
+    // The second pass is not free: even fused into the last arriving workgroup it
+    // costs a workspace allocation and a round trip through global memory. Short
     // contexts have to be kept off this path or the merge outweighs the parallelism
     // it buys, so every split is required to carry a few tiles of its own.
     constexpr int min_tiles_per_split = 4;
