@@ -21,6 +21,7 @@
 #   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare.{md,csv}
 #   bash run_g9_compare.sh --build-ck           # rebuild CK first, then sweep
 #   bash run_g9_compare.sh --repeats 5 -- --shapes qwen3next --batches 1,8
+#   bash run_g9_compare.sh --validate           # D7-lite numerical cross-check (no perf sweep)
 
 set -euo pipefail
 
@@ -29,9 +30,11 @@ REPO="$(cd "${SCRIPT_DIR}/../../.." && pwd)"          # /workspaces/aiter
 VENV_PY="${REPO}/flydsl_venv/bin/python"
 COMPARE="${SCRIPT_DIR}/compare.py"
 BUILD_CK="${SCRIPT_DIR}/build_ck_bench.sh"
+CK_BIN="/workspaces/rocm-libraries-wdec/bench_ck_warp_decode"
 
 GPU="${GPU:-6}"
 BUILD_CK_FIRST=0
+VALIDATE=0
 REPEATS=3
 ITERS=1000
 COLD=20
@@ -42,6 +45,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --gpu)        GPU="$2"; shift 2 ;;
         --build-ck)   BUILD_CK_FIRST=1; shift ;;
+        --validate)   VALIDATE=1; shift ;;
         --repeats)    REPEATS="$2"; shift 2 ;;
         --iters)      ITERS="$2"; shift 2 ;;
         --cold)       COLD="$2"; shift 2 ;;
@@ -59,6 +63,23 @@ fi
 if [ "${BUILD_CK_FIRST}" -eq 1 ]; then
     echo "==> Building CK bench ..."
     bash "${BUILD_CK}"
+fi
+
+# D7-lite: dump CK FP8/BF16 kernel I/O on real host-quantized inputs, then rebuild
+# the torch reference on the identical bytes and compare (cos / allclose). No perf
+# sweep; exits non-zero if any kernel diverges.
+if [ "${VALIDATE}" -eq 1 ]; then
+    if [ ! -x "${CK_BIN}" ]; then
+        echo "==> CK bench binary missing; building ..."
+        bash "${BUILD_CK}"
+    fi
+    DUMP_DIR="${SCRIPT_DIR}/ck_validate_dump"
+    mkdir -p "${DUMP_DIR}"
+    rm -f "${DUMP_DIR}"/*.bin
+    echo "==> D7-lite numerical cross-check: gpu=${GPU}  dump -> ${DUMP_DIR}"
+    HIP_VISIBLE_DEVICES="${GPU}" CK_WD_VALIDATE=1 CK_WD_VALIDATE_DIR="${DUMP_DIR}" "${CK_BIN}"
+    "${VENV_PY}" "${SCRIPT_DIR}/validate.py" --dir "${DUMP_DIR}"
+    exit $?
 fi
 
 MD_OUT="${OUT_PREFIX}.md"
