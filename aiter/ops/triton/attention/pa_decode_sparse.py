@@ -578,6 +578,11 @@ def _pa_decode_sparse_gfx950_gluon(
     _bk = _os.environ.get("AITER_PA_DECODE_BLOCK_K")
     if _bk:
         BLOCK_K = int(_bk)
+    # AITER_PA_DECODE_BLOCK_M: heads per MFMA M-tile. 16 is both the MFMA M and the
+    # DSv4 head count; larger pads and quadruples the accumulator (see RESULTS.md).
+    _bm = _os.environ.get("AITER_PA_DECODE_BLOCK_M")
+    if _bm:
+        BLOCK_M = int(_bm)
     # AITER_PA_DECODE_MFMA_K: 32 selects CDNA4's double-rate v_mfma_f32_16x16x32_bf16
     # (16 does 16x16x16, i.e. half the K per instruction).
     _mk = _os.environ.get("AITER_PA_DECODE_MFMA_K")
