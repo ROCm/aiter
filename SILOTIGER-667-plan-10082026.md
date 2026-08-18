@@ -25,7 +25,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 
 | # | Capability | Reference has | WIP has | Ticket priority |
 |---|---|---|---|---|
-| G1 | **i64-safe weight offsets** (only >8 GB tensors) | ✅ per-row i64 base | ✅ ticket shapes / ❌ >8 GB (K3) | **not a ticket blocker** (empirically verified 2026-08-10; K3-only) |
+| G1 | **i64-safe weight offsets** (only >8 GB tensors) | ✅ per-row i64 base | ✅ ticket shapes / ✅ FP8 large (K3 Tier-2, B5 2026-08-17) | **resolved** — FP8 `down`/`gate_up` now use a guarded per-expert i64 base (repro E=896 cos 0.999999; DeepSeek E=256 cos 1.0) |
 | G2 | **MXFP4 / FP4 weights** (down + gate_up) | ✅ (down full; gate_up fp4) | ❌ | #1 remaining (ticket) |
 | G3 | **BF16-weight path** (`w_dtype="bf16"`) | ✅ (dot2 + scalar) | ❌ FP8-only | scaffold / gfx942 |
 | G4 | **gfx942 / scalar-f32 fallback** (`use_dot2=False`) | ✅ auto-arch | ❌ gfx950-only | portability |
@@ -165,13 +165,18 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `test_gate_up_fp8_real_expert_count` + `test_down_reduce_fp8_real_expert_count` are now
       **parametrized** over `REAL_E_CASES = {deepseek_v3_e256, qwen3next_tp1_e512}` (max-offset
       expert forced, compact per-(b,k) ref, HBM-guarded); all **4 pass** on gfx950 (5.99 s).
-- [ ] **K3-scale addressing fix (deferred to the Kimi-K3 follow-on, not the ticket):** for
-      weight tensors > ~8 GB, switch to **per-row i64 base resources**
-      (`create_buffer_resource_from_addr(base_i64 + row_byte_off_i64, num_records_bytes=row_nb)`,
-      in-row i32 offset small) — this fixes *both* the dword-index truncation *and* the 4 GB
-      `num_records` clamp (`0xFFFFFFFF`) that would otherwise OOB-zero reads past 4 GB. The
-      whole-tensor + i64-offset variant is insufficient (both the clamp and `buffer_load`'s
-      i32 offset bite), so per-row is the required form at K3 scale.
+- [x] **K3-scale addressing fix — landed as B5 (2026-08-17), K3 Tier-2.** The FP8
+      `down`/`gate_up` builders now fold a **per-expert i64 base** into the buffer descriptor
+      (`_ptr_rsrc_off` = `create_buffer_resource_from_addr(ptrtoint(ptr) + e*H*I)`) and address
+      weights by the i32-safe in-expert dword offset. Guarded by a build-time `num_experts` so
+      it only fires at `E*I*H >= 2^31` (i32-safe path + all FP4 shapes untouched). This is the
+      *per-expert* form (coarser than the *per-row* sketch, but sufficient: an expert spans
+      `H*I <= ~1.5e7 B`, well inside i32, and the default `num_records` clamp is never hit since
+      each descriptor only reads its own expert). Empirically fixes the i32 **byte-offset** wrap
+      (`w_row*INTER*4` — the real killer at 2^31 B, distinct from the 8 GB dword-index limit the
+      2026-08-10 note assumed): DeepSeek E=256 FP8 `down`+`gate_up` cos 0.02→1.0, and the K3
+      E=896 repro (9.85 GB tensor) cos 0.02→0.999999. Kimi-K3 FP4 (packed, `E*H*I < 2^32`) still
+      rides the Tier-1 restructure.
 - **Where:** `build_gate_up_fp8_module` / `build_down_reduce_fp8_module` (`_ptr_rsrc` +
   `w_word0`/`a_word0`); only the K3-scale item touches kernel addressing.
 
@@ -301,10 +306,13 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       i32 up to `E*H*I < 2^32`; E=256 (`3.76e9`, byte offset 1.88 GB) now runs. Cold E=256 FP4
       `down` (pool 1.88 GB ≫ MALL): B=1 17.5 µs / B=2 26.4 / B=4 42.9 / B=8 80.8, **cos 1.000, no
       fault** — matches the E=128 timings (per-launch reads are E-independent), so the 1.26–1.54×
-      FP4-vs-FP8 ratios above hold at true E=256. **FP8 E=256 still deferred:** its byte offset is
-      `w_row*INTER` (2× FP4), overflows 2^31, needs the **K3 Tier-2 per-expert i64 base**; the cold
-      harness auto-skips the FP8 leg above 2^31 and reports it n/a. Remaining upside: G8 prefetch +
-      K3 Tier-2 (unlocks FP8 E=256 + Kimi-K3 9.85 GB).
+      FP4-vs-FP8 ratios above hold at true E=256. **FP8 E=256 — RESOLVED (K3 Tier-2, B5, 2026-08-17).**
+      Its byte offset is `w_row*INTER` (2× FP4) and wrapped i32 at 2^31; the fix folds a
+      **per-expert i64 base** into the buffer descriptor (guarded to `E*I*H >= 2^31`) so the
+      in-expert offset stays i32-safe. The cold harness no longer auto-skips FP8 (now gates on
+      the in-expert `H*I < 2^31`); DeepSeek E=256 FP8 `down`+`gate_up` cos=1.0 and the of-record
+      G9 artifact has 0 n/a cells. Remaining upside: G8 prefetch (Kimi-K3 9.85 GB addressing is
+      also covered by Tier-2 — E=896 repro cos 0.999999).
     - **gate_up cold A/B (2026-08-11) — FP4 wins *bigger* than down.** `bench_gate_up_cold`
       mirrors the down harness (two-stream gate+up pools `_gen_gate_up_fp4_pool` /
       `_gen_gate_up_fp8_pool`, touched-expert dequant, same router rotation + dual i32 guard on
@@ -320,7 +328,7 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       weight-BW-dominated than down, and halving the weight bytes helps more (1.44–1.65× vs down's
       1.26–1.54×). FP8 keeps higher raw TB/s (5.7→7.5 vs FP4 4.4→6.6, convert overhead) but moves
       2× the bytes. Real **E=256 FP4-only** confirmed fault-free (28.5/45.9/81.6/150.4 µs, cos 1.0,
-      matches E=128 → ratios carry); FP8 E=256 skipped (K3 Tier-2), same as down.
+      matches E=128 → ratios carry); FP8 E=256 now runs (K3 Tier-2 landed, B5), same as down.
 - [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
       fold for FP8 PerTensor/PerToken/Block2D.
 - [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
@@ -401,7 +409,8 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       `_bf16` (unquantized oracle). Verified import + `__all__` membership in `flydsl_venv`.
 - [x] **Widened perf sweep (2026-08-11):** extended the cold-HBM A/B to **3 real-E decode models**
       (DeepSeek-V3 E256, MiniMax E256, Qwen3Next-TP1 E512) × **B∈{1,2,4,8,32}**, both stages, FP4+FP8
-      (FP8 auto-skips at DeepSeek E256 per 2³¹). Driven by `_COLD_MODELS`/`_COLD_BATCHES` →
+      (FP8 at DeepSeek E256 now runs via the K3 Tier-2 i64 base, B5 2026-08-17; the old 2³¹
+      auto-skip is gone). Driven by `_COLD_MODELS`/`_COLD_BATCHES` →
       `COLD_{DOWN,GATE_UP}_SHAPES`; rows now carry HIDDEN/INTER. All **fp4_cos=1.0**. Headline (device
       timing): gate_up FP4 beats FP8 **1.3–1.8×** (MiniMax) / **1.0–1.2×** (Qwen); down FP4 wins at
       B≥2, ~neutral at B=1 for the smaller shapes. The **CK side-by-side (G9)** feed of the same shapes

@@ -197,18 +197,27 @@ the FlyDSL cold harness.
 - [ ] Correctness (cos vs BF16-act reference) + a cold-bench field so `compare.py` can pair
       it with CK `gate_fp8_d2`. Distinct from MXFP8 block-scaled activation (separate follow-on).
 
-#### B5 — fix the DeepSeek-E256 FP8 hole (K3 Tier-2 addressing)  [ ]
-- [ ] Add per-expert **i64 base** addressing to the FP8 down + gate_up builders (i64 expert
-      row base, i32 in-expert offset); mirror the reference per-row i64 pattern.
-- [ ] Guard so it's only paid when `E*H*I >= 2^31` (don't regress the i32-safe path; keep FP4
-      on the Tier-1 restructure).
-- [ ] Correctness: DeepSeek E=256 FP8 down + gate_up cos vs torch (repro
-      `/tmp/repro_k3_addr.py` should go ~0.02 → ~1.0).
-- [ ] Once fixed: drop the FP8 auto-skip in the cold harness for DeepSeek E256, fill the G9
-      FP8 DeepSeek rows, update the main plan's G1/K3 status + §8.2 matrix. Also unblocks the
-      Kimi-K3 follow-on (E=896).
-- Context: FP8 `w_row*INTER` (~3.76e9 > 2³¹) overflows the i32 byte offset at DeepSeek
-  E=256, so the FP8 legs report n/a there and CK (per-row i64) has no FlyDSL peer.
+#### B5 — fix the DeepSeek-E256 FP8 hole (K3 Tier-2 addressing)  [x] DONE (2026-08-17)
+- [x] Added per-expert **i64 base** addressing to the FP8 `down` + `gate_up` builders: fold the
+      per-expert byte base (`e * H*I`, fp8 = 1 B/elem) into the buffer descriptor as i64
+      (`_ptr_rsrc_off`), and address weights by the i32-safe **in-expert** dword offset
+      (`neuron_j*(H/4)` for gate_up, `(out_j+h)*(I/4)` for down). Scale offsets stay i32
+      (they never overflow). `kernels/warp_decode_moe.py`.
+- [x] Guarded by a build-time `num_experts` param: Tier-2 only fires when
+      `E*I*H >= 2^31` (`use_i64_base`); the i32-safe fast path and all FP4 shapes are byte-for-
+      byte unchanged. Threaded `E` through `_get_gate_up`/`_get_down_reduce` + both public wrappers.
+- [x] Correctness — `/tmp/repro_k3_addr.py` gate_up @ **E=896** (dword idx ~2.46e9 > 2^31):
+      cos ~0.02 → **0.999999**. DeepSeek **E=256** FP8 (`/tmp/repro_k3_deepseek_fp8.py`):
+      `down` cos=**1.000000**, `gate_up` cos=**1.000000** (was ~0.02).
+- [x] Dropped the cold-harness FP8 auto-skip: `run_fp8` now gates on the *in-expert* size
+      (`H*I < 2^31`) instead of `E*H*I`, so DeepSeek E=256 runs. Regenerated the of-record G9
+      artifact — **0 n/a cells** (was 10); the 10 DeepSeek FP8 cells fill at cos=1.0000, ratios
+      0.60→1.03, ~69–74 %peak (repeats=3, loaded sclk median ~2393 MHz). Matrix now 15/15
+      op×dtype×shape (×5 B = 75 paired points). Also unblocks the Kimi-K3 follow-on (E=896).
+- Context (resolved): FP8 whole-pool byte offset `w_row*INTER*4` (~1.5e10 for the last
+  DeepSeek expert; dword idx ~3.76e9) wrapped the i32 voffset, so the FP8 legs read garbage
+  (cos ~0.02) and reported n/a; the Tier-2 i64 base keeps the in-expert offset i32-safe
+  (an expert spans H*I ≤ ~1.5e7 B).
 
 ### Group C — the comparison script
 
@@ -425,7 +434,7 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
 
 ## 4. Dependencies (build order)
 - **C1 (`compare.py`)** needs **A1, A2, B2, B3**.
-- **Full FP8 coverage** (DeepSeek) needs **B5**.
+- **Full FP8 coverage** (DeepSeek) — ✅ done (B5; K3 Tier-2 i64 per-expert base).
 - **gate_up FP4 pair** — ✅ done (A4; needed a one-line CK gate_up kernel packed-stride fix).
 - **gate_up FP8-act pair** needs **B4** (FlyDSL side) — CK already has `gate_fp8_d2`.
 - **Trustworthy ratios** need A1 (cold) ✅, B1 (scale) ✅, D3 (config) ✅, D1 (timing) ✅,
@@ -461,6 +470,14 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-17 — **B5 done — DeepSeek-E256 FP8 hole closed (K3 Tier-2 addressing).** Added a
+  per-expert i64 base (`_ptr_rsrc_off`) to the FP8 `down`/`gate_up` builders, guarded by a
+  build-time `num_experts` so it only fires at `E*I*H >= 2^31` (i32-safe path + all FP4 shapes
+  untouched). Fixes the i32 voffset wrap: gate_up @ E=896 cos 0.02→0.999999; DeepSeek E=256
+  `down`+`gate_up` cos→1.000000. Dropped the cold-harness FP8 skip (now gates on in-expert
+  `H*I < 2^31`) and regenerated the of-record G9 artifact — **0 n/a cells** (was 10); the 10
+  DeepSeek FP8 cells fill at cos=1.0000, ratios 0.60→1.03, ~69–74 %peak. Matrix now 15/15
+  op×dtype×shape (×5 B = 75 points). Unblocks the Kimi-K3 E=896 follow-on.
 - 2026-08-17 — **D4 done — functional-equivalence audit.** Cross-checked both harnesses by
   code inspection: gate_up epilogue (`silu(gate)·up`, SiLU on gate only, bf16) and down
   reduction (`Σ router_wt · (inter·w)`, bf16) are identical; CK `element_wise::Silu` =
