@@ -17,7 +17,6 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -1203,68 +1202,6 @@ def test_chunk_opt_vk_indice(
                 ),
             ],
         ),
-        pytest.param(
-            "flydsl",
-            id="flydsl",
-            marks=pytest.mark.skipif(
-                not is_flydsl_available(),
-                reason="FlyDSL backend requires flydsl",
-            ),
-        ),
-    ],
-)
-def test_chunk_opt_vk_indexed_state_pool_requires_output_final_state(backend: str):
-    """Indexed pool write-back requires ``output_final_state=True`` on every backend."""
-    if backend == "hip":
-        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
-        extra_kwargs = {"g_head_major": True}
-    elif backend == "flydsl":
-        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
-        extra_kwargs = {"g_head_major": True}
-    else:
-        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
-        extra_kwargs = {}
-
-    B, T, H, D = 1, 128, 2, 128
-    cu_seqlens = torch.tensor([0, 64, 128], device=device, dtype=torch.int32)
-    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
-    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
-    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
-    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
-    pool = torch.randn(7, H, D, D, dtype=torch.float32, device=device)
-    indices = torch.tensor([3, 1], dtype=torch.int32, device=device)
-
-    with pytest.raises(ValueError, match="output_final_state=True"):
-        fwd_h(
-            k=k,
-            w=w,
-            u=u,
-            g=g,
-            initial_state=pool,
-            initial_state_indices=indices,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            **extra_kwargs,
-        )
-
-
-@pytest.mark.parametrize(
-    "backend",
-    [
-        pytest.param("triton", id="triton"),
-        pytest.param(
-            "hip",
-            id="hip",
-            marks=[
-                pytest.mark.skipif(
-                    not IS_AMD, reason="HIP backend requires an AMD device"
-                ),
-                pytest.mark.skipif(
-                    _is_gfx12_runtime(),
-                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
-                ),
-            ],
-        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1853,6 +1790,20 @@ def test_chunk_opt_vk_k5_hip_matches_triton_tail_gfx12():
     assert_close("tail state HIP vs Triton", final_state_triton, final_state_hip, 0.005)
 
 
+def test_chunk_opt_vk_rejects_indexed_flydsl_state_pool():
+    with pytest.raises(ValueError, match="not supported by the FlyDSL K5 path"):
+        chunk_gated_delta_rule_opt_vk(
+            q=torch.empty(1, 1, 1, 128),
+            k=torch.empty(1, 1, 1, 128),
+            v=torch.empty(1, 1, 1, 128),
+            g=torch.empty(1, 1, 1),
+            beta=torch.empty(1, 1, 1),
+            initial_state=torch.empty(1, 1, 128, 128),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32),
+            use_chunk_flydsl=True,
+        )
+
+
 def test_chunk_opt_vk_rejects_dense_index_count_mismatch():
     with pytest.raises(ValueError, match="state indices.*2 rather than 1"):
         chunk_gated_delta_rule_opt_vk(
@@ -1914,64 +1865,6 @@ def test_chunk_opt_vk_hip_downgrade_preserves_indexed_state_args(monkeypatch):
         cu_seqlens=torch.tensor([0, 1, 2]),
         use_chunk_hip=True,
         o=torch.empty(1, 1, 1, 1),
-        num_decodes=1,
-        num_decode_tokens=1,
-        initial_state_indices=initial_state_indices,
-        inplace_final_state=True,
-    )
-
-    assert captured["initial_state_indices"] is initial_state_indices
-    assert captured["inplace_final_state"] is True
-
-
-def test_chunk_opt_vk_flydsl_downgrade_preserves_indexed_state_args(monkeypatch):
-    chunk_module = importlib.import_module(
-        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
-    )
-    initial_state = torch.empty(4, 1, 1, 1)
-    initial_state_indices = torch.tensor([3], dtype=torch.int32)
-    captured = {}
-
-    monkeypatch.setattr(
-        chunk_module,
-        "fused_chunk_local_cumsum_scaled_dot_kkt_fwd",
-        lambda **kwargs: (torch.empty(1, 1, 1), torch.empty(1, 1, 1, 1)),
-    )
-    monkeypatch.setattr(
-        chunk_module,
-        "fused_solve_tril_recompute_w_u",
-        lambda **kwargs: (torch.empty(1, 1, 1, 1), torch.empty(1, 1, 1, 1)),
-    )
-
-    def fake_triton_k5(**kwargs):
-        captured.update(kwargs)
-        return (
-            torch.empty(1, 1, 1, 1, 1),
-            torch.empty(1, 1, 1, 1),
-            initial_state,
-        )
-
-    monkeypatch.setattr(
-        chunk_module, "chunk_gated_delta_rule_fwd_h_opt_vk", fake_triton_k5
-    )
-    monkeypatch.setattr(
-        chunk_module,
-        "chunk_fwd_o_opt_vk",
-        lambda **kwargs: kwargs["o"],
-    )
-
-    chunk_module.chunk_gated_delta_rule_fwd_opt_vk(
-        q=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
-        k=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
-        v=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
-        g=torch.empty(1, 1, 1),
-        beta=torch.empty(1, 1, 1),
-        scale=1.0,
-        initial_state=initial_state,
-        output_final_state=True,
-        cu_seqlens=torch.tensor([0, 1, 2]),
-        use_chunk_flydsl=True,
-        o=torch.empty(1, 1, 1, 128, dtype=torch.bfloat16),
         num_decodes=1,
         num_decode_tokens=1,
         initial_state_indices=initial_state_indices,
