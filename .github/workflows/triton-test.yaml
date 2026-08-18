@@ -30,6 +30,7 @@ on:
       # Re-include Triton workflow files after the broad workflow exclusion.
       - ".github/workflows/triton-test.yaml"
       - ".github/workflows/prepare-triton-wheel.yaml"
+      - ".github/workflows/ci-config.yaml"
   workflow_dispatch:
 
 concurrency:
@@ -37,6 +38,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     runs-on: ubuntu-latest
@@ -73,11 +78,11 @@ jobs:
 
   prepare_triton_wheel:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
-    needs: [check-signal]
+    needs: [check-signal, ci_config]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
-      artifact-name: triton_wheelhouse
+      docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
 
   # Step 2: MI35X matrix jobs
@@ -86,13 +91,14 @@ jobs:
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 60
-    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
+    needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -102,7 +108,41 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Network preflight before Triton artifact downloads
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== DNS check ==="
+          getent hosts github.com || true
+          getent hosts api.github.com || true
+          getent hosts productionresultssa4.blob.core.windows.net || true
+          getent hosts productionresultssa8.blob.core.windows.net || true
+
+          echo "=== GitHub and Azure Blob connectivity check ==="
+          for url in \
+            https://api.github.com/rate_limit \
+            https://github.com/ROCm/aiter \
+            https://productionresultssa4.blob.core.windows.net/ \
+            https://productionresultssa8.blob.core.windows.net/
+          do
+            curl -L -o /dev/null -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "url=${url} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" \
+              "$url" || true
+          done
+
       - name: Download test shard lists
+        id: download_triton_shards
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -114,8 +154,26 @@ jobs:
         timeout-minutes: 30
         continue-on-error: true
         with:
-          name: triton_wheelhouse
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
+
+      - name: Speedtest after Triton artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== speedtest-cli ==="
+          python3 -m pip install --user --disable-pip-version-check speedtest-cli || true
+          speedtest_bin="$(python3 -m site --user-base)/bin/speedtest-cli"
+          timeout 120 "$speedtest_bin" --simple --secure || true
 
       - name: List test shard files
         run: |
@@ -225,13 +283,14 @@ jobs:
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 60
-    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
+    needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -253,7 +312,7 @@ jobs:
         timeout-minutes: 30
         continue-on-error: true
         with:
-          name: triton_wheelhouse
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
       - name: List test shard files

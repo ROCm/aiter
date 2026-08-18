@@ -1410,8 +1410,8 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_softplus",                                   \
-          &aiter::topk_softplus,                             \
+    m.def("topk_gating",                                     \
+          &aiter::topk_gating,                               \
           py::arg("topk_weights"),                           \
           py::arg("topk_indices"),                           \
           py::arg("gating_output"),                          \
@@ -2404,17 +2404,17 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND                   \
-    m.def("gated_rmsnorm_fp8_group_quant",           \
-          &aiter::gated_rmsnorm_fp8_group_quant,     \
-          py::arg("out"),                            \
-          py::arg("scale"),                          \
-          py::arg("x"),                              \
-          py::arg("z"),                              \
-          py::arg("weight"),                         \
-          py::arg("epsilon"),                        \
-          py::arg("group_size"),                     \
-          py::arg("transpose_scale") = false,        \
+#define GATED_RMSNORM_QUANT_PYBIND                         \
+    m.def("gated_rmsnorm_fp8_group_quant",                 \
+          &aiter::gated_rmsnorm_fp8_group_quant,           \
+          py::arg("out"),                                  \
+          py::arg("scale"),                                \
+          py::arg("x"),                                    \
+          py::arg("z"),                                    \
+          py::arg("weight"),                               \
+          py::arg("epsilon"),                              \
+          py::arg("group_size"),                           \
+          py::arg("transpose_scale") = false,              \
           "Fused Gated RMSNorm + FP8 Group Quantization"); \
     m.def("gated_rmsnorm_fp8_per_token_quant",             \
           &aiter::gated_rmsnorm_fp8_per_token_quant,       \
