@@ -1,0 +1,80 @@
+{
+  "device": "AMD Instinct MI355X (gfx950)",
+  "shape": {
+    "tokens": 8,
+    "model_dim": 3584,
+    "inter_dim": 384,
+    "local_experts": 56,
+    "topk": 16,
+    "m_tiles": 54,
+    "gemm_tiles": 162,
+    "block_m": 32,
+    "block_n": 256,
+    "block_k": 256,
+    "persistent_workers": 192,
+    "work_shards": 8,
+    "waves_per_eu": 3
+  },
+  "correctness": {
+    "three_activations_bitwise": true,
+    "ticket_scheduler": true,
+    "strided_scheduler": true,
+    "persistent_core_port": true,
+    "device_epoch_reuse_without_host_memset": true,
+    "checked_workspace_geometry": true
+  },
+  "warm_process_median_us": {
+    "compute_only": 13.989,
+    "serial": 50.064,
+    "static_rejoin": 67.256,
+    "dynamic_persistent_ticket": 76.858,
+    "dynamic_persistent_strided": 77.026,
+    "persistent_port_compute": 14.106,
+    "sidecar": 50.511,
+    "persistent_sidecar": 50.804
+  },
+  "resources": {
+    "dynamic_ticket": {
+      "vgpr": 168,
+      "sgpr": 81,
+      "agpr": 0,
+      "lds_bytes": 32768,
+      "private_bytes": 24,
+      "vgpr_spills": 5,
+      "sgpr_spills": 0
+    },
+    "dynamic_strided": {
+      "vgpr": 168,
+      "sgpr": 80,
+      "lds_bytes": 32768,
+      "private_bytes": 24,
+      "vgpr_spills": 5,
+      "sgpr_spills": 0
+    },
+    "persistent_core_port": {
+      "vgpr": 192,
+      "sgpr": 80,
+      "lds_bytes": 32768,
+      "private_bytes": 0,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0
+    }
+  },
+  "dynamic_kernel_trace_us": {
+    "min": 19.08,
+    "median": 19.76,
+    "max": 23.36
+  },
+  "conclusion": {
+    "dynamic_single_kernel_has_speedup": false,
+    "persistent_core_preserves_compute_performance": true,
+    "recommended_current_path": "persistent compute core plus communication sidecar",
+    "primary_dynamic_blocker": "control-flow live ranges cause VGPR spill and launch/control overhead"
+  },
+  "scope_limit": "Communication is still a copy+release-signal stub. Real internode_v1 MORI NBI progress and per-M-tile ready/expected wait-acquire are not connected yet.",
+  "profile_paths": {
+    "dynamic_att": "/home/hzm/profiles/megamoe_tile_h1_persistent_finalfix_dynamic_wpe3_att",
+    "persistent_core_att": "/home/hzm/profiles/megamoe_tile_gemm1_persistent_core_att",
+    "kernel_trace": "/home/hzm/profiles/megamoe_tile_h1_persistent_finalfix_kernel_trace/mi355-gpu-46/56733_kernel_trace.csv"
+  }
+}

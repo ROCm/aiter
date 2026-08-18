@@ -1,0 +1,151 @@
+{
+  "device": "AMD Instinct MI355X (gfx950)",
+  "software": {
+    "flydsl": "0.3.1",
+    "torch": "2.9.1",
+    "rocm": "7.2"
+  },
+  "accuracy": {
+    "shape": {
+      "tokens": 2,
+      "model_dim": 1024,
+      "inter_dim": 256,
+      "experts": 4,
+      "topk": 2
+    },
+    "metric": "logits_diff = 1 - 2*dot/(norm2_sum)",
+    "silu": 2.817328e-06,
+    "swiglu": 2.852177e-06,
+    "situv2": 2.672743e-06
+  },
+  "ep8_accuracy": {
+    "shape": {
+      "tokens_per_rank": 4,
+      "model_dim": 1024,
+      "inter_dim": 256,
+      "global_experts": 32,
+      "experts_per_rank": 4,
+      "topk": 2
+    },
+    "silu": 1.3929875501972333e-06,
+    "swiglu": 1.2981299093439702e-06,
+    "situv2": 1.3894633711375448e-06
+  },
+  "att_resource_smoke": {
+    "shape": {
+      "model_dim": 1024,
+      "inter_dim": 256,
+      "experts": 8,
+      "topk": 2,
+      "block_m": 32,
+      "workgroup_size": 256
+    },
+    "silu": {
+      "vgpr": 130,
+      "sgpr": 46,
+      "agpr": 0,
+      "lds_bytes": 32768,
+      "scratch_bytes": 0,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "text_bytes": 4460,
+      "trace_us": 8.60
+    },
+    "swiglu": {
+      "vgpr": 130,
+      "sgpr": 46,
+      "agpr": 0,
+      "lds_bytes": 32768,
+      "scratch_bytes": 0,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "text_bytes": 4836,
+      "trace_us": 8.72
+    },
+    "situv2": {
+      "vgpr": 130,
+      "sgpr": 46,
+      "agpr": 0,
+      "lds_bytes": 32768,
+      "scratch_bytes": 0,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "text_bytes": 5464,
+      "trace_us": 8.92
+    }
+  },
+  "target_shape_overlap_warm_run": {
+    "shape": {
+      "tokens": 8,
+      "model_dim": 3584,
+      "inter_dim": 384,
+      "experts": 56,
+      "topk": 16,
+      "block_m": 32,
+      "copy_bytes": 65536,
+      "iterations": 100
+    },
+    "note": "Single-GPU copy-stub prototype; first cold process run excluded.",
+    "silu": {
+      "comm_us": 42.014,
+      "compute_us": 13.938,
+      "serial_us": 50.980,
+      "joint_us": 66.690,
+      "joint_hidden_fraction": 0.0,
+      "sidecar_us": 49.706,
+      "sidecar_hidden_fraction": 0.4481
+    },
+    "swiglu": {
+      "comm_us": 41.175,
+      "compute_us": 14.025,
+      "serial_us": 49.797,
+      "joint_us": 67.287,
+      "joint_hidden_fraction": 0.0,
+      "sidecar_us": 48.849,
+      "sidecar_hidden_fraction": 0.4528
+    },
+    "situv2": {
+      "comm_us": 42.586,
+      "compute_us": 14.305,
+      "serial_us": 51.511,
+      "joint_us": 66.427,
+      "joint_hidden_fraction": 0.0,
+      "sidecar_us": 49.627,
+      "sidecar_hidden_fraction": 0.5078
+    }
+  },
+  "target_shape_att_resources": {
+    "shape": {
+      "tokens": 8,
+      "model_dim": 3584,
+      "inter_dim": 384,
+      "experts": 56,
+      "topk": 16,
+      "block_m": 32,
+      "workgroup_size": 256
+    },
+    "common": {
+      "vgpr": 132,
+      "sgpr": 49,
+      "agpr": 0,
+      "lds_bytes": 32768,
+      "scratch_bytes": 0,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0
+    },
+    "text_bytes": {
+      "silu": 8792,
+      "swiglu": 9172,
+      "situv2": 9780
+    }
+  },
+  "profile_paths": {
+    "silu_att": "/home/hzm/profiles/megamoe_tile_activation_h1_silu_att/allse",
+    "swiglu_att": "/home/hzm/profiles/megamoe_tile_activation_h1_swiglu_att",
+    "situv2_att": "/home/hzm/profiles/megamoe_tile_activation_h1_situv2_att/allse",
+    "kernel_trace": "/home/hzm/profiles/megamoe_tile_activation_h1_kernel_trace/mi355-gpu-46/44183_kernel_trace.csv",
+    "target_silu_att": "/home/hzm/profiles/megamoe_tile_activation_h1_target_silu_att",
+    "target_swiglu_att": "/home/hzm/profiles/megamoe_tile_activation_h1_target_swiglu_att",
+    "target_situv2_att": "/home/hzm/profiles/megamoe_tile_activation_h1_target_situv2_att"
+  }
+}

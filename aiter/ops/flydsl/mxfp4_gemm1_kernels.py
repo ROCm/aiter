@@ -30,6 +30,11 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    swiglu_limit=None,
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+    persistent=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -45,6 +50,11 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        act=act,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        persistent=persistent,
     )
 
 
@@ -91,6 +101,12 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    swiglu_limit=None,
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+    persistent=False,
+    persistent_blocks=0,
     stream=None,
 ):
     _assert_supported(
@@ -118,8 +134,17 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        act,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
+        persistent,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+    if persistent:
+        if persistent_blocks <= 0:
+            raise ValueError("persistent_blocks must be positive in persistent mode")
+        grid = int(persistent_blocks)
     _moe_kernels._run_compiled(
         launch,
         (

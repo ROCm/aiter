@@ -9,14 +9,15 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dpp_utils
-from .gemm_common_gfx1250 import (
+from aiter.ops.flydsl.kernels import dpp_utils
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
     situv2_consts,
 )
-from .layout_utils import crd2idx
-from .mxfp4_gemm_common import (
+from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from .gemm_common import (
+    MXFP4_SCALE_LAYOUT_TAG,
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
@@ -182,7 +183,7 @@ def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
 
 
 @flyc.jit
-def _gemm1_body(
+def _gemm1_body_sc2(
     lds_raw_ptr,
     arg_aq,
     arg_ascale,
@@ -823,6 +824,12 @@ def _gemm1_body(
                 )
 
 
+# Preserve the private import spelling used by the fused wrappers while making
+# the JIT function name itself layout-versioned.  FlyDSL keys its persistent
+# cache by JIT function, not only by the emitted GPU symbol.
+_gemm1_body = _gemm1_body_sc2
+
+
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     kAStages = 2 if BM == 128 else 3
     kSubBlocks = 1 if BM < 32 else BM // 32
@@ -900,7 +907,10 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    name_suffix = (
+        f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}_"
+        f"{MXFP4_SCALE_LAYOUT_TAG}"
+    )
 
     def _float_tag(value):
         return (
@@ -1029,7 +1039,7 @@ def compile_gemm1_a4w4_port(
                 _run_tile(bx_i32)
 
     @flyc.jit
-    def launch_gemm1(
+    def launch_gemm1_sc2(
         arg_aq: fx.Int64,
         arg_ascale: fx.Int64,
         arg_bq: fx.Int64,
@@ -1059,4 +1069,4 @@ def compile_gemm1_a4w4_port(
             arg_hidden,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-    return launch_gemm1
+    return launch_gemm1_sc2

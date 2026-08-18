@@ -1,0 +1,52 @@
+{
+  "copy_put_signal": {
+    "kernel": "megamoe_tile_copy_put_signal",
+    "vgpr": 8,
+    "sgpr": 22,
+    "lds_bytes": 0,
+    "private_bytes": 0,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "workgroup_size": 256
+  },
+  "stage1_a4w4_silu": {
+    "kernel": "mfma_moe1_silu_mul_afp4_wfp4_fp4_t32x64x256_pm1_fp4q_sort_async_kw2_v2out_v32",
+    "vgpr": 134,
+    "sgpr": 54,
+    "lds_bytes": 41088,
+    "private_bytes": 0,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "workgroup_size": 256
+  },
+  "stage2_a4w4_atomic": {
+    "kernel": "gemm2_a4w4_port_hmax8192_imax384_bm32_bn128_bk128_atomic_bhoist_apf_spart4x2_bf16lds_kst_v2",
+    "vgpr": 54,
+    "sgpr": 46,
+    "lds_bytes": 8192,
+    "private_bytes": 0,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "workgroup_size": 256
+  },
+  "fused_h1_a4w4_silu_copy_stub": {
+    "kernel": "megamoe_tile_h1_a4w4_silu_h3584_i384_e56_k16_bm32_cb1_cp1_sig1_rj1",
+    "vgpr": 132,
+    "sgpr": 49,
+    "lds_bytes": 32768,
+    "private_bytes": 0,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "workgroup_size": 256
+  },
+  "fused_h2_a4w4_copy_stub": {
+    "kernel": "megamoe_tile_h2_a4w4_h3584_i384_e56_k16_bm32_bn128_bk128_cb1",
+    "vgpr": 52,
+    "sgpr": 54,
+    "lds_bytes": 8192,
+    "private_bytes": 0,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "workgroup_size": 256
+  }
+}
