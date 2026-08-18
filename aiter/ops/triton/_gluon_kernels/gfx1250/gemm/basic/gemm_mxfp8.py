@@ -340,8 +340,8 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     #     "rank must be equal to or one less than the shape size".
     # What does work: a 3-D allocation carrying the 2-D layout, so `.index(g)` is
     # a valid TDM destination (the same addressing the chunk double-buffer uses),
-    # plus an explicit `_reinterpret` for the flat view the gather needs.
-    # _reinterpret succeeds where reshape fails because the layout is given
+    # plus an explicit `reinterpret` for the flat view the gather needs.
+    # reinterpret succeeds where reshape fails because the layout is given
     # rather than derived. Verified standalone: two source rows land group-major,
     # each replicated across its 128 rows, all columns intact.
     #
@@ -718,7 +718,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             # Multi-group needs the flat view across slices; reshape() asserts in
             # LLVM on this allocation, so the layout is supplied explicitly.
             if B_SCALE_MULTIGROUP:
-                bs_view = bs_slab._reinterpret(
+                bs_view = bs_slab.reinterpret(
                     dtype=b_scale_ptr.dtype.element_ty,
                     shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
                     layout=as_shared,
@@ -806,7 +806,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             # Multi-group needs the flat view across slices; reshape() asserts in
             # LLVM on this allocation, so the layout is supplied explicitly.
             if B_SCALE_MULTIGROUP:
-                bs_view = bs_slab._reinterpret(
+                bs_view = bs_slab.reinterpret(
                     dtype=b_scale_ptr.dtype.element_ty,
                     shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
                     layout=as_shared,
@@ -879,7 +879,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         # Multi-group needs the flat view across slices; reshape() asserts in
         # LLVM on this allocation, so the layout is supplied explicitly.
         if B_SCALE_MULTIGROUP:
-            bs_view = bs_slab._reinterpret(
+            bs_view = bs_slab.reinterpret(
                 dtype=b_scale_ptr.dtype.element_ty,
                 shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
                 layout=as_shared,
