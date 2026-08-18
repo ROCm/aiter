@@ -43,6 +43,11 @@ _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
 _SMALL_D_ROWS_PER_WG = 1
+# Extra block sources kept outstanding during consume_source. Value 3 means
+# sources i+1, i+2, i+3 are already issued when reducing source i. Prefix is
+# already resident and is not prefetched. Changing this constant requires
+# _build_attn_res.cache_clear().
+_SOURCE_PREFETCH_IN_FLIGHT = 3
 _LOG2E = math.log2(math.e)
 
 
@@ -110,10 +115,11 @@ def _build_attn_res(
     red_slots = row_threads // _WARP_SIZE
     num_sources = num_blocks + 1
     write_block = block_write_idx >= 0
+    prefetch_in_flight = min(_SOURCE_PREFETCH_IN_FLIGHT, max(num_blocks - 1, 0))
     kernel_name = (
         f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{block_threads}"
         f"_r{rows_per_wg}_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
-        f"_onorm{int(apply_output_norm)}"
+        f"_onorm{int(apply_output_norm)}_pf{prefetch_in_flight}"
     )
 
     @fx.struct
@@ -222,12 +228,15 @@ def _build_attn_res(
         copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         vector_layout = fx.make_layout(_VEC_WIDTH, 1)
 
-        def load_bf16_vec(divided_tensor, index):
+        def issue_bf16_vec(divided_tensor, index):
             register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
             fx.copy_atom_call(
                 copy_atom, fx.slice(divided_tensor, (None, index)), register
             )
-            return fx.memref_load_vec(register)
+            return register
+
+        def load_bf16_vec(divided_tensor, index):
+            return fx.memref_load_vec(issue_bf16_vec(divided_tensor, index))
 
         def store_bf16_vec(value, divided_tensor, index):
             register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
@@ -323,15 +332,32 @@ def _build_attn_res(
                     )
                 return new_max, new_denominator, new_mixed
 
+            def issue_block_source(source_idx):
+                block_row = fx.slice(blocks_buf, (token, source_idx, None))
+                block_div = fx.logical_divide(block_row, vector_layout)
+                handles = []
+                for tile in range_constexpr(tiles_per_thread):
+                    handles.append(
+                        issue_bf16_vec(block_div, local_tid + tile * row_threads)
+                    )
+                return handles
+
             # The loop is specialized by num_blocks, then followed by the resident
             # prefix source so the kernel never reads an invalid block slot.
+            # Prime `prefetch_in_flight` extra block sources, then issue the
+            # replacement before each consume so that many stay outstanding
+            # across the three-barrier reduce.
+            in_flight = []
+            for source in range_constexpr(min(prefetch_in_flight, num_blocks)):
+                in_flight.append(issue_block_source(source))
+
             for source in range_constexpr(num_blocks):
-                block_row = fx.slice(blocks_buf, (token, source, None))
-                block_div = fx.logical_divide(block_row, vector_layout)
+                if const_expr(source + prefetch_in_flight < num_blocks):
+                    in_flight.append(issue_block_source(source + prefetch_in_flight))
+                handles = in_flight.pop(0)
                 source_local = []
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = local_tid + tile * row_threads
-                    source_local.append(load_bf16_vec(block_div, vector_index))
+                    source_local.append(fx.memref_load_vec(handles[tile]))
                 max_logit, denominator, mixed_local = consume_source(
                     source_local, max_logit, denominator, mixed_local
                 )
