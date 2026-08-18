@@ -8,20 +8,21 @@
 Dense BF16-output MHA v4 is implemented and validated on gfx950. A gfx942 signed INT8/FP8 row is
 also preserved under v4.
 
-The public raw and packed APIs support six dense combinations:
+The public raw and packed APIs support seven dense combinations:
 
 | Q/K | V | Output |
 |---|---|---|
 | INT8 | FP8 | BF16 |
 | FP8 | FP8 | BF16 |
+| MXFP8 | FP8 | BF16 |
 | MXFP6 E2M3 | FP8 | BF16 |
 | MXFP4 E2M1 | FP8 | BF16 |
 | MXFP6 E2M3 | MXFP4 E2M1 | BF16 |
 | MXFP4 E2M1 | MXFP4 E2M1 | BF16 |
 
-Current scope is batched, dense, non-causal MHA with matching Q/KV head counts, BF16 raw inputs,
-head dimension 128, and BF16 output. It is inference-only: no backward, dropout, RNG state, LSE,
-GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never fall back to
+Current scope is batched, dense, non-causal MHA with supported grouped-query head ratios, BF16 raw
+inputs, head dimension 128, and BF16 output. It is inference-only: no backward, dropout, RNG state,
+LSE, varlen, or sparse metadata. Unsupported requests fail explicitly and never fall back to
 `aiter.ops.mha`.
 
 ## Stable Decisions And Ownership
@@ -47,7 +48,7 @@ GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never 
 The current implementation is intentionally one module, `aiter/ops/mha_v4.py`; a speculative
 subpackage split is not part of the design. It exports:
 
-- `mha_v4` and `mha_v4_packed`;
+- `mha_v4`, `mha_v4_mxfp8`, and `mha_v4_packed`;
 - `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, and `scale_modes_for_formats`;
 - canonical per-tensor, MX Q/K, and V quantizers;
 - `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` for raw-buffer reconstruction;
@@ -77,7 +78,7 @@ Still deferred:
 - sparse ragged-LUT execution, VSA/Sparge compatibility, and ring/LSE support;
 - low-precision output with an explicit data/scale ABI;
 - approximate BF16 input under a distinct identity from v3 BF16;
-- GQA, causal, varlen, other head dimensions, and more Q/K/V/O combinations;
+- causal, varlen, other head dimensions, and more Q/K/V/O combinations;
 - broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
 
 ## Current Dense Performance
