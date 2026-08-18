@@ -89,20 +89,20 @@ def make_inputs(
     index_q_out = torch.zeros(
         num_tokens, niq * HEAD_DIM, device=dev, dtype=idx_cache_dtype
     )
-    return dict(
-        qkv=qkv,
-        weights=weights,
-        cos_sin=cos_sin,
-        positions=positions,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        index_cache=index_cache,
-        slot_mapping=slot_mapping,
-        index_slot_mapping=index_slot_mapping,
-        q_out=q_out,
-        index_q_out=index_q_out,
-        x=x,
-    )
+    return {
+        "qkv": qkv,
+        "weights": weights,
+        "cos_sin": cos_sin,
+        "positions": positions,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "index_cache": index_cache,
+        "slot_mapping": slot_mapping,
+        "index_slot_mapping": index_slot_mapping,
+        "q_out": q_out,
+        "index_q_out": index_q_out,
+        "x": x,
+    }
 
 
 def reference(t, nq, nkv, niq, rotary_dim, eps, process_index, k_scale, v_scale):
@@ -127,11 +127,15 @@ def reference(t, nq, nkv, niq, rotary_dim, eps, process_index, k_scale, v_scale)
     # index_q is quantized straight from fp32; index_k goes via the model dtype
     # (see the kernel comment: it mirrors the unfused bf16 -> fp8 insert).
     index_q_f32 = norm_rope(heads[:, iq_begin : iq_begin + niq], w["iq"])
-    index_k = norm_rope(heads[:, iq_begin + niq : iq_begin + niq + 1], w["ik"]).to(dtype)
+    index_k = norm_rope(heads[:, iq_begin + niq : iq_begin + niq + 1], w["ik"]).to(
+        dtype
+    )
 
     q_ref = q.reshape(num_tokens, nq * HEAD_DIM)
     iq_src = index_q_f32 if idx_dtype != dtype else index_q_f32.to(dtype)
-    iq_ref = iq_src.reshape(num_tokens, niq * HEAD_DIM).clamp(-448.0, 448.0).to(idx_dtype)
+    iq_ref = (
+        iq_src.reshape(num_tokens, niq * HEAD_DIM).clamp(-448.0, 448.0).to(idx_dtype)
+    )
 
     k_ref = torch.zeros_like(t["k_cache"])
     v_ref = torch.zeros_like(t["v_cache"])

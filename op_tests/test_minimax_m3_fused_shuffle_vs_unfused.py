@@ -20,11 +20,11 @@ import torch
 
 pytest.importorskip("vllm")
 
-from aiter import (  # noqa: E402
+from aiter import (
     minimax_m3_qknorm_rope_cache_shuffle_insert,
     reshape_and_cache,
 )
-from aiter.utility.dtypes import get_dtype_fp8  # noqa: E402
+from aiter.utility.dtypes import get_dtype_fp8
 
 HEAD_DIM = 128
 PAGE_SIZE = 16
@@ -78,18 +78,18 @@ def build_case(num_tokens, nq, nkv, niq, rotary_dim, cache_dtype, idx_dtype, see
     if num_tokens >= 4:
         slot_mapping[1] = -1  # padded token
 
-    return dict(
-        qkv=qkv,
-        w=w,
-        cos_sin=cos_sin,
-        positions=positions,
-        slot_mapping=slot_mapping,
-        index_slot_mapping=index_slot_mapping,
-        caches=caches,
-        x=x,
-        dtype=dtype,
-        num_tokens=num_tokens,
-    )
+    return {
+        "qkv": qkv,
+        "w": w,
+        "cos_sin": cos_sin,
+        "positions": positions,
+        "slot_mapping": slot_mapping,
+        "index_slot_mapping": index_slot_mapping,
+        "caches": caches,
+        "x": x,
+        "dtype": dtype,
+        "num_tokens": num_tokens,
+    }
 
 
 def run_unfused(c, nq, nkv, niq, rotary_dim, eps, kv_cache_dtype, k_scale, v_scale):
@@ -194,7 +194,9 @@ def assert_same(name, a, b, exact_frac=0.995):
 @pytest.mark.parametrize("num_tokens", [1, 5, 33])
 def test_fused_matches_unfused(quantized, fp8_index, num_tokens):
     nq, nkv, niq, rotary_dim, eps = 16, 1, 1, 64, 1e-6
-    _check_matches_unfused(nq, nkv, niq, rotary_dim, eps, quantized, fp8_index, num_tokens)
+    _check_matches_unfused(
+        nq, nkv, niq, rotary_dim, eps, quantized, fp8_index, num_tokens
+    )
 
 
 @pytest.mark.parametrize("nkv", [2, 4])
@@ -260,13 +262,12 @@ def test_gluon_head_folding_matches_per_head_decode(nkv):
     ctx_lens = torch.full((num_tokens,), ctx, device="cuda", dtype=torch.int32)
 
     # Folded: one row per (token, kv head), page ids scaled by nkv.
-    folded_bt = (
-        pages.repeat_interleave(nkv, dim=0) * nkv
-        + torch.arange(nkv, device="cuda", dtype=torch.int32)
-        .repeat(num_tokens)
-        .unsqueeze(1)
+    folded_bt = pages.repeat_interleave(nkv, dim=0) * nkv + torch.arange(
+        nkv, device="cuda", dtype=torch.int32
+    ).repeat(num_tokens).unsqueeze(1)
+    folded_out = torch.empty(
+        num_tokens, nq, HEAD_DIM, device="cuda", dtype=torch.bfloat16
     )
-    folded_out = torch.empty(num_tokens, nq, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     sparse_pa._run_gluon_decode(
         q,
         k_cache,

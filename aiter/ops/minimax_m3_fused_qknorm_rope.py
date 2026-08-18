@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 from torch import Tensor
-from typing import Optional
 
 from ..jit.core import compile_ops
 
@@ -23,14 +23,14 @@ def minimax_m3_qknorm_rope_cache_shuffle_insert(
     k_cache: Tensor,
     v_cache: Tensor,
     q_out: Tensor,
-    index_q_norm_weight: Optional[Tensor] = None,
-    index_k_norm_weight: Optional[Tensor] = None,
-    index_slot_mapping: Optional[Tensor] = None,
-    index_cache: Optional[Tensor] = None,
-    index_q_out: Optional[Tensor] = None,
+    index_q_norm_weight: Tensor | None = None,
+    index_k_norm_weight: Tensor | None = None,
+    index_slot_mapping: Tensor | None = None,
+    index_cache: Tensor | None = None,
+    index_q_out: Tensor | None = None,
     kv_cache_dtype: str = "auto",
-    k_scale: Optional[Tensor] = None,
-    v_scale: Optional[Tensor] = None,
+    k_scale: Tensor | None = None,
+    v_scale: Tensor | None = None,
     skip_index_branch: bool = False,
 ) -> None:
     """Fused MiniMax-M3 QK-norm + partial NeoX RoPE + page-16 SHUFFLE KV insert.
@@ -59,4 +59,3 @@ def minimax_m3_qknorm_rope_cache_shuffle_insert(
     applied as ``value / scale`` when ``kv_cache_dtype`` is quantized, matching
     ``reshape_and_cache``.
     """
-    ...
