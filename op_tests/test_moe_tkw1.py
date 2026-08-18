@@ -14,6 +14,7 @@ from aiter.fused_moe_bf16_asm import (
 from aiter.int4_utils import *
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest
+from aiter.utility.tolerance import tolerance_for
 
 BLOCK_SIZE_M = 32
 
@@ -191,7 +192,11 @@ def test_fmoe(
             out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
 
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        # Two reductions compose: stage1 over model_dim, stage2 over inter_dim.
+        rtol, atol = tolerance_for(
+            ref2, compute_dtype=dtype, num_accumulations=model_dim + inter_dim
+        )
+        checkAllclose(ref2, out_b, rtol=rtol, atol=atol, msg=msg)
     else:
         dtypeMax = 7 if use_int4 else None
         w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
@@ -274,6 +279,19 @@ def test_fmoe(
             f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:.2f}TB/s"
         )
 
+        # The quantized weights are the weakest link in both the a8w8 and the
+        # a16w8 pipeline, so they set the tolerance in both. Only the float
+        # containers have a validated error model; the int8 and int4 paths keep
+        # the tolerance they have always used.
+        if quant_dtype.is_floating_point:
+            rtol, atol = tolerance_for(
+                ref2,
+                compute_dtype=quant_dtype,
+                num_accumulations=model_dim + inter_dim,
+            )
+        else:
+            rtol, atol = 0.01, 100
+
         if (
             use_smooth
             and (inter_dim % 512 == 0 or inter_dim % 320 == 0)
@@ -296,10 +314,10 @@ def test_fmoe(
                 activation=activation,
             )
             msg = f"[perf] a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f} ......"
-            checkAllclose(ref2, out_b2, atol=100, msg=msg)
+            checkAllclose(ref2, out_b2, rtol=rtol, atol=atol, msg=msg)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        checkAllclose(ref2, out_b, rtol=rtol, atol=atol, msg=msg)
 
 
 parser = argparse.ArgumentParser(
