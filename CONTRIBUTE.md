@@ -401,26 +401,43 @@ Ensure your PR:
 
 ### PR Title Format
 
-Use one of these prefixes:
+PR titles carry two kinds of bracket tags.
+
+**Component tags — applied automatically.** A GitHub Action
+(`.github/workflows/pr-title-tags.yaml`) derives these from the files the PR
+changes and keeps them in sync on every push, so you don't need to add them
+yourself. Hand-written variants (`[TRITON]`, `[Gluon]`, `[CK_TILE]`, `[Doc]`,
+...) are normalized to the canonical forms:
+
+* `[Triton/Gluon]` - Triton/Gluon kernels (`aiter/ops/triton/`, `aiter/aot/triton/`, triton tests and benchmarks)
+* `[ASM]` - assembly kernels (`hsa/`, `*_asm.py`)
+* `[HIP]` - HIP/C++ sources (`csrc/`, HIP benchmarks)
+* `[CK]` - Composable Kernel (`csrc/ck_*`, `csrc/include/ck_tile/`, the `composable_kernel` submodule)
+* `[OPUS]` - OPUS kernels (`aiter/ops/opus/`, `csrc/opus_*`, `csrc/include/opus/`, OPUS tests)
+* `[FlyDSL]` - FlyDSL kernels (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`, FlyDSL tests)
+* `[CI]` - `.github/` workflows and scripts
+* `[JIT]` - JIT compilation system (`aiter/jit/`)
+* `[Build]` - `setup.py`, `pyproject.toml`, requirements, `MANIFEST.in`
+* `[Config]` - tuned-config-only changes
+* `[Docs]` - documentation-only changes
+
+Add the `no-auto-title` label to opt a PR out of automatic title tagging.
+
+**Type prefixes — added by you.** These are never touched by the automation;
+add whichever applies:
 
 * `[Bugfix]` - Bug fixes
 * `[Feature]` - New features or operators
 * `[Kernel]` - Kernel optimizations or new kernels
-* `[HIP]` - HIP-specific changes
-* `[CK]` - Composable Kernel integration
-* `[Triton]` - Triton kernel changes
-* `[JIT]` - JIT compilation system changes
 * `[Perf]` - Performance optimizations
-* `[Doc]` - Documentation improvements
 * `[Test]` - Test additions or fixes
-* `[CI]` - CI/CD improvements
 * `[Hardware]` - Hardware-specific changes (e.g., `[Hardware][MI300X]`)
 * `[Misc]` - Miscellaneous changes
 
 Examples:
-* `[Kernel][Perf] Optimize RMSNorm for MI300X using vec16 loads`
-* `[Feature] Add PagedAttention operator with CK backend`
-* `[Bugfix] Fix numerical instability in FP16 softmax`
+* `[Triton/Gluon] [Perf] Optimize RMSNorm for MI300X using vec16 loads`
+* `[CK] [Feature] Add PagedAttention operator with CK backend`
+* `[HIP] [Bugfix] Fix numerical instability in FP16 softmax`
 
 ### PR Description Template
 

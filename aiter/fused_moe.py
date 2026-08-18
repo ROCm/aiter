@@ -1972,11 +1972,15 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+        _validate_v2_gemm2_dtypes,
+        mxfp4_moe_gemm2,
+    )
 
     cfg = parse_flydsl_v2_gemm2_kernel(kernelName)
     if cfg is None:
         raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
+    _validate_v2_gemm2_dtypes(cfg["a_dtype"], cfg["b_dtype"])
 
     bm = cfg["tile_m"]
     bn = cfg["tile_n"]
@@ -2056,6 +2060,7 @@ def _flydsl_v2_stage2_wrapper(
         BK=bk,
         use_nt=cfg["use_nt"],
         a_dtype=cfg["a_dtype"],
+        b_dtype=cfg["b_dtype"],
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
