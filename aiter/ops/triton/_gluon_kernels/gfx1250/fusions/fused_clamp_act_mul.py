@@ -12,7 +12,6 @@ from triton.experimental.gluon import language as gl
 from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _GLUON_REPR_KEYS = [
     "ROWS_PER_PROG",
     "BLOCK_SIZE_N",
@@ -66,8 +65,12 @@ def _fused_clamp_silu_mul_kernel(
     cache_modifier: gl.constexpr,
 ):
     # constants
-    NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
-    ROWS_PER_PROG_TOTAL: gl.constexpr = ROWS_PER_PROG * BLOCK_SIZE_M # total rows processed
+    NUM_N_Q_GROUPS: gl.constexpr = (
+        BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+    )  # quant groups per row
+    ROWS_PER_PROG_TOTAL: gl.constexpr = (
+        ROWS_PER_PROG * BLOCK_SIZE_M
+    )  # total rows processed
 
     # LDS layout for the staged input tiles; padded to break bank conflicts,
     # interval clamped to what the TDM descriptor can encode (1024B)
@@ -104,10 +107,8 @@ def _fused_clamp_silu_mul_kernel(
     )
 
     # async loads gate + up
-    gl.amd.gfx1250.tdm.async_load(
-        inp_desc, [m_start, n_start], smem.index(0))
-    gl.amd.gfx1250.tdm.async_load(
-        inp_desc, [m_start, n_half + n_start], smem.index(1))
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, n_start], smem.index(0))
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, n_half + n_start], smem.index(1))
 
     # layout for input tile
     N_PER_THREAD: gl.constexpr = max(1, min(8, BLOCK_SIZE_N // (32 * num_warps)))
@@ -117,7 +118,7 @@ def _fused_clamp_silu_mul_kernel(
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
-    
+
     # register layout for group scale tile
     if NUM_N_Q_GROUPS > 128:
         reg_group_bases: gl.constexpr = [
@@ -216,19 +217,21 @@ def _fused_clamp_silu_mul_kernel(
     # row ids in the data layout
     m_ids = gl.arange(0, BLOCK_SIZE_M, layout=m_layout)
 
-    store_offs = (
-        m_ids[:, None] * out_stride_m + cols[None, :] * out_stride_n
-    ).to(gl.int32)
+    store_offs = (m_ids[:, None] * out_stride_m + cols[None, :] * out_stride_n).to(
+        gl.int32
+    )
 
     # main loop
     for i in range(ROWS_PER_PROG - 1):
         # prefetch the next tile's halves, overlapping this trip's work
         gl.amd.gfx1250.tdm.async_load(
-            inp_desc, [m_start + (i + 1) * BLOCK_SIZE_M, n_start],
+            inp_desc,
+            [m_start + (i + 1) * BLOCK_SIZE_M, n_start],
             smem.index(2 * (i + 1)),
         )
         gl.amd.gfx1250.tdm.async_load(
-            inp_desc, [m_start + (i + 1) * BLOCK_SIZE_M, n_start + n_half],
+            inp_desc,
+            [m_start + (i + 1) * BLOCK_SIZE_M, n_start + n_half],
             smem.index(2 * (i + 1) + 1),
         )
 
@@ -246,7 +249,9 @@ def _fused_clamp_silu_mul_kernel(
                 w = gl.amd.gfx1250.buffer_load(
                     weights_ptr + row.to(gl.int64) * weights_stride_m,
                     (cols * weights_stride_n).to(gl.int32),
-                    mask=mask, other=0.0, cache=cache_modifier,
+                    mask=mask,
+                    other=0.0,
+                    cache=cache_modifier,
                 )
 
         s_abs_rows = row + s_rows
@@ -273,7 +278,7 @@ def _fused_clamp_silu_mul_kernel(
                 + bs_offs_0 * 2 * 16 * SCALE_N_PAD
             )
         else:
-            bs_offs = 0 # not needed
+            bs_offs = 0  # not needed
 
         # wait for this tile
         gl.amd.gfx1250.tdm.async_wait(2)
@@ -297,33 +302,35 @@ def _fused_clamp_silu_mul_kernel(
         if HAS_QUANT:
             if SCALE_FMT == "ue8m0":
                 # mxfp8, reduce over inner QUANT_BLOCK_SIZE axis.
-                out_3d = gl.reshape(out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE])
+                out_3d = gl.reshape(
+                    out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE]
+                )
                 abs_3d = gl.maximum(out_3d, -out_3d)
-                max_val = gl.max(abs_3d, axis=2, keep_dims=True)   # [BM, NQB, 1]
+                max_val = gl.max(abs_3d, axis=2, keep_dims=True)  # [BM, NQB, 1]
                 dequant_scale = max_val / DTYPE_MAX
                 # ROUND_UP to a power of two via the fp32 exponent field.
                 dequant_scale_exp = (
                     dequant_scale.to(gl.uint32, bitcast=True) + 0x007FFFFF
                 ) & 0x7F800000
                 dequant_scale_rounded = dequant_scale_exp.to(gl.float32, bitcast=True)
-                quant_scale = gl.where(                       # reciprocal, guard 0
+                quant_scale = gl.where(  # reciprocal, guard 0
                     dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
                 )
                 quant_tensor = out_3d * quant_scale  # scale into fp8 range
                 out_q = gl.convert_layout(
                     gl.reshape(quant_tensor, [BLOCK_SIZE_M, BLOCK_SIZE_N]), xLayout2D
                 )
-                scale_exp = (dequant_scale_exp >> 23).to(gl.uint8)   # [BM, NQB, 1]
+                scale_exp = (dequant_scale_exp >> 23).to(gl.uint8)  # [BM, NQB, 1]
                 block_scales = gl.convert_layout(
                     gl.reshape(scale_exp, [BLOCK_SIZE_M, NUM_N_Q_GROUPS]), scaleLayout2D
                 )
             else:
                 # fp8 quant
-                out_3d = gl.reshape(out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE])
-                abs_3d = gl.maximum(out_3d, -out_3d)
-                max_val = gl.maximum(
-                    gl.max(abs_3d, axis=2, keep_dims=True), 1e-10
+                out_3d = gl.reshape(
+                    out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE]
                 )
+                abs_3d = gl.maximum(out_3d, -out_3d)
+                max_val = gl.maximum(gl.max(abs_3d, axis=2, keep_dims=True), 1e-10)
                 scale_out = max_val / DTYPE_MAX
                 quant_3d = gl.clamp(out_3d * (1.0 / scale_out), DTYPE_MIN, DTYPE_MAX)
                 out_q = gl.convert_layout(
@@ -341,7 +348,7 @@ def _fused_clamp_silu_mul_kernel(
                 gl.amd.gfx1250.buffer_store(
                     block_scales.to(scale_ptr.dtype.element_ty),
                     scale_ptr,
-                    bs_offs.to(gl.int32), # exists
+                    bs_offs.to(gl.int32),  # exists
                     mask=scale_mask,
                 )
             else:
@@ -380,7 +387,9 @@ def _fused_clamp_silu_mul_kernel(
             w = gl.amd.gfx1250.buffer_load(
                 weights_ptr + row.to(gl.int64) * weights_stride_m,
                 (cols * weights_stride_n).to(gl.int32),
-                mask=mask, other=0.0, cache=cache_modifier,
+                mask=mask,
+                other=0.0,
+                cache=cache_modifier,
             )
 
     # scale offsets and mask
@@ -408,7 +417,7 @@ def _fused_clamp_silu_mul_kernel(
             + bs_offs_0 * 2 * 16 * SCALE_N_PAD
         )
     else:
-        bs_offs = 0 # not needed
+        bs_offs = 0  # not needed
 
     # last tile, nothing left to overlap with, so drain fully
     gl.amd.gfx1250.tdm.async_wait(0)
@@ -434,7 +443,7 @@ def _fused_clamp_silu_mul_kernel(
         if SCALE_FMT == "ue8m0":
             out_3d = gl.reshape(out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE])
             abs_3d = gl.maximum(out_3d, -out_3d)
-            max_val = gl.max(abs_3d, axis=2, keep_dims=True)   # [BM, NQB, 1]
+            max_val = gl.max(abs_3d, axis=2, keep_dims=True)  # [BM, NQB, 1]
             dequant_scale = max_val / DTYPE_MAX
             dequant_scale_exp = (
                 dequant_scale.to(gl.uint32, bitcast=True) + 0x007FFFFF
@@ -455,9 +464,7 @@ def _fused_clamp_silu_mul_kernel(
             # fp8 quant
             out_3d = gl.reshape(out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE])
             abs_3d = gl.maximum(out_3d, -out_3d)
-            max_val = gl.maximum(
-                gl.max(abs_3d, axis=2, keep_dims=True), 1e-10
-            )
+            max_val = gl.maximum(gl.max(abs_3d, axis=2, keep_dims=True), 1e-10)
             scale_out = max_val / DTYPE_MAX
             quant_3d = gl.clamp(out_3d * (1.0 / scale_out), DTYPE_MIN, DTYPE_MAX)
             out_q = gl.convert_layout(
@@ -481,8 +488,9 @@ def _fused_clamp_silu_mul_kernel(
             gl.amd.gfx1250.buffer_store(
                 block_scales.to(scale_ptr.dtype.element_ty),
                 scale_ptr + row.to(gl.int64) * scale_stride_m,
-                (s_rows[:, None] * scale_stride_m
-                    + g_offs[None, :] * scale_stride_n).to(gl.int32),
+                (
+                    s_rows[:, None] * scale_stride_m + g_offs[None, :] * scale_stride_n
+                ).to(gl.int32),
                 mask=scale_mask,
             )
     else:

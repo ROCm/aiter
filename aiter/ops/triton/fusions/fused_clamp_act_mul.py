@@ -3,19 +3,19 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
-    _fused_clamp_silu_mul_kernel,
-)
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
+    _fused_clamp_silu_mul_kernel,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -30,6 +30,7 @@ def _is_gluon_available():
         return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
     except Exception:
         return False
+
 
 def _get_config(M: int, N: int, block_size_n: int) -> dict:
     # For gluon
@@ -84,28 +85,28 @@ def _get_config(M: int, N: int, block_size_n: int) -> dict:
 
 def fused_clamp_act_mul(
     inp: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
     swiglu_limit: float = 0,
     activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
-    weights: Optional[torch.Tensor] = None,
+    weights: torch.Tensor | None = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
-    block_size_n: Optional[int] = None,
-    backend: Optional[str] = None,
+    block_size_n: int | None = None,
+    backend: str | None = None,
 ):
     """
-    Fusion of chunk + activation + multiply + quantize, 
+    Fusion of chunk + activation + multiply + quantize,
     optional FP8 quant/shuffle.
 
     Splits inp into two halves, gate and up, then computes:
 
         out = act(clamp(gate)) * clamp(up) * weights
 
-    (clamp and weights if applicable) 
+    (clamp and weights if applicable)
 
     Args:
         inp: input, shape [M, 2N], contiguous. Splits to [M,N] for both gate/up
@@ -118,10 +119,10 @@ def fused_clamp_act_mul(
         transpose_scale: store scales as [N_blocks, M] instead of [M, N_blocks]
         quant_block_size: how many columns share one scale, default 128.
             N_blocks = ceil(N / quant_block_size).
-        scale_dtype_fmt: scale format, options "fp32" or "ue8m0" 
+        scale_dtype_fmt: scale format, options "fp32" or "ue8m0"
             (ue8m0 requires quant_block_size=32 and FP8 E4M3 dtype_quant)
         shuffle_scale: write scales in the preshuffled layout, padded to
-            [ceil(M/256)*256, ceil(N_blocks/8)*8]. 
+            [ceil(M/256)*256, ceil(N_blocks/8)*8].
             Requires scale_dtype_fmt="ue8m0"
         backend: specify "triton" or "gluon".
             None picks "gluon" on supported architectures, otherwise "triton"
@@ -132,7 +133,7 @@ def fused_clamp_act_mul(
     Constraints:
         N must be a power of two, at least 128, and a multiple of 128.
     """
-    
+
     # setup inputs
     assert inp.dim() == 2
     M, D = inp.shape
@@ -288,12 +289,12 @@ def fused_clamp_act_mul(
         )
 
         # triton/gluon
-        assert BLOCK_SIZE_M & (BLOCK_SIZE_M - 1) == 0, (
-            f"BLOCK_SIZE_M ({BLOCK_SIZE_M}) must be a power of two"
-        )
-        assert BLOCK_SIZE_N & (BLOCK_SIZE_N - 1) == 0, (
-            f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a power of two"
-        )
+        assert (
+            BLOCK_SIZE_M & (BLOCK_SIZE_M - 1) == 0
+        ), f"BLOCK_SIZE_M ({BLOCK_SIZE_M}) must be a power of two"
+        assert (
+            BLOCK_SIZE_N & (BLOCK_SIZE_N - 1) == 0
+        ), f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a power of two"
 
         assert (
             _is_gluon_available()

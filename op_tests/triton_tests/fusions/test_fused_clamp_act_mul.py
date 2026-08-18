@@ -1,18 +1,18 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
 import aiter
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-    fused_clamp_act_mul,
     _is_gluon_available,
+    fused_clamp_act_mul,
 )
+from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 from aiter.utility import fp4_utils
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     per_token_fp8_group_quant,
     upcast,
 )
-from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 
 
 def _maybe_skip_backend(backend):
@@ -49,7 +49,13 @@ def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
 @pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul(
-    M, D, swiglu_limit, transpose_scale, with_weights, weight_broadcast, dtype_quant,
+    M,
+    D,
+    swiglu_limit,
+    transpose_scale,
+    with_weights,
+    weight_broadcast,
+    dtype_quant,
     backend,
 ):
     _maybe_skip_backend(backend)

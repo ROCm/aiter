@@ -20,10 +20,11 @@ import argparse
 
 import torch
 import triton
+
 from aiter import dtypes
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-    fused_clamp_act_mul,
     _is_gluon_available,
+    fused_clamp_act_mul,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -41,12 +42,11 @@ _QUANT_MODES = {
 def get_x_vals():
     """Default (M, N) sweep; N value is n_half."""
     return [
-        (128, 4096), # small M, med N
-        (16384, 4096), # large M, med N
-        (4096, 512), # med M, small N
-        (16384, 8192), # both large, but proper intermediate size
-        (8192, 8192), # equal M=N, both med-large
-
+        (128, 4096),  # small M, med N
+        (16384, 4096),  # large M, med N
+        (4096, 512),  # med M, small N
+        (16384, 8192),  # both large, but proper intermediate size
+        (8192, 8192),  # equal M=N, both med-large
     ]
 
 
@@ -95,9 +95,7 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_fused_clamp_act_mul(M, n_half, metric, **kwargs):
         inp = torch.randn((M, 2 * n_half), dtype=dtype, device="cuda") * 3.0
-        weights = (
-            torch.randn((M, 1), dtype=dtype, device="cuda") if weighted else None
-        )
+        weights = torch.randn((M, 1), dtype=dtype, device="cuda") if weighted else None
 
         # Preallocate outputs so the timed fn does no allocation (clean CUDA-graph
         # capture): the wrapper writes into the provided out/scale buffers.
@@ -110,7 +108,7 @@ def run_benchmark(args):
         else:
             scale = None
 
-        fn = lambda: fused_clamp_act_mul(  # noqa: E731
+        fn = lambda: fused_clamp_act_mul(
             inp,
             out=out,
             scale=scale,
@@ -223,7 +221,7 @@ def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args)
