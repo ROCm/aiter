@@ -52,6 +52,19 @@ def _ptr_rsrc(ptr):
     return buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(ptr)))
 
 
+def _ptr_rsrc_off(ptr, byte_off_i64):
+    """Buffer resource whose base is ``ptr`` advanced by an i64 **byte** offset.
+
+    K3 Tier-2 addressing: at DeepSeek E=256 FP8 the per-expert weight base exceeds
+    the i32 byte range (``E*H*I`` >= 2^31 bytes), so the whole-pool element offset
+    times the dtype size wraps a signed i32 and the wave reads garbage. Folding the
+    per-expert base into the descriptor base as i64 keeps the per-lane in-expert
+    element offset i32-safe (an expert spans H*I <= ~1.5e7 bytes).
+    """
+    base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(byte_off_i64)
+    return buffer_ops.create_buffer_resource_from_addr(base)
+
+
 def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
     """``d = a.lo*b.lo + a.hi*b.hi + acc`` via one ``v_dot2_f32_bf16``.
 
@@ -326,6 +339,7 @@ def build_gate_up_fp8_module(
     serialize_dot2: bool = True,
     scale_bn: int | None = None,
     scale_bk: int | None = None,
+    num_experts: int | None = None,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -368,6 +382,13 @@ def build_gate_up_fp8_module(
     elif w_scale_mode not in ("pertensor", "pertoken"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     scale_cols_g = (hidden // scale_bk) if w_scale_mode == "block2d" else 0
+    # K3 Tier-2 guard: only pay the i64 per-expert base when the FP8 weight pool
+    # (E*INTER*HIDDEN bytes) exceeds the i32 byte range; keep the i32-safe fast
+    # path (and all smaller shapes) on whole-pool addressing.
+    use_i64_base = const_expr(
+        num_experts is not None and num_experts * inter * hidden >= 2**31
+    )
+    bytes_per_expert = inter * hidden  # fp8 = 1 byte/elem
 
     @flyc.kernel
     def _kernel(
@@ -396,8 +417,18 @@ def build_gate_up_fp8_module(
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
-        wg_rsrc = _ptr_rsrc(wg_ptr)
-        wu_rsrc = _ptr_rsrc(wu_ptr)
+        # Tier-2 (E*I*H >= 2^31): fold the per-expert base into the descriptor as
+        # i64 and address weights by the i32-safe in-expert dword base; otherwise
+        # keep whole-pool addressing (w_word_base carries the full w_row offset).
+        if const_expr(use_i64_base):
+            ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
+            wg_rsrc = _ptr_rsrc_off(wg_ptr, ebase)
+            wu_rsrc = _ptr_rsrc_off(wu_ptr, ebase)
+            w_word_base = neuron_j * (hidden // 4)
+        else:
+            wg_rsrc = _ptr_rsrc(wg_ptr)
+            wu_rsrc = _ptr_rsrc(wu_ptr)
+            w_word_base = w_row * (hidden // 4)
 
         one_f32 = fx.Float32(1.0).ir_value()
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
@@ -413,7 +444,7 @@ def build_gate_up_fp8_module(
             for i in range_constexpr(num_iter):
                 k_base = i * ktile_n + lane * kvector
                 x_word0 = (token_b * hidden + k_base) // 2
-                w_word0 = w_row * (hidden // 4) + k_base // 4
+                w_word0 = w_word_base + k_base // 4
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
                 gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
                 uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
@@ -445,7 +476,7 @@ def build_gate_up_fp8_module(
                 k_base = i * ktile_n + lane * kvector
                 # element bases -> word (i32) offsets: x 2 bf16/word, w 4 fp8/word.
                 x_word0 = (token_b * hidden + k_base) // 2
-                w_word0 = w_row * (hidden // 4) + k_base // 4
+                w_word0 = w_word_base + k_base // 4
                 # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
                 gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
@@ -525,6 +556,7 @@ def build_down_reduce_fp8_module(
     scale_bk: int | None = None,
     kh_per_warp: int = 1,
     k_batch: int = 1,
+    num_experts: int | None = None,
 ):
     """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
 
@@ -589,6 +621,12 @@ def build_down_reduce_fp8_module(
     elif w_scale_mode not in ("pertensor", "pertoken"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     scale_cols_d = (inter // scale_bk) if w_scale_mode == "block2d" else 0
+    # K3 Tier-2 guard: only pay the i64 per-expert base when the FP8 weight pool
+    # (E*HIDDEN*INTER bytes) exceeds the i32 byte range.
+    use_i64_base = const_expr(
+        num_experts is not None and num_experts * hidden * inter >= 2**31
+    )
+    bytes_per_expert = hidden * inter  # fp8 = 1 byte/elem
 
     @flyc.kernel
     def _kernel(
@@ -626,6 +664,15 @@ def build_down_reduce_fp8_module(
             )
             rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
+            # Tier-2 (E*H*I >= 2^31): fold the per-expert base into the descriptor
+            # as i64 so the in-expert dword base stays i32-safe; else whole-pool.
+            if const_expr(use_i64_base):
+                ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
+                wd_rsrc_e = _ptr_rsrc_off(wd_ptr, ebase)
+                w_word_base = [(out_j0 + h) * (inter // 4) for h in range(kh_per_warp)]
+            else:
+                wd_rsrc_e = wd_rsrc
+                w_word_base = [w_row[h] * (inter // 4) for h in range(kh_per_warp)]
 
             if const_expr(block2d):
                 # Block2D<BN,BK> scale varies along K -> fold each K-block's
@@ -638,7 +685,7 @@ def build_down_reduce_fp8_module(
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
                         load_i32_words(
-                            wd_rsrc, w_row[h] * (inter // 4) + k_base // 4, n_wwords
+                            wd_rsrc_e, w_word_base[h] + k_base // 4, n_wwords
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -684,7 +731,7 @@ def build_down_reduce_fp8_module(
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
                         load_i32_words(
-                            wd_rsrc, w_row[h] * (inter // 4) + k_base // 4, n_wwords
+                            wd_rsrc_e, w_word_base[h] + k_base // 4, n_wwords
                         )
                         for h in range(kh_per_warp)
                     ]
