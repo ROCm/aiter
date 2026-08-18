@@ -30,9 +30,33 @@ TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 8))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
 BENCH = os.environ.get("BENCH") == "1"
+BALANCED = os.environ.get("BALANCED") == "1"
 ITERS = int(os.environ.get("ITERS", 50))
 WARMUP = int(os.environ.get("WARMUP", 10))
 DTYPE = torch.bfloat16
+
+
+def _balanced_idx(pe, n_tok, n_experts, world, epr, topk):
+    """Every expert draws the same number of tokens, by construction.
+
+    randperm routing is only balanced on average, so a sweep measures the tail
+    of a multinomial as much as it measures the transport. Here route j of token
+    t lands on rank ``j % world``, which spreads a token over the ranks as evenly
+    as topk allows, and walks the destination rank's local experts on a stride
+    that rotates with the token id (and with the sending rank, so the ranks do
+    not march in lockstep). Each expert then takes exactly ``n_tok * topk /
+    n_experts`` routes from each sender.
+
+    Note this is also the heaviest traffic pattern available: with topk >= world
+    every token reaches every rank, so each rank receives ``world * n_tok`` rows
+    where random routing leaves a few percent of the pairs unrouted.
+    """
+    per_rank = -(-topk // world)  # ceil: how many of a token's routes share a rank
+    t = torch.arange(n_tok).unsqueeze(1)
+    j = torch.arange(topk).unsqueeze(0)
+    dest = j % world
+    local = (t * per_rank + j // world + pe) % epr
+    return (dest * epr + local).int()
 
 
 def _bootstrap():
@@ -129,7 +153,14 @@ def _time(op, comm, all_idx, all_wts, all_tok, rank, n_tok):
     """(us per dispatch, tokens landed in this rank's recv buffer)."""
     inp, w, i = all_tok[rank][:n_tok], all_wts[rank][:n_tok], all_idx[rank][:n_tok]
     for _ in range(WARMUP):
-        _out, _w, _s, _i, total_recv = op.dispatch(inp, w, None, i)
+        op.dispatch(inp, w, None, i)
+    torch.cuda.synchronize()
+    comm.barrier()
+    # One quiesced dispatch for the row count. Reading it out of the timed loop
+    # undercounts: that loop runs back-to-back with no barrier between ranks, so
+    # a peer is still landing rows from iteration N when this rank resets its
+    # counter for N + 1.
+    _out, _w, _s, _i, total_recv = op.dispatch(inp, w, None, i)
     torch.cuda.synchronize()
     comm.barrier()
     recv = int(total_recv.item())
@@ -156,15 +187,35 @@ def main():
     all_idx, all_wts, all_tok = [], [], []
     for pe in range(world):
         g = torch.Generator().manual_seed(1000 + pe)
-        idx = torch.stack(
-            [torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(max_tok)]
-        ).int()
+        if BALANCED:
+            idx = _balanced_idx(pe, max_tok, n_experts, world, EPR, TOPK)
+        else:
+            idx = torch.stack(
+                [torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(max_tok)]
+            ).int()
         wts = torch.rand(max_tok, TOPK, generator=g)
         tok = torch.randn(max_tok, HIDDEN, generator=g).to(DTYPE)
         dev = f"cuda:{local}"
         all_idx.append(idx.to(dev))
         all_wts.append(wts.to(dev))
         all_tok.append(tok.to(dev))
+
+    if rank == 0:
+        load = torch.zeros(n_experts, dtype=torch.int64)
+        for pe in range(world):
+            load += torch.bincount(
+                all_idx[pe][: max(SWEEP)].reshape(-1).cpu(), minlength=n_experts
+            )
+        dup = sum(
+            int((torch.unique(all_idx[pe][: max(SWEEP)], dim=1).shape[1] != TOPK))
+            for pe in range(world)
+        )
+        print(
+            f"# routing={'balanced' if BALANCED else 'random'} "
+            f"experts={n_experts} load min/max={int(load.min())}/{int(load.max())} "
+            f"dup_rows={dup}",
+            flush=True,
+        )
 
     comm = Communicator.init(world, rank, uid)
 
