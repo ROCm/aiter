@@ -552,6 +552,7 @@ def test_mha_sliding_window_no_sink(
 
 
 def test_mha_sliding_window_fused_backward_raises():
+    torch.manual_seed(0)
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
@@ -575,6 +576,7 @@ def test_mha_sliding_window_fused_backward_raises():
 
 
 def test_mha_varlen_sliding_window_fused_backward_raises():
+    torch.manual_seed(0)
     q = torch.randn(
         (1, 64, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )

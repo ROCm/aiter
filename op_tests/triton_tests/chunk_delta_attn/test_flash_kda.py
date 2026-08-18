@@ -435,6 +435,7 @@ def test_final_state_matches_fp32_recurrence(lower_bound):
 
 
 def test_supported_rejects_unsupported():
+    torch.manual_seed(42)
     q = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
     v = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
     A_log = torch.randn(4, device=device, dtype=torch.float32)
