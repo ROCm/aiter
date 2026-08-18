@@ -194,12 +194,14 @@ def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
     value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=torch.bfloat16)
     tiles = (sequence + 127) // 128
     if sequence % 128:
-        value = torch.cat(
+        reference_value = torch.cat(
             [value, value[:, -1:].expand(-1, tiles * 128 - sequence, -1, -1)],
             dim=1,
         )
+    else:
+        reference_value = value
 
-    combined = quantize_fp6_v_clean_triton(value, direct_p=True).view(
+    combined = quantize_fp6_v_clean_triton(reference_value, direct_p=True).view(
         1, 2, tiles, 12800
     )
     data, scale = quantize_fp6_v_data_scale_triton(value)
