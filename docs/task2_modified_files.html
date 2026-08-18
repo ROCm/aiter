@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Task2：OPUS 选核归 AITER/Torch 与 C++ kid dispatch</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #5d687c;
+      --line: #dce3ef;
+      --violet: #5b35b5;
+      --violet-soft: #f1edff;
+      --green: #087a50;
+      --green-soft: #e8f8f1;
+      --amber: #9a5a00;
+      --amber-soft: #fff5de;
+      --code: #edf1f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 32px auto 72px; }
+    header, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 8px 28px rgba(31, 48, 83, .06);
+    }
+    header { padding: 30px 34px; }
+    section { margin-top: 18px; padding: 24px 28px; }
+    h1 { margin: 0 0 8px; font-size: clamp(25px, 4vw, 38px); line-height: 1.25; }
+    h2 { margin: 0 0 14px; font-size: 21px; }
+    h3 { margin: 22px 0 10px; font-size: 17px; }
+    p { margin: 8px 0; }
+    .meta, .muted { color: var(--muted); }
+    .status {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--green-soft);
+      font-weight: 700;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .card {
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #fbfcff;
+    }
+    .card strong { display: block; margin-bottom: 5px; color: var(--violet); }
+    code {
+      padding: 2px 5px;
+      border-radius: 5px;
+      background: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .92em;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 12px 0 0;
+      padding: 16px;
+      overflow-x: auto;
+      border-radius: 10px;
+      background: #111827;
+      color: #e8eefb;
+      font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; }
+    .flow { display: grid; gap: 8px; margin-top: 14px; }
+    .node {
+      padding: 12px 14px;
+      border: 1px solid #d4c9f3;
+      border-radius: 9px;
+      background: var(--violet-soft);
+    }
+    .arrow { text-align: center; color: var(--violet); font-weight: 800; }
+    .flow-compare {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      align-items: start;
+      margin-top: 14px;
+    }
+    .flow-panel {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcff;
+    }
+    .flow-panel.before { border-top: 5px solid var(--amber); }
+    .flow-panel.current { border-top: 5px solid var(--green); }
+    .flow-panel h3 { margin: 0 0 12px; }
+    .flow-step {
+      padding: 11px 12px;
+      border: 1px solid #ddd6f2;
+      border-radius: 9px;
+      background: #fff;
+    }
+    .flow-step strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--violet);
+    }
+    .flow-panel.before .flow-step.key { background: var(--amber-soft); }
+    .flow-panel.current .flow-step.key { background: var(--green-soft); }
+    .flow-arrow {
+      padding: 4px 0;
+      text-align: center;
+      color: var(--violet);
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .branch-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .branch-card {
+      padding: 9px 10px;
+      border: 1px dashed #c5b9e5;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .75);
+    }
+    .branch-card b { display: block; margin-bottom: 3px; }
+    .flow-result {
+      border-color: #acd8c5;
+      background: var(--green-soft);
+    }
+    .ok {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-left: 4px solid var(--green);
+      background: var(--green-soft);
+    }
+    .note {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-left: 4px solid var(--amber);
+      background: var(--amber-soft);
+      color: #633d08;
+    }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td {
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f0edf9; white-space: nowrap; }
+    td:first-child { min-width: 235px; }
+    .group-row td {
+      min-width: 0;
+      padding: 8px 12px;
+      color: var(--violet);
+      background: var(--violet-soft);
+      font-weight: 750;
+    }
+    ul { margin: 8px 0; padding-left: 22px; }
+    li + li { margin-top: 5px; }
+    .metric { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    @media (max-width: 850px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow-compare { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      main { width: min(100% - 18px, 1180px); margin-top: 10px; }
+      header, section { padding: 20px 16px; border-radius: 10px; }
+      .grid { grid-template-columns: 1fr; }
+      .branch-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Task2：OPUS 选核归 AITER/Torch，C++ 只按 kid dispatch</h1>
+    <p class="meta">最终代码状态 · 更新日期：2026-08-18 · 固定历史比较基线：<code>a43694f1</code> · 已同步最新 GEMM/BMM public 拆分。</p>
+    <span class="status">Task2 功能与回归验收完成</span>
+    <div class="grid">
+      <div class="card"><strong>Python 选核</strong>tuned 候选校验与可复用 heuristic helper 只存在于 AITER/Torch；当前 tuned miss 不自动进入 OPUS heuristic。</div>
+      <div class="card"><strong>C++ 边界</strong>只保留启动所需检查、kernel 入口和 kid → launcher dispatch。</div>
+      <div class="card"><strong>BMM kid</strong>checked-in CSV 保持 upstream local id；仅在加载 OPUS row 时转换为 8000 段 global kid。</div>
+      <div class="card"><strong>接口整理</strong>public 按逻辑 2D GEMM / batch-first 3D BMM 拆分；family module 再按 A16W16/A8W8 拆分，底层 exact launcher 复用。</div>
+    </div>
+  </header>
+
+  <section id="status">
+    <h2>1. 最终验收结论</h2>
+    <ul>
+      <li>gfx950 A16 只把合法 tuned row 的最终 kid 交给 OPUS；tuned miss 保持原有 skinny/PyTorch fallback，不自动进入 OPUS heuristic。gfx950 A8 no-scale kid 2 与 blockscale kid 1 分别进入自己的生成表。</li>
+      <li>A16 依次尝试原始/padded-M tuned 候选，每个候选都在 exact public 前完成 legacy redirect 和 kid/split-K 整体校验；可复用 per-arch heuristic 已抽象到 <code>a16w16_policy.py</code>，但当前 <code>tuned_gemm</code> miss 不调用它。C++ runtime shape/tune lookup 和 C++ heuristic 已删除。</li>
+      <li>选核、dtype/layout/scale 路由、输出准备、split-K/workspace 和 framework fallback 均由 AITER/Torch 负责；C++ 只保留启动所需安全检查、kid → launcher 查询和 kernel launch。</li>
+      <li>Python public 拆为 strict 2D <code>opus_gemm()</code> 与 batch-first 3D <code>opus_bmm()</code>；A16/A8 family module 提供成对 adapter，继续共享 exact launcher、workspace planner、C++ ABI 和 kernel。MXFP8 仅允许 BMM。</li>
+      <li>checked-in DSV4 BMM CSV 保持 upstream local <code>kernelId=0..653</code>；<code>batched_gemm_op_a8w8.py</code> 只对加载到内存的 OPUS row执行 <code>kid + 8000</code>，最终 exact dispatcher接收 <code>8000..8653</code>。</li>
+    </ul>
+  </section>
+
+  <section id="flow">
+    <h2>2. 原本流程与当前流程</h2>
+    <div class="flow-compare" role="group" aria-label="OPUS GEMM runtime policy 简化前后流程对比">
+      <article class="flow-panel before">
+        <h3>Task2 改造前</h3>
+        <div class="flow-step">
+          <strong>1. Python wrapper 先查一套 tuned 配置</strong>
+          <code>gemm_op_a16w16.py</code> / <code>common.py::lookup_tuned()</code> 根据 shape 查 CSV；显式 kernelId 或命中 tuned row 时进入旧 tune API。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step key">
+          <strong>2. Python miss 后进入 C++ 的另一套策略</strong>
+          <div class="branch-grid">
+            <div class="branch-card"><b>Python 命中</b>把 kid/split-K 传给旧 A16/A8 tune entry。</div>
+            <div class="branch-card"><b>Python 未命中</b><code>_opus_gemm_bf16_dispatch()</code> → generic C++ <code>opus_gemm()</code>。</div>
+          </div>
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step key">
+          <strong>3. C++ runtime lookup</strong>
+          Generated shape/tune lookup 再按 M/N/K、dtype、bias 等条件查一次；C++ 同时保存一份 runtime policy。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step key">
+          <strong>4. C++ per-arch heuristic</strong>
+          lookup miss 后进入 gfx942/gfx950/gfx1250 各自的 C++ heuristic，再决定实际 launcher 或 kid。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step">
+          <strong>5. dtype/layout 处理混在 generic 入口</strong>
+          A16 与多种 A8 路径共用或复用 generic/tune 参数，scale 可选，Python、pybind 和 <code>opus_gemm.cu</code> 的合同分散。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step flow-result">
+          <strong>6. GPU 执行</strong>
+          C++ 最终选择 launcher 并启动 GPU kernel。选核与 kernel launch 都落在 C++ 路径中。
+        </div>
+      </article>
+
+      <article class="flow-panel current">
+        <h3>当前</h3>
+        <div class="flow-step key">
+          <strong>1. AITER/Torch 完成全部选核</strong>
+          <div class="branch-grid">
+            <div class="branch-card"><b>显式 kid</b>直接采用调用时提供的最终 kid。</div>
+            <div class="branch-card"><b>A16 tuned候选</b><code>tuned_gemm.py</code> 依次读取原始/padded-M row，校验 kid/split-K，并在 exact public 前完成必要的 gfx942 caller redirect。</div>
+            <div class="branch-card"><b>A16 tuned miss</b>保持 skinny/PyTorch fallback，不自动运行 OPUS heuristic；显式使用 policy helper 的其他 caller 仍须在 public 前完成 exact 校验。</div>
+            <div class="branch-card"><b>MXFP8 BMM</b>读取 local kid CSV；仅 OPUS row在内存中执行 <code>+8000</code>，再校验 padded-M 和 fallback heuristic。</div>
+            <div class="branch-card"><b>OPUS 不可用</b>由上层进入 PyTorch/其他 backend fallback。</div>
+          </div>
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step">
+          <strong>2. operation 与最终 kid 进入当前 Python public</strong>
+          逻辑 2D 调用 <code>opus_gemm(XQ, WQ, Y, kid=...)</code>，batch-first 3D 调用 <code>opus_bmm(...)</code>；两者都不查 tuned CSV，也不运行 heuristic，dtype 不决定 GEMM/BMM。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step key">
+          <strong>3. Python 整理 dtype/layout</strong>
+          <code>kernels_list.get(kid)</code> 取得架构和 kernel 类型；dtype、layout、scale、bias 和 workspace 只做合同校验与参数准备，不重新选 kid。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step">
+          <strong>4. 进入对应私有启动函数</strong>
+          <div class="branch-grid">
+            <div class="branch-card"><b>A16W16</b><code>_launch_a16w16_gemm/bmm()</code> → <code>_launch_a16w16_exact()</code></div>
+            <div class="branch-card"><b>A8W8 no-scale</b><code>_launch_a8w8_gemm/bmm()</code> → <code>_launch_a8w8_exact()</code></div>
+            <div class="branch-card"><b>A8W8 blockscale</b><code>_launch_a8w8_blockscale_gemm/bmm()</code></div>
+            <div class="branch-card"><b>A8W8 bpreshuffle</b><code>_launch_a8w8_blockscale_bpreshuffle_gemm/bmm()</code></div>
+            <div class="branch-card"><b>MXFP8 BMM</b><code>_launch_a8w8_mxscale_bmm()</code></div>
+          </div>
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step">
+          <strong>5. Torch 侧完成 framework 工作</strong>
+          上层准备 <code>Y</code>；A16/MXFP8 需要 Split-K workspace 时由 Torch Tensor 提供；Python 完成 shape、device 和调用参数组织。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step key">
+          <strong>6. C++ 只做 kernel + kid dispatch</strong>
+          对应 raw binding 进入分开的 C++ launch API；<code>opus_gemm.cu</code> / <code>opus_bmm.cu</code> 只做启动所需安全检查，并按当前 arch、输出 dtype 和最终 kid 查询 launcher 表，不再执行 shape lookup、heuristic 或 unknown-kid fallback。
+        </div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step flow-result">
+          <strong>7. GPU 执行</strong>
+          Generated launcher 最终检查物理 shape/stride/tile 条件后启动 kernel；Split-K 路径可归约到 <code>Y</code>。
+        </div>
+      </article>
+    </div>
+    <div class="ok"><strong>与 Task1 的边界：</strong>Task2 在 <code>opus_gemm(kid=...)</code> 或 <code>opus_bmm(kid=...)</code> 前确定最终 exact kid；如果该 kid 是 A16 workspace family，随后由 Task1 的 Torch workspace 流程接管，但不会改变 kid。</div>
+  </section>
+
+  <section id="files">
+    <h2>3. 固定基线与当前最终版本的 Task2 文件差异</h2>
+    <p class="muted">以下状态均按 <code>a43694f1 → a174ab51</code> 计算；upstream 已存在的 BMM 文件按“修改”记录，未把它们误记为本分支新增。</p>
+    <h3>修改文件</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件</th><th>Task2 改造前</th><th>当前最终变化</th></tr></thead>
+        <tbody>
+          <tr class="group-row"><td colspan="3">Python 接口、选核与启动</td></tr>
+          <tr><td><code>aiter/ops/opus/__init__.py</code></td><td>导出 A16 shape/tune、A8 tune 等多个入口，dtype/layout 由调用方提前判断。</td><td>只导出 strict 2D <code>opus_gemm()</code> 与 batch-first 3D <code>opus_bmm()</code>；最终 kid 直查 <code>kernels_list</code> 后进入对应 private family adapter。</td></tr>
+          <tr><td><code>aiter/ops/opus/a16w16_policy.py</code></td><td>A16 候选校验与 heuristic 分散在 wrapper/C++。</td><td>集中可复用的 tuned-candidate validation 与 per-arch heuristic helper；public/C++ 不调用，当前 <code>tuned_gemm</code> miss 也不自动调用 heuristic。</td></tr>
+          <tr><td><code>aiter/ops/opus/gemm_op_a16w16.py</code></td><td>Python 查一遍 tuned CSV；miss 后调用 generic C++，由 C++ lookup/heuristic 再选一次。</td><td>GEMM/BMM adapter 复用一个 exact launcher、Torch workspace planner 和 C ABI；C++ 不再选核。</td></tr>
+          <tr><td><code>aiter/ops/opus/gemm_op_a8w8.py</code></td><td>generic/tune 路径混合 no-scale、blockscale 和 bpreshuffle；MXFP8 BMM private launch位于独立 <code>bmm_op.py</code>。</td><td>no-scale、blockscale、bpreshuffle 均提供 GEMM/BMM adapter并复用 family exact launcher；MXFP8 保持 BMM-only，在 adapter 内用零拷贝 transpose view衔接既有 raw ABI。</td></tr>
+          <tr><td><code>aiter/ops/opus/_arch.py</code></td><td>提供通用 arch 探测。</td><td>统一按显式 device 读取 arch/CU，供各私有启动函数校验最终 kid。</td></tr>
+          <tr><td><code>aiter/tuned_gemm.py</code></td><td>tuned miss 可落入 generic C++ 的 runtime lookup/heuristic。</td><td>在 AITER 上层依次尝试原始/padded-M tuned 候选并整体校验 kid/split-K；miss 后保持 skinny/PyTorch fallback；普通 2D GEMM 调用 <code>opus_gemm()</code>。</td></tr>
+          <tr><td><code>aiter/ops/gemm_op_a8w8.py</code></td><td>OPUS bpreshuffle row 调用旧 tune 接口。</td><td>改为向对应 GEMM public 传 <code>Y</code>、kid、layout 和 scale；CK、ASM、CKTile、FlyDSL 等其他 libtype 分支不变。</td></tr>
+          <tr><td><code>aiter/ops/batched_gemm_op_a8w8.py</code></td><td>已有 MXFP8 BMM tuned/padded-M lookup，但通过私有 <code>bmm_op.py</code> 使用 local kid 和旧配置属性。</td><td>自行发现/合并配置文件；仅对内存中的 OPUS local id执行 <code>+8000</code>，校验 global kid 后按 batch-first contract 调用 <code>opus_bmm()</code>。</td></tr>
+          <tr><td><code>aiter/jit/core.py</code></td><td>定义 MXScale BMM 配置常量和 <code>AITER_CONFIGS</code> 属性。</td><td>只删除这两项旧配置入口；通用 JIT、CSV 合并和 tuned→untuned 逻辑保持基线实现。</td></tr>
+          <tr><td><code>aiter/ops/deepgemm.py</code></td><td>保留旧 OPUS A16 compatibility shim。</td><td>删除 OPUS shim，只保留 CK binding。</td></tr>
+
+          <tr class="group-row"><td colspan="3">C++ ABI 与 kid dispatch</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/opus_gemm.h</code><br><code>csrc/opus_gemm/opus_gemm.cu</code></td><td>generic <code>opus_gemm()</code>、旧 tune entry、runtime shape lookup、C++ heuristic 和可选 scale 混在一起。</td><td>拆为 A16、A8 no-scale、A8 blockscale、A8 bpreshuffle 启动入口；只做必要检查并按 arch、输出 dtype 和最终 kid dispatch。</td></tr>
+          <tr><td><code>csrc/include/rocm_ops.hpp</code><br><code>csrc/pybind/opus_gemm_pybind.cu</code></td><td>注册 generic 与旧 A16/A8 tune binding。</td><td>改为参数合同明确的 A16/三种 A8 binding，并增加 MXFP8 BMM binding；这些底层函数不作为 Python public 导出。</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/opus_bmm.h</code><br><code>csrc/opus_gemm/opus_bmm.cu</code></td><td>upstream 已有 private/local-kid BMM 入口；未知 kid会回退 baseline launcher，workspace 由内部路径管理。</td><td>改为 global exact-kid API，显式接收 optional Torch workspace；未知 kid直接报错，不再替换或 fallback。</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/gfx942/opus_gemm_arch_gfx942.cuh</code><br><code>csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx1250/opus_gemm_arch_gfx1250.cuh</code></td><td>包含 runtime shape lookup、tuned miss 分支和 per-arch C++ heuristic；gfx950 也在 C++ 选核。</td><td>改为按 kernel 类型、输出 dtype 和最终 kid 查询 generated launcher 表，不再根据 shape/bias 选择另一个 kid。</td></tr>
+
+          <tr class="group-row"><td colspan="3"><code>kernels_list</code> 与 codegen</td></tr>
+          <tr><td><code>csrc/opus_gemm/opus_gemm_common.py</code></td><td>已有跨架构 kid 段、BMM local-id family和供 C++ runtime lookup 使用的默认/heuristic 数据。</td><td>把 45 个 BMM instance映射到 canonical global <code>8000..8653</code> 段，补充 arch/family/output/workspace capability，并以 <code>DEFAULT_COMPILED_KIDS</code> 取代 C++ heuristic默认集。</td></tr>
+          <tr><td><code>csrc/opus_gemm/gen_instances.py</code><br><code>csrc/opus_gemm/codegen/common.py</code></td><td>生成 runtime shape/tune lookup以及旧 BMM tune lookup。</td><td>删除 runtime shape dispatch，生成 A16/A8/BMM exact-kid表、manifest和 typed workspace ABI；<code>--tune_files</code> 仅决定编译子集。</td></tr>
+          <tr><td><code>csrc/opus_gemm/codegen/gen_instances_gfx942.py</code><br><code>csrc/opus_gemm/codegen/gen_instances_gfx950.py</code><br><code>csrc/opus_gemm/codegen/gen_instances_gfx1250.py</code></td><td>生成旧 generic/tune host 入口和 handle-based workspace launcher。</td><td>生成 exact-kid、caller-workspace launcher与严格物理条件检查；gfx950 的八类既有 BMM family统一到同一 global-kid ABI。</td></tr>
+
+          <tr class="group-row"><td colspan="3">A8 / MXFP8 GPU pipeline</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/gfx950/opus_bmm_launchers_a8w8_mxscale_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx950/splitk_reduce_gfx950.cuh</code></td><td>upstream 已有 BMM launcher/pipeline，使用 private local kid和内部 workspace handle。</td><td>增强 dtype/shape/stride/device检查，partial/counter/reducer改用 caller workspace direct pointer，并接入 global exact-kid API。</td></tr>
+
+          <tr class="group-row"><td colspan="3">工具与 README</td></tr>
+          <tr><td><code>csrc/gemm_a16w16/gemm_a16w16_tune.py</code><br><code>csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py</code><br><code>csrc/opus_gemm/opus_gemm_tune.py</code></td><td>候选 kernel 调用各自旧 tune API。</td><td>创建 <code>Y</code> 后按张量 rank 把候选 kid 和对应参数传给 <code>opus_gemm()</code> 或 <code>opus_bmm()</code>。</td></tr>
+          <tr><td><code>csrc/opus_gemm/opus_bmm_mxscale_tune.py</code></td><td>使用 private BMM raw binding和 local kid；workspace 由底层管理。</td><td>枚举 45 个 global kid，按 exact tile/split-K创建 Torch FP32 workspace，并通过 batch-first <code>opus_bmm()</code> 验证和计时。</td></tr>
+          <tr><td><code>op_tests/test_opus_a8w8_bmm.py</code><br><code>op_tests/test_opus_interfaces.py</code><br><code>op_tests/test_opus_dispatch.py</code></td><td>覆盖 upstream BMM 与原配置合并行为。</td><td>增加 GEMM/BMM rank 隔离、global/local kid 兼容、family adapter、caller workspace 和 Graph 回归。</td></tr>
+          <tr><td><code>aiter/ops/opus/README.md</code><br><code>csrc/opus_gemm/README.md</code></td><td>说明多个公开 API 和旧 runtime 路由。</td><td>说明两个 operation public、共享 family exact launcher、<code>kernels_list</code>、Torch workspace 和 MXFP8 BMM。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>删除文件</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>删除文件</th><th>Task2 改造前的内容</th><th>当前去向</th></tr></thead>
+        <tbody>
+          <tr><td><code>aiter/ops/opus/common.py</code></td><td>再次扫描 tuned CSV，并保存旧 A16 shape helper。</td><td>tuned row 由 <code>tuned_gemm.py</code> 解析；候选校验与可选 heuristic helper 归入 <code>a16w16_policy.py</code>。</td></tr>
+          <tr><td><code>aiter/ops/opus/bmm_op.py</code></td><td>提供 private MXFP8 BMM wrapper、local-kid heuristic和旧 raw binding。</td><td>配置查找/heuristic归入 <code>batched_gemm_op_a8w8.py</code>，exact launch归入 <code>opus_bmm()</code> 和 A8 private family。</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/gfx942/opus_gemm_heuristic_dispatch_gfx942.cuh</code><br><code>csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh</code><br><code>csrc/opus_gemm/include/gfx1250/opus_gemm_heuristic_dispatch_gfx1250.cuh</code></td><td>分别在 C++ 中根据 shape、bias 和输出类型选择 A16 launcher/kid。</td><td>抽象为 <code>a16w16_policy.py</code> 的显式 caller helper；当前 <code>tuned_gemm</code> miss 不自动调用，C++ 只消费最终 kid。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>保持不变的 upstream 兼容数据</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件</th><th>当前最终状态</th></tr></thead>
+        <tbody>
+          <tr><td><code>aiter/configs/model_configs/dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv</code></td><td>与固定基线一致，文件内继续保存 upstream local <code>kernelId=0..653</code>；运行时仅对 OPUS row在内存中转换为 global <code>8000..8653</code>。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>新增文件</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>新增文件</th><th>当前新增内容</th></tr></thead>
+        <tbody>
+          <tr class="group-row"><td colspan="2">共享 exact/workspace pipeline</td></tr>
+          <tr><td><code>csrc/opus_gemm/include/gfx1250/opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_fuse_gfx1250.cuh</code></td><td>gfx1250 fused exact-kid split-K pipeline；同时属于 Task1 workspace 和 Task2 registry/codegen范围。</td></tr>
+          <tr class="group-row"><td colspan="2">Task2/共享验证与基准</td></tr>
+          <tr><td><code>op_tests/test_opus_dispatch.py</code><br><code>op_tests/test_opus_interfaces.py</code><br><code>op_tests/test_opus_ctypes.py</code><br><code>op_tests/test_opus_workspace.py</code><br><code>op_tests/test_opus_graph.py</code><br><code>op_tests/test_opus_gfx942_gpu.py</code><br><code>op_tests/test_opus_gfx942_exhaustive.py</code><br><code>op_tests/test_opus_gfx950_exhaustive.py</code></td><td>覆盖 exact dispatch、public合同、ctypes、workspace/Graph和架构候选。</td></tr>
+          <tr><td><code>op_tests/bench_opus_gfx950_workspace_ab.py</code><br><code>op_tests/bench_opus_task1_task2_interfaces.py</code><br><code>op_tests/bench_opus_task1_workspace_paired.py</code><br><code>op_tests/bench_opus_task2_gemm_bmm_paired.py</code></td><td>用同进程相邻 ABBA 分别比较 Task1 Torch workspace 与 Task2 GEMM/BMM public 路由开销，并提供 Graph replay 控制层。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+</body>
+</html>

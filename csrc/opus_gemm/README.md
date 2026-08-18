@@ -2,8 +2,9 @@
 
 The public Python contract is documented in
 [`aiter/ops/opus/README.md`](../../aiter/ops/opus/README.md). C++ keeps five
-family launch ABIs. They are private implementation boundaries for the one
-Python `opus_gemm(..., kid=...)` entry.
+family launch ABIs. They are shared private implementation boundaries for the
+Python `opus_gemm(..., kid=...)` and `opus_bmm(..., kid=...)` entries; the
+public operation split does not duplicate C++ launchers or kernels.
 
 ## Exact-id architecture
 
@@ -14,7 +15,8 @@ typed table.
 
 ```text
 caller final kid
-  -> Python canonical registry route
+  -> strict 2D opus_gemm or batch-first 3D opus_bmm
+  -> Python canonical registry route and family adapter
   -> family C++ entry
   -> runtime architecture + output-dtype table
   -> exact kid lookup
@@ -25,10 +27,13 @@ C++ does not choose a default kid, read a CSV, run a shape heuristic, redirect
 an id, allocate a workspace, or fall back to another backend.
 
 For A16 calls without an explicit id, the existing Python high-level caller
-performs `tuned CSV -> per-arch heuristic -> PyTorch fallback`.  A successful
-tuned or heuristic result is reduced to one final integer kid before the
-public Python router and this C++ layer are entered.  The heuristic functions
-live privately in the existing `aiter/ops/opus/gemm_op_a16w16.py` file.
+validates tuned CSV candidates and otherwise continues to its normal skinny
+or PyTorch fallback. It does not automatically enter an OPUS heuristic on a
+tuned miss. A successful tuned result is reduced to one final integer kid
+before the public Python router and this C++ layer are entered. Reusable
+candidate/heuristic policy helpers live in `aiter/ops/opus/a16w16_policy.py`;
+the A16 family module keeps only exact execution and workspace
+responsibilities.
 
 ## Family entries
 

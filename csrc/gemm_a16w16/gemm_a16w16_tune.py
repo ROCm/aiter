@@ -210,13 +210,10 @@ _opus_max_delta_checked = set()
 
 def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     """Launch one OPUS kid and run the existing maximum-error check."""
-    inp3 = inp.unsqueeze(0)
-    weight3 = weight.unsqueeze(0)
-    out3 = out.unsqueeze(0)
     _opus_gemm(
-        inp3,
-        weight3,
-        out3,
+        inp,
+        weight,
+        out,
         bias=bias,
         kid=kid,
         split_k=splitK,

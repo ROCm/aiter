@@ -317,10 +317,10 @@ def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
 @functools.cache
 def _get_mxscale_bmm_launchers():
     """Resolve the checked split-1 launcher and workspace planner once."""
-    from .opus import opus_gemm
+    from .opus import opus_bmm
     from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 
-    return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_gemm
+    return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 
 
 # Steady-state high-level calls must still allocate a fresh output and enter the
@@ -366,13 +366,13 @@ def _batched_gemm_a8w8_mxscale_impl(
     n = wo_a.shape[1]
     plan_key = (g, m, n, k)
     try:
-        raw_launch, opus_gemm, kid, split_k = _MXSCALE_BMM_LAUNCH_PLANS[plan_key]
+        raw_launch, opus_bmm, kid, split_k = _MXSCALE_BMM_LAUNCH_PLANS[plan_key]
     except KeyError:
-        raw_launch, opus_gemm = _get_mxscale_bmm_launchers()
+        raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
         kid, split_k = _resolve_mxscale_bmm_launch(g, m, n, k)
         _MXSCALE_BMM_LAUNCH_PLANS[plan_key] = (
             raw_launch,
-            opus_gemm,
+            opus_bmm,
             kid,
             split_k,
         )
@@ -395,16 +395,17 @@ def _batched_gemm_a8w8_mxscale_impl(
             max(1, split_k),
         )
         return Y
-    return opus_gemm(
-        x,
+    opus_bmm(
+        x.transpose(0, 1),
         wo_a,
-        Y,
+        Y.transpose(0, 1),
         kid=kid,
         layout="mxscale_bmm",
-        x_scale=x_scale,
+        x_scale=x_scale.transpose(0, 1),
         w_scale=w_scale,
         split_k=split_k,
     )
+    return Y
 
 
 def _batched_gemm_a8w8_mxscale_fake(

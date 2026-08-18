@@ -18,7 +18,7 @@ Runtime schema (what the tuner emits, and what the runtime reads back):
 ``aiter/ops/batched_gemm_op_a8w8.py:lookup_mxscale_bmm_config`` indexes on
 ``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
 ``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
-the unified ``opus_gemm`` entry, so
+the batch-first ``opus_bmm`` entry, so
 those columns must match exactly.
 
 Verification (the part that catches column-transpose / scale defects):
@@ -56,7 +56,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -236,43 +236,41 @@ def gen_bmm_mxscale_data(
 ):
     """Return the 7-tuple mp_tuner indexes into:
 
-    0 O_in   [m,g,k]     fp8 (mmajor transposed view, K contiguous)
+    0 O_mx   [g,m,k]     fp8 (batch-first, K contiguous)
     1 W_mx   [g,n,k]     fp8 (batch-major)
-    2 Y       [m,g,n]     out_dtype output buffer
-    3 xs_in  [m,g,k/128] uint8 e8m0 per-token scale (mmajor view)
+    2 Y       [g,m,n]     out_dtype output buffer
+    3 xs_mx  [g,m,k/128] uint8 e8m0 per-token scale
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
     5 workspace optional caller-owned FP32 split-K buffer
-    6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
+    6 ref     [g,m,n]     out_dtype dequant fp32 einsum reference
     """
     torch.manual_seed(seed)
     O_bf16 = _gen_varied((batch, m, k), k, device)
     W_bf16 = _gen_varied((batch, n, k), k, device)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
-    O_in = O_mx.transpose(0, 1)  # [m,g,k]
-    xs_in = xs_mx.transpose(0, 1)  # [m,g,k/128]
-    Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
+    Y = torch.empty((batch, m, n), dtype=out_dtype, device=device)
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
     workspace = (
         torch.empty(workspace_numel, dtype=torch.float32, device=device)
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
-    return (O_in, W_mx, Y, xs_in, ws_mx, workspace, ref)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).to(out_dtype)
+    return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
 
 
 def run_bmm_mxscale_bench(
-    O_in, W_mx, Y, xs_in, ws_mx, workspace, kernelId, splitK
+    O_mx, W_mx, Y, xs_mx, ws_mx, workspace, kernelId, splitK
 ):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
-    return opus_gemm(
-        O_in,
+    return opus_bmm(
+        O_mx,
         W_mx,
         Y,
         kid=int(kernelId),
         layout="mxscale_bmm",
-        x_scale=xs_in,
+        x_scale=xs_mx,
         w_scale=ws_mx,
         split_k=int(splitK),
         workspace=workspace,
@@ -280,7 +278,7 @@ def run_bmm_mxscale_bench(
 
 
 def _bmm_ref_passthrough(ref):
-    """ref_func: the fp32 reference is precomputed in gen_data (slot 5)."""
+    """ref_func: the fp32 reference is precomputed in gen_data (slot 6)."""
     return ref
 
 

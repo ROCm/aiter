@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """C ABI/ctypes tests for the private OPUS A16W16 exact-kid backend.
 
-The ctypes raw remains private, while the unified public exact-kid entry uses
-it after scalar validation and workspace planning. The original pybind raw
+The ctypes raw remains private, while both public exact-kid entries use it
+after scalar validation and workspace planning. The original pybind raw
 remains available as an A/B endpoint.
 """
 
@@ -89,7 +89,7 @@ def test_ctypes_phase1_surface_is_private_production_backend():
     assert 'ffi_type="ctypes"' not in python_source
     assert "ctypes_force_torch_exclude" not in python_source
     assert "_opus_gemm_a16w16_launch_ctypes_raw" in inspect.getsource(
-        gemm._launch_a16w16
+        gemm._launch_a16w16_exact
     )
     assert gemm.__all__ == []
 
@@ -364,7 +364,7 @@ def test_gfx950_ctypes_switches_and_restores_current_device(workspace_mode):
     gemm._opus_a16w16_cabi_primed = False
     for _ in range(2):
         Y.fill_(float("nan"))
-        opus.opus_gemm(
+        opus.opus_bmm(
             XQ, WQ, Y, kid=200, split_k=2, workspace=workspace
         )
         assert torch.cuda.current_device() == initial

@@ -50,26 +50,26 @@ def _golden(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return A.float() @ B.float().transpose(-1, -2)
 
 
-def _make_gfx950_a8_case(seed: int):
+def _make_gfx950_a8_case(seed: int, batch: int = 1):
     from aiter import dtypes
 
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    shape = (1, 256, 256)
+    shape = (batch, 256, 256)
     XQ = torch.randint(
         -2, 3, shape, generator=generator, device="cuda", dtype=torch.int32
     ).to(dtypes.fp8)
     WQ = torch.randint(
         -3, 4, shape, generator=generator, device="cuda", dtype=torch.int32
     ).to(dtypes.fp8)
-    x_scale = torch.ones((1, 256, 2), device="cuda", dtype=torch.float32)
-    w_scale = torch.ones((1, 2, 2), device="cuda", dtype=torch.float32)
+    x_scale = torch.ones((batch, 256, 2), device="cuda", dtype=torch.float32)
+    w_scale = torch.ones((batch, 2, 2), device="cuda", dtype=torch.float32)
     return XQ, WQ, x_scale, w_scale
 
 
 def _launch_gfx950_a8_family(family, opus, XQ, WQ, Y, x_scale, w_scale):
     if family == "noscale":
-        return opus.opus_gemm(XQ, WQ, Y, kid=2)
-    return opus.opus_gemm(
+        return opus.opus_bmm(XQ, WQ, Y, kid=2)
+    return opus.opus_bmm(
         XQ,
         WQ,
         Y,
@@ -77,6 +77,45 @@ def _launch_gfx950_a8_family(family, opus, XQ, WQ, Y, x_scale, w_scale):
         x_scale=x_scale,
         w_scale=w_scale,
     )
+
+
+@pytest.mark.parametrize("family", ["noscale", "blockscale"])
+def test_gfx950_a8_logical_2d_gemm_adapter(family):
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware; a skip is not a pass")
+    opus = importlib.import_module("aiter.ops.opus")
+    XQ3, WQ3, x_scale3, w_scale3 = _make_gfx950_a8_case(0x2DA8)
+    XQ, WQ = XQ3[0], WQ3[0]
+    Y = torch.empty((256, 256), device="cuda", dtype=torch.float32)
+    if family == "noscale":
+        returned = opus.opus_gemm(XQ, WQ, Y, kid=2)
+    else:
+        returned = opus.opus_gemm(
+            XQ,
+            WQ,
+            Y,
+            kid=1,
+            x_scale=x_scale3[0],
+            w_scale=w_scale3[0],
+        )
+    torch.cuda.synchronize()
+    assert returned is Y
+    torch.testing.assert_close(Y, _golden(XQ, WQ), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("family", ["noscale", "blockscale"])
+def test_gfx950_a8_batch_first_bmm_adapter(family):
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware; a skip is not a pass")
+    opus = importlib.import_module("aiter.ops.opus")
+    XQ, WQ, x_scale, w_scale = _make_gfx950_a8_case(0xB2A8, batch=2)
+    Y = torch.empty((2, 256, 256), device="cuda", dtype=torch.float32)
+    returned = _launch_gfx950_a8_family(
+        family, opus, XQ, WQ, Y, x_scale, w_scale
+    )
+    torch.cuda.synchronize()
+    assert returned is Y
+    torch.testing.assert_close(Y, _golden(XQ, WQ), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("arch", ["gfx950", "gfx942", "gfx1250"])
@@ -104,7 +143,7 @@ def test_graph_capture_replay_allocates_in_capture_without_prewarm(monkeypatch, 
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = opus.opus_gemm(
+        returned = opus.opus_bmm(
             A,
             B,
             output,
@@ -170,7 +209,7 @@ def test_two_streams_hold_distinct_call_scoped_workspaces(monkeypatch, arch):
     for stream, (A, B), output in zip(streams, inputs, outputs, strict=True):
         stream.wait_stream(producer)
         with torch.cuda.stream(stream):
-            returned = opus.opus_gemm(
+            returned = opus.opus_bmm(
                 A,
                 B,
                 output,
@@ -325,4 +364,4 @@ def test_workspace_module_keeps_only_private_exact_kid_entry():
     assert gemm.__all__ == []
     assert not hasattr(gemm, "opus_gemm_workspace_init")
     assert not hasattr(gemm, "gemm_a16w16_opus")
-    assert opus.__all__ == ["opus_gemm"]
+    assert opus.__all__ == ["opus_gemm", "opus_bmm"]

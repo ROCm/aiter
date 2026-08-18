@@ -2,11 +2,11 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Caller-side A16W16 tuned-candidate and heuristic policy.
 
-This module runs before the unified exact-kid :func:`opus_gemm` entry.  It may
-validate a tuned candidate, select a per-architecture heuristic candidate, or
-reject either so the upper caller can continue its fallback policy.  The
-public launcher and C++ dispatcher never call this module and therefore never
-replace a caller-supplied exact kid.
+This module runs before the exact-kid :func:`opus_gemm` or :func:`opus_bmm`
+entry. It may validate a tuned candidate, select a per-architecture heuristic
+candidate, or reject either so the upper caller can continue its fallback
+policy. The public launcher and C++ dispatcher never call this module and
+therefore never replace a caller-supplied exact kid.
 """
 
 from __future__ import annotations

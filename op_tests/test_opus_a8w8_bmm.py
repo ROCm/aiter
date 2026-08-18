@@ -31,10 +31,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
 GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
@@ -51,17 +49,18 @@ def _run_opus(
     split_k=1,
     workspace=None,
 ):
-    return opus_gemm(
-        x,
+    opus_bmm(
+        x.transpose(0, 1),
         weight,
-        out,
+        out.transpose(0, 1),
         kid=int(kid),
         layout="mxscale_bmm",
-        x_scale=x_scale,
+        x_scale=x_scale.transpose(0, 1),
         w_scale=w_scale,
         split_k=int(split_k),
         workspace=workspace,
     )
+    return out
 
 
 def _to_e8m0_scale(scale):
@@ -153,7 +152,7 @@ def test_mxscale_bmm(g, m, n, k, dtype):
 
     # Public backend-neutral entry: per-(g,m,n,k) tuned-CSV lookup + heuristic
     # final-kid resolution + libtype backend routing. Exercises the whole
-    # aiter.batched_gemm_a8w8_mxscale -> unified opus_gemm path end to end
+    # aiter.batched_gemm_a8w8_mxscale -> public opus_bmm path end to end
     # (not the raw binding).
     candidates["auto (batched_gemm_a8w8_mxscale)"] = (
         lambda: aiter.batched_gemm_a8w8_mxscale(O_in, W_mx, xs_in, ws_mx, dtype=ydt),
@@ -221,8 +220,8 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         return Yb  # [g, m, n]
 
     def _call_auto():
-        # Resolve the final global kid here, then use the same unified OPUS
-        # entry with a caller-owned batch-major output view.
+        # Resolve the final global kid here, then use public opus_bmm with a
+        # caller-owned batch-major output view.
         Yb = torch.empty((g, m, n), dtype=ydt)
         cfg = lookup_mxscale_bmm_config(g, m, n, k)
         _run_opus(
@@ -240,7 +239,7 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     # plus the backend dispatch path writing into the batch-major buffer via
     # out=. Per-kid perf sweep lives in csrc/opus_gemm/opus_bmm_mxscale_tune.py.
     candidates = {"kid8000_k32_fused": (lambda: _call_raw(8000), ref)}
-    candidates["auto (unified opus_gemm)"] = (_call_auto, ref)
+    candidates["auto (public opus_bmm)"] = (_call_auto, ref)
 
     flops = 2.0 * g * m * n * k
     # fp8 A + fp8 W + e8m0 scales (uint8) + output.
@@ -549,6 +548,10 @@ def check_m_align():
 
 
 def main():
+    # This module is also imported by pytest discovery.  Keep the CLI's
+    # CUDA-default convenience local to the standalone process so importing
+    # the helpers cannot change unrelated tests' default tensor device.
+    torch.set_default_device("cuda")
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "opus mxscale flatmm BMM unsupported on %s; skipping", get_gfx()

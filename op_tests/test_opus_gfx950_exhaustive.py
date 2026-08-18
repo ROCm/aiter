@@ -29,7 +29,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from aiter.ops.opus import gemm_op_a16w16 as gemm, opus_gemm
+from aiter.ops.opus import gemm_op_a16w16 as gemm, opus_bmm
 from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
     kernel_needs_external_workspace,
@@ -201,7 +201,7 @@ def test_every_gfx950_workspace_kid(case: _Case):
         # is freshly produced; reuse cannot accidentally consume stale data.
         workspace.fill_(float("nan"))
         Y = torch.empty((1, M, N), device=XQ.device, dtype=out_dtype)
-        returned = opus_gemm(
+        returned = opus_bmm(
             XQ,
             WQ,
             Y,
@@ -233,7 +233,7 @@ def test_every_gfx950_workspace_kid(case: _Case):
     auto_y = original_empty((1, M, N), device=XQ.device, dtype=torch.bfloat16)
     gemm.torch.empty = tracked_empty
     try:
-        returned = opus_gemm(
+        returned = opus_bmm(
             XQ, WQ, auto_y, kid=case.kid, split_k=2
         )
     finally:
@@ -285,7 +285,7 @@ def test_every_gfx950_non_workspace_kid(case: _Case):
     gemm.torch.empty = unexpected_empty
     try:
         for out_dtype, Y in outputs.items():
-            returned = opus_gemm(
+            returned = opus_bmm(
                 XQ, WQ, Y, kid=case.kid, split_k=0
             )
             assert returned is Y

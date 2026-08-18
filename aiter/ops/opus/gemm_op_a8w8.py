@@ -85,7 +85,7 @@ def _validate_a8w8_public_contract(
     has_workspace: bool,
     split_k: int,
 ) -> str:
-    """Validate A8W8-only options for the unified public router."""
+    """Validate A8W8-only options shared by both public operation routers."""
     try:
         family = _A8W8_FAMILY_BY_TAG[kernel_tag]
     except KeyError as exc:
@@ -95,7 +95,7 @@ def _validate_a8w8_public_contract(
 
     if input_dtype != weight_dtype:
         raise ValueError(
-            f"opus_gemm requires matching XQ/WQ dtypes; got "
+            f"OPUS requires matching XQ/WQ dtypes; got "
             f"{input_dtype}/{weight_dtype}"
         )
     if input_dtype not in _FP8_DTYPES:
@@ -127,7 +127,7 @@ def _validate_a8w8_public_contract(
             f"layout={expected_layout!r}; got {layout!r}"
         )
     if has_x_scale != has_w_scale:
-        raise ValueError("opus_gemm requires x_scale and w_scale together")
+        raise ValueError("OPUS requires x_scale and w_scale together")
     if has_bias:
         raise ValueError(f"OPUS family {family} does not support bias")
     if family == _A8W8_MXSCALE_BMM_FAMILY:
@@ -336,32 +336,97 @@ def _opus_gemm_a8w8_mxscale_bmm_launch_raw(
 ) -> Tensor: ...
 
 
-# ---- Exact-kid adapters used by the unified public entry -----------------
+# ---- Exact launchers and logical GEMM/BMM adapters -----------------------
 
 
-def _launch_a8w8(
+def _require_logical_rank(
+    entry: str,
+    rank: int,
+    **tensors: Tensor,
+) -> None:
+    invalid = [name for name, tensor in tensors.items() if tensor.dim() != rank]
+    if invalid:
+        operation = "opus_gemm" if rank == 2 else "opus_bmm"
+        other = "opus_bmm" if rank == 2 else "opus_gemm"
+        raise ValueError(
+            f"{entry}: {operation} expects {rank}D "
+            f"{', '.join(invalid)}; use {other} for "
+            f"{'batch-first 3D' if rank == 2 else 'logical 2D'} tensors"
+        )
+
+
+def _launch_a8w8_exact(
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
     *,
     kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
 ) -> Tensor:
-    """Launch a registered no-scale A8W8 kid.
-
-    Inputs are contiguous FP8 ``[B,M,K]`` and ``[B,N,K]``; output is contiguous
-    FP32 ``[B,M,N]``. The generated launcher checks its K-loop limits.
-    """
-    entry = "opus_gemm_a8w8_launch"
-    _check_same_device(entry, XQ, WQ, Y)
-    arch = _device_arch(XQ.device)
-    resolved = _require_registered_kid(
-        arch=arch, family=_A8W8_FAMILY, kid=kid, output_dtype=Y.dtype
-    )
+    """Launch the shared physical 3D no-scale A8W8 ABI."""
+    resolved = kid
+    if instance is None:
+        entry = "opus_gemm_a8w8_launch"
+        _check_same_device(entry, XQ, WQ, Y)
+        arch = route_arch or _device_arch(XQ.device)
+        resolved = _require_registered_kid(
+            arch=arch, family=_A8W8_FAMILY, kid=kid, output_dtype=Y.dtype
+        )
     _opus_gemm_a8w8_launch_raw(XQ, WQ, Y, resolved)
     return Y
 
 
-def _launch_a8w8_blockscale(
+def _launch_a8w8_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` A8W8 GEMM."""
+    if instance is None:
+        _require_logical_rank("a8w8", 2, XQ=XQ, WQ=WQ, Y=Y)
+    _launch_a8w8_exact(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        Y.unsqueeze(0),
+        kid=kid,
+        route_arch=route_arch,
+        instance=instance,
+    )
+    return Y
+
+
+def _launch_a8w8_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch batch-first ``[B,M,K] x [B,N,K] -> [B,M,N]`` A8W8 BMM.
+
+    Inputs are contiguous FP8 ``[B,M,K]`` and ``[B,N,K]``; output is contiguous
+    FP32 ``[B,M,N]``. The generated launcher checks its K-loop limits.
+    """
+    if instance is None:
+        _require_logical_rank("a8w8", 3, XQ=XQ, WQ=WQ, Y=Y)
+    return _launch_a8w8_exact(
+        XQ,
+        WQ,
+        Y,
+        kid=kid,
+        route_arch=route_arch,
+        instance=instance,
+    )
+
+
+def _launch_a8w8_blockscale_exact(
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
@@ -369,28 +434,101 @@ def _launch_a8w8_blockscale(
     w_scale: Tensor,
     *,
     kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
 ) -> Tensor:
-    """Launch a registered blockscale A8W8 kid with plain WQ.
-
-    Both contiguous FP32 scales are required. Their shapes are
-    ``[B,M,K/128]`` and ``[B,N/128,K/128]``; batch 1 may omit the first axis.
-    """
-    entry = "opus_gemm_a8w8_blockscale_launch"
-    _check_same_device(entry, XQ, WQ, Y, x_scale, w_scale)
-    arch = _device_arch(XQ.device)
-    resolved = _require_registered_kid(
-        arch=arch,
-        family=_A8W8_BLOCKSCALE_FAMILY,
-        kid=kid,
-        output_dtype=Y.dtype,
-    )
+    """Launch the shared physical 3D blockscale A8W8 ABI."""
+    resolved = kid
+    if instance is None:
+        entry = "opus_gemm_a8w8_blockscale_launch"
+        _check_same_device(entry, XQ, WQ, Y, x_scale, w_scale)
+        arch = route_arch or _device_arch(XQ.device)
+        resolved = _require_registered_kid(
+            arch=arch,
+            family=_A8W8_BLOCKSCALE_FAMILY,
+            kid=kid,
+            output_dtype=Y.dtype,
+        )
     _opus_gemm_a8w8_blockscale_launch_raw(
         XQ, WQ, Y, x_scale, w_scale, resolved
     )
     return Y
 
 
-def _launch_a8w8_blockscale_bpreshuffle(
+def _launch_a8w8_blockscale_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D blockscale A8W8 GEMM with 2D scales."""
+    if instance is None:
+        _require_logical_rank(
+            "a8w8_blockscale",
+            2,
+            XQ=XQ,
+            WQ=WQ,
+            Y=Y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+    _launch_a8w8_blockscale_exact(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        Y.unsqueeze(0),
+        x_scale,
+        w_scale,
+        kid=kid,
+        route_arch=route_arch,
+        instance=instance,
+    )
+    return Y
+
+
+def _launch_a8w8_blockscale_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch batch-first 3D blockscale A8W8 BMM.
+
+    Both contiguous FP32 scales are required. Their shapes are
+    ``[B,M,K/128]`` and ``[B,N/128,K/128]``.
+    """
+    if instance is None:
+        _require_logical_rank(
+            "a8w8_blockscale",
+            3,
+            XQ=XQ,
+            WQ=WQ,
+            Y=Y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+    return _launch_a8w8_blockscale_exact(
+        XQ,
+        WQ,
+        Y,
+        x_scale,
+        w_scale,
+        kid=kid,
+        route_arch=route_arch,
+        instance=instance,
+    )
+
+
+def _launch_a8w8_blockscale_bpreshuffle_exact(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -398,27 +536,109 @@ def _launch_a8w8_blockscale_bpreshuffle(
     Y: Tensor,
     *,
     kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
 ) -> Tensor:
-    """Launch a registered blockscale A8W8 kid with pre-shuffled WQ.
+    """Launch the shared physical bpreshuffle A8W8 ABI."""
+    resolved = kid
+    if instance is None:
+        entry = "opus_gemm_a8w8_blockscale_bpreshuffle_launch"
+        _check_same_device(entry, XQ, WQ, Y, x_scale, w_scale)
+        arch = route_arch or _device_arch(XQ.device)
+        resolved = _require_registered_kid(
+            arch=arch,
+            family=_A8W8_BPRESHUFFLE_FAMILY,
+            kid=kid,
+            output_dtype=Y.dtype,
+        )
+    _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+        XQ, WQ, x_scale, w_scale, Y, resolved
+    )
+    return Y
+
+
+def _launch_a8w8_blockscale_bpreshuffle_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D bpreshuffled blockscale A8W8 GEMM.
 
     ``WQ`` pre-shuffle is a content/layout semantic. It
     cannot be proven from Tensor shape or strides. Build it with
     ``shuffle_weight(WQ, layout=(16, 16))``. The generated launcher checks
     output dtype, scale layout, batch and tile alignment.
     """
-    entry = "opus_gemm_a8w8_blockscale_bpreshuffle_launch"
-    _check_same_device(entry, XQ, WQ, Y, x_scale, w_scale)
-    arch = _device_arch(XQ.device)
-    resolved = _require_registered_kid(
-        arch=arch,
-        family=_A8W8_BPRESHUFFLE_FAMILY,
+    if instance is None:
+        _require_logical_rank(
+            "a8w8_blockscale_bpreshuffle",
+            2,
+            XQ=XQ,
+            WQ=WQ,
+            Y=Y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+    _launch_a8w8_blockscale_bpreshuffle_exact(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        x_scale,
+        w_scale,
+        Y.unsqueeze(0),
         kid=kid,
-        output_dtype=Y.dtype,
-    )
-    _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-        XQ, WQ, x_scale, w_scale, Y, resolved
+        route_arch=route_arch,
+        instance=instance,
     )
     return Y
+
+
+def _launch_a8w8_blockscale_bpreshuffle_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch batch-first 3D bpreshuffled blockscale A8W8 BMM."""
+    if instance is None:
+        _require_logical_rank(
+            "a8w8_blockscale_bpreshuffle",
+            3,
+            XQ=XQ,
+            WQ=WQ,
+            Y=Y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+    # The only currently registered bpreshuffle BMM-capable ABI is gfx942,
+    # whose exact kid is batch-one and physically stores its scales as 2D.
+    # Preserve a uniform batch-first public contract with no-copy views.
+    resolved_arch = route_arch or _device_arch(XQ.device)
+    launch_x_scale = x_scale
+    launch_w_scale = w_scale
+    if resolved_arch == "gfx942" and XQ.shape[0] == 1:
+        launch_x_scale = x_scale.squeeze(0)
+        launch_w_scale = w_scale.squeeze(0)
+    return _launch_a8w8_blockscale_bpreshuffle_exact(
+        XQ,
+        WQ,
+        launch_x_scale,
+        launch_w_scale,
+        Y,
+        kid=kid,
+        route_arch=resolved_arch,
+        instance=instance,
+    )
 
 
 def _validate_a8w8_mxscale_bmm_tensors(
@@ -549,7 +769,7 @@ def _cached_a8w8_mxscale_bmm_plan(
     return effective_split, workspace_numel
 
 
-def _launch_a8w8_mxscale_bmm(
+def _launch_a8w8_mxscale_bmm_exact(
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
@@ -559,16 +779,20 @@ def _launch_a8w8_mxscale_bmm(
     kid: int,
     split_k: int,
     workspace: Tensor | None,
+    route_arch: str | None = None,
+    instance: object | None = None,
 ) -> Tensor:
-    """Launch one registered gfx950 MXFP8 BMM kid."""
+    """Launch the physical MXFP8 ABI: X/Y/x_scale are M-major 3D views."""
     M, batch, N, K = _mxscale_bmm_shape_for_plan(XQ, WQ)
-    arch = _device_arch(XQ.device)
-    resolved = _require_registered_kid(
-        arch=arch,
-        family=_A8W8_MXSCALE_BMM_FAMILY,
-        kid=kid,
-        output_dtype=Y.dtype,
-    )
+    arch = route_arch or _device_arch(XQ.device)
+    resolved = kid
+    if instance is None:
+        resolved = _require_registered_kid(
+            arch=arch,
+            family=_A8W8_MXSCALE_BMM_FAMILY,
+            kid=kid,
+            output_dtype=Y.dtype,
+        )
     effective_split, required_numel = _cached_a8w8_mxscale_bmm_plan(
         arch, resolved, Y.dtype, M, batch, N, K, split_k
     )
@@ -622,6 +846,70 @@ def _launch_a8w8_mxscale_bmm(
         launch_workspace,
         resolved,
         effective_split,
+    )
+    return Y
+
+
+def _launch_a8w8_mxscale_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    *,
+    kid: int,
+    split_k: int,
+    workspace: Tensor | None,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch batch-first MXFP8 BMM through the shared physical launcher.
+
+    Public tensors use ``[B,M,K]``, ``[B,N,K]`` and ``[B,M,N]``.  The raw
+    kernels retain their established M-major ``[M,B,*]`` activation/output
+    ABI; transpose views bridge the two contracts without copying storage.
+    """
+    if instance is None:
+        _require_logical_rank(
+            "a8w8_mxscale_bmm",
+            3,
+            XQ=XQ,
+            WQ=WQ,
+            Y=Y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+    launch_x = XQ.transpose(0, 1)
+    launch_y = Y.transpose(0, 1)
+    launch_x_scale = x_scale.transpose(0, 1)
+
+    if instance is not None and workspace is None and split_k <= 1:
+        # The checked C++ entry owns the dynamic tensor contract.  Public
+        # routing already validated the immutable family/kid contract, so the
+        # common split-one path need not repeat the Python registry/planner.
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            launch_x,
+            WQ,
+            launch_y,
+            launch_x_scale,
+            w_scale,
+            None,
+            kid,
+            max(1, split_k),
+        )
+        return Y
+
+    _launch_a8w8_mxscale_bmm_exact(
+        launch_x,
+        WQ,
+        launch_y,
+        launch_x_scale,
+        w_scale,
+        kid=kid,
+        split_k=split_k,
+        workspace=workspace,
+        route_arch=route_arch,
+        instance=instance,
     )
     return Y
 

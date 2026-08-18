@@ -543,7 +543,7 @@ def test_production_path_allocates_and_passes_call_scoped_workspace(monkeypatch)
     XQ = torch.empty((1, 65, 512), dtype=torch.bfloat16)
     WQ = torch.empty((1, 33, 512), dtype=torch.bfloat16)
     Y = torch.empty((1, 65, 33), dtype=torch.bfloat16)
-    output = opus.opus_gemm(
+    output = opus.opus_bmm(
         XQ,
         WQ,
         Y,

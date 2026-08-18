@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from aiter.jit.core import compile_ops
-from aiter.ops.opus import gemm_op_a16w16 as gemm, opus_gemm
+from aiter.ops.opus import gemm_op_a16w16 as gemm, opus_bmm
 from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
     kernel_needs_external_workspace,
@@ -225,7 +225,7 @@ def test_every_gfx942_workspace_kid(case: _Case):
     for out_dtype in _workspace_output_dtypes(case):
         workspace.zero_()
         Y = torch.empty((1, M, N), device=XQ.device, dtype=out_dtype)
-        returned = opus_gemm(
+        returned = opus_bmm(
             XQ,
             WQ,
             Y,
@@ -251,7 +251,7 @@ def test_every_gfx942_workspace_kid(case: _Case):
     auto_y = original_empty((1, M, N), device=XQ.device, dtype=torch.bfloat16)
     gemm.torch.empty = tracked_empty
     try:
-        returned = opus_gemm(XQ, WQ, auto_y, kid=case.kid, split_k=2)
+        returned = opus_bmm(XQ, WQ, auto_y, kid=case.kid, split_k=2)
     finally:
         gemm.torch.empty = original_empty
     assert returned is auto_y
@@ -292,7 +292,7 @@ def test_gfx942_bf16_workspace_kids_reject_fp32_y(case: _Case):
         workspace = torch.empty(
             (2, 1, M, N), device=XQ.device, dtype=torch.bfloat16
         )
-        call = lambda: opus_gemm(
+        call = lambda: opus_bmm(
             XQ,
             WQ,
             Y,
@@ -341,7 +341,7 @@ def test_every_gfx942_non_workspace_kid(case: _Case):
         for out_dtype, Y in outputs.items():
             if case.instance.kernel_tag == "a16w16_wave_k_coop_accum":
                 Y.zero_()
-            returned = opus_gemm(XQ, WQ, Y, kid=case.kid, split_k=0)
+            returned = opus_bmm(XQ, WQ, Y, kid=case.kid, split_k=0)
             assert returned is Y
             torch.cuda.synchronize(XQ.device)
             errors[str(out_dtype)] = _assert_result(Y, golden)

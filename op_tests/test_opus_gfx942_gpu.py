@@ -11,7 +11,7 @@ import torch
 from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
 from aiter.ops.opus import gemm_op_a8w8 as a8
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm, opus_gemm
 from aiter.ops.shuffle import shuffle_weight
 from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
 
@@ -97,13 +97,13 @@ def test_gfx942_a16_workspace_graph_two_streams_and_caller_tensor(
     graph_stream = torch.cuda.Stream()
     graph_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(graph_stream):
-        opus_gemm(
+        opus_bmm(
             XQ, WQ, Y, kid=kid, split_k=2, workspace=workspace
         )
     graph_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=graph_stream):
-        opus_gemm(
+        opus_bmm(
             XQ, WQ, Y, kid=kid, split_k=2, workspace=workspace
         )
     graph.replay()
@@ -122,7 +122,7 @@ def test_gfx942_a16_workspace_graph_two_streams_and_caller_tensor(
         streams, outputs, workspaces, strict=True
     ):
         with torch.cuda.stream(stream):
-            opus_gemm(
+            opus_bmm(
                 XQ,
                 WQ,
                 output,

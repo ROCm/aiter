@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""End-to-end regression of exact-kid ``opus_gemm`` vs torch.bmm.
+"""End-to-end regression of exact-kid ``opus_bmm`` vs torch.bmm.
 
 Usage:
     python3 op_tests/test_opus_a16w16_gemm.py --kid KID [-m M -n N -k K -b B]
@@ -22,7 +22,7 @@ from aiter.ops.opus._arch import _detect_arch
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm, opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
 
 try:
@@ -98,7 +98,7 @@ def run_a16w16_case(
     ref = _torch_ref(A, B, out_dtype)
 
     Y, us = run_perftest(
-        opus_gemm,
+        opus_bmm,
         A,
         B,
         Y,
@@ -173,7 +173,7 @@ def run_a16w16_csv_sweep(
             )
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
-                opus_gemm,
+                opus_bmm,
                 A,
                 B,
                 Y,
@@ -209,6 +209,38 @@ def _assert_matches_golden(actual, A, B, bias=None):
 
 
 @pytest.mark.parametrize(
+    ("kid", "M", "N", "K", "split_k"),
+    ((200, 64, 64, 512, 2), (1400, 192, 256, 128, 0)),
+)
+def test_gfx950_logical_2d_gemm_matches_torch(kid, M, N, K, split_k):
+    """The public GEMM adapter adds only a no-copy batch-one raw view."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0x2D950 + kid)
+    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    actual = opus_gemm(A, B, Y, kid=kid, split_k=split_k)
+    torch.cuda.synchronize()
+    assert actual is Y
+    _assert_matches_golden(actual, A, B)
+
+
+def test_gfx950_batch_first_bmm_matches_torch():
+    """The public BMM contract preserves a real batch dimension."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0xB950)
+    A = torch.randn((2, 192, 128), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((2, 256, 128), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((2, 192, 256), device="cuda", dtype=torch.bfloat16)
+    actual = opus_bmm(A, B, Y, kid=1400)
+    torch.cuda.synchronize()
+    assert actual is Y
+    _assert_matches_golden(actual, A, B)
+
+
+@pytest.mark.parametrize(
     ("arch", "kid", "M", "N", "K", "split_k", "out_dtype"),
     [
         ("gfx950", 200, 64, 64, 512, 2, torch.bfloat16),
@@ -226,7 +258,7 @@ def test_split_k_matches_torch_golden(arch, kid, M, N, K, split_k, out_dtype):
     A = torch.randn((1, M, K), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((1, N, K), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, M, N), device="cuda", dtype=out_dtype)
-    actual = opus_gemm(
+    actual = opus_bmm(
         A,
         B,
         Y,
@@ -250,7 +282,7 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
         (1, 192, 256), 12345.0, device="cuda", dtype=torch.float32
     )
 
-    actual = opus_gemm(
+    actual = opus_bmm(
         A,
         B,
         out,
@@ -270,7 +302,7 @@ def test_gfx950_bias_dtype_rules_and_numerics():
     B = torch.randn((1, 64, 512), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((64,), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, 64, 64), device="cuda", dtype=torch.bfloat16)
-    actual = opus_gemm(
+    actual = opus_bmm(
         A,
         B,
         Y,
@@ -282,7 +314,7 @@ def test_gfx950_bias_dtype_rules_and_numerics():
     _assert_matches_golden(actual, A, B, bias)
 
     with pytest.raises(RuntimeError, match="bias dtype must match Y dtype"):
-        opus_gemm(
+        opus_bmm(
             A,
             B,
             Y,
@@ -301,7 +333,7 @@ def test_gfx942_workspace_kid_rejects_bias_without_framework_fallback():
     bias = torch.randn((256,), device="cuda", dtype=torch.float32)
 
     with pytest.raises(ValueError, match="rejects bias on split-K kernels"):
-        opus_gemm(
+        opus_bmm(
             A,
             B,
             Y,
@@ -318,7 +350,7 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
     B = torch.randn((1, 32, 512), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, 16, 32), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((32,), device="cuda", dtype=torch.float32)
-    actual = opus_gemm(
+    actual = opus_bmm(
         A,
         B,
         Y,
@@ -338,7 +370,7 @@ if __name__ == "__main__":
         )
         sys.exit(0)
     parser = argparse.ArgumentParser(
-        description="End-to-end exact-kid test for aiter.ops.opus.opus_gemm"
+        description="End-to-end exact-kid test for aiter.ops.opus.opus_bmm"
     )
     parser.add_argument("-m", type=int, default=256)
     parser.add_argument("-n", type=int, default=512)

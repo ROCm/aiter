@@ -606,9 +606,9 @@ def opus_gemm(
     n = weights.shape[0]
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
     _opus_launch(
-        inp.unsqueeze(0),
-        weights.unsqueeze(0),
-        Y.unsqueeze(0),
+        inp,
+        weights,
+        Y,
         kid=int(solidx),
         bias=bias,
         split_k=splitK,

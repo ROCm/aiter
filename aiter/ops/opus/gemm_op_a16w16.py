@@ -50,10 +50,10 @@ def _validate_a16w16_public_contract(
     has_x_scale: bool,
     has_w_scale: bool,
 ) -> None:
-    """Validate A16W16-only options for the unified public router."""
+    """Validate A16W16-only options shared by both public routers."""
     if input_dtype != weight_dtype:
         raise ValueError(
-            f"opus_gemm requires matching XQ/WQ dtypes; got "
+            f"OPUS requires matching XQ/WQ dtypes; got "
             f"{input_dtype}/{weight_dtype}"
         )
     if input_dtype != torch.bfloat16:
@@ -66,7 +66,7 @@ def _validate_a16w16_public_contract(
             f"layout='plain'; got {layout!r}"
         )
     if has_x_scale != has_w_scale:
-        raise ValueError("opus_gemm requires x_scale and w_scale together")
+        raise ValueError("OPUS requires x_scale and w_scale together")
     if has_x_scale:
         raise ValueError("OPUS a16w16 does not accept x_scale/w_scale")
     if not _instance_output_compatible(
@@ -284,7 +284,7 @@ def _resolve_exact_a16w16_config(
     ):
         raise ValueError(
             "gfx1250 splitk_fuse has a narrower bf16 [N] bias contract than "
-            "the unified interface can represent"
+            "the public OPUS interfaces can represent"
         )
     if has_bias and arch == "gfx942" and needs_workspace:
         raise ValueError(
@@ -894,7 +894,7 @@ def _explicit_a16w16_launch(
     return Y
 
 
-def _launch_a16w16(
+def _launch_a16w16_exact(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
@@ -903,8 +903,53 @@ def _launch_a16w16(
     kid: int,
     split_k: int = 0,
     workspace: torch.Tensor | None = None,
+    route_arch: str | None = None,
+    instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
-    """Launch one exact A16W16 kid for the unified ``opus_gemm`` entry."""
+    """Launch one exact A16W16 kid shared by the GEMM and BMM adapters."""
+    if (
+        route_arch == "gfx950"
+        and workspace is not None
+        and split_k > 0
+        and instance is not None
+        and instance.splitk_workspace_dtype is not None
+    ):
+        # A caller-owned gfx950 workspace already gives this exact-kid path
+        # everything it needs.  Preserve the checked C ABI fast path without
+        # re-reading device metadata or re-entering the generic planner.
+        _check_a16w16_launch_layout(XQ, WQ, Y)
+        batch, M, K = XQ.shape
+        N = Y.shape[2]
+        actual_kid, launch_split_k, workspace_plan = (
+            _cached_explicit_a16w16_plan(
+                route_arch,
+                M,
+                N,
+                K,
+                batch,
+                1,  # Explicit gfx950 plans do not consult the CU count.
+                bias is not None,
+                XQ.dtype,
+                Y.dtype,
+                kid,
+                split_k,
+            )
+        )
+        if workspace_plan is None:
+            raise RuntimeError(
+                f"OPUS gfx950 kid {actual_kid} unexpectedly has no "
+                "caller-workspace plan"
+            )
+        _opus_gemm_a16w16_launch_ctypes_raw(
+            XQ,
+            WQ,
+            Y,
+            bias,
+            workspace,
+            actual_kid,
+            launch_split_k,
+        )
+        return Y
     return _explicit_a16w16_launch(
         _opus_gemm_a16w16_launch_ctypes_raw,
         XQ,
@@ -914,6 +959,69 @@ def _launch_a16w16(
         kid,
         split_k,
         workspace=workspace,
+    )
+
+
+def _launch_a16w16_gemm(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+    route_arch: str | None = None,
+    instance: OpusGemmInstance | None = None,
+) -> torch.Tensor:
+    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` A16W16 GEMM."""
+    if instance is None and (XQ.dim() != 2 or WQ.dim() != 2 or Y.dim() != 2):
+        raise ValueError(
+            "opus_gemm A16W16 expects 2D XQ/WQ/Y; use opus_bmm for "
+            "batch-first 3D tensors"
+        )
+    _launch_a16w16_exact(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        Y.unsqueeze(0),
+        bias,
+        kid=kid,
+        split_k=split_k,
+        workspace=workspace,
+        route_arch=route_arch,
+        instance=instance,
+    )
+    return Y
+
+
+def _launch_a16w16_bmm(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+    route_arch: str | None = None,
+    instance: OpusGemmInstance | None = None,
+) -> torch.Tensor:
+    """Launch batch-first ``[B,M,K] x [B,N,K] -> [B,M,N]`` A16W16 BMM."""
+    if instance is None and (XQ.dim() != 3 or WQ.dim() != 3 or Y.dim() != 3):
+        raise ValueError(
+            "opus_bmm A16W16 expects batch-first 3D XQ/WQ/Y; use "
+            "opus_gemm for logical 2D tensors"
+        )
+    return _launch_a16w16_exact(
+        XQ,
+        WQ,
+        Y,
+        bias,
+        kid=kid,
+        split_k=split_k,
+        workspace=workspace,
+        route_arch=route_arch,
+        instance=instance,
     )
 
 

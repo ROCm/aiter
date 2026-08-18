@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Interface goldens for the unified caller-resolved OPUS ``kid`` API."""
+"""Interface goldens for caller-resolved OPUS GEMM/BMM ``kid`` APIs."""
 
 from __future__ import annotations
 
@@ -114,25 +114,28 @@ def _instance_arch(instance) -> str:
     return (instance.arch_prefix or "gfx950").lower()
 
 
-def test_only_one_public_python_entry_and_kid_is_mandatory():
+def test_public_gemm_and_bmm_entries_keep_one_exact_kid_contract():
     import aiter
 
     opus = importlib.import_module("aiter.ops.opus")
     a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
 
-    assert opus.__all__ == ["opus_gemm"]
+    assert opus.__all__ == ["opus_gemm", "opus_bmm"]
     assert aiter.opus_gemm is opus.opus_gemm
+    assert aiter.opus_bmm is opus.opus_bmm
     assert a16.__all__ == []
     assert a8.__all__ == []
     assert _parameter_names(opus.opus_gemm) == _PUBLIC_PARAMETERS
+    assert _parameter_names(opus.opus_bmm) == _PUBLIC_PARAMETERS
 
-    parameters = inspect.signature(opus.opus_gemm).parameters
-    assert parameters["kid"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["kid"].default is inspect.Parameter.empty
-    assert parameters["layout"].default == "plain"
-    assert parameters["split_k"].default == 0
-    assert parameters["workspace"].default is None
+    for public_entry in (opus.opus_gemm, opus.opus_bmm):
+        parameters = inspect.signature(public_entry).parameters
+        assert parameters["kid"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters["kid"].default is inspect.Parameter.empty
+        assert parameters["layout"].default == "plain"
+        assert parameters["split_k"].default == 0
+        assert parameters["workspace"].default is None
 
     removed = (
         "gemm_a16w16_opus",
@@ -151,13 +154,20 @@ def test_family_modules_keep_only_private_exact_kid_adapters():
     a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
 
-    assert callable(a16._launch_a16w16)
+    assert callable(a16._launch_a16w16_exact)
+    assert callable(a16._launch_a16w16_gemm)
+    assert callable(a16._launch_a16w16_bmm)
     assert callable(a16._resolve_exact_a16w16_config)
-    assert callable(a8._launch_a8w8)
-    assert callable(a8._launch_a8w8_blockscale)
-    assert callable(a8._launch_a8w8_blockscale_bpreshuffle)
+    assert callable(a8._launch_a8w8_exact)
+    assert callable(a8._launch_a8w8_gemm)
+    assert callable(a8._launch_a8w8_bmm)
+    assert callable(a8._launch_a8w8_blockscale_gemm)
+    assert callable(a8._launch_a8w8_blockscale_bmm)
+    assert callable(a8._launch_a8w8_blockscale_bpreshuffle_gemm)
+    assert callable(a8._launch_a8w8_blockscale_bpreshuffle_bmm)
+    assert callable(a8._launch_a8w8_mxscale_bmm_exact)
     assert callable(a8._launch_a8w8_mxscale_bmm)
-    assert _parameter_names(a16._launch_a16w16) == (
+    assert _parameter_names(a16._launch_a16w16_gemm) == (
         "XQ",
         "WQ",
         "Y",
@@ -165,8 +175,23 @@ def test_family_modules_keep_only_private_exact_kid_adapters():
         "kid",
         "split_k",
         "workspace",
+        "route_arch",
+        "instance",
     )
-    assert _parameter_names(a8._launch_a8w8) == ("XQ", "WQ", "Y", "kid")
+    assert _parameter_names(a16._launch_a16w16_bmm) == _parameter_names(
+        a16._launch_a16w16_gemm
+    )
+    assert _parameter_names(a8._launch_a8w8_gemm) == (
+        "XQ",
+        "WQ",
+        "Y",
+        "kid",
+        "route_arch",
+        "instance",
+    )
+    assert _parameter_names(a8._launch_a8w8_bmm) == _parameter_names(
+        a8._launch_a8w8_gemm
+    )
 
 
 def test_cpp_pybind_family_abis_remain_exact_kid_and_policy_free():
@@ -281,7 +306,8 @@ def test_public_module_uses_lazy_family_imports():
 
     assert "kernels_list.get(kid)" in public_source
     assert "get_kernel_route" not in public_source
-    assert "_opus_gemm_a8w8_mxscale_bmm_launch_raw" in public_source
+    assert "_opus_gemm_a8w8_mxscale_bmm_launch_raw" not in public_source
+    assert "_launch_a8w8_mxscale_bmm" in public_source
     assert "_FP8_DTYPES" not in public_source
     assert "_A8W8_FAMILY_LAYOUT" not in public_source
     assert "def _validate_a16w16_public_contract(" in (
@@ -292,14 +318,16 @@ def test_public_module_uses_lazy_family_imports():
     ).read_text()
 
 
-def test_production_callers_use_unified_entry_not_family_wrappers():
-    callers = (
-        "aiter/tuned_gemm.py",
-        "aiter/ops/gemm_op_a8w8.py",
-        "csrc/opus_gemm/opus_gemm_tune.py",
-        "csrc/gemm_a16w16/gemm_a16w16_tune.py",
-        "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
-    )
+def test_production_callers_use_operation_specific_entry_not_family_wrappers():
+    callers = {
+        "aiter/tuned_gemm.py": "opus_gemm",
+        "aiter/ops/gemm_op_a8w8.py": "opus_gemm",
+        "aiter/ops/batched_gemm_op_a8w8.py": "opus_bmm",
+        "csrc/opus_gemm/opus_gemm_tune.py": "opus_bmm",
+        "csrc/opus_gemm/opus_bmm_mxscale_tune.py": "opus_bmm",
+        "csrc/gemm_a16w16/gemm_a16w16_tune.py": "opus_gemm",
+        "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py": "opus_gemm",
+    }
     removed_names = {
         "gemm_a16w16_opus",
         "opus_gemm_a16w16_launch",
@@ -308,12 +336,12 @@ def test_production_callers_use_unified_entry_not_family_wrappers():
         "opus_gemm_a8w8_blockscale_launch",
         "opus_gemm_a8w8_blockscale_bpreshuffle_launch",
     }
-    for relative_path in callers:
+    for relative_path, public_name in callers.items():
         tree = ast.parse((_ROOT / relative_path).read_text())
         imports = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
         assert any(
-            node.module == "aiter.ops.opus"
-            and any(alias.name == "opus_gemm" for alias in node.names)
+            node.module in {"aiter.ops.opus", "opus"}
+            and any(alias.name == public_name for alias in node.names)
             for node in imports
         ), relative_path
         assert all(

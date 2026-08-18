@@ -86,7 +86,7 @@ from opus_gemm_common import (
 )
 
 from aiter import dtypes, logger
-from aiter.ops.opus import opus_gemm as _opus_gemm
+from aiter.ops.opus import opus_bmm as _opus_bmm
 from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -1263,7 +1263,7 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
 def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     """Launch one eager kid and reject excessive numerical error."""
     _quiet_aiter_logger_once()
-    _opus_gemm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
+    _opus_bmm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
     ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
@@ -1306,7 +1306,7 @@ _bench_max_delta_checked = set()  # module-level per-subprocess cache
 def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
     """Benchmark one kid with a capture-safe, once-per-task accuracy check."""
     _quiet_aiter_logger_once()
-    _opus_gemm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
+    _opus_bmm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
 
     capturing = torch.cuda.is_current_stream_capturing()
 
@@ -2165,6 +2165,7 @@ if __name__ == "__main__":
         "  path passed via --tuned_file / GTUNE_TUNED) and stamps every\n"
         "  opus row with libtype='opus' so aiter.tuned_gemm passes its\n"
         "  resolved solidx directly to aiter.ops.opus.opus_gemm().\n"
+        "  This debug tuner itself uses batch-first opus_bmm() tensors.\n"
         f"  This script writes to {OPUS_DEBUG_TUNED_CSV} by default and\n"
         "  will not pollute the global aiter/configs/ tree.\n"
         "==============================================================\n"

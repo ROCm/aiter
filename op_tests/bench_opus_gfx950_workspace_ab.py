@@ -38,7 +38,7 @@ import aiter.ops.opus as opus_package
 from aiter.ops.opus import gemm_op_a16w16 as gemm
 from csrc.opus_gemm.opus_gemm_common import kernels_list
 
-opus_gemm = getattr(opus_package, "opus_gemm", None)
+opus_bmm = getattr(opus_package, "opus_bmm", None)
 
 
 WORKSPACE_KIDS_BY_ARCH = {
@@ -125,9 +125,8 @@ def _launch(endpoint, xq, wq, y, workspace, kid):
             xq, wq, y, None, workspace, kid, 2
         )
     elif endpoint == "family":
-        # Exact behavior of the former public A16 family wrapper, retained as
-        # an adjacent control after the public surface became one opus_gemm.
-        gemm._launch_a16w16(
+        # Exact family adapter retained as an adjacent control for public BMM.
+        gemm._launch_a16w16_bmm(
             xq,
             wq,
             y,
@@ -147,9 +146,9 @@ def _launch(endpoint, xq, wq, y, workspace, kid):
             workspace=workspace,
         )
     else:
-        if opus_gemm is None:
-            raise RuntimeError("the selected source tree has no unified opus_gemm")
-        opus_gemm(
+        if opus_bmm is None:
+            raise RuntimeError("the selected source tree has no public opus_bmm")
+        opus_bmm(
             xq,
             wq,
             y,

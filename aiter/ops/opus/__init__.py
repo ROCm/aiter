@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One public OPUS GEMM interface backed by exact-kid family launchers."""
+"""Public OPUS GEMM/BMM interfaces backed by shared exact-kid launchers."""
 
 from __future__ import annotations
 
@@ -66,18 +66,18 @@ def _normalize_layout(layout: object) -> str:
         ) from exc
 
 
-def _require_tensor(name: str, value: object) -> Tensor:
+def _require_tensor(operation: str, name: str, value: object) -> Tensor:
     if not isinstance(value, Tensor):
-        raise TypeError(f"opus_gemm: {name} must be a Tensor, got {type(value)!r}")
+        raise TypeError(
+            f"{operation}: {name} must be a Tensor, got {type(value)!r}"
+        )
     return value
 
 
 def _require_gpu_tensor(tensor: Tensor) -> None:
     """Reject an all-CPU call before entering a GPU-only raw launcher."""
     if tensor.device.type != "cuda":
-        raise RuntimeError(
-            f"OPUS GEMM requires a GPU tensor; got device {tensor.device}"
-        )
+        raise RuntimeError(f"OPUS requires a GPU tensor; got device {tensor.device}")
 
 
 @lru_cache(maxsize=4096)
@@ -132,7 +132,34 @@ def _cached_public_contract(
     return route_arch, family, instance, family_module
 
 
-def opus_gemm(
+def _require_operation_rank(
+    operation: str,
+    rank: int,
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor | None,
+    w_scale: Tensor | None,
+) -> None:
+    tensors = {"XQ": XQ, "WQ": WQ, "Y": Y}
+    if x_scale is not None:
+        tensors["x_scale"] = _require_tensor(operation, "x_scale", x_scale)
+    if w_scale is not None:
+        tensors["w_scale"] = _require_tensor(operation, "w_scale", w_scale)
+    invalid = [name for name, tensor in tensors.items() if tensor.dim() != rank]
+    if invalid:
+        other = "opus_bmm" if operation == "opus_gemm" else "opus_gemm"
+        expected = "logical 2D" if rank == 2 else "batch-first 3D"
+        raise ValueError(
+            f"{operation} expects {expected} {', '.join(invalid)}; use "
+            f"{other} for {'batch-first 3D' if rank == 2 else 'logical 2D'} "
+            "tensors"
+        )
+
+
+def _opus_dispatch(
+    operation: str,
+    rank: int,
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
@@ -145,24 +172,17 @@ def opus_gemm(
     split_k: int = 0,
     workspace: Tensor | None = None,
 ) -> Tensor:
-    """Launch one registered OPUS GEMM kernel selected by exact ``kid``.
-
-    ``kid`` is mandatory and uniquely determines architecture and logical
-    family from the canonical registry. Tensor dtypes, ``layout`` and scale
-    presence are validated against that route before dispatching to the
-    family-specific raw launch API. ``Y`` is caller-owned and returned.
-
-    ``layout='bpreshuffle'`` declares that ``WQ`` has already been transformed
-    for a bpreshuffle kernel; Tensor metadata cannot prove this content layout.
-    """
     if not (
         isinstance(XQ, Tensor)
         and isinstance(WQ, Tensor)
         and isinstance(Y, Tensor)
     ):
-        XQ = _require_tensor("XQ", XQ)
-        WQ = _require_tensor("WQ", WQ)
-        Y = _require_tensor("Y", Y)
+        XQ = _require_tensor(operation, "XQ", XQ)
+        WQ = _require_tensor(operation, "WQ", WQ)
+        Y = _require_tensor(operation, "Y", Y)
+    _require_operation_rank(
+        operation, rank, XQ, WQ, Y, x_scale, w_scale
+    )
 
     resolved_kid = kid if type(kid) is int else _normalize_kid(kid)
     resolved_layout = (
@@ -170,6 +190,8 @@ def opus_gemm(
         if layout in ("plain", "bpreshuffle", "mxscale_bmm")
         else _normalize_layout(layout)
     )
+    if operation == "opus_gemm" and resolved_layout == "mxscale_bmm":
+        raise ValueError("layout='mxscale_bmm' is only supported by opus_bmm")
     resolved_split_k = (
         split_k
         if type(split_k) is int and split_k >= 0
@@ -192,54 +214,12 @@ def opus_gemm(
     )
 
     if family == "a16w16":
-        if (
-            route_arch == "gfx950"
-            and workspace is not None
-            and resolved_split_k > 0
-            and instance.splitk_workspace_dtype is not None
-        ):
-            # A caller-owned gfx950 workspace already gives this exact-kid
-            # path everything it needs to launch.  Preserve the dynamic
-            # shape/stride contract and the cached exact-plan validation, but
-            # avoid re-reading device metadata and re-entering the generic
-            # workspace planner on every short public call.  The existing C
-            # ABI remains the final checked boundary (device/stream guard,
-            # tensor/workspace checks and exact-kid dispatch).
-            _require_gpu_tensor(XQ)
-            family_module._check_a16w16_launch_layout(XQ, WQ, Y)
-            batch, M, K = XQ.shape
-            N = Y.shape[2]
-            actual_kid, launch_split_k, workspace_plan = (
-                family_module._cached_explicit_a16w16_plan(
-                    route_arch,
-                    M,
-                    N,
-                    K,
-                    batch,
-                    1,  # CU count is not consulted by explicit gfx950 plans.
-                    bias is not None,
-                    XQ.dtype,
-                    Y.dtype,
-                    resolved_kid,
-                    resolved_split_k,
-                )
-            )
-            if workspace_plan is None:
-                raise RuntimeError(
-                    f"OPUS gfx950 kid {actual_kid} unexpectedly has no "
-                    "caller-workspace plan"
-                )
-            family_module._opus_gemm_a16w16_launch_ctypes_raw(
-                XQ,
-                WQ,
-                Y,
-                bias,
-                workspace,
-                actual_kid,
-                launch_split_k,
-            )
-            return Y
-        return family_module._launch_a16w16(
+        launch = (
+            family_module._launch_a16w16_gemm
+            if operation == "opus_gemm"
+            else family_module._launch_a16w16_bmm
+        )
+        return launch(
             XQ,
             WQ,
             Y,
@@ -247,43 +227,64 @@ def opus_gemm(
             kid=resolved_kid,
             split_k=resolved_split_k,
             workspace=workspace,
+            route_arch=route_arch,
+            instance=instance,
         )
 
-    # The A8 raw entries are checked C++ launchers: they validate device,
-    # dtype, shape/stride, architecture and exact kid before dispatch.  The
-    # cached public contract above already owns immutable Python routing and
-    # option-presence checks, so repeating the private family registry/device
-    # walk here only adds host latency.  Keep the private adapters unchanged
-    # for direct callers and for BMM workspace planning.
+    # The A8 family adapters receive the cached registry instance so their
+    # common paths enter the checked raw C++ ABI directly.  The adapters own
+    # only logical GEMM/BMM layout conversion; device, dtype, stride, shape and
+    # exact-kid checks remain at the unchanged raw boundary.
     _require_gpu_tensor(XQ)
 
     if family == "a8w8":
-        family_module._opus_gemm_a8w8_launch_raw(XQ, WQ, Y, resolved_kid)
-        return Y
+        launch = (
+            family_module._launch_a8w8_gemm
+            if operation == "opus_gemm"
+            else family_module._launch_a8w8_bmm
+        )
+        return launch(
+            XQ,
+            WQ,
+            Y,
+            kid=resolved_kid,
+            route_arch=route_arch,
+            instance=instance,
+        )
     assert x_scale is not None and w_scale is not None
     if family == "a8w8_blockscale":
-        family_module._opus_gemm_a8w8_blockscale_launch_raw(
-            XQ, WQ, Y, x_scale, w_scale, resolved_kid
+        launch = (
+            family_module._launch_a8w8_blockscale_gemm
+            if operation == "opus_gemm"
+            else family_module._launch_a8w8_blockscale_bmm
         )
-        return Y
+        return launch(
+            XQ,
+            WQ,
+            Y,
+            x_scale,
+            w_scale,
+            kid=resolved_kid,
+            route_arch=route_arch,
+            instance=instance,
+        )
     if family == "a8w8_blockscale_bpreshuffle":
-        family_module._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-            XQ, WQ, x_scale, w_scale, Y, resolved_kid
+        launch = (
+            family_module._launch_a8w8_blockscale_bpreshuffle_gemm
+            if operation == "opus_gemm"
+            else family_module._launch_a8w8_blockscale_bpreshuffle_bmm
         )
-        return Y
+        return launch(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Y,
+            kid=resolved_kid,
+            route_arch=route_arch,
+            instance=instance,
+        )
     if family == "a8w8_mxscale_bmm":
-        if workspace is None and resolved_split_k <= 1:
-            family_module._opus_gemm_a8w8_mxscale_bmm_launch_raw(
-                XQ,
-                WQ,
-                Y,
-                x_scale,
-                w_scale,
-                None,
-                resolved_kid,
-                max(1, resolved_split_k),
-            )
-            return Y
         return family_module._launch_a8w8_mxscale_bmm(
             XQ,
             WQ,
@@ -293,8 +294,74 @@ def opus_gemm(
             kid=resolved_kid,
             split_k=resolved_split_k,
             workspace=workspace,
+            route_arch=route_arch,
+            instance=instance,
         )
     raise RuntimeError(f"unsupported canonical OPUS family {family!r}")
 
 
-__all__ = ["opus_gemm"]
+def opus_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    layout: str = "plain",
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    bias: Tensor | None = None,
+    split_k: int = 0,
+    workspace: Tensor | None = None,
+) -> Tensor:
+    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` by exact ``kid``.
+
+    ``Y`` is caller-owned and returned. ``layout='bpreshuffle'`` declares a
+    transformed WQ content layout that Tensor metadata cannot prove.
+    """
+    return _opus_dispatch(
+        "opus_gemm",
+        2,
+        XQ,
+        WQ,
+        Y,
+        kid=kid,
+        layout=layout,
+        x_scale=x_scale,
+        w_scale=w_scale,
+        bias=bias,
+        split_k=split_k,
+        workspace=workspace,
+    )
+
+
+def opus_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    layout: str = "plain",
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    bias: Tensor | None = None,
+    split_k: int = 0,
+    workspace: Tensor | None = None,
+) -> Tensor:
+    """Launch batch-first ``[B,M,K] x [B,N,K] -> [B,M,N]`` by exact kid."""
+    return _opus_dispatch(
+        "opus_bmm",
+        3,
+        XQ,
+        WQ,
+        Y,
+        kid=kid,
+        layout=layout,
+        x_scale=x_scale,
+        w_scale=w_scale,
+        bias=bias,
+        split_k=split_k,
+        workspace=workspace,
+    )
+
+
+__all__ = ["opus_gemm", "opus_bmm"]

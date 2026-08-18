@@ -1,12 +1,27 @@
-# OPUS GEMM Python interface
+# OPUS GEMM and BMM Python interfaces
 
-OPUS exposes one public GEMM function. The caller resolves the final kernel id
-before the call; OPUS does not select a kernel from the shape.
+OPUS exposes separate public functions for logical 2D GEMM and batch-first 3D
+BMM. The caller resolves the final kernel id before the call; OPUS does not
+select a kernel from the shape.
 
 ```python
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm, opus_gemm
 
-opus_gemm(
+opus_gemm(  # XQ [M,K], WQ [N,K], Y [M,N]
+    XQ,
+    WQ,
+    Y,
+    *,
+    kid,
+    layout="plain",
+    x_scale=None,
+    w_scale=None,
+    bias=None,
+    split_k=0,
+    workspace=None,
+)
+
+opus_bmm(  # XQ [B,M,K], WQ [B,N,K], Y [B,M,N]
     XQ,
     WQ,
     Y,
@@ -21,10 +36,11 @@ opus_gemm(
 )
 ```
 
-`kid` is mandatory. `Y` is also caller-owned and is returned unchanged after
-the launch. The disjoint architecture id bands and the merged `kernels_list`
-form the canonical registry. The public entry directly calls
-`kernels_list.get(kid)`; it does not introduce or renumber ids. The returned
+`kid` is mandatory. `Y` is caller-owned and is returned unchanged after the
+launch. GEMM versus BMM is determined only by the selected public function;
+dtype does not determine the operation. The disjoint architecture id bands
+and the merged `kernels_list` form the canonical registry. Both entries call
+`kernels_list.get(kid)`; they do not introduce or renumber ids. The returned
 instance tag plus the dtype/layout arguments determine the private family
 adapter, rather than a second selector or a numeric-range guess.
 
@@ -32,15 +48,23 @@ adapter, rather than a second selector or a numeric-range guess.
 
 ```text
 caller-resolved final kid
+  -> opus_gemm (strict 2D) or opus_bmm (strict batch-first 3D)
   -> existing kernels_list.get(kid)
   -> instance arch/tag metadata
   -> family-local dtype/layout/scale checks
-  -> private family adapter
-  -> exact-kid C++ family table
+  -> A16W16 or A8W8 family adapter
+  -> shared exact launcher/workspace planner
+  -> unchanged exact-kid C++ family table
 ```
 
+The public operation split does not duplicate kernels, workspace allocation,
+or raw bindings. A logical GEMM becomes a batch-one view at the family
+boundary. A logical BMM keeps its batch-first public layout; the MXScale
+adapter alone converts activation/output tensors to the raw kernel's existing
+M-major views with `transpose(0, 1)`, which does not copy storage.
+
 There is no tuned-CSV lookup, architecture heuristic, redirect, or framework
-fallback inside this exact public path.  The existing high-level A16 caller
+fallback inside either exact public path. The existing high-level A16 caller
 resolves those policies before entering it:
 
 ```text
@@ -54,47 +78,52 @@ The A16 policy helpers are isolated in `a16w16_policy.py`, while
 `tuned_gemm.py` imports only the tuned-candidate validator.  A missing tuned
 row does not invoke an OPUS heuristic.  Invalid tuned `(kid, split-K)` pairs
 are discarded together before the caller continues to its normal skinny or
-PyTorch fallback.  Legacy gfx942 requested-to-actual resolution also happens
-in the caller, so only the final integer id reaches `opus_gemm`.
+PyTorch fallback. Legacy gfx942 requested-to-actual resolution also happens
+in the caller, so only the final integer id reaches `opus_gemm` or `opus_bmm`.
 
 ## Current families
 
-| Registry family | Current route | Python input rules |
+| Registry family | Current route | Public operation and dtype rules |
 |---|---|---|
-| `a16w16` | gfx942, gfx950, gfx1250 | BF16 `XQ/WQ`, BF16 or FP32 `Y`, plain WQ, optional bias/split-K/Torch workspace |
-| `a8w8` | gfx950 kid 2 | FP8 `XQ/WQ`, FP32 `Y`, plain WQ, no scales |
-| `a8w8_blockscale` | gfx950 kid 1 | FP8 `XQ/WQ`, FP32 `Y`, plain WQ, two FP32 scales |
-| `a8w8_blockscale_bpreshuffle` | gfx942 kid 11000 | FP8 `XQ/WQ`, BF16 `Y`, pre-shuffled WQ, two FP32 scales |
-| `a8w8_mxscale_bmm` | gfx950 global kids 8000--8653 (45 registered ids) | FP8 `[M,G,K]` / `[G,N,K]`, E8M0 scales, BF16 or FP32 `[M,G,N]`, optional split-K Torch workspace |
+| `a16w16` | gfx942, gfx950, gfx1250 | GEMM or BMM; BF16 `XQ/WQ`, BF16 or FP32 `Y`, plain WQ, optional bias/split-K/Torch workspace |
+| `a8w8` | gfx950 kid 2 | GEMM or BMM; FP8 `XQ/WQ`, FP32 `Y`, plain WQ, no scales |
+| `a8w8_blockscale` | gfx950 kid 1 | GEMM or BMM; FP8 `XQ/WQ`, FP32 `Y`, plain WQ, two FP32 scales |
+| `a8w8_blockscale_bpreshuffle` | gfx942 kid 11000 | GEMM or batch-one BMM; FP8 `XQ/WQ`, BF16 `Y`, pre-shuffled WQ, two FP32 scales |
+| `a8w8_mxscale_bmm` | gfx950 global kids 8000--8653 (45 registered ids) | BMM only; batch-first FP8 inputs, E8M0 scales, BF16 or FP32 output, optional split-K Torch workspace |
 
 Empty family tables on another architecture are valid capability states. A
 kid registered for another architecture is rejected before family launch.
 
 ## Examples
 
-### A16W16
+### A16W16 GEMM and BMM
 
 ```python
 import torch
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import opus_bmm, opus_gemm
 
-XQ = torch.randn((1, 64, 512), device="cuda", dtype=torch.bfloat16)
-WQ = torch.randn((1, 64, 512), device="cuda", dtype=torch.bfloat16)
-Y = torch.empty((1, 64, 64), device="cuda", dtype=torch.bfloat16)
+XQ = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
+WQ = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
+Y = torch.empty((64, 64), device="cuda", dtype=torch.bfloat16)
 
 # The caller/tuner has already chosen gfx950 kid 200 and split_k 2.
 opus_gemm(XQ, WQ, Y, kid=200, split_k=2)
+
+XQ_b = torch.randn((8, 64, 512), device="cuda", dtype=torch.bfloat16)
+WQ_b = torch.randn((8, 64, 512), device="cuda", dtype=torch.bfloat16)
+Y_b = torch.empty((8, 64, 64), device="cuda", dtype=torch.bfloat16)
+opus_bmm(XQ_b, WQ_b, Y_b, kid=200, split_k=2)
 ```
 
-The A16 interface takes 3D `[batch,M,K]`, `[batch,N,K]`, and
-`[batch,M,N]` tensors. Inputs are K-contiguous with a dense batch stride; `Y`
-is contiguous. Current gfx1250 kernels require batch one. Exact instances can
-impose additional tile, output dtype, bias, or K-loop constraints.
+`opus_gemm` requires 2D tensors; `opus_bmm` requires batch-first 3D tensors.
+Inputs are K-contiguous and `Y` is N-contiguous. Current gfx1250 kernels still
+require BMM batch one. Exact instances can impose additional tile, output
+dtype, bias, or K-loop constraints.
 
 ### gfx950 A8W8 without scales
 
 ```python
-Y = torch.empty((batch, M, N), device=XQ.device, dtype=torch.float32)
+Y = torch.empty((M, N), device=XQ.device, dtype=torch.float32)
 opus_gemm(XQ, WQ, Y, kid=2)
 ```
 
@@ -111,22 +140,21 @@ opus_gemm(
 )
 ```
 
-The group contract is 1x128x128. Scales are contiguous FP32 tensors on the
-input device. Their 3D shapes are `[batch,M,K/128]` and
-`[batch,N/128,K/128]`; batch-one 2D forms are also accepted by the generated
-launcher.
+The group contract is 1x128x128. GEMM scales are contiguous FP32
+`[M,K/128]` and `[N/128,K/128]` tensors. BMM uses their batch-first 3D forms
+`[B,M,K/128]` and `[B,N/128,K/128]` with `opus_bmm`.
 
 ### gfx950 MXFP8 BMM
 
 ```python
-Y = torch.empty((M, G, N), device=XQ.device, dtype=torch.bfloat16)
-opus_gemm(
-    XQ,                    # [M,G,K], K-contiguous
-    WQ,                    # [G,N,K], K-contiguous
+Y = torch.empty((G, M, N), device=XQ.device, dtype=torch.bfloat16)
+opus_bmm(
+    XQ,                    # [G,M,K], batch-first and K-contiguous
+    WQ,                    # [G,N,K], batch-first and K-contiguous
     Y,
     kid=8311,              # exact global id; family-local id 311
     layout="mxscale_bmm",
-    x_scale=x_scale,       # [M,G,K/128], one-byte E8M0
+    x_scale=x_scale,       # [G,M,K/128], one-byte E8M0
     w_scale=w_scale,       # [G,N/128,K/128], one-byte E8M0
     split_k=1,
 )
@@ -135,9 +163,11 @@ opus_gemm(
 The 45 MXFP8 BMM kernels use global ids `8000 + family_local_kid`; the
 family-local ids remain recognizable while sharing the canonical
 `kernels_list` without colliding with existing GEMM ids. `mxfp8_bmm` and
-`bmm_mxscale` are accepted layout aliases. The high-level tuned caller remains
-in the existing A8W8 module as `aiter.batched_gemm_a8w8_mxscale`; it resolves
-the final id and then calls this same public entry.
+`bmm_mxscale` are accepted layout aliases. Internally, the family adapter
+passes zero-copy `[M,G,*]` transpose views to the unchanged raw kernel ABI.
+The high-level tuned caller remains in the existing A8W8 module as
+`aiter.batched_gemm_a8w8_mxscale`; it resolves the final id and then calls
+`opus_bmm`.
 
 ### gfx942 blockscale bpreshuffle
 
@@ -238,9 +268,10 @@ exact-routable.
 
 ## Migration
 
-The former shape-driven and family-specific Python APIs were removed. Migrate
-by allocating `Y`, resolving the final id in the caller, and calling the one
-entry above. The private family modules intentionally export an empty
+The former shape-driven and family-specific Python APIs were removed. Allocate
+`Y`, resolve the final id in the caller, and choose `opus_gemm` for logical 2D
+tensors or `opus_bmm` for batch-first 3D tensors. Do not infer the operation
+from dtype. The private family modules intentionally export an empty
 `__all__`.
 
 ## Validation
@@ -266,9 +297,9 @@ skip on another architecture is not a pass for that target.
 
 | Path | Role |
 |---|---|
-| `__init__.py` | one public exact-kid router and logical-contract checks |
+| `__init__.py` | strict public `opus_gemm`/`opus_bmm` contracts and exact-kid routing |
 | `_arch.py` | per-explicit-device architecture/CU scalar cache |
-| `gemm_op_a16w16.py` | private exact A16 resolver, scalar plan cache, Torch workspace and OPUS-local C ABI adapter |
-| `gemm_op_a8w8.py` | four private exact A8 family adapters, including MXFP8 BMM workspace planning |
+| `gemm_op_a16w16.py` | A16 GEMM/BMM adapters over one exact resolver, scalar plan cache, Torch workspace and OPUS-local C ABI adapter |
+| `gemm_op_a8w8.py` | A8 GEMM/BMM adapters over shared raw launchers, including MXFP8 BMM layout conversion and workspace planning |
 | `../batched_gemm_op_a8w8.py` | MXFP8 BMM tuned-row lookup and high-level caller |
 | `../../../csrc/opus_gemm/` | canonical registry, C++ family launchers, codegen, traits and pipelines |
