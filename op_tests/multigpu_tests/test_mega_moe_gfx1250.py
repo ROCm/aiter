@@ -27,7 +27,7 @@ Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -m -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -783,7 +783,7 @@ def main():
         return
 
     E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
-    ct, n_layers = args.tokens, args.layers
+    ct, n_layers = args.token_per_rank, args.layers
     assert (
         E % dist_ctx.world == 0
     ), f"E={E} must be divisible by world_size={dist_ctx.world}"
@@ -922,7 +922,9 @@ def _parse_args():
         default="a8w4_mxfp4",
         help="quantization type",
     )
-    p.add_argument("-bs", "--tokens", type=int, default=128, help="tokens per rank")
+    p.add_argument(
+        "-tpr", "--token_per_rank", type=int, default=128, help="tokens per rank"
+    )
     p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
     p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")
     p.add_argument(
