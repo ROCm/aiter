@@ -29,15 +29,15 @@
     },
     "any": {
         "BLOCK_SIZE_M": 256,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "NUM_KSPLIT": 1,
         "num_warps": 4,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "NUM_BUFFERS": 4,
         "cache_modifier": null,
-        "LOOP_UNROLL_FACTOR": 1,
+        "LOOP_UNROLL_FACTOR": 4,
         "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound"
     }
