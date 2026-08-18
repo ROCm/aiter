@@ -168,7 +168,37 @@ def run_trace_safety(
     return True
 
 
+def run_reduce_residual_epilogue(
+    token=128, model_dim=6144, topk=4, dtype=torch.bfloat16
+):
+    """FlyDSL reduce mode must preserve reduce->BF16->residual semantics."""
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    torch.manual_seed(849)
+    routes = torch.randn(
+        (token, topk, model_dim), dtype=dtype, device="cuda"
+    )
+    residual = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    reference = torch.empty_like(residual)
+    folded = torch.empty_like(residual)
+    _run_moe_reduction(routes, reference, token, topk, model_dim)
+    reference.add_(residual)
+    _run_moe_reduction(
+        routes,
+        folded,
+        token,
+        topk,
+        model_dim,
+        residual=residual,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(reference, folded)
+    print("  [reduce] fused residual epilogue is BF16-exact")
+    return True
+
+
 if __name__ == "__main__":
     run_case()
     run_trace_safety()
+    run_reduce_residual_epilogue()
     print("PASS")

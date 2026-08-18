@@ -26,7 +26,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int dispatch_policy                             = 0,
                           std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
-                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
+                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt,
+                          std::optional<aiter_tensor_t> moe_buf_init     = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -428,6 +429,7 @@ struct MoeSortingHostArgs
     // we fused the setzero of output of fused-moe buffer
     // set this pointer to nullptr will skip this operation
     void* p_moe_buf;
+    const void* p_moe_buf_init; // optional BF16/FP16/FP32 initial contents
     void* p_ws;             // size is moe_sorting_get_workspace_size()
                             // if return zero, then could be nullptr
                             // must be cleard before use
@@ -475,6 +477,7 @@ struct MoeSortingKernel
         void* p_sorted_expert_ids;
         void* p_total_tokens_post_pad;
         void* p_moe_buf;
+        const void* p_moe_buf_init;
         void* p_local_topk_ids;
         void* p_m_indices;
         void* p_reverse_sorted;
@@ -532,6 +535,7 @@ struct MoeSortingKernel
         k.p_sorted_weights        = h.p_sorted_weights;
         k.p_sorted_expert_ids     = h.p_sorted_expert_ids;
         k.p_moe_buf               = h.p_moe_buf;
+        k.p_moe_buf_init          = h.p_moe_buf_init;
         k.p_local_topk_ids        = h.p_local_topk_ids;
         k.p_m_indices             = h.p_m_indices;
         k.p_reverse_sorted        = h.p_reverse_sorted;
@@ -693,6 +697,7 @@ struct MoeSortingKernel
     }
 
     OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
+                                           const void* init,
                                            opus::index_t row,
                                            opus::index_t col,
                                            opus::index_t elem_bytes) const
@@ -703,12 +708,13 @@ struct MoeSortingKernel
 
         using vector_type  = opus::vector_t<opus::index_t, 4>;
         vector_type* p_buf = reinterpret_cast<vector_type*>(buf);
+        const vector_type* p_init = reinterpret_cast<const vector_type*>(init);
         auto zero_         = vector_type{0};
 
         for(opus::long_index_t i = (blockIdx.x - 1) * kBlockSize + threadIdx.x; i < total_elems;
             i += (gridDim.x - 1) * kBlockSize)
         {
-            p_buf[i] = zero_;
+            p_buf[i] = p_init != nullptr ? p_init[i] : zero_;
         }
     }
 
@@ -1119,7 +1125,11 @@ struct MoeSortingKernel
             if(kargs.p_moe_buf)
             {
                 moe_buf_set_zero_kernel_2d(
-                    kargs.p_moe_buf, tokens_, kargs.moe_buf_interm_dim, kargs.moe_buf_elem_bytes);
+                    kargs.p_moe_buf,
+                    kargs.p_moe_buf_init,
+                    tokens_,
+                    kargs.moe_buf_interm_dim,
+                    kargs.moe_buf_elem_bytes);
             }
             return;
         }
@@ -1341,6 +1351,7 @@ OPUS_D void moe_sorting_wave_cumsum(data_t& thread_data)
 
 template <opus::index_t kBlockSize = 256>
 OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
+                                       const void* init,
                                        opus::index_t row,
                                        opus::index_t col,
                                        opus::index_t elem_bytes,
@@ -1353,12 +1364,13 @@ OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
 
     using vector_type  = opus::vector_t<opus::index_t, 4>;
     vector_type* p_buf = reinterpret_cast<vector_type*>(buf);
+    const vector_type* p_init = reinterpret_cast<const vector_type*>(init);
     auto zero_         = vector_type{0};
 
     for(opus::long_index_t i = gid * kBlockSize + threadIdx.x; i < total_elems;
         i += blocks * kBlockSize)
     {
-        p_buf[i] = zero_;
+        p_buf[i] = p_init != nullptr ? p_init[i] : zero_;
     }
 }
 
@@ -2279,6 +2291,7 @@ struct MoeSortingMultiPhaseKernel_P2
         void* p_total_tokens_post_pad;   // [2]
         void* p_sorted_expert_ids;
         void* p_moe_buf;
+        const void* p_moe_buf_init;
         opus::index_t tokens;
         opus::index_t num_experts;
         opus::index_t mesh_stride; // mesh_stride for p_expert_mesh
@@ -2299,6 +2312,7 @@ struct MoeSortingMultiPhaseKernel_P2
         k.p_sorted_expert_ids     = h.p_sorted_expert_ids;
 
         k.p_moe_buf = h.p_moe_buf;
+        k.p_moe_buf_init = h.p_moe_buf_init;
 
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
@@ -2342,6 +2356,7 @@ struct MoeSortingMultiPhaseKernel_P2
         if(blockIdx.x > 0)
         {
             impl::moe_buf_set_zero_kernel_2d<kBlockSize>(kargs.p_moe_buf,
+                                                         kargs.p_moe_buf_init,
                                                          kargs.tokens,
                                                          kargs.moe_buf_interm_dim,
                                                          kargs.moe_buf_elem_bytes,
@@ -2688,6 +2703,7 @@ struct MoeSortingMultiPhaseKernel_P23
         void* p_sorted_token_ids;
         void* p_sorted_weights;
         void* p_moe_buf;
+        const void* p_moe_buf_init;
         void* p_local_topk_ids;
 
         opus::index_t tokens;
@@ -2722,6 +2738,7 @@ struct MoeSortingMultiPhaseKernel_P23
         k.p_sorted_weights   = h.p_sorted_weights;
 
         k.p_moe_buf        = h.p_moe_buf;
+        k.p_moe_buf_init   = h.p_moe_buf_init;
         k.p_local_topk_ids = h.p_local_topk_ids;
 
         k.tokens         = h.tokens;
@@ -2781,6 +2798,7 @@ struct MoeSortingMultiPhaseKernel_P23
         if(static_cast<opus::index_t>(blockIdx.x) >= kargs.num_experts)
         {
             impl::moe_buf_set_zero_kernel_2d<kBlockSize>(kargs.p_moe_buf,
+                                                         kargs.p_moe_buf_init,
                                                          tokens,
                                                          kargs.moe_buf_interm_dim,
                                                          kargs.moe_buf_elem_bytes,

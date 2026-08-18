@@ -5,7 +5,6 @@ import functools
 import os
 import re
 from collections.abc import Callable
-from typing import Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -298,6 +297,7 @@ def _moe_sorting_impl(
             local_topk_ids,
             aux_m_indices,
             aux_reverse_sorted,
+            out_init_buf,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -665,8 +665,8 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    out: Optional[torch.Tensor] = None,
-    residual: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
     has_fake_topk_slot: bool | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -947,6 +947,7 @@ def _fused_moe_impl(
     if block_size_M is not None:
         block_size_M = int(block_size_M)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     need_local_topk_ids = (
         not metadata.run_1stage
@@ -999,6 +1000,14 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
+        _route_reduce = stage2_uses_route_reduce(metadata.stage2)
+        _opus_atomic_residual_fold = (
+            residual is not None
+            and not _route_reduce
+            and not metadata.flat
+            and not _USE_CK_MOE_SORTING
+            and not _USE_FLYDSL_MOE_SORTING
+        )
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -1010,13 +1019,14 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            accumulate=not _route_reduce,
             flat=metadata.flat,
             out_buf=(
                 out
-                if not stage2_uses_route_reduce(metadata.stage2) and not metadata.flat
+                if not _route_reduce and not metadata.flat
                 else None
             ),
+            out_init_buf=residual if _opus_atomic_residual_fold else None,
         )
         if need_local_topk_ids:
             (
@@ -1063,10 +1073,17 @@ def _fused_moe_impl(
             kernel_bench_callable.append(("stage1", _stage1_call))
         return _finalize(_stage1_call())
     else:
-        # The out-init fold only lands when the MXFP4 a4w4 atomic path consumed
-        # `residual` (threaded as out_init_buf/bf16_out_init above); mark it folded so
-        # `_finalize` skips the post-add and we don't double-count the shared add.
-        _folded = _atomic and residual is not None
+        # MXFP4 a4w4 atomic and standard Opus atomic paths can initialize their
+        # accumulation target from the shared output. Skip the generic post-add
+        # when either path consumed the residual.
+        _reduce_residual_fold = (
+            residual is not None
+            and stage2_func is _flydsl_stage2_wrapper
+            and stage2_uses_route_reduce(metadata.stage2)
+        )
+        _folded = residual is not None and (
+            _atomic or _opus_atomic_residual_fold or _reduce_residual_fold
+        )
         return _finalize(
             fused_moe_2stages(
                 hidden_states,
@@ -1111,6 +1128,7 @@ def _fused_moe_impl(
                 _stage2_extra_args=_stage2_extra_args,
                 out=out,
                 bf16_out_init=residual if _atomic else None,
+                residual=residual if _reduce_residual_fold else None,
             )
         )
 
@@ -1568,6 +1586,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    residual=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1616,6 +1635,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        residual=residual,
     )
 
 
@@ -3052,6 +3072,7 @@ def fused_moe_2stages(
     _stage2_extra_args: dict | None = None,
     out=None,
     bf16_out_init=None,
+    residual=None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3224,6 +3245,12 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if (
+        residual is not None
+        and stage2_func is _flydsl_stage2_wrapper
+        and stage2_uses_route_reduce(metadata.stage2)
+    ):
+        extra_stage2_args["residual"] = residual
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf

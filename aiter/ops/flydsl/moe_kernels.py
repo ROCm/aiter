@@ -995,6 +995,7 @@ def _run_moe_reduction(
     model_dim,
     expert_mask=None,
     topk_ids=None,
+    residual=None,
     stream=None,
     is_fp8=False,
 ):
@@ -1003,6 +1004,17 @@ def _run_moe_reduction(
     if use_mask and topk_ids is None:
         raise ValueError(
             "topk_ids is required when expert_mask is provided for reduce mode"
+        )
+    if residual is not None and (
+        residual.shape != (token_num, model_dim)
+        or residual.dtype != out.dtype
+        or residual.device != out.device
+        or not residual.is_contiguous()
+    ):
+        raise ValueError(
+            "residual must be contiguous and match the reduction output "
+            f"shape/dtype/device; got {tuple(residual.shape)}, {residual.dtype}, "
+            f"{residual.device}"
         )
     # Map torch dtype -> compile_moe_reduction dtype_str
     if out.dtype == torch.float16:
@@ -1022,6 +1034,8 @@ def _run_moe_reduction(
                 f"Masked moe reduction not supported for dtype {out.dtype}"
             )
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        if residual is not None:
+            out.add_(residual)
         return
 
     reduce_out_dtype_str = None
@@ -1040,6 +1054,7 @@ def _run_moe_reduction(
         "model_dim": model_dim,
         "dtype_str": _reduce_dtype_str,
         "use_mask": use_mask,
+        "use_residual": residual is not None,
         # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
         "num_experts": int(expert_mask.numel()) if use_mask else 0,
     }
@@ -1053,18 +1068,20 @@ def _run_moe_reduction(
         # Placeholders; kernel ignores them when use_mask=False (and for fp8).
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    residual_arg = (
+        residual
+        if residual is not None
+        else torch.empty(0, device=out.device, dtype=out.dtype)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
+    reduce_args = (ptr_arg(X), ptr_arg(out))
+    if not is_fp8:
+        reduce_args += (ptr_arg(residual_arg),)
+    reduce_args += (ptr_arg(em), ptr_arg(tk), token_num, stream)
     _run_compiled(
         reduce_exe,
-        (
-            ptr_arg(X),
-            ptr_arg(out),
-            ptr_arg(em),
-            ptr_arg(tk),
-            token_num,
-            stream,
-        ),
+        reduce_args,
     )
 
 
@@ -1913,6 +1930,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2006,6 +2024,7 @@ def _flydsl_moe_stage2_impl(
     _s2_fp8_inter = (
         (not accumulate)
         and (not return_per_slot)
+        and residual is None
         and use_mx_gemm
         and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
@@ -2102,6 +2121,7 @@ def _flydsl_moe_stage2_impl(
             model_dim,
             expert_mask,
             topk_ids,
+            residual,
             is_fp8=_s2_fp8_inter,
         )
     return out
@@ -2139,6 +2159,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2192,6 +2213,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        residual=residual,
     )
 
 

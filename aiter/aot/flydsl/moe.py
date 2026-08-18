@@ -840,6 +840,18 @@ def _precompile_to_cache(
                     topk_ids=None,
                     stream=0,
                 )
+                if a_dtype == "fp8" and b_dtype == "fp8":
+                    _run_moe_reduction(
+                        target,
+                        out,
+                        tokens,
+                        topk,
+                        model_dim,
+                        expert_mask=None,
+                        topk_ids=None,
+                        residual=torch.zeros_like(out),
+                        stream=0,
+                    )
 
 
 def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):

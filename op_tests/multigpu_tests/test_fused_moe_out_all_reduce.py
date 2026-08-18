@@ -38,8 +38,10 @@ from multiprocessing import Pool, set_start_method, freeze_support
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import fused_moe, fused_topk
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
-from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose
 from aiter.dist.parallel_state import (
     ensure_model_parallel_initialized,
@@ -58,8 +60,9 @@ set_start_method("spawn", force=True)
 
 def _build_moe_weights(quant, E, model_dim, inter_dim, dtype, device, seed):
     """Build (input, w1, w2, topk_weights, topk_ids, fused_moe_kwargs) for the
-    requested producer. ``a4w4`` mirrors the MXFP4 per_1x32/fp4x2 preshuffle
-    setup in op_tests/test_moe_2stage.py; ``bf16`` is dense QuantType.No."""
+    requested producer. ``a4w4`` and ``mxfp8`` mirror their per_1x32
+    preshuffle setup in op_tests/test_moe_2stage.py; ``bf16`` is dense
+    QuantType.No."""
     torch.manual_seed(seed)
     token = 128
     topk = 4
@@ -76,6 +79,48 @@ def _build_moe_weights(quant, E, model_dim, inter_dim, dtype, device, seed):
             activation=aiter.ActivationType.Silu,
         )
         return x, w1, w2, topk_weights, topk_ids, kwargs
+
+    if quant == "mxfp8":
+        w1_q, w1_scale = per_1x32_f8_scale_f8_quant(
+            w1.reshape(-1, model_dim),
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+        )
+        w2_q, w2_scale = per_1x32_f8_scale_f8_quant(
+            w2.reshape(-1, inter_dim),
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+        )
+        w1_q = w1_q.reshape_as(w1)
+        w2_q = w2_q.reshape_as(w2)
+        w1_scale = w1_scale.reshape(E, inter_dim * 2, model_dim // 32)
+        w2_scale = w2_scale.reshape(E, model_dim, inter_dim // 32)
+
+        w1_q = shuffle_weight(w1_q, is_guinterleave=True, gate_up=True)
+        w2_q = shuffle_weight(w2_q, is_guinterleave=True, gate_up=False)
+        w1_scale = shuffle_scale(
+            w1_scale.reshape(-1, model_dim // 32),
+            E,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_scale = shuffle_scale(
+            w2_scale.reshape(-1, inter_dim // 32),
+            E,
+            is_guinterleave=True,
+            gate_up=False,
+        )
+        w1_q.is_shuffled = True
+        w2_q.is_shuffled = True
+        kwargs = dict(
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            quant_type=aiter.QuantType.per_1x32,
+            activation=aiter.ActivationType.Swiglu,
+            swiglu_limit=7.0,
+            gate_mode=GateMode.INTERLEAVE.value,
+        )
+        return x, w1_q, w2_q, topk_weights, topk_ids, kwargs
 
     # a4w4 (MXFP4): per_1x32 fp4x2 weights, bf16 activations quantized inside
     # fused_moe. Follows the preshuffle fp4x2 branch of test_moe_2stage.
@@ -328,7 +373,11 @@ def run_case(tp_size, quant, E, model_dim, inter_dim, dtype, distributed_init_me
 parser = argparse.ArgumentParser(description="#3 TP validation")
 parser.add_argument("-t", "--tp", type=int, default=4, help="tensor-parallel size")
 parser.add_argument(
-    "-q", "--quant", choices=["bf16", "a4w4"], default="bf16", help="producer path"
+    "-q",
+    "--quant",
+    choices=["bf16", "a4w4", "mxfp8"],
+    default="bf16",
+    help="producer path",
 )
 parser.add_argument("-e", "--expert", type=int, default=None, help="num experts")
 parser.add_argument(
@@ -350,6 +399,10 @@ if __name__ == "__main__":
         E = args.expert or 257
         model_dim = args.dim or 7168
         inter_dim = args.inter or 256
+    elif args.quant == "mxfp8":
+        E = args.expert or 32
+        model_dim = args.dim or 6144
+        inter_dim = args.inter or 3072
     else:
         E = args.expert or 8
         model_dim = args.dim or 4096

@@ -3832,6 +3832,7 @@ def compile_moe_reduction(
     use_mask: bool = False,
     num_experts: int = 0,
     out_dtype_str: str | None = None,
+    use_residual: bool = False,
 ):
     """Compile a reduction kernel that sums over the topk dimension.
 
@@ -3840,13 +3841,17 @@ def compile_moe_reduction(
             topk_ids   [tokens, topk] i32 (optional, if use_mask=True)
     Output: Y [tokens, model_dim]
 
-    This kernel performs: Y[t, d] = sum_k(X[t, k, d]) for all t, d.
+    This kernel performs:
+        Y[t, d] = sum_k(X[t, k, d]) + residual[t, d]
+    for all t, d. The residual term is omitted when use_residual=False.
     When use_mask=True, the kernel fuses the EP validity gather:
         valid[t, k] = expert_mask[topk_ids[t, k]] != 0
     and only accumulates X[t, k, :] when valid[t, k] is true.
     Used in conjunction with compile_moe_gemm2(accumulate=False) to avoid atomic contention.
     """
     if dtype_str == "fp8":
+        if use_residual:
+            raise ValueError("FP8 route reduction does not accept a residual")
         return _compile_moe_reduction_fp8(
             topk=topk,
             model_dim=model_dim,
@@ -3881,6 +3886,7 @@ def compile_moe_reduction(
     module_name = (
         f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
         f"_{dtype_str}_topk{topk}_md{model_dim}"
+        f"{'_residual' if use_residual else ''}"
     )
 
     elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
@@ -3889,6 +3895,7 @@ def compile_moe_reduction(
     def moe_reduction_kernel(
         X: fx.Pointer,
         Y: fx.Pointer,
+        residual: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         i32_m_tokens: fx.Int32,
@@ -3938,6 +3945,14 @@ def compile_moe_reduction(
         y_buf = _buffer_tensor(
             Y, elem_numeric, c_model_dim, y_slab_nbytes, y_base_off_i64
         )
+        if const_expr(use_residual):
+            residual_buf = _buffer_tensor(
+                residual,
+                elem_numeric,
+                c_model_dim,
+                y_slab_nbytes,
+                y_base_off_i64,
+            )
 
         copy_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_numeric)
         copy_scalar = fx.make_copy_atom(
@@ -4027,9 +4042,25 @@ def compile_moe_reduction(
 
                     for si in range_constexpr(n_sub):
                         out_vec = acc_vecs[si]
+                        elem_offset = col_base + fx.Int64(si * copy_vec_width)
+                        if const_expr(use_residual):
+                            # Preserve route-reduce -> output dtype -> residual-add.
+                            if const_expr(elem_bits < 32):
+                                out_vec = out_vec.to(elem_numeric).to(compute_numeric)
+                            residual_frag = fx.make_rmem_tensor(
+                                copy_vec_width, elem_numeric
+                            )
+                            fx.copy(
+                                copy_vec,
+                                _tile(residual_buf, elem_offset, copy_vec_width),
+                                residual_frag,
+                            )
+                            residual_vec = fx.Vector(residual_frag.load())
+                            if const_expr(elem_bits < 32):
+                                residual_vec = residual_vec.to(compute_numeric)
+                            out_vec = out_vec + residual_vec
                         if const_expr(elem_bits < 32):
                             out_vec = out_vec.to(elem_numeric)
-                        elem_offset = col_base + fx.Int64(si * copy_vec_width)
                         out_frag = fx.make_rmem_tensor(copy_vec_width, elem_numeric)
                         out_frag.store(out_vec)
                         fx.copy(
@@ -4061,9 +4092,22 @@ def compile_moe_reduction(
                                 if const_expr(elem_bits < 32):
                                     v = v.to(fx.Float32)
                                 a = a + v
-                            out = (
-                                a.to(elem_numeric) if const_expr(elem_bits < 32) else a
-                            )
+                            out = a
+                            if const_expr(use_residual):
+                                if const_expr(elem_bits < 32):
+                                    out = out.to(elem_numeric).to(compute_numeric)
+                                residual_frag = fx.make_rmem_tensor(1, elem_numeric)
+                                fx.copy(
+                                    copy_scalar,
+                                    _tile(residual_buf, col, 1),
+                                    residual_frag,
+                                )
+                                residual_value = fx.Vector(residual_frag.load())[0]
+                                if const_expr(elem_bits < 32):
+                                    residual_value = residual_value.to(compute_numeric)
+                                out = out + residual_value
+                            if const_expr(elem_bits < 32):
+                                out = out.to(elem_numeric)
                             out_frag = fx.make_rmem_tensor(1, elem_numeric)
                             out_frag.store(fx.Vector.from_elements([out], elem_numeric))
                             fx.copy(
@@ -4080,13 +4124,16 @@ def compile_moe_reduction(
     def launch_moe_reduction(
         X: fx.Pointer,
         Y: fx.Pointer,
+        residual: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
         gx = fx.Int64(i32_m_tokens)
-        moe_reduction_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
+        moe_reduction_kernel(
+            X, Y, residual, expert_mask, topk_ids, i32_m_tokens
+        ).launch(
             grid=(gx, gy_static, 1),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
@@ -4222,10 +4269,12 @@ class _MoeGemm2ReduceWrapper:
             # Placeholders; kernel ignores them when use_mask=False (compile-time).
             em = torch.empty(0, device=arg_out.device, dtype=torch.int32)
             tk = torch.empty(0, device=arg_out.device, dtype=torch.int32)
+        residual = torch.empty(0, device=arg_out.device, dtype=Y.dtype)
         _run_compiled(
             self._reduce_exe,
             _ptr_arg(X),
             _ptr_arg(Y),
+            _ptr_arg(residual),
             _ptr_arg(em),
             _ptr_arg(tk),
             tokens_in,
@@ -4310,6 +4359,7 @@ def compile_moe_gemm2_ex(
             dtype_str=dtype_str,
             use_mask=use_mask,
             num_experts=experts,
+            use_residual=False,
         )
         return _MoeGemm2ReduceWrapper(
             gemm2_exe=gemm2_exe,
