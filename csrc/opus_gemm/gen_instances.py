@@ -86,13 +86,12 @@ SPLITK_REDUCE_ABI_MAP = {
         "baseline_has_oob": (True,),
     },
     "gfx1250": {
-        # gfx1250 cluster/TDM split-K: fp32 workspace + separate reduce kernel.
-        # Distinct kernel NAME (splitk_reduce_kernel_gfx1250) but the same
-        # ws_handle ABI as gfx950, so it never collides in a multi-arch build.
+        # gfx1250 cluster/TDM split-K: workspace allocated externally (torch.empty)
+        # and passed as a direct void* pointer (no ws_handle indirection).
         "forward_decl_include": '#include "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh"\n',
         "kernel": "splitk_reduce_kernel_gfx1250",
-        "ws_arg": "const opus_splitk_ws_handle* ws_handle",
-        "ws_type": "const opus_splitk_ws_handle*",
+        "ws_arg": "const void* ws_ptr",
+        "ws_type": "const void*",
         "baseline_has_oob": (True, False),
     },
 }
@@ -101,23 +100,83 @@ SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
 LEGACY_OPUS_ARCH = "gfx950"
 
 
-def _splitk_reduce_baseline_instantiations(reduce_kernel, ws_ptr_type, has_oob):
-    has_oob_str = "true" if has_oob else "false"
+def _kid_name_arch(kid_name):
+    """Resolve a kid's arch from its symbol name.
+
+    Classified by the `opus_gemm_<arch>_*` prefix; legacy names carry no arch
+    token (a16w16 flatmm / persistent / mono_tile, and the opus_bmm_* family)
+    and are gfx950, matching kid_arch's default.
+    """
+    for ap in SPLITK_REDUCE_ARCHES:
+        if kid_name.startswith(f"opus_gemm_{ap}_"):
+            return ap
+    return LEGACY_OPUS_ARCH
+
+
+def _own_arch_device_pass_guard(arch):
+    """Open/close guard admitting only `arch`'s device pass, plus the host pass.
+
+    In a mixed build (GPU_ARCHS=gfx950;gfx1250) hipcc runs every TU through
+    one device pass per offload arch, so without a guard gfx950 kid instances
+    get instantiated for gfx1250 as well: the gfx950 traits then compute their
+    layouts off a 32-wide wave and trip `BLOCK_SIZE == 4 * get_warp_size()`,
+    and the reverse direction hits gfx1250-only kernel attributes. A kid is
+    only ever launched on the arch it was generated for, so the foreign device
+    pass has nothing to contribute -- guarding out the #include as well leaves
+    it an empty TU that never parses another arch's headers.
+
+    The host pass stays inside the guard: it is what emits the __device_stub__
+    symbols the fused host TU's <<<>>> calls link against, and it is arch
+    independent.
+    """
     return (
-        f"// HAS_OOB={has_oob_str} variants\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
+        f"#if !defined(__HIP_DEVICE_COMPILE__) || defined(__{arch}__)\n",
+        f"#endif // host pass or {arch} device pass\n",
     )
+
+
+# Arches that own an opus_gemm_arch_*.cuh dispatch header, i.e. one set of
+# lookup tables each. Every generated lookup macro is emitted once per arch and
+# expanded by that arch's header only: the arches disagree on the a16w16
+# launcher signature (gfx1250 takes an extra workspace tensor), so one shared
+# macro cannot type-check in a mixed-arch build -- gfx950's table would hold
+# gfx1250 function pointers and vice versa. Filtering |S| by GPU_ARCHS hid this
+# for single-arch builds only.
+# A per-arch macro is legitimately empty (an arch whose kids all missed |S|, or
+# which has no tuned row for the host's cu_num), which expands to a zero-length
+# table -- accepted as a clang extension, and already the case before the split
+# for e.g. the gfx1250 fp32 (M,N,K) table in a gfx1250-only build.
+LOOKUP_MACRO_ARCHES = ("gfx950", "gfx942", "gfx1250")
+
+
+def _splitk_reduce_baseline_instantiations(
+    reduce_kernel, ws_ptr_type, has_oob, vec=16, block=64, split_ks=(None,), d_ws=None
+):
+    # gfx1250 tunes the reduce to VEC=8/BLOCK=128 (coalesced dwordx4 bf16 store,
+    # no cross-lane shuffle), a bf16 workspace (d_ws="__bf16", half the reduce read
+    # traffic), and a COMPILE-TIME split_k (SPLIT_K_ template) dispatched per
+    # value -> split_ks lists every value the launch helper switches on (0 = the
+    # runtime-`split_k` fallback, 1..16 = fully-unrolled). gfx950/gfx942 keep the
+    # legacy 6-param VEC=16/BLOCK=64 fp32-workspace form (split_ks=(None,)).
+    has_oob_str = "true" if has_oob else "false"
+    out = f"// HAS_OOB={has_oob_str} variants\n"
+    for sk in split_ks:
+        tail = "" if sk is None else f", {sk}, {d_ws}"
+        out += (
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, true,  __bf16, {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+            f"    const __bf16*, int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, false, __bf16, {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+            f"    const __bf16*, int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  true,  float,  {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+            f"    const float*,  int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  false, float,  {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+            f"    const float*,  int);\n"
+        )
+    return out
 
 
 def _pipeline_header_for(k):
@@ -165,6 +224,10 @@ SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
     "a16w16_cluster_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_ws",
+    # fused single-kernel split-K: lookup still forces <fp32_t> (D_C=fp32 traits),
+    # but its launcher NAME avoids the "_splitk_" substring so the reduce-TU
+    # detection (:867 / :799) never emits a reduce kernel for it.
+    "a16w16_clusterlaunch_tdm_splitk_fuse",
     *_SPLITK,
 }
 
@@ -326,7 +389,8 @@ class opus_gemm_codegen:
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
-        # Compile-time split: Build layout: * One fused HOST TU (instances/all_instances_host.cu)
+        # Compile-time split: Build layout: * One fused HOST TU per arch
+        # (instances/all_instances_host_<arch>.cu)
         # instantiates every launcher's `template...
         self._host_instantiations = []
         self._device_instantiations = []
@@ -482,11 +546,13 @@ class opus_gemm_codegen:
 """
 
     def gen_lookup_dict(self, kernels_dict):
-        """Emit opus_gemm_lookup.h with two (M,N,K)->kernel macros.
+        """Emit opus_gemm_lookup.h with the (M,N,K)->kernel macros.
+
+        One macro per (CTYPE, arch): see LOOKUP_MACRO_ARCHES.
 
         Tuned-CSV driven lookup consumed by opus_gemm.cu's runtime
-        `opus_dispatch_a16w16<CDataType>`. Two macros (BF16 / FP32)
-        mirror `gen_a16w16_tune_lookup` and exist because splitk kids
+        `opus_dispatch_a16w16<CDataType>`. The BF16 / FP32 split
+        mirrors `gen_a16w16_tune_lookup` and exists because splitk kids
         (200..210) are only emitted as `<fp32_t>` (their traits
         static_assert D_C==float, so referencing `splitk<bf16_t>`
         produces a linker error).
@@ -494,7 +560,7 @@ class opus_gemm_codegen:
         Outdtype-aware bucketing
         ------------------------
         kernels_dict tuple keys carry the outdtype string in slot 3
-        ((M, N, K, outdtype_str), produced by get_tune_dict). The BF16
+        ((M, N, K, outdtype_str, arch), produced by get_tune_dict). The BF16
         macro picks up rows whose outdtype is "torch.bfloat16" and the
         FP32 macro picks up rows whose outdtype is "torch.float32";
         same-(M,N,K) rows with different outdtypes therefore land in
@@ -521,10 +587,10 @@ class opus_gemm_codegen:
 //
 // Auto-generated. Do not edit. See gen_instances.py:gen_lookup_dict.
 //
-// Per-CTYPE sorted flat arrays for (M,N,K)->kernel runtime dispatch.
+// Per-(CTYPE, arch) sorted flat arrays for (M,N,K)->kernel runtime dispatch.
 // Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
-// tables because get_tune_dict keys winners on (M, N, K, outdtype_str)
-// and gen_lookup_dict buckets the rows into per-CTYPE macros below.
+// tables because get_tune_dict keys winners on (M, N, K, outdtype_str, arch)
+// and gen_lookup_dict buckets the rows into per-(CTYPE, arch) macros below.
 // splitk kids appear in either table with their dispatch template forced
 // to <fp32_t>; their traits pick the workspace dtype and the reduce
 // launcher writes the requested Y dtype.
@@ -547,7 +613,7 @@ class opus_gemm_codegen:
             "fp32_t": "torch.float32",
         }
 
-        def _emit_map(f, macro_name: str, ctype: str):
+        def _emit_map(f, macro_name: str, ctype: str, arch: str):
             # No body line break between `\` and the first entry; macro continuation requires every line
             # that participates in the definition ...
             f.write(f"#define {macro_name}(CTYPE) \\\n")
@@ -569,6 +635,8 @@ class opus_gemm_codegen:
                 is_splitk = k.kernel_tag in SPLITK_TAGS
                 if not is_splitk and ctype not in k.output_dtypes:
                     continue
+                if _kid_arch_common(k) != arch:
+                    continue
                 rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, is_splitk))
 
             rows.sort(key=lambda r: (r[0], r[1], r[2]))
@@ -585,11 +653,19 @@ class opus_gemm_codegen:
 
         with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
             f.write(HEADER)
-            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_BF16", "bf16_t")
-            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_FP32", "fp32_t")
+            for arch in LOOKUP_MACRO_ARCHES:
+                suffix = arch.upper()
+                _emit_map(
+                    f, f"GENERATE_OPUS_LOOKUP_TABLE_BF16_{suffix}", "bf16_t", arch
+                )
+                _emit_map(
+                    f, f"GENERATE_OPUS_LOOKUP_TABLE_FP32_{suffix}", "fp32_t", arch
+                )
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
         """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel maps for tuning.
+
+        One macro per (CTYPE, arch): see LOOKUP_MACRO_ARCHES.
 
         Three a16w16-family tags share the 4-arg launcher signature
         (XQ, WQ, Y, int splitK):
@@ -605,7 +681,8 @@ class opus_gemm_codegen:
         dispatcher in opus_gemm.cu forces kid>=200 to the <fp32_t> branch
         anyway, so having them absent from the bf16 map is correct.
 
-        Emit two macros side by side, gated on each kid's output_dtypes set.
+        Emit the macros side by side, gated on each kid's output_dtypes set
+        and on its arch.
         """
         # Same flat-array design as gen_lookup_dict, keyed on int kid instead of (M,N,K).
         HEADER = """#pragma once
@@ -614,7 +691,7 @@ class opus_gemm_codegen:
 //
 // Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_tune_lookup.
 //
-// Per-CTYPE sorted flat arrays for kid->kernel tune dispatch. Kids whose
+// Per-(CTYPE, arch) sorted flat arrays for kid->kernel tune dispatch. Kids whose
 // output_dtypes doesn't include CTYPE are omitted from that CTYPE's table
 // (splitk kids only live in the fp32 table). See
 // opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
@@ -623,13 +700,15 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
-        def _emit_map(f, macro_name, ctype):
+        def _emit_map(f, macro_name, ctype, arch):
             f.write(f"#define {macro_name}(CTYPE) \\\n")
             rows = []
             for kid, k in kernels_dict.items():
                 if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
                     continue
                 if ctype not in k.output_dtypes:
+                    continue
+                if _kid_arch_common(k) != arch:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda r: r[0])
@@ -647,8 +726,14 @@ class opus_gemm_codegen:
             f.write(HEADER)
             # Use explicit per-CTYPE macro names; the dispatcher in opus_gemm.cu calls the right one from
             # each opus_a16w16_tune_dispatch<CDat...
-            _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_BF16", "bf16_t")
-            _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
+            for arch in LOOKUP_MACRO_ARCHES:
+                suffix = arch.upper()
+                _emit_map(
+                    f, f"GENERATE_A16W16_TUNE_LOOKUP_BF16_{suffix}", "bf16_t", arch
+                )
+                _emit_map(
+                    f, f"GENERATE_A16W16_TUNE_LOOKUP_FP32_{suffix}", "fp32_t", arch
+                )
 
     def gen_a8w8_tune_lookup(self, kernels_dict):
         """Emit the int-ID-to-kernel map for A8W8 tuning."""
@@ -782,6 +867,18 @@ void
     std::optional<aiter_tensor_t> bias,
     int splitK);
 """
+        # gfx1250 a16w16 split-K (6 args: workspace tensor passed from Python).
+        MANIFEST_NOSCALE_6ARG_WS = """
+template <typename D_C>
+void
+{kernel_name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);
+"""
         # a8w8_mxscale BMM flatmm split-K launcher: mmajor layout with two fp8
         # scale tensors + an int splitK, dispatched by the hand-written
         # opus_bmm.cu switch (not the (M,N,K) lookup table).
@@ -796,6 +893,11 @@ void
     aiter_tensor_t &w_scale,
     int splitK);
 """
+        GFX1250_SPLITK_TAGS = {
+            "a16w16_cluster_tdm_splitk_ws",
+            "a16w16_clusterlaunch_tdm_splitk_ws",
+            "a16w16_clusterlaunch_tdm_splitk_fuse",
+        }
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
             for k in kernels_dict.values():
@@ -811,7 +913,10 @@ void
                 ):
                     f.write(MANIFEST_BMM_MXSCALE_SPLITK.format(kernel_name=k.name))
                 elif k.kernel_tag in A16W16_TUNE_TAGS:
-                    f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
+                    if k.kernel_tag in GFX1250_SPLITK_TAGS:
+                        f.write(MANIFEST_NOSCALE_6ARG_WS.format(kernel_name=k.name))
+                    else:
+                        f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
                 elif k.kernel_tag in NOSCALE_TAGS:
                     f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
                 else:
@@ -832,17 +937,10 @@ void
         only #includes gfx950 kid impl .cuh, etc. ODR clashes between
         same-named layout helpers in different pipeline headers are
         naturally avoided.
+
+        This TU needs no arch guard: it is host-pass only, so a mixed
+        build's device passes already see nothing here.
         """
-
-        # Bucket host/device instantiations by arch. We classify by the
-        # kid_name prefix `opus_gemm_<arch>_*`; legacy kid names without
-        # explicit arch prefix default to gfx950 (matches kid_arch).
-        def _kid_name_arch(kid_name):
-            for ap in SPLITK_REDUCE_ARCHES:
-                if kid_name.startswith(f"opus_gemm_{ap}_"):
-                    return ap
-            return LEGACY_OPUS_ARCH
-
         host_by_arch = {}
         for row in self._host_instantiations:
             arch = _kid_name_arch(row["kid_name"])
@@ -900,10 +998,15 @@ void
         which doesn't depend on any libtorch type. Skipping the torch
         parse on host pass drops each device TU's compile to ~1.5s
         (down from ~13s when torch was forced in).
+
+        Both the #include and the instantiations sit behind the kid's own
+        arch guard, so a mixed build's other device passes see an empty TU
+        (see _own_arch_device_pass_guard).
         """
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
+            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
             # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
             # OPUS_FUSED_HOST_TU is NOT defined here) an...
             contents = (
@@ -918,7 +1021,10 @@ void
                 "#ifndef __HIPCC_RTC__\n"
                 "#define __HIPCC_RTC__ 1\n"
                 "#endif\n"
-                f'#include "impl/{name}.cuh"\n' + row["device_decl"]
+                + guard_open
+                + f'#include "impl/{name}.cuh"\n'
+                + row["device_decl"]
+                + guard_close
             )
             Path(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
@@ -975,6 +1081,18 @@ void
             reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
             ws_ptr_type = reduce_abi["ws_type"]
             reduce_kernel = reduce_abi["kernel"]
+            # gfx1250 reduce: VEC=8/BLOCK=128 + bf16 workspace + compile-time split_k
+            # (SPLIT_K_ = 0..16, matching the launch-helper switch). Other arches keep
+            # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
+            if reduce_arch == "gfx1250":
+                reduce_vec, reduce_block = 8, 128
+                reduce_split_ks = tuple(range(17))  # 0 (runtime) + 1..16 (unrolled)
+                reduce_d_ws = "__bf16"
+            else:
+                reduce_vec, reduce_block = 16, 64
+                reduce_split_ks = (None,)
+                reduce_d_ws = None
+            guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
@@ -983,16 +1101,24 @@ void
                 "#ifndef __HIPCC_RTC__\n"
                 "#define __HIPCC_RTC__ 1\n"
                 "#endif\n"
-                f'#include "{reduce_header}"\n'
+                + guard_open
+                + f'#include "{reduce_header}"\n'
                 + "".join(
                     _splitk_reduce_baseline_instantiations(
-                        reduce_kernel, ws_ptr_type, has_oob
+                        reduce_kernel,
+                        ws_ptr_type,
+                        has_oob,
+                        reduce_vec,
+                        reduce_block,
+                        reduce_split_ks,
+                        reduce_d_ws,
                     )
                     for has_oob in reduce_abi["baseline_has_oob"]
                 )
             )
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
             contents += extra_reduce.get("device_instantiations", lambda: "")()
+            contents += guard_close
             Path(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
@@ -1039,13 +1165,18 @@ def get_tune_dict(tune_dict_csv):
 
     Key layout
     ----------
-    Tuple keys: (M, N, K, outdtype_str). Promoting outdtype into the key
-    is what lets a single (M, N, K) shape carry distinct winners for bf16
-    vs fp32 output (the underlying main kernel hardware rules differ
+    Tuple keys: (M, N, K, outdtype_str, arch). Promoting outdtype into the
+    key is what lets a single (M, N, K) shape carry distinct winners for
+    bf16 vs fp32 output (the underlying main kernel hardware rules differ
     enough that the best kid is not always the same; e.g. fp32 output
     biases reduce-bound shapes toward larger split-K). gen_lookup_dict
     then writes outdtype="torch.bfloat16" rows only into the BF16 (M,N,K)
     map and outdtype="torch.float32" rows only into the FP32 (M,N,K) map.
+
+    arch is in the key for the same reason: the (M,N,K) tables are emitted
+    per arch, so a shape tuned on two arches has one winner per arch. With
+    arch out of the key, whichever CSV row was read last silently evicted
+    the other arch's winner and that arch fell back to its heuristic.
 
     Backwards compat
     ----------------
@@ -1057,10 +1188,23 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
+        cu_num = None
+        try:
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
+        except Exception:  # noqa: BLE001
+            # torch device enumeration is broken on some ROCm nightlies
+            # (device_count()==0 / "Invalid device id"); use rocminfo instead.
+            cu_num = None
+        if cu_num is None:
+            try:
+                from aiter.jit.utils.chip_info import get_cu_num as _rocminfo_cu_num
+
+                cu_num = _rocminfo_cu_num()
+            except Exception:  # noqa: BLE001
+                cu_num = None
+        if cu_num is not None:
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
         # Accept either the legacy "kernelId" column or the new "solidx" column.
         kids = _tune_df_kids(tune_df)
@@ -1076,7 +1220,8 @@ def get_tune_dict(tune_dict_csv):
             )
             kid = int(kids.loc[i])
             if kid in kernels_list:
-                tune_dict[(M, N, K, outdtype)] = kernels_list[kid]
+                inst = kernels_list[kid]
+                tune_dict[(M, N, K, outdtype, _kid_arch_common(inst))] = inst
     return tune_dict
 
 
