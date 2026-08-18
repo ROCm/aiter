@@ -960,6 +960,7 @@ def _pa_decode_sparse(
     # columns); >= the tile's extent on that axis means one shot.
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
+    PART_STORE_CACHE: gl.constexpr,
     # How many of the NUM_SPLITS programs share the main (SWA) segment. The two
     # segments have very different shapes -- main is a contiguous window whose
     # length is fixed by the sliding window, extra is the top-k list -- so one
@@ -1308,20 +1309,35 @@ def _pa_decode_sparse(
         # base-2 exponent domain (row-max * softmax_scale * log2e), which is the
         # reduce/skip_reduce convention the triton kernel also uses.
         pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
+        # The reduce kernel reads these back immediately, so they want to stay
+        # resident rather than stream to memory. ATT puts 8.5% of all stall cycles
+        # on the 68 buffer_store_dwordx4 of the accumulator alone (~154 cycles
+        # each), and the partials are ~31% of the kernel's HBM traffic.
         gl.amd.cdna4.buffer_store(
             m_pv,
             ptr=part_m_ptr + pm_base,
             offsets=h_pv.to(gl.int32),
             mask=head_mask_pv,
+            cache=PART_STORE_CACHE,
         )
         gl.amd.cdna4.buffer_store(
-            l_pv, ptr=part_l_ptr + pm_base, offsets=h_pv.to(gl.int32), mask=head_mask_pv
+            l_pv,
+            ptr=part_l_ptr + pm_base,
+            offsets=h_pv.to(gl.int32),
+            mask=head_mask_pv,
+            cache=PART_STORE_CACHE,
         )
         offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, pv_layout))
         a_base = query_idx * pa_stride0 + split_id * pa_stride_s
         a_off = (a_base + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
+        # Follow part_acc's own dtype: at bf16 this halves both the partial traffic
+        # (~31% of the kernel's HBM bytes) and the store instruction count.
         gl.amd.cdna4.buffer_store(
-            acc, ptr=part_acc_ptr, offsets=a_off, mask=head_mask_pv[:, None]
+            acc.to(part_acc_ptr.dtype.element_ty),
+            ptr=part_acc_ptr,
+            offsets=a_off,
+            mask=head_mask_pv[:, None],
+            cache=PART_STORE_CACHE,
         )
 
 
@@ -1352,6 +1368,7 @@ def _pa_decode_sparse_reduce(
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     ADAPTIVE_SPLITS: gl.constexpr,
+    PART_LOAD_CACHE: gl.constexpr,
 ):
     """Split-KV combine: merge the per-split partials, fold the attn sink, and write
     the final output. Partials store m in the base-2 exponent domain (row-max *
@@ -1398,7 +1415,8 @@ def _pa_decode_sparse_reduce(
     for s in range(NUM_SPLITS):
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
+            ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf,
+            cache=PART_LOAD_CACHE,
         )
         m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
     if HAS_SINK:
@@ -1413,10 +1431,12 @@ def _pa_decode_sparse_reduce(
     for s in range(NUM_SPLITS):
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
+            ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf,
+            cache=PART_LOAD_CACHE,
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr + base, offsets=h, mask=head_mask, other=0.0
+            ptr=part_l_ptr + base, offsets=h, mask=head_mask, other=0.0,
+            cache=PART_LOAD_CACHE,
         )
         w = gl.exp2(m_s - m_final)
         l_final = l_final + w * l_s
@@ -1430,9 +1450,10 @@ def _pa_decode_sparse_reduce(
         else:
             acc_mask = head_mask[:, None]
         acc_s = gl.amd.cdna4.buffer_load(
-            ptr=part_acc_ptr, offsets=a_off, mask=acc_mask, other=0.0
+            ptr=part_acc_ptr, offsets=a_off, mask=acc_mask, other=0.0,
+            cache=PART_LOAD_CACHE,
         )
-        acc = acc + w[:, None] * acc_s
+        acc = acc + w[:, None] * acc_s.to(gl.float32)
 
     if HAS_SINK:
         sink = gl.amd.cdna4.buffer_load(

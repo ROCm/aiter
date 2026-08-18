@@ -711,9 +711,21 @@ def _pa_decode_sparse_gfx950_gluon(
             (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
+        # Split-K accumulator partials in bf16. They are ~31% of the kernel's HBM
+        # traffic and ATT puts 8.5% of all stall cycles on the 68 buffer_store of
+        # them, so halving both is worth 6-23% depending on split count. The
+        # mantissa bits it costs are far inside the error the fp8 KV format already
+        # carries: against an fp64 reference, max|delta|/max|ref| goes 3.517e-2 ->
+        # 3.567e-2 at C128A, and the bf16-vs-f32 delta (4-6e-3) is ~6x smaller than
+        # the error already present. Not used on the skip_reduce path, which hands
+        # part_acc back to the caller and must keep its dtype.
+        _pab = (
+            _os.environ.get("AITER_PA_DECODE_PART_BF16", "1") == "1"
+            and not skip_reduce
+        )
         part_acc = torch.empty(
             (num_queries, num_splits, num_heads, head_dim),
-            dtype=torch.float32,
+            dtype=torch.bfloat16 if _pab else torch.float32,
             device=q.device,
         )
         pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
@@ -821,6 +833,7 @@ def _pa_decode_sparse_gfx950_gluon(
         LDS_PAD=lds_pad,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
+        PART_STORE_CACHE=_os.environ.get('AITER_PA_DECODE_PART_ST', ''),
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
@@ -870,6 +883,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=num_heads % red_block_m == 0,
         ADAPTIVE_SPLITS=adaptive_splits,
+        PART_LOAD_CACHE=_os.environ.get("AITER_PA_DECODE_PART_LD", ""),
         num_warps=red_warps,
     )
     return out
