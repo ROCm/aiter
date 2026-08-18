@@ -31,10 +31,10 @@ that feeds each layer -- is built once outside the timed region, mirroring the
 build()/fn() split in mi450-scripts/run_moe_a4w4.py so the numbers are
 comparable to that runner (which benches one projection per invocation).
 
-On gfx1250 `moe_gemm_a4w4` defaults to the gluon backend, which dispatches to
-_moe_gemm_a4w4_decode when routing picks block_m == 16 and to
-_moe_gemm_a4w4_prefill otherwise. --backend pins the backend, and --preshuffle
-enables the gluon-only gfx1250 WMMA weight preshuffle.
+`moe_gemm_a4w4` picks its kernel from the arch: the gluon kernels on gfx1250 --
+_moe_gemm_a4w4_decode when routing picks block_m == 16 and _moe_gemm_a4w4_prefill
+otherwise -- and the triton kernel on gfx950. --preshuffle enables the
+gluon-only gfx1250 WMMA weight preshuffle.
 """
 
 import argparse
@@ -49,7 +49,6 @@ import triton
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    is_gluon_supported,
     moe_gemm_a4w4,
     mxfp4_quant,
 )
@@ -242,17 +241,15 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def resolve_backend(backend):
-    """`None` lets moe_gemm_a4w4 pick per arch; resolve it the way it does."""
-    if backend is None:
-        return "gluon" if is_gluon_supported() else "triton"
-    return backend
+def backend_name():
+    """Backend moe_gemm_a4w4 runs here -- it derives this from the arch."""
+    return "gluon" if get_arch() == "gfx1250" else "triton"
 
 
-def kernel_variant(block_m, backend):
+def kernel_variant(block_m):
     """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
     run_moe_a4w4.py's `name` subcommand."""
-    if resolve_backend(backend) != "gluon":
+    if backend_name() != "gluon":
         return "_moe_gemm_a4w4"
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
@@ -266,7 +263,6 @@ def bench_mlp_single_weight_init(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
     routed_experts,
     rep,
@@ -340,7 +336,6 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             preshuffle_weights=preshuffle,
             apply_swiglu=True,
-            backend=backend,
         )
 
     # layer 2 reads layer 1's swiglu output; quantize it once here so the timed
@@ -361,7 +356,6 @@ def bench_mlp_single_weight_init(
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
-            backend=backend,
         )
 
     y2 = layer2()
@@ -418,7 +412,7 @@ def bench_mlp_single_weight_init(
 
     return {
         "layers": measured,
-        "kernel": kernel_variant(rdata.block_m, backend),
+        "kernel": kernel_variant(rdata.block_m),
         "block_m": rdata.block_m,
         "routed_experts": routed,
     }
@@ -433,7 +427,6 @@ def bench_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
     routed_experts,
     rep,
@@ -451,7 +444,6 @@ def bench_mlp(
             x_dtype,
             w_dtype,
             TP,
-            backend,
             preshuffle,
             routed_experts,
             rep,
@@ -486,7 +478,6 @@ def roofline_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
     routed_experts,
     rep,
@@ -506,7 +497,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
-    stem += f"-{resolve_backend(backend)}"
+    stem += f"-{backend_name()}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -522,7 +513,6 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        backend,
         preshuffle,
         routed_experts,
         rep,  # fixed args
@@ -569,12 +559,6 @@ def parse_args(args: list[str] | None = None):
         "dim, TOPK multiplies the row count each GEMM sees (batch * TOPK "
         "routed rows). Use --routed-experts to pin how many of the TOTAL "
         "actually receive tokens.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "triton", "gluon"],
-        default="auto",
-        help="moe_gemm_a4w4 backend (default: auto, which is gluon on gfx1250).",
     )
     parser.add_argument(
         "--preshuffle",
@@ -649,7 +633,6 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        backend=None if parsed_args.backend == "auto" else parsed_args.backend,
         preshuffle=parsed_args.preshuffle,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
