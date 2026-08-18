@@ -777,17 +777,9 @@ def launch_gemm_a8w4_tdm(
             ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
             ``prefetch_kt`` is None.
             """
-            # With the carry, the issue rides the last k128's fence instead of the
-            # tile top; without one it stays at the top, walled off by a barrier.
-            tail_issue = prefetch_kt is not None and next_stage_buf is not None
-
             def do_issue():
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
 
-            if const_expr(prefetch_kt is not None and not tail_issue):
-                rocdl.sched_barrier(0)
-                do_issue()
-                rocdl.sched_barrier(0)
             # Form and pin the bases here so the tile pays one va_vdst(0) drain
             # instead of one per scattered address v_add; unpinned they remat.
             addr_keepalive(*lds_bases(buf))
@@ -819,7 +811,9 @@ def launch_gemm_a8w4_tdm(
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
-                    TDM_PER if (tail_issue and ksl + 1 == KWS) else 0,
+                    TDM_PER
+                    if (prefetch_kt is not None and ksl + 1 == KWS)
+                    else 0,
                     schedule_slots,
                 )
                 for i in range_constexpr(schedule_slots):
@@ -855,7 +849,11 @@ def launch_gemm_a8w4_tdm(
                     num_outstanding_tdm=(
                         next_stage_wait if const_expr(carries) else None
                     ),
-                    issue_fn=do_issue if const_expr(tail_issue and is_last) else None,
+                    issue_fn=(
+                        do_issue
+                        if const_expr(prefetch_kt is not None and is_last)
+                        else None
+                    ),
                 )
                 # One region per k128: sched_group_barrier only partitions
                 # within a region, and only sched_barrier delimits one.
@@ -889,14 +887,26 @@ def launch_gemm_a8w4_tdm(
                     for kt in range(n_steady):
                         s = kt % num_buffers
                         buf = ptr_to_idx(buf_ptr(s))
-                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - next_stage_on))
-                        workgroup_barrier()
+                        if const_expr(not next_stage_on):
+                            pipeline_fence(
+                                outstanding=TDM_PER * (num_buffers - 1)
+                            )
                         next_stage_buf = (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                             if const_expr(next_stage_on)
                             else None
                         )
-                        compute_ktile(buf, None, next_stage_on, next_stage_buf)
+                        compute_ktile(
+                            buf,
+                            None,
+                            next_stage_on,
+                            next_stage_buf,
+                            next_stage_wait=(
+                                TDM_PER * (num_buffers - 2)
+                                if const_expr(next_stage_on)
+                                else None
+                            ),
+                        )
                         workgroup_barrier()
                         issue(s, kt + num_buffers, my_jobs)
 
@@ -934,6 +944,13 @@ def launch_gemm_a8w4_tdm(
                         buf = ptr_to_idx(buf_ptr(s))
                         if const_expr(not next_stage_on):
                             pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                            rocdl.sched_barrier(0)
+                            issue(
+                                (kt + PRE) % num_buffers,
+                                kt + PRE,
+                                my_jobs,
+                            )
+                            rocdl.sched_barrier(0)
                         next_stage_buf = (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                             if const_expr(next_stage_on)
@@ -941,7 +958,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         compute_ktile(
                             buf,
-                            kt + PRE,
+                            kt + PRE if const_expr(next_stage_on) else None,
                             next_stage_on,
                             next_stage_buf,
                             my_jobs,
