@@ -42,7 +42,7 @@ import torch
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4_bwd import (
     build_inverted_topk_fast,
     delta_v4,
-    dkv_gather_acc_be,
+    dkv_gather_acc,
 )
 from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd_gluon import (
     sparse_mla_bwd_dkv_interm_v4_bd as _dkv_interm_gluon,
@@ -153,7 +153,7 @@ def sparse_mla_bwd_dsv4(
         inv_ptr, inv_data = build_inverted_topk_fast(
             topk_indices[:, r : r + R_CHUNK], num_kv
         )
-        dkv_gather_acc_be(interm, inv_ptr, inv_data, dkv_acc)
+        dkv_gather_acc(interm, inv_ptr, inv_data, dkv_acc)
 
     dkv = dkv_acc.to(kv.dtype)
 

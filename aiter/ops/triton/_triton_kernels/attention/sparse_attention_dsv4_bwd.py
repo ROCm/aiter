@@ -7,7 +7,7 @@
     ``delta = rowsum(O * dO)`` -- the standard flash-attention "o_dot_do" preamble. Streams the
     bf16 inputs and accumulates in fp32, so it moves exactly the working set.
 
-``_bwd_dkv_gather_acc_v4_be`` + ``build_inverted_topk_fast``
+``_bwd_dkv_gather_acc_v4`` + ``build_inverted_topk_fast``
     Reduce ``interm[t, slot, :]`` into ``dkv[kv_row, :]`` over the top-k mapping. The scatter is
     inverted into a CSR gather (each output KV row collects its own contributors), so no atomics
     are needed. ``BLOCK_E`` entries are carried per loop iteration, which both widens the load
@@ -66,7 +66,7 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
 
 
 @triton.jit
-def _bwd_dkv_gather_acc_v4_be(
+def _bwd_dkv_gather_acc_v4(
     Interm_ptr,  # [T, R_CHUNK, D] bf16, flat [T*R_CHUNK, D]
     InvPtr_ptr,  # [num_kv+1] int32 — CSR row pointers
     InvData_ptr,  # [valid] int32 — encoded q*R_CHUNK+local_r, sorted by KV token
@@ -79,15 +79,15 @@ def _bwd_dkv_gather_acc_v4_be(
 ):
     """Grid (num_kv,) — one CTA per KV token, BLOCK_E CSR entries in flight.
 
-    Fixes two things about ``_bwd_dkv_gather_acc_v4``, which walks the run one entry at a time
-    with a bare ``tl.arange(0, D)``:
+    Carrying ``BLOCK_E`` entries per iteration rather than walking the run one entry at a time
+    buys two separate things, and this gather needs both:
 
-      * **load width.** A [D] block over 256 threads is 2 bf16 = 4 B per lane -- a dword. The
-        [BLOCK_E, D] block gives ``BLOCK_E*D/threads`` elements per lane instead, so the loads
-        become dwordx4. The gather is issue-bound, so this is the dominant term.
-      * **loop trip count.** The run is consumed BLOCK_E entries at a time rather than one, and
-        ``tl.sum`` over the entry axis folds them. The realistic topk gives run lengths up to
-        ~3000 (pool rows), so the serial walk was the other half of the problem.
+      * **load width.** A bare ``tl.arange(0, D)`` block over 256 threads is 2 bf16 = 4 B per
+        lane -- a dword. The [BLOCK_E, D] block gives ``BLOCK_E*D/threads`` elements per lane
+        instead, so the loads become dwordx4. The gather is issue-bound, so this dominates.
+      * **loop trip count.** The run is consumed BLOCK_E entries at a time and ``tl.sum`` over
+        the entry axis folds them. A realistic top-k gives run lengths up to ~3000 (pool rows),
+        so the serial walk was the other half of the problem.
 
     ``ACCUMULATE=False`` skips the read-modify-write of the destination, valid when the caller
     does not chunk (each KV row is then written by exactly one CTA).
@@ -145,20 +145,21 @@ def build_inverted_topk_fast(topk_indices_slice, num_kv):
     return inv_ptr, inv_data.to(torch.int32)
 
 
-def dkv_gather_acc_be(
+def dkv_gather_acc(
     interm, inv_ptr, inv_data, dkv_acc, BLOCK_E=64, num_warps=8, accumulate=True
 ):
     # BLOCK_E=64 / num_warps=8 measured best (0.345 ms, 6.29 TB/s = 79% peak at T4096 H128
     # topk512 SWA+pool). Time falls monotonically with BLOCK_E across the whole sweep
     # (4->64: 1.021, 0.715, 0.505, 0.407, 0.345), i.e. both the load width AND the trip count
-    # on the ~3000-entry pool runs were binding. Reference was 1.491 ms at 1.45 TB/s.
+    # on the ~3000-entry pool runs were binding. The one-entry-at-a-time walk this replaced
+    # was 1.491 ms at 1.45 TB/s.
     """interm[T,R,D] bf16 -> dkv_acc[num_kv,D] fp32 via the entry-blocked CSR gather.
 
     Grid is ``num_kv`` (from ``dkv_acc``), not ``T``, so a compressed-pool KV works.
     """
     _, _, D = interm.shape
     num_kv = dkv_acc.shape[0]
-    _bwd_dkv_gather_acc_v4_be[(num_kv,)](
+    _bwd_dkv_gather_acc_v4[(num_kv,)](
         interm,
         inv_ptr,
         inv_data,
