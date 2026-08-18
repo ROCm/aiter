@@ -19,8 +19,26 @@ share one kernel. Launchers: aiter/ops/triton/attention/pa_decode_sparse.py.
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language.core import PropagateNan
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+# Triton's default max ignores NaN, which on AMD costs a v_max_f32 x, x, x
+# canonicalize per operand before the real compare -- 60 of the 96 v_max in this
+# kernel were those no-ops. Nothing here produces NaN (masked lanes are -inf and
+# the all-masked row is guarded explicitly), so propagate instead.
+_MAX_PROP_NAN: gl.constexpr = gl.constexpr(PropagateNan.ALL)
+
+
+@gluon.jit
+def _max2(a, b):
+    return gl.maximum(a, b, propagate_nan=_MAX_PROP_NAN)
+
+
+@gluon.jit
+def _rmax(x, axis):
+    return gl.reduce(x, axis, _max2)
+
 
 
 @gluon.jit
@@ -63,21 +81,50 @@ def _split2(x):
 
 
 @gluon.jit
-def _deq_store(x_u8, sc, kv_smem, off, UNIFORM: gl.constexpr, FP8_FNUZ: gl.constexpr):
+def _split2_dim0(x):
+    """Contiguous register split along dim 0: [A, B] -> two [A//2, B].
+
+    The dim-0 counterpart of _split2, for the row-wide gather layout where dim 1
+    is spent entirely on threads (one instruction = whole token rows) and the
+    per-lane register repeats live on dim 0 instead.
+    """
+    layout: gl.constexpr = x.type.layout
+    x_r = x.reshape(2, x.shape[0] // 2, x.shape[1]).permute(1, 2, 0)
+    x0, x1 = gl.split(x_r)
+    x0 = gl.convert_layout(x0, layout, assert_trivial=True)
+    x1 = gl.convert_layout(x1, layout, assert_trivial=True)
+    return x0, x1
+
+
+@gluon.jit
+def _split_ax(x, AXIS: gl.constexpr):
+    if AXIS == 1:
+        a, b = _split2(x)
+    else:
+        a, b = _split2_dim0(x)
+    return a, b
+
+
+@gluon.jit
+def _deq_store(
+    x_u8, sc, kv_smem, off,
+    AXIS: gl.constexpr, UNIFORM: gl.constexpr, FP8_FNUZ: gl.constexpr,
+):
     """Dequant one fp8 slab and write it straight to kv_smem[:, off:off+W].
 
     Keep the dequant in f32: gfx950 has no bf16 multiply, so a bf16 path lowers to
     an emulated mul and doubles the loop. ``sc`` is the raw per-64-group exponent
     byte (packed fp8_ds_mla, UE8M0) or an f32 scale (uniform pool).
     """
-    W: gl.constexpr = x_u8.shape[1]
     if UNIFORM:
         scale = sc
     else:
         scale = gl.exp2(sc.to(gl.float32) - 127.0)
-    kv_smem.slice(off, W, dim=1).store(
-        (_fp8_to_f32(x_u8, FP8_FNUZ) * scale).to(gl.bfloat16)
-    )
+    val = (_fp8_to_f32(x_u8, FP8_FNUZ) * scale).to(gl.bfloat16)
+    if AXIS == 1:
+        kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
+    else:
+        kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
 
 
 @gluon.jit
@@ -86,56 +133,58 @@ def _deq_store_tile(
     sc,
     kv_smem,
     NOPE_CHUNK: gl.constexpr,
+    AXIS: gl.constexpr,
     UNIFORM: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
-    """Dequant a whole gathered fp8 tile into kv_smem in NOPE_CHUNK-wide pieces.
+    """Dequant a whole gathered fp8 tile into kv_smem in NOPE_CHUNK-sized pieces
+    along CHUNK_AXIS (0 = rows, 1 = columns).
 
     The f32 expansion is 4x the fp8 tile (a [64, 512] tile is 128 f32 VGPRs/lane),
     so materializing it in one shot is what pins the kernel at 1 wave/SIMD.
     Splitting first makes the dependence chain explicit -- piece c's converts feed
-    piece c's ds_writes and die -- so only HEAD_SIZE/NOPE_CHUNK-th of it is ever
+    piece c's ds_writes and die -- so only a 1/pieces fraction of it is ever
     live. The splits themselves are register renames (see ``_split2``).
     """
-    W: gl.constexpr = x_u8.shape[1]
+    W: gl.constexpr = x_u8.shape[1] if AXIS == 1 else x_u8.shape[0]
     if NOPE_CHUNK >= W:
-        _deq_store(x_u8, sc, kv_smem, 0, UNIFORM, FP8_FNUZ)
+        _deq_store(x_u8, sc, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
     else:
-        x0, x1 = _split2(x_u8)
-        s0, s1 = _split2(sc)
+        x0, x1 = _split_ax(x_u8, AXIS)
+        s0, s1 = _split_ax(sc, AXIS)
         W2: gl.constexpr = W // 2
         if NOPE_CHUNK >= W2:
-            _deq_store(x0, s0, kv_smem, 0, UNIFORM, FP8_FNUZ)
-            _deq_store(x1, s1, kv_smem, W2, UNIFORM, FP8_FNUZ)
+            _deq_store(x0, s0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
+            _deq_store(x1, s1, kv_smem, W2, AXIS, UNIFORM, FP8_FNUZ)
         else:
-            x00, x01 = _split2(x0)
-            s00, s01 = _split2(s0)
-            x10, x11 = _split2(x1)
-            s10, s11 = _split2(s1)
+            x00, x01 = _split_ax(x0, AXIS)
+            s00, s01 = _split_ax(s0, AXIS)
+            x10, x11 = _split_ax(x1, AXIS)
+            s10, s11 = _split_ax(s1, AXIS)
             W4: gl.constexpr = W // 4
             if NOPE_CHUNK >= W4:
-                _deq_store(x00, s00, kv_smem, 0, UNIFORM, FP8_FNUZ)
-                _deq_store(x01, s01, kv_smem, W4, UNIFORM, FP8_FNUZ)
-                _deq_store(x10, s10, kv_smem, 2 * W4, UNIFORM, FP8_FNUZ)
-                _deq_store(x11, s11, kv_smem, 3 * W4, UNIFORM, FP8_FNUZ)
+                _deq_store(x00, s00, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(x01, s01, kv_smem, W4, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(x10, s10, kv_smem, 2 * W4, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(x11, s11, kv_smem, 3 * W4, AXIS, UNIFORM, FP8_FNUZ)
             else:
                 W8: gl.constexpr = W // 8
-                y0, y1 = _split2(x00)
-                t0, t1 = _split2(s00)
-                _deq_store(y0, t0, kv_smem, 0, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, W8, UNIFORM, FP8_FNUZ)
-                y0, y1 = _split2(x01)
-                t0, t1 = _split2(s01)
-                _deq_store(y0, t0, kv_smem, 2 * W8, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 3 * W8, UNIFORM, FP8_FNUZ)
-                y0, y1 = _split2(x10)
-                t0, t1 = _split2(s10)
-                _deq_store(y0, t0, kv_smem, 4 * W8, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 5 * W8, UNIFORM, FP8_FNUZ)
-                y0, y1 = _split2(x11)
-                t0, t1 = _split2(s11)
-                _deq_store(y0, t0, kv_smem, 6 * W8, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 7 * W8, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split_ax(x00, AXIS)
+                t0, t1 = _split_ax(s00, AXIS)
+                _deq_store(y0, t0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, W8, AXIS, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split_ax(x01, AXIS)
+                t0, t1 = _split_ax(s01, AXIS)
+                _deq_store(y0, t0, kv_smem, 2 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 3 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split_ax(x10, AXIS)
+                t0, t1 = _split_ax(s10, AXIS)
+                _deq_store(y0, t0, kv_smem, 4 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 5 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split_ax(x11, AXIS)
+                t0, t1 = _split_ax(s11, AXIS)
+                _deq_store(y0, t0, kv_smem, 6 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 7 * W8, AXIS, UNIFORM, FP8_FNUZ)
 
 
 @gluon.jit
@@ -201,6 +250,7 @@ def _decode_tile(
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
+    CHUNK_AXIS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     MASKED: gl.constexpr,
     UNIFORM: gl.constexpr,
@@ -249,7 +299,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
             sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
-        _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, True, FP8_FNUZ)
+        _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, True, FP8_FNUZ)
     elif IS_FP8:
         # DSv4 packed fp8_ds_mla: NoPE fp8 + embedded UE8M0 + separate RoPE-bf16.
         nope_off = (block_idx_g * cs0 + pos_g * 576)[:, None] + offs_full[None, :]
@@ -266,7 +316,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
             exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
-        _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, False, FP8_FNUZ)
+        _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, CHUNK_AXIS, False, FP8_FNUZ)
         block_idx_gr, pos_gr, valid_gr = _slots(
             indices_ptr,
             seg_start,
@@ -323,12 +373,18 @@ def _decode_tile(
             ]
         S = gl.where(col_mask, S, neg_inf)
 
-    m_block = gl.max(S, axis=1)
-    m_new = gl.maximum(m_i, m_block)
+    # Online softmax in the base-2 exponent domain: fold qk_scale*log2(e) into S
+    # once, right out of the MFMA, and carry m_i already scaled. The alternative
+    # (raw running max, scale at use) needs qk_scale on both the S tile and the two
+    # m vectors every iteration; here the per-element work in the loop is one
+    # subtract feeding exp2, and the whole epilogue -- sink combine and partial
+    # store, both of which want base-2 m -- stops converting.
+    S = S * qk_scale
+    m_block = _rmax(S, 1)
+    m_new = _max2(m_i, m_block)
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)  # guard all-masked rows
-    m_new_s = m_new * qk_scale
-    p = gl.exp2(S * qk_scale - m_new_s[:, None])
-    alpha = gl.exp2(m_i * qk_scale - m_new_s)
+    p = gl.exp2(S - m_new[:, None])
+    alpha = gl.exp2(m_i - m_new)
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
     v = kv_smem.load(v_layout)  # [BLOCK_K, HEAD_SIZE]
@@ -433,6 +489,7 @@ def _qkpv_fp8(
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
+    CHUNK_AXIS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
@@ -442,7 +499,7 @@ def _qkpv_fp8(
     skips the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID,
     mask the columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
     neg_inf = float("-inf")
-    _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, UNIFORM, FP8_FNUZ)
+    _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, UNIFORM, FP8_FNUZ)
     if not UNIFORM:
         kv_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(k_rope)
     k = kv_smem.permute([1, 0]).load(k_layout)
@@ -463,12 +520,12 @@ def _qkpv_fp8(
                 :, None
             ]
         S = gl.where(col_mask, S, neg_inf)
-    m_block = gl.max(S, axis=1)
-    m_new = gl.maximum(m_i, m_block)
+    S = S * qk_scale  # see _decode_tile: m_i is carried in base-2 exponent space
+    m_block = _rmax(S, 1)
+    m_new = _max2(m_i, m_block)
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
-    m_new_s = m_new * qk_scale
-    p = gl.exp2(S * qk_scale - m_new_s[:, None])
-    alpha = gl.exp2(m_i * qk_scale - m_new_s)
+    p = gl.exp2(S - m_new[:, None])
+    alpha = gl.exp2(m_i - m_new)
     l_new = l_i * alpha + gl.sum(p, axis=1)
     v = kv_smem.load(v_layout)
     p_dot = gl.convert_layout(p.to(gl.bfloat16), p_layout)
@@ -511,6 +568,7 @@ def _process_segment(
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
+    CHUNK_AXIS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
@@ -593,6 +651,7 @@ def _process_segment(
                     BLOCK_M,
                     BLOCK_K,
                     NOPE_CHUNK,
+                    CHUNK_AXIS,
                     HEAD_ALIGNED,
                     UNIFORM,
                     FP8_FNUZ,
@@ -622,6 +681,7 @@ def _process_segment(
                 BLOCK_M,
                 BLOCK_K,
                 NOPE_CHUNK,
+                CHUNK_AXIS,
                 HEAD_ALIGNED,
                 UNIFORM,
                 FP8_FNUZ,
@@ -664,6 +724,7 @@ def _process_segment(
                 BLOCK_M,
                 BLOCK_K,
                 NOPE_CHUNK,
+                CHUNK_AXIS,
                 HEAD_ALIGNED,
                 False,
                 UNIFORM,
@@ -708,6 +769,7 @@ def _process_segment(
             BLOCK_M,
             BLOCK_K,
             NOPE_CHUNK,
+            CHUNK_AXIS,
             HEAD_ALIGNED,
             True,
             UNIFORM,
@@ -771,12 +833,11 @@ def _pa_decode_sparse(
     HEAD_ALIGNED: gl.constexpr,
     MFMA_K: gl.constexpr,
     UNIFORM: gl.constexpr,
-    # Experiment knobs (driver reads AITER_PA_DECODE_* env vars; defaults = prior
-    # behaviour). GATHER_W0: put the NoPE gather's warps on dim 0 (rows) instead of
-    # dim 1 (columns).
-    GATHER_W0: gl.constexpr,
-    # NOPE_CHUNK: width of one dequant piece (HEAD_SIZE = one shot, prior behaviour).
+    GATHER_TW1: gl.constexpr,
+    # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows, 1 =
+    # columns); >= the tile's extent on that axis means one shot.
     NOPE_CHUNK: gl.constexpr,
+    CHUNK_AXIS: gl.constexpr,
     # How many of the NUM_SPLITS programs share the main (SWA) segment. The two
     # segments have very different shapes -- main is a contiguous window whose
     # length is fixed by the sliding window, extra is the top-k list -- so one
@@ -842,10 +903,18 @@ def _pa_decode_sparse(
     # warps-on-dim-0 carries BLOCK_K/(8*NUM_WARPS). Dim 0 also makes the column
     # direction a pure per-lane register repeat, so a chunked dequant can split it
     # with a trivial (register-renaming) layout convert.
+    # GATHER_TW1 = threads spent on the head dim. Each thread loads 16 B, so
+    # TW1=8 requests 128 B of a token row per instruction and TW1=32 requests the
+    # whole 512 B row -- for a scattered gather that is one request instead of
+    # four quarters. The cost is that the row-index vector lives in
+    # SliceLayout(1, gather_l), so a wider TW1 leaves fewer dim-0 thread slots and
+    # every lane carries more slots (BLOCK_K*TW1/64 of them). Whichever dim keeps
+    # per-lane register repeats is the one the chunked dequant can split
+    # (CHUNK_AXIS).
     gather_l: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, GSPT],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[NUM_WARPS, 1] if GATHER_W0 else [1, NUM_WARPS],
+        threads_per_warp=[64 // GATHER_TW1, GATHER_TW1],
+        warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     # Warps tile dim 0 here, one warp already covers all 64 RoPE columns, so putting
@@ -941,6 +1010,7 @@ def _pa_decode_sparse(
         BLOCK_M,
         BLOCK_K,
         NOPE_CHUNK,
+        CHUNK_AXIS,
         HEAD_ALIGNED,
         UNIFORM,
         MAIN_USE_BUFFER_LOAD,
@@ -987,6 +1057,7 @@ def _pa_decode_sparse(
             BLOCK_M,
             BLOCK_K,
             NOPE_CHUNK,
+            CHUNK_AXIS,
             HEAD_ALIGNED,
             UNIFORM,
             EXTRA_USE_BUFFER_LOAD,
@@ -1001,15 +1072,15 @@ def _pa_decode_sparse(
 
     if NUM_SPLITS == 1:
         if HAS_SINK:
-            # m_pv is the RAW row-max; the sink is a scaled-score logit. Combine
-            # in scaled space (Ms = scale*m) using exp2.
-            Ms = m_pv * scale
+            # m_pv is already the row-max in the base-2 exponent domain
+            # (row_max * softmax_scale * log2e); lift the sink -- a scaled-score
+            # logit -- into the same domain and combine there.
             sink = gl.amd.cdna4.buffer_load(
                 ptr=attn_sink_ptr, offsets=h_pv, mask=head_mask_pv, other=float("-inf")
-            ).to(gl.float32)
-            m_final = gl.maximum(Ms, sink)
-            alpha = gl.exp2((Ms - m_final) * RCP_LN2)
-            l_final = l_pv * alpha + gl.exp2((sink - m_final) * RCP_LN2)
+            ).to(gl.float32) * RCP_LN2
+            m_final = _max2(m_pv, sink)
+            alpha = gl.exp2(m_pv - m_final)
+            l_final = l_pv * alpha + gl.exp2(sink - m_final)
             acc = acc * alpha[:, None]
         else:
             l_final = l_pv
@@ -1025,12 +1096,12 @@ def _pa_decode_sparse(
             mask=head_mask_pv[:, None],
         )
     else:
-        # store un-normalized partials for the reduce kernel. m is stored in the
-        # base-2 exponent domain (row-max * softmax_scale * log2e) so the reduce/
-        # skip_reduce partials match the triton convention.
+        # store un-normalized partials for the reduce kernel. m is already in the
+        # base-2 exponent domain (row-max * softmax_scale * log2e), which is the
+        # reduce/skip_reduce convention the triton kernel also uses.
         pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
         gl.amd.cdna4.buffer_store(
-            m_pv * (scale * RCP_LN2),
+            m_pv,
             ptr=part_m_ptr + pm_base,
             offsets=h_pv.to(gl.int32),
             mask=head_mask_pv,
@@ -1115,12 +1186,12 @@ def _pa_decode_sparse_reduce(
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
         )
-        m_final = gl.maximum(m_final, m_s)  # m_s already in base-2 exponent domain
+        m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
     if HAS_SINK:
         sink = gl.amd.cdna4.buffer_load(
             ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf
         ).to(gl.float32)
-        m_final = gl.maximum(m_final, sink * RCP_LN2)  # lift sink to base-2
+        m_final = _max2(m_final, sink * RCP_LN2)  # lift sink to base-2
 
     # pass 2: weighted sums
     l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)

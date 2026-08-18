@@ -579,8 +579,12 @@ def _pa_decode_sparse_gfx950_gluon(
     if _mk:
         MFMA_K = int(_mk)
     num_warps = max(1, BLOCK_K // 16)
-    # AITER_PA_DECODE_GATHER_W0: NoPE gather warps on dim 0 (rows) instead of dim 1.
-    GATHER_W0 = _os.environ.get("AITER_PA_DECODE_GATHER_W0", "1") == "1"
+    # AITER_PA_DECODE_TW1: threads the NoPE gather spends on the head dim (16 B
+    # each). 32 issues a whole 512 B token row per instruction instead of 8 x 128 B
+    # quarters, which is what a scattered top-k gather wants; the cost is a longer
+    # per-lane slot vector. Measured best at 32 for every extra >= 128 (-10% at
+    # extra=128) and within noise at extra=8.
+    gather_tw1 = int(_os.environ.get("AITER_PA_DECODE_TW1", "32"))
     # AITER_PA_DECODE_NOPE_CHUNK: width of one fp8 dequant piece (0/unset = one shot).
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
@@ -713,10 +717,17 @@ def _pa_decode_sparse_gfx950_gluon(
     # 128 is the narrowest piece the gather layout can split to for free (below
     # that a split falls inside a thread's 16-byte run, which Triton rejects), and
     # the split is only trivial when the gather's warps tile dim 0.
+    # Row-wide gather chunks rows (4 pieces of BLOCK_K/4) instead of 128-wide
+    # column pieces; both leave a quarter of the tile's f32 expansion live.
+    # Split the axis that still has per-lane register repeats: columns when the
+    # gather leaves >=2 column repeats (TW1=8), rows otherwise.
+    col_reps = head_dim // (gather_tw1 * 16)
+    chunk_axis = 1 if col_reps >= 4 else 0
     _nc = _os.environ.get("AITER_PA_DECODE_NOPE_CHUNK")
-    nope_chunk = int(_nc) if _nc else min(128, head_dim)
-    if not GATHER_W0:
-        nope_chunk = head_dim
+    if chunk_axis == 0:
+        nope_chunk = int(_nc) if _nc else max(1, BLOCK_K // 4)
+    else:
+        nope_chunk = int(_nc) if _nc else min(128, head_dim)
 
     # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
     # threshold on gfx950's 512-VGPR file. The chunked dequant gets the buffer_load
@@ -724,7 +735,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # offset gathers through 64-bit addresses and lands at ~321 -- there the cap
     # buys nothing and costs ~150 scratch stores (+40% at C4A), so only ask for it
     # when both caches are on the fast path.
-    if use_buffer_load and nope_chunk < head_dim:
+    if use_buffer_load and (chunk_axis == 0 or nope_chunk < head_dim):
         waves_per_eu = 2
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
     if _wp:
@@ -787,8 +798,9 @@ def _pa_decode_sparse_gfx950_gluon(
         HEAD_ALIGNED=HEAD_ALIGNED,
         MFMA_K=MFMA_K,
         UNIFORM=UNIFORM,
-        GATHER_W0=GATHER_W0,
+        GATHER_TW1=gather_tw1,
         NOPE_CHUNK=nope_chunk,
+        CHUNK_AXIS=chunk_axis,
         MAIN_SPLITS=main_splits,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
