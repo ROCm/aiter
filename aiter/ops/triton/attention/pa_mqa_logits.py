@@ -50,13 +50,9 @@ if triton_version >= Version("3.5.0"):
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
     )
-    from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 
-    # The gluon paged-MQA-logits kernels are duplicated per arch generation under
-    # _gluon_kernels/<arch>/. The copies are byte-identical today, so this only
-    # picks which one is compiled; once they are specialized per arch this is the
-    # single selection point. gfx1250 is a first-class target here -- the kernels
-    # carry IS_GFX1250 branches and a 32-wide warp.
+    # The gluon paged-MQA-logits kernels are specialized per arch generation under
+    # _gluon_kernels/<arch>/, so this is the single point that selects one.
     # Selected with get_gfx(), the same value this module feeds to GPUTarget and to
     # the kernel's ARCH constexpr, so the copy compiled always matches the target.
     _gluon_arch = get_gfx()
@@ -64,8 +60,11 @@ if triton_version >= Version("3.5.0"):
         from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_mqa_logits import (
             _gluon_deepgemm_fp8_paged_mqa_logits,
             _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
         )
+
+        # VarCtx has no gfx1250 implementation (see the warning below, which forces
+        # VarCtxSchedule=None there), so the gfx1250 copy carries no varctx kernel.
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx = None
     elif _gluon_arch == "gfx942":
         from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_mqa_logits import (
             _gluon_deepgemm_fp8_paged_mqa_logits,
@@ -302,7 +301,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 f"KVBlockSize={KVBlockSize}. Use Preshuffle=True for "
                 f"KVBlockSize>1 (TDM block-load)."
             )
-    cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
     target = GPUTarget("hip", gfx_version, warp_size)
 
@@ -344,8 +342,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["ChunkK"] = "constexpr"
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
-    fn_signature["CDNA_VERSION"] = "constexpr"
-    fn_signature["ARCH"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -390,8 +386,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "ChunkK": ChunkK,
             "KVBlockSize": KVBlockSize,
             "HiddenDim": HiddenDim,
-            "CDNA_VERSION": cdna_version,
-            "ARCH": gfx_version,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -559,7 +553,6 @@ def deepgemm_fp8_paged_mqa_logits(
             VarCtxOpt=VarCtxOpt,
         )
         if triton_version >= Version("3.5.0"):
-            cdna_version = get_cdna_version()
             kernel[grid](
                 batch_size,
                 next_n,
@@ -587,8 +580,6 @@ def deepgemm_fp8_paged_mqa_logits(
                 ChunkK,
                 KVBlockSize,
                 hidden_dim,
-                cdna_version,
-                get_gfx(),
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
