@@ -58,13 +58,10 @@ _DISP_NSTREAMS = 4
 _MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
-# NOTE: the cross-device xdb barrier is kept inlined per kernel (dispatch Phase 2,
-# combine gather/scatter/fused) rather than a shared helper: FlyDSL only AST-rewrites
-# dynamic `if` in the @flyc.kernel body, not in called helpers, so a helper's
-# `if <lane predicate>:` would raise "cannot evaluate dynamic Boolean" at trace time.
-
-
-# ── dispatch ──────────────────────────────────────────────────────────────
+# The cross-device barrier is inlined per kernel rather than shared with combine:
+# FlyDSL only AST-rewrites dynamic `if` in the @flyc.kernel body, not in called
+# helpers, so a helper's `if <lane predicate>:` would raise "cannot evaluate
+# dynamic Boolean" at trace time.
 
 
 def _make_dispatch(
@@ -124,8 +121,8 @@ def _make_dispatch(
             k_slot = work_idx % experts_per_token
             dest_expert = buffer_load(rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32)
             # Dedup: a token routed to several experts on the SAME dest PE is sent
-            # once. If a lower lane (< k_slot) already targets our dest_pe, drop this
-            # (src_tok, k_slot); safe_lane keeps the probe in-bounds for lanes >= k_slot.
+            # once, by the lowest k_slot. safe_lane keeps the probe in-bounds for
+            # lanes >= k_slot.
             safe_lane = arith.select(lane < k_slot, lane, 0)
             lane_expert = buffer_load(
                 rsrc_inp_idx,
@@ -162,8 +159,8 @@ def _make_dispatch(
 
             if lane == 0:  # noqa: SIM102 - device predicates
                 if do_publish:
-                    # publish this recv slot's origin (global source token id) into
-                    # the dest peer's tis, for combine routing.
+                    # Publish this recv slot's origin into the dest peer's tis,
+                    # which combine routing reads back.
                     src_tok_encoded = rank * max_tok_per_rank + src_tok
                     peer_tis = fx.Int64(window.lsa_ptr(dest_pe, off_tis))
                     buffer_store(
@@ -239,11 +236,10 @@ def _make_dispatch(
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32)
                     buffer_store(vec_a, rsrc_dst, chunk)
 
-        # Self-reset total_recv (replaces the host-side total_recv.zero_()):
-        # only global warp 0 touches it — lane 0 zeros it here, all lanes
-        # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
-        # drains this store before the Phase-3 adds; total_recv is local, so
-        # no release fence / L2 writeback is needed. CUDAGraph-safe.
+        # Self-reset total_recv (CUDAGraph-safe; replaces a host-side zero_()).
+        # Only global warp 0 touches it, and the waitcnt_all + grid barrier below
+        # drains this store before the Phase-3 adds. total_recv is local, so no
+        # release fence / L2 writeback is needed.
         if global_warp_id == 0:  # noqa: SIM102 - device predicates
             if lane == 0:
                 buffer_store(
@@ -253,10 +249,9 @@ def _make_dispatch(
                 )
 
         # ── Phase 2: grid barrier + per-peer count signal ──
-        # s_barrier only syncs wavefronts; drain memory counters first so the
-        # token/count stores above are complete before the grid barrier makes
-        # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
-        # implicit s_waitcnt).
+        # gpu.barrier lowers to s_barrier, which syncs wavefronts but (unlike HIP
+        # __syncthreads) emits no implicit s_waitcnt, so drain the memory counters
+        # first or the stores above may not be visible to peers.
         comm_ops.waitcnt_all()
         fx.barrier()
         if tid == 0:

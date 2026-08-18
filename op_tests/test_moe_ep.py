@@ -677,7 +677,7 @@ def test_fmoe_ep_mxfp4(
         w1_u8 = w1_qt.view(torch.uint8)
         w2_u8 = w2_qt.view(torch.uint8)
         # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
-        # felix TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
+        # TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
         # row-interleaved ([g0,u0,g1,u1,...]) inside moe_shuffle_weight/scale,
         # matching test_flydsl_grouped_gemm_gfx1250.py.
         w1_a = moe_shuffle_weight(

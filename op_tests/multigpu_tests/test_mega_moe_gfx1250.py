@@ -94,9 +94,7 @@ def _import_mori_v2():
     return EpDispatchCombineConfig, EpDispatchCombineOp
 
 
-# --------------------------------------------------------------------------- #
 # Config / quant-path spec
-# --------------------------------------------------------------------------- #
 def resolve_spec(quant_key, transport):
     """How to prepare weights / quantize activations / call fused_moe for a quant
     key, plus the dispatch transport dtype. transport: auto|bf16|fp8."""
@@ -132,9 +130,7 @@ def resolve_spec(quant_key, transport):
     }
 
 
-# --------------------------------------------------------------------------- #
 # Weight quantization + shuffle (device path) / dequant (reference)
-# --------------------------------------------------------------------------- #
 def weight_per_128x128_quant(weight, quant_dtype):
     E, dim1, dim2 = weight.shape
     wb = weight.view(E, dim1 // 128, 128, dim2 // 128, 128)
@@ -284,9 +280,7 @@ def moe_forward(
     )
 
 
-# --------------------------------------------------------------------------- #
 # Shared setup (fed to BOTH reference and device path)
-# --------------------------------------------------------------------------- #
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
 
 
@@ -356,9 +350,7 @@ def _calc_diff(x, y):
     return float(1 - 2 * (x * y).sum() / denom)
 
 
-# --------------------------------------------------------------------------- #
 # torchrun rendezvous helper
-# --------------------------------------------------------------------------- #
 class Dist:
     def __init__(self):
         self.rank = int(os.environ["RANK"])
@@ -396,9 +388,7 @@ class Dist:
             dist.destroy_process_group()
 
 
-# --------------------------------------------------------------------------- #
 # Reference: pure-torch fp32 multi-layer chained MoE (ground truth, ISOLATED)
-# --------------------------------------------------------------------------- #
 class RefModel:
     """fp32 reference. mxfp4-dequant weights (shared, lazily per expert), per-token
     routed FFN summed over topk, dense shared expert, chained N layers with a
@@ -464,9 +454,7 @@ class RefModel:
         return x.to(dtypes.bf16)
 
 
-# --------------------------------------------------------------------------- #
 # Device pipeline: N-layer dispatch->gemm->combine, one CUDA graph (ISOLATED)
-# --------------------------------------------------------------------------- #
 class DeviceMoEPipeline:
     """Owns the cco Communicator + EpDispatchCombineOp + a8w4 shuffled weights.
     Each layer recomputes its own routing inside dispatch (e2e-faithful), and the
@@ -765,9 +753,7 @@ def _device_shared_ffn(tokens, sw1, sw2):
     return acc.to(tokens.dtype)
 
 
-# --------------------------------------------------------------------------- #
 # Driver
-# --------------------------------------------------------------------------- #
 def main():
     args = _parse_args()
     dist_ctx = Dist()

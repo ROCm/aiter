@@ -14,11 +14,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-from .combine import (
-    _XDB_FLAG_SLOTS,
-    _make_combine_fused_reduce,
-    _make_combine_fused_sync,
-)
+from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
 from .types import Stage2ScatterContext, _from_gpu_ptr
@@ -29,10 +25,9 @@ _DISPATCH_BACKENDS = ("flydsl", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
 
-# mori's C++ EpArgs offset stems -> this package's arena region names. mori binds
-# all eight when a plan is built, though its dispatch dereferences only the first
-# six, so `outTok` -- combine staging this package does not have -- is aimed at a
-# region the dispatch never touches.
+# mori's C++ EpArgs offset stems -> this package's arena region names. All eight
+# are bound when a plan is built even though mori's dispatch dereferences only the
+# first six, so `outTok` is aimed at a region the dispatch never touches.
 _MORI_REGION_NAMES = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -54,9 +49,8 @@ def _mori_dispatch_schedule(config) -> tuple:
 
     Not `_select_dispatch_config`'s: that table asks for 32 warps above 256
     tokens, and mori's gfx1250 dispatch stages a hidden-dim tile per warp in
-    dynamic LDS -- 32 * 7168 * 2 = 458 KB, past the 320 KB the combine path
-    budgets against. EpCfgIsValid does not check LDS, so that would not be
-    rejected when the plan is built; it would fail at launch.
+    dynamic LDS -- 32 * 7168 * 2 = 458 KB, past the 320 KB budget. EpCfgIsValid
+    does not check LDS, so the plan would build and then fail at launch.
     """
     from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
 
@@ -217,11 +211,10 @@ class MegaMoEGfx1250:
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
-        A model's MoE layers share their geometry, expert-GEMM recipe (activation,
-        gate mode, quant type, padding) and communication arena, and differ only in
-        their weights -- so one instance serves every layer and the per-layer
-        weights are forward() arguments. That also keeps a single cco symmetric
-        arena for the model instead of one per layer.
+        A model's MoE layers share their geometry, expert-GEMM recipe and
+        communication arena and differ only in their weights, so one instance
+        serves every layer (weights are forward() arguments) and the model keeps a
+        single cco symmetric arena instead of one per layer.
         """
         gfx = get_gfx()
         if gfx != "gfx1250":
@@ -340,14 +333,13 @@ class MegaMoEGfx1250:
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
-        The weights are this layer's; everything shared by the model was fixed at
-        construction. ``recv_token_bound`` caps how many recv slots the GEMM is
-        shown: dispatch always fills a world_size*max_tokens_per_rank arena, so a
-        caller that knows a tighter static bound (e.g. a uniform decode batch,
-        where it is graph_bs*topk*world_size) can shrink the GEMM's grid with it.
-        It must be a python int so the shape stays static under graph capture, and
-        it must not cut below the received count -- the kernels still skip the
-        tail past the device-side count on their own.
+        ``recv_token_bound`` caps how many recv slots the GEMM is shown. Dispatch
+        always fills a world_size*max_tokens_per_rank arena, so a caller that
+        knows a tighter static bound (e.g. graph_bs*topk*world_size for a uniform
+        decode batch) can shrink the GEMM's grid with it. It must be a python int
+        so the shape stays static under graph capture, and must not cut below the
+        received count -- the kernels skip the tail past the device-side count on
+        their own.
         """
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
@@ -498,9 +490,7 @@ class MegaMoEGfx1250:
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
-        self._cross_device_flag = torch.ones(
-            _XDB_FLAG_SLOTS, dtype=torch.int64, device=device
-        )
+        self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
         self._combine_output = torch.zeros(
             config.max_tokens_per_rank * config.hidden_dim,
             dtype=torch.int16,
@@ -508,8 +498,8 @@ class MegaMoEGfx1250:
         )
 
         if config.dispatch_backend == "mori":
-            # mori's dispatch is tuned on its own kernel, and its geometry is a
-            # compile-time Cfg field, so it brings its own buckets.
+            # mori's geometry is a compile-time Cfg field, so it brings its own
+            # tuned buckets.
             config.schedule = _mori_dispatch_schedule(config)
 
         if config.schedule:
@@ -554,16 +544,11 @@ class MegaMoEGfx1250:
         self._combine_specs = combine_specs
         self._combine_variants = {
             spec: _make_combine_fused_reduce(
-                rank=config.rank,
-                npes=config.world_size,
                 experts_per_token=config.topk,
                 hidden_dim=config.hidden_dim,
                 block_num=spec[0],
                 warp_num_per_block=spec[1],
-                off_comb_inp=self._arena.offset("comb_inp"),
-                off_xdb_mem=self._arena.offset("cross_device_barrier"),
                 slot_stride_nbytes=config.combine_slot_stride_bytes,
-                include_sync=False,
             )
             for spec in combine_specs
         }
@@ -576,19 +561,16 @@ class MegaMoEGfx1250:
     def _build_mori_dispatch(self, config: MegaMoEStage2Config) -> dict:
         """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
 
-        Only the kernel changes. mori leaves the same arena state this package's
-        own dispatch does -- disp_out rows at slot*hidden, out_idx/out_wts at
-        slot*topk+k, and recv_to_src_token as src_pe*max_tok+src_tok, which is
-        what the GEMM host pass decodes to build ep_rowmap -- so gemm1, the
-        gemm2 P2P scatter and the fused combine are untouched. It also never
-        touches cross_device_barrier (its cross-rank rendezvous is the same
-        recv_num signal/ack handshake), so the combine's epoch is undisturbed.
+        Only the kernel changes: mori leaves the same arena state this package's
+        own dispatch does (disp_out rows at slot*hidden, out_idx/out_wts at
+        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok) and never
+        touches cross_device_barrier, so gemm1, the gemm2 P2P scatter and the
+        fused combine are untouched.
 
-        The recv SLOT a token lands in does change: mori's gfx1250 dispatch
-        reserves a block's slots with one atomic and hands them out block-local.
-        Nothing indexes by slot order -- routing goes through the reverse map --
-        but a test comparing arena contents slot-by-slot against the FlyDSL
-        dispatch will differ.
+        The recv SLOT a token lands in does change -- mori reserves a block's
+        slots with one atomic and hands them out block-local. Nothing indexes by
+        slot order, but a test comparing arena contents slot-by-slot against the
+        FlyDSL dispatch will differ.
         """
         try:
             from mori.ops.dispatch_combine_v2.ep_plans import EpDispatchPlan
@@ -638,9 +620,8 @@ class MegaMoEGfx1250:
                 inp_cur_tok,
                 stream,
             ):
-                # This package's dispatch zeroes total_recv in its own Phase 2;
-                # mori's only accumulates into it, and the fused combine never
-                # resets it, so without this it grows every forward.
+                # mori's dispatch only accumulates into total_recv (this package's
+                # zeroes it in Phase 2), so without this it grows every forward.
                 self._total_recv.zero_()
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
@@ -745,8 +726,7 @@ class MegaMoEGfx1250:
         spec = self._combine_specs[0]
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
-        # stream. The kernel boundary gives the reduce its visibility, so no
-        # in-kernel fence is needed.
+        # stream; the kernel boundary gives the reduce its visibility.
         self._combine_sync(
             self._arena.handle,
             self._cross_device_flag.data_ptr(),
@@ -754,11 +734,8 @@ class MegaMoEGfx1250:
             stream,
         )
         self._combine_variants[spec](
-            self._arena.handle,
             self._arena.local_ptr("comb_inp"),
-            self._cross_device_flag.data_ptr(),
             self._combine_output.data_ptr(),
-            self._config.rank,
             routing.token_count,
             stream,
         )
