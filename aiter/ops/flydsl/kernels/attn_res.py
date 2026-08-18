@@ -124,8 +124,10 @@ def _build_attn_res(
 
     @fx.struct
     class SharedStorage:
-        sumsq: fx.Array[fx.Float32, red_slots, 16]
-        dot: fx.Array[fx.Float32, red_slots, 16]
+        # Two buffers so successive reductions write disjoint LDS slots and
+        # do not need a write-after-read barrier. Array is 1D; the view is (2, red_slots).
+        sumsq: fx.Array[fx.Float32, 2 * red_slots, 16]
+        dot: fx.Array[fx.Float32, 2 * red_slots, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def attn_res_kernel(
@@ -144,8 +146,9 @@ def _build_attn_res(
         fm_fast = arith.FastMathFlags.fast
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        s_sumsq = lds.sumsq.view(fx.make_layout(red_slots, 1))
-        s_dot = lds.dot.view(fx.make_layout(red_slots, 1))
+        pingpong_layout = fx.make_layout((2, red_slots), (red_slots, 1))
+        s_sumsq_all = lds.sumsq.view(pingpong_layout)
+        s_dot_all = lds.dot.view(pingpong_layout)
 
         zero = fx.Float32(0.0)
         neg_inf = fx.Float32(float("-inf"))
@@ -160,13 +163,14 @@ def _build_attn_res(
                 reduced = reduced.addf(peer, fastmath=fm_fast)
             return reduced
 
-        def block_reduce_add2(sumsq_local, dot_local):
+        def block_reduce_add2(sumsq_local, dot_local, buf):
             if const_expr(red_slots == 1):
                 return wave_reduce_add(sumsq_local), wave_reduce_add(dot_local)
 
-            # The previous source's callers must all finish reading slot zero
-            # before this source's wave leaders reuse the LDS arrays.
-            gpu.barrier()
+            # buf is a compile-time 0/1 ping-pong index. Successive reductions
+            # write disjoint LDS slots, so there is no write-after-read barrier.
+            s_sumsq = fx.slice(s_sumsq_all, (buf, None))
+            s_dot = fx.slice(s_dot_all, (buf, None))
 
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
@@ -178,31 +182,24 @@ def _build_attn_res(
                 fx.memref_store(dot_wave, s_dot, wave)
             gpu.barrier()
 
-            if wave == 0:
-                in_range = lane < red_slots
-                lane_safe = in_range.select(lane, 0)
-                sumsq_partial = fx.memref_load(s_sumsq, lane_safe)
-                dot_partial = fx.memref_load(s_dot, lane_safe)
-                sumsq_partial = in_range.select(sumsq_partial, zero)
-                dot_partial = in_range.select(dot_partial, zero)
-                sumsq_total = wave_reduce_add(sumsq_partial)
-                dot_total = wave_reduce_add(dot_partial)
+            # Every wave reduces the seven LDS partials in registers, so there
+            # is no slot-zero write-back or trailing broadcast barrier.
+            in_range = lane < red_slots
+            lane_safe = in_range.select(lane, 0)
+            sumsq_partial = fx.memref_load(s_sumsq, lane_safe)
+            dot_partial = fx.memref_load(s_dot, lane_safe)
+            sumsq_partial = in_range.select(sumsq_partial, zero)
+            dot_partial = in_range.select(dot_partial, zero)
+            return wave_reduce_add(sumsq_partial), wave_reduce_add(dot_partial)
 
-                if lane == 0:
-                    fx.memref_store(sumsq_total, s_sumsq, 0)
-                    fx.memref_store(dot_total, s_dot, 0)
-            gpu.barrier()
-
-            return fx.memref_load(s_sumsq, 0), fx.memref_load(s_dot, 0)
-
-        def block_reduce_add(value):
+        def block_reduce_add(value, buf):
             if const_expr(red_slots == 1):
                 return wave_reduce_add(value)
 
             # Keep this structurally aligned with block_reduce_add2. The output
             # RMSNorm epilogue has one payload, so reducing a dummy zero through
             # s_dot would spend shuffles and LDS traffic for no result.
-            gpu.barrier()
+            s_sumsq = fx.slice(s_sumsq_all, (buf, None))
 
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
@@ -212,18 +209,11 @@ def _build_attn_res(
                 fx.memref_store(wave_total, s_sumsq, wave)
             gpu.barrier()
 
-            if wave == 0:
-                in_range = lane < red_slots
-                lane_safe = in_range.select(lane, 0)
-                partial = fx.memref_load(s_sumsq, lane_safe)
-                partial = in_range.select(partial, zero)
-                total = wave_reduce_add(partial)
-
-                if lane == 0:
-                    fx.memref_store(total, s_sumsq, 0)
-            gpu.barrier()
-
-            return fx.memref_load(s_sumsq, 0)
+            in_range = lane < red_slots
+            lane_safe = in_range.select(lane, 0)
+            partial = fx.memref_load(s_sumsq, lane_safe)
+            partial = in_range.select(partial, zero)
+            return wave_reduce_add(partial)
 
         copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         vector_layout = fx.make_layout(_VEC_WIDTH, 1)
@@ -295,7 +285,7 @@ def _build_attn_res(
             max_logit = neg_inf
             denominator = zero
 
-            def consume_source(values_local, old_max, old_denominator, old_mixed):
+            def consume_source(values_local, old_max, old_denominator, old_mixed, buf):
                 """Update online-softmax state while ``values_local`` is resident."""
                 thread_sumsq = zero
                 thread_dot = zero
@@ -310,7 +300,7 @@ def _build_attn_res(
                         ReductionOp.ADD, fastmath=fm_fast
                     )
 
-                sumsq, dot = block_reduce_add2(thread_sumsq, thread_dot)
+                sumsq, dot = block_reduce_add2(thread_sumsq, thread_dot, buf)
                 reciprocal_rms = fmath.rsqrt(
                     sumsq * inv_hidden_size + eps, fastmath=fm_fast
                 )
@@ -346,7 +336,7 @@ def _build_attn_res(
             # prefix source so the kernel never reads an invalid block slot.
             # Prime `prefetch_in_flight` extra block sources, then issue the
             # replacement before each consume so that many stay outstanding
-            # across the three-barrier reduce.
+            # across the remaining reduction barrier.
             in_flight = []
             for source in range_constexpr(min(prefetch_in_flight, num_blocks)):
                 in_flight.append(issue_block_source(source))
@@ -359,11 +349,11 @@ def _build_attn_res(
                 for tile in range_constexpr(tiles_per_thread):
                     source_local.append(fx.memref_load_vec(handles[tile]))
                 max_logit, denominator, mixed_local = consume_source(
-                    source_local, max_logit, denominator, mixed_local
+                    source_local, max_logit, denominator, mixed_local, source % 2
                 )
 
             max_logit, denominator, mixed_local = consume_source(
-                prefix_local, max_logit, denominator, mixed_local
+                prefix_local, max_logit, denominator, mixed_local, num_blocks % 2
             )
 
             if const_expr(apply_output_norm):
@@ -372,7 +362,7 @@ def _build_attn_res(
                     thread_sumsq = thread_sumsq + (
                         mixed_local[tile] * mixed_local[tile]
                     ).reduce(ReductionOp.ADD, fastmath=fm_fast)
-                sumsq = block_reduce_add(thread_sumsq)
+                sumsq = block_reduce_add(thread_sumsq, (num_blocks + 1) % 2)
                 scale = fmath.rsqrt(
                     sumsq * inv_hidden_size
                     + output_norm_eps * denominator * denominator,
