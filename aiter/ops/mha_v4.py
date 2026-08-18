@@ -380,10 +380,16 @@ def mha_v4_packed(
         raise ValueError("Q, K, and V must have the same batch size")
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
         raise ValueError("K and V must have matching sequence and head dimensions")
-    if query_heads != k.shape[2]:
+    kv_heads = k.shape[2]
+    if kv_heads == 0:
+        raise ValueError("MHA v4 requires non-empty KV heads")
+    if query_heads % kv_heads != 0:
         raise ValueError(
-            "MHA v4 initially supports MHA only; Q and KV heads must match"
+            "MHA v4 requires query heads to be divisible by KV heads"
         )
+    gqa_ratio = query_heads // kv_heads
+    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
+        raise ValueError("MHA v4 supports power-of-two GQA ratios up to 16")
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise ValueError("MHA v4 expects GPU tensors")
     if q.device != k.device or q.device != v.device:
