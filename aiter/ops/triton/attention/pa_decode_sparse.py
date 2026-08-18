@@ -53,6 +53,17 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
+def _check_out(out, q, dtype):
+    """Caller-supplied output buffer, or a fresh one. Writing the caller's buffer
+    directly saves a full [T, H, D] device copy per call."""
+    if out is None:
+        return torch.empty_like(q, dtype=dtype)
+    assert out.shape == q.shape, f"out shape {tuple(out.shape)} != q {tuple(q.shape)}"
+    assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
+    assert out.device == q.device
+    return out
+
+
 def pa_decode_sparse(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -70,6 +81,7 @@ def pa_decode_sparse(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -88,6 +100,8 @@ def pa_decode_sparse(
             auto-infers to fill ~512 total CTAs while capping below the number
             of K-blocks, then rounds up to a power of 2.
         num_stages: software-pipeline depth of the K loop (default 2).
+        out: optional ``[N, H, D]`` destination. Supplied -> written in place and
+            returned, which saves the caller a full-size device copy.
         skip_reduce: when the split-K path is active (``kv_splits > 1``), return
             the pre-reduce ``(acc_partial, m_partial, l_partial)`` partials
             instead of launching the reduce kernel. Has no effect when
@@ -163,6 +177,7 @@ def pa_decode_sparse(
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
                 fp8_fnuz=fp8_fnuz,
+                out=out,
             )
 
     assert (
@@ -199,7 +214,7 @@ def pa_decode_sparse(
         f"PA_DECODE_SPARSE T={T} H={H} D={D} " f"total_indices={kv_indices.shape[0]}"
     )
 
-    out = torch.empty_like(q)
+    out = _check_out(out, q, q.dtype)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
 
@@ -495,6 +510,7 @@ def _pa_decode_sparse_gfx950_gluon(
     extra_indptr=None,
     kv_splits=None,
     skip_reduce=False,
+    out=None,
     has_invalid=False,
     fp8_fnuz=False,
 ):
@@ -620,7 +636,7 @@ def _pa_decode_sparse_gfx950_gluon(
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    out = _check_out(out, q, torch.bfloat16)
 
     # AITER_PA_DECODE_SPLITS: experiment override for the split-K count.
     _sp = _os.environ.get("AITER_PA_DECODE_SPLITS")
