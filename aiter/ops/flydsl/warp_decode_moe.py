@@ -26,6 +26,7 @@ from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_down_reduce_fp8_module,
     build_gate_up_bf16_module,
     build_gate_up_fp4_module,
+    build_gate_up_fp8_act_module,
     build_gate_up_fp8_module,
     pick_kvector,
 )
@@ -81,6 +82,22 @@ def _get_down_reduce(
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
         k_batch=k_batch,
+        num_experts=num_experts,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_gate_up_fp8_act(
+    hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk, num_experts
+):
+    return build_gate_up_fp8_act_module(
+        hidden,
+        inter,
+        top_k,
+        kvector=kvector,
+        serialize_dot2=serialize_dot2,
+        scale_bn=scale_bn,
+        scale_bk=scale_bk,
         num_experts=num_experts,
     )
 
@@ -288,6 +305,85 @@ def flydsl_warp_decode_gate_up(
         launcher,
         (
             ptr_arg(x),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(w_gate_scale),
+            ptr_arg(w_up_scale),
+            ptr_arg(router_ids),
+            ptr_arg(out),
+            grid_x,
+            torch.cuda.current_stream(),
+        ),
+    )
+    return out
+
+
+def flydsl_warp_decode_gate_up_fp8act(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    router_ids: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_gate_scale: torch.Tensor,
+    w_up_scale: torch.Tensor,
+    *,
+    scale_block: tuple[int, int] = (128, 128),
+    x_scale_bk: int = 128,
+    serialize_dot2: bool = True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gate_up stage with **FP8 activation** x FP8 weights (CK ``gate_fp8_d2`` peer).
+
+    Same ``silu(gate)*up`` epilogue as :func:`flydsl_warp_decode_gate_up`, but the
+    activation ``x`` is FP8 e4m3 with a ``Block2D<1, x_scale_bk>`` per-(token,
+    K-block) scale; the weight scale is ``Block2D<BN, BK>`` (= ``scale_block``,
+    CK's ``Block2D<128,128>``). Both scales fold after dot2 (main plan ?2).
+
+    Args:
+        x:            [B, HIDDEN] float8_e4m3fn (row-major, contiguous).
+        w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j).
+        router_ids:   [B, TOPK] int32.
+        x_scale:      float32 activation scale, shape [B * HIDDEN//x_scale_bk]
+            row-major over (token, K-block) -- Block2D<1, x_scale_bk>.
+        w_gate_scale/w_up_scale: float32 Block2D<BN,BK> weight scales, shape
+            [(E*INTER)//BN * HIDDEN//BK] over (row-block, K-block).
+        scale_block:  (BN, BK) weight-scale block dims (default (128,128)).
+        x_scale_bk:   activation-scale K-block (default 128, CK ``kBXK``).
+        out:          optional [B, TOPK, INTER] bfloat16 output buffer.
+
+    Returns:
+        [B, TOPK, INTER] bfloat16 intermediate.
+    """
+    assert x.dtype == torch.float8_e4m3fn, "activation must be float8_e4m3fn"
+    assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
+    assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
+
+    B, HIDDEN = x.shape
+    E, INTER, Hk = w_gate.shape
+    assert Hk == HIDDEN, f"w_gate HIDDEN {Hk} != x HIDDEN {HIDDEN}"
+    TOPK = router_ids.shape[1]
+
+    scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
+    assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
+    assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
+    assert HIDDEN % x_scale_bk == 0, "HIDDEN must be divisible by x_scale_bk"
+    # The builder derives the x-scale K-block from scale_bk (CK fixes both = 128);
+    # reject a mismatch rather than silently ignore x_scale_bk.
+    assert x_scale_bk == scale_bk, "x_scale_bk must equal weight scale_bk (both 128)"
+
+    kvector = pick_kvector(HIDDEN)
+    if out is None:
+        out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
+
+    launcher = _get_gate_up_fp8_act(
+        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, E
+    )
+    grid_x = B * TOPK * INTER
+    _run(
+        launcher,
+        (
+            ptr_arg(x),
+            ptr_arg(x_scale),
             ptr_arg(w_gate),
             ptr_arg(w_up),
             ptr_arg(w_gate_scale),

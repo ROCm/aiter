@@ -188,6 +188,7 @@ def test_butterfly_reduce():
 from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
     flydsl_warp_decode_down_reduce,
     flydsl_warp_decode_gate_up,
+    flydsl_warp_decode_gate_up_fp8act,
 )
 
 # name, B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
@@ -1776,6 +1777,64 @@ def _ref_gate_up_fp8_pool(
     return out.to(torch.bfloat16)
 
 
+_FP8_E4M3_MAX = 448.0
+
+
+def _gen_gate_up_fp8act_pool(
+    B, HIDDEN, INTER, E, TOPK, scale_block=_FP8_SCALE_BLOCK, x_bk=128
+):
+    """FP8-activation gate_up pool (B4 / CK ``gate_fp8_d2`` peer): FP8 e4m3 ``x``
+    with a ``Block2D<1, x_bk>`` per-(token, K-block) scale, plus the same FP8
+    weights + ``Block2D<128,128>`` weight scales as :func:`_gen_gate_up_fp8_pool`
+    (identical RNG stream, so the weight legs stay comparable)."""
+    x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp8_pool(
+        B, HIDDEN, INTER, E, TOPK, scale_block=scale_block
+    )
+    # Quantize the bf16 x into FP8 with a per-(token, x_bk) block scale (amax/max).
+    nblk = HIDDEN // x_bk
+    xr = x.float().view(B, nblk, x_bk)
+    amax = xr.abs().amax(dim=2).clamp(min=1e-8)  # [B, nblk]
+    x_scale = (amax / _FP8_E4M3_MAX).float()  # [B, nblk]
+    x_fp8 = (xr / x_scale[..., None]).view(B, HIDDEN).to(torch.float8_e4m3fn)
+    x_scale_flat = x_scale.reshape(-1).contiguous()  # row-major (token, K-block)
+    return x_fp8, x_scale_flat, wg, wgs, wu, wus, rid_list
+
+
+def _ref_gate_up_fp8act_pool(
+    x_fp8,
+    x_scale,
+    wg,
+    wgs,
+    wu,
+    wus,
+    rid,
+    INTER,
+    HIDDEN,
+    scale_block=_FP8_SCALE_BLOCK,
+    x_bk=128,
+):
+    B, _ = x_fp8.shape
+    TOPK = rid.shape[1]
+    bn, bk = scale_block
+    nblk = HIDDEN // x_bk
+    xs = x_scale.view(-1, nblk)[:B]  # tolerate a full-B x_scale with a sliced x
+    xf = (x_fp8.float().view(B, nblk, x_bk) * xs[..., None]).view(B, HIDDEN)
+    out = torch.zeros(B, TOPK, INTER, device=x_fp8.device)
+    cache = {}
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(rid[b, k])
+            if e not in cache:
+                sg = _block2d_scale_matrix(wgs, e, INTER, HIDDEN, bn, bk)
+                su = _block2d_scale_matrix(wus, e, INTER, HIDDEN, bn, bk)
+                cache[e] = (wg[e].float() * sg, wu[e].float() * su)
+            gate_e, up_e = cache[e]
+            gate = xf[b] @ gate_e.T
+            up = xf[b] @ up_e.T
+            out[b, k] = (gate * torch.sigmoid(gate)) * up
+    return out.to(torch.bfloat16)
+
+
 @benchmark()
 def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup):
     """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
@@ -1849,6 +1908,41 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
             "nan"
         )  # per-expert I*H offset would overflow i32 (beyond K3 Tier-2)
 
+    # ---- FP8-activation (B4, CK gate_fp8_d2 peer): FP8 x + Block2D<1,128> x-scale --
+    if run_fp8:
+        xa, xsa, wga, wgsa, wua, wusa, rid_lista = _gen_gate_up_fp8act_pool(
+            B, HIDDEN, INTER, E, TOPK
+        )
+        outa = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
+        entrya = lambda rid, xa=xa, xsa=xsa, wga=wga, wgsa=wgsa, wua=wua, wusa=wusa, outa=outa: flydsl_warp_decode_gate_up_fp8act(  # noqa: E731
+            xa,
+            wga,
+            wua,
+            rid,
+            xsa,
+            wgsa,
+            wusa,
+            scale_block=_FP8_SCALE_BLOCK,
+            out=outa,
+        )
+        gota = entrya(rid_lista[0])
+        torch.cuda.synchronize()
+        refa = _ref_gate_up_fp8act_pool(
+            xa[:nchk], xsa, wga, wgsa, wua, wusa, rid_lista[0][:nchk], INTER, HIDDEN
+        )
+        cosa = _cosine(refa, gota[:nchk])
+        assert (
+            cosa >= 0.99
+        ), f"gate_up fp8-act cold: correctness regression (cos={cosa:.4f})"
+        _, usa = _time_rotating(entrya, rid_lista, num_iters, num_warmup, timing)
+        tbsa = compute_metrics(
+            "gate_up", B, HIDDEN, INTER, TOPK, "fp8", usa, act_dtype="fp8"
+        )["TB/s"]
+        del xa, wga, wua, outa
+        torch.cuda.empty_cache()
+    else:
+        usa = tbsa = cosa = float("nan")
+
     return {
         "gfx": get_gfx(),
         "B": B,
@@ -1858,11 +1952,14 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
         "TOPK": TOPK,
         "fp4_us": us4,
         "fp8_us": us8,
+        "fp8act_us": usa,
         "fp4/fp8": us4 / us8 if us8 > 0 else float("nan"),
         "fp4_TB/s": tbs4,
         "fp8_TB/s": tbs8,
+        "fp8act_TB/s": tbsa,
         "fp4_cos": cos4,
         "fp8_cos": cos8,
+        "fp8act_cos": cosa,
         "TFLOPS_fp4": m4["TFLOPS"],
     }
 

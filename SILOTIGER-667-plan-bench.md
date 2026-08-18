@@ -188,14 +188,22 @@ the FlyDSL cold harness.
       exact-equivalence check so their recorded numbers stay unchanged. Deferred from B3 to
       keep that change tight; tracked here as low-priority tech-debt cleanup.
 
-#### B4 — FlyDSL counterpart to CK's `gate_fp8_d2` (FP8-activation gate_up)  [ ]
-- [ ] Add an FP8-activation gate_up entry: quantize `x` BF16→FP8 (activation scale contract),
-      feed FP8 `x` + its `(1,128)` block scale through the cvt/dot2 path, fold the activation
-      scale after dot2 (exponent-only convert, main plan §2).
-- [ ] Match CK's layout: `XScaleFP8 = Block2D<1,128>` activation scale, FP8 weight
-      `Block2D<128,128>`, dot2 on.
-- [ ] Correctness (cos vs BF16-act reference) + a cold-bench field so `compare.py` can pair
-      it with CK `gate_fp8_d2`. Distinct from MXFP8 block-scaled activation (separate follow-on).
+#### B4 — FlyDSL counterpart to CK's `gate_fp8_d2` (FP8-activation gate_up)  [x] DONE (2026-08-18)
+- [x] Added `build_gate_up_fp8_act_module` + public `flydsl_warp_decode_gate_up_fp8act`
+      (exported in `aiter/ops/flydsl/__init__.py`): FP8 e4m3 `x` + `Block2D<1,128>` activation
+      scale, both operands scaled-converted to BF16 (scale=1) and fed through dot2; per K-block
+      the lane partial gets `dot * (x_scale_block * w_scale_block)` before the single wavefront
+      reduce (exponent-only fold, main plan §2). Reuses the K3 Tier-2 i64 base (B5) so DeepSeek
+      E=256 works.
+- [x] Matches CK's layout: activation scale `Block2D<1,128>` (`x_scale_bk=128` = CK `kBXK`),
+      FP8 weight `Block2D<128,128>`, dot2 on. `x` and weight share the 4-fp8/word dword layout.
+- [x] Correctness: cos vs a dequant-both torch reference (`_ref_gate_up_fp8act_pool`) =
+      **1.000000** at small / qwen3next E=512 / DeepSeek E=256. Added an `fp8act_*` field to
+      `bench_gate_up_cold` and a new `("gate_up","fp8","fp8")` cell in `compare.py` that pairs
+      with CK `gate_fp8_d2`. Regenerated the of-record G9 artifact: **15 new fp8-act cells**
+      fill (3 models × 5 B) at cos=1.0000, ratios 0.75→0.95, ~35–79 %peak; **0 n/a**. Matrix now
+      fully paired for every op×dtype×act CK exposes. Distinct from MXFP8 block-scaled
+      activation (separate follow-on).
 
 #### B5 — fix the DeepSeek-E256 FP8 hole (K3 Tier-2 addressing)  [x] DONE (2026-08-17)
 - [x] Added per-expert **i64 base** addressing to the FP8 `down` + `gate_up` builders: fold the
@@ -240,8 +248,8 @@ the FlyDSL cold harness.
 - [x] Output: markdown ratio table (HTML-comment provenance header: gfx, aiter+CK commits,
       iters/cold/timing/method, CK provenance line, config-policy note) + optional `--csv-out`.
 - **Depends on:** A1 (cold) ✅, A2 (CSV) ✅, B2 (TOPK) ✅, B3 (compute_metrics) ✅, B1 (scale)
-  ✅, A4 (gate_up FP4 peer) ✅. Remaining completeness depends on **B4** (FP8-act peer) and
-  **B5** (DeepSeek Tier-2); those cells show as n/a until landed.
+  ✅, A4 (gate_up FP4 peer) ✅, B4 (FP8-act peer) ✅, B5 (DeepSeek Tier-2) ✅ — all cells now
+  joined (0 n/a).
 
 ### Group D — methodology, rigor, reproducibility
 
@@ -291,8 +299,8 @@ the FlyDSL cold harness.
       of-record `tickets/667/g9_compare.{md,csv}`. **9/15 cells (45 paired points) covered**:
       `down fp4` ×3, `down fp8` ×{MiniMax,Qwen}, `gate_up fp4` ×3, `gate_up fp8 bf16-act`
       ×{MiniMax,Qwen}. Each marked covered / ⏳(step) / ⛔(reason).
-- [x] **G9 completion gate:** closes when every non-blocked cell has a FlyDSL+CK pair. Two
-      holes remain — DeepSeek FP8 (→ **B5**) and gate_up FP8-act (→ **B4**); see §3.
+- [x] **G9 completion gate:** every cell now has a FlyDSL+CK pair — the last two holes
+      (DeepSeek FP8 → **B5**, gate_up FP8-act → **B4**) closed 2026-08-17/18; see §3 (0 n/a).
 
 #### D3 — decide + document the FlyDSL config policy (default-vs-default)  [x]
 - [x] **Pinned the exact config per side in the artifact provenance header** (verified from
@@ -339,8 +347,10 @@ the same math** — no cell needs to be marked n/a on equivalence grounds. Detai
       quantized weights and validates `cos≥0.99`. So equivalence of the *math* is established
       here by inspection; a numerical output cross-check on identical inputs is the separate
       **D7** (still optional/stretch).
-- [x] **FP8-activation (`gate_fp8_d2`) not in scope yet.** That peer needs FlyDSL **B4**; until
-      then it isn't joined, so there's no equivalence claim to make for it.
+- [x] **FP8-activation (`gate_fp8_d2`) — now joined (B4).** FlyDSL
+      `flydsl_warp_decode_gate_up_fp8act` computes the same `silu(gate)·up` with the activation
+      block scale folded after dot2 (same graph as the BF16-act peer, just an extra scaled
+      convert on `x`); cos=1.0 vs the dequant-both reference, so it's comparable, not n/a.
 
 #### D5 — capture environment/provenance + run-to-run variance  [x]
 - [x] `compare.py` header records arch (`get_gfx()`), aiter commit, CK worktree commit
@@ -411,24 +421,18 @@ change on every regen).
 
 | Op | dtype (act × w) | DeepSeek-V3 | MiniMax | Qwen3Next-TP1 |
 |---|---|---|---|---|
-| gate_up | BF16-act × FP8-w | ⏳ B5 (FlyDSL n/a) | ✅ | ✅ |
-| gate_up | FP8-act × FP8-w | ⏳ B4 (+B5) | ⏳ B4 | ⏳ B4 |
+| gate_up | BF16-act × FP8-w | ✅ (B5) | ✅ | ✅ |
+| gate_up | FP8-act × FP8-w | ✅ (B4) | ✅ (B4) | ✅ (B4) |
 | gate_up | BF16-act × FP4-w | ✅ (A4) | ✅ (A4) | ✅ (A4) |
-| down | FP8-w | ⏳ B5 (FlyDSL n/a) | ✅ | ✅ |
+| down | FP8-w | ✅ (B5) | ✅ | ✅ |
 | down | FP4-w | ✅ | ✅ | ✅ |
 
-**Covered now:** 9 of 15 (op×dtype×shape) cells are complete FlyDSL+CK pairs across all
-5 batches (= 45 paired data points): `down fp4` ×3 shapes, `down fp8` ×{MiniMax,Qwen},
-`gate_up fp4` ×3, `gate_up fp8 (bf16-act)` ×{MiniMax,Qwen}.
+**Covered now: 15 of 15** (op×dtype×shape) cells are complete FlyDSL+CK pairs across all
+5 batches (= **75 paired data points**). The last two holes closed 2026-08-17/18:
+DeepSeek FP8 (`down`+`gate_up bf16-act`) via **B5** (E256 Tier-2 i64 base), and
+`gate_up FP8-act × FP8-w` (all shapes) via **B4** (`gate_fp8_d2` peer). All cos=1.0000.
 
-**Remaining holes (the completion gate):**
-- **DeepSeek FP8** — `down fp8` + `gate_up fp8 (bf16-act)`: FlyDSL side n/a until **B5**
-  (E256 Tier-2 i64 base addressing). CK side already measured.
-- **gate_up FP8-act × FP8-w** (all shapes): no FlyDSL FP8-activation peer until **B4**; CK's
-  `gate_fp8_d2` exists but isn't joined (not in `FLYDSL_CELLS`).
-
-**G9 closes when B4 + B5 land** (then all cells are ✅); the FP4 and MiniMax/Qwen-FP8 legs
-are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
+**G9 coverage is closed** — every op×dtype×act CK exposes now has a joined FlyDSL peer.
 
 ---
 
@@ -436,7 +440,7 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
 - **C1 (`compare.py`)** needs **A1, A2, B2, B3**.
 - **Full FP8 coverage** (DeepSeek) — ✅ done (B5; K3 Tier-2 i64 per-expert base).
 - **gate_up FP4 pair** — ✅ done (A4; needed a one-line CK gate_up kernel packed-stride fix).
-- **gate_up FP8-act pair** needs **B4** (FlyDSL side) — CK already has `gate_fp8_d2`.
+- **gate_up FP8-act pair** — ✅ done (B4; FlyDSL `flydsl_warp_decode_gate_up_fp8act` peer of CK `gate_fp8_d2`).
 - **Trustworthy ratios** need A1 (cold) ✅, B1 (scale) ✅, D3 (config) ✅, D1 (timing) ✅,
   and D4 (equiv) ✅ — **all prerequisites now met**; ratios are defensible for review.
 
@@ -470,6 +474,14 @@ are already done. FP8-act rows depend on B4; DeepSeek-FP8 rows depend on B5.
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-18 — **B4 done — FP8-activation gate_up (CK `gate_fp8_d2` peer).** Added
+  `build_gate_up_fp8_act_module` + `flydsl_warp_decode_gate_up_fp8act` (FP8 e4m3 `x` +
+  `Block2D<1,128>` activation scale, FP8 weight `Block2D<128,128>`, dot2; both scales fold
+  after dot2 per K-block; reuses B5's Tier-2 i64 base). Correctness cos=1.0 at small/qwen/
+  DeepSeek. Wired an `fp8act` field into `bench_gate_up_cold` and a `("gate_up","fp8","fp8")`
+  cell into `compare.py`, pairing with CK `gate_fp8_d2`. Regenerated the of-record artifact:
+  15 new fp8-act cells (3 models × 5 B) at cos=1.0000, ratios 0.75→0.95, ~35–79 %peak, **0
+  n/a** — the comparison is now fully paired for every op×dtype×act CK exposes.
 - 2026-08-17 — **B5 done — DeepSeek-E256 FP8 hole closed (K3 Tier-2 addressing).** Added a
   per-expert i64 base (`_ptr_rsrc_off`) to the FP8 `down`/`gate_up` builders, guarded by a
   build-time `num_experts` so it only fires at `E*I*H >= 2^31` (i32-safe path + all FP4 shapes

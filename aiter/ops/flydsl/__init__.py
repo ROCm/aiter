@@ -65,6 +65,7 @@ if is_flydsl_available():
         flydsl_warp_decode_gate_up,
         flydsl_warp_decode_gate_up_bf16,
         flydsl_warp_decode_gate_up_fp4,
+        flydsl_warp_decode_gate_up_fp8act,
     )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
@@ -89,5 +90,6 @@ if is_flydsl_available():
         "flydsl_warp_decode_gate_up",
         "flydsl_warp_decode_gate_up_bf16",
         "flydsl_warp_decode_gate_up_fp4",
+        "flydsl_warp_decode_gate_up_fp8act",
         # "flydsl_gdr_decode",
     ]

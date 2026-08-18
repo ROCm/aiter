@@ -65,7 +65,7 @@ CK_MAP = {
     "gate_up_bf16": ("gate_up", "fp8", "bf16", False),  # non-dot2 default
     "gate_bf16_d2": ("gate_up", "fp8", "bf16", True),  # <- gate_up FP8 (bf16-act) peer
     "gate_up_fp8": ("gate_up", "fp8", "fp8", False),
-    "gate_fp8_d2": ("gate_up", "fp8", "fp8", True),  # <- FP8-act peer (needs FlyDSL B4)
+    "gate_fp8_d2": ("gate_up", "fp8", "fp8", True),  # <- FP8-act peer (FlyDSL B4 ?)
     "down_h2_d2": ("down", "fp8", None, True),
     "down_fp4_h2": ("down", "fp4", None, True),
     "gate_up_fp4": (
@@ -82,6 +82,7 @@ FLYDSL_CELLS = [
     ("down", "fp8", None),
     ("gate_up", "fp4", "bf16"),
     ("gate_up", "fp8", "bf16"),
+    ("gate_up", "fp8", "fp8"),  # B4: FP8-act peer of CK gate_fp8_d2
 ]
 
 
@@ -246,6 +247,10 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing):
             records[_key(H, I, E, K, B, "gate_up", "fp8", "bf16")] = (
                 gu.get("fp8_us"),
                 gu.get("fp8_cos"),
+            )
+            records[_key(H, I, E, K, B, "gate_up", "fp8", "fp8")] = (
+                gu.get("fp8act_us"),
+                gu.get("fp8act_cos"),
             )
     return records
 
