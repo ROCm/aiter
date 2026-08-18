@@ -800,7 +800,6 @@ def launch_gemm_a8w4_tdm(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
-                return
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and next_stage_buf is not None
                 )
