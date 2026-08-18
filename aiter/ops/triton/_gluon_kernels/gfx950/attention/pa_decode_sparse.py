@@ -42,14 +42,33 @@ def _rmax(x, axis):
 
 
 @gluon.jit
-def _cache_load(ptr, off, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
-    # gfx950 buffer_load carries a 32-bit offset (2 GB cap), a cache past that gathers
-    # via 64-bit gl.load instead.
+def _cache_load(ptr, row, col, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
+    """Gather rows[i] + col[j] out of a cache.
+
+    ``row`` is the per-token byte offset ([BLOCK_K]); ``col`` is the in-row offset
+    ([W]), which is always a small compile-time arange. Keeping them apart is what
+    makes the >2 GB path affordable: buffer_load carries a 32-bit offset (2 GB cap),
+    so a bigger cache has to gather through 64-bit addresses -- and adding the
+    pointer to a fully materialized [BLOCK_K, W] offset tensor makes that a 64-bit
+    add *per element*. Resolving one pointer per token instead costs BLOCK_K of
+    them, and the leftover column offset is a constant the load can fold into its
+    immediate field. (Same shape as the in-tree triton kernel's token_data_ptr.)
+    """
     if USE_BUFFER_LOAD:
         return gl.amd.cdna4.buffer_load(
-            ptr=ptr, offsets=off.to(gl.int32), mask=mask, other=other, cache=".cg"
+            ptr=ptr,
+            offsets=row.to(gl.int32)[:, None] + col.to(gl.int32)[None, :],
+            mask=mask,
+            other=other,
+            cache=".cg",
         )
-    return gl.load(ptr + off.to(gl.int64), mask=mask, other=other, cache_modifier=".cg")
+    row_ptr = ptr + row.to(gl.int64)
+    return gl.load(
+        row_ptr[:, None] + col[None, :],
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    )
 
 
 @gluon.jit
@@ -60,6 +79,68 @@ def _fp8_to_f32(x_u8, FP8_FNUZ: gl.constexpr):
     if FP8_FNUZ:
         return x_u8.to(gl.float8e4b8, bitcast=True).to(gl.bfloat16).to(gl.float32)
     return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+
+
+@gluon.jit
+def _scale_load(
+    ptr,
+    row,
+    valid,
+    USE_BUFFER_LOAD: gl.constexpr,
+    gather_l: gl.constexpr,
+    scl_l: gl.constexpr,
+    NG: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    MASKED: gl.constexpr,
+):
+    """Gather the NG per-64-group scale bytes of each token and broadcast them out
+    to HEAD_SIZE in registers.
+
+    The obvious spelling -- index the full row with ``offs_full // 64`` -- builds a
+    [BLOCK_K, HEAD_SIZE] pointer tensor for a value that has only NG distinct
+    entries per row. On the buffer_load path the identical 32-bit offsets CSE away
+    and it costs 48 byte loads; on the 64-bit path they do not, and it costs 288.
+    (The in-tree triton kernel loads tensor<32x2x!tt.ptr<i8>> here, we were loading
+    tensor<64x512x!tt.ptr<i8>>.) Gather NG wide instead and broadcast: ``scl_l`` is
+    the dim-2 slice of a 3-D layout picked so that reshaping [BLOCK_K, NG, 64] back
+    to [BLOCK_K, HEAD_SIZE] lands exactly on ``gather_l`` -- column c = g*64 + j
+    maps to thread 4g + j//16 -- so the broadcast is a register rename.
+    """
+    cols = gl.arange(0, NG, layout=gl.SliceLayout(0, scl_l))
+    rows = gl.convert_layout(row, gl.SliceLayout(1, scl_l))
+    if MASKED:
+        m = gl.convert_layout(valid, gl.SliceLayout(1, scl_l))[:, None]
+        if USE_BUFFER_LOAD:
+            sc = gl.amd.cdna4.buffer_load(
+                ptr=ptr,
+                offsets=rows.to(gl.int32)[:, None] + cols[None, :],
+                mask=m,
+                other=127,
+                cache=".cg",
+            )
+        else:
+            sc = gl.load(
+                (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
+                mask=m,
+                other=127,
+                cache_modifier=".cg",
+            )
+    else:
+        if USE_BUFFER_LOAD:
+            sc = gl.amd.cdna4.buffer_load(
+                ptr=ptr,
+                offsets=rows.to(gl.int32)[:, None] + cols[None, :],
+                cache=".cg",
+            )
+        else:
+            sc = gl.load(
+                (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
+                cache_modifier=".cg",
+            )
+    wide = gl.expand_dims(sc, 2).broadcast_to([sc.shape[0], NG, HEAD_SIZE // NG])
+    return gl.convert_layout(
+        wide.reshape([sc.shape[0], HEAD_SIZE]), gather_l, assert_trivial=True
+    )
 
 
 @gluon.jit
@@ -242,6 +323,8 @@ def _decode_tile(
     p_layout: gl.constexpr,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    scl_l: gl.constexpr,
+    NARROW_SCALE: gl.constexpr,
     IS_FP8: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     NOPE_DIM: gl.constexpr,
@@ -283,39 +366,55 @@ def _decode_tile(
     if IS_FP8 and UNIFORM:
         # uniform pool: one fp8 gather over the whole head + separate fp32 scales.
         NGRP: gl.constexpr = HEAD_SIZE // 64
-        kv_off = (block_idx_g * cs0 + pos_g * HEAD_SIZE)[:, None] + offs_full[None, :]
-        scl_off = (block_idx_g * NGRP)[:, None] + (offs_full[None, :] // 64)
+        kv_row = block_idx_g * cs0 + pos_g * HEAD_SIZE
+        scl_row = block_idx_g * NGRP
+        scl_col = offs_full // 64
         if MASKED:
             x_u8 = _cache_load(
-                cache_ptr, kv_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=0
+                cache_ptr, kv_row, offs_full, USE_BUFFER_LOAD,
+                mask=valid_g[:, None], other=0,
             )
             sc = _cache_load(
                 cache_bf16_ptr,
-                scl_off,
+                scl_row,
+                scl_col,
                 USE_BUFFER_LOAD,
                 mask=valid_g[:, None],
                 other=0.0,
-            )
+            )  # uniform pool: fp32 scales, left wide (see _scale_load)
         else:
-            x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
-            sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
+            x_u8 = _cache_load(cache_ptr, kv_row, offs_full, USE_BUFFER_LOAD)
+            sc = _cache_load(cache_bf16_ptr, scl_row, scl_col, USE_BUFFER_LOAD)
         _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, True, FP8_FNUZ)
     elif IS_FP8:
         # DSv4 packed fp8_ds_mla: NoPE fp8 + embedded UE8M0 + separate RoPE-bf16.
-        nope_off = (block_idx_g * cs0 + pos_g * 576)[:, None] + offs_full[None, :]
-        scl_off = (block_idx_g * cs0 + BLOCK_SIZE * 576 + pos_g * 8)[:, None] + (
-            offs_full[None, :] // 64
-        )
+        nope_row = block_idx_g * cs0 + pos_g * 576
+        scl_row = block_idx_g * cs0 + BLOCK_SIZE * 576 + pos_g * 8
+        scl_col = offs_full // 64
         if MASKED:  # scales first: see _gd_fp8
-            exps = _cache_load(
-                cache_ptr, scl_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=127
-            )
+            if NARROW_SCALE and not USE_BUFFER_LOAD:
+                exps = _scale_load(
+                    cache_ptr, scl_row, valid1d, USE_BUFFER_LOAD, gather_l, scl_l,
+                    HEAD_SIZE // 64, HEAD_SIZE, True,
+                )
+            else:
+                exps = _cache_load(
+                    cache_ptr, scl_row, scl_col, USE_BUFFER_LOAD,
+                    mask=valid_g[:, None], other=127,
+                )
             x_u8 = _cache_load(
-                cache_ptr, nope_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=0
+                cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD,
+                mask=valid_g[:, None], other=0,
             )
         else:
-            exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
-            x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
+            if NARROW_SCALE and not USE_BUFFER_LOAD:
+                exps = _scale_load(
+                    cache_ptr, scl_row, scl_row, USE_BUFFER_LOAD, gather_l, scl_l,
+                    HEAD_SIZE // 64, HEAD_SIZE, False,
+                )
+            else:
+                exps = _cache_load(cache_ptr, scl_row, scl_col, USE_BUFFER_LOAD)
+            x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
         _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, CHUNK_AXIS, False, FP8_FNUZ)
         block_idx_gr, pos_gr, valid_gr = _slots(
             indices_ptr,
@@ -327,28 +426,28 @@ def _decode_tile(
             MASKED,
             HAS_INVALID,
         )
-        rope_off = (block_idx_gr * (cs0 // 2) + pos_gr * 288 + 224)[
-            :, None
-        ] + offs_rope[None, :]
+        rope_row = block_idx_gr * (cs0 // 2) + pos_gr * 288 + 224
         if MASKED:
             k_rope = _cache_load(
                 cache_bf16_ptr,
-                rope_off,
+                rope_row,
+                offs_rope,
                 USE_BUFFER_LOAD,
                 mask=valid_gr[:, None],
                 other=0.0,
             )
         else:
-            k_rope = _cache_load(cache_bf16_ptr, rope_off, USE_BUFFER_LOAD)
+            k_rope = _cache_load(cache_bf16_ptr, rope_row, offs_rope, USE_BUFFER_LOAD)
         kv_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(k_rope)
     else:
-        off = (block_idx_g * cs0 + pos_g * HEAD_SIZE)[:, None] + offs_full[None, :]
+        kv_row2 = block_idx_g * cs0 + pos_g * HEAD_SIZE
         if MASKED:
             kv = _cache_load(
-                cache_bf16_ptr, off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=0.0
+                cache_bf16_ptr, kv_row2, offs_full, USE_BUFFER_LOAD,
+                mask=valid_g[:, None], other=0.0,
             )
         else:
-            kv = _cache_load(cache_bf16_ptr, off, USE_BUFFER_LOAD)
+            kv = _cache_load(cache_bf16_ptr, kv_row2, offs_full, USE_BUFFER_LOAD)
         kv_smem.store(kv)
 
     k = kv_smem.permute([1, 0]).load(k_layout)  # [HEAD_SIZE, BLOCK_K]
@@ -409,6 +508,8 @@ def _gd_fp8(
     k_rng_rope,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    scl_l: gl.constexpr,
+    NARROW_SCALE: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     UNIFORM: gl.constexpr,
@@ -438,23 +539,27 @@ def _gd_fp8(
     )
     if UNIFORM:
         NGRP: gl.constexpr = HEAD_SIZE // 64
-        kv_off = (bg * cs0 + pg * HEAD_SIZE)[:, None] + offs_full[None, :]
-        scl_off = (bg * NGRP)[:, None] + (offs_full[None, :] // 64)
-        x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
-        sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
+        x_u8 = _cache_load(
+            cache_ptr, bg * cs0 + pg * HEAD_SIZE, offs_full, USE_BUFFER_LOAD
+        )
+        sc = _cache_load(cache_bf16_ptr, bg * NGRP, offs_full // 64, USE_BUFFER_LOAD)
         k_rope = x_u8  # unused for UNIFORM (rope slice-store skipped) -> DCE'd
     else:
-        nope_off = (bg * cs0 + pg * 576)[:, None] + offs_full[None, :]
-        scl_off = (bg * cs0 + BLOCK_SIZE * 576 + pg * 8)[:, None] + (
-            offs_full[None, :] // 64
-        )
+        nope_row = bg * cs0 + pg * 576
+        scl_row = bg * cs0 + BLOCK_SIZE * 576 + pg * 8
         # UE8M0 scales first, bulk fp8 after. vmcnt is one in-order FIFO, so a
         # wait can only name "at most N outstanding", never a specific load:
         # issuing the scales last would make the first dequant piece wait behind
         # every data load as well. Issued first, the scales are covered by the
         # wait that the first piece's own data needs anyway.
-        sc = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
-        x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
+        if NARROW_SCALE and not USE_BUFFER_LOAD:
+            sc = _scale_load(
+                cache_ptr, scl_row, scl_row, USE_BUFFER_LOAD, gather_l, scl_l,
+                HEAD_SIZE // 64, HEAD_SIZE, False,
+            )
+        else:
+            sc = _cache_load(cache_ptr, scl_row, offs_full // 64, USE_BUFFER_LOAD)
+        x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
         bgr, pgr, _ = _slots(
             indices_ptr,
             seg_start,
@@ -465,8 +570,9 @@ def _gd_fp8(
             False,
             HAS_INVALID,
         )
-        rope_off = (bgr * (cs0 // 2) + pgr * 288 + 224)[:, None] + offs_rope[None, :]
-        k_rope = _cache_load(cache_bf16_ptr, rope_off, USE_BUFFER_LOAD)
+        k_rope = _cache_load(
+            cache_bf16_ptr, bgr * (cs0 // 2) + pgr * 288 + 224, offs_rope, USE_BUFFER_LOAD
+        )
     return x_u8, sc, k_rope, valid
 
 
@@ -564,6 +670,8 @@ def _process_segment(
     p_layout: gl.constexpr,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    scl_l: gl.constexpr,
+    NARROW_SCALE: gl.constexpr,
     slot_l: gl.constexpr,
     IS_FP8: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
@@ -605,6 +713,8 @@ def _process_segment(
                 k_rng_rope,
                 gather_l,
                 gather_rope_l,
+                scl_l,
+                NARROW_SCALE,
                 BLOCK_SIZE,
                 HEAD_SIZE,
                 UNIFORM,
@@ -626,6 +736,8 @@ def _process_segment(
                     k_rng_rope,
                     gather_l,
                     gather_rope_l,
+                    scl_l,
+                    NARROW_SCALE,
                     BLOCK_SIZE,
                     HEAD_SIZE,
                     UNIFORM,
@@ -721,6 +833,8 @@ def _process_segment(
                 p_layout,
                 gather_l,
                 gather_rope_l,
+                scl_l,
+                NARROW_SCALE,
                 IS_FP8,
                 BLOCK_SIZE,
                 NOPE_DIM,
@@ -766,6 +880,8 @@ def _process_segment(
             p_layout,
             gather_l,
             gather_rope_l,
+            scl_l,
+            NARROW_SCALE,
             IS_FP8,
             BLOCK_SIZE,
             NOPE_DIM,
@@ -933,6 +1049,30 @@ def _pa_decode_sparse(
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
+    # 3-D companion of gather_l used by _scale_load: dim 1 carries the NG scale
+    # groups (one thread each) and dim 2 the 64 columns inside a group, so that
+    # reshaping [BLOCK_K, NG, 64] back to 2-D reproduces gather_l exactly. Legal
+    # only when the group's columns fill whole threads, i.e. GSPT * (TW1 // NG) is
+    # the group width; otherwise fall back to the wide (redundant) gather.
+    NGRP_S: gl.constexpr = HEAD_SIZE // 64
+    NARROW_SCALE: gl.constexpr = (
+        GATHER_TW1 % NGRP_S == 0 and GSPT * (GATHER_TW1 // NGRP_S) == 64
+    )
+    # ...and only worth it on the 64-bit path. With buffer_load the wide gather's
+    # identical 32-bit offsets CSE to the same 48 byte loads, so the narrow form
+    # only adds a layout convert per tile (+3.4% at extra=1024). Without it they do
+    # not CSE and the wide form costs 288 loads.
+    scl_l3: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, GSPT],
+        threads_per_warp=[
+            64 // GATHER_TW1,
+            NGRP_S if NARROW_SCALE else 1,
+            (GATHER_TW1 // NGRP_S) if NARROW_SCALE else GATHER_TW1,
+        ],
+        warps_per_cta=[NUM_WARPS, 1, 1],
+        order=[2, 1, 0],
+    )
+    scl_l: gl.constexpr = gl.SliceLayout(2, scl_l3)
     slot_l: gl.constexpr = gl.SliceLayout(1, gather_l)
     blocked_q: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
@@ -1062,6 +1202,8 @@ def _pa_decode_sparse(
         p_layout,
         gather_l,
         gather_rope_l,
+        scl_l,
+        NARROW_SCALE,
         slot_l,
         MAIN_IS_FP8,
         MAIN_BLOCK_SIZE,
@@ -1106,6 +1248,8 @@ def _pa_decode_sparse(
             p_layout,
             gather_l,
             gather_rope_l,
+            scl_l,
+            NARROW_SCALE,
             slot_l,
             EXTRA_IS_FP8,
             EXTRA_BLOCK_SIZE,
