@@ -124,14 +124,14 @@ def test_sparse_mla_bwd_dsv4(T, H, topk, npool, has_sink, r_chunk):
 
 
 def _dummy_inputs(T=64, H=64, topk=64, dev="cuda"):
-    return dict(
-        q=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
-        kv=torch.randn(T, D, device=dev, dtype=torch.bfloat16),
-        do=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
-        o=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
-        lse=torch.randn(T, H, device=dev, dtype=torch.float32),
-        idx=torch.randint(0, T, (T, topk), dtype=torch.int32, device=dev),
-    )
+    return {
+        "q": torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        "kv": torch.randn(T, D, device=dev, dtype=torch.bfloat16),
+        "do": torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        "o": torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        "lse": torch.randn(T, H, device=dev, dtype=torch.float32),
+        "idx": torch.randint(0, T, (T, topk), dtype=torch.int32, device=dev),
+    }
 
 
 def test_sparse_mla_bwd_dsv4_rejects_bad_chunk():

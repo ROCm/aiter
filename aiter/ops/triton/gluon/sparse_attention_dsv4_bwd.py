@@ -43,7 +43,6 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _dq_v4_kernel_repr = make_kernel_repr(
     "_dq_v4_kernel",
     [

@@ -32,7 +32,7 @@ Pipeline (five kernels + one torch reduction), per rank chunk:
 Its ``lse`` is sink-inclusive (the sink is folded into ``e_max``/``e_sum`` before
 ``lse = e_max + log(e_sum)``), which is the convention this backward expects.
 
-Measured on MI355X at ``T=4096 H=128 topk=512`` with a realistic SWA(128)+pool top-k:
+Measured on gfx950 (MI355X) at ``T=4096 H=128 topk=512`` with a realistic SWA(128)+pool top-k:
 delta 0.178 / dQ 1.391 / interm 1.152 / CSR build 0.130 / gather 0.503 / d_sink 0.026 ms,
 3.380 ms total = 407 TFLOPS.
 """
@@ -43,7 +43,11 @@ from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd import (
     build_inverted_topk,
     delta_v4,
     dkv_gather_acc,
+)
+from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd import (
     sparse_mla_bwd_dkv_interm_v4 as _dkv_interm_gluon,
+)
+from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd import (
     sparse_mla_bwd_dq as _dq_gluon,
 )
 from aiter.ops.triton.utils._triton import arch_info
