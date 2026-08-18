@@ -41,8 +41,22 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@gluon.jit
+
+_dq_v4_kernel_repr = make_kernel_repr(
+    "_dq_v4_kernel",
+    [
+        "R_CHUNK",
+        "BLOCK_H",
+        "TILE_K",
+        "D",
+        "IS_FIRST_CHUNK",
+    ],
+)
+
+
+@gluon.jit(repr=_dq_v4_kernel_repr)
 def _dq_v4_kernel(
     Q_ptr,  # [T, H, D] bf16
     KV_ptr,  # [T, D]    bf16   (K == V)
@@ -404,7 +418,22 @@ def sparse_mla_bwd_dq(
     )
 
 
-@gluon.jit
+_dkv_interm_v4_kernel_repr = make_kernel_repr(
+    "_dkv_interm_v4_kernel",
+    [
+        "R_CHUNK",
+        "TILE_K",
+        "NH",
+        "BD",
+        "D",
+        "MFMA_K",
+        "DUAL_STAGE",
+        "PREFETCH",
+    ],
+)
+
+
+@gluon.jit(repr=_dkv_interm_v4_kernel_repr)
 def _dkv_interm_v4_kernel(
     Q_ptr,  # [T, H, D] bf16
     dO_ptr,  # [T, H, D] bf16
@@ -679,7 +708,16 @@ def sparse_mla_bwd_dkv_interm_v4(
     return interm
 
 
-@triton.jit
+_delta_v4_kernel_repr = make_kernel_repr(
+    "_delta_v4_kernel",
+    [
+        "D",
+        "BLOCK_R",
+    ],
+)
+
+
+@triton.jit(repr=_delta_v4_kernel_repr)
 def _delta_v4_kernel(
     O_ptr,  # [n_rows, D] bf16   (rows = T*H, contiguous)
     dO_ptr,  # [n_rows, D] bf16
@@ -723,7 +761,17 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
     return out
 
 
-@triton.jit
+_bwd_dkv_gather_acc_v4_repr = make_kernel_repr(
+    "_bwd_dkv_gather_acc_v4",
+    [
+        "D",
+        "BLOCK_E",
+        "ACCUMULATE",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_dkv_gather_acc_v4_repr)
 def _bwd_dkv_gather_acc_v4(
     Interm_ptr,  # [T, R_CHUNK, D] bf16, flat [T*R_CHUNK, D]
     InvPtr_ptr,  # [num_kv+1] int32 — CSR row pointers

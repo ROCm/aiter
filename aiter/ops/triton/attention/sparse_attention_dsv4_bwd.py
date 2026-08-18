@@ -92,14 +92,38 @@ def sparse_mla_bwd_dsv4(
         arch_info.get_arch() == "gfx950"
     ), f"sparse_mla_bwd_dsv4 requires gfx950 (CDNA4), got {arch_info.get_arch()}"
 
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError(f"sparse_mla_bwd_dsv4 expects bf16 q, got {q.dtype}")
+    for name, t in (("kv", kv), ("do", do), ("o", o)):
+        if t.dtype != q.dtype:
+            raise RuntimeError(f"{name} dtype mismatch: {name}={t.dtype}, q={q.dtype}")
+
     T, H, D = q.shape
     TOPK = topk_indices.shape[1]
     num_kv = kv.shape[0]
     assert D == 512, f"DSv4 sparse-MLA backward is fixed to head_dim 512, got {D}"
-    assert kv.shape[-1] == D and do.shape == q.shape and o.shape == q.shape
+    assert kv.shape[-1] == D, f"kv must be [num_kv, {D}], got {tuple(kv.shape)}"
+    assert (
+        do.shape == q.shape
+    ), f"do must match q {tuple(q.shape)}, got {tuple(do.shape)}"
+    assert o.shape == q.shape, f"o must match q {tuple(q.shape)}, got {tuple(o.shape)}"
+    assert lse.shape == (T, H), f"lse must be [{T}, {H}], got {tuple(lse.shape)}"
     assert num_kv >= T, f"num_kv ({num_kv}) must be >= T ({T})"
-    assert q.is_contiguous() and kv.is_contiguous() and do.is_contiguous()
-    assert o.is_contiguous() and topk_indices.is_contiguous()
+    if attn_sink is not None:
+        assert attn_sink.shape == (
+            H,
+        ), f"attn_sink must be [{H}], got {tuple(attn_sink.shape)}"
+    assert (
+        topk_indices.dtype == torch.int32
+    ), f"topk_indices must be int32, got {topk_indices.dtype}"
+    for name, t in (
+        ("q", q),
+        ("kv", kv),
+        ("do", do),
+        ("o", o),
+        ("topk_indices", topk_indices),
+    ):
+        assert t.is_contiguous(), f"{name} must be contiguous"
 
     if scale is None:
         scale = 1.0 / (D**0.5)
