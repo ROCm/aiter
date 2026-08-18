@@ -452,6 +452,30 @@ def _decode_num_splits(
         cost = waves * (m_it + e_it) + GAMMA * splits + DELTA * fill
         if best_cost is None or cost < best_cost - 1e-9:
             best_splits, best_cost = splits, cost
+
+    # Collapse to the FEWEST splits that keeps both the wave count and the
+    # per-split BLOCK_K iteration count. The cost model above treats extra
+    # splits as nearly free while ``waves`` stays 1 (GAMMA is small and it has no
+    # reduce term), so at small per-query work it over-splits: at C=64/H=16 with
+    # main=128, extra=8 it picked 3, where 2 does the same 2 iterations in the
+    # same single wave but launches 1/3 fewer CTAs and reduces over 2 partials
+    # instead of 3 (measured 16.2 -> 14.4 us on gfx950/MI355X).
+    #
+    # Ported from vLLM's _decode_gfx950_num_splits (PR #52212), which fixed the
+    # same over-splitting in the in-tree triton decode.
+    def _iters(s):
+        m = math.ceil(math.ceil(avg_main / s) / block_k) if avg_main > 0 else 0
+        e = math.ceil(math.ceil(avg_extra / s) / block_k) if avg_extra > 0 else 0
+        return m + e
+
+    def _waves(s):
+        return (base * s + cu - 1) // cu
+
+    if best_splits > 1:
+        target_waves, target_iters = _waves(best_splits), _iters(best_splits)
+        for splits in range(1, best_splits):
+            if _waves(splits) == target_waves and _iters(splits) == target_iters:
+                return splits
     return best_splits
 
 
@@ -485,7 +509,18 @@ def _pa_decode_sparse_gfx950_gluon(
     # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
     # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
     BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
-    num_warps = BLOCK_K // 16
+    # AITER_PA_DECODE_BLOCK_K: experiment override for the KV tile width.
+    # num_warps stays BLOCK_K//16 (warps tile the dot-N, MFMA N=16).
+    import os as _os
+    _bk = _os.environ.get("AITER_PA_DECODE_BLOCK_K")
+    if _bk:
+        BLOCK_K = int(_bk)
+    # AITER_PA_DECODE_MFMA_K: 32 selects CDNA4's double-rate v_mfma_f32_16x16x32_bf16
+    # (16 does 16x16x16, i.e. half the K per instruction).
+    _mk = _os.environ.get("AITER_PA_DECODE_MFMA_K")
+    if _mk:
+        MFMA_K = int(_mk)
+    num_warps = max(1, BLOCK_K // 16)
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -551,7 +586,30 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
-    use_buffer_load = cache_bytes < MAX_BYTES
+    # Largest power-of-2 (<=16) dividing BOTH page strides. Lets the kernel assert
+    # 16B-aligned row bases so a contiguous row gather can vectorize to dwordx4.
+    _s0 = int(cache.stride(0)); _s1 = int(extra_cache.stride(0))
+    cs0_align = 1
+    for _a in (16, 8, 4, 2):
+        if _s0 % _a == 0 and _s1 % _a == 0:
+            cs0_align = _a
+            break
+    # Gate each cache on its OWN span: one oversized cache must not disable the
+    # fast path for the other. (cache_bytes, the max of the two, is kept for the
+    # arch/format asserts below.)
+    main_use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
+    extra_use_buffer_load = max_addressable_bytes(extra_cache) < MAX_BYTES
+    use_buffer_load = main_use_buffer_load and extra_use_buffer_load
+    # AITER_PA_DECODE_FORCE_GLOBAL_LOAD emulates a >2GB production cache without
+    # allocating one: 1 = both caches, main = main only, extra = extra only.
+    _fg = _os.environ.get("AITER_PA_DECODE_FORCE_GLOBAL_LOAD", "")
+    if _fg == "1":
+        main_use_buffer_load = extra_use_buffer_load = False
+    elif _fg == "main":
+        main_use_buffer_load = False
+    elif _fg == "extra":
+        extra_use_buffer_load = False
+    use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = torch.empty_like(q, dtype=torch.bfloat16)
@@ -620,6 +678,7 @@ def _pa_decode_sparse_gfx950_gluon(
         EXTRA_IS_FP8=extra_is_fp8,
         MAIN_BLOCK_SIZE=main_block,
         EXTRA_BLOCK_SIZE=extra_block,
+        CS0_ALIGN=cs0_align,
         NOPE_DIM=nope_dim,
         ROPE_DIM=ROPE_DIM,
         HEAD_SIZE=head_dim,
@@ -629,7 +688,8 @@ def _pa_decode_sparse_gfx950_gluon(
         HEAD_ALIGNED=HEAD_ALIGNED,
         MFMA_K=MFMA_K,
         UNIFORM=UNIFORM,
-        USE_BUFFER_LOAD=use_buffer_load,
+        MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
+        EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
         num_warps=num_warps,

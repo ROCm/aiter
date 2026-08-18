@@ -658,6 +658,7 @@ def _pa_decode_sparse(
     EXTRA_IS_FP8: gl.constexpr,
     MAIN_BLOCK_SIZE: gl.constexpr,
     EXTRA_BLOCK_SIZE: gl.constexpr,
+    CS0_ALIGN: gl.constexpr,
     NOPE_DIM: gl.constexpr,
     ROPE_DIM: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
@@ -667,7 +668,13 @@ def _pa_decode_sparse(
     HEAD_ALIGNED: gl.constexpr,
     MFMA_K: gl.constexpr,
     UNIFORM: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
+    # Per-cache buffer/global gate. buffer_load carries a 32-bit offset, so a cache
+    # whose span exceeds that must gather via 64-bit gl.load -- but the two caches
+    # are sized independently (SWA window vs full compressed history), so gating
+    # them together would drop the fast path on a small cache just because its
+    # partner is large. At tiny top-k the main/SWA gather is ~94% of the tokens.
+    MAIN_USE_BUFFER_LOAD: gl.constexpr,
+    EXTRA_USE_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -676,6 +683,16 @@ def _pa_decode_sparse(
     un-normalized partials for the reduce kernel. HAS_INVALID gates -1-sentinel
     handling (clamp + score mask) on the full-tile fast paths."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
+    # Page stride alignment hint. The row base of every cache gather is
+    # ``block_idx*cs0 + pos*576`` (packed) / ``... + pos*HEAD_SIZE`` (uniform) with
+    # block_idx/pos gathered at runtime, so the divisibility analysis has to assume
+    # 1-byte alignment and a contiguous 512-byte row gather lowers to hundreds of
+    # global_load_ubyte instead of global_load_dwordx4. 576 and HEAD_SIZE are
+    # literals the compiler can already reason about; cs0 is the one opaque term.
+    # The driver sets CS0_ALIGN>1 only after checking the strides on the host.
+    if CS0_ALIGN > 1:
+        main_cs0 = gl.multiple_of(main_cs0, CS0_ALIGN)
+        extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
     query_idx = gl.program_id(0)
     split_id = gl.program_id(1)
     pid_h = gl.program_id(2)
@@ -800,7 +817,7 @@ def _pa_decode_sparse(
         BLOCK_K,
         HEAD_ALIGNED,
         UNIFORM,
-        USE_BUFFER_LOAD,
+        MAIN_USE_BUFFER_LOAD,
         HAS_INVALID,
         FP8_FNUZ,
     )
@@ -845,7 +862,7 @@ def _pa_decode_sparse(
             BLOCK_K,
             HEAD_ALIGNED,
             UNIFORM,
-            USE_BUFFER_LOAD,
+            EXTRA_USE_BUFFER_LOAD,
             HAS_INVALID,
             FP8_FNUZ,
         )
