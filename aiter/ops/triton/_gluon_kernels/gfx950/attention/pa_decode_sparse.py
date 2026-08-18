@@ -1130,6 +1130,7 @@ def _pa_decode_sparse(
     # extra still wants the CTAs. MAIN_SPLITS <= NUM_SPLITS lets main stop at whole
     # tiles and extra keep going; programs with split_id >= MAIN_SPLITS get an
     # empty main range and contribute an extra-only partial.
+    GRID_ORDER: gl.constexpr,
     MAIN_SPLITS: gl.constexpr,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
@@ -1160,9 +1161,11 @@ def _pa_decode_sparse(
     if CS0_ALIGN > 1:
         main_cs0 = gl.multiple_of(main_cs0, CS0_ALIGN)
         extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
-    query_idx = gl.program_id(0)
-    split_id = gl.program_id(1)
-    pid_h = gl.program_id(2)
+    # GRID_ORDER names the launch axes in grid-dim order (see the driver): dim 0
+    # varies fastest, which is what decides XCD/L2 sharing.
+    query_idx = gl.program_id(GRID_ORDER.index("q"))
+    split_id = gl.program_id(GRID_ORDER.index("s"))
+    pid_h = gl.program_id(GRID_ORDER.index("h"))
 
     qk_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,

@@ -818,7 +818,10 @@ def _pa_decode_sparse_gfx950_gluon(
     # and buys no overlap. Measured on the main kernel at C in {4,16,32,64,128} x
     # top-k in {64,272,1024}: 1 wave/EU + ASM_DEQ is 0.927-0.953x at every shape with
     # launch <= CU, and 1.19-1.43x *worse* at every shape above it.
-    one_wg_per_cu = num_queries * heads_blocks * num_splits <= get_num_sms()
+    one_wg_per_cu = (
+        use_buffer_load
+        and num_queries * heads_blocks * num_splits <= get_num_sms()
+    )
     if one_wg_per_cu:
         waves_per_eu = 1
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
@@ -856,7 +859,13 @@ def _pa_decode_sparse_gfx950_gluon(
         and main_is_fp8
     )
 
-    grid = (num_queries, num_splits, heads_blocks)
+    # AITER_PA_DECODE_GRID_ORDER: which launch axis varies fastest. Dim 0 is the
+    # fastest-varying and XCD assignment is round-robin over the linear workgroup id,
+    # so this decides what shares an XCD's L2. "qsh" is the historical order.
+    _go = _os.environ.get("AITER_PA_DECODE_GRID_ORDER", "qsh")
+    _ax = {"q": num_queries, "s": num_splits, "h": heads_blocks}
+    assert sorted(_go) == ["h", "q", "s"], f"bad AITER_PA_DECODE_GRID_ORDER {_go!r}"
+    grid = tuple(_ax[c] for c in _go)
     _pa_decode_sparse_gfx950[grid](
         q,
         cache,
@@ -908,6 +917,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE=_os.environ.get('AITER_PA_DECODE_PART_ST', ''),
+        GRID_ORDER=_go,
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
         ASM_DEQ=asm_deq,
