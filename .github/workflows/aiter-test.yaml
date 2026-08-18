@@ -527,7 +527,41 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Network preflight before Aiter test artifact downloads
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== DNS check ==="
+          getent hosts github.com || true
+          getent hosts api.github.com || true
+          getent hosts productionresultssa4.blob.core.windows.net || true
+          getent hosts productionresultssa8.blob.core.windows.net || true
+
+          echo "=== GitHub and Azure Blob connectivity check ==="
+          for url in \
+            https://api.github.com/rate_limit \
+            https://github.com/ROCm/aiter \
+            https://productionresultssa4.blob.core.windows.net/ \
+            https://productionresultssa8.blob.core.windows.net/
+          do
+            curl -L -o /dev/null -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "url=${url} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" \
+              "$url" || true
+          done
+
       - name: Download test shard lists
+        id: download_aiter_shards
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -565,6 +599,7 @@ jobs:
 
       - name: Retry Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
+        id: retry_aiter_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
@@ -572,12 +607,31 @@ jobs:
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
+        id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
+
+      - name: Speedtest after Aiter test artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== speedtest-cli ==="
+          python3 -m pip install --user --disable-pip-version-check speedtest-cli || true
+          speedtest_bin="$(python3 -m site --user-base)/bin/speedtest-cli"
+          timeout 120 "$speedtest_bin" --simple --secure || true
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
