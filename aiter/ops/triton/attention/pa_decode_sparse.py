@@ -527,9 +527,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
     # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
-    # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
-    # threshold on gfx950's 512-VGPR file. Reachable only with the chunked dequant.
-    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 2
+    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
     # AITER_PA_DECODE_BLOCK_K: experiment override for the KV tile width.
     # num_warps stays BLOCK_K//16 (warps tile the dot-N, MFMA N=16).
     import os as _os
@@ -670,11 +668,21 @@ def _pa_decode_sparse_gfx950_gluon(
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
     # 128 is the narrowest piece the gather layout can split to for free (below
-    # that a split falls inside a thread's 16-byte run, which Triton rejects).
+    # that a split falls inside a thread's 16-byte run, which Triton rejects), and
+    # the split is only trivial when the gather's warps tile dim 0.
     _nc = _os.environ.get("AITER_PA_DECODE_NOPE_CHUNK")
     nope_chunk = int(_nc) if _nc else min(128, head_dim)
-    # AITER_PA_DECODE_WPEU: amdgpu-waves-per-eu floor. 2 caps the allocator at 256
-    # unified VGPRs (the 2 waves/SIMD threshold) instead of letting it run to 512.
+    if not GATHER_W0:
+        nope_chunk = head_dim
+
+    # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
+    # threshold on gfx950's 512-VGPR file. The chunked dequant gets the buffer_load
+    # path to 256 with a single spilled VGPR, but a cache past buffer_load's 2 GB
+    # offset gathers through 64-bit addresses and lands at ~321 -- there the cap
+    # buys nothing and costs ~150 scratch stores (+40% at C4A), so only ask for it
+    # when both caches are on the fast path.
+    if use_buffer_load and nope_chunk < head_dim:
+        waves_per_eu = 2
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
     if _wp:
         waves_per_eu = int(_wp)
