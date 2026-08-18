@@ -446,6 +446,14 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
+        model_name="varlen-64k-qwen-ptpc-ali-tp1",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[8192],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        # max_num_batched_tokens=[65536],
+    ),
+    PrefillGroup(
         # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
         # all %64!=0, so the last chunk has padding rows -- validates the masking
         # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
