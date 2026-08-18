@@ -119,9 +119,8 @@ def _build(
 
 
 def _shuffle_k_to_vectorized(kpool, vec=_KV_VEC):
-    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, D//vec, PAGE, vec]. Ported
-    from scripts/test_stage1_decode.py (pre-removal); this is the exact
-    permutation the decode kernel's vectorized K loader assumes."""
+    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, D//vec, PAGE, vec]. This is
+    the exact permutation the decode kernel's vectorized K loader assumes."""
     nb, page, hkv, d = kpool.shape
     x = kpool.permute(0, 2, 3, 1).contiguous()  # [nb,hkv,d,page]
     x = x.view(nb, hkv, d // vec, vec, page)
@@ -129,9 +128,8 @@ def _shuffle_k_to_vectorized(kpool, vec=_KV_VEC):
 
 
 def _shuffle_v_to_vectorized(vpool, vec=_KV_VEC):
-    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, PAGE//vec, D, vec]. Ported
-    from scripts/test_stage1_decode.py (pre-removal); this is the exact
-    permutation the decode kernel's vectorized V loader assumes."""
+    """[nb, PAGE, kv_heads, D] fp8 -> [nb, kv_heads, PAGE//vec, D, vec]. This is
+    the exact permutation the decode kernel's vectorized V loader assumes."""
     nb, page, hkv, d = vpool.shape
     x = vpool.permute(0, 2, 3, 1).contiguous()  # [nb,hkv,d,page]
     x = x.view(nb, hkv, d, page // vec, vec)
@@ -452,8 +450,7 @@ def test_correctness_all_modes(kwargs):
     dtype, the production shuffled 5D KV-cache layout, a padded production-scale
     page pool, and a split-K-triggering ragged decode batch. Subsumes the former
     per-axis sweeps (prefill context depth, decode batch size, mixed batch) plus
-    the three regression guards carried over from scripts/test_stage1_decode.py
-    (production pool, split-K, shuffled layout)."""
+    three regression guards (production pool, split-K, shuffled layout)."""
     r = _run(**kwargs)
     assert r is not None, "adapter declined a supported config"
     _check(*r)

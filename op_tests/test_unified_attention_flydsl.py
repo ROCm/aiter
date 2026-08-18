@@ -403,7 +403,7 @@ def test_fp16_output_with_packed_splitk():
     alone or split-K alone (item 13)."""
     import aiter.ops.flydsl.unified_attention_kernels as uak
 
-    # Stage 4: all-decode now routes to the decode-specialized kernel, whose own
+    # all-decode routes to the decode-specialized kernel, whose own
     # host split-K plan (plan_num_kv_splits) picks S. Probe _get_decode_kernel
     # (not the prefill-body _get_kernel) to confirm the fp16-output + split-K
     # combine path fires, and keep the correctness assertion.
@@ -641,10 +641,9 @@ def test_predicate_declines_unsupported_geometry():
     # Triton-only layouts and flags.
     assert not _supported(**{**base, "block_table": None})
     assert not _supported(**{**base, "skip_reduce": True})
-    # shuffled_kv_cache is supported as of Stage 4, but ONLY with a matching 5D
+    # shuffled_kv_cache is supported, but ONLY with a matching 5D
     # cache. The flag on this base's 4D linear tensors is an inconsistent combo
-    # and must decline (the vectorized loader would mis-address 4D memory); a
-    # consistent 5D shuffled call is covered end-to-end in test_stage4_matrix.py.
+    # and must decline (the vectorized loader would mis-address 4D memory).
     assert not _supported(**{**base, "shuffled_kv_cache": True})
     # causal is intentionally unconstrained here -- non-causal is served (see
     # test_non_causal_routes_and_agrees below); the assert above only checks
@@ -692,11 +691,11 @@ def test_predicate_declines_wrong_dtypes():
     assert not _supported(**{**base, "block_table": bt.to(torch.int64)})
 
 
-# --- 5. decode cede threshold (_DECODE_CEDE_WORK, SILOTIGER-877) -------------
+# --- 5. decode cede threshold (_DECODE_CEDE_WORK) ---------------------------
 
 
 def test_decode_cede_threshold():
-    """Stage-4 conservative decode-kernel cede boundary
+    """Conservative decode-kernel cede boundary
     (`_decode_dispatch_action`). All-decode GQA-16:1 routes to the
     decode-specialized kernel EXCEPT the mid-batch x deep-context band --
     `_DECODE_CEDE_MIN_SEQS <= num_seqs <= _DECODE_CEDE_MAX_SEQS` (9..48) AND

@@ -16,8 +16,7 @@ const_expr branches of the prefill kernel. It is deliberately decode-local and
 does NOT call the welded dualwave loaders (which are hardwired to
 num_waves=8 / rows_per_wave=32); it carries its own small decode traits.
 
-Proven cores lifted verbatim from the probes
-(``scripts/stage0_probe_qkpv.py``, ``scripts/stage0_probe_blayout.py``):
+Proven cores, measured empirically:
 
 - QK = mma(A=K, B=Q) -> S^T[n_kv, m_q]. C-output packing: value v in {0..3} of
   lane = C[m=(lane//16)*4+v, n=lane%16]; here M=n_kv, n=m_q. Softmax reduces
@@ -26,10 +25,10 @@ Proven cores lifted verbatim from the probes
   distinct).
 - QK C-output -> PV B-operand handoff is a register-side ds_bpermute gather (the
   4-per-group vs 8-per-group packing mismatch), not a free relabel and not an
-  LDS round-trip. See ``repack_p`` -- lifted from the probe.
+  LDS round-trip. See ``repack_p``.
 - PV = mma(A=V^T, B=P) -> O^T[d, m_q]. C-output m=d, n=m_q=lane%16.
 
-V mechanism (RESOLVED FORK 2): bespoke single-wave LDS transpose-scatter. V is
+V mechanism: bespoke single-wave LDS transpose-scatter. V is
 stored [n_kv, d] (d contiguous); we scatter it into LDS as [d, n_kv] (n_kv
 contiguous) so a plain 8-fp8 register read lands n_kv on the MMA K axis. This is
 NOT ds_read_b64_tr_b8 (linear-welded) and NOT the welded coalesced V loaders.
@@ -418,7 +417,7 @@ def build_flash_attn_fp8_decode_module(
 
         def load_frag8(view2d, base):
             # operand register r of lane holds K-index (lane//16)*8+r (measured
-            # in stage0_probe_blayout); `base` is the 8-aligned flat i8 offset of
+            # empirically); `base` is the 8-aligned flat i8 offset of
             # r==0, so row = base//8 is the [N,8] row of the 8 contiguous bytes.
             row = fx.Int32(base // 8)
             fr8 = fx.make_rmem_tensor(8, fx.Int8)
@@ -436,9 +435,8 @@ def build_flash_attn_fp8_decode_module(
             q_frags.append(load_frag8(gq2, base))
 
         def repack_p(p):
-            # QK C-output -> PV B-operand ds_bpermute gather (see
-            # stage0_probe_qkpv.py). p = [d1a[0..3], d1b[0..3]] are the two
-            # KV-tile P fragments.
+            # QK C-output -> PV B-operand ds_bpermute gather.
+            # p = [d1a[0..3], d1b[0..3]] are the two KV-tile P fragments.
             vals8 = []
             for r in range_constexpr(8):
                 sg = (lg % fx.Int32(2)) * 2 + fx.Int32(r // 4)
