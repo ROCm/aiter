@@ -671,6 +671,13 @@ def _pa_decode_sparse_gfx950_gluon(
         if _s0 % _a == 0 and _s1 % _a == 0:
             cs0_align = _a
             break
+    # AITER_PA_DECODE_CS0_ALIGN: override for re-measuring the hint (1 = off). As of
+    # the row/column gather split the hint is codegen-neutral -- the column offsets are
+    # compile-time constants, so vectorization no longer depends on knowing cs0's
+    # divisibility, and the emitted load mix is identical with it on and off.
+    _ca = _os.environ.get("AITER_PA_DECODE_CS0_ALIGN")
+    if _ca:
+        cs0_align = int(_ca)
     # Gate each cache on its OWN span: one oversized cache must not disable the
     # fast path for the other. (cache_bytes, the max of the two, is kept for the
     # arch/format asserts below.)
