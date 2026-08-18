@@ -306,16 +306,16 @@ def _decode_tile(
         scl_off = (block_idx_g * cs0 + BLOCK_SIZE * 576 + pos_g * 8)[:, None] + (
             offs_full[None, :] // 64
         )
-        if MASKED:
-            x_u8 = _cache_load(
-                cache_ptr, nope_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=0
-            )
+        if MASKED:  # scales first: see _gd_fp8
             exps = _cache_load(
                 cache_ptr, scl_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=127
             )
+            x_u8 = _cache_load(
+                cache_ptr, nope_off, USE_BUFFER_LOAD, mask=valid_g[:, None], other=0
+            )
         else:
-            x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
             exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
+            x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
         _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, CHUNK_AXIS, False, FP8_FNUZ)
         block_idx_gr, pos_gr, valid_gr = _slots(
             indices_ptr,
@@ -448,8 +448,13 @@ def _gd_fp8(
         scl_off = (bg * cs0 + BLOCK_SIZE * 576 + pg * 8)[:, None] + (
             offs_full[None, :] // 64
         )
-        x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
+        # UE8M0 scales first, bulk fp8 after. vmcnt is one in-order FIFO, so a
+        # wait can only name "at most N outstanding", never a specific load:
+        # issuing the scales last would make the first dequant piece wait behind
+        # every data load as well. Issued first, the scales are covered by the
+        # wait that the first piece's own data needs anyway.
         sc = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
+        x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
         bgr, pgr, _ = _slots(
             indices_ptr,
             seg_start,
@@ -941,6 +946,24 @@ def _pa_decode_sparse(
 
     h_off = pid_h * BLOCK_M
 
+    # ---- segment lengths, issued first ----
+    # These gate the whole KV chain: indptr -> segment range -> indices gather ->
+    # cache addresses -> cache gather, three dependent memory round trips deep.
+    # Q is independent of all of it, so issue the indptr loads before Q rather
+    # than after: the scalar readfirstlane they feed needs s_waitcnt vmcnt(0), and
+    # behind Q's load plus its through-LDS layout conversion (two barriers) that
+    # wait lands at the end of a long serial prologue instead of overlapping it.
+    main_start = gl.load(main_indptr_ptr + query_idx)
+    main_end = gl.load(main_indptr_ptr + query_idx + 1)
+    if HAS_EXTRA:
+        extra_start = gl.load(extra_indptr_ptr + query_idx)
+        extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+    else:
+        extra_start = 0
+        extra_len = 0
+    main_len = main_end - main_start
+
     # ---- load Q [BLOCK_M, HEAD_SIZE] ----
     offs_m_q = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_q))
     offs_d_q = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, blocked_q))
@@ -972,18 +995,6 @@ def _pa_decode_sparse(
     # for the sink/normalization (sink is a scaled-score-space logit).
     RCP_LN2: gl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
-
-    # ---- segment lengths ----
-    main_start = gl.load(main_indptr_ptr + query_idx)
-    main_end = gl.load(main_indptr_ptr + query_idx + 1)
-    main_len = main_end - main_start
-    if HAS_EXTRA:
-        extra_start = gl.load(extra_indptr_ptr + query_idx)
-        extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
-        extra_len = extra_end - extra_start
-    else:
-        extra_start = 0
-        extra_len = 0
 
     # ---- how many of the launched splits this query actually wants ----
     # NUM_SPLITS / MAIN_SPLITS come from the host, which only knows the batch's
