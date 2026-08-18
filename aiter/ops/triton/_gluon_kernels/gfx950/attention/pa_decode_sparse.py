@@ -278,17 +278,32 @@ def _slots(
     BLOCK_SIZE: gl.constexpr,
     MASKED: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    IDX_BUFFER_LOAD: gl.constexpr,
 ):
     # Returns in whatever layout k_pos carries. Called once per gather layout: NoPE
     # and RoPE tile their warps differently, and re-loading this tiny broadcast
     # vector is cheaper than a cross-lane convert between the two.
+    # The index list is one int32 per gathered token -- orders of magnitude under
+    # buffer_load's 2 GB offset limit even for a full batch -- so it can keep the
+    # fast path however big the KV caches are. It is also the largest single source
+    # of exec-mask branching in the kernel (20 of 55 s_and_saveexec_b64 on the
+    # buffer path, all from the masked tail), because a masked gl.load predicates
+    # while a masked buffer_load folds the mask into the offset.
     if MASKED:
         in_range = k_pos < hi
-        slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
+        if IDX_BUFFER_LOAD:
+            slot = gl.amd.cdna4.buffer_load(
+                ptr=indices_ptr + seg_start, offsets=k_pos, mask=in_range, other=-1
+            )
+        else:
+            slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < num_rows)
         slot = gl.where(valid, slot, 0)
     else:
-        slot = gl.load(indices_ptr + seg_start + k_pos)
+        if IDX_BUFFER_LOAD:
+            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=k_pos)
+        else:
+            slot = gl.load(indices_ptr + seg_start + k_pos)
         valid = slot >= 0  # -1 sentinels: clamp in-bounds, mask score below
         if HAS_INVALID:
             slot = gl.where(valid, slot, 0)
@@ -338,6 +353,7 @@ def _decode_tile(
     MASKED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -357,6 +373,7 @@ def _decode_tile(
         BLOCK_SIZE,
         MASKED,
         HAS_INVALID,
+        IDX_BUFFER_LOAD,
     )
     block_idx_g = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_l))
     pos_g = gl.convert_layout(pos, gl.SliceLayout(1, gather_l))
@@ -425,6 +442,7 @@ def _decode_tile(
             BLOCK_SIZE,
             MASKED,
             HAS_INVALID,
+            IDX_BUFFER_LOAD,
         )
         rope_row = block_idx_gr * (cs0 // 2) + pos_gr * 288 + 224
         if MASKED:
@@ -514,6 +532,7 @@ def _gd_fp8(
     HEAD_SIZE: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -536,6 +555,7 @@ def _gd_fp8(
         BLOCK_SIZE,
         False,
         HAS_INVALID,
+        IDX_BUFFER_LOAD,
     )
     if UNIFORM:
         NGRP: gl.constexpr = HEAD_SIZE // 64
@@ -569,6 +589,7 @@ def _gd_fp8(
             BLOCK_SIZE,
             False,
             HAS_INVALID,
+            IDX_BUFFER_LOAD,
         )
         k_rope = _cache_load(
             cache_bf16_ptr, bgr * (cs0 // 2) + pgr * 288 + 224, offs_rope, USE_BUFFER_LOAD
@@ -685,6 +706,7 @@ def _process_segment(
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -719,6 +741,7 @@ def _process_segment(
                 HEAD_SIZE,
                 UNIFORM,
                 USE_BUFFER_LOAD,
+                IDX_BUFFER_LOAD,
                 HAS_INVALID,
                 FP8_FNUZ,
             )
@@ -742,6 +765,7 @@ def _process_segment(
                     HEAD_SIZE,
                     UNIFORM,
                     USE_BUFFER_LOAD,
+                    IDX_BUFFER_LOAD,
                     HAS_INVALID,
                     FP8_FNUZ,
                 )
@@ -848,6 +872,7 @@ def _process_segment(
                 False,
                 UNIFORM,
                 USE_BUFFER_LOAD,
+                IDX_BUFFER_LOAD,
                 HAS_INVALID,
                 FP8_FNUZ,
             )
@@ -895,6 +920,7 @@ def _process_segment(
             True,
             UNIFORM,
             USE_BUFFER_LOAD,
+            IDX_BUFFER_LOAD,
             HAS_INVALID,
             FP8_FNUZ,
         )
@@ -979,6 +1005,7 @@ def _pa_decode_sparse(
     # partner is large. At tiny top-k the main/SWA gather is ~94% of the tokens.
     MAIN_USE_BUFFER_LOAD: gl.constexpr,
     EXTRA_USE_BUFFER_LOAD: gl.constexpr,
+    IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -1224,6 +1251,7 @@ def _pa_decode_sparse(
         HEAD_ALIGNED,
         UNIFORM,
         MAIN_USE_BUFFER_LOAD,
+        IDX_BUFFER_LOAD,
         HAS_INVALID,
         FP8_FNUZ,
     )
@@ -1270,6 +1298,7 @@ def _pa_decode_sparse(
             HEAD_ALIGNED,
             UNIFORM,
             EXTRA_USE_BUFFER_LOAD,
+            IDX_BUFFER_LOAD,
             HAS_INVALID,
             FP8_FNUZ,
         )

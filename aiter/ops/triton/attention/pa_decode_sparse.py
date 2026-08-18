@@ -676,6 +676,14 @@ def _pa_decode_sparse_gfx950_gluon(
     # arch/format asserts below.)
     main_use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
     extra_use_buffer_load = max_addressable_bytes(extra_cache) < MAX_BYTES
+    # The index lists are one int32 per gathered token, orders of magnitude under
+    # the 2 GB buffer offset limit even for a full batch, so they keep the fast path
+    # regardless of how big the KV caches are.
+    idx_use_buffer_load = (
+        _os.environ.get("AITER_PA_DECODE_IDX_BUF", "1") == "1"
+        and max_addressable_bytes(indices) < MAX_BYTES
+        and max_addressable_bytes(extra_indices) < MAX_BYTES
+    )
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     # AITER_PA_DECODE_FORCE_GLOBAL_LOAD emulates a >2GB production cache without
     # allocating one: 1 = both caches, main = main only, extra = extra only.
@@ -842,6 +850,7 @@ def _pa_decode_sparse_gfx950_gluon(
         ADAPTIVE_SPLITS=adaptive_splits,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
+        IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
         num_warps=num_warps,
