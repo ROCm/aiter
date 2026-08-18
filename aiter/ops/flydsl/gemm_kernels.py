@@ -17,35 +17,41 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    ptr_arg,
+    unused_tensor_arg,
+)
 
 from .kernels.gemm_decode_block_mfma import compile_gemm_decode_block_mfma_bf16
-from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from .kernels.hgemm_dispatch import (
+    KERNEL_FAMILY_HGEMM,
+    KERNEL_FAMILY_SMALL_M,
+    compile_flydsl_hgemm_kernel,
+)
 from .kernels.gemm_decode_common import (
     ActivationSource,
     BlockMfmaDecodeConfig,
     ContractionMode,
-    DecodeArchTraits,
     DecodeConfig,
-    DecodePolicy,
     OutputRounding,
     ReductionMode,
     WaveDecodeConfig,
+    gemm_decode_kernel_name,
     get_decode_arch_traits,
     iter_gemm_decode_configs,
+    parse_gemm_decode_kernel_name,
 )
 from .kernels.gemm_decode_wave import compile_gemm_decode_wave_bf16
-from .kernels.small_m_hgemm import LDS_STAGING_DIRECT
-from .kernels.tensor_shim import _run_compiled
+from .kernels.small_m_hgemm import SMALL_M_KERNEL_MAX
+from .kernels.splitk_hgemm import SPLIT_K_SEMAPHORE_MAX_LEN
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "ActivationSource",
     "BlockMfmaDecodeConfig",
     "ContractionMode",
-    "DecodeArchTraits",
     "DecodeConfig",
-    "DecodePolicy",
     "OutputRounding",
     "ReductionMode",
     "WaveDecodeConfig",
@@ -53,8 +59,10 @@ __all__ = [
     "flydsl_hgemm",
     "flydsl_small_m_hgemm",
     "gemm_decode_bf16",
+    "gemm_decode_kernel_name",
     "get_decode_arch_traits",
     "iter_gemm_decode_configs",
+    "parse_gemm_decode_kernel_name",
 ]
 
 
@@ -64,12 +72,9 @@ def _get_dtypes():
     return dtypes
 
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
-KERNEL_FAMILY_HGEMM = "hgemm"
-KERNEL_FAMILY_SMALL_M = "small_m"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -87,8 +92,6 @@ _HGEMM_KERNEL_RE = re.compile(
 )
 
 SplitKStreamKey = tuple[int, int]
-SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
-SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
@@ -551,7 +554,7 @@ def _normalize_registry_config(
     return config
 
 
-def _parse_hgemm_kernel_params(name: str) -> dict | None:
+def get_flydsl_splitk_hgemm_kernel_params(name: str) -> dict | None:
     m = _HGEMM_KERNEL_RE.fullmatch(name)
     if m is None:
         return None
@@ -560,7 +563,7 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
 
     block_k_warps = m.group("block_k_warps")
     block_k_warps = int(block_k_warps) if block_k_warps else 1
-    config: dict[str, object] = {
+    return {
         "kernel_family": KERNEL_FAMILY_HGEMM,
         "stages": int(m.group("stages")),
         "tile_m": int(m.group("tile_m")),
@@ -580,14 +583,6 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
         "k": int(m.group("k")),
         "target_gfx": m.group("target_gfx"),
     }
-    return config
-
-
-def get_flydsl_splitk_hgemm_kernel_params(name: str) -> dict | None:
-    config = _parse_hgemm_kernel_params(name)
-    if config is not None:
-        return dict(config)
-    return None
 
 
 def get_flydsl_splitk_hgemm_kernels(
@@ -679,9 +674,10 @@ def get_flydsl_splitk_hgemm_kernels(
 
 @functools.lru_cache(maxsize=128)
 def _get_split_k_tensors(
-    device: torch.device,
-    stream: torch.cuda.Stream,
+    cache_key: SplitKStreamKey,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    device_index, _ = cache_key
+    device = torch.device("cuda", device_index)
     semaphore = torch.zeros(
         (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
     )
@@ -707,7 +703,6 @@ def _check_split_k_semaphore_capacity(
 @functools.lru_cache(maxsize=16384)
 def _compile_flydsl_hgemm(
     dtype: str,
-    m: int,
     n: int,
     k: int,
     *,
@@ -730,8 +725,6 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
-    target_gfx: str | None = None,
-    lds_staging: str = LDS_STAGING_DIRECT,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -744,7 +737,7 @@ def _compile_flydsl_hgemm(
                 "Current generic kernel only supports `b_preshuffle=False`"
             )
         _validate_hgemm_tiling(
-            m,
+            1,
             n,
             k,
             dtype=dtype,
@@ -781,7 +774,6 @@ def _compile_flydsl_hgemm(
         dtype,
         n,
         k,
-        target_gfx=target_gfx,
         kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -801,7 +793,6 @@ def _compile_flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
-        lds_staging=lds_staging,
     )
 
     def launcher(
@@ -820,17 +811,16 @@ def _compile_flydsl_hgemm(
                 "This launcher was compiled without bias support; "
                 "recompile with `has_bias=True`."
             )
-        launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
+        semaphore, signal = _get_split_k_tensors(_stream_cache_key(launch_stream))
         return _run_compiled(
             kernel,
             ptr_arg(out),
             ptr_arg(a),
             ptr_arg(b),
-            ptr_arg(launch_bias),
+            ptr_arg(unused_tensor_arg(bias, b)),
             runtime_m,
             ptr_arg(semaphore),
             ptr_arg(signal),
@@ -854,17 +844,12 @@ def flydsl_hgemm(
     block_m_warps: int = 2,
     block_n_warps: int = 2,
     block_k_warps: int = 1,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
     stages: int = 2,
     async_copy: bool = False,
     b_to_lds: bool = False,
     b_preshuffle: bool = False,
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
-    kernel_family: str | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
@@ -893,12 +878,8 @@ def flydsl_hgemm(
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
 
     launch_stream = _normalize_launch_stream(a.device, stream)
-    resolved_kernel_family = (
-        KERNEL_FAMILY_HGEMM if kernel_family is None else kernel_family
-    )
     launcher = _compile_flydsl_hgemm(
         kernel_dtype,
-        m,
         n,
         k,
         tile_k=tile_k,
@@ -908,17 +889,13 @@ def flydsl_hgemm(
         tile_m=tile_m,
         tile_n=tile_n,
         pack_n=pack_n,
-        n_tile_repeat=n_tile_repeat,
-        persistent_n_tiles=persistent_n_tiles,
-        waves_per_eu=waves_per_eu,
-        b_to_lds_unroll=b_to_lds_unroll,
         stages=stages,
         async_copy=async_copy,
         b_to_lds=b_to_lds,
         b_preshuffle=b_preshuffle,
         split_k=split_k,
         c_to_lds=c_to_lds,
-        kernel_family=resolved_kernel_family,
+        kernel_family=KERNEL_FAMILY_HGEMM,
         has_bias=bias is not None,
     )
 
@@ -941,12 +918,11 @@ def flydsl_small_m_hgemm(
     waves_per_eu: int = 0,
     b_to_lds_unroll: int = 0,
     b_to_lds: bool = False,
-    lds_staging: str = LDS_STAGING_DIRECT,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run the dedicated BF16 small-M kernel family."""
     m, n, k = _validate_hgemm_inputs(a, b, out, bias)
-    if not 1 <= m < 17:
+    if not 1 <= m < SMALL_M_KERNEL_MAX:
         raise ValueError(f"small-M kernel requires M=1..16, got {m}")
     if a.dtype != torch.bfloat16:
         raise ValueError(f"small-M kernel requires BF16 input, got {a.dtype}")
@@ -963,7 +939,6 @@ def flydsl_small_m_hgemm(
     launch_stream = _normalize_launch_stream(a.device, stream)
     launcher = _compile_flydsl_hgemm(
         "bf16",
-        m,
         n,
         k,
         tile_m=16,
@@ -984,16 +959,10 @@ def flydsl_small_m_hgemm(
         c_to_lds=False,
         kernel_family=KERNEL_FAMILY_SMALL_M,
         has_bias=bias is not None,
-        target_gfx=get_gfx_runtime(),
-        lds_staging=lds_staging,
     )
     launcher(out, a, b, bias=bias, stream=launch_stream)
     return out
 
-
-# ---------------------------------------------------------------------------
-# Public BF16 decode GEMM runtime
-# ---------------------------------------------------------------------------
 
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     """Check if two tensors overlap in memory."""
@@ -1124,10 +1093,6 @@ def gemm_decode_bf16(
     return C
 
 
-# ---------------------------------------------------------------------------
-# FlyDSL preshuffle GEMM kernel management
-# ---------------------------------------------------------------------------
-
 _flydsl_compile_fn = None
 _flydsl_import_done = False
 
@@ -1225,10 +1190,6 @@ def flydsl_preshuffle_gemm_a8(
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = Out.contiguous()
-    # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
-    # epilogue != "none"). Pass an empty tensor as a placeholder for the
-    # default epilogue="none" path.
-    _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
@@ -1239,7 +1200,7 @@ def flydsl_preshuffle_gemm_a8(
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        _dummy_bias,
+        unused_tensor_arg(None, torch.empty(0, dtype=Out.dtype, device=Out.device)),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

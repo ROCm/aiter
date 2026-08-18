@@ -36,8 +36,6 @@ schedule than the generic HGEMM kernel.
 """
 
 import functools
-import re
-from itertools import product
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -47,13 +45,13 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.ops.flydsl.kernels import vector
 
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
+
 from .splitk_hgemm import (
     OnlineScheduler,
-    SPLIT_K_SEMAPHORE_MAX_LEN,
     WmmaHalf_m16n16k16,
     WmmaHalf_m16n16k32,
     swizzle_xor16,
@@ -61,22 +59,9 @@ from .splitk_hgemm import (
 from .tensor_shim import GTensor, _to_raw, get_dtype_in_kernel
 
 __all__ = [
-    "LDS_STAGING_DIRECT",
-    "LDS_STAGING_OPTIONS",
-    "LDS_STAGING_VGPR",
     "SMALL_M_KERNEL_MAX",
-    "SMALL_M_SUPPORTED_ARCHS",
-    "SMALL_M_TUNING_MAX_CONFIGS",
     "compile_small_m_hgemm_kernel",
-    "iter_small_m_registry_configs",
-    "iter_small_m_tuning_configs",
-    "parse_small_m_kernel_name",
-    "small_m_arch_params",
     "small_m_kernel_name",
-    "small_m_lds_bytes",
-    "small_m_max_lds_bytes",
-    "small_m_tile_k_is_swizzle_safe",
-    "validate_small_m_kernel_config",
 ]
 
 SMALL_M_KERNEL_MAX = 17
@@ -87,44 +72,6 @@ STAGES = 2
 WARP_SIZE = 64
 DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
-LDS_STAGING_DIRECT = "direct"
-LDS_STAGING_VGPR = "vgpr"
-LDS_STAGING_OPTIONS = (LDS_STAGING_DIRECT, LDS_STAGING_VGPR)
-
-# Expand the original small-M catalog with the additional cases that proved
-# useful during the deeper exhaustive search, instead of maintaining separate
-# compact/exhaustive modes.
-SMALL_M_TILE_K_OPTIONS = (32, 64, 128, 256)
-SMALL_M_MAX_SPLIT_K = 32
-SMALL_M_TILE_N_OPTIONS = (
-    32,
-    64,
-    96,
-    128,
-    160,
-    192,
-    224,
-    256,
-    384,
-    512,
-    768,
-    1024,
-)
-SMALL_M_GFX942_EXTRA_TILE_N_OPTIONS = (16,)
-SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
-# Keep 0 for narrow B_TO_LDS shapes where it remains a real candidate, and
-# canonicalize only the wide-N B_TO_LDS duplicates at registry emission time.
-SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
-SMALL_M_B_TO_LDS_UNROLL_OPTIONS = (8, 16)
-SMALL_M_N_TILE_REPEAT_OPTIONS = (1, 2, 4)
-SMALL_M_PERSISTENT_N_TILE_OPTIONS = (2, 4, 8)
-SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 3, 4)
-SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
-SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
-SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
-SMALL_M_TUNING_MAX_CONFIGS = 256
-SMALL_M_TUNING_SPLIT_K_OPTIONS = frozenset((1, 2, 4))
-
 
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -162,7 +109,7 @@ def small_m_arch_params(arch: str) -> dict:
 def small_m_max_lds_bytes(arch: str) -> int:
     """Return the addressable per-workgroup LDS budget for ``arch``."""
     _require_small_m_arch(arch)
-    return SMEM_CAPACITY_MAP[arch]
+    return addressable_lds_bytes_for_gfx(arch)
 
 
 def small_m_tile_k_is_swizzle_safe(tile_k: int) -> bool:
@@ -184,40 +131,12 @@ def small_m_lds_bytes(*, tile_n: int, tile_k: int, b_to_lds: bool) -> int:
     return _align_up(a_lds_bytes, 16) + STAGES * tile_n * tile_k * DTYPE_BYTES
 
 
-def _small_m_tile_n_options(arch: str) -> tuple[int, ...]:
-    _require_small_m_arch(arch)
-    if arch == "gfx942":
-        return tuple(
-            sorted(SMALL_M_GFX942_EXTRA_TILE_N_OPTIONS + SMALL_M_TILE_N_OPTIONS)
-        )
-    return SMALL_M_TILE_N_OPTIONS
-
-
-def _small_m_tile_k_options(k: int) -> tuple[int, ...]:
-    return tuple(
-        tile_k
-        for tile_k in SMALL_M_TILE_K_OPTIONS
-        if any(
-            k % split_k == 0 and (k // split_k) % tile_k == 0
-            for split_k in range(1, SMALL_M_MAX_SPLIT_K + 1)
-        )
-    )
-
-
-def _small_m_split_k_options(k: int, tile_k: int) -> tuple[int, ...]:
-    return tuple(
-        split_k
-        for split_k in range(1, SMALL_M_MAX_SPLIT_K + 1)
-        if k % split_k == 0 and (k // split_k) % tile_k == 0
-    )
-
-
 def small_m_kernel_name(
     dtype: str,
     n: int,
     k: int,
+    arch: str,
     *,
-    target_gfx: str,
     tile_n: int,
     tile_k: int,
     split_k: int,
@@ -228,15 +147,9 @@ def small_m_kernel_name(
     b_to_lds_unroll: int,
     b_to_lds: bool,
     has_bias: bool,
-    lds_staging: str = LDS_STAGING_DIRECT,
 ) -> str:
-    _require_small_m_arch(target_gfx)
-    if lds_staging not in LDS_STAGING_OPTIONS:
-        raise ValueError(f"unrecognized LDS staging policy: {lds_staging!r}")
-    if target_gfx != "gfx942" and lds_staging != LDS_STAGING_DIRECT:
-        raise ValueError(f"LDS staging {lds_staging!r} is not supported for {target_gfx}")
     name = (
-        f"smallm_hgemm_{dtype}_{target_gfx}_n{n}_k{k}_"
+        f"smallm_hgemm_{dtype}_a{arch}_n{n}_k{k}_"
         f"{TILE_M}x{tile_n}x{tile_k}_S{STAGES}TN_AS"
         f"_BNW{block_n_warps}"
     )
@@ -248,482 +161,13 @@ def small_m_kernel_name(
         name += f"_SPK{split_k}"
     if b_to_lds:
         name += "_BS"
-    if waves_per_eu > 0:
-        name += f"_WPE{waves_per_eu}"
-    if b_to_lds:
+        if waves_per_eu > 0:
+            name += f"_WPE{waves_per_eu}"
         if b_to_lds_unroll > 0:
             name += f"_UR{b_to_lds_unroll}"
     if has_bias:
         name += "_BIAS"
-    name += f"_LDS{lds_staging.upper()}"
     return name
-
-
-_SMALL_M_KERNEL_NAME_RE = re.compile(
-    r"^smallm_hgemm_(?P<dtype>bf16)_(?P<target_gfx>gfx\d+)_"
-    r"n(?P<n>[1-9]\d*)_k(?P<k>[1-9]\d*)_"
-    r"16x(?P<tile_n>[1-9]\d*)x"
-    r"(?P<tile_k>[1-9]\d*)_S2TN_AS_BNW(?P<block_n_warps>[1-9]\d*)"
-    r"(?:_NR(?P<n_tile_repeat>(?:[2-9]|[1-9]\d+)))?"
-    r"(?:_PN(?P<persistent_n_tiles>(?:[2-9]|[1-9]\d+)))?"
-    r"(?:_SPK(?P<split_k>(?:[2-9]|[1-9]\d+)))?"
-    r"(?P<b_to_lds>_BS)?"
-    r"(?:_WPE(?P<waves_per_eu>[1-9]\d*))?"
-    r"(?:_UR(?P<b_to_lds_unroll>[1-9]\d*))?"
-    r"(?P<has_bias>_BIAS)?"
-    r"_LDS(?P<lds_staging>DIRECT|VGPR)$"
-)
-
-
-def parse_small_m_kernel_name(kernel_name: str) -> dict:
-    """Parse a canonical small-M kernel name into its compile-time config."""
-    match = _SMALL_M_KERNEL_NAME_RE.fullmatch(kernel_name)
-    if match is None:
-        raise ValueError(f"invalid FlyDSL small-M kernel name: {kernel_name!r}")
-
-    groups = match.groupdict()
-    config = {
-        "kernel_family": "small_m",
-        "target_gfx": groups["target_gfx"],
-        "n": int(groups["n"]),
-        "k": int(groups["k"]),
-        "stage": STAGES,
-        "tile_m": TILE_M,
-        "tile_n": int(groups["tile_n"]),
-        "tile_k": int(groups["tile_k"]),
-        "split_k": int(groups["split_k"] or 1),
-        "block_m_warps": BLOCK_M_WARPS,
-        "block_n_warps": int(groups["block_n_warps"]),
-        "block_k_warps": 1,
-        "n_tile_repeat": int(groups["n_tile_repeat"] or 1),
-        "persistent_n_tiles": int(groups["persistent_n_tiles"] or 1),
-        "waves_per_eu": int(groups["waves_per_eu"] or 0),
-        "b_to_lds_unroll": int(groups["b_to_lds_unroll"] or 0),
-        "async_copy": True,
-        "b_to_lds": groups["b_to_lds"] is not None,
-        "c_to_lds": False,
-        "dtype": groups["dtype"],
-        "out_dtype": groups["dtype"],
-        "has_bias": groups["has_bias"] is not None,
-        "lds_staging": groups["lds_staging"].lower(),
-    }
-    if config["b_to_lds_unroll"] and not config["b_to_lds"]:
-        raise ValueError("small-M kernel name encodes unroll without B-to-LDS")
-    if config["b_to_lds"] and config["b_to_lds_unroll"] == 0:
-        raise ValueError("small-M B-to-LDS kernel name must encode its effective unroll")
-    wide_n_b_to_lds = (
-        config["b_to_lds"]
-        and config["n_tile_repeat"] == 1
-        and config["tile_n"] >= 128
-        and config["block_n_warps"] >= 2
-    )
-    if wide_n_b_to_lds and config["waves_per_eu"] == 0:
-        raise ValueError(
-            "wide-N small-M B-to-LDS kernel name must encode effective waves-per-EU"
-        )
-
-    try:
-        _validate_small_m_registry_config(
-            1,
-            config["n"],
-            config["k"],
-            tile_n=config["tile_n"],
-            tile_k=config["tile_k"],
-            split_k=config["split_k"],
-            block_n_warps=config["block_n_warps"],
-            n_tile_repeat=config["n_tile_repeat"],
-            persistent_n_tiles=config["persistent_n_tiles"],
-            waves_per_eu=config["waves_per_eu"],
-            b_to_lds_unroll=config["b_to_lds_unroll"],
-            b_to_lds=config["b_to_lds"],
-            lds_staging=config["lds_staging"],
-            arch=config["target_gfx"],
-        )
-    except ValueError as error:
-        raise ValueError(
-            f"illegal FlyDSL small-M kernel name: {kernel_name!r}"
-        ) from error
-
-    canonical_name = small_m_kernel_name(
-        config["dtype"],
-        config["n"],
-        config["k"],
-        target_gfx=config["target_gfx"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_n_warps=config["block_n_warps"],
-        n_tile_repeat=config["n_tile_repeat"],
-        persistent_n_tiles=config["persistent_n_tiles"],
-        waves_per_eu=config["waves_per_eu"],
-        b_to_lds_unroll=config["b_to_lds_unroll"],
-        b_to_lds=config["b_to_lds"],
-        has_bias=config["has_bias"],
-        lds_staging=config["lds_staging"],
-    )
-    if canonical_name != kernel_name:
-        raise ValueError(
-            f"non-canonical FlyDSL small-M kernel name: {kernel_name!r}; "
-            f"expected {canonical_name!r}"
-        )
-    return config
-
-
-def _validate_small_m_registry_config(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    tile_n: int,
-    tile_k: int,
-    split_k: int,
-    block_n_warps: int,
-    n_tile_repeat: int,
-    persistent_n_tiles: int,
-    waves_per_eu: int,
-    b_to_lds_unroll: int,
-    b_to_lds: bool,
-    lds_staging: str,
-    arch: str,
-) -> None:
-    del waves_per_eu
-
-    _require_small_m_arch(arch)
-    if lds_staging not in LDS_STAGING_OPTIONS:
-        raise ValueError
-    if arch != "gfx942" and lds_staging != LDS_STAGING_DIRECT:
-        raise ValueError
-    if not (1 <= m < SMALL_M_KERNEL_MAX):
-        raise ValueError
-    if tile_n < 1 or not small_m_tile_k_is_swizzle_safe(tile_k):
-        raise ValueError
-    if block_n_warps < 1 or split_k < 1:
-        raise ValueError
-    if n_tile_repeat < 1 or persistent_n_tiles < 1:
-        raise ValueError
-    if b_to_lds_unroll < 0:
-        raise ValueError
-    if tile_n % (block_n_warps * 16) != 0:
-        raise ValueError
-    if n_tile_repeat > 1:
-        if b_to_lds:
-            raise ValueError
-        classic_repeat = block_n_warps == 1 and tile_n == 64
-        wave_repeat = n_tile_repeat == 2 and block_n_warps == 2 and tile_n == 192
-        if not (classic_repeat or wave_repeat):
-            raise ValueError
-    if persistent_n_tiles > 1 and (
-        not b_to_lds or n_tile_repeat != 1 or tile_n < 128 or block_n_warps < 2
-    ):
-        raise ValueError
-    if n < tile_n or n % tile_n != 0:
-        raise ValueError
-    if persistent_n_tiles > n // tile_n:
-        raise ValueError
-    if k % split_k != 0:
-        raise ValueError
-    ks = k // split_k
-    if ks < tile_k or ks % tile_k != 0:
-        raise ValueError
-
-    if split_k > 1:
-        counters = _ceil_div(m, TILE_M) * (n // tile_n)
-        if counters > SPLIT_K_SEMAPHORE_MAX_LEN:
-            raise ValueError
-
-    if (
-        small_m_lds_bytes(tile_n=tile_n, tile_k=tile_k, b_to_lds=b_to_lds)
-        > small_m_max_lds_bytes(arch)
-    ):
-        raise ValueError
-
-
-def validate_small_m_kernel_config(
-    m: int,
-    n: int,
-    k: int,
-    config: dict,
-    *,
-    arch: str,
-) -> None:
-    """Validate a parsed small-M config against its CSV/runtime shape."""
-    if arch not in SMALL_M_SUPPORTED_ARCHS:
-        raise ValueError(
-            "FlyDSL small-M currently supports "
-            f"{', '.join(sorted(SMALL_M_SUPPORTED_ARCHS))}, got {arch!r}"
-        )
-    if config.get("target_gfx") != arch:
-        raise ValueError(
-            "FlyDSL small-M config architecture mismatch: "
-            f"name={config.get('target_gfx')!r}, runtime={arch!r}"
-        )
-    if (config.get("n"), config.get("k")) != (n, k):
-        raise ValueError(
-            "FlyDSL small-M config shape mismatch: "
-            f"name={(config.get('n'), config.get('k'))}, runtime={(n, k)}"
-        )
-    try:
-        _validate_small_m_registry_config(
-            m,
-            n,
-            k,
-            tile_n=config["tile_n"],
-            tile_k=config["tile_k"],
-            split_k=config["split_k"],
-            block_n_warps=config["block_n_warps"],
-            n_tile_repeat=config["n_tile_repeat"],
-            persistent_n_tiles=config["persistent_n_tiles"],
-            waves_per_eu=config["waves_per_eu"],
-            b_to_lds_unroll=config["b_to_lds_unroll"],
-            b_to_lds=config["b_to_lds"],
-            lds_staging=config["lds_staging"],
-            arch=arch,
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(
-            f"illegal FlyDSL small-M config for M={m}, N={n}, K={k}"
-        ) from error
-
-
-def _small_m_registry_variants():
-    variants = []
-    seen_variants = set()
-
-    def add_variant(
-        *,
-        block_n_warps: int,
-        b_to_lds: bool,
-        n_tile_repeat: int = 1,
-        persistent_n_tiles: int = 1,
-        waves_per_eu: int = 0,
-        b_to_lds_unroll: int = 0,
-    ) -> None:
-        variant = {
-            "block_m_warps": BLOCK_M_WARPS,
-            "block_n_warps": block_n_warps,
-            "b_to_lds": b_to_lds,
-            "n_tile_repeat": n_tile_repeat,
-            "persistent_n_tiles": persistent_n_tiles,
-            "waves_per_eu": waves_per_eu,
-            "b_to_lds_unroll": b_to_lds_unroll,
-        }
-        variant_key = tuple(sorted(variant.items()))
-        if variant_key in seen_variants:
-            return
-        seen_variants.add(variant_key)
-        variants.append(variant)
-
-    for block_n_warps in SMALL_M_BASE_BLOCK_N_WARPS:
-        for waves_per_eu in SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS:
-            add_variant(
-                block_n_warps=block_n_warps,
-                b_to_lds=False,
-                waves_per_eu=waves_per_eu,
-            )
-
-    for n_tile_repeat in SMALL_M_N_TILE_REPEAT_OPTIONS[1:]:
-        for block_n_warps in SMALL_M_REPEAT_BLOCK_N_WARPS:
-            for waves_per_eu in SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS:
-                add_variant(
-                    block_n_warps=block_n_warps,
-                    b_to_lds=False,
-                    n_tile_repeat=n_tile_repeat,
-                    waves_per_eu=waves_per_eu,
-                )
-
-    for block_n_warps in SMALL_M_B_TO_LDS_BLOCK_N_WARPS:
-        for waves_per_eu in SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS:
-            for b_to_lds_unroll in SMALL_M_B_TO_LDS_UNROLL_OPTIONS:
-                add_variant(
-                    block_n_warps=block_n_warps,
-                    b_to_lds=True,
-                    waves_per_eu=waves_per_eu,
-                    b_to_lds_unroll=b_to_lds_unroll,
-                )
-
-    for persistent_n_tiles in SMALL_M_PERSISTENT_N_TILE_OPTIONS:
-        for block_n_warps in SMALL_M_PERSISTENT_BLOCK_N_WARPS:
-            for waves_per_eu in SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS:
-                for b_to_lds_unroll in SMALL_M_B_TO_LDS_UNROLL_OPTIONS:
-                    add_variant(
-                        block_n_warps=block_n_warps,
-                        b_to_lds=True,
-                        persistent_n_tiles=persistent_n_tiles,
-                        waves_per_eu=waves_per_eu,
-                        b_to_lds_unroll=b_to_lds_unroll,
-                    )
-
-    return tuple(variants)
-
-
-def _canonicalize_small_m_registry_config(config: dict) -> dict:
-    """Match registry metadata to the effective compile-time kernel settings."""
-    canonical = dict(config)
-    wide_n_b_to_lds = (
-        canonical["b_to_lds"]
-        and canonical["n_tile_repeat"] == 1
-        and canonical["tile_n"] >= 128
-        and canonical["block_n_warps"] >= 2
-    )
-    if canonical["b_to_lds"]:
-        if canonical["b_to_lds_unroll"] <= 0:
-            canonical["b_to_lds_unroll"] = 8
-        if canonical["waves_per_eu"] <= 0 and wide_n_b_to_lds:
-            canonical["waves_per_eu"] = 2
-    return canonical
-
-
-def iter_small_m_registry_configs(
-    dtype: str,
-    out_dtype: str,
-    *,
-    m: int,
-    n: int,
-    k: int,
-):
-    if dtype != "bf16" or out_dtype != "bf16":
-        return
-
-    gpu_arch = get_rocm_arch()
-    if gpu_arch not in SMALL_M_SUPPORTED_ARCHS or not (
-        1 <= m < SMALL_M_KERNEL_MAX
-    ):
-        return
-
-    seen_configs = set()
-    staging_options = (
-        LDS_STAGING_OPTIONS if gpu_arch == "gfx942" else (LDS_STAGING_DIRECT,)
-    )
-    for tile_n in _small_m_tile_n_options(gpu_arch):
-        for tile_k in _small_m_tile_k_options(k):
-            split_k_options = _small_m_split_k_options(k, tile_k)
-            if not split_k_options:
-                continue
-            for split_k in split_k_options:
-                for variant, lds_staging in product(
-                    _small_m_registry_variants(), staging_options
-                ):
-                    config = {
-                        "kernel_family": "small_m",
-                        "stage": STAGES,
-                        "tile_m": TILE_M,
-                        "tile_n": tile_n,
-                        "tile_k": tile_k,
-                        "split_k": split_k,
-                        "block_m_warps": BLOCK_M_WARPS,
-                        "block_n_warps": variant["block_n_warps"],
-                        "n_tile_repeat": variant["n_tile_repeat"],
-                        "persistent_n_tiles": variant["persistent_n_tiles"],
-                        "waves_per_eu": variant["waves_per_eu"],
-                        "b_to_lds_unroll": variant["b_to_lds_unroll"],
-                        "async_copy": True,
-                        "b_to_lds": variant["b_to_lds"],
-                        "lds_staging": lds_staging,
-                        "c_to_lds": False,
-                        "dtype": dtype,
-                        "out_dtype": out_dtype,
-                        "target_gfx": gpu_arch,
-                    }
-                    try:
-                        _validate_small_m_registry_config(
-                            m,
-                            n,
-                            k,
-                            tile_n=config["tile_n"],
-                            tile_k=config["tile_k"],
-                            split_k=config["split_k"],
-                            block_n_warps=config["block_n_warps"],
-                            n_tile_repeat=config["n_tile_repeat"],
-                            persistent_n_tiles=config["persistent_n_tiles"],
-                            waves_per_eu=config["waves_per_eu"],
-                            b_to_lds_unroll=config["b_to_lds_unroll"],
-                            b_to_lds=config["b_to_lds"],
-                            lds_staging=config["lds_staging"],
-                            arch=gpu_arch,
-                        )
-                    except ValueError:
-                        continue
-                    config = _canonicalize_small_m_registry_config(config)
-                    config_key = tuple(sorted(config.items()))
-                    if config_key in seen_configs:
-                        continue
-                    seen_configs.add(config_key)
-                    yield config
-
-
-def _small_m_tuning_bucket(config: dict) -> tuple:
-    if config["persistent_n_tiles"] > 1:
-        path = "persistent"
-    elif config["n_tile_repeat"] > 1:
-        path = "repeat"
-    elif config["b_to_lds"]:
-        path = "b_to_lds"
-    else:
-        path = "direct"
-    return path, config["lds_staging"], config["split_k"]
-
-
-def _small_m_tuning_priority(config: dict) -> tuple:
-    def rank(value: int, preferred: tuple[int, ...]) -> int:
-        try:
-            return preferred.index(value)
-        except ValueError:
-            return len(preferred)
-
-    return (
-        rank(config["tile_n"], (128, 256, 64, 192, 384, 512, 32, 16, 768, 1024)),
-        rank(config["tile_k"], (64, 128, 32, 256)),
-        rank(config["block_n_warps"], (2, 4, 1, 3)),
-        rank(config["waves_per_eu"], (2, 0, 4)),
-        rank(config["b_to_lds_unroll"], (8, 16, 0)),
-        rank(config["persistent_n_tiles"], (2, 4, 1, 8)),
-        rank(config["n_tile_repeat"], (2, 1, 4)),
-        tuple(sorted(config.items())),
-    )
-
-
-def iter_small_m_tuning_configs(
-    dtype: str,
-    out_dtype: str,
-    *,
-    m: int,
-    n: int,
-    k: int,
-    max_configs: int = SMALL_M_TUNING_MAX_CONFIGS,
-):
-    """Yield a bounded, policy-diverse normal-tuner candidate set."""
-    if max_configs < 1:
-        return
-
-    buckets: dict[tuple, list[dict]] = {}
-    for config in iter_small_m_registry_configs(
-        dtype, out_dtype, m=m, n=n, k=k
-    ):
-        if config["split_k"] not in SMALL_M_TUNING_SPLIT_K_OPTIONS:
-            continue
-        buckets.setdefault(_small_m_tuning_bucket(config), []).append(config)
-
-    for configs in buckets.values():
-        configs.sort(key=_small_m_tuning_priority)
-
-    bucket_keys = sorted(buckets)
-    offsets = {key: 0 for key in bucket_keys}
-    emitted = 0
-    while bucket_keys and emitted < max_configs:
-        next_keys = []
-        for key in bucket_keys:
-            offset = offsets[key]
-            configs = buckets[key]
-            if offset >= len(configs):
-                continue
-            yield configs[offset]
-            emitted += 1
-            offsets[key] = offset + 1
-            if offsets[key] < len(configs):
-                next_keys.append(key)
-            if emitted >= max_configs:
-                break
-        bucket_keys = next_keys
 
 
 @functools.lru_cache(maxsize=1024)
@@ -732,7 +176,6 @@ def compile_small_m_hgemm_kernel(
     n: int,
     k: int,
     *,
-    ARCH: str | None = None,
     TILE_N: int = 128,
     TILE_K: int = 64,
     SPLIT_K: int = 1,
@@ -743,30 +186,22 @@ def compile_small_m_hgemm_kernel(
     B_TO_LDS_UNROLL: int = 0,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
-    LDS_STAGING: str = LDS_STAGING_DIRECT,
 ):
     if dtype != "bf16":
         raise ValueError(f"`small_m_hgemm.py` only supports bf16, got {dtype!r}")
     if SPLIT_K < 1:
         raise ValueError(f"SPLIT_K must be >= 1, got {SPLIT_K}")
-    if LDS_STAGING not in LDS_STAGING_OPTIONS:
-        raise ValueError(
-            f"LDS_STAGING must be one of {LDS_STAGING_OPTIONS}, got {LDS_STAGING!r}"
-        )
 
-    GPU_ARCH = get_rocm_arch() if ARCH is None else ARCH
+    GPU_ARCH = get_rocm_arch()
     _require_small_m_arch(GPU_ARCH)
-    if GPU_ARCH != "gfx942" and LDS_STAGING != LDS_STAGING_DIRECT:
-        raise ValueError(
-            f"LDS_STAGING={LDS_STAGING!r} is only implemented for gfx942; "
-            f"{GPU_ARCH} keeps the direct global-to-LDS path"
-        )
 
     ARCH_PARAMS = small_m_arch_params(GPU_ARCH)
     WMMA_IMPL = ARCH_PARAMS["wmma_cls"](dtype)
     DMA_BYTES = ARCH_PARAMS["direct_dma_bytes"]
     MFMA_PER_WARP_K = ARCH_PARAMS["mfma_per_warp_k"]
-    DIRECT_TO_LDS = LDS_STAGING == LDS_STAGING_DIRECT
+    # gfx942 cannot issue 16-byte global-to-LDS DMA. Use wide VGPR loads plus
+    # ds_write instead of the losing 4-byte direct path.
+    DIRECT_TO_LDS = GPU_ARCH != "gfx942"
     MAX_LDS_BYTES = small_m_max_lds_bytes(GPU_ARCH)
     BLOCK_K = TILE_K
     IS_SPLIT_K = SPLIT_K > 1
@@ -914,7 +349,7 @@ def compile_small_m_hgemm_kernel(
         dtype,
         n,
         k,
-        target_gfx=GPU_ARCH,
+        GPU_ARCH,
         tile_n=TILE_N,
         tile_k=TILE_K,
         split_k=SPLIT_K,
@@ -925,7 +360,6 @@ def compile_small_m_hgemm_kernel(
         b_to_lds_unroll=EFFECTIVE_B_TO_LDS_UNROLL if const_expr(B_TO_LDS) else 0,
         b_to_lds=B_TO_LDS,
         has_bias=HAS_BIAS,
-        lds_staging=LDS_STAGING,
     )
 
     @flyc.kernel

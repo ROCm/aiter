@@ -26,7 +26,6 @@ from .gemm_decode_common import (
     load_vector,
     make_buffer_matrix,
     make_buffer_vector,
-    make_decode_cache_tag,
     make_vector_view,
     masked_bf16_vector,
     mfma_4x4x4_bf16,
@@ -36,7 +35,7 @@ from .gemm_decode_common import (
     validate_block_mfma_grid_i32,
     wave_lane_coordinates,
 )
-from .tensor_shim import _run_compiled
+from .tensor_shim import _run_compiled, unused_tensor_arg
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -314,101 +313,99 @@ def _make_block_kernel(
     class SharedStorage:
         activation: fx.Array[fx.BFloat16, m * staged_k, 16]
 
-    @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
-    def block_mfma_kernel(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        BIAS: fx.Tensor,
-        runtime_grid_workgroups: Int32,
-        runtime_persistent_turns: Int32,
-    ):
-        tid = fx.Int32(gpu.thread_idx.x)
-        wave, lane = wave_lane_coordinates(tid, waves)
-        first_column = (
-            gpu.block_idx.x * fx.Int32(waves * columns)
-            + wave * fx.Int32(columns)
-        )
-        a_global = make_buffer_matrix(A, m, k)
-        b_global = make_buffer_matrix(B, n, k)
-        c_global = make_buffer_matrix(C, m, n)
-        if const_expr(has_bias):
-            bias_global = make_buffer_vector(BIAS, n)
-        a_smem = None
-        if use_lds:
-            shared = fx.SharedAllocator().allocate(SharedStorage).peek()
-            a_smem = shared.activation.view(
-                fx.make_layout((m, staged_k), (staged_k, 1))
-            )
-            for iteration in range_constexpr(stage_iterations):
-                slot = tid + fx.Int32(iteration * block_threads)
-                if slot < fx.Int32(activation_vectors):
-                    row, row_vector = padded_row_coordinates(
-                        slot,
-                        m,
-                        activation_vectors_per_row,
-                    )
-                    column = row_vector * fx.Int32(8)
-                    staged = load_vector(a_global, row, column, k, 8)
-                    make_vector_view(
-                        a_smem,
-                        row,
-                        column,
-                        staged_k,
-                        8,
-                    ).store(staged)
-            if global_tail_elements:
-                a_global_tail = fx.make_view(
-                    fx.add_offset(
-                        fx.get_iter(a_global),
-                        fx.make_int_tuple(vector_prefix),
-                    ),
-                    fx.make_layout(
-                        (m, global_tail_per_row),
-                        (k, 1),
-                    ),
-                )
-                a_smem_tail = fx.make_view(
-                    fx.add_offset(
-                        fx.get_iter(a_smem),
-                        fx.make_int_tuple(vector_prefix),
-                    ),
-                    fx.make_layout(
-                        (m, global_tail_per_row),
-                        (staged_k, 1),
-                    ),
-                )
-                if tid < fx.Int32(global_tail_elements):
-                    row, row_tail = padded_row_coordinates(
-                        tid,
-                        m,
-                        global_tail_per_row,
-                    )
-                    a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
-            if shared_padding_elements:
-                a_smem_padding = fx.make_view(
-                    fx.add_offset(
-                        fx.get_iter(a_smem),
-                        fx.make_int_tuple(k),
-                    ),
-                    fx.make_layout(
-                        (m, shared_padding_per_row),
-                        (staged_k, 1),
-                    ),
-                )
-                if tid < fx.Int32(shared_padding_elements):
-                    row, row_padding = padded_row_coordinates(
-                        tid,
-                        m,
-                        shared_padding_per_row,
-                    )
-                    a_smem_padding[row, row_padding] = arith.constant(
-                        0.0,
-                        type=T.bf16,
-                    )
-            gpu.barrier()
+    if persistent_turns == 1:
 
-        if persistent_turns == 1:
+        @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+        def block_mfma_kernel(
+            A: fx.Tensor,
+            B: fx.Tensor,
+            C: fx.Tensor,
+            BIAS: fx.Tensor,
+        ):
+            tid = fx.Int32(gpu.thread_idx.x)
+            wave, lane = wave_lane_coordinates(tid, waves)
+            first_column = (
+                gpu.block_idx.x * fx.Int32(waves * columns)
+                + wave * fx.Int32(columns)
+            )
+            a_global = make_buffer_matrix(A, m, k)
+            b_global = make_buffer_matrix(B, n, k)
+            c_global = make_buffer_matrix(C, m, n)
+            if const_expr(has_bias):
+                bias_global = make_buffer_vector(BIAS, n)
+            a_smem = None
+            if use_lds:
+                shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+                a_smem = shared.activation.view(
+                    fx.make_layout((m, staged_k), (staged_k, 1))
+                )
+                for iteration in range_constexpr(stage_iterations):
+                    slot = tid + fx.Int32(iteration * block_threads)
+                    if slot < fx.Int32(activation_vectors):
+                        row, row_vector = padded_row_coordinates(
+                            slot,
+                            m,
+                            activation_vectors_per_row,
+                        )
+                        column = row_vector * fx.Int32(8)
+                        staged = load_vector(a_global, row, column, k, 8)
+                        make_vector_view(
+                            a_smem,
+                            row,
+                            column,
+                            staged_k,
+                            8,
+                        ).store(staged)
+                if global_tail_elements:
+                    a_global_tail = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_global),
+                            fx.make_int_tuple(vector_prefix),
+                        ),
+                        fx.make_layout(
+                            (m, global_tail_per_row),
+                            (k, 1),
+                        ),
+                    )
+                    a_smem_tail = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_smem),
+                            fx.make_int_tuple(vector_prefix),
+                        ),
+                        fx.make_layout(
+                            (m, global_tail_per_row),
+                            (staged_k, 1),
+                        ),
+                    )
+                    if tid < fx.Int32(global_tail_elements):
+                        row, row_tail = padded_row_coordinates(
+                            tid,
+                            m,
+                            global_tail_per_row,
+                        )
+                        a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
+                if shared_padding_elements:
+                    a_smem_padding = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_smem),
+                            fx.make_int_tuple(k),
+                        ),
+                        fx.make_layout(
+                            (m, shared_padding_per_row),
+                            (staged_k, 1),
+                        ),
+                    )
+                    if tid < fx.Int32(shared_padding_elements):
+                        row, row_padding = padded_row_coordinates(
+                            tid,
+                            m,
+                            shared_padding_per_row,
+                        )
+                        a_smem_padding[row, row_padding] = arith.constant(
+                            0.0,
+                            type=T.bf16,
+                        )
+                gpu.barrier()
             reduced, logical_columns = _compute_column_tile(
                 config=config,
                 geometry=compute_geometry,
@@ -421,9 +418,9 @@ def _make_block_kernel(
             for row in range_constexpr(m):
                 for column in range_constexpr(columns):
                     column_coord = logical_columns[column]
-                    if (
-                        lane == fx.Int32(WAVE_SIZE - 1)
-                    ) & (column_coord < fx.Int32(n)):
+                    if (lane == fx.Int32(WAVE_SIZE - 1)) & (
+                        column_coord < fx.Int32(n)
+                    ):
                         element = (
                             fx.Int32(row) * fx.Int32(n)
                             + fx.Int32(column_coord)
@@ -441,10 +438,103 @@ def _make_block_kernel(
                             config.output_rounding,
                         )
                         c_global[row, column_coord] = output
-        else:
-            column_stride = (
-                runtime_grid_workgroups * fx.Int32(waves * columns)
+
+    else:
+
+        @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+        def block_mfma_kernel(
+            A: fx.Tensor,
+            B: fx.Tensor,
+            C: fx.Tensor,
+            BIAS: fx.Tensor,
+            runtime_grid_workgroups: Int32,
+            runtime_persistent_turns: Int32,
+        ):
+            tid = fx.Int32(gpu.thread_idx.x)
+            wave, lane = wave_lane_coordinates(tid, waves)
+            first_column = (
+                gpu.block_idx.x * fx.Int32(waves * columns)
+                + wave * fx.Int32(columns)
             )
+            a_global = make_buffer_matrix(A, m, k)
+            b_global = make_buffer_matrix(B, n, k)
+            c_global = make_buffer_matrix(C, m, n)
+            if const_expr(has_bias):
+                bias_global = make_buffer_vector(BIAS, n)
+            a_smem = None
+            if use_lds:
+                shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+                a_smem = shared.activation.view(
+                    fx.make_layout((m, staged_k), (staged_k, 1))
+                )
+                for iteration in range_constexpr(stage_iterations):
+                    slot = tid + fx.Int32(iteration * block_threads)
+                    if slot < fx.Int32(activation_vectors):
+                        row, row_vector = padded_row_coordinates(
+                            slot,
+                            m,
+                            activation_vectors_per_row,
+                        )
+                        column = row_vector * fx.Int32(8)
+                        staged = load_vector(a_global, row, column, k, 8)
+                        make_vector_view(
+                            a_smem,
+                            row,
+                            column,
+                            staged_k,
+                            8,
+                        ).store(staged)
+                if global_tail_elements:
+                    a_global_tail = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_global),
+                            fx.make_int_tuple(vector_prefix),
+                        ),
+                        fx.make_layout(
+                            (m, global_tail_per_row),
+                            (k, 1),
+                        ),
+                    )
+                    a_smem_tail = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_smem),
+                            fx.make_int_tuple(vector_prefix),
+                        ),
+                        fx.make_layout(
+                            (m, global_tail_per_row),
+                            (staged_k, 1),
+                        ),
+                    )
+                    if tid < fx.Int32(global_tail_elements):
+                        row, row_tail = padded_row_coordinates(
+                            tid,
+                            m,
+                            global_tail_per_row,
+                        )
+                        a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
+                if shared_padding_elements:
+                    a_smem_padding = fx.make_view(
+                        fx.add_offset(
+                            fx.get_iter(a_smem),
+                            fx.make_int_tuple(k),
+                        ),
+                        fx.make_layout(
+                            (m, shared_padding_per_row),
+                            (staged_k, 1),
+                        ),
+                    )
+                    if tid < fx.Int32(shared_padding_elements):
+                        row, row_padding = padded_row_coordinates(
+                            tid,
+                            m,
+                            shared_padding_per_row,
+                        )
+                        a_smem_padding[row, row_padding] = arith.constant(
+                            0.0,
+                            type=T.bf16,
+                        )
+                gpu.barrier()
+            column_stride = runtime_grid_workgroups * fx.Int32(waves * columns)
             turn = fx.Int32(0)
             while turn < runtime_persistent_turns:
                 column_base = first_column + turn * column_stride
@@ -469,9 +559,9 @@ def _make_block_kernel(
                     for row in range_constexpr(m):
                         for column in range_constexpr(columns):
                             column_coord = logical_columns[column]
-                            if (
-                                lane == fx.Int32(WAVE_SIZE - 1)
-                            ) & (column_coord < fx.Int32(n)):
+                            if (lane == fx.Int32(WAVE_SIZE - 1)) & (
+                                column_coord < fx.Int32(n)
+                            ):
                                 element = (
                                     fx.Int32(row) * fx.Int32(n)
                                     + fx.Int32(column_coord)
@@ -530,34 +620,10 @@ def compile_gemm_decode_block_mfma_bf16(
     else:
         grid_workgroups = logical_workgroups
         persistent_turns = 1
-    use_lds = config.activation_source == ActivationSource.FULL_LDS
-    cache_tag = make_decode_cache_tag(
-        policy="block_mfma",
-        kernel_name=kernel_name,
-        arch=arch,
-        num_cus=num_cus or 0,
-        compile_scalars={
-            "m": m,
-            "n": n,
-            "k": k,
-            "waves_per_workgroup": config.waves_per_workgroup,
-            "columns_per_wave": config.columns_per_wave,
-            "activation_source": config.activation_source.value,
-            "b_load_width": config.b_load_width,
-            "k_unroll": config.k_unroll,
-            "prefetch_stages": config.prefetch_stages,
-            "persistent_n": config.persistent_n,
-            "workgroups_per_cu": config.workgroups_per_cu,
-            "waves_per_eu": config.waves_per_eu,
-            "b_cache_modifier": config.b_cache_modifier,
-            "output_rounding": config.output_rounding.value,
-            "block_threads": block_threads,
-            "logical_workgroups": logical_workgroups,
-            "grid_workgroups": grid_workgroups,
-            "persistent_turns": persistent_turns,
-            "use_lds": use_lds,
-            "has_bias": has_bias,
-        },
+    cache_tag = (
+        f"{kernel_name}_cus{num_cus}"
+        if config.persistent_n
+        else kernel_name
     )
 
     kernel = _make_block_kernel(
@@ -575,28 +641,47 @@ def compile_gemm_decode_block_mfma_bf16(
         else {}
     )
 
-    @flyc.jit
-    def launch(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        BIAS: fx.Tensor,
-        cache_identity: fx.Constexpr[str],
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        kernel(
-            A,
-            B,
-            C,
-            BIAS,
-            fx.Int32(grid_workgroups),
-            fx.Int32(persistent_turns),
-            value_attrs=kernel_attributes,
-        ).launch(
-            grid=(grid_workgroups, 1, 1),
-            block=(block_threads, 1, 1),
-            stream=stream,
-        )
+    if persistent_turns == 1:
+
+        @flyc.jit
+        def launch(
+            A: fx.Tensor,
+            B: fx.Tensor,
+            C: fx.Tensor,
+            BIAS: fx.Tensor,
+            cache_identity: fx.Constexpr[str],
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            kernel(A, B, C, BIAS, value_attrs=kernel_attributes).launch(
+                grid=(grid_workgroups, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.jit
+        def launch(
+            A: fx.Tensor,
+            B: fx.Tensor,
+            C: fx.Tensor,
+            BIAS: fx.Tensor,
+            cache_identity: fx.Constexpr[str],
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            kernel(
+                A,
+                B,
+                C,
+                BIAS,
+                fx.Int32(grid_workgroups),
+                fx.Int32(persistent_turns),
+                value_attrs=kernel_attributes,
+            ).launch(
+                grid=(grid_workgroups, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
 
     def launcher(
         A: fx.Tensor,
@@ -611,13 +696,12 @@ def compile_gemm_decode_block_mfma_bf16(
             raise ValueError(
                 "This decode launcher was compiled without bias support."
             )
-        launch_bias = B if bias is None else bias
         return _run_compiled(
             launch,
             A,
             B,
             C,
-            launch_bias,
+            unused_tensor_arg(bias, B),
             cache_tag,
             stream,
         )

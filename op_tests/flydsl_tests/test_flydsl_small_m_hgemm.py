@@ -13,10 +13,6 @@ pytest.importorskip("flydsl")
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.gemm_kernels import flydsl_small_m_hgemm
-from aiter.ops.flydsl.kernels.small_m_hgemm import (
-    LDS_STAGING_DIRECT,
-    LDS_STAGING_VGPR,
-)
 
 
 ARCH = get_gfx_runtime()
@@ -45,7 +41,6 @@ class Case:
     n_tile_repeat: int = 1
     persistent_n_tiles: int = 1
     b_to_lds: bool = False
-    lds_staging: str = LDS_STAGING_DIRECT
     with_bias: bool = False
 
 
@@ -79,7 +74,7 @@ CASES = [
         split_k=2,
     ),
     Case(
-        "persistent-bias-direct",
+        "persistent-bias",
         m=16,
         n=384,
         k=256,
@@ -94,17 +89,14 @@ CASES = [
 if ARCH == "gfx942":
     CASES.append(
         Case(
-            "persistent-bias-vgpr",
-            m=16,
-            n=384,
-            k=256,
-            tile_n=128,
+            "vgpr-b",
+            m=8,
+            n=128,
+            k=64,
+            tile_n=16,
             tile_k=64,
-            split_k=2,
-            persistent_n_tiles=2,
-            b_to_lds=True,
-            lds_staging=LDS_STAGING_VGPR,
-            with_bias=True,
+            block_n_warps=1,
+            b_to_lds=False,
         )
     )
 
@@ -156,7 +148,6 @@ def test_small_m_hgemm_matches_fp32_oracle(case: Case) -> None:
         n_tile_repeat=case.n_tile_repeat,
         persistent_n_tiles=case.persistent_n_tiles,
         b_to_lds=case.b_to_lds,
-        lds_staging=case.lds_staging,
     )
     torch.cuda.synchronize()
 

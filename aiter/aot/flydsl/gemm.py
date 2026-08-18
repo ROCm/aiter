@@ -17,7 +17,6 @@ Supported kernel families:
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
   - ``flydsl_decode_*``                       exact-shape BF16 decode GEMM kernels
-  - ``smallm_hgemm_*``                        gfx942/gfx950 small-M BF16 GEMM kernels
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -62,17 +61,11 @@ from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     compile_gemm_decode_bf16,
     get_flydsl_splitk_hgemm_kernel_params,
-)
-from aiter.ops.flydsl.kernels.gemm_decode_common import (
     parse_gemm_decode_kernel_name,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
-from aiter.ops.flydsl.kernels.small_m_hgemm import (
-    SMALL_M_SUPPORTED_ARCHS,
-    parse_small_m_kernel_name,
-    validate_small_m_kernel_config,
-)
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg, unused_tensor_arg
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
@@ -247,58 +240,6 @@ def parse_csv(csv_path: str):
                     seen.add(key)
                     jobs.append(job)
                 continue
-            if libtype == "flydsl_small_m":
-                if not kernel_name:
-                    raise ValueError("FlyDSL small-M CSV row requires kernelName")
-                m = int(row["M"])
-                n = int(row["N"])
-                k = int(row["K"])
-                cu_num = int(row.get("cu_num", "0"))
-                gfx = row.get("gfx", "").strip()
-                params = parse_small_m_kernel_name(kernel_name)
-                cu_arch = cu_num_to_arch(cu_num, default="")
-                if (
-                    not cu_arch
-                    or gfx not in SMALL_M_SUPPORTED_ARCHS
-                    or cu_arch != gfx
-                    or params["target_gfx"] != gfx
-                ):
-                    raise ValueError(
-                        "FlyDSL small-M AOT requires consistent architecture metadata: "
-                        f"gfx={gfx or '(unset)'}, cu_num={cu_num} "
-                        f"({cu_arch or 'unrecognized'})"
-                    )
-                if params["has_bias"] != _parse_bool(row.get("bias")):
-                    raise ValueError(
-                        "FlyDSL small-M CSV bias metadata does not match kernel name"
-                    )
-                if (params["n"], params["k"]) != (n, k):
-                    raise ValueError(
-                        "FlyDSL small-M CSV N/K does not match kernel name"
-                    )
-                if params["split_k"] != int(row.get("splitK", "0")):
-                    raise ValueError(
-                        "FlyDSL small-M CSV splitK does not match kernel name"
-                    )
-                validate_small_m_kernel_config(m, n, k, params, arch=gfx)
-                params = dict(params)
-                params["stages"] = params.pop("stage")
-                params["b_preshuffle"] = False
-                job = {
-                    "kernel_name": kernel_name,
-                    "kind": "small_m",
-                    "m": m,
-                    "n": n,
-                    "k": k,
-                    "cu_num": cu_num,
-                    "gfx": gfx,
-                    **params,
-                }
-                key = job_identity(job)
-                if key not in seen:
-                    seen.add(key)
-                    jobs.append(job)
-                continue
             if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
                 continue
 
@@ -396,12 +337,6 @@ def _compile_executable_to_cache(exe, *args) -> None:
         exe(*args)
 
 
-def _ptr_view_safe(t):
-    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-
-    return ptr_arg(t)
-
-
 def _compile_hgemm_to_cache(
     *,
     m: int,
@@ -417,21 +352,14 @@ def _compile_hgemm_to_cache(
     block_m_warps: int,
     block_n_warps: int,
     block_k_warps: int,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
     async_copy: bool,
     b_to_lds: bool,
     b_preshuffle: bool,
     c_to_lds: bool,
     target_gfx: str,
-    kernel_family: str = "hgemm",
     has_bias: bool = False,
-    lds_staging: str = "direct",
-    **kwargs,
 ):
-    del kwargs, out_dtype
+    del out_dtype
 
     import torch
 
@@ -454,12 +382,11 @@ def _compile_hgemm_to_cache(
     )
     stream = fx.Stream(0)
 
+    del target_gfx
     exe = compile_flydsl_hgemm_kernel(
         dtype,
         n,
         k,
-        target_gfx=target_gfx,
-        kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
@@ -468,29 +395,24 @@ def _compile_hgemm_to_cache(
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
         block_k_warps=block_k_warps,
-        n_tile_repeat=n_tile_repeat,
-        persistent_n_tiles=persistent_n_tiles,
-        waves_per_eu=waves_per_eu,
-        b_to_lds_unroll=b_to_lds_unroll,
         async_copy=async_copy,
         b_to_lds=b_to_lds,
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
-        lds_staging=lds_staging,
     )
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.
-    launch_bias = bias if has_bias else b
+    launch_bias = unused_tensor_arg(bias if has_bias else None, b)
     _compile_executable_to_cache(
         exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(launch_bias),
+        ptr_arg(out),
+        ptr_arg(a),
+        ptr_arg(b),
+        ptr_arg(launch_bias),
         m,
-        _ptr_view_safe(semaphore),
-        _ptr_view_safe(signal),
+        ptr_arg(semaphore),
+        ptr_arg(signal),
         stream,
     )
 
@@ -526,7 +448,7 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
+    bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
     stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm(
@@ -627,11 +549,11 @@ def _compile_mxfp8_128_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8(
-            _ptr_view_safe(out),
-            _ptr_view_safe(xq),
-            _ptr_view_safe(wq),
-            _ptr_view_safe(a_scale),
-            _ptr_view_safe(b_scale),
+            ptr_arg(out),
+            ptr_arg(xq),
+            ptr_arg(wq),
+            ptr_arg(a_scale),
+            ptr_arg(b_scale),
             m,
             stream,
             n,
@@ -684,11 +606,11 @@ def _compile_ptpc_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8(
-            _ptr_view_safe(out),
-            _ptr_view_safe(xq),
-            _ptr_view_safe(wq),
-            _ptr_view_safe(scale_a),
-            _ptr_view_safe(scale_b),
+            ptr_arg(out),
+            ptr_arg(xq),
+            ptr_arg(wq),
+            ptr_arg(scale_a),
+            ptr_arg(scale_b),
             m,
             stream,
             n,
@@ -726,28 +648,7 @@ def _compile_decode_to_cache(
     has_bias: bool = False,
     **kwargs,
 ) -> None:
-    del kwargs
-    name_arch, name_m, name_n, name_k, name_config, name_has_bias = (
-        parse_gemm_decode_kernel_name(kernel_name)
-    )
-    if (
-        name_arch,
-        name_m,
-        name_n,
-        name_k,
-        name_config,
-        name_has_bias,
-    ) != (
-        arch,
-        m,
-        n,
-        k,
-        config,
-        has_bias,
-    ):
-        raise ValueError(
-            "FlyDSL decode compile metadata does not match encoded kernel name"
-        )
+    del kwargs, kernel_name
     import torch
 
     device = torch.device("cpu")
@@ -789,7 +690,7 @@ def compile_one_config(
 
     requested_arch = kwargs.pop("arch", None)
     aot_arch = requested_arch or job_arch(cu_num, gfx)
-    if kind in {"decode", "small_m"}:
+    if kind == "decode":
         cu_arch = cu_num_to_arch(cu_num, default="")
         if not cu_arch:
             raise ValueError(
@@ -800,11 +701,6 @@ def compile_one_config(
                 f"FlyDSL {kind} AOT architecture metadata mismatch: "
                 f"arch={aot_arch}, gfx={gfx or '(unset)'}, "
                 f"cu_num={cu_num} ({cu_arch})"
-            )
-        if kind == "small_m" and aot_arch not in SMALL_M_SUPPORTED_ARCHS:
-            raise ValueError(
-                "FlyDSL small-M AOT supports "
-                f"{', '.join(sorted(SMALL_M_SUPPORTED_ARCHS))}, got {aot_arch}"
             )
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
@@ -821,10 +717,9 @@ def compile_one_config(
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            if kind in {"hgemm", "small_m"}:
-                hgemm_kwargs = dict(kwargs)
-                hgemm_kwargs["target_gfx"] = aot_arch
-                _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            if kind == "hgemm":
+                kwargs.pop("kernel_family", None)
+                _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
@@ -890,7 +785,6 @@ def main():
         print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
-    small_m_jobs = [j for j in all_jobs if j["kind"] == "small_m"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
     eightwave_jobs = [j for j in all_jobs if j["kind"] == "8wave"]
     mxfp8_128_wmma_jobs = [j for j in all_jobs if j["kind"] == "mxfp8_128_wmma"]
@@ -903,7 +797,6 @@ def main():
     for csv_path in csv_paths:
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
-    print(f"  Small-M jobs:     {len(small_m_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  8wave jobs:       {len(eightwave_jobs)}")
     print(f"  MXFP8_128 wmma jobs: {len(mxfp8_128_wmma_jobs)}")
@@ -922,7 +815,6 @@ def main():
     results = run_jobs_parallel(
         compile_one_config,
         hgemm_jobs
-        + small_m_jobs
         + preshuffle_jobs
         + eightwave_jobs
         + mxfp8_128_wmma_jobs

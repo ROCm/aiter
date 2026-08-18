@@ -38,7 +38,6 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 
 FLYDSL_TUNE_ERROR = None
-FLYDSL_SMALL_M_SUPPORTED_ARCHS = frozenset()
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
@@ -46,35 +45,22 @@ try:
             SPLIT_K_SEMAPHORE_MAX_LEN,
             WaveDecodeConfig,
             flydsl_hgemm,
-            flydsl_small_m_hgemm,
             gemm_decode_bf16,
+            gemm_decode_kernel_name,
             get_flydsl_splitk_hgemm_kernels,
             iter_gemm_decode_configs,
         )
-        from aiter.ops.flydsl.kernels.gemm_decode_common import (
-            gemm_decode_kernel_name,
-        )
-        from aiter.ops.flydsl.kernels.small_m_hgemm import (
-            SMALL_M_SUPPORTED_ARCHS,
-            iter_small_m_tuning_configs,
-            small_m_kernel_name,
-        )
-
-        FLYDSL_SMALL_M_SUPPORTED_ARCHS = SMALL_M_SUPPORTED_ARCHS
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     BlockMfmaDecodeConfig = None
     WaveDecodeConfig = None
     flydsl_hgemm = None
-    flydsl_small_m_hgemm = None
     SPLIT_K_SEMAPHORE_MAX_LEN = 256
     get_flydsl_splitk_hgemm_kernels = None
     gemm_decode_bf16 = None
     gemm_decode_kernel_name = None
     iter_gemm_decode_configs = None
-    iter_small_m_tuning_configs = None
-    small_m_kernel_name = None
     FLYDSL_TUNE_ERROR = str(exc)
 
 
@@ -469,63 +455,18 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
 def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
-    if config is None:
+    if config is None or not config.get("kernelName"):
         raise ValueError("flydsl tuning requires a kernel config")
-    stages = config.get("stages", config.get("stage", 2))
-    fused_bias = None
-    if (
-        bias is not None
-        and (otype is None or otype == input.dtype)
-        and bias.dtype == input.dtype
-    ):
-        fused_bias = bias
-    if config.get("kernel_family") == "small_m":
-        if flydsl_small_m_hgemm is None:
-            raise RuntimeError("FlyDSL small-M runtime is unavailable")
-        out = flydsl_small_m_hgemm(
-            input,
-            weight,
-            bias=fused_bias,
-            tile_n=config["tile_n"],
-            tile_k=config["tile_k"],
-            split_k=config["split_k"],
-            block_n_warps=config["block_n_warps"],
-            n_tile_repeat=config.get("n_tile_repeat", 1),
-            persistent_n_tiles=config.get("persistent_n_tiles", 1),
-            waves_per_eu=config.get("waves_per_eu", 0),
-            b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-            b_to_lds=config["b_to_lds"],
-            lds_staging=config["lds_staging"],
-        )
-    else:
-        out = flydsl_hgemm(
-            input,
-            weight,
-            bias=fused_bias,
-            kernel_family=config.get("kernel_family"),
-            tile_m=config["tile_m"],
-            tile_n=config["tile_n"],
-            tile_k=config["tile_k"],
-            split_k=config["split_k"],
-            block_m_warps=config["block_m_warps"],
-            block_n_warps=config["block_n_warps"],
-            block_k_warps=config.get("block_k_warps", 1),
-            n_tile_repeat=config.get("n_tile_repeat", 1),
-            persistent_n_tiles=config.get("persistent_n_tiles", 1),
-            waves_per_eu=config.get("waves_per_eu", 0),
-            b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-            stages=stages,
-            async_copy=config.get("async_copy", False),
-            b_to_lds=config["b_to_lds"],
-            b_preshuffle=config.get("b_preshuffle", False),
-            auto_shuffle_b=False,
-            c_to_lds=config.get("c_to_lds", False),
-        )
-    if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
+    from aiter.tuned_gemm import flydsl_gemm
+
+    return flydsl_gemm(
+        input,
+        weight,
+        0,
+        bias=bias,
+        otype=otype,
+        config=config,
+    )
 
 
 def vllm_wvsplitk_eligibility(
@@ -699,7 +640,6 @@ ALL_LIBTYPES = [
     "triton",
     "flydsl",
     "flydsl_decode",
-    "flydsl_small_m",
     "vllm_wvsplitk",
     "torch",
     "skinny",
@@ -839,7 +779,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=["all"],
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
-            "flydsl_decode, flydsl_small_m, vllm_wvsplitk, torch, skinny, opus. "
+            "flydsl_decode, vllm_wvsplitk, torch, skinny, opus. "
             "hipblaslt and comparison-only vllm_wvsplitk require their opt-in flags.",
         )
         self.parser.add_argument(
@@ -1184,13 +1124,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 "flydsl",
                 is_shuffle,
             )
+            task_config = dict(config)
+            task_config["kernelName"] = kernel_name
             tasks.append(
                 (
                     info,
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "bias"], outdtype, config),
+                    (["inp", weight_key, "bias"], outdtype, task_config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
@@ -1317,133 +1259,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
         logger.info(
             f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: "
-            f"{len(tasks)}"
-        )
-        return tasks
-
-    def _get_flydsl_small_m_tasks(
-        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
-    ):
-        if (
-            flydsl_hgemm is None
-            or iter_small_m_tuning_configs is None
-            or small_m_kernel_name is None
-        ):
-            logger.warning(f"FlyDSL small-M unavailable: {FLYDSL_TUNE_ERROR}")
-            return []
-        M, N, K = map(int, info_keys[2:5])
-        if (
-            not 1 <= M <= 16
-            or scaleAB
-            or is_shuffle
-            or indtype != dtypes.bf16
-            or outdtype != dtypes.bf16
-        ):
-            return []
-        arch = str(info_keys[0])
-        if arch not in FLYDSL_SMALL_M_SUPPORTED_ARCHS:
-            supported = ", ".join(sorted(FLYDSL_SMALL_M_SUPPORTED_ARCHS))
-            logger.info(
-                f"FlyDSL small-M unavailable for {arch}: supported architectures "
-                f"are {supported}"
-            )
-            return []
-        runtime_arch = get_gfx_runtime()
-        if arch != runtime_arch:
-            raise ValueError(
-                f"FlyDSL small-M tuner row targets {arch}, "
-                f"but the runtime device is {runtime_arch}"
-            )
-        configs = list(
-            iter_small_m_tuning_configs(
-                "bf16",
-                "bf16",
-                m=M,
-                n=N,
-                k=K,
-                max_configs=256,
-            )
-        )
-        if getattr(self, "candidate_policy", "bounded") == "bounded":
-            configs = [config for config in configs if config["split_k"] <= 2]
-
-            def small_m_bucket(config):
-                if config["persistent_n_tiles"] > 1:
-                    path = "persistent"
-                elif config["n_tile_repeat"] > 1:
-                    path = "repeat"
-                elif config["b_to_lds"]:
-                    path = "b_to_lds"
-                else:
-                    path = "direct"
-                return path, config["lds_staging"], config["split_k"]
-
-            configs = _round_robin_representatives(
-                configs,
-                limit=16,
-                bucket_key=small_m_bucket,
-                priority_key=lambda config: (
-                    config["tile_n"] != 128,
-                    config["tile_k"] != 64,
-                    config["block_n_warps"] != 2,
-                    config["waves_per_eu"] != 2,
-                    config["b_to_lds_unroll"] not in (0, 8),
-                    tuple(sorted(config.items())),
-                ),
-            )
-        tasks = []
-        small_m_run_kwargs = dict(run_kwargs)
-        small_m_run_kwargs["use_cuda_event"] = True
-        for solidx, config in enumerate(configs):
-            config = dict(config)
-            config["block_k_warps"] = 1
-            kernel_name = small_m_kernel_name(
-                "bf16",
-                N,
-                K,
-                target_gfx=config["target_gfx"],
-                tile_n=config["tile_n"],
-                tile_k=config["tile_k"],
-                split_k=config["split_k"],
-                block_n_warps=config["block_n_warps"],
-                n_tile_repeat=config["n_tile_repeat"],
-                persistent_n_tiles=config["persistent_n_tiles"],
-                waves_per_eu=config["waves_per_eu"],
-                b_to_lds_unroll=config["b_to_lds_unroll"],
-                b_to_lds=config["b_to_lds"],
-                has_bias=has_bias,
-                lds_staging=config["lds_staging"],
-            )
-            info = (
-                info_keys,
-                solidx,
-                config["split_k"],
-                kernel_name,
-                "flydsl_small_m",
-                False,
-            )
-            tasks.append(
-                (
-                    info,
-                    generate_data,
-                    (M, N, K, indtype, outdtype, False, False, 0, has_bias),
-                    run_flydsl_gemm_bf16,
-                    (["inp", "weights", "bias"], outdtype, config),
-                    small_m_run_kwargs,
-                    get_gemm_ref,
-                    (
-                        ["inp", "weights", "bias", "x_scale", "w_scale"],
-                        indtype,
-                        outdtype,
-                    ),
-                    {},
-                    None,
-                    0.01,
-                    0.125,
-                )
-            )
-        logger.info(
-            f"FlyDSL small-M candidate count for M={M}, N={N}, K={K}: "
             f"{len(tasks)}"
         )
         return tasks
@@ -1720,8 +1535,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_flydsl_tasks(*common))
             if "all" in libtype or "flydsl_decode" in libtype:
                 task.extend(self._get_flydsl_decode_tasks(*common))
-            if "all" in libtype or "flydsl_small_m" in libtype:
-                task.extend(self._get_flydsl_small_m_tasks(*common))
             if with_vllm_wvsplitk and (
                 "all" in libtype or "vllm_wvsplitk" in libtype
             ):

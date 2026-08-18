@@ -6,9 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-import hashlib
 from itertools import product
-import json
 import re
 from typing import Iterator, TypeAlias
 
@@ -21,6 +19,9 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
+
+from .tensor_shim import _to_raw as raw
 
 
 # Host configuration, validation, naming, and enumeration.
@@ -39,31 +40,6 @@ def validate_cache_policy(cache_policy: int) -> None:
         raise TypeError("cache policy must be an integer")
     if cache_policy < 0 or cache_policy & ~_CACHE_POLICY_MASK:
         raise ValueError(f"unsupported cache policy: {cache_policy:#x}")
-
-
-def make_decode_cache_tag(
-    *,
-    policy: str,
-    kernel_name: str,
-    arch: str,
-    num_cus: int,
-    compile_scalars: dict,
-) -> str:
-    """Return one scalar identity for explicit decode compile-time configuration."""
-    payload = {
-        "policy": policy,
-        "kernel_name": kernel_name,
-        "arch": arch,
-        "num_cus": num_cus,
-        "compile_scalars": compile_scalars,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-class DecodePolicy(str, Enum):
-    WAVE = "wave"
-    BLOCK_MFMA = "block"
 
 
 class OutputRounding(str, Enum):
@@ -143,10 +119,6 @@ class WaveDecodeConfig:
     contraction: ContractionMode = ContractionMode.SCALAR_F32
     output_rounding: OutputRounding = OutputRounding.RNE
 
-    @property
-    def policy(self) -> DecodePolicy:
-        return DecodePolicy.WAVE
-
     def validate(self, *, m: int, n: int, k: int, arch: str) -> None:
         traits = get_decode_arch_traits(arch)
         _validate_problem(m, n, k)
@@ -201,10 +173,6 @@ class BlockMfmaDecodeConfig:
     b_cache_modifier: int = CACHE_POLICY_DEFAULT
     output_rounding: OutputRounding = OutputRounding.RNE
 
-    @property
-    def policy(self) -> DecodePolicy:
-        return DecodePolicy.BLOCK_MFMA
-
     def validate(self, *, m: int, n: int, k: int, arch: str) -> None:
         traits = get_decode_arch_traits(arch)
         _validate_problem(m, n, k)
@@ -245,10 +213,11 @@ class BlockMfmaDecodeConfig:
                 raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.activation_source == ActivationSource.FULL_LDS:
             required = block_mfma_lds_bytes(m, k)
-            if required > traits.max_lds_bytes:
+            lds_limit = addressable_lds_bytes_for_gfx(arch)
+            if required > lds_limit:
                 raise ValueError(
                     f"full A LDS requires {required} bytes, exceeding the "
-                    f"{traits.max_lds_bytes}-byte {arch} limit"
+                    f"{lds_limit}-byte {arch} limit"
                 )
         # Keep the exact five-row/c4 body below the validated accumulator budget.
         if m * self.columns_per_wave > 20:
@@ -878,16 +847,6 @@ def k_element(
 
 
 # Compiler-sensitive numeric, MFMA, DPP, and tail helpers.
-def raw(value):
-    if isinstance(value, ir.Value):
-        return value
-    if hasattr(value, "ir_value"):
-        return raw(value.ir_value())
-    if hasattr(value, "value"):
-        return raw(value.value)
-    return value
-
-
 def const_bf16(value: float = 0.0):
     return arith_dialect.ConstantOp(
         ir.BF16Type.get(),
@@ -1119,7 +1078,6 @@ def masked_bf16_vector(
     width: int,
     row_size: int,
     cache_modifier: int = 0,
-    row_valid=None,
 ):
     """Load a compile-time BF16 vector with safe N/K tail masking."""
     zero = const_bf16()
@@ -1127,15 +1085,10 @@ def masked_bf16_vector(
     for offset in range_constexpr(width):
         column = column_base + fx.Int32(offset)
         valid = column < fx.Int32(row_size)
-        if row_valid is not None:
-            valid = valid & row_valid
         safe_column = ArithValue(raw(valid)).select(column, fx.Int32(0))
-        safe_row = row
-        if row_valid is not None:
-            safe_row = ArithValue(raw(row_valid)).select(row, fx.Int32(0))
         loaded = load_scalar(
             tensor,
-            safe_row,
+            row,
             safe_column,
             row_size,
             cache_modifier,

@@ -130,12 +130,16 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
+def collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
+    """Return the package-default, deduplicated jobs for one operation kind.
+
+    Importing .gemm / .moe / .chunk_gdn_h here also runs their module-level
+    imports, which pull in FlyDSL (e.g. ``flydsl.expr``). Job collection is
+    therefore not free in the parent process, just shifted once out of every
+    child.
+    """
+    if not isinstance(kind, OpKind):
+        raise TypeError(f"kind must be an OpKind, got {kind!r}")
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
@@ -149,13 +153,6 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
-
-
-def collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Return the package-default, deduplicated jobs for one operation kind."""
-    if not isinstance(kind, OpKind):
-        raise TypeError(f"kind must be an OpKind, got {kind!r}")
-    return _collect_aot_jobs_for(kind)
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:

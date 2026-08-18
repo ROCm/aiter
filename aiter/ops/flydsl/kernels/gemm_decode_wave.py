@@ -20,7 +20,6 @@ from .gemm_decode_common import (
     load_vector,
     make_buffer_matrix,
     make_buffer_vector,
-    make_decode_cache_tag,
     masked_bf16_vector,
     pack_bf16x2,
     prepare_pair,
@@ -29,7 +28,7 @@ from .gemm_decode_common import (
     wave_lane_coordinates,
     zero_wave_accumulator,
 )
-from .tensor_shim import _run_compiled
+from .tensor_shim import _run_compiled, unused_tensor_arg
 
 
 def _accumulate_vectors(
@@ -95,28 +94,7 @@ def compile_gemm_decode_wave_bf16(
     # output columns in Y. Multi-row waves keep columns in X.
     use_column_grid_y = mp == 1
     store_lane = 63 if config.reduction == ReductionMode.DPP else 0
-    cache_tag = make_decode_cache_tag(
-        policy="wave",
-        kernel_name=kernel_name,
-        arch=arch,
-        num_cus=0,
-        compile_scalars={
-            "m": m,
-            "n": n,
-            "k": k,
-            "m_per_wave": config.m_per_wave,
-            "n_per_wave": config.n_per_wave,
-            "kvec": config.kvec,
-            "prefetch_depth": config.prefetch_depth,
-            "waves_per_eu": config.waves_per_eu,
-            "b_cache_modifier": config.b_cache_modifier,
-            "reduction": config.reduction.value,
-            "contraction": config.contraction.value,
-            "output_rounding": config.output_rounding.value,
-            "use_column_grid_y": use_column_grid_y,
-            "has_bias": has_bias,
-        },
-    )
+    cache_tag = kernel_name
 
     @flyc.kernel(name=kernel_name, known_block_size=[64, 1, 1])
     def wave_decode_kernel(
@@ -362,13 +340,12 @@ def compile_gemm_decode_wave_bf16(
             raise ValueError(
                 "This decode launcher was compiled without bias support."
             )
-        launch_bias = B if bias is None else bias
         return _run_compiled(
             launch,
             A,
             B,
             C,
-            launch_bias,
+            unused_tensor_arg(bias, B),
             cache_tag,
             stream,
         )
