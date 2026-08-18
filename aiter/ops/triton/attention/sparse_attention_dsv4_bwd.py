@@ -81,7 +81,9 @@ def sparse_mla_bwd_dsv4(
                       runs unchunked, which is what you want. Chunking exists only to bound the
                       ``interm`` intermediate, which is ``T*TOPK*512`` bf16 (2.0 GiB at
                       T=4096, TOPK=512); it costs a dQ read-modify-write between chunks and one
-                      CSR build per chunk. Any multiple of 32 is accepted.
+                      CSR build per chunk. Must be a multiple of 32 (the mfma tile width) and
+                      must divide ``TOPK`` -- a partial tail chunk is rejected rather than
+                      handled, since the chunk width is a kernel constexpr.
 
     Returns:
         dq [T, H, 512] bf16, dkv [num_kv, 512] bf16, d_sink [H] fp32 (None if no ``attn_sink``)
@@ -116,6 +118,18 @@ def sparse_mla_bwd_dsv4(
     assert (
         tk_dkv is not None and tk_dq is not None
     ), f"R_CHUNK={R_CHUNK} must be a multiple of 32 (it is the mfma tile width)"
+
+    # A tail chunk narrower than R_CHUNK is wrong in three places at once. The kernels take
+    # R_CHUNK as a constexpr and mask the top-k load against it rather than against TOPK, so
+    # they read past the end of each row -- into the next token's indices for tokens 0..T-2,
+    # and past the tensor entirely for the last one (measured: that faults the GPU). The CSR
+    # build meanwhile gets a torch-clamped, narrower slice, and the gather then indexes interm,
+    # which is still R_CHUNK wide, with entries encoded against that narrower width. Require
+    # the divisor rather than paying a second compile for a narrower tail.
+    assert TOPK % R_CHUNK == 0, (
+        f"R_CHUNK={R_CHUNK} must divide TOPK={TOPK} -- a partial tail chunk reads past the end "
+        "of each top-k row and desynchronizes the CSR index space from interm"
+    )
 
     delta = delta_v4(o, do)
 

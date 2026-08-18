@@ -123,15 +123,35 @@ def test_sparse_mla_bwd_dsv4(T, H, topk, npool, has_sink, r_chunk):
         assert d_sink is None
 
 
+def _dummy_inputs(T=64, H=64, topk=64, dev="cuda"):
+    return dict(
+        q=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        kv=torch.randn(T, D, device=dev, dtype=torch.bfloat16),
+        do=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        o=torch.randn(T, H, D, device=dev, dtype=torch.bfloat16),
+        lse=torch.randn(T, H, device=dev, dtype=torch.float32),
+        idx=torch.randint(0, T, (T, topk), dtype=torch.int32, device=dev),
+    )
+
+
 def test_sparse_mla_bwd_dsv4_rejects_bad_chunk():
     """R_CHUNK must be a multiple of the mfma tile width."""
-    dev = "cuda"
-    T, H, topk = 64, 64, 64
-    q = torch.randn(T, H, D, device=dev, dtype=torch.bfloat16)
-    kv = torch.randn(T, D, device=dev, dtype=torch.bfloat16)
-    do = torch.randn(T, H, D, device=dev, dtype=torch.bfloat16)
-    o = torch.randn(T, H, D, device=dev, dtype=torch.bfloat16)
-    lse = torch.randn(T, H, device=dev, dtype=torch.float32)
-    idx = torch.randint(0, T, (T, topk), dtype=torch.int32, device=dev)
+    t = _dummy_inputs(topk=64)
     with pytest.raises(AssertionError, match="multiple of 32"):
-        sparse_mla_bwd_dsv4(q, kv, do, o, lse, idx, R_CHUNK=48)
+        sparse_mla_bwd_dsv4(
+            t["q"], t["kv"], t["do"], t["o"], t["lse"], t["idx"], R_CHUNK=48
+        )
+
+
+def test_sparse_mla_bwd_dsv4_rejects_indivisible_chunk():
+    """A chunk width that is a valid tile multiple but does not divide TOPK is still rejected.
+
+    96 = 3*32 so it clears the tile-width check, but 128 % 96 == 32 would leave a 32-wide tail
+    chunk. The kernels take the chunk width as a constexpr and would read past the end of each
+    top-k row, silently, so this is an error rather than a handled case.
+    """
+    t = _dummy_inputs(topk=128)
+    with pytest.raises(AssertionError, match="must divide TOPK"):
+        sparse_mla_bwd_dsv4(
+            t["q"], t["kv"], t["do"], t["o"], t["lse"], t["idx"], R_CHUNK=96
+        )
