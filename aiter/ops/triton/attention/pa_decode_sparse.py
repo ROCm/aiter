@@ -533,19 +533,12 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
         # split still owns a real run of tiles. At C=256 extra=8 (2 tiles) forcing
         # a split costs 31%; at extra=2048 (32 tiles) it saves 19%.
         return max(1, min(cta_cap, tiles // 4))
-    if tiles <= cta_cap:
-        return max(1, tiles)
-    # The cap binds, so every split owns several tiles and the only question is
-    # whether the last one is partial. S * ceil(tiles/S) is the number of tiles
-    # actually executed: at 18 tiles, S=8 runs 24 of them and S=6 runs 18. Take the
-    # largest S in range that executes the fewest -- largest because, ties aside,
-    # more programs is more memory parallelism.
-    best_s, best_cost = 1, tiles
-    for s in range(2, cta_cap + 1):
-        cost = s * math.ceil(tiles / s)
-        if cost <= best_cost:
-            best_s, best_cost = s, cost
-    return best_s
+    # Deliberately NOT refined toward split counts that divide `tiles` evenly.
+    # Minimizing the executed tile count S*ceil(tiles/S) is only right for a
+    # uniform batch -- it is worth ~5% on the 1-loop seq=1152 shape -- but `tiles`
+    # here is a batch AVERAGE, and wall clock is set by the longest query. On a
+    # 16x-ragged batch that refinement picks 5 splits where 8 is 22% faster.
+    return max(1, min(cta_cap, tiles))
 
 
 def _pa_decode_sparse_gfx950_gluon(
@@ -763,6 +756,13 @@ def _pa_decode_sparse_gfx950_gluon(
     if _ms:
         main_splits = max(1, min(num_splits, int(_ms)))
 
+    # AITER_PA_DECODE_ADAPTIVE: per-query split count decided in-kernel. Only
+    # meaningful when there is more than one split to give back.
+    adaptive_splits = (
+        num_splits > 1
+        and _os.environ.get("AITER_PA_DECODE_ADAPTIVE", "1") == "1"
+    )
+
     grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
         q,
@@ -814,6 +814,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         MAIN_SPLITS=main_splits,
+        ADAPTIVE_SPLITS=adaptive_splits,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         HAS_INVALID=has_invalid,
@@ -860,6 +861,7 @@ def _pa_decode_sparse_gfx950_gluon(
         BLOCK_M=red_block_m,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=num_heads % red_block_m == 0,
+        ADAPTIVE_SPLITS=adaptive_splits,
         num_warps=red_warps,
     )
     return out

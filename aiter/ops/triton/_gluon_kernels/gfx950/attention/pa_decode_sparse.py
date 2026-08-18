@@ -847,6 +847,8 @@ def _pa_decode_sparse(
     # tiles and extra keep going; programs with split_id >= MAIN_SPLITS get an
     # empty main range and contribute an extra-only partial.
     MAIN_SPLITS: gl.constexpr,
+    # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
+    ADAPTIVE_SPLITS: gl.constexpr,
     # Per-cache buffer/global gate. buffer_load carries a 32-bit offset, so a cache
     # whose span exceeds that must gather via 64-bit gl.load -- but the two caches
     # are sized independently (SWA window vs full compressed history), so gating
@@ -971,11 +973,59 @@ def _pa_decode_sparse(
     RCP_LN2: gl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    # ---- main (SWA) segment ----
+    # ---- segment lengths ----
     main_start = gl.load(main_indptr_ptr + query_idx)
     main_end = gl.load(main_indptr_ptr + query_idx + 1)
     main_len = main_end - main_start
-    main_chunk = (main_len + MAIN_SPLITS - 1) // MAIN_SPLITS
+    if HAS_EXTRA:
+        extra_start = gl.load(extra_indptr_ptr + query_idx)
+        extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+    else:
+        extra_start = 0
+        extra_len = 0
+
+    # ---- how many of the launched splits this query actually wants ----
+    # NUM_SPLITS / MAIN_SPLITS come from the host, which only knows the batch's
+    # AVERAGE segment lengths. In a ragged batch (the SWA window saturates at
+    # sliding_window while top-k keeps growing with context) the per-query lengths
+    # differ a lot, and a split count sized for the average over-splits the short
+    # queries -- each surplus program still gathers a mostly-masked tile and writes
+    # a full [BLOCK_M, HEAD_SIZE] f32 partial. Recompute the useful count from this
+    # query's own lengths and let the surplus programs write a neutral partial and
+    # leave. The reduce skips a split whose m is -inf, so their part_acc is never
+    # read and does not have to be written.
+    if ADAPTIVE_SPLITS:
+        m_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
+        e_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
+        work_splits = gl.minimum(gl.maximum(gl.maximum(m_tiles, e_tiles), 1), NUM_SPLITS)
+        main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
+        if split_id >= work_splits:
+            pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
+            gl.amd.cdna4.buffer_store(
+                gl.full(
+                    [BLOCK_M],
+                    float("-inf"),
+                    gl.float32,
+                    layout=gl.SliceLayout(1, pv_layout),
+                ),
+                ptr=part_m_ptr + pm_base,
+                offsets=h_pv.to(gl.int32),
+                mask=head_mask_pv,
+            )
+            gl.amd.cdna4.buffer_store(
+                gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, pv_layout)),
+                ptr=part_l_ptr + pm_base,
+                offsets=h_pv.to(gl.int32),
+                mask=head_mask_pv,
+            )
+            return
+    else:
+        work_splits = NUM_SPLITS
+        main_splits = MAIN_SPLITS
+
+    # ---- main (SWA) segment ----
+    main_chunk = (main_len + main_splits - 1) // main_splits
     main_lo = gl.minimum(split_id * main_chunk, main_len)
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
     m_i, l_i, acc = _process_segment(
@@ -1019,10 +1069,7 @@ def _pa_decode_sparse(
     )
 
     if HAS_EXTRA:
-        extra_start = gl.load(extra_indptr_ptr + query_idx)
-        extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
-        extra_len = extra_end - extra_start
-        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_chunk = (extra_len + work_splits - 1) // work_splits
         extra_lo = split_id * extra_chunk
         extra_hi = gl.minimum(extra_lo + extra_chunk, extra_len)
         m_i, l_i, acc = _process_segment(
@@ -1143,6 +1190,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_M: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
+    ADAPTIVE_SPLITS: gl.constexpr,
 ):
     """Split-KV combine: merge the per-split partials, fold the attn sink, and write
     the final output. Partials store m in the base-2 exponent domain (row-max *
@@ -1179,6 +1227,11 @@ def _pa_decode_sparse_reduce(
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, BLK))
 
     neg_inf = float("-inf")
+    # NOT made adaptive. Bounding these loops by the per-query split count instead
+    # of NUM_SPLITS turns them into dynamic loops, and losing the static unroll
+    # costs 5-7% on a uniform batch -- more than the ~0.9 us it saves when the
+    # launch over-splits. The acc load is masked on m > -inf instead, which is
+    # what actually has to be right (a split that bowed out wrote no accumulator).
     m_final = gl.full([BLOCK_M], neg_inf, gl.float32, layout=row_l)
     # pass 1: global max over splits
     for s in range(NUM_SPLITS):
@@ -1208,8 +1261,15 @@ def _pa_decode_sparse_reduce(
         l_final = l_final + w * l_s
         a_base = query_idx * pa_stride0 + s * pa_stride_s
         a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
+        # An adaptive-split program that bowed out wrote m = -inf and no
+        # accumulator, so its part_acc slot is uninitialized -- mask the load
+        # rather than relying on w == 0 (0 * NaN is NaN).
+        if ADAPTIVE_SPLITS:
+            acc_mask = head_mask[:, None] & (m_s > neg_inf)[:, None]
+        else:
+            acc_mask = head_mask[:, None]
         acc_s = gl.amd.cdna4.buffer_load(
-            ptr=part_acc_ptr, offsets=a_off, mask=head_mask[:, None], other=0.0
+            ptr=part_acc_ptr, offsets=a_off, mask=acc_mask, other=0.0
         )
         acc = acc + w[:, None] * acc_s
 
