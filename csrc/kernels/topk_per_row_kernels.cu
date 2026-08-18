@@ -523,6 +523,11 @@ __global__ void radix_kernel_persistent(T const* in,
                 __atomic_store_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done),
                                  static_cast<unsigned int>(pass + 1), __ATOMIC_RELEASE);
             }
+            // Waiting blocks acquire pass_done and invalidate their cache before
+            // reloading the global histogram. The elected block does not take
+            // that path, so give it equivalent device-scope visibility here.
+            __threadfence();
+            __syncthreads();
         }
         else
         {
