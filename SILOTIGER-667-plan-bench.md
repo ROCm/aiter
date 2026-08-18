@@ -389,10 +389,26 @@ the same math** — no cell needs to be marked n/a on equivalence grounds. Detai
 - [x] Checked-in artifact: `tickets/667/g9_compare.{md,csv}` (of-record, repeats=3). Reproduce
       with `bash tickets/667/harness/run_g9_compare.sh`.
 
-#### D7 — (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs  [ ]
+#### D7 — (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs  [~] D7-lite DONE (2026-08-18); FP4 leg deferred
 Both harnesses are currently **perf-only** (CK runs uninitialized weights + dummy scales;
 timing is data-independent so this doesn't affect perf). This item = "convert CK to real
 weights" and validate. Est **~2–3 days**, dominated by FP4 pack/scale convention-matching.
+
+**D7-lite done (2026-08-18) — FP8 + BF16 legs verified.** Added a `CK_WD_VALIDATE=1` path to
+`ck_bench_warp_decode.cpp` that, for `gate_bf16_d2` / `gate_fp8_d2` / `down_h2_d2`, host-quantizes
+real inputs (`type_convert<fp8_t>` = OCP e4m3 = torch `float8_e4m3fn`), runs each kernel **once**
+functionally, and dumps the *exact* input bytes + GPU output to `ck_validate_dump/`. A Python
+validator (`tickets/667/harness/validate.py`) reloads the identical bytes, rebuilds the torch
+reference (same math as the FlyDSL op-test refs), and compares. Result on a small
+`B4/H512/I512/K2/E8` shape (satisfies the kernels' `%512` / Block2D `%128` gates):
+**all three cos = 0.999999**, max Δ ≤ 0.35% of max (pure bf16 rounding). Scales are a single
+uniform constant per operand (`wscale=xscale=0.5`), so the check is independent of CK's internal
+Block2D scale-index layout — it validates the matmul + fp8 dequant + silu + router-weight math.
+Wired as `run_g9_compare.sh --validate` (build-if-needed → dump → torch compare, non-zero exit on
+divergence); perf runs are untouched (the flag returns before the timing loop). Dumps are
+git-ignored (regenerated on demand).
+
+**Still deferred (full D7):** the FP4 leg + per-block (non-uniform) scale-layout validation.
 Steps:
 - [ ] **Init real inputs per shape** on-device (small fill / hiprand) rather than multi-GB
       H2D — the pools are ~3.75 GB each (DeepSeek gate/up). Behind a `CK_WD_VALIDATE` flag so
@@ -477,6 +493,13 @@ DeepSeek FP8 (`down`+`gate_up bf16-act`) via **B5** (E256 Tier-2 i64 base), and
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-18 — **D7-lite done — CK outputs numerically cross-checked (FP8 + BF16).** Added a
+  `CK_WD_VALIDATE=1` dump path to `ck_bench_warp_decode.cpp` (host-quantized real inputs, one
+  functional launch, dumps exact input bytes + GPU output for `gate_bf16_d2`/`gate_fp8_d2`/
+  `down_h2_d2`) + a `validate.py` torch cross-check that rebuilds the reference on the identical
+  bytes. **All three cos=0.999999** (max Δ ≤0.35% of max = bf16 rounding) at B4/H512/I512/K2/E8.
+  Uniform per-operand scales make it layout-independent; wired as `run_g9_compare.sh --validate`,
+  perf path untouched. FP4 leg + non-uniform scale-layout validation stay deferred (full D7 / B1).
 - 2026-08-18 — **B3 follow-up done — warm benches migrated to `compute_metrics`.** Dropped the
   inline `outputs`/`flops`/`wbytes`/`tbs` accounting from `bench_gate_up`, `bench_down`, and
   `bench_down_fp4`; each now derives TFLOPS/TB-s/%peak from `compute_metrics(..., weight_stream)`,
