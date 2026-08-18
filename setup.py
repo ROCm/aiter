@@ -248,12 +248,16 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
+            # Exclude tune modules; for MHA keep fmha_v3 fwd variants and:
+            #  - gfx950 bf16 opus fwd kernel (MLA prefill); if not prebuilt it
+            #    JIT-builds at runtime with a pybind ABI that mismatches the
+            #    prebuilt core, so its aiter_tensor_t args get rejected.
             if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
                 "module_fmha_v3_varlen_fwd",
+                "module_fmha_fwd_bf16_opus",
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
