@@ -73,6 +73,8 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
     MODEL_CACHE_ARGS+=" -e HF_TOKEN"
 fi
 
+DISAGG_ENV_ARGS="-e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-600}"
+
 AITER_MOUNT_ARGS=""
 if [[ -n "${AITER_SOURCE_DIR:-}" ]]; then
     AITER_MOUNT_ARGS=" -v $AITER_SOURCE_DIR:/aiter-under-test:ro"
@@ -95,7 +97,7 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 128g --privileged \\
 --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \\
 --security-opt seccomp=unconfined \\
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \\
--v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $MODEL_CACHE_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
+-v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $MODEL_CACHE_ARGS $DISAGG_ENV_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
 DOCKER_DOWNLOAD_COMMON="--rm --network host --ipc host --shm-size 32g \\
 --security-opt seccomp=unconfined \\
 -v $WORKDIR:/ci_workdir $MODEL_DOWNLOAD_MOUNT_ARGS $MODEL_CACHE_ARGS"
@@ -650,11 +652,42 @@ docker rm -f mi355x_bench 2>/dev/null || true
     )
     text = replace_once(
         text,
+        "      python3 -m sglang.bench_serving --backend sglang \\\n",
+        "      BENCH_RC=0\n"
+        "      python3 -m sglang.bench_serving --backend sglang \\\n",
+    )
+    text = replace_once(
+        text,
         """        --num-prompts \\$((C*$NPF)) --warmup-requests \\$C \\
         --output-file \\$OUT || true
 """,
         """        --num-prompts \\$((C*$NPF)) --warmup-requests \\$C \\
-        --output-file "\\$OUT" || true
+        --output-file "\\$OUT" || BENCH_RC=\\$?
+      python3 - "\\$OUT" "\\$((C*$NPF))" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected = int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+except FileNotFoundError:
+    raise SystemExit(f"[bench] ERROR: missing raw result file: {path}")
+if not rows:
+    raise SystemExit(f"[bench] ERROR: empty raw result file: {path}")
+completed = int(rows[-1].get("completed") or 0)
+if completed != expected:
+    raise SystemExit(
+        f"[bench] ERROR: incomplete result for {path}: "
+        f"completed={completed}, expected={expected}"
+    )
+print(f"[bench] completed all {completed}/{expected} requests for {path}")
+PY
+      if [ "\\$BENCH_RC" -ne 0 ]; then
+        echo "[bench] ERROR: bench_serving exited with rc=\\$BENCH_RC for concurrency=\\$C"
+        exit "\\$BENCH_RC"
+      fi
 """,
     )
     text = replace_once(

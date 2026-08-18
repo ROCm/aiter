@@ -49,6 +49,11 @@ on:
         required: false
         type: string
         default: "1,8,16,32,64,128,256"
+      sglang_disaggregation_waiting_timeout:
+        description: "Seconds to wait for disaggregation KV transfer completion"
+        required: false
+        type: string
+        default: "600"
       run_accuracy:
         description: "Run the GSM8K correctness gate before the perf sweep"
         required: false
@@ -85,9 +90,12 @@ env:
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
+  SLURM_NODELIST_PREFERRED: >-
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
   SLURM_PARTITION_DEFAULT: ""
   SLURM_EXCLUSIVE_DEFAULT: "1"
   CONC_LIST_DEFAULT: "1,8,16,32,64,128,256"
+  SGLANG_DISAGGREGATION_WAITING_TIMEOUT_DEFAULT: "600"
   RUN_ACCURACY_DEFAULT: "true"
   TIME_LIMIT_DEFAULT: "02:30:00"
 
@@ -141,6 +149,10 @@ jobs:
               "SLURM_PARTITION_OVERRIDE": value("slurm_partition", "SLURM_PARTITION_DEFAULT"),
               "SLURM_EXCLUSIVE_OVERRIDE": value("slurm_exclusive", "SLURM_EXCLUSIVE_DEFAULT"),
               "CONC_LIST": value("conc_list", "CONC_LIST_DEFAULT"),
+              "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": value(
+                  "sglang_disaggregation_waiting_timeout",
+                  "SGLANG_DISAGGREGATION_WAITING_TIMEOUT_DEFAULT",
+              ),
               "RUN_ACCURACY": value("run_accuracy", "RUN_ACCURACY_DEFAULT"),
               "TIME_LIMIT_OVERRIDE": value("time_limit", "TIME_LIMIT_DEFAULT"),
           }
@@ -156,10 +168,33 @@ jobs:
               if node.strip()
           ]
           blocked_set = set(blocked_nodes)
+          preferred_nodes = [
+              node.strip()
+              for node in os.environ.get("SLURM_NODELIST_PREFERRED", "").split(",")
+              if node.strip()
+          ]
+          preferred_set = set(preferred_nodes)
+          unknown_preferred = [
+              node for node in preferred_nodes if node not in set(allowed_nodes)
+          ]
+          if unknown_preferred:
+              raise SystemExit(
+                  "SLURM_NODELIST_PREFERRED contains non-approved nodes: "
+                  + ", ".join(unknown_preferred)
+              )
+          selection_nodes = preferred_nodes + [
+              node for node in allowed_nodes if node not in preferred_set
+          ]
           print(
               "approved Slurm/SPUR node pool: " + ", ".join(allowed_nodes),
               file=sys.stderr,
           )
+          if preferred_nodes:
+              print(
+                  "preferred Slurm/SPUR auto-selection order: "
+                  + ", ".join(preferred_nodes),
+                  file=sys.stderr,
+              )
           if blocked_nodes:
               print(
                   "blocked Slurm/SPUR nodes for auto selection: "
@@ -189,7 +224,7 @@ jobs:
                       node_state[parts[0]] = parts[3].lower()
                   idle_nodes = [
                       node
-                      for node in allowed_nodes
+                      for node in selection_nodes
                       if node not in blocked_set
                       and node_state.get(node, "").startswith("idle")
                   ]
@@ -335,6 +370,7 @@ jobs:
             echo "- Slurm reservation: \`${SLURM_RESERVATION_OVERRIDE:-none}\`"
             echo "- Shared workspace: \`${SHARED_ROOT}\`"
             echo "- Concurrency list: \`${CONC_LIST}\`"
+            echo "- Disaggregation waiting timeout: \`${SGLANG_DISAGGREGATION_WAITING_TIMEOUT}s\`"
             echo "- GSM8K gate: \`${RUN_ACCURACY}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -381,6 +417,7 @@ jobs:
           export MODEL_PATH="${MODEL_PATH_OVERRIDE}"
           export MODEL_MOUNT_ROOTS="${MODEL_MOUNT_ROOTS}"
           export SGLANG_SPUR_IB_DEVICES="${SGLANG_SPUR_IB_DEVICES}"
+          export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT}"
           export IMAGE_OVERRIDE="${IMAGE_OVERRIDE}"
           export SLURM_NODELIST="${SLURM_NODELIST_OVERRIDE}"
           export SLURM_RESERVATION="${SLURM_RESERVATION_OVERRIDE}"
