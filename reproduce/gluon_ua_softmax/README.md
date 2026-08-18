@@ -29,21 +29,31 @@ python repro.py --fixed
 python repro.py --broken
 ```
 
-Requires a gfx950 (MI355X) device. An LLVM abort kills the process (rc 134), so the two
-paths must run in separate processes.
+Requires a gfx950 (MI355X) device and a triton 3.8. An LLVM abort kills the process, so the
+two paths must run in separate processes.
 
-## Expected
+## Result
 
-| triton | `--fixed` | `--broken` |
-|---|---|---|
-| 3.8 | compiles and runs | **SIGABRT (rc 134)** in codegen |
-| 3.7 | compiles and runs | compiles and runs |
+| triton | LLVM | `--fixed` | `--broken` |
+|---|---|---|---|
+| 3.8.0 `1f0a8cfc` (main, 2026-08-18) | `b010a18d` | compiles and runs | **SIGABRT, rc 134** |
+| 3.7.1 `0263a6a6` (ROCm 7.14) | `1f126a6d` | compiles and runs | compiles and runs |
 
-On 3.8 (assertions on) the abort is:
+The abort:
 
 ```
-GCNRewritePartialRegUses.cpp:384: Assertion `NewLI.verify(MRI)' failed
+llvm/lib/Target/AMDGPU/GCNRewritePartialRegUses.cpp:384:
+GCNRewritePartialRegUsesImpl::updateLiveIntervals(...):
+  Assertion `NewLI.verify(MRI)' failed.
 ```
+
+**Still present on today's main.** It was first seen on 3.8.0 `71d3f5cf` (2026-07-29, LLVM
+`850a2b1b`); triton has since bumped its LLVM pin to `b010a18d` (triton `640190e`, "Pin LLVM
+at b010a18d", #11163) and the abort is unchanged, so this is a retest against newer LLVM
+rather than the same build twice.
+
+Assertions are enabled in triton's prebuilt LLVM, so the failure is loud. Whether the same
+IR miscompiles silently in a no-assertions build has not been checked.
 
 ## Config
 
