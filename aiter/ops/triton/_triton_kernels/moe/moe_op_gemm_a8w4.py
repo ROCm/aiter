@@ -8,6 +8,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -129,7 +130,28 @@ def unswizzle_mx_scale_gfx1250(
     return scale_buffer_slice
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a8w4_repr = make_kernel_repr(
+    "_moe_gemm_a8w4",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "APPLY_SWIGLU",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+        "HAS_MX_OUT",
+    ],
+)
+
+
+@triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a8w4_repr)
 def _moe_gemm_a8w4(
     Y,
     stride_y_k,

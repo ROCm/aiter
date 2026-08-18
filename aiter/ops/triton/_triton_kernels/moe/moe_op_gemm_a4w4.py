@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -188,7 +189,27 @@ def _mxfp4_quant_kernel(
         )
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a4w4_repr = make_kernel_repr(
+    "_moe_gemm_a4w4",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "APPLY_SWIGLU",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ],
+)
+
+
+@triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_repr)
 def _moe_gemm_a4w4(
     Y,
     stride_y_k,
