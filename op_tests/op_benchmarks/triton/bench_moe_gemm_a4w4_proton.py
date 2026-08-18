@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from aiter.ops.shuffle import moe_shuffle_scale
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     moe_gemm_a4w4,
@@ -20,7 +20,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -132,6 +132,18 @@ def compute_roofline(
             w.writerow(row)
 
 
+def preshuffle_moe_weight(w):
+    """gfx1250 WMMA weight preshuffle.
+
+    `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLE_WEIGHTS=True.
+    ``moe_shuffle_weight`` takes the ``(E, N, K // 2)`` orientation and asserts
+    K // 2 % 32 and N % 16; ``moe_weight_decode_view`` then reinterprets the
+    result (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
 def preshuffle_moe_wscale(s):
     """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
 
@@ -221,6 +233,7 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     op_regex,
+    preshuffle=False,
     routed_experts=None,
 ):
     rank = 0
@@ -229,6 +242,10 @@ def bench_mlp_single_weight_init(
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {x_dtype}"
     assert w_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {w_dtype}"
+    if preshuffle:
+        assert (
+            get_arch() == "gfx1250"
+        ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
     if routed_experts is not None:
         # every token needs n_expts_act distinct experts, so the pool can't be smaller
         assert n_expts_act <= routed_experts <= n_expts_tot, (
@@ -260,6 +277,9 @@ def bench_mlp_single_weight_init(
     w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
+    if preshuffle:
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype
@@ -296,6 +316,7 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale1,
+            preshuffle_weights=preshuffle,
             apply_swiglu=True,
         )
         x, x_scale = mxfp4_quant(x)
@@ -308,6 +329,7 @@ def bench_mlp_single_weight_init(
             rdata,
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
+            preshuffle_weights=preshuffle,
         )
     proton.finalize()
     return parse_profile(
@@ -325,6 +347,7 @@ def bench_mlp(
     w_dtype,
     TP,
     op_regex,
+    preshuffle=False,
     routed_experts=None,
     num_weight_inits=1,
 ):
@@ -340,6 +363,7 @@ def bench_mlp(
             w_dtype,
             TP,
             op_regex,
+            preshuffle,
             routed_experts,
         )
         all_results.append(result)
@@ -366,6 +390,7 @@ def roofline_mlp(
     w_dtype,
     TP,
     op_regex,
+    preshuffle=False,
     routed_experts=None,
     num_weight_inits=1,
     name="",
@@ -374,7 +399,12 @@ def roofline_mlp(
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    # --preshuffle changes what is measured, so it gets its own file rather
+    # than overwriting the unshuffled sweep.
+    stem = f"{x_dtype}x-{w_dtype}w-TP{TP}"
+    if preshuffle:
+        stem += "-preshuffled"
+    out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
         dim1,
@@ -385,6 +415,7 @@ def roofline_mlp(
         w_dtype,
         TP,
         op_regex,
+        preshuffle,
         routed_experts,  # fixed args
         num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
@@ -424,6 +455,12 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default=".*moe_gemm.*",
         help="Regex to find perf for specific operation by its kernel name.",
+    )
+    parser.add_argument(
+        "--preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
     )
     parser.add_argument(
         "--routed-experts",
@@ -477,6 +514,7 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         op_regex=parsed_args.op_regex,
+        preshuffle=parsed_args.preshuffle,
         routed_experts=parsed_args.routed_experts,
         num_weight_inits=parsed_args.num_weight_inits,
         name="gpt-oss-x2",

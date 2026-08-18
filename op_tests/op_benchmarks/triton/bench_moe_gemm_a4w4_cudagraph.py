@@ -175,7 +175,7 @@ def preshuffle_moe_weight(w):
     """gfx1250 WMMA weight preshuffle.
 
     `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
-    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLED=True.
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLE_WEIGHTS=True.
     ``moe_shuffle_weight`` takes the ``(E, N, K // 2)`` orientation and asserts
     K // 2 % 32 and N % 16; ``moe_weight_decode_view`` then reinterprets the
     result (zero-copy) as the flattened view the kernel loads.
