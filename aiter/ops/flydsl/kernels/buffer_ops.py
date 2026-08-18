@@ -593,15 +593,13 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_flags = _create_i32_constant(cache_modifier)
-
     # Emit buffer load
     load_op = rocdl.RawPtrBufferLoadOp(
         result_type,
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        **({"aux": cache_modifier} if cache_modifier else {}),
     )
 
     return load_op.result
@@ -679,13 +677,11 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_flags = _create_i32_constant(cache_modifier)
-
     # Emit buffer store
     rocdl.RawPtrBufferStoreOp(
         data,
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        **({"aux": cache_modifier} if cache_modifier else {}),
     )
