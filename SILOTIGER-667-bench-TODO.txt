@@ -1,6 +1,7 @@
 NOTE: the per-stage FlyDSL-vs-CK G9 benchmark TODOs that used to live here have been
 folded into the styled plan SILOTIGER-667-plan-bench.md (Groups A-D + coverage matrix).
-This file now tracks ONLY the Full-MoE / AITER-default track below (deferred).
+This file now tracks the deferred, out-of-G9 tracks below: (1) Full-MoE / AITER-default,
+(2) CK FP4 gate_up fast path (surfaced by the D7 numerical cross-check).
 
 === Full-MoE / AITER track (complementary to the per-stage FlyDSL-vs-CK G9 plan) ===
 This track answers "how does FlyDSL compare vs whatever AITER dispatches by default",
@@ -40,3 +41,49 @@ per-stage cold FlyDSL-vs-CK comparison. Anchor = the existing reference script
     Possibly worth revisiting: apply the same treatment as the FlyDSL cold harness
     (oversized pool + router rotation over disjoint expert groups, or a cache flush) so
     the full-MoE numbers are cold too; at minimum, label the regime in the output.
+
+=== CK FP4 gate_up fast path track (upstream CK kernel work; surfaced by D7) ===
+This track builds the missing fast packed-FP4 gate_up path in CK. It is UPSTREAM CK work
+(rocm-libraries branch users/samremes/ck/warp-decode, commit 62e30c9098), not aiter, so it
+needs a CK build + a PR to that branch -- distinct from this ticket's harness. Motivation:
+the ticket's own #1 remaining item ("FP4 gate_up ... biggest remaining ~2x decode win"), and
+the D7 numerical cross-check (SILOTIGER-667-plan-bench.md) could only validate gate_up_fp4 as
+INFORMATIONAL: CK's gate_up FP4 runs the SLOW packed *scalar* path (dot2/NPerWarp=2 reject
+packed FP4) whose tiled make_naive_tensor_view weight layout is swizzled -> value-set matches
+(value_set_cos ~0.99) but output positions are permuted. down_fp4_h2 already has the fast path
+and validates exactly (cos 0.999999), so it is the drop-in template.
+Est ~1.5-2 days for a correct first cut; ~3-5 days for correct + competitive (~2x), the
+tuning tail being the variable part. Anchor template = the down FP4 dot2 fast path in
+projects/composablekernel/include/ck_tile/ops/warp_decode/kernel/warp_decode_down_reduce_kernel.hpp
+(is_packed_w && kUseDot2 branches, 1-output and kHPerWarp==2/H2).
+    Sub-steps:
+    - Add a gate_up packed+dot2 branch mirroring down-H2: raw 128-bit packed loads
+      (__builtin_memcpy, NOT load_tile) so a lane owns kVector contiguous FP4 along HIDDEN;
+      fp4x2_to_bf16x2 + dot2_bf16_packed_raw_nonop into TWO accumulator sets (gate = x.wg,
+      up = x.wu) sharing one loaded activation x (the down-H2 "two rows, one shared
+      activation" structure); one dot2 drain; reuse the existing silu(gate)*up epilogue.
+      Bonus: raw-load natural ordering fixes the swizzled output layout, so the result plugs
+      straight into the D7 validator as a GATED cos~0.999999 cell. Est ~1-1.5 d.
+    - Relax IsSupportedArgument (warp_decode_gate_up_kernel.hpp): currently rejects
+      NPerWarp=2 && kUseDot2 && pk_fp4_t, and the dot2 body has static_assert(!is_packed_w).
+      Carve out the new legal packed+dot2 gate_up config + add divisibility asserts
+      (HIDDEN % (warp_size*kVector), etc.). Est ~0.5 d.
+    - Wire type aliases / bench / dispatch / autotune: kVector 8/16/32 variants (8 = FP4 fast
+      lane chunk, 32 = wide single-transaction), hook into ck_bench_warp_decode.cpp and the
+      FlyDSL/AITER dispatch. Est ~0.5 d.
+    - Correctness gate ("gate on accuracy", per ticket): validate via the D7 harness
+      (tickets/667/harness: CK_WD_VALIDATE + validate.py). Once natural-ordered, move
+      gate_up_fp4 from informational to a gated cos cell; watch silu sensitivity near 0. ~0.5 d.
+    - Perf tune to actually hit ~2x (THE VARIABLE PART): accumulator count (4 vs 8), enough
+      in-flight packed loads per wave (the H2 "double the loads" lever), possibly the
+      software-pipelined prefetch already listed for down B=1. ~1-2 d.
+    - OPTIONAL / decide up front: offline FP4 weight prepack + versioned layout contract
+      (K3 report technique; ticket notes it is cheapest to introduce alongside FP4 gate_up
+      rather than retrofit). Adds ~1-2 d + a layout-contract decision; a first fast path can
+      ship without it (like down did).
+    Cross-refs: SILOTIGER-667.md "Remaining/untried" #1 + "Datatypes targeted"
+    ("MXFP4 only on the slow scalar path so far"); D7 note + B1 (1,32)-scale correction in
+    SILOTIGER-667-plan-bench.md.
+- REVISIT: once the fast path lands, the ticket's line-99 "refreshed head-to-head with
+    down_fp4_h2 AND FP4 gate_up once built" measurement becomes possible -- re-run the G9
+    compare so the gate_up|fp4 cells reflect the fast path, not the slow scalar one.
