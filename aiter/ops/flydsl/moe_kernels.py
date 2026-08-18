@@ -374,6 +374,11 @@ def get_flydsl_stage2_v2_kernels(
 ):
     """Return v2 layout GEMM2 candidates, optionally filtered for a shape."""
     kernels = {}
+    valid_pairs = {("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")}
+    if (a_dtype, b_dtype) not in valid_pairs:
+        return kernels
+    if a_dtype == "fp8" and b_dtype == "fp8" and block_m == 16:
+        return kernels
     # tile_m=16 requires the native SBM16 layout: its A-scale chunks are only
     # valid when the sort block (sbm=block_m) is also 16, so re-tiling a larger
     # sort block down to 16 is excluded.
