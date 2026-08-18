@@ -1,22 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import Tensor
 
-from ..jit.core import compile_ops
+from aiter import logger
+
+from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
 # match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
 _KERNEL_NAME = "f6gemm_dmabig_kernel_func"
+_SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
 _TILE = 256
 _PADK = 2  # K-padding steps (of 128) baked into the packed A/B layout
+_PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
+_TUNED_CONFIG_COLUMNS = {
+    "gfx",
+    "cu_num",
+    "M",
+    "N",
+    "K",
+    "kernelName",
+    "splitK",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +376,124 @@ def _ceil(x, m):
     return (x + m - 1) // m * m
 
 
+@functools.lru_cache(maxsize=8)
+def _load_gemm_a6w6_configs(tuned_file: str) -> dict:
+    """Load and validate an A6W6 shape-tuning table."""
+    if not os.path.exists(tuned_file):
+        return {}
+    try:
+        configs = pd.read_csv(tuned_file)
+    except pd.errors.EmptyDataError:
+        return {}
+    missing = _TUNED_CONFIG_COLUMNS - set(configs.columns)
+    if missing:
+        raise ValueError(
+            f"{tuned_file} is missing required A6W6 columns: {sorted(missing)}"
+        )
+    if configs.empty:
+        return {}
+
+    configs = configs.copy()
+    for column in ("cu_num", "M", "N", "K", "splitK"):
+        configs[column] = pd.to_numeric(configs[column], errors="raise").astype(int)
+    configs["gfx"] = configs["gfx"].astype(str).str.strip()
+    configs["kernelName"] = configs["kernelName"].astype(str).str.strip()
+
+    if (configs["gfx"] == "").any() or (configs["kernelName"] == "").any():
+        raise ValueError(f"{tuned_file} contains an empty gfx or kernelName")
+    if (configs["splitK"] != 0).any():
+        raise ValueError("A6W6 tuned configs must use splitK=0")
+
+    key_columns = ["gfx", "cu_num", "M", "N", "K"]
+    duplicate_rows = configs[configs.duplicated(key_columns, keep=False)]
+    if not duplicate_rows.empty:
+        raise ValueError(
+            f"{tuned_file} contains duplicate A6W6 shape keys:\n"
+            f"{duplicate_rows[key_columns + ['kernelName']].to_string(index=False)}"
+        )
+    return configs.set_index(key_columns).to_dict("index")
+
+
+def clear_gemm_a6w6_config_cache() -> None:
+    """Clear cached tuning data after a tuner updates the CSV."""
+    _load_gemm_a6w6_configs.cache_clear()
+
+
+def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
+    """Choose a safe untuned fallback for the physical launch shape.
+
+    The optimized grouped-M kernel has compile-time swizzle bounds for short-K
+    launches. Natural ordering has no such grid bound and is used outside them.
+    """
+    padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
+    short_k = padK <= 48 * 128
+    grouped_grid_in_bounds = padM <= 16 * 32 * 256 and padN <= 64 * 256
+    return (
+        _KERNEL_NAME
+        if not short_k or grouped_grid_in_bounds
+        else _SAFE_FALLBACK_KERNEL_NAME
+    )
+
+
+def get_GEMM_A6W6_config(
+    M: int, N: int, K: int, tuned_file: Optional[str] = None
+) -> Optional[dict]:
+    """Return an exact or physical-shape A6W6 tuning record."""
+    tuned_file = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_A6W6_FILE
+    tuned_file = os.path.abspath(tuned_file)
+    configs = _load_gemm_a6w6_configs(tuned_file)
+    gfx, cu_num = get_gfx(), get_cu_num()
+    candidates = [(M, N, K, "exact")]
+    padded = (_ceil(M, 256), _ceil(N, 256), _ceil(K, 128))
+    if padded != (M, N, K):
+        candidates.append((*padded, "padded"))
+
+    for candidate_M, candidate_N, candidate_K, match_kind in candidates:
+        config = configs.get(
+            (gfx, cu_num, candidate_M, candidate_N, candidate_K)
+        )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    "A6W6 shape M:%s N:%s K:%s matched %s config "
+                    "M:%s N:%s K:%s on %s/%s in %s: %s",
+                    M,
+                    N,
+                    K,
+                    match_kind,
+                    candidate_M,
+                    candidate_N,
+                    candidate_K,
+                    gfx,
+                    cu_num,
+                    tuned_file,
+                    config["kernelName"],
+                )
+            return config
+
+    if AITER_LOG_TUNED_CONFIG:
+        logger.info(
+            "A6W6 shape M:%s N:%s K:%s has no tuned config in %s; "
+            "using the safe default kernel",
+            M,
+            N,
+            K,
+            tuned_file,
+        )
+    return None
+
+
+def _select_gemm_a6w6_kernel(
+    M: int, N: int, K: int, kernelName: Optional[str]
+) -> str:
+    if kernelName:
+        return kernelName
+    config = get_GEMM_A6W6_config(M, N, K)
+    if config is not None:
+        return str(config["kernelName"])
+    return _default_gemm_a6w6_kernel(M, N, K)
+
+
 def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
     """Return packed operand and scale element counts for quant_mxfp6_gemm."""
     padR, padK = _ceil(rows, 256), _ceil(K, 128)
@@ -493,19 +628,21 @@ def gemm_a6w6(
     K: int,
     dtype: torch.dtype = dtypes.bf16,
     alpha: float = 1.0,
-    kernelName: str = _KERNEL_NAME,
+    kernelName: Optional[str] = None,
 ) -> Tensor:
     """A6W6 (mxfp6 E2M3, per-1x32 blockscale) GEMM: D = A * B^T.
 
     A/B and their scales must be pre-packed with `quant_mxfp6_gemm`. M/N/K are
-    the logical (unpadded) dims; the kernel operates on the tile-padded extent
-    and the result is sliced back to [M, N].
+    the logical (unpadded) dims. Unless ``kernelName`` explicitly overrides it,
+    a shape-tuned kernel is selected before the launch is padded. The result is
+    sliced back to [M, N].
     """
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)
     padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, kernelName, alpha)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
     if padM != M or padN != N:
         return out[:M, :N]
     return out
