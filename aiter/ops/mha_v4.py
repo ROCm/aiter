@@ -942,7 +942,11 @@ def mha_v4_mxfp8(
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
 ) -> Tensor:
-    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8."""
+    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8.
+
+    K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
+    be a power of two no greater than 16; output retains Q's head count.
+    """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_mxfp8")
@@ -988,6 +992,8 @@ def mha_v4(
 
     Q and K formats must match. The selected Q/K/V recipe determines canonical
     quantizers, scale modes, and the packed ASM row; output is BF16 BSHD.
+    K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
+    be a power of two no greater than 16; output retains Q's head count.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
