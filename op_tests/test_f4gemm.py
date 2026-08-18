@@ -49,6 +49,8 @@ pd.set_option("display.width", 1000)
 
 SUPPORTED_GFX = ["gfx1250"]
 
+_OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8, "fp4": dtypes.fp4x2}
+
 PERF_SHAPES = [(16384, 16384, 16384)]
 FUNC_SHAPES = [
     # pure_compute
@@ -173,12 +175,14 @@ def _support_reason(intype, outtype, apre, M, N, K):
     is supported, else a short reason string (row marked "not support"). Mirrors
     the dispatch heuristic in asm_f4gemm.cu so shapes are skipped before the
     shuffle/prep step rather than crashing on an assert."""
-    if N % 16 != 0:
-        return "N%16"
+    if outtype not in _OUT_DTYPE:
+        return f"outtype {outtype}"  # no kernel for this output format yet
     if K % 32 != 0:
-        return "K%32"
+        return "K%32"  # B 16x16 preshuffle
+    if N % 16 != 0:
+        return "N%16"  # B 16x16 preshuffle
     if apre and M % 16 != 0:
-        return "apre M%16"
+        return "apre M%16"  # A 16x16 preshuffle
     if outtype == "fp8" and N % MXFP8_OUT_SCALE_BLOCK != 0:
         return "fp8 N%128"  # per-128 output-scale golden limitation
     if outtype == "fp4" and intype != "mxfp4":
@@ -278,19 +282,18 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     return inp, ref
 
 
-@benchmark()  # (intype, M, N, K, apre, outtype, data_init, scale_init, seed) -> cols
+@benchmark()  # intype, M, N, K, apre, outtype, data_init, ... -> table columns
 def test_gemm(
     intype,
     M,
     N,
     K,
     apre,
-    outtype,
-    data_init,
-    scale_init,
+    outtype="bf16",
+    data_init="uniform",
+    scale_init="auto",
     seed=0,
     mode="perf",
-    dtype=dtypes.bf16,
     knl_name=None,
 ):
     # Skip unsupported combos up front (before prep/shuffle) so they show as
@@ -328,7 +331,7 @@ def test_gemm(
     noscale = outtype == "fp4"
     out_fp4 = outtype == "fp4"
     out_fp8 = outtype == "fp8"
-    out_dtype = dtypes.fp4x2 if out_fp4 else (dtypes.fp8 if out_fp8 else dtype)
+    out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
@@ -339,7 +342,7 @@ def test_gemm(
     elif out_fp8:
         ref = _quant_mxfp8_blockN(ref_f32)  # (ref_fp8, ref_scale_e8m0)
     else:
-        ref = ref_f32.to(dtype)
+        ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
@@ -403,7 +406,7 @@ def test_gemm(
     elif out_fp8:
         out_bytes = M * N + M * (N // MXFP8_OUT_SCALE_BLOCK)
     else:
-        out_bytes = M * N * dtype.itemsize
+        out_bytes = M * N * out_dtype.itemsize
     nbytes = (
         inp["A"].nbytes
         + inp["B"].nbytes
@@ -514,7 +517,17 @@ def test_gemm(
             )
             err = max(err_s, err_d)
         else:
-            err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
+            # Compare in fp32: checkAllclose does no dtype promotion, so a bf16
+            # comparison evaluates atol + rtol*|b| at 8-bit mantissa too. That
+            # makes the threshold itself jitter ~0.2% and systematically
+            # under-reports borderline elements.
+            err = checkAllclose(
+                ref.to(dtypes.fp32),
+                out.to(dtypes.fp32),
+                rtol=1e-1,
+                atol=1.0,
+                msg=f"{intype} {name}",
+            )
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
@@ -539,6 +552,12 @@ def main():
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the low-level asm entry",
     )
     parser.add_argument(
+        "--mode",
+        choices=["func", "perf", "profile"],
+        default="perf",
+        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
+    )
+    parser.add_argument(
         "--intype",
         nargs="*",
         choices=["mxfp4", "nvfp4"],
@@ -557,7 +576,7 @@ def main():
     parser.add_argument(
         "--outtype",
         nargs="*",
-        choices=["bf16", "fp8", "fp4"],
+        choices=sorted(_OUT_DTYPE),
         default=["bf16", "fp8"],
         help="output-format sweep list (default: bf16 fp8):\n"
         "  bf16 = bf16 [M,N]\n"
@@ -612,12 +631,7 @@ def main():
         "= use that exact mangled knl_name for all runs (developer experiment/debug).",
     )
     parser.add_argument(
-        "--mode",
-        choices=["func", "perf", "profile"],
-        default="perf",
-        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
-    )
-    parser.add_argument(
+        "-s",
         "-mnk",
         "--shape",
         type=dtypes.str2tuple,
@@ -681,7 +695,7 @@ def main():
     ]
     df = pd.DataFrame(rows)
     # Keep knl_name (the actual .co); drop the columns constant within a table.
-    df = df.drop(columns=["seed", "dtype", "gfx", "mode"], errors="ignore")
+    df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
     aiter.logger.info(
         "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
         df.to_markdown(index=False),

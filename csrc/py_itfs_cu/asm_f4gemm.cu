@@ -51,8 +51,9 @@
 constexpr int MXFP4_SCALE_BLOCK = 32;
 constexpr int NVFP4_SCALE_BLOCK = 16;
 
-constexpr int F4GEMM_N_ALIGN = 16;
-constexpr int F4GEMM_K_ALIGN = 32;
+constexpr int F4GEMM_N_ALIGN      = 16;
+constexpr int F4GEMM_K_ALIGN      = 32;
+constexpr int F4GEMM_M_ALIGN_APRE = 16;
 
 // Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
 // kernarg byte offsets the preload-aware shader s_load's from.
@@ -108,7 +109,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         if(cfg.outtype != outtype)
             continue;
 
-        const int m_align = a_preshuffle ? 16 : 1;
+        const int m_align = a_preshuffle ? F4GEMM_M_ALIGN_APRE : 1;
         if((M % m_align) != 0 || (N % F4GEMM_N_ALIGN) != 0 || (K % F4GEMM_K_ALIGN) != 0)
             continue;
 
@@ -316,70 +317,59 @@ static void f4gemm_launch(aiter_tensor_t* A,
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
     // ----- Launch geometry: cluster + persistent -----
-    const int SUBM      = cfg.tile_m;
-    const int SUBN      = cfg.tile_n;
-    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
+    // Every f4gemm .co is a persistent shader, so the launch is fixed-size and
+    // independent of M/N/K. The tile-walk swizzle is NOT baked into
+    // the .co: the shader reads log2(gridX)/log2(gridY) as kernargs, so the host
+    // picks the cluster-grid shape here and must ship it. persistent_tg / grid_y
+    // are runtime-only knobs; gridX is derived.
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co (CSV)
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    // Persistent dispatch is hardcoded on: all f4gemm .co are persistent
-    // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
-    // .co), so they're fixed here at the default; gridX is derived.
-    constexpr int PERSISTENT    = 1;
     constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
     constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
 
-    const int tiles_x = (Ndim + SUBN - 1) / SUBN;   // N-direction output tiles
-    const int tiles_y = (Mdim + SUBM - 1) / SUBM;   // M-direction output tiles
+    AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
+                __func__, " persistent_tg=", PERSISTENT_TG,
+                " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
+    const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
+    AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
+                __func__, " grid_y=", PERSISTENT_GY,
+                " must be a nonzero divisor of cluster count ", clusters);
+    const int gridY = PERSISTENT_GY;
+    const int gridX = clusters / gridY;
+    // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
+    // cluster count, so cluster count and both grid dims must be power-of-two.
+    AITER_CHECK((clusters & (clusters - 1)) == 0,
+                __func__, " persistent cluster count ", clusters, " must be power-of-two");
+    AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
+                __func__, " persistent gridX=", gridX, " gridY=", gridY,
+                " must each be power-of-two");
 
-    int          gdx         = tiles_x;
-    int          gdy         = tiles_y;
-    int          gdz         = 1;
+    // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
+    // scaled by the cluster dims.
+    const int gdx = gridX * cluster_x;
+    const int gdy = gridY * cluster_y;
+    const int gdz = 1;
+
     unsigned int log2_grid_x = 0;
     unsigned int log2_grid_y = 0;
+    for(int g = gridX; g > 1; g >>= 1)
+        log2_grid_x++;
+    for(int g = gridY; g > 1; g >>= 1)
+        log2_grid_y++;
 
-    if(PERSISTENT)
+    // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
+    // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
+    // GlobalScale slots (dw18/19).
+    if(intype == "nvfp4")
     {
-        AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
-                    __func__, " persistent_tg=", PERSISTENT_TG,
-                    " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
-        const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
-        AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
-                    __func__, " grid_y=", PERSISTENT_GY,
-                    " must be a nonzero divisor of cluster count ", clusters);
-        const int gridY = PERSISTENT_GY;
-        const int gridX = clusters / gridY;
-        // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
-        // cluster count, so cluster count and both grid dims must be power-of-two.
-        AITER_CHECK((clusters & (clusters - 1)) == 0,
-                    __func__, " persistent cluster count ", clusters, " must be power-of-two");
-        AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
-                    __func__, " persistent gridX=", gridX, " gridY=", gridY,
-                    " must each be power-of-two");
-
-        // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
-        // scaled by the cluster dims.
-        gdx = gridX * cluster_x;
-        gdy = gridY * cluster_y;
-        gdz = 1;
-
-        for(int g = gridX; g > 1; g >>= 1)
-            log2_grid_x++;
-        for(int g = gridY; g > 1; g >>= 1)
-            log2_grid_y++;
-
-        // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
-        // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
-        // GlobalScale slots (dw18/19).
-        if(intype == "nvfp4")
-        {
-            args.log2_grid_x = log2_grid_x;
-            args.log2_grid_y = log2_grid_y;
-        }
-        else
-        {
-            std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
-            std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
-        }
+        args.log2_grid_x = log2_grid_x;
+        args.log2_grid_y = log2_grid_y;
+    }
+    else
+    {
+        std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
+        std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
     }
 
     // fp8 output E8M0 scale pointer (set after the persistent block so the log2
