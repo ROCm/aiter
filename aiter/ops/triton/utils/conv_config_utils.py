@@ -60,6 +60,15 @@ def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
     return f"N={N},C={C},H={H},W={W},CB={CB}"
 
 
+def _conv_config_path(config_name: str) -> str:
+    dev = arch_info.get_arch()
+    return f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
+
+
+def _get_conv_config_file(config_name: str) -> dict:
+    return load_config_json(_conv_config_path(config_name))
+
+
 @functools.lru_cache(maxsize=512 if USE_LRU_CACHE else 0)
 def _get_conv_config_cached(
     config_name: str,
@@ -69,9 +78,7 @@ def _get_conv_config_cached(
 ) -> dict:
     """Config walk: variant shape entries, generic shape, M bucket, any."""
     dev = arch_info.get_arch()
-    config_dict = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
-    )
+    config_dict = _get_conv_config_file(config_name)
 
     # Tier 1: optional layout/dtype-specific exact-shape pins.
     if shape_key is not None:
@@ -105,12 +112,19 @@ def _get_conv_config_cached(
 @functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
 def has_conv_config(config_name: str) -> bool:
     """Return whether the running architecture ships this optional table."""
-    dev = arch_info.get_arch()
-    config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json",
-        required=False,
-    )
+    config = load_config_json(_conv_config_path(config_name), required=False)
     return config is not None
+
+
+def conv_config_uses_exact_routes(config_name: str) -> bool:
+    """Return whether routing is restricted to exact shape entries."""
+    return bool(_get_conv_config_file(config_name).get("route_exact_only"))
+
+
+def has_exact_conv_config(config_name: str, shape_key: str) -> bool:
+    """Return whether a config has an exact generic shape entry."""
+    config_dict = _get_conv_config_file(config_name)
+    return shape_key in config_dict.get("shapes", {})
 
 
 def get_conv_config(

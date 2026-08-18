@@ -209,12 +209,14 @@ Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`
 
 Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
 file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json` and
-`gfx1201-CONV-PREPACK.json`. The loader walks
-three tiers: literal shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
+`gfx1201-CONV-PREPACK.json`. The loader walks four tiers: layout/dtype shape
+pin → generic shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.
 
-Tuned for RDNA4 today (configs ship as `gfx1201-*.json` and `gfx1200-*.json`).
+Configs are available for gfx1100, gfx1200, gfx1201, gfx1250, gfx942, and
+gfx950. The gfx1100 direct-NCHW table uses exact-shape routing: shapes not
+measured faster than the complete NCHWc path remain on the cblocked fallback.
 
 If you need to retune at runtime (e.g. while developing a new kernel), set
 `AITER_TRITON_CONV_AUTOTUNE=1` — this restores the original `@triton.autotune`

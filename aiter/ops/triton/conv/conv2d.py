@@ -35,7 +35,12 @@ from aiter.ops.triton.conv._utils import (
     _prep_bias,
     _require_winograd_eligible,
 )
-from aiter.ops.triton.utils.conv_config_utils import has_conv_config
+from aiter.ops.triton.utils.conv_config_utils import (
+    conv_config_uses_exact_routes,
+    format_shape_key,
+    has_conv_config,
+    has_exact_conv_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -65,11 +70,44 @@ _NCHW_DIRECT_MIN_PIXELS = int(
 )
 
 
-def _nchw_direct_is_profitable(N: int, H: int, W: int) -> bool:
+def _nchw_direct_is_profitable(
+    N: int,
+    C: int,
+    H: int,
+    W: int,
+    K_out: int,
+    stride,
+    padding,
+    dilation,
+) -> bool:
     """Whether direct NCHW should replace a materialized NCHWc input pack."""
-    return N * H * W >= _NCHW_DIRECT_MIN_PIXELS and (
-        CONV_AUTOTUNE_ENABLED or has_conv_config("CONV-3X3-NCHW")
+    if CONV_AUTOTUNE_ENABLED:
+        return N * H * W >= _NCHW_DIRECT_MIN_PIXELS
+    config_name = "CONV-3X3-NCHW"
+    if not has_conv_config(config_name):
+        return False
+    if not conv_config_uses_exact_routes(config_name):
+        return N * H * W >= _NCHW_DIRECT_MIN_PIXELS
+
+    sh, sw = stride
+    ph, pw = padding
+    dh, dw = dilation
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=dh,
+        dw=dw,
     )
+    return has_exact_conv_config(config_name, shape_key)
 
 
 def _select_3x3_method(N, C, H, W, K_out, stride, dilation, block_c=BLOCK_K):
@@ -98,7 +136,19 @@ def _select_3x3_method(N, C, H, W, K_out, stride, dilation, block_c=BLOCK_K):
     return "cblocked"
 
 
-def _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout):
+def _resolve_route(
+    R,
+    S,
+    stride,
+    dilation,
+    N,
+    C,
+    H,
+    W_in,
+    K_out,
+    layout,
+    padding=(0, 0),
+):
     if _is_1x1_conv(R, S, dilation):
         return Route.ONE_X_ONE
     if _is_3x3_conv(R, S):
@@ -118,7 +168,9 @@ def _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout):
             return Route.WF4X3_CBLOCKED
         if method == "winograd_f4x3":
             return Route.WF4X3
-        if _nchw_direct_is_profitable(N, H, W_in):
+        if _nchw_direct_is_profitable(
+            N, C, H, W_in, K_out, stride, padding, dilation
+        ):
             return Route.DIRECT_NCHW_3X3
         return Route.CBLOCKED_NCHW
     return Route.GENERAL
@@ -390,7 +442,19 @@ def _route_and_run(
     """Resolve and execute one route, including required input preparation."""
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
-    route = _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout)
+    route = _resolve_route(
+        R,
+        S,
+        stride,
+        dilation,
+        N,
+        C,
+        H,
+        W_in,
+        K_out,
+        layout,
+        padding=padding,
+    )
 
     if route == Route.ONE_X_ONE:
         return conv2d_1x1(

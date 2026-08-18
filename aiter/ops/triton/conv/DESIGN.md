@@ -356,11 +356,15 @@ because real inference produces a new activation on every layer invocation.
 
 ### 5.3a `_conv2d_3x3_nchw_kernel`
 
-For `N*H*W >= 512` on architectures with a `CONV-3X3-NCHW` table, the input
-stays in contiguous NCHW and no activation buffer is allocated. The kernel
-transposes the dot operands so lanes traverse the unit-stride pixel dimension.
-It uses the true `C*H*W` batch stride and masks `C_pad-C` weight lanes, so channel
-counts that are not multiples of 64 do not require a padded activation copy.
+Architectures can use either the default `N*H*W >= 512` crossover or an
+exact-route table. gfx1100 uses generic exact pins because direct versus
+cblocked performance depends on channels, output channels, stride, and spatial
+size; the JSON contains only shapes where direct wins by at least the tuning
+margin for both fp16 and bf16. Selected inputs stay in contiguous NCHW and
+allocate no activation buffer. The kernel transposes the dot operands so lanes
+traverse the unit-stride pixel dimension. It uses the true `C*H*W` batch stride
+and masks `C_pad-C` weight lanes, so channel counts that are not multiples of 64
+do not require a padded activation copy.
 
 ### 5.4 `_conv2d_general_kernel`
 
