@@ -8,7 +8,31 @@ from triton.experimental.gluon.language.amd.gfx1250 import async_copy
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+_MOE_GEMM_A8W4_REPR_KEYS = [
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+    "SWIZZLE_MX_SCALE",
+    "APPLY_SWIGLU",
+    "num_warps",
+    "NUM_BUFFERS",
+    "HAS_MX_OUT",
+]
+
+_moe_gemm_a8w4_prefill_repr = make_kernel_repr(
+    "_moe_gemm_a8w4_prefill", _MOE_GEMM_A8W4_REPR_KEYS
+)
+
+_moe_gemm_a8w4_decode_repr = make_kernel_repr(
+    "_moe_gemm_a8w4_decode", _MOE_GEMM_A8W4_REPR_KEYS
+)
+
+_moe_gemm_a8w4_decode_persistent_repr = make_kernel_repr(
+    "_moe_gemm_a8w4_decode_persistent", _MOE_GEMM_A8W4_REPR_KEYS
+)
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -101,6 +125,7 @@ def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],
+    repr=_moe_gemm_a8w4_decode_persistent_repr,
 )
 def _moe_gemm_a8w4_decode_persistent(
     Y,
@@ -845,6 +870,7 @@ def _moe_gemm_a8w4_decode_persistent(
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],
+    repr=_moe_gemm_a8w4_decode_repr,
 )
 def _moe_gemm_a8w4_decode(
     Y,
@@ -1806,7 +1832,7 @@ def get_moe_a8w4_layouts(
     return layouts
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
+@gluon.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a8w4_prefill_repr)
 def _moe_gemm_a8w4_prefill(
     Y,
     stride_y_m,

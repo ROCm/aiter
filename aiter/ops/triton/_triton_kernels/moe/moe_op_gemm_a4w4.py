@@ -200,11 +200,6 @@ _moe_gemm_a4w4_repr = make_kernel_repr(
         "EVEN_K",
         "SWIZZLE_MX_SCALE",
         "APPLY_SWIGLU",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
     ],
 )
 
