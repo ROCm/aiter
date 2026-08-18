@@ -525,7 +525,7 @@ def test_unified_docs_separate_caller_policy_from_exact_public_launch():
     assert "opus_gemm" in combined
     assert "kid" in combined
     assert "caller" in combined.lower()
-    assert "tuned CSV -> per-arch private heuristic -> PyTorch fallback" in combined
+    assert "no valid row -> skinny (if eligible) -> PyTorch fallback" in combined
     assert "public/C++ path" in combined
     for stale in (
         "gemm_a16w16_opus",

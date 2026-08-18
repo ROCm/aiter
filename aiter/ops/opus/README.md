@@ -45,16 +45,17 @@ resolves those policies before entering it:
 
 ```text
 explicit kid -> exact public launch
-otherwise: tuned CSV -> per-arch private heuristic -> PyTorch fallback
-                              |
-                              +-> final kid -> exact public launch
+otherwise: tuned CSV -> validated final kid -> exact public launch
+                  |
+                  +-> no valid row -> skinny (if eligible) -> PyTorch fallback
 ```
 
-The three A16 heuristics are private functions in the existing
-`gemm_op_a16w16.py`; no selector or per-architecture Python modules are added.
-Invalid tuned `(kid, split-K)` pairs are discarded together.  Legacy gfx942
-requested-to-actual resolution also happens in the caller, so only the final
-integer id reaches `opus_gemm`.
+The A16 policy helpers are isolated in `a16w16_policy.py`, while
+`tuned_gemm.py` imports only the tuned-candidate validator.  A missing tuned
+row does not invoke an OPUS heuristic.  Invalid tuned `(kid, split-K)` pairs
+are discarded together before the caller continues to its normal skinny or
+PyTorch fallback.  Legacy gfx942 requested-to-actual resolution also happens
+in the caller, so only the final integer id reaches `opus_gemm`.
 
 ## Current families
 

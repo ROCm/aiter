@@ -83,14 +83,36 @@ def test_common_queries_remain_arch_family_and_output_scoped():
         kernel_needs_external_workspace("gfx942", "a16w16", 11000)
 
 
-def test_arch_policy_is_private_in_existing_a16_file_without_extra_modules():
+def test_a16_caller_policy_is_isolated_from_exact_execution():
     opus_dir = _ROOT / "aiter/ops/opus"
-    assert not (opus_dir / "_selector_a16w16.py").exists()
-    assert not (opus_dir / "common.py").exists()
-    assert not any((opus_dir / "heuristics").glob("*.py"))
-    source = (opus_dir / "gemm_op_a16w16.py").read_text()
-    assert "_A16W16_HEURISTICS" in source
-    assert "_resolve_a16w16_caller_candidate" in source
+    policy_source = (opus_dir / "a16w16_policy.py").read_text()
+    execution_source = (opus_dir / "gemm_op_a16w16.py").read_text()
+    tuned_source = (_ROOT / "aiter/tuned_gemm.py").read_text()
+
+    assert "_A16W16_HEURISTICS" in policy_source
+    assert "def select_a16w16_heuristic_kid(" in policy_source
+    assert "def resolve_a16w16_tuned_candidate(" in policy_source
+    assert "def resolve_a16w16_heuristic_candidate(" in policy_source
+    assert "def resolve_a16w16_caller_candidate(" in policy_source
+    assert "def _heuristic_a16w16_kid_gfx950(" not in execution_source
+    assert "def _select_a16w16_heuristic_kid(" not in execution_source
+    assert "def _resolve_a16w16_caller_candidate(" not in execution_source
+    assert "aiter.ops.opus.a16w16_policy" in tuned_source
+    assert "resolve_a16w16_tuned_candidate" in tuned_source
+    assert "resolve_a16w16_heuristic_candidate" not in tuned_source
+    assert "resolve_a16w16_caller_candidate" not in tuned_source
+    assert "aiter.ops.opus.gemm_op_a16w16 import (\n        _resolve" not in (
+        tuned_source
+    )
+
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    execution = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    assert execution._select_a16w16_heuristic_kid is (
+        policy.select_a16w16_heuristic_kid
+    )
+    assert execution._resolve_a16w16_caller_candidate is (
+        policy.resolve_a16w16_caller_candidate
+    )
 
 
 def _gfx950_heuristic_golden(M, N, K, has_bias):
@@ -122,21 +144,21 @@ def _gfx1250_heuristic_golden(M, N):
 
 
 def test_gfx950_caller_heuristic_matches_baseline_boundary_policy():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     for M in (1, 4, 5, 63, 64, 65, 127, 128, 129, 192, 255, 256, 257):
         for N in (31, 32, 63, 64, 65, 240, 256, 257):
             for K in (64, 127, 128, 192, 256):
                 for has_bias in (False, True):
-                    assert gemm._heuristic_a16w16_kid_gfx950(
+                    assert policy._heuristic_a16w16_kid_gfx950(
                         M, N, K, has_bias=has_bias
                     ) == _gfx950_heuristic_golden(M, N, K, has_bias)
 
 
 def test_gfx1250_caller_heuristic_matches_baseline_boundary_policy():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     for M in (1, 15, 16, 17, 31, 32, 33, 63, 64, 65):
         for N in (31, 32, 33, 63, 64, 65, 127, 128, 129, 256):
-            assert gemm._heuristic_a16w16_kid_gfx1250(
+            assert policy._heuristic_a16w16_kid_gfx1250(
                 M, N, 4096
             ) == _gfx1250_heuristic_golden(M, N)
 
@@ -167,8 +189,8 @@ def test_gfx1250_caller_heuristic_matches_baseline_boundary_policy():
 def test_gfx942_caller_heuristic_matches_baseline_policy(
     M, N, K, output_dtype, has_bias, expected
 ):
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    assert gemm._heuristic_a16w16_kid_gfx942(
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    assert policy._heuristic_a16w16_kid_gfx942(
         M,
         N,
         K,
@@ -178,7 +200,7 @@ def test_gfx942_caller_heuristic_matches_baseline_policy(
 
 
 def test_caller_heuristic_kids_are_in_default_compiled_floor():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     from csrc.opus_gemm.opus_gemm_common import DEFAULT_COMPILED_KIDS_BY_ARCH
 
     cases = {
@@ -187,7 +209,7 @@ def test_caller_heuristic_kids_are_in_default_compiled_floor():
         "gfx1250": (32, 128, 4096),
     }
     for arch, (M, N, K) in cases.items():
-        kid = gemm._select_a16w16_heuristic_kid(
+        kid = policy.select_a16w16_heuristic_kid(
             arch=arch,
             M=M,
             N=N,
@@ -200,7 +222,7 @@ def test_caller_heuristic_kids_are_in_default_compiled_floor():
 
 
 def test_caller_candidate_resolves_before_exact_public_launch():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     common = dict(
         arch="gfx942",
         M=256,
@@ -212,25 +234,34 @@ def test_caller_candidate_resolves_before_exact_public_launch():
         input_dtype=torch.bfloat16,
         output_dtype=torch.bfloat16,
     )
-    tuned = gemm._resolve_a16w16_caller_candidate(
+    tuned = policy.resolve_a16w16_tuned_candidate(
         **common, requested_kid=10210, requested_split_k=7
     )
     assert tuned is not None
     assert tuned.actual_kid == 10200
     assert tuned.allocation_split_k == 7
 
-    heuristic = gemm._resolve_a16w16_caller_candidate(
-        **common, requested_kid=None, requested_split_k=0
+    heuristic = policy.resolve_a16w16_heuristic_candidate(
+        **common, requested_split_k=0
     )
     assert heuristic is not None
     assert heuristic.actual_kid == 10200
 
     assert (
-        gemm._resolve_a16w16_caller_candidate(
+        policy.resolve_a16w16_tuned_candidate(
             **common, requested_kid=10216, requested_split_k=13
         )
         is None
     )
+
+    # The former combined API remains behavior-compatible while production
+    # callers migrate to the explicit tuned/heuristic policy operations.
+    assert policy.resolve_a16w16_caller_candidate(
+        **common, requested_kid=10210, requested_split_k=7
+    ) == tuned
+    assert policy.resolve_a16w16_caller_candidate(
+        **common, requested_kid=None, requested_split_k=0
+    ) == heuristic
 
 
 def _tuned_row_key(gfx, cu_num, M, N, K, *, bias=False):
@@ -248,9 +279,9 @@ def _tuned_row_key(gfx, cu_num, M, N, K, *, bias=False):
     )
 
 
-def test_tuned_a16_row_precedes_caller_heuristic(monkeypatch):
+def test_tuned_a16_row_does_not_invoke_heuristic(monkeypatch):
     tuned = importlib.import_module("aiter.tuned_gemm")
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     row = {
         "libtype": "opus",
         "solidx": 200,
@@ -269,7 +300,7 @@ def test_tuned_a16_row_precedes_caller_heuristic(monkeypatch):
     def fail_heuristic(**_kwargs):
         raise AssertionError("heuristic ran before a valid tuned row")
 
-    monkeypatch.setattr(gemm, "_select_a16w16_heuristic_kid", fail_heuristic)
+    monkeypatch.setattr(policy, "select_a16w16_heuristic_kid", fail_heuristic)
     tuned.get_GEMM_A16W16_config.cache_clear()
     config = tuned.get_GEMM_A16W16_config(
         128,
@@ -284,7 +315,7 @@ def test_tuned_a16_row_precedes_caller_heuristic(monkeypatch):
     assert (config["solidx"], config["splitK"]) == (200, 7)
 
 
-def test_invalid_tuned_pair_is_discarded_before_caller_heuristic(monkeypatch):
+def test_invalid_tuned_pair_is_discarded_before_default_fallback(monkeypatch):
     tuned = importlib.import_module("aiter.tuned_gemm")
     stale = {
         "libtype": "opus",
@@ -310,9 +341,7 @@ def test_invalid_tuned_pair_is_discarded_before_caller_heuristic(monkeypatch):
         str(torch.bfloat16),
     )
     tuned.get_GEMM_A16W16_config.cache_clear()
-    assert config["libtype"] == "opus"
-    assert config["solidx"] == 10210
-    assert config["splitK"] == 0
+    assert config == {"libtype": "torch", "solidx": 0}
 
 
 def test_tuned_adapter_passes_resolved_final_kid_to_public(monkeypatch):
@@ -486,28 +515,37 @@ def test_mxscale_bmm_high_level_reuses_one_scalar_launch_plan(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("gfx", "bias", "expected_backend"),
+    ("gfx", "cu_num", "M", "N", "K", "bias", "otype", "expected_backend"),
     [
-        ("gfx942", True, "torch"),
-        ("gfx90a", False, "torch"),
+        ("gfx950", 256, 1, 64, 7168, False, torch.bfloat16, "skinny"),
+        ("gfx950", 256, 16, 256, 256, False, torch.float32, "skinny"),
+        ("gfx950", 256, 17, 128, 256, False, torch.bfloat16, "torch"),
+        ("gfx942", 304, 32, 256, 1024, True, torch.bfloat16, "torch"),
+        ("gfx90a", 120, 32, 256, 1024, False, torch.bfloat16, "torch"),
     ],
 )
-def test_unavailable_a16_heuristic_reaches_pytorch_fallback(
-    monkeypatch, gfx, bias, expected_backend
+def test_no_tuned_row_uses_skinny_then_torch_without_heuristic(
+    monkeypatch, gfx, cu_num, M, N, K, bias, otype, expected_backend
 ):
     tuned = importlib.import_module("aiter.tuned_gemm")
+    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {})
     monkeypatch.setattr(tuned, "get_gfx", lambda: gfx)
-    monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
+    monkeypatch.setattr(tuned, "get_cu_num", lambda: cu_num)
     monkeypatch.setattr(tuned, "_opus_launch", object())
+
+    def fail_heuristic(**_kwargs):
+        raise AssertionError("no-tuned fallback invoked the OPUS heuristic")
+
+    monkeypatch.setattr(policy, "select_a16w16_heuristic_kid", fail_heuristic)
     tuned.get_GEMM_A16W16_config.cache_clear()
     config = tuned.get_GEMM_A16W16_config(
-        32,
-        256,
-        1024,
+        M,
+        N,
+        K,
         bias,
         str(torch.bfloat16),
-        str(torch.bfloat16),
+        str(otype),
     )
     tuned.get_GEMM_A16W16_config.cache_clear()
     assert config["libtype"] == expected_backend

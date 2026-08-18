@@ -113,7 +113,7 @@ def is_skinny_default_shape(
     )
 
 
-def _resolve_opus_a16w16_caller_candidate(
+def _resolve_opus_a16w16_tuned_candidate(
     *,
     gfx: str,
     cu_num: int,
@@ -123,17 +123,17 @@ def _resolve_opus_a16w16_caller_candidate(
     bias: bool,
     dtype,
     otype,
-    requested_kid=None,
+    requested_kid,
     requested_split_k=0,
 ):
-    """Resolve tuned/heuristic policy before the exact public OPUS call."""
+    """Validate one tuned OPUS row before the exact public call."""
     if _opus_launch is None:
         return None
-    from aiter.ops.opus.gemm_op_a16w16 import (
-        _resolve_a16w16_caller_candidate,
+    from aiter.ops.opus.a16w16_policy import (
+        resolve_a16w16_tuned_candidate,
     )
 
-    return _resolve_a16w16_caller_candidate(
+    return resolve_a16w16_tuned_candidate(
         arch=gfx,
         M=M,
         N=N,
@@ -198,7 +198,7 @@ def get_GEMM_A16W16_config(
             if config is None:
                 continue
             if config["libtype"] == "opus":
-                resolved = _resolve_opus_a16w16_caller_candidate(
+                resolved = _resolve_opus_a16w16_tuned_candidate(
                     gfx=gfx,
                     cu_num=cu_num,
                     M=M,
@@ -212,7 +212,7 @@ def get_GEMM_A16W16_config(
                 )
                 if resolved is None:
                     # Discard the whole stale (kid, split-K) pair before
-                    # trying another padded row or the architecture heuristic.
+                    # trying another padded row or the default fallback.
                     config = None
                     continue
                 config = dict(config)
@@ -228,32 +228,6 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        opus_plain = (
-            not bpreshuffle
-            and not scaleAB
-            and eval(dtype) == dtypes.bf16
-            and eval(otype) in (dtypes.bf16, dtypes.fp32)
-        )
-        if opus_plain:
-            resolved = _resolve_opus_a16w16_caller_candidate(
-                gfx=gfx,
-                cu_num=cu_num,
-                M=M,
-                N=N,
-                K=K,
-                bias=bias,
-                dtype=eval(dtype),
-                otype=eval(otype),
-                requested_kid=None,
-                requested_split_k=0,
-            )
-            if resolved is not None:
-                default_config.update(
-                    libtype="opus",
-                    solidx=int(resolved.actual_kid),
-                    splitK=0,
-                    kernelName="",
-                )
         if bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
@@ -274,7 +248,7 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif not opus_plain and is_skinny_default_shape(M, N, K, dtype, cu_num):
+        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
             # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
