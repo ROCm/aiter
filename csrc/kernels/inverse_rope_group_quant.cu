@@ -9,6 +9,7 @@
 #include "mx_quant_utils.h"
 #include "opus/opus.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <type_traits>
@@ -29,6 +30,34 @@ static constexpr MxDtype kHwFp8E4m3 =
 template <int N>
 using ic = std::integral_constant<int, N>;
 
+// Butterfly max over N adjacent lanes, N <= 16 so it stays inside a DPP row.
+//
+// This does not use hip_reduce.h's multithread_reduce_max_dpp: that one emits
+// its DPP through `asm volatile`, so the compiler cannot see that a DPP reads a
+// VGPR the previous VALU wrote. gfx9 needs two wait states for that hazard and
+// only one `s_nop 0` gets inserted, which lets lanes reduce stale data (a
+// measured wrong-scale bug at N=16, see inverse_rope_group_quant.md 3.1; N=8 is
+// merely unfalsified). Going through the builtin hands the hazard to the
+// compiler, and on wave32 hardware, which resolves it itself, the emitted
+// instructions are the same.
+//
+// bound_ctrl makes an invalid source read 0, which is below every |x| here.
+template <int N>
+__device__ __forceinline__ float group_reduce_max_dpp(float v)
+{
+    static_assert(N >= 1 && N <= 16 && (N & (N - 1)) == 0,
+                  "N must be a power of two in [1,16]");
+    if constexpr(N > 1) // quad_perm:[1,0,3,2]
+        v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0xb1>{}));
+    if constexpr(N > 2) // quad_perm:[2,3,0,1]
+        v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0x4e>{}));
+    if constexpr(N > 4) // row_half_mirror
+        v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0x141>{}));
+    if constexpr(N > 8) // row_mirror
+        v = fmaxf(v, opus::upd_dpp(0.0f, v, opus::number<0x140>{}));
+    return v;
+}
+
 // scale_shuffle = false: row-major [S, G, Ks], unit stride on Ks.
 // scale_shuffle = true:  MFMA tile-shuffled for V_MFMA_SCALE_F32_16x16x128_F8.
 //     Storage: [G, S_pad, Ks_pad] with 256-byte tiles of [32_M, 8_K].
@@ -36,12 +65,33 @@ using ic = std::integral_constant<int, N>;
 //       lane = (k%4)*16 + (m%16)
 //       iter = ((m/16)&1) + ((k/4)&1)*2
 
+// One block owns one [S, G] row and a contiguous span of that row's quant
+// groups; threads walk the span along d, so lane order is address order and a
+// wave's loads coalesce into k_slots * GROUP_SIZE contiguous elements. `s` being
+// block-invariant also keeps the position lookup scalar.
+//
+//   tid  -> k_slot = tid / THREADS_PER_GROUP  (which group within the span)
+//           lane   = tid % THREADS_PER_GROUP  (which slice of that group)
+//   blockIdx = (s, span index along Ks, g)
+//
+// s owns x, the dimension blocks are dispatched along fastest, so consecutive
+// blocks start a row apart rather than adjacent inside one row. Handing x to the
+// Ks span instead -- which looks like the better locality -- was much slower
+// (s=8192: 38.2us vs 21.9us on gfx1250), the blocks that run together then
+// crowd the same channels.
+//
+// s and g get a grid dimension each rather than being divided out of one index:
+// G is a runtime value, so `row / G` compiled to a reciprocal-multiply chain
+// sitting at the head of the load address chain. k_slots arrives as an argument
+// for the same reason -- reading it from blockDim.x costs a load from the hidden
+// kernarg segment, and the addresses depend on it, so the data loads could not
+// issue until that load returned.
 template <typename scalar_t,
           int HEAD_DIM,
           int RD,
           int GROUP_SIZE,
           int THREAD_DATA_SIZE,
-          int K_PER_BLOCK>
+          int K_PER_THREAD>
 __global__ void inverse_rope_group_quant_kernel(
     const scalar_t* __restrict__ o,
     opus::fp8_t* __restrict__ x_fp8,
@@ -54,6 +104,7 @@ __global__ void inverse_rope_group_quant_kernel(
     int G,
     int D,
     int scale_n,
+    int k_slots,
     bool scale_shuffle,
     int64_t scale_stride_s,
     int64_t scale_stride_g,
@@ -67,61 +118,57 @@ __global__ void inverse_rope_group_quant_kernel(
     static_assert(GROUP_SIZE == 32 || GROUP_SIZE == 64 || GROUP_SIZE == 128);
     static_assert(HEAD_DIM % GROUP_SIZE == 0);
     static_assert(THREADS_PER_GROUP >= 1 && THREADS_PER_GROUP <= 64);
+    static_assert(THREAD_DATA_SIZE >= 2 && (THREAD_DATA_SIZE % 2) == 0);
 
     constexpr int GROUPS_PER_HEAD = HEAD_DIM / GROUP_SIZE;
     constexpr int ROPE_START = HEAD_DIM - RD;
+    // A thread's slice never straddles the rope boundary, so the rotation is
+    // taken per thread rather than per element.
+    constexpr bool kSliceAlignedToRope = (ROPE_START % THREAD_DATA_SIZE) == 0;
 
     const int tid = threadIdx.x;
-    const int row_in_tile = tid / THREADS_PER_GROUP;
-    const int lane_in_group = tid - row_in_tile * THREADS_PER_GROUP;
-    const int rows_per_block = static_cast<int>(blockDim.x) / THREADS_PER_GROUP;
-    const int row = static_cast<int>(blockIdx.y) * rows_per_block + row_in_tile;
-    const int k_group_base = static_cast<int>(blockIdx.x) * K_PER_BLOCK;
-    if(row >= S * G || k_group_base >= scale_n)
-    {
-        return;
-    }
-
-    const int s = row / G;
-    const int g = row - s * G;
+    const int k_slot = tid / THREADS_PER_GROUP;
+    const int lane_in_group = tid - k_slot * THREADS_PER_GROUP;
+    // k_slots is the groups covered per pass; K_PER_THREAD passes stride by it
+    // so every pass stays contiguous across the block.
+    const int s = static_cast<int>(blockIdx.x);
+    const int k_group0 = static_cast<int>(blockIdx.y) * k_slots * K_PER_THREAD + k_slot;
+    const int g = static_cast<int>(blockIdx.z);
+    const int row = s * G + g;
     const int group_elem_base = lane_in_group * THREAD_DATA_SIZE;
-    const int d_base0 = k_group_base * GROUP_SIZE + group_elem_base;
 
     // --- Load input ---
     using vec_i = opus::vector_t<scalar_t, THREAD_DATA_SIZE>;
     auto input_buffer = opus::make_gmem<scalar_t>(
         o, static_cast<int64_t>(S) * H * HEAD_DIM * sizeof(scalar_t));
-    const int64_t input_offset0 =
-        static_cast<int64_t>(s) * H * HEAD_DIM + static_cast<int64_t>(g) * D + d_base0;
+    const int64_t input_offset0 = static_cast<int64_t>(s) * H * HEAD_DIM +
+                                  static_cast<int64_t>(g) * D +
+                                  static_cast<int64_t>(k_group0) * GROUP_SIZE +
+                                  group_elem_base;
     constexpr int in_chunk_bytes =
         (THREAD_DATA_SIZE * sizeof(scalar_t)) % 16 == 0 ? 16 :
         ((THREAD_DATA_SIZE * sizeof(scalar_t)) % 8 == 0 ? 8 : 4);
 
-    // Issue all loads before consuming any -- K_PER_BLOCK independent loads give
-    // the wave that many requests in flight for latency hiding.
-    vec_i in_vec[K_PER_BLOCK];
+    // Issue all loads before consuming any -- K_PER_THREAD independent loads
+    // give the wave that many requests in flight for latency hiding.
+    vec_i in_vec[K_PER_THREAD];
 #pragma unroll
-    for(int k = 0; k < K_PER_BLOCK; ++k)
+    for(int k = 0; k < K_PER_THREAD; ++k)
     {
+        // Passes stride by the block's whole span, not by one group: that keeps
+        // every single load fully coalesced across the wave. Giving a thread
+        // KPT adjacent groups instead would fold these strides into immediate
+        // offsets, but it splits each load into k_slots separate segments and
+        // measured slower on gfx1250 (s=8192: 25.5us vs 21.9us).
         in_vec[k] = load_vector_nbytes<scalar_t, THREAD_DATA_SIZE, in_chunk_bytes>(
-            input_buffer, input_offset0 + static_cast<int64_t>(k) * GROUP_SIZE);
+            input_buffer,
+            input_offset0 + static_cast<int64_t>(k) * k_slots * GROUP_SIZE);
     }
 
-    // --- Determine if any group in this tile overlaps the rope tail ---
-    bool any_rope = false;
-#pragma unroll
-    for(int k = 0; k < K_PER_BLOCK; ++k)
-    {
-        const int bhs = ((k_group_base + k) % GROUPS_PER_HEAD) * GROUP_SIZE;
-        any_rope = any_rope || (bhs + GROUP_SIZE > ROPE_START);
-    }
-    int64_t pos = 0;
-    if(any_rope)
-    {
-        pos = positions[s];
-        if(pos < 0) pos = 0;
-        if(max_position > 0 && pos >= max_position) pos = max_position - 1;
-    }
+    // `s` is block-invariant, so this is one scalar load per block.
+    int64_t pos = positions[s];
+    if(pos < 0) pos = 0;
+    if(max_position > 0 && pos >= max_position) pos = max_position - 1;
 
     // --- Output buffer ---
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
@@ -140,10 +187,10 @@ __global__ void inverse_rope_group_quant_kernel(
 
     // --- Per-group: rope -> amax -> scale -> quantize -> store ---
 #pragma unroll
-    for(int k = 0; k < K_PER_BLOCK; ++k)
+    for(int k = 0; k < K_PER_THREAD; ++k)
     {
-        const int k_group = k_group_base + k;
-        const int d_base = d_base0 + k * GROUP_SIZE;
+        const int k_group = k_group0 + k * k_slots;
+        const int d_base = k_group * GROUP_SIZE + group_elem_base;
 
         float vals[THREAD_DATA_SIZE];
 #pragma unroll
@@ -153,61 +200,71 @@ __global__ void inverse_rope_group_quant_kernel(
         }
 
         // --- Inverse RoPE on the rope tail ---
-        const int block_head_start = (k_group % GROUPS_PER_HEAD) * GROUP_SIZE;
-        const bool block_has_rope = block_head_start + GROUP_SIZE > ROPE_START;
+        const int head_elem_base = (k_group % GROUPS_PER_HEAD) * GROUP_SIZE +
+                                   group_elem_base;
+        const int local0 = head_elem_base - ROPE_START;
 
-        if(block_has_rope)
+        constexpr int NCOS = THREAD_DATA_SIZE / 2;
+        // 16B is the widest load, and NCOS is a power of two here.
+        constexpr int CCHUNK = NCOS >= 8 ? 8 : NCOS;
+
+        auto rope_whole_slice = [&]()
         {
-            float orig[THREAD_DATA_SIZE];
+            scalar_t cbuf[NCOS];
+            scalar_t sbuf[NCOS];
+            using vec_c = opus::vector_t<scalar_t, CCHUNK>;
+            const int64_t crow = pos * (RD / 2) + (local0 >> 1);
 #pragma unroll
-            for(int i = 0; i < THREAD_DATA_SIZE; ++i)
+            for(int c = 0; c < NCOS / CCHUNK; ++c)
             {
-                orig[i] = vals[i];
+                *reinterpret_cast<vec_c*>(cbuf + c * CCHUNK) =
+                    *reinterpret_cast<const vec_c*>(cos_cache + crow + c * CCHUNK);
+                *reinterpret_cast<vec_c*>(sbuf + c * CCHUNK) =
+                    *reinterpret_cast<const vec_c*>(sin_cache + crow + c * CCHUNK);
             }
+#pragma unroll
+            for(int i = 0; i < NCOS; ++i)
+            {
+                const float c = static_cast<float>(cbuf[i]);
+                const float sn = static_cast<float>(sbuf[i]);
+                const float even = vals[2 * i];
+                const float odd = vals[2 * i + 1];
+                vals[2 * i] = even * c + odd * sn;
+                vals[2 * i + 1] = odd * c - even * sn;
+            }
+        };
 
-            constexpr int NCOS = THREAD_DATA_SIZE / 2;
-            const int local0 = block_head_start + group_elem_base - ROPE_START;
-            bool vectorized = false;
-            if constexpr(NCOS >= 1)
+        if constexpr(kSliceAlignedToRope)
+        {
+            if(local0 >= 0)
             {
-                if(local0 >= 0)
-                {
-                    using vec_c = opus::vector_t<scalar_t, NCOS>;
-                    const int64_t crow = pos * (RD / 2) + (local0 >> 1);
-                    const vec_c cvec = *reinterpret_cast<const vec_c*>(cos_cache + crow);
-                    const vec_c svec = *reinterpret_cast<const vec_c*>(sin_cache + crow);
-#pragma unroll
-                    for(int i = 0; i < THREAD_DATA_SIZE; ++i)
-                    {
-                        const float c = static_cast<float>(cvec[i >> 1]);
-                        const float sn = static_cast<float>(svec[i >> 1]);
-                        const float val = orig[i];
-                        const float pair = orig[i ^ 1];
-                        vals[i] = (i & 1) == 0 ? (val * c + pair * sn)
-                                                : (val * c - pair * sn);
-                    }
-                    vectorized = true;
-                }
+                rope_whole_slice();
             }
-            if(!vectorized)
+        }
+        else if(head_elem_base + THREAD_DATA_SIZE > ROPE_START)
+        {
+            if(local0 >= 0)
             {
+                rope_whole_slice();
+            }
+            else
+            {
+                // A slice straddling ROPE_START rotates only its tail pairs.
 #pragma unroll
-                for(int i = 0; i < THREAD_DATA_SIZE; ++i)
+                for(int i = 0; i < NCOS; ++i)
                 {
-                    const int group_elem = group_elem_base + i;
-                    const int hd = block_head_start + group_elem;
+                    const int hd = head_elem_base + 2 * i;
                     if(hd >= ROPE_START)
                     {
-                        const int local = hd - ROPE_START;
-                        const int cos_i = local >> 1;
-                        const float c = static_cast<float>(
-                            cos_cache[pos * (RD / 2) + cos_i]);
-                        const float sn = static_cast<float>(
-                            sin_cache[pos * (RD / 2) + cos_i]);
-                        const float val = orig[i];
-                        const float pair = orig[i ^ 1];
-                        vals[i] = (local & 1) == 0 ? (val * c + pair * sn)
-                                                   : (val * c - pair * sn);
+                        const int cos_i = (hd - ROPE_START) >> 1;
+                        const float c =
+                            static_cast<float>(cos_cache[pos * (RD / 2) + cos_i]);
+                        const float sn =
+                            static_cast<float>(sin_cache[pos * (RD / 2) + cos_i]);
+                        const float even = vals[2 * i];
+                        const float odd = vals[2 * i + 1];
+                        vals[2 * i] = even * c + odd * sn;
+                        vals[2 * i + 1] = odd * c - even * sn;
                     }
                 }
             }
@@ -222,25 +279,11 @@ __global__ void inverse_rope_group_quant_kernel(
         }
         if constexpr(THREADS_PER_GROUP > 1)
         {
+            // At most GROUP_SIZE / 8 lanes share a group, so this stays within
+            // the DPP row every arch supports -- no permlane*_swap widening.
+            static_assert(THREADS_PER_GROUP <= 16);
 #if defined(__HIP_DEVICE_COMPILE__)
-#if defined(__GFX9__)
-            amax = multithread_reduce_max_dpp<THREADS_PER_GROUP>(amax);
-#else
-            // Non-GFX9 host dispatch never launches a specialization wider
-            // than its supported 32-lane DPP reduction, but all switch arms
-            // are still instantiated. Keep the generic fallback compileable
-            // for the unreachable 64-lane specialization.
-            if constexpr(THREADS_PER_GROUP <= 32)
-            {
-                amax = multithread_reduce_max_dpp<THREADS_PER_GROUP>(amax);
-            }
-            else
-            {
-                auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
-                amax = wave_reduce<float, decltype(fmax_op), THREADS_PER_GROUP>(
-                    amax, fmax_op);
-            }
-#endif
+            amax = group_reduce_max_dpp<THREADS_PER_GROUP>(amax);
 #else
             auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
             amax = wave_reduce<float, decltype(fmax_op), THREADS_PER_GROUP>(
@@ -253,6 +296,8 @@ __global__ void inverse_rope_group_quant_kernel(
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kHwFp8E4m3>(amax);
         const float inv_scale = 1.0f / s8.dq_scale;
 
+        // One byte per group, from consecutive k_slots: row-major scale lands as
+        // one contiguous run per wave.
         if(lane_in_group == 0)
         {
             if(scale_shuffle)
@@ -381,31 +426,37 @@ void inverse_rope_group_quant(
     const int Ks_pad = scale_shuffle ? ((scale_n + 7) / 8) * 8 : scale_n;
     const int S_pad = scale_shuffle ? ((S + 31) / 32) * 32 : S;
     const int wave_size = static_cast<int>(get_warp_size_func());
+    const int rows = S * G;
 
-    auto launch = [&](auto group_tag, auto tds_tag, auto kpb_tag, int block_m)
+    // k_slots (groups a block covers per pass) is a runtime launch choice: it
+    // only sizes the block, so it costs no extra kernel instantiations.
+    auto launch = [&](auto group_tag, auto tds_tag, auto kpt_tag, int k_slots)
     {
         constexpr int GS = decltype(group_tag)::value;
         constexpr int HEAD_DIM_T = 512;
         constexpr int RD_T = 64;
         constexpr int TDS = decltype(tds_tag)::value;
         constexpr int THREADS_PER_GROUP = GS / TDS;
-        constexpr int KPB = decltype(kpb_tag)::value;
+        constexpr int KPT = decltype(kpt_tag)::value;
         if constexpr(THREADS_PER_GROUP < 1)
         {
             AITER_CHECK(false, "invalid THREAD_DATA_SIZE/GROUP_SIZE combination");
         }
         else
         {
-            const int block_size = block_m * THREADS_PER_GROUP;
+            const int block_size = k_slots * THREADS_PER_GROUP;
+            const int k_per_block = k_slots * KPT;
             AITER_CHECK(block_size <= 1024, "block size exceeds 1024 threads");
-            const dim3 grid(scale_n / KPB, (S * G + block_m - 1) / block_m);
+            AITER_CHECK(scale_n % k_per_block == 0,
+                        "Ks must be divisible by the block's group span");
+            const dim3 grid(S, scale_n / k_per_block, G);
             const dim3 block(block_size);
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 o.dtype(), "inverse_rope_group_quant", [&]
             {
                 using scalar_opus_t = typename hip2opus<scalar_t>::type;
                 inverse_rope_group_quant_kernel<
-                    scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPB>
+                    scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPT>
                     <<<grid, block, 0, stream>>>(
                         reinterpret_cast<const scalar_opus_t*>(o.data_ptr()),
                         reinterpret_cast<opus::fp8_t*>(x_fp8.data_ptr()),
@@ -413,7 +464,7 @@ void inverse_rope_group_quant(
                         reinterpret_cast<const int64_t*>(positions.data_ptr()),
                         reinterpret_cast<const scalar_opus_t*>(cos_cache.data_ptr()),
                         reinterpret_cast<const scalar_opus_t*>(sin_cache.data_ptr()),
-                        S, H, G, D, scale_n, scale_shuffle,
+                        S, H, G, D, scale_n, k_slots, scale_shuffle,
                         x_scale.stride(0), x_scale.stride(1), x_scale.stride(2),
                         S_pad, Ks_pad,
                         static_cast<int>(cos_cache.size(0)));
@@ -421,50 +472,115 @@ void inverse_rope_group_quant(
         }
     };
 
-    auto dispatch_kpb = [&](auto group_tag, auto tds_tag, int kpb, int block_m)
+    auto dispatch_kpt = [&](auto group_tag, auto tds_tag, int kpt, int k_slots)
     {
-        switch(kpb)
+        constexpr int TDS = decltype(tds_tag)::value;
+        // Four groups per thread only pairs with the narrowest slice, the one
+        // the wave64 tier uses. On a 64B slice it would hold 128 floats live and
+        // spill to scratch, and no tier asks for that pair -- instantiating it
+        // anyway would only cost compile time.
+        if constexpr(TDS <= 8)
         {
-            case 2: launch(group_tag, tds_tag, ic<2>{}, block_m); break;
-            case 4: launch(group_tag, tds_tag, ic<4>{}, block_m); break;
-            default: launch(group_tag, tds_tag, ic<1>{}, block_m); break;
+            if(kpt >= 4)
+            {
+                launch(group_tag, tds_tag, ic<4>{}, k_slots);
+                return;
+            }
         }
+        if(kpt >= 2)
+        {
+            launch(group_tag, tds_tag, ic<2>{}, k_slots);
+            return;
+        }
+        launch(group_tag, tds_tag, ic<1>{}, k_slots);
     };
 
     auto dispatch = [&](auto group_tag)
     {
         constexpr int GS = decltype(group_tag)::value;
 
-        // Dispatch tiers from TDS x KPB sweep on MI355X (gfx950):
-        // Small S: few rows -> keep one group per block (KPB=1).
-        // Large S: bandwidth bound -> multiple loads in flight (KPB=4).
-        int tds = (S <= 4) ? 2 : (S <= 128 ? 4 : 8);
+        // Every tier below aims a wave at one contiguous run and keeps four
+        // loads per thread in flight; what differs is how wide a slice each
+        // thread takes, which trades register pressure against how many lanes
+        // share a group (and so how many reduction steps).
+        //
+        // wave64 keeps the 16B slice tuned on MI355X, because the wide slices
+        // below are free on gfx1250 (60 VGPRs, still 16 waves per SIMD) but not
+        // on gfx950, whose register file is half as deep per lane: there
+        // 64B/thread costs 68 VGPRs and drops a SIMD from 8 resident waves to
+        // 7, while 16B/thread with four groups per thread stays at 52 and 8.
+        const bool wave64 = wave_size == 64;
+
+        // wave32 tiers, from a THREAD_DATA_SIZE x block-width x K_PER_THREAD
+        // sweep on gfx1250. The wide slice needs fewer lanes per group and so
+        // fewer reduction steps, which wins while waves are scarce; once enough
+        // waves are in flight to hide that reduction, the narrow slice plus a
+        // second group per thread pulls ahead. The crossover is a
+        // group-size-dependent wave count.
+        constexpr int kNarrowCrossoverWavesPerSimd =
+            GS >= 128 ? 56 : (GS >= 64 ? 40 : 24);
+        const int64_t simds = static_cast<int64_t>(get_num_cu_func()) * 4;
+        const int64_t wide_waves =
+            static_cast<int64_t>(rows) * D / (wave_size * 32);
+        const bool narrow_slice =
+            wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
+
+        // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
+        int tds = wave64 ? 8 : (narrow_slice ? 16 : 32);
+        if(scale_shuffle)
+        {
+            // The shuffled scale scatters one byte per 64B of tile, so let a
+            // wave own at least 8 groups: its bytes then merge into fewer
+            // write transactions.
+            tds = std::max(tds, GS * 8 / wave_size);
+        }
+        tds = std::min(tds, GS);
         // A logical quant group must fit wholly within one hardware wave.
         while(GS / tds > wave_size)
         {
             tds <<= 1;
         }
+        AITER_CHECK(GS % tds == 0 && tds <= GS,
+                    "THREAD_DATA_SIZE must divide the quant group size");
 
         const int threads_per_group = GS / tds;
-        AITER_CHECK(wave_size % threads_per_group == 0,
-                    "threads per quant group must divide wave size");
-
-        // Preserve the tuned wave64 launch. On wave32, aim for four physical
-        // waves per block. BLOCK_M is a runtime launch choice and does not
-        // multiply the number of kernel template instantiations.
-        const int block_m =
-            wave_size == 64 ? 16 : std::min(32, 4 * wave_size / threads_per_group);
-
-        int kpb = (S <= 128) ? 1 : (S <= 512 ? 2 : 4);
-        while(kpb > 1 && scale_n % kpb != 0)
+        // One wave per block for the row layout: the row-major scale write is
+        // already coalesced, so the narrowest block spreads best. The shuffled
+        // layout instead wants several waves aiming at the same scale tile.
+        const int waves_per_block = scale_shuffle ? 4 : 1;
+        const int k_slots_min =
+            std::min(std::max(wave_size / threads_per_group, 1), scale_n);
+        int k_slots = std::min(
+            std::max(waves_per_block * wave_size / threads_per_group, 1), scale_n);
+        const int64_t target_blocks = static_cast<int64_t>(get_num_cu_func()) * 4;
+        while(k_slots > k_slots_min &&
+              static_cast<int64_t>(rows) * (scale_n / k_slots) < target_blocks)
         {
-            kpb >>= 1;
+            k_slots >>= 1;
         }
+        while(k_slots > 1 && scale_n % k_slots != 0)
+        {
+            k_slots >>= 1;
+        }
+
+        // Extra groups per thread, so a narrow slice still keeps four loads in
+        // flight. Dropped when the span would not divide Ks or would cost too
+        // many blocks -- which is what backs off on the small shapes the wave64
+        // tiering used to spell out as an S threshold.
+        int kpt = wave64 ? 4 : (narrow_slice ? 2 : 1);
+        while(kpt > 1 &&
+              (scale_n % (k_slots * kpt) != 0 ||
+               static_cast<int64_t>(rows) * (scale_n / (k_slots * kpt)) <
+                   target_blocks))
+        {
+            kpt >>= 1;
+        }
+
         switch(tds)
         {
-            case 2: dispatch_kpb(group_tag, ic<2>{}, kpb, block_m); break;
-            case 4: dispatch_kpb(group_tag, ic<4>{}, kpb, block_m); break;
-            default: dispatch_kpb(group_tag, ic<8>{}, kpb, block_m); break;
+            case 8: dispatch_kpt(group_tag, ic<8>{}, kpt, k_slots); break;
+            case 32: dispatch_kpt(group_tag, ic<32>{}, kpt, k_slots); break;
+            default: dispatch_kpt(group_tag, ic<16>{}, kpt, k_slots); break;
         }
     };
 
