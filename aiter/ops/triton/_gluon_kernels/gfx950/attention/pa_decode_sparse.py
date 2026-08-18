@@ -186,21 +186,22 @@ def _split_ax(x, AXIS: gl.constexpr):
     return a, b
 
 
-# fp8 (e4m3 OCP) x E8M0 -> bf16, one instruction per 2 elements. $0 takes the low two
-# fp8 bytes of the 32-bit source, $1 the high two via op_sel. "=&v" (early clobber) is
-# load-bearing: without it the allocator may give an output the same VGPR as the scale
-# input, and the first convert then clobbers the scale before the second reads it --
-# silently wrong in exactly the elements $1 produces.
-_DEQ_ASM: gl.constexpr = gl.constexpr(
-    "v_cvt_scalef32_pk_bf16_fp8 $0, $2, $3\n"
-    "v_cvt_scalef32_pk_bf16_fp8 $1, $2, $3 op_sel:[1,0,0]"
+# fp8 (e4m3 OCP) x E8M0 -> bf16, one instruction per 2 elements. Emitted as two
+# separate single-output asm calls, NOT as one two-output blob: a single-instruction
+# asm reads all its sources before writing dst, so no output can clobber an input and
+# neither needs early clobber. The blob form does -- without `=&v` on its first output
+# the allocator may give it the scale's register and the second convert then reads a
+# clobbered scale, wrong in exactly the elements it produces -- and that forced
+# liveness costs spills: 21 st/28 ld against 11/12 here, on a kernel with zero
+# headroom at the 256-VGPR cap. The split form costs +184 instructions (each call
+# re-reads the sources) and is worth it: 0.970-0.977x against the blob's 0.983-1.017x
+# across C=16/64/128 at short top-k, and it removes the reduce knock-on that the
+# blob's scratch traffic caused by evicting the split-K partials from L2.
+_DEQ_LO: gl.constexpr = gl.constexpr("v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2")
+_DEQ_HI: gl.constexpr = gl.constexpr(
+    "v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]"
 )
-# $0 must be early-clobber: the second convert re-reads $2/$3 after $0 is written,
-# so an output sharing a register with an input would read a clobbered scale. $1 is
-# written last, after every read, so it may alias an input -- one more reuse for the
-# allocator. 4 constraints, not 5: an i16 scale packs into one register where an f32
-# scale took two ($4 was never named).
-_DEQ_CONS: gl.constexpr = gl.constexpr("=&v,=v,v,v")
+_DEQ_CONS: gl.constexpr = gl.constexpr("=v,v,v")
 
 
 @gluon.jit
@@ -214,13 +215,12 @@ def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     Converting to f32 with exp2 also works but is a longer chain for nothing. Because the scale is a power of two this is bit-identical to the f32
     chain: fp8 -> bf16 is exact (3 mantissa bits into 8) and scaling by 2^k stays exact.
     """
-    lo, hi = gl.inline_asm_elementwise(
-        _DEQ_ASM,
-        _DEQ_CONS,
-        [x16, (e_u8.to(gl.uint16) << 7)],
-        dtype=(gl.bfloat16, gl.bfloat16),
-        is_pure=True,
-        pack=2,
+    sc16 = e_u8.to(gl.uint16) << 7
+    lo = gl.inline_asm_elementwise(
+        _DEQ_LO, _DEQ_CONS, [x16, sc16], dtype=gl.bfloat16, is_pure=True, pack=2
+    )
+    hi = gl.inline_asm_elementwise(
+        _DEQ_HI, _DEQ_CONS, [x16, sc16], dtype=gl.bfloat16, is_pure=True, pack=2
     )
     # lo carries fp8 elements 4i+{0,1} and hi 4i+{2,3}, so the flat order is
     # 4i + 2*lohi + s. A lane's 8 int16 are the same 16-byte run the u8 gather used,
