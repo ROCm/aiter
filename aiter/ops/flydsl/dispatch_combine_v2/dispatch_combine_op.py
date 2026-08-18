@@ -30,6 +30,11 @@ import torch
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
+from .intranode_kernels_tdm import (
+    make_dispatch_tdm,
+    tdm_max_warps,
+    tdm_stage_capacity,
+)
 from .intranode_kernels import (
     xdb_flag_slots,
     make_dispatch,
@@ -323,6 +328,14 @@ class EpDispatchCombineConfig:
     # > 0): the wire must carry fp8 + e8m0 only, never bf16 alongside it. Default
     # off; the existing dispatch -> finalize -> GEMM1 sequence stays the fallback.
     push_group_overlap: bool = False
+    # Which dispatch transport to build: "vector" is the portable per-lane 16 B
+    # copy, "tdm" the gfx1250 Tensor-Data-Mover port of mori's
+    # ep_intranode_1250x (block-local counting + one remote atomic per
+    # (block, peer) + bulk metadata + DMA payload). "auto" picks vector, so
+    # nothing changes for existing callers; env AITER_EP_DISPATCH_TDM=1 flips
+    # the auto default for A/B runs. The two produce interchangeable state, so
+    # combine / replay / the routing handle do not care which ran.
+    dispatch_transport: str = "auto"
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -339,6 +352,34 @@ class EpDispatchCombineConfig:
                 f"combine_quant_type must be one of {_COMBINE_QUANT_TYPES}, "
                 f"got {self.combine_quant_type!r}"
             )
+        if self.dispatch_transport not in ("auto", "vector", "tdm"):
+            raise ValueError(
+                "dispatch_transport must be auto|vector|tdm, "
+                f"got {self.dispatch_transport!r}"
+            )
+        if self.dispatch_transport == "auto":
+            self.dispatch_transport = (
+                "tdm" if os.environ.get("AITER_EP_DISPATCH_TDM") == "1" else "vector"
+            )
+        if self.dispatch_transport == "tdm":
+            # Each of these has its own staging region / slot arithmetic that the
+            # TDM kernel does not carry; failing loudly beats silently dropping
+            # scales or landing tokens in the wrong group.
+            unsupported = [
+                name
+                for name, on in (
+                    ("scale_dim", self.scale_dim > 0),
+                    ("push_group", self.push_group),
+                    ("fp4 tokens", self.is_fp4),
+                )
+                if on
+            ]
+            if unsupported:
+                raise ValueError(
+                    "dispatch_transport='tdm' does not implement "
+                    + ", ".join(unsupported)
+                    + "; use dispatch_transport='vector'"
+                )
         if self.combine_mode not in ("gather", "scatter", "scatter_fused"):
             raise ValueError(
                 "combine_mode must be gather|scatter|scatter_fused, "
@@ -922,6 +963,67 @@ class EpDispatchCombineOp:
             for (b, w) in dispatch_specs
         }
         self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
+
+        # TDM transport: same kwargs minus the knobs it does not implement, plus
+        # its own staging pool. FINALIZE gathers each route's metadata into a
+        # (block, peer)-contiguous run there so META can ship it in bulk; the
+        # pool is sized for the widest precompiled geometry, since a narrower
+        # grid only ever addresses a prefix of it.
+        self._dispatch_tdm_variants = {}
+        self._tdm_stage = None
+        if cfg.dispatch_transport == "tdm":
+            tdm_kwargs = {
+                k: v
+                for k, v in self._dispatch_kwargs.items()
+                if k
+                not in (
+                    "off_out_scales",
+                    "scale_dim",
+                    "scale_type_size",
+                    "fp4",
+                    "push_group",
+                    "push_group_cap",
+                    "off_pg_running",
+                    "off_pg_rowmap",
+                    "push_group_scale_wmma_rep",
+                )
+            }
+            # The schedule is tuned against the vector transport, which holds no
+            # per-warp LDS, so it can name a warp width this one cannot build
+            # (32 warps of a 7168-wide bf16 tile want 448 KB of a 320 KB budget).
+            # Clamp the width, keep the tuned block count, and keep the caller's
+            # spec as the key so _pick still resolves.
+            max_warps = tdm_max_warps(
+                hidden_dim=hidden_dim,
+                hidden_elem_size=elem_size,
+                npes=cfg.world_size,
+            )
+            tdm_geom = {(b, w): (b, min(w, max_warps)) for (b, w) in dispatch_specs}
+            slots = max(
+                tdm_stage_capacity(
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    max_tok_per_rank=max_tok_per_rank,
+                    block_num=b,
+                    warp_num_per_block=w,
+                )[1]
+                for (b, w) in tdm_geom.values()
+            )
+            dev = torch.cuda.current_device()
+            self._tdm_stage = (
+                torch.empty(slots * topk, dtype=torch.int32, device=dev),  # indices
+                torch.empty(slots * topk, dtype=torch.int32, device=dev),  # weights
+                torch.empty(slots, dtype=torch.int32, device=dev),  # srcmap
+            )
+            _built = {}
+            for spec, geom in tdm_geom.items():
+                if geom not in _built:
+                    _built[geom] = make_dispatch_tdm(
+                        block_num=geom[0],
+                        warp_num_per_block=geom[1],
+                        **tdm_kwargs,
+                    )
+                self._dispatch_tdm_variants[spec] = _built[geom]
         if cfg.is_fused:
             # gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp;
             # combine only barriers (wait for peers' writes) + sums the topk slots.
@@ -1211,6 +1313,13 @@ class EpDispatchCombineOp:
         stream = fx.Stream(torch.cuda.current_stream())
         weight_ptr = weights.data_ptr() if weights is not None else 0
         if routing is not None:
+            if self._dispatch_tdm_variants:
+                raise NotImplementedError(
+                    "replay is not ported to dispatch_transport='tdm': its slots "
+                    "come from a per-(block, peer) reservation, so a cached map is "
+                    "only replayable under the same grid AND the same block->token "
+                    "assignment"
+                )
             kern = self._dispatch_replay_variants.get(disp_spec)
             if kern is None:
                 kern = self._dispatch_replay_variants[disp_spec] = make_dispatch(
@@ -1243,20 +1352,39 @@ class EpDispatchCombineOp:
                 if return_routing
                 else self.token_dest_map
             )
-            self._dispatch_variants[disp_spec](
-                self.arena.handle,
-                input.data_ptr(),
-                indices.data_ptr(),
-                weight_ptr,
-                dest_map.data_ptr(),
-                self.dest_pe_counter.data_ptr(),
-                self.dispatch_barrier.data_ptr(),
-                self.total_recv.data_ptr(),
-                scale_ptr,
-                self.cfg.rank,
-                num_input_tokens,
-                stream,
-            )
+            if self._dispatch_tdm_variants:
+                stg_idx, stg_wt, stg_src = self._tdm_stage
+                self._dispatch_tdm_variants[disp_spec](
+                    self.arena.handle,
+                    input.data_ptr(),
+                    indices.data_ptr(),
+                    weight_ptr,
+                    dest_map.data_ptr(),
+                    self.dest_pe_counter.data_ptr(),
+                    self.dispatch_barrier.data_ptr(),
+                    self.total_recv.data_ptr(),
+                    stg_idx.data_ptr(),
+                    stg_wt.data_ptr(),
+                    stg_src.data_ptr(),
+                    self.cfg.rank,
+                    num_input_tokens,
+                    stream,
+                )
+            else:
+                self._dispatch_variants[disp_spec](
+                    self.arena.handle,
+                    input.data_ptr(),
+                    indices.data_ptr(),
+                    weight_ptr,
+                    dest_map.data_ptr(),
+                    self.dest_pe_counter.data_ptr(),
+                    self.dispatch_barrier.data_ptr(),
+                    self.total_recv.data_ptr(),
+                    scale_ptr,
+                    self.cfg.rank,
+                    num_input_tokens,
+                    stream,
+                )
 
         out = self.recv_tokens()
         out_weights = self.recv_weights()
