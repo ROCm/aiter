@@ -612,6 +612,25 @@ docker rm -f mi355x_bench 2>/dev/null || true
       || { rc=\\$?; echo "[probe] request failed (curl rc=\\$rc); aborting before sweep"; cat "\\$PROBE_OUT" 2>/dev/null || true; exit 1; }
     python3 \\$CIDIR/assert_nonempty.py < "\\$PROBE_OUT" \\
       || { echo "[probe] empty/invalid generation; aborting before sweep"; cat "\\$PROBE_OUT" 2>/dev/null || true; exit 1; }
+    echo "[probe] wait for PD worker health to settle after first generation"
+    for i in \\$(seq 1 6); do
+      sleep 45
+      SETTLE_OUT=/tmp/sglang_probe_settle_out.json
+      rm -f "\\$SETTLE_OUT"
+      if curl -sf -m 180 -X POST http://127.0.0.1:$LBPORT/generate \\
+        -H "content-type: application/json" -d @\\$CIDIR/probe.json > "\\$SETTLE_OUT" \\
+        && python3 \\$CIDIR/assert_nonempty.py < "\\$SETTLE_OUT"; then
+        echo "[probe] settle ok after \\$i attempt(s): \\$(cat "\\$SETTLE_OUT")"
+        break
+      fi
+      rc=\\$?
+      echo "[probe] settle attempt \\$i failed (rc=\\$rc); waiting for router worker health recovery"
+      cat "\\$SETTLE_OUT" 2>/dev/null || true
+      if [ "\\$i" -eq 6 ]; then
+        echo "[probe] PD path did not recover after first generation; aborting before GSM8K/sweep"
+        exit 1
+      fi
+    done
 """,
     )
     text = replace_once(
