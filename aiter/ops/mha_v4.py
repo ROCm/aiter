@@ -908,6 +908,71 @@ def _launch_mxfp6_fake(
     del out
 
 
+def _validate_mha_v4_raw_inputs(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Optional[Tensor],
+    operation: str,
+) -> Tensor:
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(f"{operation} expects BSHD Q, K, and V tensors")
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+    ):
+        raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
+    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError(f"{operation} currently supports head dimension 128 only")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
+    if out is None:
+        return torch.empty_like(q, dtype=torch.bfloat16)
+    if out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
+        raise ValueError("out must match Q's shape/device and have BF16 dtype")
+    return out
+
+
+def mha_v4_mxfp8(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+) -> Tensor:
+    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8."""
+    if return_lse:
+        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_mxfp8")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    fp8_format = native_fp8_format()
+    q_quantized, q_descale = quantize_mxfp8_q(
+        q, mha_v4_q_multiplier(softmax_scale)
+    )
+    k_quantized, k_descale = quantize_mxfp8_k(k)
+    v_quantized, v_descale = quantize_fp8(v)
+    return mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+
+
 def mha_v4(
     q: Tensor,
     k: Tensor,
@@ -926,25 +991,10 @@ def mha_v4(
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        raise ValueError("mha_v4 expects BSHD Q, K, and V tensors")
-    if (
-        q.dtype != torch.bfloat16
-        or k.dtype != torch.bfloat16
-        or v.dtype != torch.bfloat16
-    ):
-        raise ValueError("mha_v4 currently expects BF16 Q, K, and V inputs")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError("mha_v4 currently supports head dimension 128 only")
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
         q_format, k_format, v_format
     )
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("mha_v4 currently requires contiguous BSHD inputs")
-    if out is None:
-        out = torch.empty_like(q, dtype=torch.bfloat16)
-    elif out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
-        raise ValueError("out must match Q's shape/device and have BF16 dtype")
 
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)

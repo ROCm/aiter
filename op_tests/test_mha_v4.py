@@ -10,6 +10,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -759,6 +760,27 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_mxfp8_raw_compile_parity():
+    torch.manual_seed(41)
+    q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+
+    eager = mha_v4_mxfp8(q, k, v, out=eager_out)
+    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(
+        q, k, v, out=compiled_out
+    )
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(eager, compiled)
+    assert torch.isfinite(compiled).all()
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
