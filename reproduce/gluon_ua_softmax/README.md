@@ -47,23 +47,9 @@ GCNRewritePartialRegUsesImpl::updateLiveIntervals(...):
   Assertion `NewLI.verify(MRI)' failed.
 ```
 
-**Still present on today's main.** It was first seen on 3.8.0 `71d3f5cf` (2026-07-29, LLVM
-`850a2b1b`); triton has since bumped its LLVM pin to `b010a18d` (triton `640190e`, "Pin LLVM
-at b010a18d", #11163) and the abort is unchanged, so this is a retest against newer LLVM
-rather than the same build twice.
-
-Assertions are enabled in triton's prebuilt LLVM, so the failure is loud. Whether the same
-IR miscompiles silently in a no-assertions build has not been checked.
-
 ## Config
 
-`repro.py` uses the smallest config known to trigger it. All three are required:
-
-* `sinks` passed — `sinks=None` selects the non-CDNA4 softmax and compiles either way
-* a prefill sequence — pure decode compiles
-* `head_size` 64 or 128 — 256 compiles
-
-bf16, causal, no sliding window, no descales.
+`repro.py` uses the smallest config known to trigger it. 
 
 ## Files
 
