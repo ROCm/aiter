@@ -20,13 +20,19 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+)
 from aiter.ops.triton.utils.gemm_config_utils import (
+    STANDARD_M_BOUNDS,
     compute_splitk_params,
     get_gemm_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -127,12 +133,29 @@ def gemm_a16w16_(
         N, _ = w.shape
 
         if config is None:
-            # backend-scoped: the two backends need different config formats
-            # (triton BLOCK_SIZE_*, gluon BLOCK_*), and on gfx1250 the flat
-            # config file only carries the gluon keys.
-            config, _ = get_gemm_config(
-                "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
+            arch = get_arch()
+            fpath = (
+                f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/gemm/"
+                f"{arch}-GEMM-A16W16-PERSISTENT-N={N}-K={K}.json"
             )
+            raw = load_config_json(fpath, required=False)
+            config = None
+            if raw is not None:
+                for bound in STANDARD_M_BOUNDS:
+                    if M <= bound and f"M_LEQ_{bound}" in raw:
+                        config = dict(raw[f"M_LEQ_{bound}"])
+                        break
+                if config is None:
+                    for bound in reversed(STANDARD_M_BOUNDS):
+                        if M >= bound and f"M_GEQ_{bound}" in raw:
+                            config = dict(raw[f"M_GEQ_{bound}"])
+                            break
+                if config is None and "any" in raw:
+                    config = dict(raw["any"])
+            if config is None:
+                config, _ = get_gemm_config(
+                    "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
+                )
             if backend == "triton":
                 config = compute_splitk_params(config, K)
 
