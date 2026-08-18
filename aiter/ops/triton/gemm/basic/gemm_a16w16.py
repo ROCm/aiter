@@ -167,7 +167,10 @@ def gemm_a16w16_(
         #   bandwidth_bound : peels the last tile (needs num_k_tiles >= NB)
         #                     -> cap = num_k_tiles
         #   compute_bound : preloads one tile ahead AND peels the last tile
-        #                   (needs num_k_tiles >= NB + 2) -> cap = num_k_tiles - 2
+        #                   (needs num_k_tiles >= NB + 1). The prologue now fills
+        #                   NB-1 slots rather than NB, so one tile of reach came
+        #                   back; _DEPTH_SLACK stays at 2, which is one deeper
+        #                   than required and therefore still safe.
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
         _DEPTH_SLACK = {"compute_bound": 2}
