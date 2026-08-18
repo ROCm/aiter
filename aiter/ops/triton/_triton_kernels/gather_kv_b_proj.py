@@ -374,6 +374,7 @@ def _triton_gather_kv_b_proj_fp4_impl(
 @triton.jit
 def _triton_gather_kv_b_proj_impl(
     batch_size,
+    total_kv,
     k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
     k_scale,  # [1] or None
     kv_indptr,  # [batch_size + 1]
@@ -396,6 +397,7 @@ def _triton_gather_kv_b_proj_impl(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
     SHUFFLED_KV_CACHE: tl.constexpr = False,
+    FLAT_TOKEN_GRID: tl.constexpr = False,
 ):
     # All three strides are multiplied by runtime indices that can overflow
     # i32 at large scales. Promote the scalar (broadcast) side to i64 so the multiply
@@ -414,29 +416,39 @@ def _triton_gather_kv_b_proj_impl(
     # ===---------------------------------------------------
     # Workload Partition
     # ===---------------------------------------------------
-    # One program per (batch, head, KV chunk) -- the partition the FP4 impl
-    # already uses. Chunking over KV is what makes the launch big enough to fill
-    # the device: at batch=1 with 12 local heads a (batch x head) grid is 12
-    # workgroups on a 256-CU part, and walking the context as a serial loop
-    # inside each of them left this kernel at ~0.26 TB/s of ~8 TB/s peak.
+    # Page-size-1 inputs use one program per (head, global token chunk). Both
+    # kv_indices and output rows are packed in batch-major token order, and this
+    # projection has no cross-token state, so chunks may cross sequence
+    # boundaries without consulting either indptr.
+    #
+    # Other layouts use one program per (batch, head, sequence-local KV chunk).
     flat_pid = tl.program_id(0)
-    num_batch_heads = batch_size * TpNumHeads
-    pid = flat_pid % num_batch_heads
-    chunk_id = flat_pid // num_batch_heads
-    pid_batch = pid // TpNumHeads
-    pid_head = pid % TpNumHeads
+    if FLAT_TOKEN_GRID:
+        assert KBlockSize == 1
+        pid_head = flat_pid % TpNumHeads
+        chunk_id = flat_pid // TpNumHeads
+        kv_block_start = 0
+        context_start = 0
+        context_end = total_kv
+        total_kv_block = total_kv
+    else:
+        num_batch_heads = batch_size * TpNumHeads
+        pid = flat_pid % num_batch_heads
+        chunk_id = flat_pid // num_batch_heads
+        pid_batch = pid // TpNumHeads
+        pid_head = pid % TpNumHeads
 
-    kv_block_start = tl.load(kv_indptr + pid_batch)
-    kv_block_end = tl.load(kv_indptr + pid_batch + 1)
+        kv_block_start = tl.load(kv_indptr + pid_batch)
+        kv_block_end = tl.load(kv_indptr + pid_batch + 1)
 
-    context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
-    context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
+        context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
+        context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
 
-    total_kv_block = kv_block_end - kv_block_start
-    # The chunk axis of the grid is an upper bound over the whole batch (see
-    # the launch site), so a program past its own sequence's end has nothing to
-    # do. Returning here, before the weight loads below, keeps that cost to two
-    # indptr loads.
+        total_kv_block = kv_block_end - kv_block_start
+
+    # The generic grid's chunk axis is an upper bound over the whole batch, so
+    # programs past their sequence's end return before loading projection data.
+    # This also handles the empty total_kv case for the flat-token grid.
     if chunk_id >= (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK:
         return
 
@@ -760,6 +772,7 @@ def _triton_gather_kv_b_proj_impl(
 @triton.jit
 def _triton_gather_kv_b_proj(
     batch_size,
+    total_kv,
     k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
     k_scale,  # [1] or None
     kv_indptr,  # [batch_size + 1]
@@ -785,6 +798,7 @@ def _triton_gather_kv_b_proj(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
     SHUFFLED_KV_CACHE: tl.constexpr = False,
+    FLAT_TOKEN_GRID: tl.constexpr = False,
 ):
     if IS_FP4:
         _triton_gather_kv_b_proj_fp4_impl(
@@ -815,6 +829,7 @@ def _triton_gather_kv_b_proj(
     else:
         _triton_gather_kv_b_proj_impl(
             batch_size,
+            total_kv,
             k_buffer,
             k_scale,
             kv_indptr,
@@ -837,4 +852,5 @@ def _triton_gather_kv_b_proj(
             PER_ROW_SCALE,
             NO_SCALE,
             SHUFFLED_KV_CACHE,
+            FLAT_TOKEN_GRID,
         )

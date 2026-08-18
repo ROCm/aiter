@@ -117,26 +117,29 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    # Both impls partition (batch, head, KV chunk). The chunk axis is sized
-    # from `k_prefix`'s row count -- the batch's total output tokens -- rather
-    # than from `kv_indices`, whose length is a capacity in serving paths that
-    # pass a preallocated buffer far larger than the valid range `kv_indptr`
-    # describes. The per-sequence maximum would be tighter still, but the only
-    # thing that knows it is `kv_indptr`, which is on device and reading it
-    # here would cost a sync. So the axis is an upper bound: with B sequences
-    # in the batch it launches up to B x more programs than have work, and
-    # each of the extras loads two indptr entries and returns.
+    # Size the chunk axis from the actual output token count rather than from
+    # `kv_indices`, whose length may be a much larger preallocated capacity.
     #
-    # Also the bound cannot be too *small*: a sequence's chunk count is
-    # computed in the kernel from its block span, and `ChunkK % block_size == 0`
-    # above makes ceil(blocks * block_size / ChunkK) == ceil(tokens / ChunkK),
-    # so no sequence ever asks for a chunk id this grid does not cover.
+    # With page_size=1, non-FP4 `kv_indices` and the output rows are both packed
+    # in batch-major token order. Projection is independent per token, so one
+    # program can process a chunk that crosses a sequence boundary and the batch
+    # axis can be removed entirely. Besides eliminating empty programs for
+    # ragged batches, this also removes the indptr loads from the hot path.
+    #
+    # Other layouts retain the generic (batch, head, KV chunk) partition. Their
+    # physical block indices need per-sequence indptrs to map partial pages to
+    # packed output rows.
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
-    grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
+    flat_token_grid = block_size == 1 and not is_fp4_weight
+    grid_batch_heads = (
+        tp_k_head_num_k if flat_token_grid else batch_size * tp_k_head_num_k
+    )
+    grid = (grid_batch_heads * max_kv_chunks,)
     if is_fp4_weight:
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         _triton_gather_kv_b_proj[grid](
             batch_size,
+            total_kv_k,
             k_buffer,
             k_scale,
             kv_indptr,
@@ -166,6 +169,7 @@ def gather_kv_b_proj(
 
     _triton_gather_kv_b_proj[grid](
         batch_size,
+        total_kv_k,
         k_buffer,
         k_scale,
         kv_indptr,
@@ -189,5 +193,6 @@ def gather_kv_b_proj(
         PER_ROW_SCALE=per_row_scale,
         NO_SCALE=no_scale,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
+        FLAT_TOKEN_GRID=flat_token_grid,
         num_stages=num_stages,
     )
