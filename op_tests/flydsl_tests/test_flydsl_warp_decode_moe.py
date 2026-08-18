@@ -1303,9 +1303,10 @@ COLD_DOWN_SHAPES = [
     for (_name, HIDDEN, INTER, E, TOPK) in _COLD_MODELS
     for B in _COLD_BATCHES
 ]
-# i32 addressing limits on E*HIDDEN*INTER (see K3 scope): FP4's hardware byte
-# offset is w_row*INTER/2 (dword*4), so it overflows at E*H*I >= 2^32; FP8's is
-# w_row*INTER (dword*4), overflowing at 2^31.
+# i32 addressing limits (see K3 scope). FP4 still addresses the whole pool with an
+# i32 byte offset (w_row*INTER/2), overflowing at E*H*I >= 2^32. FP8 now uses the
+# K3 Tier-2 per-expert i64 base (B5), so E*H*I no longer bounds it; the residual
+# i32 limit is the *in-expert* byte offset (HIDDEN*INTER bytes/expert) vs 2^31.
 _COLD_FP4_LIMIT = 2**32
 _COLD_FP8_LIMIT = 2**31
 
@@ -1550,12 +1551,13 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     device = torch.device("cuda")
     nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * HIDDEN * INTER
-    # K3 i32 addressing limits (see scope): FP4 byte offset = w_row*INTER/2, FP8 =
-    # w_row*INTER; the FP8 leg is skipped above 2^31 (needs the Tier-2 i64 base).
+    # K3 addressing: FP4 still uses whole-pool i32 (byte offset w_row*INTER/2 -> caps
+    # at E*H*I < 2^32). FP8 now uses the K3 Tier-2 per-expert i64 base (B5), so the
+    # only residual i32 constraint is the *in-expert* offset (H*I bytes/expert).
     assert (
         ehi < _COLD_FP4_LIMIT
     ), f"E*HIDDEN*INTER={ehi} overflows even FP4's i32 offset (needs K3 Tier-2)"
-    run_fp8 = ehi < _COLD_FP8_LIMIT
+    run_fp8 = HIDDEN * INTER < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
     inter, w_down, w_scale, rid_list, rwt = _gen_down_fp4_pool(
@@ -1578,7 +1580,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     del inter, w_down, w_scale, out
     torch.cuda.empty_cache()
 
-    # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*H*I < 2^31) ----
+    # ---- FP8 (Block2D<128,128>, B1) -- K3 Tier-2 i64 base carries E*H*I >= 2^31 ----
     if run_fp8:
         inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
             B, INTER, HIDDEN, E, TOPK
@@ -1608,7 +1610,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     else:
         us8 = tbs8 = cos8 = float(
             "nan"
-        )  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
+        )  # per-expert H*I offset would overflow i32 (beyond K3 Tier-2)
 
     return {
         "gfx": get_gfx(),
@@ -1785,10 +1787,13 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     device = torch.device("cuda")
     nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * INTER * HIDDEN
+    # FP4 stays on whole-pool i32 (caps at E*I*H < 2^32); FP8 uses the K3 Tier-2
+    # per-expert i64 base (B5), so its only residual i32 limit is the in-expert
+    # offset (INTER*HIDDEN bytes/expert).
     assert (
         ehi < _COLD_FP4_LIMIT
     ), f"E*INTER*HIDDEN={ehi} overflows even FP4's i32 offset (needs K3 Tier-2)"
-    run_fp8 = ehi < _COLD_FP8_LIMIT
+    run_fp8 = INTER * HIDDEN < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
     x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK)
@@ -1809,7 +1814,7 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     del x, wg, wgs, wu, wus, out
     torch.cuda.empty_cache()
 
-    # ---- FP8 (Block2D<128,128>, B1) -- only when i32 byte offset fits (E*I*H < 2^31) ----
+    # ---- FP8 (Block2D<128,128>, B1) -- K3 Tier-2 i64 base carries E*I*H >= 2^31 ----
     if run_fp8:
         x8, wg8, wgs8, wu8, wus8, rid_list8 = _gen_gate_up_fp8_pool(
             B, HIDDEN, INTER, E, TOPK
@@ -1842,7 +1847,7 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     else:
         us8 = tbs8 = cos8 = float(
             "nan"
-        )  # FP8 E=256 needs K3 Tier-2 per-expert i64 base
+        )  # per-expert I*H offset would overflow i32 (beyond K3 Tier-2)
 
     return {
         "gfx": get_gfx(),

@@ -33,7 +33,15 @@ from aiter.ops.flydsl.kernels.warp_decode_moe import (
 
 @functools.lru_cache(maxsize=64)
 def _get_gate_up(
-    hidden, inter, top_k, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+    hidden,
+    inter,
+    top_k,
+    kvector,
+    w_scale_mode,
+    serialize_dot2,
+    scale_bn,
+    scale_bk,
+    num_experts,
 ):
     return build_gate_up_fp8_module(
         hidden,
@@ -44,6 +52,7 @@ def _get_gate_up(
         serialize_dot2=serialize_dot2,
         scale_bn=scale_bn,
         scale_bk=scale_bk,
+        num_experts=num_experts,
     )
 
 
@@ -59,6 +68,7 @@ def _get_down_reduce(
     scale_bk,
     kh_per_warp,
     k_batch,
+    num_experts,
 ):
     return build_down_reduce_fp8_module(
         inter,
@@ -71,6 +81,7 @@ def _get_down_reduce(
         scale_bk=scale_bk,
         kh_per_warp=kh_per_warp,
         k_batch=k_batch,
+        num_experts=num_experts,
     )
 
 
@@ -262,7 +273,15 @@ def flydsl_warp_decode_gate_up(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     launcher = _get_gate_up(
-        HIDDEN, INTER, TOPK, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+        HIDDEN,
+        INTER,
+        TOPK,
+        kvector,
+        w_scale_mode,
+        serialize_dot2,
+        scale_bn,
+        scale_bk,
+        E,
     )
     grid_x = B * TOPK * INTER
     _run(
@@ -456,6 +475,7 @@ def flydsl_warp_decode_down_reduce(
         scale_bk,
         kh_per_warp,
         split_k,
+        E,
     )
     # Split-K writes FP32 partials via atomic-add into a caller-zeroed accumulator;
     # the plain path stores bf16 directly to `out` (Locked decision, main plan ?1.2).
