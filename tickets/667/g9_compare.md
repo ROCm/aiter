@@ -1,71 +1,71 @@
 <!-- SILOTIGER-667 G9 FlyDSL-vs-CK cold warp-decode comparison -->
-<!-- gfx=gfx950  aiter=7d325bc40  ck_worktree=c03392a91b8 -->
+<!-- gfx=gfx950  aiter=aaa1ab6e3  ck_worktree=c03392a91b8 -->
 <!-- iters=1000 cold=20 timing=device method=weight_stream repeats=3 -->
 <!-- CK provenance: # ck_bench_warp_decode  base_commit=62e30c9098 patch=A4-gateup-fp4-packed-stride  cold=20  iters=1000  rotate=auto(ceil(E/BK))  format=csv  mechanism=manual-hipEvent+disjoint-router-rotation -->
-<!-- clocks: auto (unpinnable on this gfx950; D1) -- effective loaded sclk MHz min/median/max = 1698/2394/2403 (n=193/196) on GPU 6; per-cell spread%% + noisy flag (>5%) capture drift (D5). -->
+<!-- clocks: auto (unpinnable on this gfx950; D1) -- effective loaded sclk MHz min/median/max = 1427/2393/2404 (n=230/233) on GPU 6; per-cell spread%% + noisy flag (>5%) capture drift (D5). -->
 <!-- config policy (D3): default-vs-default. FlyDSL = library defaults, no overrides: serialize_dot2=True, kh_per_warp=auto(2 when HIDDEN even), prefetch=False; down_fp4 dot2_acc=4, gate_up_fp4 dot2_acc=1 (G7: acc>1 ~4% slower for gate_up); down_fp8 split_k=1; FP8 w_scale=block2d(128,128) to match CK. CK = maintainer-recommended variant per op (down_h2_d2, down_fp4_h2, gate_bf16_d2, gate_up_fp4 non-dot2/NPerWarp=1); CK has no single runtime default (mild asymmetry). FP8-down ratio is a CK-favored lower bound: block2d(128,128) costs FlyDSL ~10-38% vs pertensor (B1); FP4 rows carry a ~6% CK-favored scale-traffic bias (dummy PerTensor vs e8m0(1,32)). Treat under-converged fast cells as noisy (D1). -->
 
 **metric method:** `weight_stream` &nbsp; (ratio = flydsl_us / ck_us; CK is perf-only / uninitialized weights)
 
 | shape | B | op | dtype | act | flydsl_us | ck_us | ratio(f/c) | fly_TB/s | ck_TB/s | fly_%peak | fly_spr% | ck_spr% | cos | note |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| deepseek-v3 | 1 | down | fp4 | - | 18.1453 | 29.6461 | 0.612 | 3.4 | 2.1 | 43.0 | 5.8 | 0.3 | 1.0000 | noisy (>5% spread) |
-| deepseek-v3 | 1 | down | fp8 | - | n/a | 35.3736 | n/a | n/a | 3.3 | n/a | n/a | 0.1 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 1 | gate_up | fp4 | bf16 | 29.0553 | 50.2104 | 0.579 | 4.3 | 2.5 | 53.7 | 2.5 | 0.1 | 1.0000 |  |
-| deepseek-v3 | 1 | gate_up | fp8 | bf16 | n/a | 46.5244 | n/a | n/a | 5.0 | n/a | n/a | 0.2 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 2 | down | fp4 | - | 31.2949 | 37.4887 | 0.835 | 4.0 | 3.3 | 49.8 | 0.1 | 0.2 | 1.0000 |  |
-| deepseek-v3 | 2 | down | fp8 | - | n/a | 51.8767 | n/a | n/a | 4.5 | n/a | n/a | 0.2 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 2 | gate_up | fp4 | bf16 | 53.3716 | 92.3138 | 0.578 | 4.7 | 2.7 | 58.4 | 0.4 | 0.0 | 1.0000 |  |
-| deepseek-v3 | 2 | gate_up | fp8 | bf16 | n/a | 86.4009 | n/a | n/a | 5.4 | n/a | n/a | 0.2 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 4 | down | fp4 | - | 54.8550 | 69.0738 | 0.794 | 4.5 | 3.6 | 56.9 | 0.1 | 0.1 | 1.0000 |  |
-| deepseek-v3 | 4 | down | fp8 | - | n/a | 93.4108 | n/a | n/a | 5.0 | n/a | n/a | 0.2 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 4 | gate_up | fp4 | bf16 | 104.4302 | 173.7681 | 0.601 | 4.8 | 2.9 | 59.7 | 0.1 | 0.1 | 1.0000 |  |
-| deepseek-v3 | 4 | gate_up | fp8 | bf16 | n/a | 164.6944 | n/a | n/a | 5.7 | n/a | n/a | 0.1 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 8 | down | fp4 | - | 107.8992 | 134.5758 | 0.802 | 4.6 | 3.7 | 57.8 | 2.3 | 0.1 | 1.0000 |  |
-| deepseek-v3 | 8 | down | fp8 | - | n/a | 179.9731 | n/a | n/a | 5.2 | n/a | n/a | 0.1 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 8 | gate_up | fp4 | bf16 | 208.1574 | 339.2121 | 0.614 | 4.8 | 2.9 | 59.9 | 0.2 | 0.0 | 1.0000 |  |
-| deepseek-v3 | 8 | gate_up | fp8 | bf16 | n/a | 317.0799 | n/a | n/a | 5.9 | n/a | n/a | 0.1 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 32 | down | fp4 | - | 416.0498 | 480.9226 | 0.865 | 4.8 | 4.2 | 60.0 | 0.2 | 0.2 | 1.0000 |  |
-| deepseek-v3 | 32 | down | fp8 | - | n/a | 673.8299 | n/a | n/a | 5.6 | n/a | n/a | 0.1 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| deepseek-v3 | 32 | gate_up | fp4 | bf16 | 839.0408 | 1330.6024 | 0.631 | 4.8 | 3.0 | 59.5 | 0.3 | 0.1 | 1.0000 |  |
-| deepseek-v3 | 32 | gate_up | fp8 | bf16 | n/a | 1261.3939 | n/a | n/a | 6.0 | n/a | n/a | 0.2 | n/a | FlyDSL n/a (DeepSeek FP8 -> K3 Tier-2, B5) |
-| minimax | 1 | down | fp4 | - | 9.9348 | 20.8878 | 0.476 | 2.0 | 1.0 | 25.2 | 1.5 | 0.2 | 1.0000 |  |
-| minimax | 1 | down | fp8 | - | 12.0506 | 23.2594 | 0.518 | 3.1 | 1.6 | 39.2 | 5.8 | 0.1 | 1.0000 | noisy (>5% spread) |
-| minimax | 1 | gate_up | fp4 | bf16 | 11.5039 | 18.3964 | 0.625 | 3.5 | 2.2 | 43.6 | 0.4 | 0.6 | 1.0000 |  |
-| minimax | 1 | gate_up | fp8 | bf16 | 14.9456 | 19.2601 | 0.776 | 5.1 | 3.9 | 63.1 | 0.2 | 0.5 | 1.0000 |  |
-| minimax | 2 | down | fp4 | - | 13.3267 | 27.3360 | 0.488 | 3.0 | 1.5 | 37.6 | 7.5 | 12.3 | 1.0000 | noisy (>5% spread) |
-| minimax | 2 | down | fp8 | - | 18.6686 | 27.4500 | 0.680 | 4.0 | 2.8 | 50.6 | 10.0 | 0.2 | 1.0000 | noisy (>5% spread) |
-| minimax | 2 | gate_up | fp4 | bf16 | 18.3276 | 32.7425 | 0.560 | 4.4 | 2.4 | 54.7 | 1.4 | 0.1 | 1.0000 |  |
-| minimax | 2 | gate_up | fp8 | bf16 | 26.0758 | 32.1434 | 0.811 | 5.8 | 4.7 | 72.4 | 0.8 | 0.1 | 1.0000 |  |
-| minimax | 4 | down | fp4 | - | 22.3383 | 29.6531 | 0.753 | 3.6 | 2.7 | 44.9 | 0.8 | 0.0 | 1.0000 |  |
-| minimax | 4 | down | fp8 | - | 32.5741 | 36.5965 | 0.890 | 4.6 | 4.1 | 57.9 | 2.3 | 0.1 | 1.0000 |  |
-| minimax | 4 | gate_up | fp4 | bf16 | 34.8894 | 59.7405 | 0.584 | 4.6 | 2.7 | 57.5 | 0.1 | 0.1 | 1.0000 |  |
-| minimax | 4 | gate_up | fp8 | bf16 | 49.6355 | 56.3683 | 0.881 | 6.1 | 5.4 | 76.1 | 1.8 | 0.2 | 1.0000 |  |
-| minimax | 8 | down | fp4 | - | 39.9162 | 53.8744 | 0.741 | 4.0 | 3.0 | 50.2 | 2.0 | 0.1 | 1.0000 |  |
-| minimax | 8 | down | fp8 | - | 60.6538 | 65.5963 | 0.925 | 5.0 | 4.6 | 62.2 | 1.1 | 0.1 | 1.0000 |  |
-| minimax | 8 | gate_up | fp4 | bf16 | 64.2237 | 112.3167 | 0.572 | 5.0 | 2.9 | 62.5 | 3.6 | 0.2 | 1.0000 |  |
-| minimax | 8 | gate_up | fp8 | bf16 | 97.1102 | 104.3384 | 0.931 | 6.2 | 5.8 | 77.7 | 0.5 | 0.1 | 1.0000 |  |
-| minimax | 32 | down | fp4 | - | 149.3293 | 171.2609 | 0.872 | 4.3 | 3.7 | 53.7 | 0.0 | 0.3 | 1.0000 |  |
-| minimax | 32 | down | fp8 | - | 226.6455 | 227.8645 | 0.995 | 5.3 | 5.3 | 66.6 | 1.4 | 0.7 | 1.0000 |  |
-| minimax | 32 | gate_up | fp4 | bf16 | 251.2445 | 431.5957 | 0.582 | 5.1 | 3.0 | 63.9 | 1.9 | 0.2 | 1.0000 |  |
-| minimax | 32 | gate_up | fp8 | bf16 | 388.6799 | 401.8832 | 0.967 | 6.2 | 6.0 | 77.7 | 0.2 | 0.2 | 1.0000 |  |
-| qwen3next | 1 | down | fp4 | - | 5.2268 | 9.7728 | 0.535 | 1.1 | 0.6 | 13.3 | 0.1 | 0.2 | 1.0000 |  |
-| qwen3next | 1 | down | fp8 | - | 5.7116 | 10.3765 | 0.550 | 1.8 | 1.0 | 22.9 | 0.3 | 0.1 | 1.0000 |  |
-| qwen3next | 1 | gate_up | fp4 | bf16 | 6.0655 | 7.2126 | 0.841 | 1.8 | 1.5 | 23.0 | 0.3 | 0.4 | 1.0000 |  |
-| qwen3next | 1 | gate_up | fp8 | bf16 | 7.0350 | 7.8502 | 0.896 | 3.0 | 2.7 | 37.3 | 5.4 | 0.5 | 1.0000 | noisy (>5% spread) |
-| qwen3next | 2 | down | fp4 | - | 5.8393 | 11.3508 | 0.514 | 1.9 | 1.0 | 23.8 | 0.2 | 0.2 | 1.0000 |  |
-| qwen3next | 2 | down | fp8 | - | 7.1388 | 15.2024 | 0.470 | 2.9 | 1.4 | 36.7 | 0.3 | 0.7 | 1.0000 |  |
-| qwen3next | 2 | gate_up | fp4 | bf16 | 8.6882 | 10.9344 | 0.795 | 2.6 | 2.0 | 32.1 | 1.8 | 0.4 | 1.0000 |  |
-| qwen3next | 2 | gate_up | fp8 | bf16 | 9.8442 | 12.7384 | 0.773 | 4.3 | 3.3 | 53.3 | 5.8 | 0.2 | 1.0000 | noisy (>5% spread) |
-| qwen3next | 4 | down | fp4 | - | 8.3848 | 13.6263 | 0.615 | 2.7 | 1.6 | 33.2 | 1.1 | 0.2 | 1.0000 |  |
-| qwen3next | 4 | down | fp8 | - | 10.7613 | 17.7337 | 0.607 | 3.9 | 2.4 | 48.7 | 0.1 | 0.3 | 1.0000 |  |
-| qwen3next | 4 | gate_up | fp4 | bf16 | 13.2059 | 17.0219 | 0.776 | 3.4 | 2.6 | 42.2 | 5.2 | 0.2 | 1.0000 | noisy (>5% spread) |
-| qwen3next | 4 | gate_up | fp8 | bf16 | 16.1635 | 20.0079 | 0.808 | 5.2 | 4.2 | 64.9 | 4.3 | 0.2 | 1.0000 |  |
-| qwen3next | 8 | down | fp4 | - | 12.5754 | 16.1413 | 0.779 | 3.5 | 2.8 | 44.3 | 0.6 | 0.1 | 1.0000 |  |
-| qwen3next | 8 | down | fp8 | - | 18.7549 | 23.3650 | 0.803 | 4.5 | 3.6 | 55.9 | 2.9 | 0.1 | 1.0000 |  |
-| qwen3next | 8 | gate_up | fp4 | bf16 | 22.6951 | 29.6694 | 0.765 | 3.9 | 3.0 | 49.1 | 1.4 | 0.0 | 1.0000 |  |
-| qwen3next | 8 | gate_up | fp8 | bf16 | 29.0067 | 32.8654 | 0.883 | 5.8 | 5.1 | 72.3 | 2.4 | 0.2 | 1.0000 |  |
-| qwen3next | 32 | down | fp4 | - | 37.2433 | 54.6628 | 0.681 | 4.8 | 3.3 | 59.8 | 0.4 | 0.4 | 1.0000 |  |
-| qwen3next | 32 | down | fp8 | - | 62.0467 | 73.1378 | 0.848 | 5.4 | 4.6 | 67.6 | 0.1 | 0.1 | 1.0000 |  |
-| qwen3next | 32 | gate_up | fp4 | bf16 | 73.3704 | 104.9539 | 0.699 | 4.9 | 3.4 | 60.7 | 3.6 | 0.1 | 1.0000 |  |
-| qwen3next | 32 | gate_up | fp8 | bf16 | 103.7448 | 112.6343 | 0.921 | 6.5 | 6.0 | 80.9 | 0.5 | 0.0 | 1.0000 |  |
+| deepseek-v3 | 1 | down | fp4 | - | 17.1851 | 29.6046 | 0.580 | 3.6 | 2.1 | 45.4 | 8.0 | 0.1 | 1.0000 | noisy (>5% spread) |
+| deepseek-v3 | 1 | down | fp8 | - | 21.3163 | 35.3307 | 0.603 | 5.5 | 3.3 | 68.9 | 0.7 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 1 | gate_up | fp4 | bf16 | 29.6911 | 50.2051 | 0.591 | 4.2 | 2.5 | 52.5 | 0.9 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 1 | gate_up | fp8 | bf16 | 42.2493 | 46.4849 | 0.909 | 5.6 | 5.1 | 69.5 | 2.5 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 2 | down | fp4 | - | 31.4237 | 37.5213 | 0.837 | 4.0 | 3.3 | 49.6 | 5.2 | 0.1 | 1.0000 | noisy (>5% spread) |
+| deepseek-v3 | 2 | down | fp8 | - | 42.0234 | 51.8489 | 0.810 | 5.6 | 4.5 | 69.9 | 0.3 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 2 | gate_up | fp4 | bf16 | 53.8126 | 92.2956 | 0.583 | 4.6 | 2.7 | 58.0 | 1.0 | 0.0 | 1.0000 |  |
+| deepseek-v3 | 2 | gate_up | fp8 | bf16 | 81.0750 | 86.3305 | 0.939 | 5.8 | 5.4 | 72.4 | 1.5 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 4 | down | fp4 | - | 58.3636 | 69.0828 | 0.845 | 4.3 | 3.6 | 53.4 | 0.1 | 0.2 | 1.0000 |  |
+| deepseek-v3 | 4 | down | fp8 | - | 82.8410 | 93.2970 | 0.888 | 5.7 | 5.0 | 70.9 | 2.3 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 4 | gate_up | fp4 | bf16 | 103.7334 | 173.6467 | 0.597 | 4.8 | 2.9 | 60.1 | 0.9 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 4 | gate_up | fp8 | bf16 | 159.5629 | 164.5935 | 0.969 | 5.9 | 5.7 | 73.6 | 0.8 | 0.0 | 1.0000 |  |
+| deepseek-v3 | 8 | down | fp4 | - | 108.8906 | 134.4605 | 0.810 | 4.6 | 3.7 | 57.3 | 3.5 | 0.2 | 1.0000 |  |
+| deepseek-v3 | 8 | down | fp8 | - | 159.6975 | 179.7878 | 0.888 | 5.9 | 5.2 | 73.5 | 0.9 | 0.0 | 1.0000 |  |
+| deepseek-v3 | 8 | gate_up | fp4 | bf16 | 208.8340 | 339.1949 | 0.616 | 4.8 | 2.9 | 59.8 | 2.1 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 8 | gate_up | fp8 | bf16 | 319.9498 | 316.7416 | 1.010 | 5.9 | 5.9 | 73.4 | 0.8 | 0.0 | 1.0000 |  |
+| deepseek-v3 | 32 | down | fp4 | - | 434.2262 | 479.4029 | 0.906 | 4.6 | 4.2 | 57.5 | 2.0 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 32 | down | fp8 | - | 641.7441 | 673.5654 | 0.953 | 5.9 | 5.6 | 73.2 | 0.1 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 32 | gate_up | fp4 | bf16 | 850.5764 | 1330.6895 | 0.639 | 4.7 | 3.0 | 58.7 | 1.1 | 0.1 | 1.0000 |  |
+| deepseek-v3 | 32 | gate_up | fp8 | bf16 | 1297.3660 | 1260.2664 | 1.029 | 5.8 | 6.0 | 72.4 | 0.8 | 0.6 | 1.0000 |  |
+| minimax | 1 | down | fp4 | - | 10.0043 | 20.8797 | 0.479 | 2.0 | 1.0 | 25.1 | 2.2 | 0.2 | 1.0000 |  |
+| minimax | 1 | down | fp8 | - | 11.7990 | 23.2093 | 0.508 | 3.2 | 1.6 | 40.0 | 0.2 | 0.3 | 1.0000 |  |
+| minimax | 1 | gate_up | fp4 | bf16 | 11.4334 | 18.3803 | 0.622 | 3.5 | 2.2 | 43.8 | 0.0 | 0.2 | 1.0000 |  |
+| minimax | 1 | gate_up | fp8 | bf16 | 14.7532 | 19.2165 | 0.768 | 5.1 | 3.9 | 64.0 | 0.4 | 0.2 | 1.0000 |  |
+| minimax | 2 | down | fp4 | - | 12.1331 | 24.0428 | 0.505 | 3.3 | 1.7 | 41.3 | 0.2 | 17.9 | 1.0000 | noisy (>5% spread) |
+| minimax | 2 | down | fp8 | - | 17.3812 | 27.3938 | 0.634 | 4.3 | 2.8 | 54.3 | 9.8 | 0.2 | 1.0000 | noisy (>5% spread) |
+| minimax | 2 | gate_up | fp4 | bf16 | 18.3092 | 32.7272 | 0.559 | 4.4 | 2.5 | 54.8 | 1.9 | 0.1 | 1.0000 |  |
+| minimax | 2 | gate_up | fp8 | bf16 | 26.2600 | 32.0473 | 0.819 | 5.8 | 4.7 | 71.9 | 1.2 | 0.5 | 1.0000 |  |
+| minimax | 4 | down | fp4 | - | 22.4876 | 29.6608 | 0.758 | 3.6 | 2.7 | 44.6 | 1.4 | 0.1 | 1.0000 |  |
+| minimax | 4 | down | fp8 | - | 32.6156 | 36.5597 | 0.892 | 4.6 | 4.1 | 57.9 | 5.8 | 0.1 | 1.0000 | noisy (>5% spread) |
+| minimax | 4 | gate_up | fp4 | bf16 | 34.7126 | 59.6907 | 0.582 | 4.6 | 2.7 | 57.8 | 3.5 | 0.1 | 1.0000 |  |
+| minimax | 4 | gate_up | fp8 | bf16 | 48.5427 | 56.3920 | 0.861 | 6.2 | 5.4 | 77.8 | 0.7 | 0.1 | 1.0000 |  |
+| minimax | 8 | down | fp4 | - | 39.9810 | 53.8545 | 0.742 | 4.0 | 3.0 | 50.2 | 5.1 | 0.0 | 1.0000 | noisy (>5% spread) |
+| minimax | 8 | down | fp8 | - | 60.6470 | 65.5335 | 0.925 | 5.0 | 4.6 | 62.2 | 4.7 | 0.1 | 1.0000 |  |
+| minimax | 8 | gate_up | fp4 | bf16 | 65.1982 | 112.2468 | 0.581 | 4.9 | 2.9 | 61.5 | 3.9 | 0.1 | 1.0000 |  |
+| minimax | 8 | gate_up | fp8 | bf16 | 95.2318 | 104.1279 | 0.915 | 6.3 | 5.8 | 79.3 | 2.7 | 0.2 | 1.0000 |  |
+| minimax | 32 | down | fp4 | - | 149.2668 | 171.1795 | 0.872 | 4.3 | 3.7 | 53.7 | 3.2 | 0.1 | 1.0000 |  |
+| minimax | 32 | down | fp8 | - | 228.7144 | 227.5804 | 1.005 | 5.3 | 5.3 | 66.0 | 3.5 | 0.1 | 1.0000 |  |
+| minimax | 32 | gate_up | fp4 | bf16 | 248.8620 | 431.2708 | 0.577 | 5.2 | 3.0 | 64.5 | 1.6 | 0.1 | 1.0000 |  |
+| minimax | 32 | gate_up | fp8 | bf16 | 384.9980 | 401.9760 | 0.958 | 6.3 | 6.0 | 78.4 | 0.1 | 0.5 | 1.0000 |  |
+| qwen3next | 1 | down | fp4 | - | 5.2571 | 9.7667 | 0.538 | 1.1 | 0.6 | 13.2 | 0.3 | 0.3 | 1.0000 |  |
+| qwen3next | 1 | down | fp8 | - | 5.6890 | 10.3380 | 0.550 | 1.8 | 1.0 | 23.0 | 0.3 | 0.4 | 1.0000 |  |
+| qwen3next | 1 | gate_up | fp4 | bf16 | 6.0805 | 7.1999 | 0.845 | 1.8 | 1.5 | 22.9 | 1.2 | 1.4 | 1.0000 |  |
+| qwen3next | 1 | gate_up | fp8 | bf16 | 7.5093 | 7.8847 | 0.952 | 2.8 | 2.7 | 34.9 | 0.6 | 0.2 | 1.0000 |  |
+| qwen3next | 2 | down | fp4 | - | 5.8381 | 11.3586 | 0.514 | 1.9 | 1.0 | 23.9 | 0.3 | 0.3 | 1.0000 |  |
+| qwen3next | 2 | down | fp8 | - | 7.3351 | 15.2257 | 0.482 | 2.9 | 1.4 | 35.7 | 5.0 | 0.2 | 1.0000 | noisy (>5% spread) |
+| qwen3next | 2 | gate_up | fp4 | bf16 | 8.3387 | 10.8433 | 0.769 | 2.7 | 2.1 | 33.4 | 4.9 | 0.2 | 1.0000 |  |
+| qwen3next | 2 | gate_up | fp8 | bf16 | 10.7714 | 12.7435 | 0.845 | 3.9 | 3.3 | 48.7 | 1.8 | 0.2 | 1.0000 |  |
+| qwen3next | 4 | down | fp4 | - | 8.4150 | 13.6454 | 0.617 | 2.6 | 1.6 | 33.1 | 1.8 | 0.2 | 1.0000 |  |
+| qwen3next | 4 | down | fp8 | - | 11.5926 | 17.7333 | 0.654 | 3.6 | 2.4 | 45.2 | 2.2 | 0.2 | 1.0000 |  |
+| qwen3next | 4 | gate_up | fp4 | bf16 | 13.2041 | 16.9696 | 0.778 | 3.4 | 2.6 | 42.2 | 5.0 | 0.4 | 1.0000 |  |
+| qwen3next | 4 | gate_up | fp8 | bf16 | 17.2461 | 20.0217 | 0.861 | 4.9 | 4.2 | 60.8 | 1.0 | 0.1 | 1.0000 |  |
+| qwen3next | 8 | down | fp4 | - | 12.2772 | 16.2128 | 0.757 | 3.6 | 2.7 | 45.4 | 2.3 | 0.5 | 1.0000 |  |
+| qwen3next | 8 | down | fp8 | - | 18.9079 | 23.3146 | 0.811 | 4.4 | 3.6 | 55.5 | 7.6 | 0.1 | 1.0000 | noisy (>5% spread) |
+| qwen3next | 8 | gate_up | fp4 | bf16 | 22.7865 | 29.5656 | 0.771 | 3.9 | 3.0 | 48.9 | 3.8 | 0.1 | 1.0000 |  |
+| qwen3next | 8 | gate_up | fp8 | bf16 | 30.2343 | 32.8288 | 0.921 | 5.5 | 5.1 | 69.4 | 1.2 | 0.3 | 1.0000 |  |
+| qwen3next | 32 | down | fp4 | - | 37.0307 | 54.8669 | 0.675 | 4.8 | 3.2 | 60.2 | 0.1 | 0.3 | 1.0000 |  |
+| qwen3next | 32 | down | fp8 | - | 64.8011 | 73.1110 | 0.886 | 5.2 | 4.6 | 64.7 | 4.0 | 0.1 | 1.0000 |  |
+| qwen3next | 32 | gate_up | fp4 | bf16 | 72.6790 | 104.7649 | 0.694 | 4.9 | 3.4 | 61.3 | 2.1 | 0.3 | 1.0000 |  |
+| qwen3next | 32 | gate_up | fp8 | bf16 | 105.9028 | 112.7496 | 0.939 | 6.3 | 6.0 | 79.2 | 0.6 | 0.1 | 1.0000 |  |
